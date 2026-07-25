@@ -34,6 +34,8 @@ These are load-bearing — each one backs a headline requirement, so treat them 
 9. Every widget carries an `accesskit` node as part of its definition. Aurora renders its own UI, so nothing is accessible for free; a widget without one is incomplete.
 10. No style value is hardcoded. Widgets resolve colors, spacing, sizes, radii, and durations from semantic design tokens in `aurora-theme` (FR-027) — never a literal, never by reading a *theme*. CI lints for this. A hardcoded color is a bug: it's the one thing a user's theme cannot override.
 
+Licensed MIT. Two practical consequences when adding dependencies: `cargo deny` enforces an allowed-licence list in CI, and copyleft C libraries (LibRaw is LGPL-2.1/CDDL, `libheif` is LGPL) must be dynamically linked to satisfy LGPL — prefer a pure-Rust alternative where one is viable. See PRD §14.
+
 ## Technology stack (PRD §8)
 
 Rust end to end (edition 2024, stable). `wgpu` + WGSL for GPU across Vulkan/Metal/DX12; `winit` for windowing and tablet input; `rayon` for CPU tile parallelism; `tokio` for I/O and background work but **not** the render loop. FFI wrappers are acceptable where Rust lacks maturity (RAW, ICC).

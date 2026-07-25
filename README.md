@@ -61,7 +61,7 @@ Every phase has a measurable exit criterion rather than a feature checklist — 
 
 ## Contributing
 
-Aurora is not yet accepting code contributions — there is no code to contribute to, and the foundational decisions are still being written into ADRs. What is genuinely useful right now:
+Aurora is MIT licensed and open to contribution, but there is no code to contribute to yet — the foundational decisions are still being written into ADRs. What is genuinely useful right now:
 
 - **Review the [PRD](PRD.md).** Particularly §11 (Risks) and §12 (Open Questions). Several open questions are unresolved and shape the architecture, notably the PSD round-trip target versions and the handling of Photoshop features with no Aurora equivalent.
 - **Tell us about your workflow.** [PRD §13 Step 2](PRD.md) calls for a ranked list of the Photoshop workflows that actually matter to professionals. First-hand accounts are more valuable than speculation.
@@ -69,4 +69,6 @@ Aurora is not yet accepting code contributions — there is no code to contribut
 
 ## License
 
-Not yet decided — see [PRD §12](PRD.md), Open Question 3. Until a licence is chosen, no permissions are granted beyond viewing the repository.
+[MIT](LICENSE) — © 2026 Cahya Wirawan.
+
+Aurora is permissively licensed: use it, fork it, build commercial products on it. Note that shipped binaries will also carry the licences of their dependencies, several of which are C libraries under other terms (see [PRD §8.2](PRD.md)); `cargo deny` enforces licence compatibility in CI.

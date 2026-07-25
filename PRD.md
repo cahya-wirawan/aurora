@@ -1,12 +1,13 @@
 # Product Requirements Document (PRD)
 
 **Project:** Aurora  
-**Version:** 1.3  
+**Version:** 1.4  
 **Document Owner:** Product Team  
 **Status:** Draft — pre-implementation  
 **Target Release:** TBD  
 **Implementation Language:** Rust (see §8)  
-**UI:** Custom GPU-rendered UI on `wgpu` — **decided** (see §8.3)
+**UI:** Custom GPU-rendered UI on `wgpu` — **decided** (see §8.3)  
+**License:** MIT (see §14)
 
 ---
 
@@ -1241,11 +1242,12 @@ These block or reshape implementation and need owners and answers, most before P
 - **Document ceiling → 300,000 × 300,000 px** (§6 *Scalability*). Set to match Adobe's PSB maximum rather than the original 500,000, which corresponded to nothing. Photoshop's own limits are 30,000 px for PSD and 300,000 px for PSB; matching PSB means Aurora can open anything Photoshop can produce, without over-building.
 - **Precision floor → always ≥16-bit float** (§6 *Precision*). No 8-bit internal path; costs 2× memory versus 8-bit, accepted.
 - **PSD scope → full layered read *and* write**, with explicit lossy-conversion warnings (FR-001).
+- **Licence → MIT** ([LICENSE](LICENSE)). Aurora is open source and permissively licensed. See §14 for what this settles and what it does not.
 
 1. **Accessibility conformance target** — WCAG 2.1 AA equivalent, or a specific procurement standard (Section 508 / EN 301 549)? This sets the bar the §9 Phase 1 audit measures against, and custom UI means it is earned widget by widget.
 2. **Team size and funding** — the §9 durations (now 52 months, with Phase 0 and the extended Phases 1 and 3) presuppose a staffed team. What is it? Custom UI adds specialist needs: text input, IME, and accessibility are their own discipline, and FR-027 requires a dedicated design owner.
 2b. **Who owns visual design?** FR-027 raises "beautiful and elegant" to a Must, but a token system and a contrast check only prevent ugliness — they do not produce beauty. This needs a named designer with final say on the design language, settled in Phase 0. Without one, FR-027 will not be met regardless of the infrastructure.
-3. **Business model** — perpetual, subscription, or open source? This determines whether cloud services (FR-022) and the marketplace (FR-019) are viable at all.
+3. **Revenue model** — the licence is settled (MIT, §14), but funding is not. MIT means the application itself cannot be sold under exclusive terms, so anything paying for 52 months of development must come from elsewhere: hosted services, support contracts, sponsorship, or a marketplace cut. This determines whether cloud services (FR-022) and the marketplace (FR-019) are viable, and it is the same question as Q2 (staffing) viewed from the income side.
 4. **Tile size and scratch-disk budget** — follows from the resolved precision and ceiling decisions. At 8 bytes/px the tile dimension trades GPU upload efficiency against paging granularity; settle it with the Phase 0 paging prototype.
 5. **Photoshop version target for PSD round-trip** — which Photoshop versions must reopen Aurora-written files? Determines the format features and the composition of the 1,000-file test corpus.
 6. **PSD features with no Aurora equivalent** — on import, are they dropped with a warning, or preserved opaquely and written back untouched on save? The latter is far friendlier to mixed Photoshop/Aurora teams and far harder to build.
@@ -1307,7 +1309,39 @@ With Steps 1–6 done, revisit §9. The durations are currently estimates made w
 
 ---
 
-# 14. Future Roadmap
+# 14. Licensing
+
+**Aurora is released under the MIT License** ([LICENSE](LICENSE)), © 2026 Cahya Wirawan.
+
+## Rationale
+
+MIT is the most permissive mainstream choice: it allows use, modification, and commercial redistribution with attribution as the only real condition. For Aurora specifically it maximizes plugin-ecosystem and contributor adoption (FR-019), imposes nothing on people embedding parts of the engine, and matches the prevailing licence of the Rust crates Aurora depends on — minimizing friction in both directions.
+
+## Consequences
+
+- **The application cannot be sold under exclusive terms.** Anyone may fork Aurora and ship it commercially. Funding must therefore come from services, support, sponsorship, or the marketplace, not from selling the binary (§12 Q3).
+- **Contributions are inbound under MIT.** Contributors should sign off via DCO (`git commit -s`) rather than a CLA — lighter weight, and adequate given there is no relicensing plan.
+- **Themes, plugins, and scripts are independent works.** Third-party themes (FR-027) and WASM plugins (FR-019) may carry any licence their authors choose; Aurora's licence does not reach them.
+- **`.aur` is an open format.** Specified and freely implementable, consistent with the local-first goal (§2).
+
+## Dependency licence obligations
+
+MIT applies to Aurora's own code; shipped binaries also carry their dependencies' terms. This needs active management, not a one-time check:
+
+- Most Rust crates in §8 are MIT/Apache-2.0 — no friction.
+- **Copyleft C dependencies need care.** LibRaw is LGPL-2.1/CDDL dual-licensed and `libheif` is LGPL — LGPL obligations are satisfiable but constrain linking, so these must be dynamically linked or otherwise relinkable, and the choice affects packaging on all three platforms.
+- Where an LGPL dependency proves too constraining, prefer the pure-Rust alternative (§8.2) even at some capability cost, and record the decision.
+- `cargo deny` enforces an allowed-licence list in CI (§8.5), and a generated third-party notices file ships with every build.
+
+## Not settled by the licence
+
+- **Trademark.** "Aurora" as a project name is not protected by MIT and is a widely used word. If the name matters, it needs a separate trademark decision — and a check that it does not collide with an existing product in this space.
+- **Revenue model** (§12 Q3) — open source is not a business model.
+- **Governance.** Who merges, who decides, and what happens to the project if the original author steps away. Worth writing down before the first outside contributor arrives, not after.
+
+---
+
+# 15. Future Roadmap
 
 - Node-based compositing
 - 3D editing
