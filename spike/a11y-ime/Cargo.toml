@@ -1,0 +1,23 @@
+# THROWAWAY. Outside the workspace, like the vertical slice.
+#
+# PRD §13 Step 4 / ADR 0001 escape-hatch triggers. Aurora renders its own UI, so
+# accessibility and IME are not inherited from a toolkit — they are ours to build.
+# This exists to find out whether that is viable BEFORE the widget toolkit does.
+[package]
+name = "a11y-ime"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wgpu = "30"
+winit = "0.30"
+pollster = "1"
+glyphon = "0.12"
+accesskit = "0.24"
+accesskit_winit = "0.33"
+
+[profile.dev]
+opt-level = 2
+[profile.dev.package."*"]
+opt-level = 3

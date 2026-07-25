@@ -13,9 +13,11 @@ Window → `wgpu` → 100,000 × 100,000 px half-float tiled document (80 GB at
 panel drawn in the same frame as the canvas. Memory budget deliberately set to
 64 MB (128 resident tiles of 512 KB) so paging is exercised rather than avoided.
 
-**Not covered:** screen reader and CJK IME (ADR 0001's escape-hatch triggers).
-Those need real text input and `accesskit` and remain the highest-value
-outstanding Phase 0 spike. Also absent: tile compression, SIMD, threading — all
+**Not covered here:** screen reader and CJK IME (ADR 0001's escape-hatch
+triggers). Those are now a separate spike — see
+[`a11y-ime/FINDINGS.md`](a11y-ime/FINDINGS.md) — which is **partially** done: the
+tree builds and the adapter initializes, but the decisive human tests (does a
+screen reader speak it, does CJK compose) have not been run. Also absent: tile compression, SIMD, threading — all
 of which the real implementation has and this does not, so several numbers below
 are pessimistic by design.
 

@@ -8,7 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The vertical slice (PRD §13 Step 4) is built and measured: `spike/vertical-slice/`, results in [spike/FINDINGS.md](spike/FINDINGS.md). Read that before writing tile, render, or brush code — it corrected several assumptions, and its numbers are the only real performance data the project has.
 
-Remaining Phase 0 work: the accessibility and CJK IME spikes (unbuilt, and the largest unmeasured risk — they could still overturn ADR 0001), the design language and token system, `wgpu` validation on Windows and Linux, and the RAW/ICC and PSD-write feasibility spikes.
+A second spike covers accessibility and IME (`spike/a11y-ime/`, [FINDINGS](spike/a11y-ime/FINDINGS.md)). It is **partial**: the tree builds and the platform adapter initializes, but nobody has yet confirmed a screen reader speaks the field or that CJK composition works — those need a human, and until they are done ADR 0001 is not de-risked.
+
+Two constraints it already surfaced: **windows must be created hidden, adapted, then shown** (`accesskit_winit` panics otherwise — this shapes `aurora-app`'s window management), and the text stack sets the toolchain floor (`cosmic-text` needs ≥1.89, which is why the pin moved to 1.97).
+
+Remaining Phase 0 work: finishing the human half of the a11y/IME verification, the design language and token system, running both spikes on Windows and Linux, and the RAW/ICC and PSD-write feasibility spikes.
 
 ## Commands
 
@@ -46,7 +50,7 @@ cargo fmt --all --check && python3 scripts/check_layering.py \
   && cargo nextest run --workspace
 ```
 
-Toolchain is pinned in `rust-toolchain.toml` (1.88, edition 2024). CI runs on Linux, macOS, and Windows from the first commit — cross-platform breakage is cheap to fix now and catastrophic in month 30.
+Toolchain is pinned in `rust-toolchain.toml` (1.97, edition 2024 — `cosmic-text` requires ≥1.89, so the text stack sets the floor). CI runs on Linux, macOS, and Windows from the first commit — cross-platform breakage is cheap to fix now and catastrophic in month 30.
 
 ## Lints worth knowing
 

@@ -1318,7 +1318,9 @@ Include the two escape-hatch triggers here, not later: a screen reader reading t
 2. The **10 ms brush budget passes at p99 9.1 ms — under 1 ms of margin**, on a naive implementation but also with a small brush. It needs a CI regression test from the first Phase 1 commit, not a one-time check.
 3. **Upload bandwidth caps pan speed** (~18 MB per screenful). Progressive/mip rendering while panning is what §6's progressive-rendering requirement is for.
 
-The accessibility and IME spikes remain **unbuilt** and are now the largest unmeasured risk in the project.
+The accessibility and IME spike is **built but only partially verified** — `spike/a11y-ime/`. The accessibility tree constructs correctly and the platform adapter initializes, but whether a screen reader speaks the field and whether CJK composition works have not been tested: both need a human, on each platform. **Until that is done, ADR 0001 is not de-risked.**
+
+It has already surfaced one constraint on `aurora-app`: windows must be created hidden, given an accessibility adapter, then made visible — `accesskit_winit` panics otherwise. Worth encoding in window creation before FR-002's multi-window support exists.
 
 ## Step 4b — Settle the design language
 

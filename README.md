@@ -66,6 +66,8 @@ A throwaway [vertical slice](spike/) exercises the whole stack — window → `w
 
 An 80 GB document edits comfortably in a 64 MB memory budget, and half-float save/reload is bit-exact. It also corrected the main assumption: the bottleneck is CPU compositing, **not** disk I/O. Full results and limitations — one GPU, one OS, single-threaded — are in [spike/FINDINGS.md](spike/FINDINGS.md).
 
+A second spike covers [accessibility and IME](spike/a11y-ime/FINDINGS.md), the two risks that could still overturn the custom-UI decision. It is **partially** complete: the accessibility tree builds and the platform adapter initializes, but confirming that a screen reader speaks the field and that CJK composition works needs a human on each platform. **Help wanted** — the checklist is in that document.
+
 ## Building
 
 ```sh
@@ -73,7 +75,7 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Requires Rust 1.88+ (pinned in `rust-toolchain.toml`, edition 2024). The full CI gate:
+Requires Rust 1.97+ (pinned in `rust-toolchain.toml`, edition 2024). The full CI gate:
 
 ```sh
 cargo fmt --all --check && python3 scripts/check_layering.py \
@@ -87,6 +89,10 @@ To run the prototype (a separate crate, outside the workspace):
 cd spike/vertical-slice
 cargo run --release -- --headless   # benchmark, no display needed
 cargo run --release                 # windowed — drag to paint
+
+cd ../a11y-ime
+cargo run -- --dump-tree            # accessibility tree
+cargo run                           # windowed — needs a screen reader to judge
 ```
 
 ## Documentation
@@ -94,6 +100,7 @@ cargo run --release                 # windowed — drag to paint
 - **[PRD.md](PRD.md)** — the full product requirements document: functional requirements, architecture, technology decisions, risks, open questions, and the pre-implementation plan.
 - **[docs/adr/](docs/adr/)** — architecture decision records. Each states what was decided, what was rejected, and what would justify reopening it.
 - **[spike/FINDINGS.md](spike/FINDINGS.md)** — measured results from the vertical slice, including what they invalidated.
+- **[spike/a11y-ime/FINDINGS.md](spike/a11y-ime/FINDINGS.md)** — accessibility and IME spike, with the human verification checklist still outstanding.
 - **[CLAUDE.md](CLAUDE.md)** — orientation for [Claude Code](https://claude.com/claude-code) sessions working in this repository.
 
 ## Contributing
@@ -104,6 +111,7 @@ Aurora is MIT licensed and open to contribution, but there are no features to bu
 - **Tell us about your workflow.** [PRD §13 Step 2](PRD.md) calls for a ranked list of the Photoshop workflows that actually matter to professionals. First-hand accounts are more valuable than speculation.
 - **Flag a technology choice you think is wrong.** Cheaper to fix now than in Phase 3.
 - **Run the [vertical slice](spike/) on your hardware.** It has only been measured on one GPU under macOS; Windows and Linux numbers, and anything from a different GPU vendor, would be genuinely useful.
+- **Test the [accessibility and IME spike](spike/a11y-ime/FINDINGS.md) with a screen reader or a CJK input method.** This is the most valuable thing anyone can contribute right now — it is the last open question that could change a foundational architecture decision, and it cannot be automated.
 
 ## License
 

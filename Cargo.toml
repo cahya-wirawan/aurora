@@ -13,7 +13,7 @@ version = "0.0.0"
 # internal path dependencies, which it declines to do for publishable crates.
 publish = false
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/cahya-wirawan/aurora"
 authors = ["Cahya Wirawan"]
