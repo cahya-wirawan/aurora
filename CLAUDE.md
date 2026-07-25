@@ -22,7 +22,8 @@ A single Cargo workspace with crates layered so dependencies point **downward on
 
 These are load-bearing — each one backs a headline requirement, so treat them as rules:
 
-1. Nothing assumes a document fits in memory; all pixel access goes through the tile store (500,000² px ≈ 1 PB).
+1. Nothing assumes a document fits in memory; all pixel access goes through the tile store. Ceiling is 300,000 × 300,000 px (matching Adobe PSB) — one layer at half-float RGBA is ~720 GB.
+1b. No 8-bit intermediates. The pipeline is ≥16-bit float end to end: `f16` tile storage, `f32` compute. 8-bit appears only at import (promoted immediately) and export (quantized with dithering). An 8-bit buffer inside the graph is a bug — the banding is invisible in review and unrecoverable downstream.
 2. Edits are non-destructive: adjustments/filters/smart objects are render-graph nodes, never baked pixels.
 3. History stores reversible operations plus dirtied tiles, not snapshots.
 4. The UI thread never blocks on rendering — rendering is async and progressive.
@@ -55,10 +56,14 @@ From PRD §6 and §10 — these drive implementation choices rather than being m
 - Open a 2 GB PSD in under 5 s (implies lazy/streaming parsing, not a full load).
 - Unlimited layers and history — storage must be incremental and compressed.
 
+Note these budgets are set at 8 bytes/px (half-float RGBA), which is 2× an 8-bit pipeline. Tile compression is mandatory, not an optimization.
+
+**PSD/PSB is full layered read *and* write** (PRD FR-001) — Aurora round-trips, so a file edited here must reopen in Photoshop with layers intact. Two rules follow: never overwrite a user's file in place (write to temp, verify by reopening, then swap), and warn with an itemized list before any lossy save. Silently degrading a professional's file is the worst failure this project can have.
+
 ## Phasing (PRD §9)
 
 **Phase 0 (de-risking) comes first** and is not yet done: `wgpu` validation on all three platforms, tile-paging prototype, screen-reader and CJK-IME spikes (the §8.3 escape-hatch triggers), widget toolkit foundations, the design language and token system (which must exist *before* widgets — tokens can't be retrofitted cheaply), RAW/ICC library decisions, PSD feasibility, and the workspace + CI skeleton. PRD §13 lists the ordered pre-implementation steps; Phase 1 feature work should not start before steps 1, 3, and 4 there are complete.
 
-Phase 1 is 9 months, not 6 — the widget toolkit is roughly a third of it.
+Phase 1 is 9 months (not 6 — the widget toolkit is roughly a third of it) and Phase 3 is 10 months (not 8 — full PSD write). Total ~52 months.
 
 Each phase has a measurable exit criterion in §9 — prefer working toward the current gate over stubbing later-phase subsystems. Open questions that block design are tracked in PRD §12; risks in §11.

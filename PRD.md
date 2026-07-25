@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
 
 **Project:** Aurora  
-**Version:** 1.2  
+**Version:** 1.3  
 **Document Owner:** Product Team  
 **Status:** Draft — pre-implementation  
 **Target Release:** TBD  
@@ -56,7 +56,7 @@ Create the most modern image editing software by combining:
 - Fast startup
 - Responsive editing
 - Unlimited undo
-- PSD compatibility
+- PSD/PSB compatibility — full layered read *and* write
 - AI-assisted workflows
 - Modern, elegant UI that users can restyle through themes without code (FR-027)
 
@@ -214,6 +214,29 @@ Export
 - WebP
 - AVIF
 - PSD
+- PSB
+
+## PSD/PSB Compatibility
+
+**Scope: full read *and* write, layered.** Aurora is not merely a PSD importer — it round-trips. A file opened from Photoshop, edited in Aurora, and saved back must reopen in Photoshop with its layer structure intact. This is the single largest interoperability commitment in the PRD (see R3) and the practical precondition for professionals adopting Aurora inside an existing Photoshop team.
+
+**Preserved on round-trip:**
+
+- Layer tree, groups, nesting, names, colour labels
+- Opacity, fill opacity, blend modes, visibility, locking
+- Layer masks, vector masks, clipping masks
+- Text layers as editable text (not rasterized)
+- Shape and path data
+- Adjustment layers, mapped to Photoshop equivalents where one exists
+- Smart objects, embedded and linked
+- Layer styles (effects), ICC profile, document metadata
+- 8/16/32-bit and Lab/CMYK/Grayscale documents
+
+**Automatic PSB promotion:** documents above 30,000 px in either dimension are written as PSB, since PSD cannot represent them.
+
+**Lossy-conversion policy:** Aurora features with no Photoshop representation (e.g. Aurora-specific filters or node configurations) are preserved losslessly in `.aur` but cannot survive a PSD round-trip. On save, Aurora **warns explicitly and itemizes what will be lost or flattened** before writing — silent degradation of a professional's file is unacceptable. A compatibility report is available before committing the save.
+
+**Fidelity gate:** a corpus of 1,000 real-world PSDs must round-trip with no layer loss and composites matching within tolerance (Phase 3 exit criterion, §9).
 
 ---
 
@@ -737,6 +760,7 @@ Visual design and theming are specified separately in **FR-027**.
 
 ---
 
+# FR-025 History
 
 Features
 
@@ -835,14 +859,43 @@ Testable, so "beautiful" does not become unfalsifiable:
 
 ---
 
+## Precision
+
+**The internal pipeline is always ≥16-bit float. There is no 8-bit-per-channel internal path.**
+
+- **Storage:** tiles are stored as half-float (`f16`) RGBA — 8 bytes/px — compressed on disk and in cold cache
+- **Compute:** filters, blending, and compositing run at `f32` (or `f16` where a shader proves equivalent within tolerance); intermediate results are never quantized to 8-bit
+- **Import:** 8-bit sources are promoted to float on load, with their colour space recorded (invariant §7.3.6). Promotion is exact and happens once
+- **Export:** quantization to 8-bit happens only at export or explicit user rasterization, with dithering applied to avoid banding
+- **HDR and scene-referred values are representable.** Values above 1.0 are preserved through the graph rather than clipped — required for EXR/HDR (FR-001), Camera RAW (FR-015), and HDR output (FR-016)
+
+Rationale: a single 8-bit intermediate anywhere in a non-destructive graph destroys the precision every downstream node depends on, and the damage is invisible until it bands. Supporting both paths would double the shader surface and the test matrix for a memory saving that tiling already manages. One precision floor, enforced everywhere, is simpler and correct.
+
+Cost, accepted knowingly: **2× the memory and bandwidth of an 8-bit pipeline.** See *Memory implications* under Scalability below.
+
+---
+
 ## Scalability
 
 Support
 
-- 500,000 × 500,000 pixel documents
+- **300,000 × 300,000 pixel documents** — matches Adobe's PSB (Large Document Format) ceiling, so Aurora can open anything Photoshop can produce
 - Unlimited layers
 - Unlimited history
-- Large PSD files (>2 GB)
+- Large PSD/PSB files (>2 GB)
+
+Note: plain PSD is limited to 30,000 × 30,000 px; documents above that must be written as PSB (FR-001). Aurora's native `.aur` format uses the same 300,000 px ceiling.
+
+### Memory implications
+
+At the ≥16-bit float precision floor (§6, *Precision*), a full-resolution RGBA tile costs 8 bytes/px. A 300,000 × 300,000 px layer is therefore ~720 GB — three orders of magnitude beyond any machine's RAM, and roughly double what an 8-bit pipeline would cost.
+
+This is the intended consequence of the precision decision, not an oversight. It means:
+
+- Tiling and disk paging are load-bearing from day one, not an optimization (invariant §7.3.1)
+- Tile compression is mandatory, not optional — half-float compresses well, but the budget assumes it
+- The scratch disk is a first-class resource: SSD strongly recommended, its location and size are user preferences (FR-026)
+- Working-set management, not total document size, is the metric that matters for performance
 
 ---
 
@@ -933,12 +986,13 @@ Aurora is a single Cargo workspace. Dependencies point **downward only**; a lowe
 
 These are load-bearing. Violating any one of them invalidates a headline requirement, so they are stated as rules rather than preferences:
 
-1. **Nothing assumes a document fits in memory.** All pixel access goes through `aurora-tile`. A 500,000 × 500,000 px document at 8-bit RGBA is ~1 PB; only the visible working set is resident. Tiles page to the scratch disk under memory pressure.
+1. **Nothing assumes a document fits in memory.** All pixel access goes through `aurora-tile`. A 300,000 × 300,000 px layer at half-float RGBA is ~720 GB; only the working set is resident. Tiles page to the scratch disk under memory pressure.
 2. **Edits are non-destructive by default.** Adjustments, filters, and smart objects are *nodes in the render graph*, never baked pixels. Baking happens only at export or on explicit user rasterization.
 3. **History stores operations, not snapshots.** "Unlimited history" is only affordable if undo records a reversible operation plus the tiles it dirtied. Full-document snapshots are reserved for explicit user Snapshots (FR-025).
 4. **The UI thread never blocks on rendering.** Rendering is asynchronous and progressive: the canvas always presents the best currently-available result and refines it. This is what makes 60 FPS achievable independently of scene complexity.
 5. **Brush input bypasses the general graph.** The 10 ms latency budget cannot survive a full graph re-evaluation. The active stroke renders into a dedicated scratch layer composited on top, and merges into the graph on stroke end.
 6. **Color is explicit.** Every buffer carries its color space. There is no "default RGB" — untagged data is an error, not a fallback.
+6b. **No 8-bit intermediates, ever.** The pipeline is ≥16-bit float end to end (§6 *Precision*). 8-bit appears only at import (promoted immediately) and export (quantized with dithering). A buffer typed as 8-bit anywhere inside the graph is a bug — the resulting banding is invisible in review and unrecoverable downstream.
 7. **Plugins are untrusted.** They run sandboxed with explicitly granted capabilities and cannot hold raw pointers into document memory.
 8. **UI and canvas share one GPU device and one frame.** The UI is not a separate surface composited over the canvas; both are drawn by `aurora-gpu` into the same swapchain image (§8.3). No interop layer, no readback, no compositing seam.
 9. **Every widget carries an accessibility node.** Accessibility is part of a widget's definition, not a later pass. Since Aurora renders its own UI, nothing is accessible for free — a widget without an `accesskit` node is incomplete (§8.3).
@@ -976,7 +1030,7 @@ These are load-bearing. Violating any one of them invalidates a headline require
 | OpenEXR / HDR | `exr` crate | Pure Rust, actively maintained |
 | RAW decoding | `rawler`, or LibRaw via FFI | **Risk:** pure-Rust RAW coverage is thinner than LibRaw; decide in Phase 0 spike |
 | Color management | `lcms2` bindings (ICC), `ocio` optional | **Risk:** no mature pure-Rust ICC engine; FFI wrapper required |
-| PSD/PSB | Custom crate (`aurora-io`) | Existing crates are read-only and incomplete; write support must be built |
+| PSD/PSB | Custom crate (`aurora-io`) | Existing crates are read-only and incomplete. Full layered **write** is committed scope (FR-001) and must be built from scratch — the largest single item in `aurora-io` |
 | PDF | `pdf-writer` (export), `pdfium`/`pdf` (import) | Import fidelity is the hard part |
 | SVG | `usvg` / `resvg` | |
 | Vector rasterization | `lyon` (tessellation) + custom GPU path renderer | |
@@ -1065,10 +1119,10 @@ Each phase has an **exit criterion** — a measurable gate, not a feature checkl
 - Widget toolkit foundations: layout engine, damage tracking, input routing, text field
 - **Design language and token system** (FR-027) — the token vocabulary and one built-in theme must exist before widgets are written, since tokens cannot be retrofitted cheaply (invariant §7.3.10)
 - RAW and ICC library decision (pure Rust vs. FFI)
-- PSD format study and read/write feasibility
+- PSD/PSB format study and **write** feasibility — write is now committed scope (FR-001), so the spike must produce a file Photoshop reopens, not merely parse one
 - Skeleton workspace, CI, and golden-image test harness
 
-**Exit criterion:** a throwaway prototype paints a stroke onto a 100,000 × 100,000 px tiled document at 60 FPS with sub-10 ms input latency on Windows, macOS, and Linux, with custom-rendered docked panels in the same frame; a screen reader reads a panel's controls on each platform; CJK text is composed into a custom text field. Every §8 entry marked "risk" is resolved in a written decision record.
+**Exit criterion:** a throwaway prototype paints a stroke onto a 100,000 × 100,000 px **half-float** tiled document at 60 FPS with sub-10 ms input latency on Windows, macOS, and Linux, with custom-rendered docked panels in the same frame; a screen reader reads a panel's controls on each platform; CJK text is composed into a custom text field. Every §8 entry marked "risk" is resolved in a written decision record.
 
 Duration: 3 months
 
@@ -1111,9 +1165,9 @@ Duration: 8 months
 - Color Management
 - PSD Compatibility
 
-**Exit criterion:** round-trip a corpus of 1,000 real-world PSDs with no layer loss and pixel-accurate composites within tolerance.
+**Exit criterion:** round-trip a corpus of 1,000 real-world PSDs — open in Aurora, edit, save, **reopen in Photoshop** — with no layer loss and composites matching within tolerance. Verification is automated and runs in CI, not sampled by hand.
 
-Duration: 8 months
+**Duration: 10 months** (raised from 8). Full PSD *write* (FR-001) is a substantially larger commitment than read, and this phase now owns both directions plus the round-trip harness.
 
 ---
 
@@ -1144,6 +1198,7 @@ Duration: 12 months
 # 10. Success Metrics
 
 - Open a 2 GB PSD in under 5 seconds
+- Round-trip a PSD through Aurora and reopen it in Photoshop with no layer loss
 - Maintain 60 FPS during editing
 - Support 95% of common Photoshop workflows
 - Crash rate below 0.1%
@@ -1165,10 +1220,11 @@ Duration: 12 months
 | R2d | Visual design quality is subjective and can stall decisions or drift late in the project | Medium | FR-027 makes it testable (contrast, gallery, token lint); a single design owner decides; design language settled in Phase 0 before widgets exist |
 | R2e | Theming flexibility becomes a compatibility burden — user themes break on upgrade as tokens change | Medium | Versioned theme schema, semantic tokens, inherit-and-override, documented migration; malformed themes degrade rather than fail |
 | R2f | No design resource — the plan assumes engineers alone can deliver "beautiful" | High | FR-027 requires a design owner; it is a staffing dependency, not something the token system solves |
-| R3 | PSD compatibility is a large reverse-engineering effort with no complete spec | High | Start the format study in Phase 0; build the test corpus before the parser |
+| R3 | PSD compatibility is a large reverse-engineering effort with no complete spec — and **full write** (FR-001) is substantially harder than read | High | Start the format study in Phase 0; build the 1,000-file corpus before the parser; automated round-trip diffing in CI from the first layer type |
+| R3b | Writing PSD risks *corrupting a professional's file* — a reputational failure far worse than a missing feature | High | Never overwrite in place: write to a temp file, verify by reopening and diffing, then swap. Warn and itemize before any lossy save (FR-001) |
 | R4 | Pure-Rust RAW/ICC coverage is thinner than LibRaw/LCMS | Medium | FFI wrappers are acceptable; decide in Phase 0 |
 | R5 | Scope: 26 FRs is multiple products' worth of work | High | §3 non-goals + MoSCoW priorities; enforce at phase gates |
-| R6 | 500,000 × 500,000 px target may be over-specified vs. real demand | Medium | Validate with target users; a lower ceiling materially simplifies the tile store |
+| R6 | Float precision doubles memory and bandwidth versus 8-bit, tightening every performance budget in §6 | Medium | Accepted deliberately (§6 *Precision*); mandatory tile compression, and the Phase 0 prototype validates the budgets at 8 bytes/px rather than assuming them |
 | R7 | AI features imply model hosting, licensing, and per-user inference cost | Medium | Local-first; treat cloud AI as a separate business decision |
 | R8 | `wgpu` abstraction may block platform-specific optimizations | Medium | Phase 0 benchmarks; escape hatch to native backends per-platform |
 | R9 | Team hiring — senior Rust + GPU + imaging is a narrow talent pool | High | Factor into the schedule; the durations in §9 assume a staffed team |
@@ -1179,15 +1235,20 @@ Duration: 12 months
 
 These block or reshape implementation and need owners and answers, most before Phase 1.
 
-*Resolved in v1.2: the UI toolkit question — Aurora builds a custom `wgpu` UI (§8.3).*
+*Resolved in v1.2:* UI toolkit — Aurora builds a custom `wgpu` UI (§8.3).
+
+*Resolved in v1.3:*
+- **Document ceiling → 300,000 × 300,000 px** (§6 *Scalability*). Set to match Adobe's PSB maximum rather than the original 500,000, which corresponded to nothing. Photoshop's own limits are 30,000 px for PSD and 300,000 px for PSB; matching PSB means Aurora can open anything Photoshop can produce, without over-building.
+- **Precision floor → always ≥16-bit float** (§6 *Precision*). No 8-bit internal path; costs 2× memory versus 8-bit, accepted.
+- **PSD scope → full layered read *and* write**, with explicit lossy-conversion warnings (FR-001).
 
 1. **Accessibility conformance target** — WCAG 2.1 AA equivalent, or a specific procurement standard (Section 508 / EN 301 549)? This sets the bar the §9 Phase 1 audit measures against, and custom UI means it is earned widget by widget.
-2. **Team size and funding** — the §9 durations (now 50 months with Phase 0 and the extended Phase 1) presuppose a staffed team. What is it? Custom UI adds specialist needs: text input, IME, and accessibility are their own discipline, and FR-027 requires a dedicated design owner.
+2. **Team size and funding** — the §9 durations (now 52 months, with Phase 0 and the extended Phases 1 and 3) presuppose a staffed team. What is it? Custom UI adds specialist needs: text input, IME, and accessibility are their own discipline, and FR-027 requires a dedicated design owner.
 2b. **Who owns visual design?** FR-027 raises "beautiful and elegant" to a Must, but a token system and a contrast check only prevent ugliness — they do not produce beauty. This needs a named designer with final say on the design language, settled in Phase 0. Without one, FR-027 will not be met regardless of the infrastructure.
 3. **Business model** — perpetual, subscription, or open source? This determines whether cloud services (FR-022) and the marketplace (FR-019) are viable at all.
-4. **Is the 500,000 px document target real?** It drives the entire tile architecture. What is the largest document actual target users open?
-5. **Colour precision floor** — is 8-bit-per-channel supported internally, or is the pipeline always ≥16-bit float? Affects every buffer in the system.
-6. **PSD scope** — read-only, or full write? Write fidelity is dramatically harder and may not be needed if users export flattened.
+4. **Tile size and scratch-disk budget** — follows from the resolved precision and ceiling decisions. At 8 bytes/px the tile dimension trades GPU upload efficiency against paging granularity; settle it with the Phase 0 paging prototype.
+5. **Photoshop version target for PSD round-trip** — which Photoshop versions must reopen Aurora-written files? Determines the format features and the composition of the 1,000-file test corpus.
+6. **PSD features with no Aurora equivalent** — on import, are they dropped with a warning, or preserved opaquely and written back untouched on save? The latter is far friendlier to mixed Photoshop/Aurora teams and far harder to build.
 7. **`.aur` format** — must it be forward-compatible across versions from v1.0? Decide before the first byte is written.
 8. **AI models** — first-party, bundled third-party, or bring-your-own? Licensing and download size follow from this.
 9. **Minimum GPU baseline** — what hardware must Aurora run on? Sets the `wgpu` feature floor.
@@ -1201,9 +1262,14 @@ In order. Nothing here is Phase 1 feature code — this is the work that makes P
 
 ## Step 1 — Resolve the blocking decisions
 
-The UI toolkit decision is made (§8.3) and should be written up as `docs/adr/0001-custom-wgpu-ui.md`, capturing the alternatives rejected and the escape-hatch trigger — the reasoning matters more than the verdict when someone revisits it in year two.
+The four decisions that shape the tile store and render graph are now made. Each needs an ADR capturing the alternatives rejected and the trigger that would reopen it — the reasoning matters more than the verdict when someone revisits it in year two:
 
-Still open and blocking: Open Questions 4, 5, and 6 (§12) — the document-size ceiling, the color precision floor, and PSD write scope. Each becomes its own ADR. They determine the shape of the tile store and the render graph, and all are expensive to reverse once Phase 1 code exists.
+- `docs/adr/0001-custom-wgpu-ui.md` — custom UI toolkit (§8.3), including the escape-hatch trigger
+- `docs/adr/0002-document-size-ceiling.md` — 300,000 px, matching PSB
+- `docs/adr/0003-float-precision-floor.md` — ≥16-bit float, and the 2× memory cost accepted
+- `docs/adr/0004-psd-full-write.md` — full layered round-trip, and the lossy-conversion policy
+
+Remaining open questions (§12) shape scope and staffing rather than core architecture, and no longer block starting.
 
 ## Step 2 — Define the 95%
 
