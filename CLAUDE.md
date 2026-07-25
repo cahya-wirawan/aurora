@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Skeleton only.** The Cargo workspace, all 19 crates, CI, and the ADRs exist; no functionality is implemented. Each library crate holds a placeholder `crate_name()` and one test, so CI has something real to check. Phase 0 work (PRD §9) is what comes next — see §13 Step 4, the vertical slice.
+**Skeleton plus one measured spike.** The Cargo workspace, all 19 crates, CI, and the ADRs exist; **no functionality is implemented** — each library crate holds a placeholder `crate_name()` and one test so CI has something real to check.
+
+The vertical slice (PRD §13 Step 4) is built and measured: `spike/vertical-slice/`, results in [spike/FINDINGS.md](spike/FINDINGS.md). Read that before writing tile, render, or brush code — it corrected several assumptions, and its numbers are the only real performance data the project has.
+
+Remaining Phase 0 work: the accessibility and CJK IME spikes (unbuilt, and the largest unmeasured risk — they could still overturn ADR 0001), the design language and token system, `wgpu` validation on Windows and Linux, and the RAW/ICC and PSD-write feasibility spikes.
 
 ## Commands
 
@@ -24,6 +28,14 @@ cargo doc --workspace --no-deps --open  # docs
 
 cargo run -p aurora-app                 # the application
 cargo run -p aurora-cli                 # headless binary
+```
+
+The spike is a separate crate, deliberately outside the workspace (root `Cargo.toml` `exclude`s it) so it can never become a dependency of real code:
+
+```sh
+cd spike/vertical-slice
+cargo run --release -- --headless       # the benchmark; no display needed
+cargo run --release                     # windowed, drag to paint, Esc for stats
 ```
 
 The full CI gate locally, in the order CI runs it:
@@ -100,12 +112,21 @@ From PRD §6 and §10 — these drive implementation choices rather than being m
 
 Note these budgets are set at 8 bytes/px (half-float RGBA), which is 2× an 8-bit pipeline. Tile compression is mandatory, not an optimization.
 
+### Measured, not assumed (spike/FINDINGS.md, 2026-07-26)
+
+One GPU (Radeon Pro 5300M, Metal), so treat as indicative rather than settled — but these are real numbers and they changed the design:
+
+- **Stroke latency p99 9.1 ms against a 10 ms budget.** Under 1 ms of margin. Add a latency regression test in CI with the first Phase 1 commit; do not assume this holds as the brush engine grows.
+- **CPU compositing is the bottleneck, not disk I/O** — the opposite of what was assumed. Page-in panning runs at 7 ms; merging whole tiles costs ~20 ms. So: `aurora-tile` needs **per-tile dirty rectangles**, and compositing belongs on the **GPU** with the CPU path as fallback.
+- **Upload bandwidth caps pan speed** (~18 MB per screenful). Render a lower mip while panning and refine when motion stops — this is what the progressive-rendering requirement is for.
+- Invariants §7.3.1 and §7.3.8 hold; half-float round-trips bit-exact.
+
 **PSD/PSB is full layered read *and* write** (PRD FR-001) — Aurora round-trips, so a file edited here must reopen in Photoshop with layers intact. Two rules follow: never overwrite a user's file in place (write to temp, verify by reopening, then swap), and warn with an itemized list before any lossy save. Silently degrading a professional's file is the worst failure this project can have.
 
 ## Phasing (PRD §9)
 
 **Phase 0 (de-risking) comes first** and is not yet done: `wgpu` validation on all three platforms, tile-paging prototype, screen-reader and CJK-IME spikes (the §8.3 escape-hatch triggers), widget toolkit foundations, the design language and token system (which must exist *before* widgets — tokens can't be retrofitted cheaply), RAW/ICC library decisions, PSD feasibility, and the workspace + CI skeleton. PRD §13 lists the ordered pre-implementation steps; Phase 1 feature work should not start before steps 1, 3, and 4 there are complete.
 
-Phase 1 is 9 months (not 6 — the widget toolkit is roughly a third of it) and Phase 3 is 10 months (not 8 — full PSD write). Total ~52 months.
+Phase 1 is 9 months (not 6 — the widget toolkit is roughly a third of it) and Phase 3 is 10 months (not 8 — full PSD write). Total ~52 months. These estimates predate the prototype; PRD §13 Step 7 calls for re-grounding them now that the slice exists.
 
 Each phase has a measurable exit criterion in §9 — prefer working toward the current gate over stubbing later-phase subsystems. Open questions that block design are tracked in PRD §12; risks in §11.

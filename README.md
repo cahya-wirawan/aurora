@@ -2,7 +2,7 @@
 
 A modern, GPU-accelerated, non-destructive professional image editor for Windows, macOS, and Linux — written in Rust.
 
-> **Status: pre-implementation.** The workspace skeleton, CI, and architecture decisions are in place; **no features are implemented yet**. The 19 crates compile and the CI gate is green, but nothing does anything. Phase 0 (technical de-risking) is the current work — see [Roadmap](#roadmap). Stars and discussion are welcome; working software is not yet available.
+> **Status: pre-implementation.** The workspace skeleton, CI, architecture decisions, and a measured prototype are in place; **no features are implemented yet**. The 19 crates compile and CI is green, but nothing does anything. Phase 0 (technical de-risking) is the current work — see [Roadmap](#roadmap). Stars and discussion are welcome; working software is not.
 
 ---
 
@@ -52,7 +52,19 @@ The design rests on a short list of invariants documented in [PRD §7.3](PRD.md)
 | **4** | AI features, plugin SDK, automation, cloud sync | 10 months |
 | **5** | Collaboration, animation, mobile, web | 12 months |
 
-Every phase has a measurable exit criterion rather than a feature checklist — see [PRD §9](PRD.md). The durations assume a staffed team and are estimates made without a prototype; they will be revised once the Phase 0 vertical slice produces real numbers.
+Every phase has a measurable exit criterion rather than a feature checklist — see [PRD §9](PRD.md). The durations assume a staffed team and were estimated before any code existed; now that the prototype has produced real numbers, they are due a revision (PRD §13 Step 7).
+
+## What has been measured
+
+A throwaway [vertical slice](spike/) exercises the whole stack — window → `wgpu` → a 100,000 × 100,000 px half-float tiled document (80 GB) → per-tile composite → brush stroke → save/reload, with UI drawn in the same frame as the canvas. It exists to turn the performance targets from assertions into numbers.
+
+| | Budget | p50 | p99 |
+|---|---|---|---|
+| Stroke latency (input → frame) | 10 ms | 4.1 ms | 9.1 ms |
+| Idle frame | 16.7 ms | 0.6 ms | 0.8 ms |
+| Pan with page-in from disk | 16.7 ms | 7.0 ms | 16.7 ms |
+
+An 80 GB document edits comfortably in a 64 MB memory budget, and half-float save/reload is bit-exact. It also corrected the main assumption: the bottleneck is CPU compositing, **not** disk I/O. Full results and limitations — one GPU, one OS, single-threaded — are in [spike/FINDINGS.md](spike/FINDINGS.md).
 
 ## Building
 
@@ -69,10 +81,19 @@ cargo fmt --all --check && python3 scripts/check_layering.py \
   && cargo nextest run --workspace
 ```
 
+To run the prototype (a separate crate, outside the workspace):
+
+```sh
+cd spike/vertical-slice
+cargo run --release -- --headless   # benchmark, no display needed
+cargo run --release                 # windowed — drag to paint
+```
+
 ## Documentation
 
 - **[PRD.md](PRD.md)** — the full product requirements document: functional requirements, architecture, technology decisions, risks, open questions, and the pre-implementation plan.
 - **[docs/adr/](docs/adr/)** — architecture decision records. Each states what was decided, what was rejected, and what would justify reopening it.
+- **[spike/FINDINGS.md](spike/FINDINGS.md)** — measured results from the vertical slice, including what they invalidated.
 - **[CLAUDE.md](CLAUDE.md)** — orientation for [Claude Code](https://claude.com/claude-code) sessions working in this repository.
 
 ## Contributing
@@ -82,6 +103,7 @@ Aurora is MIT licensed and open to contribution, but there are no features to bu
 - **Review the [PRD](PRD.md).** Particularly §11 (Risks) and §12 (Open Questions). Several open questions are unresolved and shape the architecture, notably the PSD round-trip target versions and the handling of Photoshop features with no Aurora equivalent.
 - **Tell us about your workflow.** [PRD §13 Step 2](PRD.md) calls for a ranked list of the Photoshop workflows that actually matter to professionals. First-hand accounts are more valuable than speculation.
 - **Flag a technology choice you think is wrong.** Cheaper to fix now than in Phase 3.
+- **Run the [vertical slice](spike/) on your hardware.** It has only been measured on one GPU under macOS; Windows and Linux numbers, and anything from a different GPU vendor, would be genuinely useful.
 
 ## License
 
