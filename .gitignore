@@ -1,0 +1,54 @@
+# Rust / Cargo
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is committed for binaries (Aurora ships applications),
+# so it is deliberately NOT ignored.
+
+# Build & profiling artifacts
+/dist/
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+criterion/
+
+# Test output
+# Golden-image baselines are committed; only failure diffs are ignored.
+**/tests/**/*.actual.png
+**/tests/**/*.diff.png
+/target/nextest/
+
+# Large binary corpora — fetched by script, never committed (PRD §13 Step 6)
+/corpora/
+/assets/samples/
+
+# Local development
+.env
+.env.local
+*.local.toml
+
+# Editors & IDEs
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini
+
+# Aurora runtime output
+*.aur.bak
+/scratch/
+aurora.log
+crash-reports/
