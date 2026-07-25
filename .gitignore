@@ -52,3 +52,6 @@ desktop.ini
 /scratch/
 aurora.log
 crash-reports/
+
+# Spike build output (the spike is outside the workspace, so /target misses it)
+/spike/*/target/

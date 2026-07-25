@@ -38,6 +38,19 @@ The trade was taken because the costs are asymmetric: memory pressure is measura
 
 **Follow-on work:** `f16` tile format and compression in `aurora-tile`; promote-on-import and dither-on-export in `aurora-io`; Phase 0 prototype validates the budgets at 8 bytes/px rather than assuming them; a CI check that no buffer inside the graph is typed 8-bit.
 
+## Measured (2026-07-26)
+
+The vertical slice (`spike/FINDINGS.md`) ran a 100,000 × 100,000 px half-float
+document in a 64 MB tile budget on a Radeon Pro 5300M. Nothing was bottlenecked
+on the 2× memory of `f16` versus 8-bit: stroke latency held at p99 9.1 ms against
+the 10 ms budget, and paged-in panning at 7 ms. Save/reload round-tripped
+bit-exact.
+
+The actual bottleneck was scalar `f16 → f32 → f16` conversion during CPU
+compositing — an implementation matter, not a precision one, and addressable with
+dirty rectangles, GPU compositing, and SIMD. **This decision is confirmed by
+measurement**, with the caveat that one GPU on one OS is not three.
+
 ## Reconsider if…
 
 - The Phase 0 prototype misses the §6 budgets at half-float and profiling attributes it to bandwidth rather than to the implementation

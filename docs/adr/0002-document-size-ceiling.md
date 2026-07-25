@@ -40,6 +40,14 @@ Documents exceeding 30,000 px in either dimension are written as PSB rather than
 
 **Follow-on work:** coordinate types sized for 300,000 px with defined overflow behaviour; tile dimension and scratch-disk budget settled by the Phase 0 paging prototype; PSB auto-promotion in `aurora-io`.
 
+## Measured (2026-07-26)
+
+The vertical slice exercised 100,000 × 100,000 px (80 GB) sparsely in a 64 MB
+budget: 930 evictions, 393 page faults, and panning that pages in from disk still
+within frame budget. The sparse tile store should be indifferent to the ceiling
+itself, but **300,000 px is untested** — only the tile-count scaling would differ,
+and that is worth confirming before Phase 1 closes.
+
 ## Reconsider if…
 
 - Target users turn out to work far below this, and a lower ceiling would materially simplify the tile store (PRD §13 Step 2 should surface this)

@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
 
 **Project:** Aurora  
-**Version:** 1.5  
+**Version:** 1.6  
 **Document Owner:** Product Team  
 **Status:** Draft — pre-implementation  
 **Target Release:** TBD  
@@ -1311,6 +1311,14 @@ Create the Cargo workspace with the crate skeleton from §7.2, and CI enforcing:
 The single most valuable pre-implementation artifact: one throwaway prototype that exercises the whole stack top to bottom — window → `wgpu` surface → tile store → render graph → single brush stroke → save/reload, with a custom-drawn docked panel and one text field **in the same frame as the canvas**. Narrow but complete. It validates the §7.3 invariants (including 8 and 9) against reality and produces the honest latency and throughput numbers that the §6 budgets are currently only asserting.
 
 Include the two escape-hatch triggers here, not later: a screen reader reading the panel, and CJK composition in the text field. They are the cheapest things to test now and the most expensive to discover in Phase 2.
+
+**Status: built and measured 2026-07-26** — `spike/` (throwaway, outside the workspace), results in `spike/FINDINGS.md`. Invariants §7.3.1 and §7.3.8 hold, and ADR 0003 is confirmed affordable. Three corrections came out of it:
+
+1. The bottleneck is **CPU compositing, not disk I/O** — the opposite of the assumed risk. Paged-in panning runs at 7 ms; whole-tile merging costs ~20 ms. `aurora-tile` needs per-tile dirty rectangles, and compositing belongs on the GPU.
+2. The **10 ms brush budget passes at p99 9.1 ms — under 1 ms of margin**, on a naive implementation but also with a small brush. It needs a CI regression test from the first Phase 1 commit, not a one-time check.
+3. **Upload bandwidth caps pan speed** (~18 MB per screenful). Progressive/mip rendering while panning is what §6's progressive-rendering requirement is for.
+
+The accessibility and IME spikes remain **unbuilt** and are now the largest unmeasured risk in the project.
 
 ## Step 4b — Settle the design language
 

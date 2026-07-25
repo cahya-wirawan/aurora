@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The vertical slice (PRD §13 Step 4) is throwaway and stays out of the
+# workspace, so it cannot accidentally become a dependency of real code.
+exclude = ["spike"]
 
 [workspace.package]
 version = "0.0.0"
