@@ -7,6 +7,11 @@ exclude = ["spike"]
 
 [workspace.package]
 version = "0.0.0"
+# Not published: `aurora-core` and `aurora` are taken on crates.io by unrelated
+# projects (PRD §12 Q2b), and nothing needs publishing to build or ship the
+# application. This also lets cargo-deny's allow-wildcard-paths exempt the
+# internal path dependencies, which it declines to do for publishable crates.
+publish = false
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"

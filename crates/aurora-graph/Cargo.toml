@@ -2,6 +2,7 @@
 name = "aurora-graph"
 description = "Render graph: node definitions, dirty tracking, and scheduling."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

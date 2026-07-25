@@ -26,6 +26,9 @@ allow = [
     "Unlicense",
 ]
 confidence-threshold = 0.9
+# The allow list is deliberately forward-looking: most entries are not hit yet
+# because the workspace is a skeleton. Unused allowances are not a problem.
+unused-allowed-license = "allow"
 
 # LGPL dependencies (LibRaw, libheif — PRD §8.2) are NOT on the allow list. They
 # are permissible only when dynamically linked, which cargo-deny cannot verify.
@@ -35,7 +38,12 @@ exceptions = []
 
 [bans]
 multiple-versions = "warn"
+# Wildcards are denied for published crates, but the internal aurora-* crates are
+# path dependencies with no version, which cargo-deny counts as wildcards. They
+# are never published, so exempting paths keeps the check meaningful for real
+# third-party dependencies rather than disabling it outright.
 wildcards = "deny"
+allow-wildcard-paths = true
 deny = []
 
 [sources]

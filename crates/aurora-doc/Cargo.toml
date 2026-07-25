@@ -2,6 +2,7 @@
 name = "aurora-doc"
 description = "Document model: layer tree, masks, selections, and history."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

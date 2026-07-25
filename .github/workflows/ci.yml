@@ -80,8 +80,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Run on the normal runner rather than cargo-deny-action's musl container,
+      # which has no toolchain matching rust-toolchain.toml and errors on it.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
       # PRD §14: Aurora is MIT, and shipped binaries carry their dependencies'
       # terms. Copyleft C libraries need a documented exception, not a silent add.
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check all
+      - run: cargo deny check all

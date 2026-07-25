@@ -2,6 +2,7 @@
 name = "aurora-text"
 description = "Shaping, layout, OpenType handling, and text on path."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

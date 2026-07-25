@@ -2,6 +2,7 @@
 name = "aurora-io"
 description = "Format import and export, including full layered PSD/PSB read and write."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

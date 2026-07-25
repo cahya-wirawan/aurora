@@ -2,6 +2,7 @@
 name = "aurora-brush"
 description = "Brush engine: stroke input, stabilization, and dab scheduling."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -2,6 +2,7 @@
 name = "aurora-ui"
 description = "Aurora-specific panels, docking, workspace, tools, and command palette."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
