@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
 
 **Project:** Aurora  
-**Version:** 1.4  
+**Version:** 1.5  
 **Document Owner:** Product Team  
 **Status:** Draft — pre-implementation  
 **Target Release:** TBD  
@@ -832,6 +832,24 @@ A single source of truth, consumed by every widget. No widget may hardcode a col
 - **Versioned schema** — theme files declare a schema version; Aurora migrates or warns rather than breaking on upgrade
 - **Fallback** — missing tokens inherit from the base theme; a malformed theme degrades to the default with a clear diagnostic, never a broken or unusable UI
 
+## Ownership
+
+**Design owner: Cahya Wirawan** — final say on the design language, resolved 2026-07-25.
+
+The role decides rather than advises: token vocabulary, scales, colour, iconography, and whether a widget looks right are settled by the owner, and disagreements resolve there rather than by committee or by whoever is implementing.
+
+**Phase 0 deliverables** (must precede any widget code — §13 Step 4b):
+
+1. Token vocabulary — the semantic names widgets will resolve against, which is the interface everything else is written to
+2. Type scale, spacing scale, radius, elevation, and motion values
+3. One complete built-in theme (Dark), with all token pairs passing the contrast gate
+4. Static mockups: main workspace plus two or three panels
+5. Component gallery skeleton — the review surface and golden-image target
+
+**Ongoing:** review of new widgets against the design language, and approval of the remaining built-in themes.
+
+**Risk of a solo owner** (see R2f): design review has no second opinion, and the owner is also making engineering decisions, so visual work can be deprioritized under schedule pressure — the failure mode being tokens that grow ad hoc rather than by design. Two cheap mitigations: fix the token vocabulary early and treat additions as deliberate changes, and get outside critique on the Phase 0 mockups before they harden into a system everything else depends on.
+
 ## Acceptance Criteria
 
 Testable, so "beautiful" does not become unfalsifiable:
@@ -1220,7 +1238,7 @@ Duration: 12 months
 | R2c | Custom UI feels foreign — wrong cursors, missing menu conventions, no OS setting respect | Medium | Platform-integration checklist is explicit FR-024 scope; per-platform UX review at the Phase 1 gate |
 | R2d | Visual design quality is subjective and can stall decisions or drift late in the project | Medium | FR-027 makes it testable (contrast, gallery, token lint); a single design owner decides; design language settled in Phase 0 before widgets exist |
 | R2e | Theming flexibility becomes a compatibility burden — user themes break on upgrade as tokens change | Medium | Versioned theme schema, semantic tokens, inherit-and-override, documented migration; malformed themes degrade rather than fail |
-| R2f | No design resource — the plan assumes engineers alone can deliver "beautiful" | High | FR-027 requires a design owner; it is a staffing dependency, not something the token system solves |
+| R2f | Solo design owner (FR-027 *Ownership*) — no second opinion in review, and the same person carries engineering decisions, so design work can be squeezed under schedule pressure | Medium | Fix the token vocabulary in Phase 0 and treat additions as deliberate changes; seek outside critique on the mockups before they harden |
 | R3 | PSD compatibility is a large reverse-engineering effort with no complete spec — and **full write** (FR-001) is substantially harder than read | High | Start the format study in Phase 0; build the 1,000-file corpus before the parser; automated round-trip diffing in CI from the first layer type |
 | R3b | Writing PSD risks *corrupting a professional's file* — a reputational failure far worse than a missing feature | High | Never overwrite in place: write to a temp file, verify by reopening and diffing, then swap. Warn and itemize before any lossy save (FR-001) |
 | R4 | Pure-Rust RAW/ICC coverage is thinner than LibRaw/LCMS | Medium | FFI wrappers are acceptable; decide in Phase 0 |
@@ -1243,10 +1261,11 @@ These block or reshape implementation and need owners and answers, most before P
 - **Precision floor → always ≥16-bit float** (§6 *Precision*). No 8-bit internal path; costs 2× memory versus 8-bit, accepted.
 - **PSD scope → full layered read *and* write**, with explicit lossy-conversion warnings (FR-001).
 - **Licence → MIT** ([LICENSE](LICENSE)). Aurora is open source and permissively licensed. See §14 for what this settles and what it does not.
+- **Design owner → Cahya Wirawan.** FR-027 now has a named owner with final say on the design language. See FR-027 *Ownership*.
 
 1. **Accessibility conformance target** — WCAG 2.1 AA equivalent, or a specific procurement standard (Section 508 / EN 301 549)? This sets the bar the §9 Phase 1 audit measures against, and custom UI means it is earned widget by widget.
-2. **Team size and funding** — the §9 durations (now 52 months, with Phase 0 and the extended Phases 1 and 3) presuppose a staffed team. What is it? Custom UI adds specialist needs: text input, IME, and accessibility are their own discipline, and FR-027 requires a dedicated design owner.
-2b. **Who owns visual design?** FR-027 raises "beautiful and elegant" to a Must, but a token system and a contrast check only prevent ugliness — they do not produce beauty. This needs a named designer with final say on the design language, settled in Phase 0. Without one, FR-027 will not be met regardless of the infrastructure.
+2. **Team size and funding** — the §9 durations (now 52 months, with Phase 0 and the extended Phases 1 and 3) presuppose a staffed team. What is it? Custom UI adds specialist needs: text input, IME, and accessibility are their own discipline.
+2b. **Trademark on the name "Aurora"** — MIT grants no trademark rights (§14), and "Aurora" is widely used, including *Aurora HDR* by Skylum in the image-editing category specifically. A same-category collision is the one that matters. Search USPTO and EUIPO in Nice class 9, and check domain, app-store, and crates.io availability. Resolve before the project gains public identity: renaming later touches 19 crate names, the repository, the domain, and every document.
 3. **Revenue model** — the licence is settled (MIT, §14), but funding is not. MIT means the application itself cannot be sold under exclusive terms, so anything paying for 52 months of development must come from elsewhere: hosted services, support contracts, sponsorship, or a marketplace cut. This determines whether cloud services (FR-022) and the marketplace (FR-019) are viable, and it is the same question as Q2 (staffing) viewed from the income side.
 4. **Tile size and scratch-disk budget** — follows from the resolved precision and ceiling decisions. At 8 bytes/px the tile dimension trades GPU upload efficiency against paging granularity; settle it with the Phase 0 paging prototype.
 5. **Photoshop version target for PSD round-trip** — which Photoshop versions must reopen Aurora-written files? Determines the format features and the composition of the 1,000-file test corpus.
@@ -1291,7 +1310,9 @@ Include the two escape-hatch triggers here, not later: a screen reader reading t
 
 Before widgets are written, not after. Produce the token vocabulary, type and spacing scales, and one complete built-in theme, together with static mockups of the main workspace and two or three panels. Stand up the component gallery as the first UI artifact — it is where the design is reviewed and where golden-image tests attach.
 
-This ordering is the whole point: tokens are cheap to adopt at widget #1 and a rewrite at widget #200 (invariant §7.3.10). It also needs the design owner from Open Question 2b to exist first.
+This ordering is the whole point: tokens are cheap to adopt at widget #1 and a rewrite at widget #200 (invariant §7.3.10).
+
+**Unblocked** — the design owner is named (FR-027 *Ownership*), and the deliverable list is there. This step can now run in parallel with Steps 3 and 4, since it produces design artifacts rather than engine code.
 
 ## Step 5 — Prove the risky dependencies
 
