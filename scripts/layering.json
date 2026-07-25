@@ -1,0 +1,125 @@
+{
+  "aurora-core": [],
+  "aurora-tile": [
+    "aurora-core"
+  ],
+  "aurora-graph": [
+    "aurora-core",
+    "aurora-tile"
+  ],
+  "aurora-gpu": [
+    "aurora-core",
+    "aurora-tile"
+  ],
+  "aurora-render": [
+    "aurora-core",
+    "aurora-tile",
+    "aurora-graph",
+    "aurora-gpu"
+  ],
+  "aurora-doc": [
+    "aurora-core",
+    "aurora-tile",
+    "aurora-graph"
+  ],
+  "aurora-color": [
+    "aurora-core"
+  ],
+  "aurora-filters": [
+    "aurora-core",
+    "aurora-gpu",
+    "aurora-graph",
+    "aurora-color"
+  ],
+  "aurora-brush": [
+    "aurora-core",
+    "aurora-tile",
+    "aurora-gpu"
+  ],
+  "aurora-vector": [
+    "aurora-core"
+  ],
+  "aurora-text": [
+    "aurora-core",
+    "aurora-vector"
+  ],
+  "aurora-io": [
+    "aurora-core",
+    "aurora-tile",
+    "aurora-doc",
+    "aurora-color"
+  ],
+  "aurora-ai": [
+    "aurora-core",
+    "aurora-tile"
+  ],
+  "aurora-plugin": [
+    "aurora-core",
+    "aurora-tile",
+    "aurora-graph"
+  ],
+  "aurora-theme": [
+    "aurora-core",
+    "aurora-color"
+  ],
+  "aurora-widgets": [
+    "aurora-core",
+    "aurora-gpu",
+    "aurora-vector",
+    "aurora-text",
+    "aurora-theme"
+  ],
+  "aurora-ui": [
+    "aurora-core",
+    "aurora-tile",
+    "aurora-graph",
+    "aurora-gpu",
+    "aurora-render",
+    "aurora-doc",
+    "aurora-color",
+    "aurora-filters",
+    "aurora-brush",
+    "aurora-vector",
+    "aurora-text",
+    "aurora-io",
+    "aurora-ai",
+    "aurora-plugin",
+    "aurora-theme",
+    "aurora-widgets"
+  ],
+  "aurora-app": [
+    "aurora-core",
+    "aurora-tile",
+    "aurora-graph",
+    "aurora-gpu",
+    "aurora-render",
+    "aurora-doc",
+    "aurora-color",
+    "aurora-filters",
+    "aurora-brush",
+    "aurora-vector",
+    "aurora-text",
+    "aurora-io",
+    "aurora-ai",
+    "aurora-plugin",
+    "aurora-theme",
+    "aurora-widgets",
+    "aurora-ui"
+  ],
+  "aurora-cli": [
+    "aurora-core",
+    "aurora-tile",
+    "aurora-graph",
+    "aurora-gpu",
+    "aurora-render",
+    "aurora-doc",
+    "aurora-color",
+    "aurora-filters",
+    "aurora-brush",
+    "aurora-vector",
+    "aurora-text",
+    "aurora-io",
+    "aurora-ai",
+    "aurora-plugin"
+  ]
+}

@@ -1,0 +1,71 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/cahya-wirawan/aurora"
+authors = ["Cahya Wirawan"]
+
+[workspace.dependencies]
+# Internal crates. Layering is enforced by scripts/check_layering.py — adding a
+# dependency here does not make it legal, see docs/adr and PRD §7.2.
+aurora-core = { path = "crates/aurora-core" }
+aurora-tile = { path = "crates/aurora-tile" }
+aurora-graph = { path = "crates/aurora-graph" }
+aurora-gpu = { path = "crates/aurora-gpu" }
+aurora-render = { path = "crates/aurora-render" }
+aurora-doc = { path = "crates/aurora-doc" }
+aurora-color = { path = "crates/aurora-color" }
+aurora-filters = { path = "crates/aurora-filters" }
+aurora-brush = { path = "crates/aurora-brush" }
+aurora-vector = { path = "crates/aurora-vector" }
+aurora-text = { path = "crates/aurora-text" }
+aurora-io = { path = "crates/aurora-io" }
+aurora-ai = { path = "crates/aurora-ai" }
+aurora-plugin = { path = "crates/aurora-plugin" }
+aurora-theme = { path = "crates/aurora-theme" }
+aurora-widgets = { path = "crates/aurora-widgets" }
+aurora-ui = { path = "crates/aurora-ui" }
+
+# External. Versions are declared centrally so crates cannot drift apart.
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+half = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Denied outright: these are the ones that cost a user their work.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+# Noise in a codebase that is mostly graphics math.
+module_name_repetitions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+similar_names = "allow"
+
+[profile.dev]
+opt-level = 1        # Debug builds must still paint at interactive rates.
+
+[profile.dev.package."*"]
+opt-level = 3        # Dependencies are not what we debug.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1            # Keep symbols: crash reports are a reliability requirement (PRD §6).

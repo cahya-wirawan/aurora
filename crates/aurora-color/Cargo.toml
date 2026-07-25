@@ -1,0 +1,17 @@
+[package]
+name = "aurora-color"
+description = "ICC profiles, working spaces, soft proof, and HDR transforms."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aurora-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

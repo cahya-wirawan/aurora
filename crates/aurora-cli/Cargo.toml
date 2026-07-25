@@ -1,0 +1,34 @@
+[package]
+name = "aurora-cli"
+description = "Headless binary for batch processing and automation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aurora-core = { workspace = true }
+aurora-tile = { workspace = true }
+aurora-graph = { workspace = true }
+aurora-gpu = { workspace = true }
+aurora-render = { workspace = true }
+aurora-doc = { workspace = true }
+aurora-color = { workspace = true }
+aurora-filters = { workspace = true }
+aurora-brush = { workspace = true }
+aurora-vector = { workspace = true }
+aurora-text = { workspace = true }
+aurora-io = { workspace = true }
+aurora-ai = { workspace = true }
+aurora-plugin = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "aurora-cli"
+path = "src/main.rs"

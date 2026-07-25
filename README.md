@@ -2,7 +2,7 @@
 
 A modern, GPU-accelerated, non-destructive professional image editor for Windows, macOS, and Linux — written in Rust.
 
-> **Status: pre-implementation.** This repository currently contains planning documents only — there is no source code yet. The architecture, technology stack, and roadmap are settled and written down; the first code lands with Phase 0 (see [Roadmap](#roadmap)). Stars and discussion are welcome; working software is not yet available.
+> **Status: pre-implementation.** The workspace skeleton, CI, and architecture decisions are in place; **no features are implemented yet**. The 19 crates compile and the CI gate is green, but nothing does anything. Phase 0 (technical de-risking) is the current work — see [Roadmap](#roadmap). Stars and discussion are welcome; working software is not yet available.
 
 ---
 
@@ -54,14 +54,30 @@ The design rests on a short list of invariants documented in [PRD §7.3](PRD.md)
 
 Every phase has a measurable exit criterion rather than a feature checklist — see [PRD §9](PRD.md). The durations assume a staffed team and are estimates made without a prototype; they will be revised once the Phase 0 vertical slice produces real numbers.
 
+## Building
+
+```sh
+cargo build --workspace
+cargo test --workspace
+```
+
+Requires Rust 1.88+ (pinned in `rust-toolchain.toml`, edition 2024). The full CI gate:
+
+```sh
+cargo fmt --all --check && python3 scripts/check_layering.py \
+  && cargo clippy --workspace --all-targets --all-features -- -D warnings \
+  && cargo nextest run --workspace
+```
+
 ## Documentation
 
 - **[PRD.md](PRD.md)** — the full product requirements document: functional requirements, architecture, technology decisions, risks, open questions, and the pre-implementation plan.
+- **[docs/adr/](docs/adr/)** — architecture decision records. Each states what was decided, what was rejected, and what would justify reopening it.
 - **[CLAUDE.md](CLAUDE.md)** — orientation for [Claude Code](https://claude.com/claude-code) sessions working in this repository.
 
 ## Contributing
 
-Aurora is MIT licensed and open to contribution, but there is no code to contribute to yet — the foundational decisions are still being written into ADRs. What is genuinely useful right now:
+Aurora is MIT licensed and open to contribution, but there are no features to build on yet — the workspace is a skeleton and Phase 0 is where the real work starts. Contributions are made under the MIT licence; sign off your commits with `git commit -s` (DCO). What is genuinely useful right now:
 
 - **Review the [PRD](PRD.md).** Particularly §11 (Risks) and §12 (Open Questions). Several open questions are unresolved and shape the architecture, notably the PSD round-trip target versions and the handling of Photoshop features with no Aurora equivalent.
 - **Tell us about your workflow.** [PRD §13 Step 2](PRD.md) calls for a ranked list of the Photoshop workflows that actually matter to professionals. First-hand accounts are more valuable than speculation.

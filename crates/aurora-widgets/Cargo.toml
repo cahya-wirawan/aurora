@@ -1,0 +1,21 @@
+[package]
+name = "aurora-widgets"
+description = "Document-agnostic widget toolkit: layout, input routing, damage tracking, accessibility."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aurora-core = { workspace = true }
+aurora-gpu = { workspace = true }
+aurora-vector = { workspace = true }
+aurora-text = { workspace = true }
+aurora-theme = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

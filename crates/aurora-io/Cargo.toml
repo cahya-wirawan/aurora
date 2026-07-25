@@ -1,0 +1,20 @@
+[package]
+name = "aurora-io"
+description = "Format import and export, including full layered PSD/PSB read and write."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aurora-core = { workspace = true }
+aurora-tile = { workspace = true }
+aurora-doc = { workspace = true }
+aurora-color = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

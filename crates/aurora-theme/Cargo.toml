@@ -1,0 +1,18 @@
+[package]
+name = "aurora-theme"
+description = "Design tokens, theme parsing and inheritance, hot reload, contrast validation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aurora-core = { workspace = true }
+aurora-color = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "aurora-ai"
+description = "Inference sessions, model registry, and local/cloud dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aurora-core = { workspace = true }
+aurora-tile = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

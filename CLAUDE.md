@@ -4,9 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-This repository contains **no source code yet** — only [PRD.md](PRD.md), a full product requirements document. There is no build system, no test suite, no git repository, and no dependency manifest. The first implementation work will need to establish all of these.
+**Skeleton only.** The Cargo workspace, all 19 crates, CI, and the ADRs exist; no functionality is implemented. Each library crate holds a placeholder `crate_name()` and one test, so CI has something real to check. Phase 0 work (PRD §9) is what comes next — see §13 Step 4, the vertical slice.
 
-When adding the first code, update this file with the actual build/test/run commands.
+## Commands
+
+```sh
+cargo build --workspace                 # build everything
+cargo test --workspace                  # all tests
+cargo test -p aurora-tile               # one crate
+cargo test -p aurora-tile -- name_of_test   # one test
+cargo nextest run --workspace           # what CI runs (faster, better output)
+
+cargo fmt --all                         # format
+cargo fmt --all --check                 # CI check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+python3 scripts/check_layering.py       # crate layering rule (PRD §7.2)
+cargo deny check all                    # licences + advisories
+cargo doc --workspace --no-deps --open  # docs
+
+cargo run -p aurora-app                 # the application
+cargo run -p aurora-cli                 # headless binary
+```
+
+The full CI gate locally, in the order CI runs it:
+
+```sh
+cargo fmt --all --check && python3 scripts/check_layering.py \
+  && cargo clippy --workspace --all-targets --all-features -- -D warnings \
+  && cargo nextest run --workspace
+```
+
+Toolchain is pinned in `rust-toolchain.toml` (1.88, edition 2024). CI runs on Linux, macOS, and Windows from the first commit — cross-platform breakage is cheap to fix now and catastrophic in month 30.
+
+## Lints worth knowing
+
+The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `Cargo.toml`). This is deliberate: Aurora holds a professional's unsaved work, and a panic loses it. Return errors instead. A crate needing `unsafe` (likely `aurora-gpu` for FFI) must override `unsafe_code` in its own `[lints]` table rather than the workspace's, so the exception is visible in review.
 
 ## What Aurora is
 
@@ -17,6 +49,10 @@ A cross-platform, GPU-accelerated, non-destructive professional image editor (a 
 A single Cargo workspace with crates layered so dependencies point **downward only** — `core` → `tile` → `graph`/`gpu` → `render`/`doc` → feature crates (`filters`, `brush`, `vector`, `text`, `io`, `ai`, `plugin`, `theme`) → `widgets` → `ui` → `app`/`cli`. PRD §7.2 has the full table. A lower crate must never depend on a higher one; CI enforces this.
 
 `aurora-widgets` (the general-purpose toolkit) knows nothing about documents or layers and must stay headlessly testable; Aurora-specific panels belong in `aurora-ui`. Keep that seam sharp.
+
+The allowed dependency map lives in `scripts/layering.json` and is checked by `scripts/check_layering.py`. If the checker rejects a dependency, the fix is almost always to move shared code *down* the stack — editing the JSON is an architecture decision, not a build fix.
+
+Decisions with lasting consequences are recorded in [docs/adr/](docs/adr/). Read those before revisiting the UI toolkit, document ceiling, precision floor, or PSD scope; each records what would justify reopening it.
 
 ### Invariants (PRD §7.3)
 
