@@ -1,0 +1,463 @@
+//! A reader/writer for `EngineData` — the plain-text-ish markup Photoshop's
+//! text engine (ATE) uses for paragraph/style/resource data, embedded as the
+//! raw payload of `TySh`'s `EngineData` field (see `descriptor.rs`, `Value::Raw`).
+//!
+//! Unlike the Descriptor binary format, this one is a human-legible nested
+//! structure — `<<...>>` dicts, `/Key` properties, `[...]` lists, numbers,
+//! `true`/`false`, and parenthesized strings — but the string encoding is not
+//! plain text: each string is a UTF-16BE byte-order mark followed by
+//! UTF-16BE-encoded text, with `\`, `(`, `)` backslash-escaped.
+//!
+//! Every construct here was confirmed by reading `psd-tools`' own tokenizer
+//! and writer (`psd/engine_data.py`) before writing this file, then tested
+//! against the `EngineData` payload actually embedded in `reference/tysh.bin`
+//! (extracted from a genuine Photoshop-authored file). `reference/engineData.txt`
+//! (from `ag-psd`'s test suite) was useful for confirming the *structure* —
+//! keys, nesting shape — while designing this, but turned out to be a
+//! human-readable pretty-print with no embedded UTF-16BE/BOM bytes at all,
+//! not the real wire format; see `reference/README.md`. Caught by checking
+//! its raw bytes directly rather than assuming a plausible-looking reference
+//! file was usable as real test input.
+//!
+//! See FINDINGS.md findings 6 and 9 for why reading a working implementation
+//! mattered here specifically, rather than working from spec text alone.
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Dict(Vec<(String, Value)>),
+    List(Vec<Value>),
+    Str(String),
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+}
+
+impl Value {
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match self {
+            Value::Dict(items) => items.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        match self {
+            Value::Dict(items) => items.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// Walks a dotted path, e.g. `get_path("EngineDict.Editor.Text")`.
+    pub fn get_path(&self, path: &str) -> Option<&Value> {
+        let mut cur = self;
+        for seg in path.split('.') {
+            cur = cur.get(seg)?;
+        }
+        Some(cur)
+    }
+
+    pub fn get_path_mut(&mut self, path: &str) -> Option<&mut Value> {
+        let mut cur = self;
+        for seg in path.split('.') {
+            cur = cur.get_mut(seg)?;
+        }
+        Some(cur)
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Token {
+    DictStart,
+    DictEnd,
+    ArrayStart,
+    ArrayEnd,
+    Property(String),
+    Str(String),
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+}
+
+struct Tokenizer<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+#[derive(Debug)]
+pub struct ParseError(String);
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EngineData parse error: {}", self.0)
+    }
+}
+impl std::error::Error for ParseError {}
+
+type Result<T> = std::result::Result<T, ParseError>;
+
+fn err(msg: impl Into<String>) -> ParseError {
+    ParseError(msg.into())
+}
+
+impl<'a> Tokenizer<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.data.len() && self.data[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.data.get(self.pos).copied()
+    }
+
+    /// A parenthesized string: `(` + UTF-16BE BOM (FE FF) + UTF-16BE text,
+    /// with `\`, `(`, `)` backslash-escaped + `)`. Confirmed against
+    /// `psd-tools`' `engine_data.String.frombytes`/`write`.
+    fn read_string(&mut self) -> Result<String> {
+        debug_assert_eq!(self.peek(), Some(b'('));
+        self.pos += 1;
+        let mut raw = Vec::new();
+        loop {
+            match self.data.get(self.pos) {
+                None => return Err(err("unterminated string")),
+                Some(b'\\') => {
+                    let next = *self
+                        .data
+                        .get(self.pos + 1)
+                        .ok_or_else(|| err("dangling escape at end of input"))?;
+                    raw.push(next);
+                    self.pos += 2;
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(&b) => {
+                    raw.push(b);
+                    self.pos += 1;
+                }
+            }
+        }
+        if raw.len() < 2 || raw[0] != 0xFE || raw[1] != 0xFF {
+            return Err(err("string missing UTF-16BE byte-order mark"));
+        }
+        let units: Vec<u16> = raw[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16(&units).map_err(|e| err(format!("invalid UTF-16: {e}")))
+    }
+
+    fn read_bareword(&mut self) -> Result<Token> {
+        let start = self.pos;
+        while let Some(b) = self.peek() {
+            if b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'[' | b']' | b'/' | b'(') {
+                break;
+            }
+            self.pos += 1;
+        }
+        let word = std::str::from_utf8(&self.data[start..self.pos])
+            .map_err(|_| err("non-UTF8 bareword"))?;
+        match word {
+            "true" => Ok(Token::Bool(true)),
+            "false" => Ok(Token::Bool(false)),
+            _ => {
+                if let Ok(i) = word.parse::<i64>() {
+                    Ok(Token::Int(i))
+                } else if let Ok(f) = word.parse::<f64>() {
+                    Ok(Token::Float(f))
+                } else {
+                    Err(err(format!("unrecognized token {word:?}")))
+                }
+            }
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<Token>> {
+        self.skip_ws();
+        let Some(b) = self.peek() else {
+            return Ok(None);
+        };
+        match b {
+            b'<' => {
+                self.expect_seq(b"<<")?;
+                Ok(Some(Token::DictStart))
+            }
+            b'>' => {
+                self.expect_seq(b">>")?;
+                Ok(Some(Token::DictEnd))
+            }
+            b'[' => {
+                self.pos += 1;
+                Ok(Some(Token::ArrayStart))
+            }
+            b']' => {
+                self.pos += 1;
+                Ok(Some(Token::ArrayEnd))
+            }
+            b'/' => {
+                self.pos += 1;
+                let start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_whitespace()
+                        || matches!(c, b'<' | b'>' | b'[' | b']' | b'/' | b'(')
+                    {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                let name = std::str::from_utf8(&self.data[start..self.pos])
+                    .map_err(|_| err("non-UTF8 property name"))?
+                    .to_string();
+                Ok(Some(Token::Property(name)))
+            }
+            b'(' => Ok(Some(Token::Str(self.read_string()?))),
+            _ => Ok(Some(self.read_bareword()?)),
+        }
+    }
+
+    fn expect_seq(&mut self, seq: &[u8]) -> Result<()> {
+        if self.data[self.pos..].starts_with(seq) {
+            self.pos += seq.len();
+            Ok(())
+        } else {
+            Err(err(format!(
+                "expected {:?} at byte {}",
+                std::str::from_utf8(seq).unwrap_or("?"),
+                self.pos
+            )))
+        }
+    }
+}
+
+pub fn parse(data: &[u8]) -> Result<Value> {
+    let mut t = Tokenizer::new(data);
+    let first = t.next()?.ok_or_else(|| err("empty input"))?;
+    parse_from(&mut t, first)
+}
+
+fn parse_from(t: &mut Tokenizer, first: Token) -> Result<Value> {
+    match first {
+        Token::DictStart => parse_dict(t),
+        Token::ArrayStart => parse_list(t),
+        Token::Str(s) => Ok(Value::Str(s)),
+        Token::Bool(b) => Ok(Value::Bool(b)),
+        Token::Int(i) => Ok(Value::Int(i)),
+        Token::Float(f) => Ok(Value::Float(f)),
+        other => Err(err(format!("unexpected token at top level: {other:?}"))),
+    }
+}
+
+fn parse_dict(t: &mut Tokenizer) -> Result<Value> {
+    let mut items = Vec::new();
+    loop {
+        match t.next()? {
+            None => return Err(err("unterminated dict")),
+            Some(Token::DictEnd) => return Ok(Value::Dict(items)),
+            Some(Token::Property(name)) => {
+                let value_tok = t.next()?.ok_or_else(|| err("dict key with no value"))?;
+                let value = parse_from(t, value_tok)?;
+                items.push((name, value));
+            }
+            Some(other) => return Err(err(format!("expected /Property or >>, got {other:?}"))),
+        }
+    }
+}
+
+fn parse_list(t: &mut Tokenizer) -> Result<Value> {
+    let mut items = Vec::new();
+    loop {
+        match t.next()? {
+            None => return Err(err("unterminated array")),
+            Some(Token::ArrayEnd) => return Ok(Value::List(items)),
+            Some(tok) => items.push(parse_from(t, tok)?),
+        }
+    }
+}
+
+fn write_string(out: &mut Vec<u8>, s: &str) {
+    // Matches `psd-tools`' own escaping exactly: encode to UTF-16BE, then do
+    // a naive whole-buffer byte-level replace for `\`, `(`, `)`, in that
+    // order (backslash first, so bytes inserted while escaping `(`/`)` are
+    // never re-escaped by a later pass). This deliberately does NOT try to
+    // be "smarter" by only escaping ASCII-range low bytes -- an earlier
+    // version of this function did that and was a real bug: some non-ASCII
+    // codepoints (e.g. U+29xx) have 0x29 as their *high* byte, and an
+    // unescaped literal `)` byte there would be misread by `read_string` as
+    // the string's terminator, truncating the string silently. Byte-level
+    // escaping, unit-alignment-unaware, is what actually round-trips for
+    // arbitrary Unicode content.
+    let mut encoded: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+    for special in *b"\\()" {
+        let mut escaped = Vec::with_capacity(encoded.len());
+        for &b in &encoded {
+            if b == special {
+                escaped.push(b'\\');
+            }
+            escaped.push(b);
+        }
+        encoded = escaped;
+    }
+    out.push(b'(');
+    out.push(0xFE);
+    out.push(0xFF);
+    out.extend_from_slice(&encoded);
+    out.push(b')');
+}
+
+fn write_float(out: &mut Vec<u8>, f: f64) {
+    // Matches psd-tools' formatting: 8 decimals, trim trailing zeros, and a
+    // magnitude between 0 and 1 drops the leading "0" (".5" not "0.5"). Not
+    // required for a reader to accept the value, but keeping it close to
+    // Photoshop's own output style reduces risk for no cost.
+    let mut s = format!("{f:.8}");
+    while s.ends_with('0') && !s.ends_with(".0") {
+        s.pop();
+    }
+    if f.abs() < 1.0 && f != 0.0 {
+        if let Some(stripped) = s.strip_prefix('0') {
+            s = stripped.to_string();
+        } else if let Some(stripped) = s.strip_prefix("-0") {
+            s = format!("-{stripped}");
+        }
+    }
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn write_value(out: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Dict(items) => {
+            out.extend_from_slice(b"<<");
+            for (k, val) in items {
+                out.push(b'/');
+                out.extend_from_slice(k.as_bytes());
+                out.push(b' ');
+                write_value(out, val);
+            }
+            out.extend_from_slice(b">>");
+        }
+        Value::List(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b' ');
+                }
+                write_value(out, item);
+            }
+            out.push(b']');
+        }
+        Value::Str(s) => write_string(out, s),
+        Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+        Value::Int(i) => out.extend_from_slice(i.to_string().as_bytes()),
+        Value::Float(f) => write_float(out, *f),
+    }
+}
+
+pub fn write(v: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_value(&mut out, v);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `EngineData` payload actually embedded in a Photoshop-authored
+    /// `TySh` block (extracted via `descriptor.rs` from `reference/tysh.bin`,
+    /// which itself came from a real Photoshop-exported file — see
+    /// `reference/README.md`). This is genuine raw wire-format bytes, unlike
+    /// `reference/engineData.txt` — see the note on that file below.
+    fn real_engine_data() -> Vec<u8> {
+        let tysh_bytes = include_bytes!("../reference/tysh.bin");
+        let tysh = crate::descriptor::parse_fixture(tysh_bytes).expect("parse TySh");
+        match tysh.text_data.get(b"EngineData") {
+            Some(crate::descriptor::Value::Raw(bytes)) => bytes.clone(),
+            other => panic!("expected EngineData to be Raw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_real_photoshop_engine_data_payload() {
+        let v = parse(&real_engine_data()).expect("a real EngineData payload must parse");
+        assert_eq!(
+            v.get_path("EngineDict.Editor.Text").and_then(Value::as_str),
+            Some("Line 1\rLine 2\rLine 3 and text\r")
+        );
+        // Confirms the parser actually descended into deeply nested
+        // structure, not just the first couple of keys.
+        assert!(v.get_path("ResourceDict.KinsokuSet").is_some());
+        assert!(v.get_path("EngineDict.ParagraphRun.RunArray").is_some());
+    }
+
+    #[test]
+    fn round_trips_and_reparses_identically() {
+        let data = real_engine_data();
+        let v = parse(&data).expect("parse");
+        let out = write(&v);
+        let reparsed = parse(&out).expect("re-parse of our own output");
+        assert_eq!(reparsed, v, "semantic structure changed after round-trip");
+    }
+
+    #[test]
+    fn patches_editor_text_and_stays_consistent() {
+        let mut v = parse(&real_engine_data()).expect("parse");
+        let slot = v
+            .get_path_mut("EngineDict.Editor.Text")
+            .expect("Editor.Text must exist in a real document");
+        *slot = Value::Str("Aurora spike\r".into());
+
+        let out = write(&v);
+        let reparsed = parse(&out).expect("re-parse after patch");
+        assert_eq!(
+            reparsed
+                .get_path("EngineDict.Editor.Text")
+                .and_then(Value::as_str),
+            Some("Aurora spike\r")
+        );
+        // Everything else must be untouched by the patch.
+        assert_eq!(
+            reparsed.get_path("ResourceDict.KinsokuSet"),
+            v.get_path("ResourceDict.KinsokuSet")
+        );
+    }
+
+    #[test]
+    fn round_trips_unicode_whose_bytes_collide_with_delimiters() {
+        // U+2913 has UTF-16BE bytes [0x29, 0x13] -- 0x29 is ')', the string
+        // terminator this format uses. A unit-alignment-aware escaper (an
+        // earlier version of write_string) would not escape it, because
+        // 0x29 lands in the *high* byte of the unit, not the low byte where
+        // ASCII '(' / ')' / '\' normally appear. That produces a literal,
+        // unescaped ')' byte in the output, which read_string then
+        // misreads as the string's own terminator -- silent truncation.
+        //
+        // Found and fixed *because* this test was written before trusting
+        // the "obviously correct" first implementation, not after a bug
+        // report -- consistent with this spike's established discipline of
+        // checking against real bytes rather than assuming a parser that
+        // compiles is a parser that's right.
+        let tricky = format!(
+            "before{}after\\with(parens)",
+            char::from_u32(0x2913).unwrap()
+        );
+        let v = Value::Str(tricky.clone());
+        let out = write(&v);
+        let reparsed = parse(&out).expect("must parse despite delimiter-colliding bytes");
+        assert_eq!(
+            reparsed,
+            Value::Str(tricky),
+            "string was corrupted or truncated on round-trip"
+        );
+    }
+}

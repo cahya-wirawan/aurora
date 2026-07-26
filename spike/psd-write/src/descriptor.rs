@@ -338,6 +338,51 @@ mod tests {
     /// synthesized. See `reference/README.md`.
     const REAL_TYSH: &[u8] = include_bytes!("../reference/tysh.bin");
 
+    /// Two more `TySh` blocks, extracted from `ag-psd`'s test suite — a
+    /// separate, independently-written PSD library (unlike `text.psd`, its
+    /// provenance as genuine Photoshop output vs. ag-psd's own generated
+    /// test data is unconfirmed; see `reference/README.md`). Still a
+    /// meaningful cross-check: it tests whether the container format
+    /// understanding built from reading `psd-tools`' source generalizes to
+    /// bytes this parser has never seen, from a codebase this parser was
+    /// never informed by.
+    const SINGLE_RUN_TYSH: &[u8] = include_bytes!("../reference/tysh-single-run.bin");
+    /// Two separate style runs across two characters — the multi-run case
+    /// `text.psd` didn't cover (its `StyleRun` was one run for all 30 chars).
+    const MULTI_RUN_TYSH: &[u8] = include_bytes!("../reference/tysh-multi-run.bin");
+
+    #[test]
+    fn generalizes_to_an_independent_codebases_fixtures() {
+        for (name, bytes, expected_text) in [
+            ("single-run", SINGLE_RUN_TYSH, "a\u{0}"),
+            ("multi-run", MULTI_RUN_TYSH, "b\u{0}"),
+        ] {
+            let tysh =
+                parse_fixture(bytes).unwrap_or_else(|e| panic!("{name} failed to parse: {e}"));
+            assert_eq!(tysh.text(), Some(expected_text), "{name}: wrong text");
+
+            let out = tysh.to_bytes();
+            assert_eq!(
+                out.len(),
+                bytes.len(),
+                "{name}: length changed on round-trip"
+            );
+            let reparsed = parse_fixture(&out).unwrap_or_else(|e| {
+                panic!("{name}: re-parse of our own re-serialized output failed: {e}")
+            });
+            assert_eq!(
+                reparsed, tysh,
+                "{name}: not semantically identical after round-trip"
+            );
+        }
+        // Note: MULTI_RUN_TYSH's two separate style runs (confirmed via
+        // psd-tools when the fixture was extracted -- see reference/README.md)
+        // live inside EngineData's own text format, which this parser treats
+        // as opaque (finding 6/9). This test confirms the *container* format
+        // — text_data/warp, the six top-level fields — generalizes; it does
+        // not exercise the run count itself, which is future work.
+    }
+
     #[test]
     fn parses_real_photoshop_bytes() {
         let tysh = parse_fixture(REAL_TYSH).expect("a real Photoshop TySh block must parse");

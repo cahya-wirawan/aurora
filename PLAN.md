@@ -144,9 +144,10 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
 - [x] PSD write spike — layer file with names, alpha, opacity, blend modes, visibility, Unicode names; verified by two independent readers with layer pixels checked
 - [x] **Layer groups** — 2-level nesting, open/closed state, membership, and multiply-blend compositing through nested groups; structural assertions in `verify.sh`, pixel math checked by hand, not just eyeballed
 - [!] **Verify in Photoshop itself** — no licence available; the only check that settles ADR 0004
-- [x→bigger] **Text layer (`TySh`) spike — container format tractable, but scope grew.** Downloaded a real Photoshop-authored text layer (a `psd-tools` test fixture) and read its structure before writing code. `TySh`'s own container is small (6 fields) and its byte layout is now implemented in Rust (`src/descriptor.rs`, 4 tests, all against real extracted bytes) — parses, patches, and round-trips real Photoshop data correctly. **But `EngineData` (the actual text/styling content) is far richer than expected** — full kinsoku/moji-kumi tables, duplicated resource dicts, even for plain English text — making from-scratch generation genuinely higher-risk than assumed. The validated lower-risk path is patch-a-real-file rather than generate-from-scratch (proven end-to-end in Python, independently verified by `psd-tools` + `sips`). **Found a new, mandatory, previously-unscoped requirement: editing text content requires rendering actual glyphs into the layer's pixel channels**, or the file is internally inconsistent (descriptor says new text, pixels still show old text) — confirmed by direct visual inspection. This is now the single biggest addition to Phase 3 scope from any spike so far.
-- [ ] `EngineData`'s own text-format writer (patch-in-place only, so far — see above)
-- [ ] Glyph rendering into pixel channels on text edit — **new, mandatory, unscoped work surfaced by the above**
+- [x→bigger] **Text layer (`TySh`) spike — container format tractable, but scope grew.** Downloaded a real Photoshop-authored text layer (a `psd-tools` test fixture) and read its structure before writing code. `TySh`'s own container is small (6 fields) and its byte layout is implemented in Rust (`src/descriptor.rs`) — parses, patches, and round-trips real Photoshop data correctly. **But `EngineData` (the actual text/styling content) is far richer than expected** — full kinsoku/moji-kumi tables, duplicated resource dicts, even for plain English text — making from-scratch generation genuinely higher-risk than assumed. The validated lower-risk path is patch-a-real-file rather than generate-from-scratch (proven end-to-end in Python, independently verified by `psd-tools` + `sips`). **Found a new, mandatory, previously-unscoped requirement: editing text content requires rendering actual glyphs into the layer's pixel channels**, or the file is internally inconsistent — confirmed by direct visual inspection. This is now the single biggest addition to Phase 3 scope from any spike so far.
+- [x] **`EngineData`'s own text-format reader/writer** (`src/engine_data.rs`) — implemented and tested, not just patch-in-place on an opaque blob anymore. `--tysh-demo` now patches both the top-level `Txt ` field and the nested `EngineDict.Editor.Text` together. Corpus extended with two `TySh` blocks from `ag-psd` (a second, independently-written library that also *writes* text layers) — including a genuine multi-style-run case — and the existing parser needed **zero changes** to handle them. Caught and fixed one real bug in the process: a Unicode-escaping edge case (codepoints with `)` as their high byte) that would have silently truncated strings; found by a test, not inspection. 9 tests total, all against real extracted bytes.
+- [ ] **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s on text edit** — `--tysh-demo` patches text but deliberately leaves these stale and says so; separate, additional bookkeeping from the pixel-sync gap below
+- [ ] Glyph rendering into pixel channels on text edit — **still the single biggest unstarted item; unaffected by the `EngineData` work above**
 - [ ] Layer masks, vector masks, smart objects, layer styles, adjustment layers
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
@@ -333,6 +334,9 @@ here so they are not silently lost between phases.
 | Editing text content requires rendering glyphs into pixel channels, or the file is internally inconsistent (descriptor vs. preview mismatch) | psd | **New, mandatory Phase 3 scope** — needs Aurora's text stack (`cosmic-text`/`glyphon`) wired into `aurora-io`, not previously planned |
 | `TySh`'s `text_data`/`warp` fields are `DescriptorBlock` (extra leading version field), not plain `Descriptor` — desyncs silently if missed | psd | Phase 3 `aurora-io` — captured in `descriptor.rs` |
 | The Descriptor format's zero-length key shorthand means byte-identical round-trip is the wrong test; same-length + semantic-identity is correct | psd | Phase 3 test design for `aurora-io` |
+| `EngineData`'s container format generalized to a second, independent library's fixtures with zero parser changes — real corroboration, not just one file fitting one parser | psd | Phase 3 `aurora-io` confidence |
+| A naive Unicode string escaper can silently truncate strings (codepoints with `)` as their UTF-16BE high byte); needs whole-buffer byte-level escaping, not unit-aligned | psd | Phase 3 `aurora-io` — implemented, see `engine_data.rs` |
+| Editing text also requires recomputing paragraph/style `RunLengthArray`s to match the new length — separate from, and in addition to, the pixel-sync requirement | psd | Phase 3 — new line item alongside glyph rendering |
 
 ---
 
@@ -344,13 +348,15 @@ here so they are not silently lost between phases.
    entirely and remain the only thing that can still overturn ADR 0001.
 2. **Start 0.5, the token vocabulary** — yours as design owner, blocks every
    widget, needs no engine code, and can run in parallel with everything else.
-3. **Build a small real-world text-layer corpus** (extending PLAN 0.7 early) —
-   the PSD text-layer spike found that hand-generating `EngineData` from
-   scratch is genuinely risky, but patching real files is validated and
-   low-risk. The next step isn't more research, it's collecting a handful of
-   real Photoshop text layers (multi-style runs, paragraph vs. point text,
-   warped text) to build the writer against, the same way the spike's
-   proof-of-concept did for the simple case.
+3. **Extend the text-layer corpus further, or move on to run-length/glyph
+   work.** The corpus-plus-patch strategy is now proven in both Python
+   (full file level) and Rust (`descriptor.rs` + `engine_data.rs`, 9 tests,
+   two independent libraries' fixtures). Two concrete gaps remain before this
+   is more than "the mechanics work": recomputing `RunLengthArray`s on text
+   edit, and rendering glyphs into pixel channels (still unstarted, still
+   the bigger of the two). Paragraph-vs-point text and warped text
+   (non-`warpNone` values) are still untested — worth 1-2 more fixtures if
+   continuing this line before moving to the two gaps above.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`

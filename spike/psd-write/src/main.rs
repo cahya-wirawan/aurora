@@ -13,6 +13,7 @@
 //! both are independent of this writer, which is the property that matters.
 
 mod descriptor;
+mod engine_data;
 mod psd;
 
 use psd::{Document, Group, Item, Layer};
@@ -170,22 +171,59 @@ fn tysh_demo() -> std::io::Result<()> {
     );
 
     tysh.set_text("Aurora spike\u{0}");
+
+    // Also patch EngineData.Editor.Text -- the nested text-engine content,
+    // via engine_data.rs, which descriptor.rs treats as an opaque blob (it's
+    // a completely different text-based format, not the Descriptor binary
+    // format). Patching both fields is what the Python proof-of-concept in
+    // FINDINGS.md finding 7 did at the full-file level; this is the same
+    // operation natively in Rust, closing the gap the original version of
+    // this demo left open.
+    if let descriptor::Value::Raw(engine_bytes) = tysh
+        .text_data
+        .get(b"EngineData")
+        .expect("EngineData field must exist")
+        .clone()
+    {
+        let mut engine = engine_data::parse(&engine_bytes)
+            .expect("a real Photoshop EngineData payload must parse");
+        if let Some(slot) = engine.get_path_mut("EngineDict.Editor.Text") {
+            *slot = engine_data::Value::Str("Aurora spike\r".into());
+        }
+        let new_engine_bytes = engine_data::write(&engine);
+        tysh.text_data
+            .set(b"EngineData", descriptor::Value::Raw(new_engine_bytes));
+    }
+
     let after = tysh.to_bytes();
     let reparsed_after = descriptor::parse_fixture(&after)?;
-    println!("\nPatched text to: {:?}", reparsed_after.text());
+    println!("\nPatched `Txt ` to: {:?}", reparsed_after.text());
+    if let Some(descriptor::Value::Raw(engine_bytes)) = reparsed_after.text_data.get(b"EngineData")
+    {
+        let engine = engine_data::parse(engine_bytes).expect("re-parse patched EngineData");
+        println!(
+            "Patched EngineDict.Editor.Text to: {:?}",
+            engine
+                .get_path("EngineDict.Editor.Text")
+                .and_then(engine_data::Value::as_str)
+        );
+    }
     println!(
-        "New size: {} bytes (was {}) — shrank because the new `Txt ` string is \
-         shorter; EngineData and warp bytes themselves are untouched",
+        "New size: {} bytes (was {}) — both the top-level `Txt ` field and the \
+         nested EngineData.Editor.Text now agree; `warp` bytes are untouched",
         after.len(),
         before.len()
     );
 
     println!(
-        "\nNote: only the top-level `Txt ` field was patched. The nested \
-         EngineData.Editor.Text and StyleRun/ParagraphRun content (what \
-         Photoshop's own text engine actually renders), plus the layer's \
-         rasterized pixel preview, still reflect the old text — see \
-         FINDINGS.md finding 8, the pixel/vector sync gap."
+        "\nTwo things this demo deliberately leaves inconsistent, both real gaps \
+         for a production writer:\n\
+         \x20 1. ParagraphRun/StyleRun RunLengthArrays still sum to the OLD \
+         text's length (30) -- a real writer must recompute these to match \
+         the new text, or Photoshop's own run bookkeeping is wrong.\n\
+         \x20 2. The layer's rasterized pixel preview is untouched -- a real \
+         implementation must re-render glyphs into the pixel channels too, \
+         or the file is visually inconsistent (FINDINGS.md finding 8)."
     );
     Ok(())
 }

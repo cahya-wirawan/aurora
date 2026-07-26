@@ -26,17 +26,21 @@ exactly.
 **But "accepted by a reader" is a much weaker claim than it sounds**, and
 findings 1–5 below are mostly about that gap.
 
-**Text layers (findings 6–9) turned out to be the more consequential result
+**Text layers (findings 6–10) turned out to be the more consequential result
 of this spike.** A real Photoshop text layer's `EngineData` is far richer
 than a naive minimal example — hand-generating it from scratch carries real,
 untested risk (finding 6). The lower-risk path — patch a real file's bytes
-rather than generate from nothing — was proven out end-to-end (finding 7) and
-its core mechanics validated in Rust against real bytes (finding 9). But that
-same investigation surfaced a mandatory piece of engineering that was not in
-the original Phase 3 scope at all: **editing text content requires rendering
-actual glyphs into the layer's pixel channels**, or the resulting file is
-visually inconsistent — descriptor says one thing, pixels show another
-(finding 8). This is the most important finding in the document.
+rather than generate from nothing — was proven out end-to-end (finding 7),
+and both the `TySh` container and `EngineData`'s own text format are now
+implemented and tested in Rust against real bytes from two independent PSD
+libraries (findings 9, 10), catching one genuine Unicode-escaping bug along
+the way. But the same investigation surfaced mandatory engineering that was
+not in the original Phase 3 scope at all: **editing text content requires
+rendering actual glyphs into the layer's pixel channels** (finding 8), or the
+resulting file is visually inconsistent — descriptor says one thing, pixels
+show another — and separately, **paragraph/style run lengths must be
+recomputed to match the new text** (finding 10). Finding 8 is the single most
+important finding in the document.
 
 ## What was verified
 
@@ -254,29 +258,75 @@ stays internally consistent, and rejects unknown types. Run via
 `cargo run -- --tysh-demo` for a human-readable walkthrough of the same
 parse-then-patch operation.
 
-**What the Rust side does *not* do, on purpose:** the full end-to-end
-file-level splice (patching a complete PSD's byte stream, including the
-enclosing layer-record and layer-info length prefixes) was proven out in
-Python (finding 7) and not re-implemented in Rust for this spike — once the
-format understanding was validated in the target language (finding 9's
-tests), re-deriving the same file-level result a second time would have
-spent effort on engineering polish rather than answering a further open
-question. That full Rust-side splice, plus rendering glyphs into pixel
-channels (finding 8), is Phase 3 scope.
+**Follow-up (same day):** the full Rust-side splice was still not
+implemented (see below), but `EngineData`'s own text-format *was* — see
+finding 10.
+
+### 10. `EngineData`'s own format is now implemented and tested in Rust — corpus generalized to a second library, one real bug found and fixed by testing rather than assuming
+
+Following finding 7's validated strategy, `src/engine_data.rs` implements a
+full reader/writer for `EngineData`'s text-based format (`<<...>>` dicts,
+`/Key` properties, `[...]` lists, numbers, `true`/`false`, and the
+UTF-16BE-with-BOM parenthesized strings) — not just treating it as an opaque
+blob. `--tysh-demo` now patches **both** the top-level `Txt ` field and the
+nested `EngineDict.Editor.Text`, closing the gap the original version of
+this demo explicitly left open.
+
+**Corpus generalization.** Beyond `text.psd`, two more `TySh` blocks were
+pulled from [`ag-psd`](https://github.com/Agamnentzar/ag-psd)'s test suite —
+a second, independently written PSD library (unlike `psd-tools`, one that
+also *writes* text layers) — including a genuine multi-style-run case
+(`text.psd`'s one file had a single style run covering all 30 characters;
+one of these has two separate runs). The existing `Descriptor`/`DescriptorBlock`
+parser required **zero code changes** to handle bytes from a codebase it was
+never informed by — real evidence the container-format understanding
+generalizes, not just fits the one file it was built against.
+
+**A genuine bug, found by testing against real bytes rather than trusting a
+"reasonable-looking" first implementation.** The first version of the string
+writer escaped `\`, `(`, `)` only when they appeared as the *low* byte of an
+ASCII-range UTF-16 unit. That's wrong: some non-ASCII codepoints (e.g.
+U+29xx) have `0x29` — literal `)` — as their *high* byte. An unescaped `)`
+there is silently misread by the reader as the string's own terminator,
+truncating the content with no error at all. Caught by a test constructing
+exactly that case, not by inspection. Fixed to match `psd-tools`' own
+approach: a naive whole-buffer byte-level replace (backslash first, so
+newly-inserted escape characters aren't re-escaped), which is
+alignment-unaware and therefore correct for arbitrary Unicode content. Same
+lesson as findings 1, 2, and 9, one format deeper: something that looks
+locally reasonable is not the same as something verified against real data.
+
+**One reference file turned out to be the wrong kind of evidence, and was
+caught before it caused a false result.** `ag-psd`'s `engineData.txt` looked
+like a plain-text `EngineData` dump — genuinely useful for confirming key
+names and nesting shape while designing the parser — but checking its raw
+bytes directly (`0 in data` → `False` for the whole 19 KB file) showed it has
+no embedded UTF-16BE/BOM bytes at all. It's a human-readable pretty-print,
+not the wire format a real `.psd` file embeds. Using it as parser test input
+would have meant testing against a format the parser doesn't actually need
+to handle. All test fixtures instead use the `EngineData` payload genuinely
+extracted from a Photoshop-authored `TySh` block (`reference/tysh.bin`).
+Recorded in `reference/README.md` so the distinction isn't lost.
+
+**Still not done:** `--tysh-demo`'s own output says so explicitly rather than
+implying more completeness than exists — after patching both text fields,
+the `ParagraphRun`/`StyleRun` `RunLengthArray`s still sum to the *old* text's
+length. A real writer must recompute these against the new text, or
+Photoshop's own run bookkeeping is internally wrong. This is additional,
+separate work from finding 8's pixel/vector sync gap, not the same issue.
 
 ## Scope: what this did *not* touch
 
-Groups and the text-layer *descriptor* mechanics are done; the rest is still
-the easy-versus-hard split. Untested and unimplemented:
+Groups, the `TySh` container, and `EngineData`'s text format are all now
+implemented and tested against real bytes. Remaining, still untested and
+unimplemented:
 
-- Layer masks and vector masks
-- **`EngineData`'s own text-format writer** — this spike's Rust code treats
-  `EngineData` as an opaque `tdta` blob (finding 6); generating or modifying
-  its internal paragraph/style/resource structure from scratch is unstarted
-  and, per finding 6, higher-risk than anything else in this document
+- **Recomputing `RunLengthArray`s to match edited text length** (finding 10)
+  — needed alongside the text patch itself, not instead of it
 - **Rendering glyphs into pixel channels to keep text layers visually
-  consistent** (finding 8) — the single most important piece of unstarted
-  work this spike surfaced
+  consistent** (finding 8) — still the single most important piece of
+  unstarted work this spike surfaced; nothing in finding 10 touches this
+- Layer masks and vector masks
 - Smart objects, embedded and linked
 - Layer styles and effects
 - Adjustment layers
@@ -285,15 +335,24 @@ the easy-versus-hard split. Untested and unimplemented:
   larger uncompressed — this 320×240 file is 763 KB)*
 - PSB (>30,000 px)
 - ICC profiles and metadata in the image-resources section
+- The full Rust-side file-level splice (patching a complete PSD's byte
+  stream in place, including enclosing layer-record/layer-info length
+  prefixes) — proven out in Python (finding 7); the *format* understanding
+  needed for it is now validated natively in Rust (findings 9, 10), but the
+  file-splice plumbing itself is not built
 
 **Do not read this spike as "PSD write is a solved problem," and do not read
 the text-layer result as "text layers are solved."** What's established: the
 container, layer records, channel data, Unicode naming, and groups are
-tractable from scratch (finding 5); the `TySh` *container* format and a
-patch-a-real-file strategy are tractable and demonstrated end-to-end
-(findings 7, 9); but full from-scratch `EngineData` generation is
-higher-risk than assumed (finding 6), and the pixel/vector sync requirement
-(finding 8) is real, mandatory, unstarted engineering work.
+tractable from scratch (finding 5); the `TySh` container and `EngineData`
+formats are both implemented and tested against real, independently-sourced
+bytes (findings 9, 10); the patch-a-real-file strategy is validated
+end-to-end at the file level (finding 7). What's still open: full
+from-scratch `EngineData` generation remains higher-risk than assumed
+(finding 6) — the corpus-and-patch approach sidesteps rather than resolves
+that; the pixel/vector sync requirement (finding 8) is real, mandatory,
+unstarted engineering work; and run-length bookkeeping on edit (finding 10)
+is a real, separate gap from the pixel sync one.
 
 ## Recommendations for Phase 3
 
@@ -306,14 +365,20 @@ higher-risk than assumed (finding 6), and the pixel/vector sync requirement
    from scratch** (finding 7) — collect a small corpus of real Photoshop text
    layers spanning common cases (multi-style runs, paragraph vs point text,
    warped text) and build the writer against them, the same way finding 7's
-   proof-of-concept did for the simple case.
+   proof-of-concept did for the simple case, and finding 10 extended into
+   Rust with a second library's fixtures.
 5. **Budget real engineering time for glyph rendering into pixel channels**
    (finding 8) — this is not a follow-on detail, it's required for any text
    edit to produce a non-broken file, and it did not appear in the original
    Phase 3 scoping.
-6. **Get a Photoshop licence for verification.** Nothing else settles ADR 0004,
+6. **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s whenever text
+   length changes** (finding 10) — a second, separate piece of mandatory
+   bookkeeping alongside finding 8's pixel sync; `--tysh-demo` deliberately
+   leaves this undone and reports so, rather than looking more complete than
+   it is.
+7. **Get a Photoshop licence for verification.** Nothing else settles ADR 0004,
    and an independent reader agreeing is not evidence that Photoshop will.
-7. **When a binary layout is ambiguous from the spec text alone, read a
-   working implementation rather than infer it** (findings 5, 9). This cost
+8. **When a binary layout is ambiguous from the spec text alone, read a
+   working implementation rather than infer it** (findings 5, 9, 10). This cost
    a search and a few minutes of reading each time; guessing wrong would have
    cost a session of debugging a file that opens but composites incorrectly.
