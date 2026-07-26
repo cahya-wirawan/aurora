@@ -2,7 +2,7 @@
 
 A modern, GPU-accelerated, non-destructive professional image editor for Windows, macOS, and Linux — written in Rust.
 
-> **Status: pre-implementation.** The workspace skeleton, CI, architecture decisions, and a measured prototype are in place; **no features are implemented yet**. The 19 crates compile and CI is green, but nothing does anything. Phase 0 (technical de-risking) is the current work — see [Roadmap](#roadmap). Stars and discussion are welcome; working software is not.
+> **Status: pre-implementation, Phase 0 about half done.** The workspace skeleton, CI, architecture decisions, and two measured prototypes are in place; **no features are implemented yet**. The 19 crates compile and CI is green, but nothing does anything. Track progress in **[PLAN.md](PLAN.md)**. Stars and discussion are welcome; working software is not.
 
 ---
 
@@ -97,6 +97,7 @@ cargo run                           # windowed — needs a screen reader to judg
 
 ## Documentation
 
+- **[PLAN.md](PLAN.md)** — the implementation plan and live progress tracker: what is done, what is in progress, what is blocked, and what comes next.
 - **[PRD.md](PRD.md)** — the full product requirements document: functional requirements, architecture, technology decisions, risks, open questions, and the pre-implementation plan.
 - **[docs/adr/](docs/adr/)** — architecture decision records. Each states what was decided, what was rejected, and what would justify reopening it.
 - **[spike/FINDINGS.md](spike/FINDINGS.md)** — measured results from the vertical slice, including what they invalidated.
@@ -105,7 +106,7 @@ cargo run                           # windowed — needs a screen reader to judg
 
 ## Contributing
 
-Aurora is MIT licensed and open to contribution, but there are no features to build on yet — the workspace is a skeleton and Phase 0 is where the real work starts. Contributions are made under the MIT licence; sign off your commits with `git commit -s` (DCO). What is genuinely useful right now:
+Aurora is MIT licensed and open to contribution, but there are no features to build on yet — the workspace is a skeleton and Phase 0 is where the real work starts. [PLAN.md](PLAN.md) shows exactly what is open. Contributions are made under the MIT licence; sign off your commits with `git commit -s` (DCO). What is genuinely useful right now:
 
 - **Review the [PRD](PRD.md).** Particularly §11 (Risks) and §12 (Open Questions). Several open questions are unresolved and shape the architecture, notably the PSD round-trip target versions and the handling of Photoshop features with no Aurora equivalent.
 - **Tell us about your workflow.** [PRD §13 Step 2](PRD.md) calls for a ranked list of the Photoshop workflows that actually matter to professionals. First-hand accounts are more valuable than speculation.

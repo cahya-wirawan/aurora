@@ -14,6 +14,8 @@ Two constraints it already surfaced: **windows must be created hidden, adapted, 
 
 Remaining Phase 0 work: finishing the human half of the a11y/IME verification, the design language and token system, running both spikes on Windows and Linux, and the RAW/ICC and PSD-write feasibility spikes.
 
+**[PLAN.md](PLAN.md) is the progress tracker** — task-level status for Phase 0 and a full Phase 1 breakdown. Check it before starting work to see what is done, blocked, or next, and update the relevant checkbox in the same commit as the work. It also lists findings carried forward from the spikes and where each one lands.
+
 ## Commands
 
 ```sh

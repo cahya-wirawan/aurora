@@ -1287,6 +1287,8 @@ These block or reshape implementation and need owners and answers, most before P
 
 In order. Nothing here is Phase 1 feature code — this is the work that makes Phase 1 safe to start.
 
+> Task-level status for these steps, and a full Phase 1 breakdown, live in [PLAN.md](PLAN.md). This section states the intent; PLAN.md tracks the progress.
+
 ## Step 1 — Resolve the blocking decisions
 
 The four decisions that shape the tile store and render graph are now made. Each needs an ADR capturing the alternatives rejected and the trigger that would reopen it — the reasoning matters more than the verdict when someone revisits it in year two:
