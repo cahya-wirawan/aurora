@@ -102,6 +102,7 @@ cargo run                           # windowed — needs a screen reader to judg
 - **[docs/adr/](docs/adr/)** — architecture decision records. Each states what was decided, what was rejected, and what would justify reopening it.
 - **[spike/FINDINGS.md](spike/FINDINGS.md)** — measured results from the vertical slice, including what they invalidated.
 - **[spike/a11y-ime/FINDINGS.md](spike/a11y-ime/FINDINGS.md)** — accessibility and IME spike, with the human verification checklist still outstanding.
+- **[spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)** — PSD write spike: a layered PSD written from scratch and checked against independent readers.
 - **[CLAUDE.md](CLAUDE.md)** — orientation for [Claude Code](https://claude.com/claude-code) sessions working in this repository.
 
 ## Contributing

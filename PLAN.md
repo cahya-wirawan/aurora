@@ -27,7 +27,7 @@ than the tidiness.
 ## Where we are
 
 **Phase 0 (technical de-risking) — roughly half done.** No product features exist
-and none should yet. Eleven commits, CI green on Linux, macOS, and Windows.
+and none should yet. CI green on Linux, macOS, and Windows.
 
 | Area | State |
 |---|---|
@@ -36,7 +36,8 @@ and none should yet. Eleven commits, CI green on Linux, macOS, and Windows.
 | Performance validation | **Measured** — budgets hold, with one correction |
 | Accessibility & IME | **Partially verified — the decisive test is unrun** |
 | Design language | Not started — blocked on design owner time |
-| Format feasibility (RAW/ICC/PSD) | Not started |
+| PSD write feasibility | **Proven tractable** — text layers still unassessed |
+| RAW / ICC feasibility | Not started |
 
 **The single most important open item:** nobody has confirmed a screen reader
 speaks a custom-drawn text field, or that CJK composition works. Until that is
@@ -121,9 +122,15 @@ be retrofitted cheaply). Runs in parallel with 0.3/0.6; needs no engine code.
 - [ ] Component gallery skeleton — review surface and golden-image target
 - [ ] Outside critique on the mockups before they harden (risk R2f mitigation)
 
-### 0.6 Format feasibility — not started
+### 0.6 Format feasibility — PSD partially done
 
-- [ ] PSD/PSB write spike — produce a file **Photoshop reopens**, not merely parse one (ADR 0004 commits to write; this is a 10-month phase resting on an assumption)
+Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
+
+- [x] PSD write spike — 5-layer file with names, alpha, opacity, blend modes, visibility, Unicode names; verified by two independent readers with layer pixels checked
+- [!] **Verify in Photoshop itself** — no licence available; the only check that settles ADR 0004
+- [ ] Text layer (`TySh`) spike — the largest remaining unknown, and ADR 0004 promises it
+- [ ] Groups, masks, smart objects, layer styles, adjustment layers
+- [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
 - [ ] ICC transform spike — `lcms2` binding, and the LGPL linking question (PRD §14)
 - [ ] Decide RAW and ICC libraries, record as ADRs
@@ -297,6 +304,9 @@ here so they are not silently lost between phases.
 | Windows must be created hidden, adapted, then shown | a11y | M1.8 |
 | Composition state must be announced, or CJK users hear silence | a11y | M1.7 |
 | Text stack sets the toolchain floor | a11y | done — pinned 1.97 |
+| A reader accepting a PSD proves little; gate on pixel comparison | psd | Phase 3 gate (already worded this way in PRD §9) |
+| The flattened preview must apply blend modes, or 44 % of pixels differ | psd | Phase 3 — write the flatten through the real render graph |
+| Layer names need both the legacy Pascal string and the `luni` block | psd | Phase 3 |
 
 ---
 
@@ -306,5 +316,5 @@ here so they are not silently lost between phases.
    that can overturn a foundational decision. [Checklist](spike/a11y-ime/FINDINGS.md).
 2. **Start 0.5, the token vocabulary** — blocks every widget, needs no engine code,
    and can run in parallel with everything else.
-3. **PSD write spike (0.6)** — a 10-month phase currently rests on an untested
-   assumption.
+3. **Spike PSD text layers (0.6)** — the container and layer records are now
+   proven tractable; editable text is the largest remaining unknown in Phase 3.

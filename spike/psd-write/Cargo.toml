@@ -1,0 +1,11 @@
+# THROWAWAY. Outside the workspace, like the other spikes.
+#
+# PLAN 0.6 / ADR 0004. Aurora commits to full layered PSD *write* — a 10-month
+# phase (Phase 3) resting on the assumption that it is feasible. This finds out.
+[package]
+name = "psd-write"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
