@@ -33,8 +33,8 @@ and none should yet. CI green on Linux, macOS, and Windows.
 |---|---|
 | Requirements & architecture | Settled and written down (PRD v1.6, 4 ADRs) |
 | Workspace & CI | Built and green |
-| Performance validation | **Measured** — budgets hold, with one correction |
-| Accessibility & IME | **macOS verified (9/10)** — Windows/Linux outstanding |
+| Performance validation | **Measured** — budgets hold, with one correction; re-run on Linux/Vulkan 2026-07-26, same correction reproduces |
+| Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
 | Design language | Not started — blocked on design owner time |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | Not started |
@@ -90,7 +90,7 @@ Evidence: [spike/FINDINGS.md](spike/FINDINGS.md), `spike/vertical-slice/`
 - [x] Half-float round-trip verified bit-exact (§7.3.6b)
 - [x] Latency, frame, paging, and I/O measured
 - [ ] Run on Windows *(DX12 backend unvalidated)*
-- [ ] Run on Linux *(Vulkan backend unvalidated)*
+- [x] Run on Linux — Vulkan/NVIDIA RTX 3090, 6 runs, 2026-07-26 — [spike/FINDINGS.md](spike/FINDINGS.md#second-platform-linux--vulkan-2026-07-26). Stroke latency and idle-frame budgets pass with more headroom than macOS; pan-while-painting is marginal (straddles the 16.7 ms budget across runs on this shared machine) rather than a clean pass — same architectural bottleneck as macOS (finding 1), not a new one
 - [ ] Re-run at the 300,000 px ceiling *(only 100,000 px tested)*
 
 ### 0.4 Accessibility and IME spike — **macOS verified (9/10); Windows/Linux outstanding**
@@ -112,7 +112,7 @@ and diagnosed down to a specific, non-structural cause.
 - [x] **CJK composition commits correctly (macOS)** — preedit, commit both PASS
 - [x] **IME candidate window appears at the field (macOS)** — PASS, `set_ime_cursor_area` confirmed working
 - [!] **Narrator announces the field (Windows, UIA — a different API; macOS success does not carry over)** — not run, no Windows machine tested yet
-- [!] **Orca announces the field (Linux, AT-SPI)** — not run
+- [!] **Orca announces the field (Linux, AT-SPI)** — build clean on Linux 1.97.1, `accesskit`'s AT-SPI backend (`accesskit_atspi_common`/`accesskit_unix`) compiles in, `--dump-tree` shows correct role/label/value/composition-state with no window needed — see [FINDINGS.md](spike/a11y-ime/FINDINGS.md#linux--build-and-tree-construction-confirmed-orca-leg-still-blocked). Still blocked: the decisive human-plus-Orca test needs a live logged-in desktop session, which this machine did not have (GDM greeter only, no user session) — not yet run
 - [x→bug] **Live value-change announcements (macOS)** — FAILS; typing updates the tree correctly every keystroke (confirmed via debug logging) but VoiceOver never announces it. Traced into `accesskit_macos` source — looks like a real, narrow implementation bug, not a platform inability. Candidate root cause: `Role::Window` nested inside a real native window (same suspect as the navigation-depth finding below)
 - [~] **Screen-reader linear navigation (macOS)** — reaches the label, but only via VoiceOver's "interact" command, not plain arrow keys; confirmed present via the Rotor. Worth a quick experiment: try a plainer root role than `Role::Window`
 - [ ] Screen-reader-driven actions (set value, navigate by word/line)
@@ -342,10 +342,14 @@ here so they are not silently lost between phases.
 
 ## Next three actions
 
-1. **Run the a11y/IME checklist on Windows and Linux** — macOS is done (9/10,
-   [full results](spike/a11y-ime/FINDINGS.md)) and nothing found there is
-   structural. Windows (UIA) and Linux (AT-SPI) are different platform APIs
-   entirely and remain the only thing that can still overturn ADR 0001.
+1. **Run the human/Orca leg of the a11y/IME checklist on Linux, and the whole
+   checklist on Windows** — macOS is done (9/10,
+   [full results](spike/a11y-ime/FINDINGS.md)). Linux build and standalone
+   tree construction are now confirmed (2026-07-26), but the decisive test —
+   a human at a live desktop session with Orca actually speaking — still
+   needs a machine with an active graphical login, which was not available
+   this pass. Windows (UIA) is fully unstarted. Both are different platform
+   APIs entirely and remain the only thing that can still overturn ADR 0001.
 2. **Start 0.5, the token vocabulary** — yours as design owner, blocks every
    widget, needs no engine code, and can run in parallel with everything else.
 3. **Extend the text-layer corpus further, or move on to run-length/glyph

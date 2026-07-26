@@ -144,7 +144,35 @@ working from a copy here, which would drift.
 |---|---|---|
 | **macOS** | **VoiceOver** | **9/10 — see below** |
 | Windows | Narrator (UIA — a *different* API; macOS success does not carry over) | **not run** |
-| Linux | Orca (AT-SPI) | **not run** |
+| Linux | Orca (AT-SPI) | **build/tree confirmed 2026-07-26; live human test still not run — see below** |
+
+### Linux — build and tree construction confirmed, Orca leg still blocked
+
+2026-07-26: `cargo build --release` is clean on Linux (toolchain 1.97.1),
+and pulls in `accesskit`'s Unix backend (`accesskit_atspi_common`,
+`accesskit_unix`) as expected — the AT-SPI path exists and compiles.
+`cargo run -- --dump-tree` runs with no window and no display, and shows
+the tree building correctly in both idle and mid-composition states (role,
+label, value, and the composition description all present, same shape as
+the macOS output).
+
+This is **not** the decisive test. Exactly like macOS, the thing that
+settles anything is a human running the interactive checklist
+(`cargo run`, no flag) at a live desktop session with Orca actually
+speaking, and confirming by ear. That could not be done in this pass: the
+machine had no active graphical login session for the test user — only the
+GDM login screen was up (`loginctl` showed a greeter session on seat0, no
+logged-in desktop) — and there was no way to log into a graphical session
+remotely to drive Orca's speech output. Standing up a substitute (nested
+Wayland/X compositor via Xvfb/sway, etc.) was considered and rejected here:
+none of that tooling was installed, and even with it, checking
+speech-dispatcher's text log instead of a human listening would be a
+materially weaker check than the macOS process used, not an equivalent one.
+
+**Still needed:** a human logged into a real Linux desktop session (this
+machine or another), Orca running, executing `cargo run` and answering the
+same ten-item checklist as macOS (ctrl+Y/N/K/B, Esc to write
+`result-linux.md`).
 
 ### macOS / VoiceOver — human-verified 2026-07-26
 

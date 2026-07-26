@@ -111,10 +111,50 @@ how UVs are computed.
 5. **A latency regression test in CI** from the first Phase 1 commit, since the
    brush budget has under 1 ms of margin today.
 
+## Second platform: Linux / Vulkan (2026-07-26)
+
+Ran the same unmodified `--headless` benchmark on Linux: **NVIDIA GeForce
+RTX 3090, driver 560.35.03, `wgpu` backend Vulkan** (confirmed via
+`adapter.get_info()`) — a discrete desktop GPU, the opposite end of the
+spectrum from the mobile AMD part macOS was measured on. Toolchain 1.97.1
+matches the pin; `cargo build --release` is clean workspace-wide.
+
+Caveat before the numbers: this machine is a shared, multi-user dev box (8
+cores, ~28 concurrent login sessions, load average ~1 at test time), not a
+dedicated bench rig, so treat variance between runs as partly environmental
+noise, not pure signal. Ran the benchmark 6 times.
+
+| Measurement | Budget | Linux (Vulkan/RTX 3090) | macOS (Metal/5300M) | Verdict |
+|---|---|---|---|---|
+| Stroke latency (p99) | 10 ms | **~2.0 ms**, consistent across 6 runs | 9.1 ms | Comfortable — far more headroom than macOS |
+| Idle frame (p99) | 16.7 ms | **~0.1–0.3 ms** | 0.8 ms | Comfortable |
+| Pan with page-in (p99) | 16.7 ms | **~4–10.6 ms** | 16.7 ms | Comfortable — more headroom than macOS |
+| Pan while painting (p99) | 16.7 ms | **12–23 ms, straddling the line** — over budget in 3 of 6 runs, within it in 3 | 29.2–34.6 ms, **clearly over** | **Marginal**, not a clean pass |
+| Save/reload round-trip | — | bit-exact, all 6 runs | bit-exact | Confirms §7.3.6b on a second platform |
+
+The one budget macOS clearly failed (pan while painting — CPU tile merge
+dominating the frame) is **not clearly failing on Linux, but not clearly
+passing either**: `stroke + merge (CPU)` p99 ranged 12.5–22.9 ms across runs
+against the same 16.7 ms budget, flipping between "within budget" and "over
+budget" between otherwise-identical runs. Given the shared-machine caveat
+above, this is read as the same architectural bottleneck (whole-tile CPU
+merge, identified in finding 1) reproducing on a second, unrelated GPU and
+API — a discrete NVIDIA/Vulkan machine, not just a mobile AMD/Metal one —
+which strengthens rather than weakens the case for per-tile dirty rectangles
+and GPU-side compositing. It does **not** newly invalidate anything: the
+fix already recommended (dirty rects + GPU compositing) is unchanged by this
+run, and the noisier result argues for building the CI regression test
+(0.2) against a quieter reference machine than this one.
+
+This satisfies PLAN.md 0.3's "run on Linux (Vulkan backend unvalidated)."
+Windows (DX12) and the 300,000 px ceiling remain unmeasured.
+
 ## Honest limitations
 
-- One machine, one GPU, one OS. Windows and Linux are unmeasured, and `wgpu`'s
-  DX12 and Vulkan backends may differ materially.
+- One GPU per platform measured so far (AMD Radeon Pro 5300M / Metal on
+  macOS; NVIDIA RTX 3090 / Vulkan on Linux, see above). Windows/DX12 is
+  still unmeasured, and the Linux run was on a noisy shared machine rather
+  than a dedicated bench rig.
 - Single-threaded throughout; no attempt at overlapping I/O with rendering.
 - The brush is a circle with a falloff — no texture, no dual brush, no
   stabilization. A real brush engine does considerably more work per dab.
