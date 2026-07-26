@@ -39,7 +39,12 @@ impl Layer {
     }
     fn plane(&self, channel: usize) -> Vec<u8> {
         // PSD stores channels planar; Aurora holds them interleaved.
-        self.pixels.iter().skip(channel).step_by(4).copied().collect()
+        self.pixels
+            .iter()
+            .skip(channel)
+            .step_by(4)
+            .copied()
+            .collect()
     }
 }
 
@@ -274,7 +279,12 @@ impl Document {
                 * (record.rect.3 - record.rect.1).max(0) as usize;
             let mut per_channel = Vec::new();
             // Order must match the channel-info order below: alpha, R, G, B.
-            for plane in [&record.channels[3], &record.channels[0], &record.channels[1], &record.channels[2]] {
+            for plane in [
+                &record.channels[3],
+                &record.channels[0],
+                &record.channels[1],
+                &record.channels[2],
+            ] {
                 let mut blob = Out::default();
                 blob.u16(0); // compression: raw
                 debug_assert_eq!(plane.len(), n);

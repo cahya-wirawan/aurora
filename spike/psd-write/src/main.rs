@@ -5,12 +5,14 @@
 //! rests on that being feasible. This writes a real layered PSD from scratch so
 //! the assumption can be checked against independent readers.
 //!
-//!   cargo run          writes out/spike.psd
+//!   cargo run                writes out/spike.psd
+//!   cargo run -- --tysh-demo parses+patches a real Photoshop text layer (see descriptor.rs)
 //!
 //! Verification is external, in `verify.sh`: Apple's system decoder (`sips`)
 //! and `psd-tools`. Neither is Photoshop — that check remains outstanding — but
 //! both are independent of this writer, which is the property that matters.
 
+mod descriptor;
 mod psd;
 
 use psd::{Document, Group, Item, Layer};
@@ -44,6 +46,10 @@ fn swatch(w: u32, h: u32, rgb: [u8; 3], feather: f32) -> Vec<u8> {
 }
 
 fn main() -> std::io::Result<()> {
+    if std::env::args().any(|a| a == "--tysh-demo") {
+        return tysh_demo();
+    }
+
     // Written bottom-up throughout: PSD stores the layer list from the bottom
     // of the stack upwards, the opposite of how a layers panel reads. Groups
     // follow the same convention for their own children.
@@ -122,6 +128,65 @@ fn main() -> std::io::Result<()> {
     println!("wrote out/spike.psd — {} bytes", bytes.len());
     print_tree(&doc.items, 0);
     println!("\nNow run ./verify.sh — this program cannot mark its own homework.");
+    Ok(())
+}
+
+/// Parses a real Photoshop-authored `TySh` block (extracted from psd-tools'
+/// own `text.psd` test fixture — see `reference/README.md` and
+/// `descriptor.rs`), patches its text content, and reports what changed.
+///
+/// This does NOT write a full PSD file — that full-file, independently
+/// verified (psd-tools + sips + visual inspection) round trip was done as a
+/// Python proof-of-concept, documented in FINDINGS.md, precisely because a
+/// full Rust-side file splice wasn't warranted for a spike once the format
+/// understanding itself was validated here. See FINDINGS.md for the scope
+/// boundary and what's left for a real implementation.
+fn tysh_demo() -> std::io::Result<()> {
+    let real_tysh = include_bytes!("../reference/tysh.bin");
+    let mut tysh = descriptor::parse_fixture(real_tysh)?;
+
+    println!(
+        "Parsed a real Photoshop TySh block ({} bytes)",
+        real_tysh.len()
+    );
+    println!(
+        "  version={} text_version={}",
+        tysh.version, tysh.text_version
+    );
+    println!("  text: {:?}", tysh.text());
+    println!("  bbox: {:?}  transform: {:?}", tysh.bbox, tysh.transform);
+
+    let before = tysh.to_bytes();
+    let reparsed_before = descriptor::parse_fixture(&before)?;
+    assert_eq!(
+        reparsed_before, tysh,
+        "unmodified re-serialize must round-trip"
+    );
+    println!(
+        "\nUnmodified round-trip: {} bytes (same length as source: {}), \
+         semantically identical on re-parse.",
+        before.len(),
+        before.len() == real_tysh.len()
+    );
+
+    tysh.set_text("Aurora spike\u{0}");
+    let after = tysh.to_bytes();
+    let reparsed_after = descriptor::parse_fixture(&after)?;
+    println!("\nPatched text to: {:?}", reparsed_after.text());
+    println!(
+        "New size: {} bytes (was {}) — shrank because the new `Txt ` string is \
+         shorter; EngineData and warp bytes themselves are untouched",
+        after.len(),
+        before.len()
+    );
+
+    println!(
+        "\nNote: only the top-level `Txt ` field was patched. The nested \
+         EngineData.Editor.Text and StyleRun/ParagraphRun content (what \
+         Photoshop's own text engine actually renders), plus the layer's \
+         rasterized pixel preview, still reflect the old text — see \
+         FINDINGS.md finding 8, the pixel/vector sync gap."
+    );
     Ok(())
 }
 

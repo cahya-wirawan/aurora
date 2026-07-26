@@ -36,7 +36,7 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | Performance validation | **Measured** — budgets hold, with one correction |
 | Accessibility & IME | **macOS verified (9/10)** — Windows/Linux outstanding |
 | Design language | Not started — blocked on design owner time |
-| PSD write feasibility | **Proven tractable** — text layers still unassessed |
+| PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | Not started |
 
 **The single most important open item, updated:** on macOS, a screen reader
@@ -144,7 +144,9 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
 - [x] PSD write spike — layer file with names, alpha, opacity, blend modes, visibility, Unicode names; verified by two independent readers with layer pixels checked
 - [x] **Layer groups** — 2-level nesting, open/closed state, membership, and multiply-blend compositing through nested groups; structural assertions in `verify.sh`, pixel math checked by hand, not just eyeballed
 - [!] **Verify in Photoshop itself** — no licence available; the only check that settles ADR 0004
-- [ ] Text layer (`TySh`) spike — the largest remaining unknown, and ADR 0004 promises it
+- [x→bigger] **Text layer (`TySh`) spike — container format tractable, but scope grew.** Downloaded a real Photoshop-authored text layer (a `psd-tools` test fixture) and read its structure before writing code. `TySh`'s own container is small (6 fields) and its byte layout is now implemented in Rust (`src/descriptor.rs`, 4 tests, all against real extracted bytes) — parses, patches, and round-trips real Photoshop data correctly. **But `EngineData` (the actual text/styling content) is far richer than expected** — full kinsoku/moji-kumi tables, duplicated resource dicts, even for plain English text — making from-scratch generation genuinely higher-risk than assumed. The validated lower-risk path is patch-a-real-file rather than generate-from-scratch (proven end-to-end in Python, independently verified by `psd-tools` + `sips`). **Found a new, mandatory, previously-unscoped requirement: editing text content requires rendering actual glyphs into the layer's pixel channels**, or the file is internally inconsistent (descriptor says new text, pixels still show old text) — confirmed by direct visual inspection. This is now the single biggest addition to Phase 3 scope from any spike so far.
+- [ ] `EngineData`'s own text-format writer (patch-in-place only, so far — see above)
+- [ ] Glyph rendering into pixel channels on text edit — **new, mandatory, unscoped work surfaced by the above**
 - [ ] Layer masks, vector masks, smart objects, layer styles, adjustment layers
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
@@ -327,6 +329,10 @@ here so they are not silently lost between phases.
 | The flattened preview must apply blend modes, or 44 % of pixels differ | psd | Phase 3 — write the flatten through the real render graph |
 | Layer names need both the legacy Pascal string and the `luni` block | psd | Phase 3 |
 | Groups are two bracketing pseudo-layers (bounding + folder record), not a container field — order confirmed against a working implementation, not guessed | psd | Phase 3 `aurora-io` group support |
+| Real `EngineData` is far richer than a minimal example (kinsoku/moji-kumi tables, duplicated resource dicts) even for plain English text — from-scratch generation is higher-risk than assumed | psd | Phase 3 — patch a real file's bytes instead of generating from scratch |
+| Editing text content requires rendering glyphs into pixel channels, or the file is internally inconsistent (descriptor vs. preview mismatch) | psd | **New, mandatory Phase 3 scope** — needs Aurora's text stack (`cosmic-text`/`glyphon`) wired into `aurora-io`, not previously planned |
+| `TySh`'s `text_data`/`warp` fields are `DescriptorBlock` (extra leading version field), not plain `Descriptor` — desyncs silently if missed | psd | Phase 3 `aurora-io` — captured in `descriptor.rs` |
+| The Descriptor format's zero-length key shorthand means byte-identical round-trip is the wrong test; same-length + semantic-identity is correct | psd | Phase 3 test design for `aurora-io` |
 
 ---
 
@@ -338,14 +344,20 @@ here so they are not silently lost between phases.
    entirely and remain the only thing that can still overturn ADR 0001.
 2. **Start 0.5, the token vocabulary** — yours as design owner, blocks every
    widget, needs no engine code, and can run in parallel with everything else.
-3. **Spike PSD text layers (0.6)** — groups are done and verified; text is the
-   largest remaining unknown in Phase 3. Unlike groups, the `TySh`/Descriptor/
-   `EngineData` binary format is sparsely and inconsistently documented, so this
-   needs spec research (via a working implementation, per finding 5) *before*
-   writing bytes — guessing here risks repeating findings 1–2 on a much larger
-   surface. Budget more time for it than the groups spike took.
+3. **Build a small real-world text-layer corpus** (extending PLAN 0.7 early) —
+   the PSD text-layer spike found that hand-generating `EngineData` from
+   scratch is genuinely risky, but patching real files is validated and
+   low-risk. The next step isn't more research, it's collecting a handful of
+   real Photoshop text layers (multi-style runs, paragraph vs. point text,
+   warped text) to build the writer against, the same way the spike's
+   proof-of-concept did for the simple case.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
 (finding 5/6 in the a11y results) to see if it fixes both the navigation-depth
 quirk and the live-announcement bug in one change.
+
+**Newly surfaced, not yet scheduled:** glyph rendering into pixel channels on
+text edit (PSD spike finding 8) is mandatory Phase 3 work with no prior line
+item — needs a home in the M1.x/Phase 3 breakdown once Phase 3 is planned in
+detail.
