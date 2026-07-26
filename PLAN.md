@@ -90,9 +90,15 @@ Evidence: [spike/FINDINGS.md](spike/FINDINGS.md), `spike/vertical-slice/`
 - [ ] Run on Linux *(Vulkan backend unvalidated)*
 - [ ] Re-run at the 300,000 px ceiling *(only 100,000 px tested)*
 
-### 0.4 Accessibility and IME spike — **partial, and blocking**
+### 0.4 Accessibility and IME spike — **partial; human verification deferred**
 
 Evidence: [spike/a11y-ime/FINDINGS.md](spike/a11y-ime/FINDINGS.md)
+
+**Deferred 2026-07-26 by explicit decision, not forgotten.** The checklist tool
+is ready (`cargo run` in `spike/a11y-ime/`); running it is 5–10 minutes with
+VoiceOver on macOS alone. Still the single highest-value open item in Phase 0 —
+resume it before Phase 1 widget work starts, since it's the last thing that can
+overturn ADR 0001.
 
 - [x] `accesskit` tree construction — role, label, value, focus, composition state
 - [x] Platform adapter initializes; window runs stably
@@ -126,10 +132,11 @@ be retrofitted cheaply). Runs in parallel with 0.3/0.6; needs no engine code.
 
 Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
 
-- [x] PSD write spike — 5-layer file with names, alpha, opacity, blend modes, visibility, Unicode names; verified by two independent readers with layer pixels checked
+- [x] PSD write spike — layer file with names, alpha, opacity, blend modes, visibility, Unicode names; verified by two independent readers with layer pixels checked
+- [x] **Layer groups** — 2-level nesting, open/closed state, membership, and multiply-blend compositing through nested groups; structural assertions in `verify.sh`, pixel math checked by hand, not just eyeballed
 - [!] **Verify in Photoshop itself** — no licence available; the only check that settles ADR 0004
 - [ ] Text layer (`TySh`) spike — the largest remaining unknown, and ADR 0004 promises it
-- [ ] Groups, masks, smart objects, layer styles, adjustment layers
+- [ ] Layer masks, vector masks, smart objects, layer styles, adjustment layers
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
 - [ ] ICC transform spike — `lcms2` binding, and the LGPL linking question (PRD §14)
@@ -307,14 +314,20 @@ here so they are not silently lost between phases.
 | A reader accepting a PSD proves little; gate on pixel comparison | psd | Phase 3 gate (already worded this way in PRD §9) |
 | The flattened preview must apply blend modes, or 44 % of pixels differ | psd | Phase 3 — write the flatten through the real render graph |
 | Layer names need both the legacy Pascal string and the `luni` block | psd | Phase 3 |
+| Groups are two bracketing pseudo-layers (bounding + folder record), not a container field — order confirmed against a working implementation, not guessed | psd | Phase 3 `aurora-io` group support |
 
 ---
 
 ## Next three actions
 
-1. **Run the a11y/IME checklist on macOS** — 10 minutes, and it is the last thing
-   that can overturn a foundational decision. [Checklist](spike/a11y-ime/FINDINGS.md).
-2. **Start 0.5, the token vocabulary** — blocks every widget, needs no engine code,
-   and can run in parallel with everything else.
-3. **Spike PSD text layers (0.6)** — the container and layer records are now
-   proven tractable; editable text is the largest remaining unknown in Phase 3.
+1. **Run the a11y/IME checklist on macOS** — deferred by explicit decision
+   2026-07-26, not forgotten. Still the last thing that can overturn ADR 0001;
+   resume before Phase 1 widget work starts. [Checklist](spike/a11y-ime/FINDINGS.md).
+2. **Start 0.5, the token vocabulary** — yours as design owner, blocks every
+   widget, needs no engine code, and can run in parallel with everything else.
+3. **Spike PSD text layers (0.6)** — groups are done and verified; text is the
+   largest remaining unknown in Phase 3. Unlike groups, the `TySh`/Descriptor/
+   `EngineData` binary format is sparsely and inconsistently documented, so this
+   needs spec research (via a working implementation, per finding 5) *before*
+   writing bytes — guessing here risks repeating findings 1–2 on a much larger
+   surface. Budget more time for it than the groups spike took.

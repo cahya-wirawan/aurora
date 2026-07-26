@@ -15,10 +15,11 @@ cargo run        # writes out/spike.psd
 
 ## Verdict: feasible, and the easy 80 % is genuinely easy
 
-A hand-written PSD with five layers — names, positions, per-layer alpha,
-opacity, blend modes, visibility, and a non-ASCII name — is accepted by two
-independent readers, with layer pixel data verified correct and the flattened
-preview matching a re-composite from layer data to within rounding.
+A hand-written PSD with a nested layer tree — a top-level layer, a two-level
+group hierarchy, per-layer alpha, opacity, blend modes, visibility, and a
+non-ASCII name — is accepted by two independent readers, with layer pixel data
+verified correct and the flattened preview matching hand-computed blend math
+exactly.
 
 **But "accepted by a reader" is a much weaker claim than it sounds**, and the
 findings below are mostly about that gap.
@@ -34,6 +35,8 @@ findings below are mostly about that gap.
 | Per-layer pixel data (centre-pixel RGBA per layer) | Correct for all 5 |
 | Non-ASCII layer name (`レイヤー 5`) | Correct, via the `luni` block |
 | Flattened preview vs re-composite from layers | Max channel delta 3 (rounding) |
+| **Groups: 2-level nesting, open/closed state, membership** | Correct (asserted in `verify.sh`, not just eyeballed) |
+| **Multiply-blend compositing through nested groups** | Exact match to hand-computed pixel value |
 
 **Not verified: Photoshop itself.** No copy was available. That check is still
 outstanding and is the only one that settles ADR 0004. Everything here is a
@@ -94,11 +97,32 @@ for a professional tool with international users.
 
 None is hard. All are silent when wrong.
 
+### 5. Groups are two invisible pseudo-layers, and the order is load-bearing
+
+A group is not a container field on a layer record — it is represented by
+**two extra zero-sized layer records** bracketing its members: a "bounding
+divider" (`lsct` kind 3) at the *bottom* of the group's span, the member
+records in between, and a "folder" record (`lsct` kind 1 open / 2 closed) at
+the *top*, which is the one that actually carries the group's name, opacity,
+blend mode, and visibility. Nesting is just recursion — a sub-group's own
+bounding/folder pair sits inside its parent's span like any other member.
+
+This was **not derived from the spec text** but confirmed by reading
+`psd-tools`' own writer (`Group.new()` and `_build_record_tree()` in its
+source) before writing a single byte, specifically because a plausible-looking
+*wrong* order — bounding-first vs folder-first, which end holds the metadata —
+would have produced exactly the kind of silently-broken file findings 1 and 2
+already caught once. Trusting a working implementation over a guess at binary
+layout was cheaper than debugging a mis-ordered group from the reader's side.
+
+Open vs closed is UI-only — a closed group's contents still composite
+normally, which the implementation had to get right rather than assume.
+
 ## Scope: what this did *not* touch
 
-Deliberately the easy 20 % of the work. Untested and unimplemented:
+Groups are done; the rest is still the easy-versus-hard split. Untested and
+unimplemented:
 
-- Groups and nesting (`lsct` section dividers)
 - Layer masks and vector masks
 - **Editable text layers** (`TySh`) — the hardest single item, and one ADR 0004
   promises
@@ -128,3 +152,7 @@ text layers in particular remain unassessed.
    (FR-001) has to cover it explicitly.
 5. **Get a Photoshop licence for verification.** Nothing else settles ADR 0004,
    and an independent reader agreeing is not evidence that Photoshop will.
+6. **When a binary layout is ambiguous from the spec text alone, read a
+   working implementation rather than infer it** (finding 5). This cost one
+   search and a few minutes of reading; guessing wrong would have cost a
+   session of debugging a file that opens but composites incorrectly.
