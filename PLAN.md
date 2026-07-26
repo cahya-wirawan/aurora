@@ -34,15 +34,18 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | Requirements & architecture | Settled and written down (PRD v1.6, 4 ADRs) |
 | Workspace & CI | Built and green |
 | Performance validation | **Measured** — budgets hold, with one correction |
-| Accessibility & IME | **Partially verified — the decisive test is unrun** |
+| Accessibility & IME | **macOS verified (9/10)** — Windows/Linux outstanding |
 | Design language | Not started — blocked on design owner time |
 | PSD write feasibility | **Proven tractable** — text layers still unassessed |
 | RAW / ICC feasibility | Not started |
 
-**The single most important open item:** nobody has confirmed a screen reader
-speaks a custom-drawn text field, or that CJK composition works. Until that is
-done, [ADR 0001](docs/adr/0001-custom-wgpu-ui.md) (custom UI on `wgpu`) is not
-de-risked, and it is the most expensive decision in the project to reverse.
+**The single most important open item, updated:** on macOS, a screen reader
+does speak a custom-drawn text field, and CJK composition works — human-verified
+2026-07-25/26, [full results](spike/a11y-ime/FINDINGS.md). Nothing found rises to
+[ADR 0001](docs/adr/0001-custom-wgpu-ui.md)'s structural escape-hatch trigger. What
+remains open is **Windows (UIA) and Linux (AT-SPI)** — different APIs entirely,
+and macOS passing says nothing about them — plus one real but non-structural bug
+(live value-change announcements don't reach VoiceOver).
 
 ---
 
@@ -90,31 +93,37 @@ Evidence: [spike/FINDINGS.md](spike/FINDINGS.md), `spike/vertical-slice/`
 - [ ] Run on Linux *(Vulkan backend unvalidated)*
 - [ ] Re-run at the 300,000 px ceiling *(only 100,000 px tested)*
 
-### 0.4 Accessibility and IME spike — **partial; human verification deferred**
+### 0.4 Accessibility and IME spike — **macOS verified (9/10); Windows/Linux outstanding**
 
 Evidence: [spike/a11y-ime/FINDINGS.md](spike/a11y-ime/FINDINGS.md)
 
-**Deferred 2026-07-26 by explicit decision, not forgotten.** The checklist tool
-is ready (`cargo run` in `spike/a11y-ime/`); running it is 5–10 minutes with
-VoiceOver on macOS alone. Still the single highest-value open item in Phase 0 —
-resume it before Phase 1 widget work starts, since it's the last thing that can
-overturn ADR 0001.
+**Human-verified on macOS 2026-07-26**, two consecutive runs. Role, label,
+value, focus, screen-reader navigation, and full CJK IME composition (preedit,
+correctly-positioned candidates, commit) all confirmed via VoiceOver on a
+custom-rendered `wgpu` field. **Nothing found rises to ADR 0001's structural
+escape-hatch trigger** — one real bug found (live value-change announcements)
+and diagnosed down to a specific, non-structural cause.
 
 - [x] `accesskit` tree construction — role, label, value, focus, composition state
 - [x] Platform adapter initializes; window runs stably
 - [x] `winit` IME plumbing wired (`set_ime_allowed`, `set_ime_cursor_area`)
 - [x] Custom text field: insert, backspace (char-wise), cursor motion, preedit
-- [!] **VoiceOver announces the field (macOS)** — needs a human to listen
-- [!] **Narrator announces the field (Windows, UIA — a different API; macOS success does not carry over)**
-- [!] **Orca announces the field (Linux, AT-SPI)**
-- [!] **CJK composition commits correctly** (Pinyin, kana→kanji, jamo)
-- [!] **IME candidate window appears at the field**, not the window corner
+- [x] **VoiceOver announces the field (macOS)** — role, label, value, focus all PASS
+- [x] **CJK composition commits correctly (macOS)** — preedit, commit both PASS
+- [x] **IME candidate window appears at the field (macOS)** — PASS, `set_ime_cursor_area` confirmed working
+- [!] **Narrator announces the field (Windows, UIA — a different API; macOS success does not carry over)** — not run, no Windows machine tested yet
+- [!] **Orca announces the field (Linux, AT-SPI)** — not run
+- [x→bug] **Live value-change announcements (macOS)** — FAILS; typing updates the tree correctly every keystroke (confirmed via debug logging) but VoiceOver never announces it. Traced into `accesskit_macos` source — looks like a real, narrow implementation bug, not a platform inability. Candidate root cause: `Role::Window` nested inside a real native window (same suspect as the navigation-depth finding below)
+- [~] **Screen-reader linear navigation (macOS)** — reaches the label, but only via VoiceOver's "interact" command, not plain arrow keys; confirmed present via the Rotor. Worth a quick experiment: try a plainer root role than `Role::Window`
 - [ ] Screen-reader-driven actions (set value, navigate by word/line)
 - [ ] `TextSelection` exposed in the tree
+- [ ] Dead-key accent composition (macOS) — optional; one attempt was confounded by the CJK IME still being active, left honestly unanswered rather than guessed
 
-> **If any of the blocked rows fails *structurally* — AccessKit cannot express it
-> on that platform, rather than needing more code — that is ADR 0001's
-> escape-hatch trigger. Reconsider CXX-Qt before the widget toolkit is written.**
+> **Nothing found on macOS meets ADR 0001's structural bar** — AccessKit and
+> winit *can* express role/label/focus/IME through a custom-rendered field.
+> The open question is now Windows and Linux, not whether this is feasible at
+> all. Revisit the escape hatch only if one of those surfaces something
+> AccessKit genuinely cannot express on that platform.
 
 ### 0.5 Design language — not started
 
@@ -311,6 +320,9 @@ here so they are not silently lost between phases.
 | Windows must be created hidden, adapted, then shown | a11y | M1.8 |
 | Composition state must be announced, or CJK users hear silence | a11y | M1.7 |
 | Text stack sets the toolchain floor | a11y | done — pinned 1.97 |
+| A `Role::Window`-shaped root nested in a real window may need VoiceOver "interact" before plain arrow navigation reaches children | a11y | M1.7 — try a plainer root role in `aurora-widgets` |
+| Live value-change announcements can silently fail to reach VoiceOver even when the tree updates correctly every keystroke | a11y | M1.7 — needs a regression test that doesn't just build the tree but confirms delivery |
+| The Rotor (VO+U) is a more reliable diagnostic than step-by-step arrow navigation when debugging screen-reader delivery | a11y | process note for whoever runs Windows/Linux |
 | A reader accepting a PSD proves little; gate on pixel comparison | psd | Phase 3 gate (already worded this way in PRD §9) |
 | The flattened preview must apply blend modes, or 44 % of pixels differ | psd | Phase 3 — write the flatten through the real render graph |
 | Layer names need both the legacy Pascal string and the `luni` block | psd | Phase 3 |
@@ -320,9 +332,10 @@ here so they are not silently lost between phases.
 
 ## Next three actions
 
-1. **Run the a11y/IME checklist on macOS** — deferred by explicit decision
-   2026-07-26, not forgotten. Still the last thing that can overturn ADR 0001;
-   resume before Phase 1 widget work starts. [Checklist](spike/a11y-ime/FINDINGS.md).
+1. **Run the a11y/IME checklist on Windows and Linux** — macOS is done (9/10,
+   [full results](spike/a11y-ime/FINDINGS.md)) and nothing found there is
+   structural. Windows (UIA) and Linux (AT-SPI) are different platform APIs
+   entirely and remain the only thing that can still overturn ADR 0001.
 2. **Start 0.5, the token vocabulary** — yours as design owner, blocks every
    widget, needs no engine code, and can run in parallel with everything else.
 3. **Spike PSD text layers (0.6)** — groups are done and verified; text is the
@@ -331,3 +344,8 @@ here so they are not silently lost between phases.
    needs spec research (via a working implementation, per finding 5) *before*
    writing bytes — guessing here risks repeating findings 1–2 on a much larger
    surface. Budget more time for it than the groups spike took.
+
+Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
+retry the a11y spike's root node with a plainer role than `Role::Window`
+(finding 5/6 in the a11y results) to see if it fixes both the navigation-depth
+quirk and the live-announcement bug in one change.

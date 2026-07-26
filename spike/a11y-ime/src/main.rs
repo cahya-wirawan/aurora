@@ -122,6 +122,15 @@ impl App {
         };
         let field = &self.field;
         let focused = self.focused;
+        // On macOS, update_if_active() silently drops the update with no error
+        // if the platform adapter doesn't believe an AT is listening, or if
+        // `focused` doesn't point at this node — VoiceOver only announces
+        // changes to whatever it believes currently has focus. Logging both,
+        // since either explains "visual update works, VoiceOver stays silent".
+        eprintln!(
+            "[a11y] push_a11y: value={:?} self.focused={} a11y_activated={}",
+            field.text, focused, self.a11y_activated
+        );
         adapter.update_if_active(|| tree::update(field, focused));
     }
 }
