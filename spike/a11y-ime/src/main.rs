@@ -14,10 +14,12 @@
 //! `--dump-tree` proves the tree is *built*; the checklist below proves it is
 //! *delivered*.
 
+mod checklist;
 mod field;
 mod tree;
 
 use accesskit_winit::Adapter;
+use checklist::{Checklist, Context, Verdict};
 use field::TextField;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -37,6 +39,12 @@ const FIELD_H: f32 = 44.0;
 fn main() {
     if std::env::args().any(|a| a == "--dump-tree") {
         tree::dump();
+        return;
+    }
+    // Renders the result file from sample answers, so the report format can be
+    // reviewed without a GUI, a screen reader, or an IME.
+    if std::env::args().any(|a| a == "--demo-report") {
+        checklist::demo_report();
         return;
     }
     windowed();
@@ -63,6 +71,12 @@ struct App {
     field: TextField,
     ime_events: Vec<String>,
     focused: bool,
+    modifiers: winit::keyboard::ModifiersState,
+    checklist: Checklist,
+    /// Set when the platform actually asks for the tree, i.e. an assistive
+    /// technology connected. Observed rather than self-reported.
+    a11y_activated: bool,
+    backend: String,
 }
 
 impl App {
@@ -73,23 +87,21 @@ impl App {
         // platform's underline styles.
         let display = self.field.display_text();
         let info = format!(
-            "Aurora accessibility + IME spike\n\
-             \n\
-             Field value: {:?}\n\
-             Cursor: {}   Preedit: {:?}\n\
-             \n\
-             {}\n\
-             \n\
-             IME events seen ({}):\n{}",
-            self.field.text,
-            self.field.cursor,
-            self.field.preedit,
+            "{}\n\
+             ----------------------------------------------------------\n\
+             Type here: {}\n\
+             value {:?}   preedit {:?}\n\
+             AT connected: {}   IME events: {}\n{}",
+            self.checklist.screen_text(),
             display,
+            self.field.text,
+            self.field.preedit,
+            if self.a11y_activated { "YES" } else { "not yet" },
             self.ime_events.len(),
             self.ime_events
                 .iter()
                 .rev()
-                .take(6)
+                .take(3)
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -156,6 +168,8 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         }))
         .expect("device");
 
+        self.backend = format!("{:?}", adapter_gpu.get_info().backend);
+
         let size = window.inner_size();
         let config = surface
             .get_default_config(&adapter_gpu, size.width.max(1), size.height.max(1))
@@ -199,10 +213,17 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         // "set value" or "move cursor" arrive here rather than from the keyboard.
         match event.window_event {
             accesskit_winit::WindowEvent::InitialTreeRequested => {
+                // The platform only asks for a tree when something is listening.
+                self.a11y_activated = true;
                 self.push_a11y();
+                self.rebuild_text();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             accesskit_winit::WindowEvent::ActionRequested(req) => {
                 println!("screen reader requested action: {:?}", req.action);
+                self.a11y_activated = true;
                 self.field.handle_action(&req);
                 self.rebuild_text();
                 self.push_a11y();
@@ -260,12 +281,49 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                     w.request_redraw();
                 }
             }
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 use winit::event::ElementState;
                 use winit::keyboard::{Key, NamedKey};
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // Checklist controls use ctrl+ so plain typing — and IME
+                // composition — still reach the field untouched.
+                if self.modifiers.control_key() {
+                    let handled = match &event.logical_key {
+                        Key::Character(c) => match c.as_str() {
+                            "y" | "Y" => {
+                                self.checklist.record(Verdict::Pass);
+                                true
+                            }
+                            "n" | "N" => {
+                                self.checklist.record(Verdict::Fail);
+                                true
+                            }
+                            "k" | "K" => {
+                                self.checklist.record(Verdict::Skipped);
+                                true
+                            }
+                            "b" | "B" => {
+                                self.checklist.back();
+                                true
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    if handled {
+                        self.rebuild_text();
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                }
+
                 // While composing, the platform owns the keystrokes.
                 if !self.field.preedit.is_empty() {
                     return;
@@ -372,15 +430,18 @@ impl App {
     }
 
     fn report(&self) {
-        println!("\n--- session summary ---");
-        println!("final field value: {:?}", self.field.text);
-        println!("IME events seen:   {}", self.ime_events.len());
-        for e in &self.ime_events {
-            println!("  {e}");
-        }
-        if self.ime_events.is_empty() {
-            println!("\n  NO IME EVENTS. Either no IME was used, or winit is not");
-            println!("  delivering them on this platform — the latter would be a finding.");
+        let ctx = Context {
+            platform: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            backend: self.backend.clone(),
+            a11y_activated: self.a11y_activated,
+            ime_events: self.ime_events.clone(),
+            field_text: self.field.text.clone(),
+        };
+        let report = self.checklist.report(&ctx);
+        let name = format!("result-{}.md", std::env::consts::OS);
+        match std::fs::write(&name, &report) {
+            Ok(()) => println!("\n{report}\n--- written to {name} ---"),
+            Err(e) => println!("\n{report}\n(could not write {name}: {e})"),
         }
     }
 }
@@ -397,7 +458,8 @@ fn windowed() {
     println!("     It should announce a text field, its label, and its current value.");
     println!("  2. Switch to a CJK input method and compose — e.g. Pinyin \"ni hao\".");
     println!("     Preedit should appear inline and Commit should insert the characters.");
-    println!("  3. Esc or close the window for a summary.\n");
+    println!("  3. Answer each item with ctrl+Y / ctrl+N / ctrl+K (skip).");
+    println!("  4. Esc when done — a result-<os>.md file is written for pasting.\n");
 
     let mut app = App {
         window: None,
@@ -406,6 +468,10 @@ fn windowed() {
         field: TextField::default(),
         ime_events: Vec::new(),
         focused: false,
+        modifiers: winit::keyboard::ModifiersState::empty(),
+        checklist: Checklist::default(),
+        a11y_activated: false,
+        backend: String::from("unknown"),
         proxy,
     };
     el.run_app(&mut app).expect("run");

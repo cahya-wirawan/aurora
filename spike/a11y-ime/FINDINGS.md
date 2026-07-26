@@ -6,9 +6,22 @@ Reproduce:
 
 ```sh
 cd spike/a11y-ime
-cargo run -- --dump-tree   # tree construction, no window
-cargo run                  # windowed; needs a human with a screen reader
+cargo run -- --dump-tree     # accessibility tree, no window
+cargo run -- --demo-report   # what a completed result file looks like
+cargo run                    # the actual test; needs a human
 ```
+
+**Running the test.** The window shows a ten-item checklist, one item at a time
+with instructions. Answer each with **ctrl+Y** (pass), **ctrl+N** (fail), or
+**ctrl+K** (skip); **ctrl+B** goes back. Plain typing and IME composition are
+untouched by those bindings, so you can test the field while the checklist is
+open. Press **Esc** to write `result-<os>.md`, which is meant to be pasted into
+an issue or below.
+
+Two things the program records for itself rather than asking, because a log
+beats recollection: every `Ime::*` event received, and whether an assistive
+technology ever actually connected (the platform only requests the tree when
+something is listening).
 
 ## Status: PARTIAL — the decisive test has not been run
 
@@ -70,30 +83,24 @@ double-click, drag-select, undo, clipboard, RTL, and bidi.
 Bumped to 1.97 (current stable). Minor in itself, but it shows the text stack
 sets the toolchain floor, and the original pin was already a year stale.
 
-## Human verification checklist — REQUIRED
+## Human verification — REQUIRED, and outstanding on every platform
 
-Run `cargo run` and confirm, per platform:
+The ten items are in the app itself (`src/checklist.rs`); run it rather than
+working from a copy here, which would drift. Results go in the table below as
+they come in.
 
-**Screen reader**
-- [ ] macOS VoiceOver (⌘F5): announces "Layer name, edit text, Background"
-- [ ] Windows Narrator (⊞+Ctrl+Enter) — **untested, and Windows uses a different
-      platform API (UIA); do not assume macOS success carries over**
-- [ ] Linux Orca (AT-SPI) — untested
-- [ ] Value changes are announced as you type
-- [ ] Composition is announced while typing CJK, not just after commit
+| Platform | Screen reader | Status | Result file |
+|---|---|---|---|
+| macOS | VoiceOver | **not run** | — |
+| Windows | Narrator (UIA — a *different* API; macOS success does not carry over) | **not run** | — |
+| Linux | Orca (AT-SPI) | **not run** | — |
 
-**IME**
-- [ ] Pinyin: "ni hao" shows preedit inline, commits 你好
-- [ ] Japanese: kana → kanji conversion, candidate window positioned at the field
-      (`set_ime_cursor_area` should place it — verify it is not stuck at 0,0)
-- [ ] Korean: jamo composition
-- [ ] Dead keys (e.g. ´ + e = é) on a European layout
-- [ ] The candidate window appears at the field, not the window corner
-
-**If any screen-reader row fails structurally** — not "needs more code", but
-"AccessKit cannot express this on this platform" — that is the ADR 0001
-escape-hatch trigger, and the CXX-Qt fallback should be reconsidered before the
-widget toolkit is written.
+**Interpreting a failure.** A failed item is not automatically the ADR 0001
+escape-hatch trigger. The trigger is a *structural* failure — AccessKit or winit
+cannot express the thing on that platform — as distinct from our code not doing
+it yet. Most failures will be the latter and are simply bugs. Note which it
+looked like; the generated report says the same thing so a tester does not have
+to remember it.
 
 ## What this does not cover
 

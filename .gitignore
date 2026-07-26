@@ -56,3 +56,4 @@ crash-reports/
 # Spike build output (the spike is outside the workspace, so /target misses it)
 /spike/*/target/
 /spike/psd-write/out/
+/spike/a11y-ime/result-*.md
