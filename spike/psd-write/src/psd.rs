@@ -28,6 +28,13 @@ pub struct Layer {
     pub visible: bool,
     /// Four-character blend key, e.g. `norm`, `mul `, `scrn`.
     pub blend: [u8; 4],
+    /// A serialized `TySh` (Type Tool Object Setting) payload — the exact
+    /// bytes `descriptor::TypeToolObjectSetting::to_bytes()` produces — if
+    /// this is a text layer. This writer has no opinion on the format of
+    /// those bytes at all; it only places them, the same separation
+    /// `descriptor.rs`/`engine_data.rs` already keep from this module.
+    /// `None` for an ordinary pixel layer.
+    pub tysh: Option<Vec<u8>>,
 }
 
 impl Layer {
@@ -88,6 +95,10 @@ struct FlatRecord {
     section: Option<u32>,
     /// R, G, B, A planes. Empty on all four for the zero-sized pseudo-layers.
     channels: [Vec<u8>; 4],
+    /// See `Layer::tysh`. Always `None` for a group's bracketing pseudo-layers
+    /// — `section` and `tysh` are mutually exclusive in practice, since a
+    /// record is either a group marker or a real layer, never both.
+    tysh: Option<Vec<u8>>,
 }
 
 fn flatten(items: &[Item], out: &mut Vec<FlatRecord>) {
@@ -101,6 +112,7 @@ fn flatten(items: &[Item], out: &mut Vec<FlatRecord>) {
                 blend: l.blend,
                 section: None,
                 channels: [l.plane(0), l.plane(1), l.plane(2), l.plane(3)],
+                tysh: l.tysh.clone(),
             }),
             Item::Group(g) => {
                 // Bottom of the group's span: opens a new nesting level for
@@ -113,6 +125,7 @@ fn flatten(items: &[Item], out: &mut Vec<FlatRecord>) {
                     blend: *b"norm",
                     section: Some(3),
                     channels: [vec![], vec![], vec![], vec![]],
+                    tysh: None,
                 });
                 flatten(&g.children, out);
                 // Top of the span: this record IS the group, carrying its
@@ -125,6 +138,7 @@ fn flatten(items: &[Item], out: &mut Vec<FlatRecord>) {
                     blend: g.blend,
                     section: Some(if g.open { 1 } else { 2 }),
                     channels: [vec![], vec![], vec![], vec![]],
+                    tysh: None,
                 });
             }
         }
@@ -338,6 +352,20 @@ impl Document {
             extra.u32(luni.0.len() as u32);
             extra.raw(&luni.0);
 
+            // TySh (Type Tool Object Setting): present only for a text
+            // layer. Written with no length padding, matching psd-tools'
+            // own writer — per-layer tagged blocks there are written with
+            // `padding=1` (a no-op divisor), unlike `luni` above, which pads
+            // itself internally for its own reasons. Confirmed by reading
+            // psd-tools' `tagged_blocks.py`/`layer_and_mask.py` rather than
+            // assumed, the same discipline as findings 5, 9, 10.
+            if let Some(tysh_bytes) = &record.tysh {
+                extra.raw(b"8BIM");
+                extra.raw(b"TySh");
+                extra.u32(tysh_bytes.len() as u32);
+                extra.raw(tysh_bytes);
+            }
+
             // Section-divider block: marks this record as a group's bounding
             // start or its folder end (`flatten` above). Absent for a plain
             // pixel layer. Kind-only (4-byte payload) matches what psd-tools'
@@ -377,5 +405,55 @@ impl Document {
         o.raw(&self.composite_planar());
 
         o.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_layer_doc(tysh: Option<Vec<u8>>) -> Document {
+        Document {
+            width: 10,
+            height: 10,
+            items: vec![Item::Layer(Layer {
+                name: "Text".into(),
+                rect: (0, 0, 4, 4),
+                pixels: vec![0u8; 4 * 4 * 4],
+                opacity: 255,
+                visible: true,
+                blend: *b"norm",
+                tysh,
+            })],
+        }
+    }
+
+    #[test]
+    fn embeds_a_tysh_tagged_block_for_a_text_layer() {
+        // Stand-in payload -- constructing real TySh bytes is descriptor.rs's
+        // job, not this writer's; this only tests that whatever bytes a
+        // Layer carries end up placed in the file, verbatim, as a proper
+        // tagged block.
+        let tysh_bytes: Vec<u8> = (0..40).collect();
+        let bytes = one_layer_doc(Some(tysh_bytes.clone())).write();
+
+        let mut needle = Vec::new();
+        needle.extend_from_slice(b"8BIM");
+        needle.extend_from_slice(b"TySh");
+        needle.extend_from_slice(&(tysh_bytes.len() as u32).to_be_bytes());
+        needle.extend_from_slice(&tysh_bytes);
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle.as_slice()),
+            "written PSD does not contain the expected TySh tagged block"
+        );
+    }
+
+    #[test]
+    fn a_pixel_layer_without_text_has_no_tysh_block() {
+        let bytes = one_layer_doc(None).write();
+        assert!(
+            !bytes.windows(4).any(|w| w == b"TySh"),
+            "a layer without a tysh field must not emit a TySh block"
+        );
     }
 }

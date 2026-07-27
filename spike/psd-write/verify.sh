@@ -12,7 +12,9 @@ FILE=out/spike.psd
 fail=0
 
 echo "=== 1. Apple system decoder (sips) — reads the composite image"
-if sips -g pixelWidth -g pixelHeight -g format "$FILE" 2>&1 | sed 's/^/    /'; then
+if ! command -v sips >/dev/null 2>&1; then
+  echo "    SKIPPED — sips is macOS-only, not available on this platform"
+elif sips -g pixelWidth -g pixelHeight -g format "$FILE" 2>&1 | sed 's/^/    /'; then
   sips -s format png "$FILE" --out out/composite-sips.png >/dev/null 2>&1 \
     && echo "    composite decoded to out/composite-sips.png" \
     || { echo "    FAILED to decode composite"; fail=1; }
@@ -79,6 +81,27 @@ try:
     print("    structural assertions: PASS (2-level nesting, open/closed state, membership)")
 except AssertionError as e:
     print(f"    structural assertions: FAIL — {e}")
+    ok = False
+
+# The text layer (FINDINGS.md finding 14): the first time this writer embeds
+# a patched TySh block AND matching rendered pixels together in one written
+# file, checked with an independent reader rather than just our own
+# descriptor.rs — the same bar finding 1 set for the rest of this spike.
+try:
+    top = list(psd)
+    text_layer = next(l for l in top if l.name == "Aurora spike")
+    assert text_layer.kind == "type", "Aurora spike layer did not round-trip as a text layer"
+    # psd-tools' own .text property strips trailing NUL itself (api/layers.py)
+    assert text_layer.text == "Aurora spike", f"unexpected text: {text_layer.text!r}"
+    img = text_layer.topil()
+    assert img is not None, "text layer has no pixel data"
+    non_transparent = sum(1 for p in img.getdata() if p[3] > 0) if img.mode == "RGBA" else img.size[0] * img.size[1]
+    assert non_transparent > 20, f"text layer pixels look empty ({non_transparent} inked)"
+    img.save("out/text-layer-psdtools.png")
+    print(f"    text layer: PASS — psd-tools reads back {text_layer.text!r}, "
+          f"{non_transparent} inked pixels, saved to out/text-layer-psdtools.png")
+except (StopIteration, AssertionError) as e:
+    print(f"    text layer: FAIL — {e}")
     ok = False
 
 try:

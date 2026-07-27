@@ -55,6 +55,17 @@ fn main() -> std::io::Result<()> {
         return glyph_demo();
     }
 
+    // The first text layer this writer has ever embedded in a real file —
+    // every prior TySh patch (--tysh-demo) operated on a standalone
+    // extracted block, never inside a written PSD. Shares the exact same
+    // patch as --tysh-demo via patch_tysh_text, and the standalone
+    // rasterizer proven in glyph.rs (finding 13) — color and font size are
+    // still hardcoded arguments here, not read from the patched TySh's own
+    // StyleSheetData.FillColor/FontSize; that wiring is the next step, not
+    // this one (see FINDINGS.md finding 14).
+    let text_tysh = patch_tysh_text("Aurora spike")?;
+    let text_raster = glyph::rasterize("Aurora spike", 24.0, (20, 20, 20), None);
+
     // Written bottom-up throughout: PSD stores the layer list from the bottom
     // of the stack upwards, the opposite of how a layers panel reads. Groups
     // follow the same convention for their own children.
@@ -69,6 +80,7 @@ fn main() -> std::io::Result<()> {
                 opacity: 255,
                 visible: true,
                 blend: *b"norm",
+                tysh: None,
             }),
             // A group containing two layers, one of which is itself a
             // one-layer closed sub-group — exercises multi-level nesting, not
@@ -93,6 +105,7 @@ fn main() -> std::io::Result<()> {
                             opacity: 153, // 60 %
                             visible: true,
                             blend: *b"mul ",
+                            tysh: None,
                         })],
                     }),
                     Item::Layer(Layer {
@@ -102,6 +115,7 @@ fn main() -> std::io::Result<()> {
                         opacity: 255,
                         visible: true,
                         blend: *b"norm",
+                        tysh: None,
                     }),
                 ],
             }),
@@ -112,6 +126,7 @@ fn main() -> std::io::Result<()> {
                 opacity: 255,
                 visible: false,
                 blend: *b"norm",
+                tysh: None,
             }),
             // A non-ASCII name, because layer names are a Pascal string with
             // padding and this is where an off-by-one shows up.
@@ -122,6 +137,22 @@ fn main() -> std::io::Result<()> {
                 opacity: 200,
                 visible: true,
                 blend: *b"scrn",
+                tysh: None,
+            }),
+            // The text layer described above.
+            Item::Layer(Layer {
+                name: "Aurora spike".into(),
+                rect: (
+                    10,
+                    10,
+                    10 + text_raster.width as i32,
+                    10 + text_raster.height as i32,
+                ),
+                pixels: text_raster.pixels,
+                opacity: 255,
+                visible: true,
+                blend: *b"norm",
+                tysh: Some(text_tysh.to_bytes()),
             }),
         ],
     };
@@ -136,19 +167,67 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Parses a real Photoshop-authored `TySh` block (extracted from psd-tools'
-/// own `text.psd` test fixture — see `reference/README.md` and
-/// `descriptor.rs`), patches its text content, and reports what changed.
+/// Patches a real Photoshop-authored `TySh` block's text content — both the
+/// top-level `Txt ` field and the nested `EngineData.Editor.Text` — to
+/// `new_text`, recomputing `ParagraphRun`/`StyleRun` `RunLengthArray`s to
+/// match (finding 12). Shared by `tysh_demo` and the text layer embedded in
+/// `main`'s written PSD, so both exercise the exact same patch rather than
+/// two subtly different ones.
 ///
-/// This does NOT write a full PSD file — that full-file, independently
-/// verified (psd-tools + sips + visual inspection) round trip was done as a
-/// Python proof-of-concept, documented in FINDINGS.md, precisely because a
-/// full Rust-side file splice wasn't warranted for a spike once the format
-/// understanding itself was validated here. See FINDINGS.md for the scope
-/// boundary and what's left for a real implementation.
-fn tysh_demo() -> std::io::Result<()> {
+/// The two fields get different terminators (`\u{0}` vs. `\r`) — an
+/// existing, real convention difference between the two representations,
+/// not a typo; see the original `--tysh-demo` output this was extracted
+/// from.
+fn patch_tysh_text(new_text: &str) -> std::io::Result<descriptor::TypeToolObjectSetting> {
     let real_tysh = include_bytes!("../reference/tysh.bin");
     let mut tysh = descriptor::parse_fixture(real_tysh)?;
+    tysh.set_text(format!("{new_text}\u{0}"));
+
+    // EngineData.Editor.Text -- the nested text-engine content, via
+    // engine_data.rs, which descriptor.rs treats as an opaque blob (it's a
+    // completely different text-based format, not the Descriptor binary
+    // format). Patching both fields is what the Python proof-of-concept in
+    // FINDINGS.md finding 7 did at the full-file level.
+    if let descriptor::Value::Raw(engine_bytes) = tysh
+        .text_data
+        .get(b"EngineData")
+        .expect("EngineData field must exist")
+        .clone()
+    {
+        let mut engine = engine_data::parse(&engine_bytes)
+            .expect("a real Photoshop EngineData payload must parse");
+        let engine_text = format!("{new_text}\r");
+        if let Some(slot) = engine.get_path_mut("EngineDict.Editor.Text") {
+            *slot = engine_data::Value::Str(engine_text.clone());
+        }
+        // Closes the gap finding 10 named: without this, ParagraphRun/
+        // StyleRun's RunLengthArrays would still sum to the OLD text's
+        // length, which is exactly the internal inconsistency a real writer
+        // must not produce. See engine_data.rs's module docs on
+        // recompute_run_lengths for what this does and doesn't cover.
+        engine_data::recompute_run_lengths(&mut engine, engine_text.encode_utf16().count())
+            .expect("a real fixture must have well-formed ParagraphRun/StyleRun");
+        let new_engine_bytes = engine_data::write(&engine);
+        tysh.text_data
+            .set(b"EngineData", descriptor::Value::Raw(new_engine_bytes));
+    }
+
+    Ok(tysh)
+}
+
+/// Parses a real Photoshop-authored `TySh` block (extracted from psd-tools'
+/// own `text.psd` test fixture — see `reference/README.md` and
+/// `descriptor.rs`), patches its text content via `patch_tysh_text`, and
+/// reports what changed.
+///
+/// This does NOT write a full PSD file itself — that now happens in `main`
+/// (the first text layer this writer has ever embedded in a real file; see
+/// FINDINGS.md finding 14). This demo remains useful on its own for
+/// inspecting the patch step in isolation, byte-counted, without the rest of
+/// the document around it.
+fn tysh_demo() -> std::io::Result<()> {
+    let real_tysh = include_bytes!("../reference/tysh.bin");
+    let original = descriptor::parse_fixture(real_tysh)?;
 
     println!(
         "Parsed a real Photoshop TySh block ({} bytes)",
@@ -156,15 +235,18 @@ fn tysh_demo() -> std::io::Result<()> {
     );
     println!(
         "  version={} text_version={}",
-        tysh.version, tysh.text_version
+        original.version, original.text_version
     );
-    println!("  text: {:?}", tysh.text());
-    println!("  bbox: {:?}  transform: {:?}", tysh.bbox, tysh.transform);
+    println!("  text: {:?}", original.text());
+    println!(
+        "  bbox: {:?}  transform: {:?}",
+        original.bbox, original.transform
+    );
 
-    let before = tysh.to_bytes();
+    let before = original.to_bytes();
     let reparsed_before = descriptor::parse_fixture(&before)?;
     assert_eq!(
-        reparsed_before, tysh,
+        reparsed_before, original,
         "unmodified re-serialize must round-trip"
     );
     println!(
@@ -174,39 +256,7 @@ fn tysh_demo() -> std::io::Result<()> {
         before.len() == real_tysh.len()
     );
 
-    tysh.set_text("Aurora spike\u{0}");
-
-    // Also patch EngineData.Editor.Text -- the nested text-engine content,
-    // via engine_data.rs, which descriptor.rs treats as an opaque blob (it's
-    // a completely different text-based format, not the Descriptor binary
-    // format). Patching both fields is what the Python proof-of-concept in
-    // FINDINGS.md finding 7 did at the full-file level; this is the same
-    // operation natively in Rust, closing the gap the original version of
-    // this demo left open.
-    if let descriptor::Value::Raw(engine_bytes) = tysh
-        .text_data
-        .get(b"EngineData")
-        .expect("EngineData field must exist")
-        .clone()
-    {
-        let mut engine = engine_data::parse(&engine_bytes)
-            .expect("a real Photoshop EngineData payload must parse");
-        let new_text = "Aurora spike\r";
-        if let Some(slot) = engine.get_path_mut("EngineDict.Editor.Text") {
-            *slot = engine_data::Value::Str(new_text.into());
-        }
-        // Closes the gap finding 10 named: without this, ParagraphRun/
-        // StyleRun's RunLengthArrays would still sum to the OLD text's
-        // length (30), which is exactly the internal inconsistency a real
-        // writer must not produce. See engine_data.rs's module docs on
-        // recompute_run_lengths for what this does and doesn't cover.
-        engine_data::recompute_run_lengths(&mut engine, new_text.encode_utf16().count())
-            .expect("a real fixture must have well-formed ParagraphRun/StyleRun");
-        let new_engine_bytes = engine_data::write(&engine);
-        tysh.text_data
-            .set(b"EngineData", descriptor::Value::Raw(new_engine_bytes));
-    }
-
+    let tysh = patch_tysh_text("Aurora spike")?;
     let after = tysh.to_bytes();
     let reparsed_after = descriptor::parse_fixture(&after)?;
     println!("\nPatched `Txt ` to: {:?}", reparsed_after.text());
@@ -237,15 +287,12 @@ fn tysh_demo() -> std::io::Result<()> {
     );
 
     println!(
-        "\nOne thing this demo still deliberately leaves inconsistent, a real \
-         gap for a production writer: the layer's rasterized pixel preview is \
-         untouched. A real implementation must re-render glyphs into the pixel \
-         channels too, or the file is visually inconsistent \
-         (FINDINGS.md finding 8) — unaffected by the run-length fix above \
-         (finding 12), which only closes the descriptor-level bookkeeping gap \
-         (finding 10). See --glyph-demo for a first, standalone step toward \
-         closing finding 8 itself (finding 13) — rasterization only, not yet \
-         wired into this patch."
+        "\nThis demo only patches the descriptor, in isolation — no pixels, \
+         no written file. `cargo run`'s own \"Aurora spike\" text layer is now \
+         the first place this writer embeds a patched TySh block AND \
+         matching rendered pixels together in one real file (FINDINGS.md \
+         finding 14); this demo remains useful for inspecting the patch step \
+         on its own, byte-counted, without the rest of the document around it."
     );
     Ok(())
 }
@@ -278,10 +325,13 @@ fn glyph_demo() -> std::io::Result<()> {
     );
 
     println!(
-        "\nThis is rasterization only — it does not yet write a PSD. Closing \
-         FINDINGS.md finding 8 for real means wiring this into psd.rs's layer \
-         writer, which has no TySh slot at all yet; see finding 13 for what \
-         that next step needs."
+        "\nThis is rasterization only, standalone. `cargo run`'s own \
+         \"Aurora spike\" text layer now wires this exact rasterizer into a \
+         written PSD alongside a patched TySh block (FINDINGS.md finding \
+         14) — the first genuinely embedded, internally-consistent text \
+         layer this writer has produced. Font and color there are still \
+         hardcoded, same as here; reading a real FillColor/FontSet is \
+         separate, smaller remaining work."
     );
     Ok(())
 }

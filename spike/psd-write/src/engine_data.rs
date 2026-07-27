@@ -334,26 +334,40 @@ fn write_float(out: &mut Vec<u8>, f: f64) {
     out.extend_from_slice(s.as_bytes());
 }
 
+// `psd-tools`' own tokenizer (engine_data.py `Tokenizer`) splits tokens on
+// whitespace ONLY (`[ \n\t]+`) — unlike this file's reader, which also
+// treats `<`, `>`, `[`, `]`, `/`, `(` as delimiters and so tolerates zero
+// whitespace between tokens. A real Photoshop-authored file always has
+// whitespace between every token (confirmed directly: reference/tysh.bin's
+// raw bytes are `\n\n<<\n\t/EngineDict\n\t<<...`, not `<</EngineDict...`).
+// Every token written here must therefore be separated by at least one
+// space, or a stricter/independent reader reads two adjacent tokens as one
+// unrecognizable blob and fails outright — caught exactly this way, by
+// embedding a patched file in a real PSD and having psd-tools reject it
+// with "Unknown token: b'<</EngineDict'", not by inspection or by our own
+// (too permissive) round-trip tests, which this bug passed cleanly. See
+// FINDINGS.md finding 14.
 fn write_value(out: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Dict(items) => {
             out.extend_from_slice(b"<<");
             for (k, val) in items {
+                out.push(b' ');
                 out.push(b'/');
                 out.extend_from_slice(k.as_bytes());
                 out.push(b' ');
                 write_value(out, val);
             }
+            out.push(b' ');
             out.extend_from_slice(b">>");
         }
         Value::List(items) => {
             out.push(b'[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(b' ');
-                }
+            for item in items {
+                out.push(b' ');
                 write_value(out, item);
             }
+            out.push(b' ');
             out.push(b']');
         }
         Value::Str(s) => write_string(out, s),
