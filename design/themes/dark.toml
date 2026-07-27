@@ -1,0 +1,52 @@
+schema_version = 1
+name = "Dark"
+extends = "none" # this is the base theme; Light/High Contrast/Color-Critical extend it
+is_default = true
+
+# Every value here is a reference into ../tokens/palette.toml ("<ramp>.<step>"),
+# never a literal. Draft — Cahya to revise; contrast-checked but not
+# eyeballed for aesthetics yet. Run ../check_contrast.py after any edit here.
+
+[surface]
+canvas  = "neutral.0"
+app     = "neutral.50"
+panel   = "neutral.100"
+raised  = "neutral.150"
+overlay = "neutral.200"
+sunken  = "neutral.0"
+
+[text]
+primary   = "neutral.900"
+secondary = "neutral.700"
+disabled  = "neutral.500"
+on_accent = "neutral.0"
+
+[icon]
+default   = "neutral.800"
+secondary = "neutral.600"
+disabled  = "neutral.500"
+on_accent = "neutral.0"
+
+[border]
+default = "neutral.300"
+strong  = "neutral.400"
+focus   = "accent.blue.500"
+
+[accent]
+primary        = "accent.blue.500"
+primary_hover  = "accent.blue.600"
+primary_active = "accent.blue.400"
+
+[state]
+error   = "semantic.red.500"
+warning = "semantic.amber.500"
+success = "semantic.green.500"
+disabled_opacity = 0.4
+
+[state.hover_overlay]
+color = "neutral.900"
+alpha = 0.06
+
+[state.active_overlay]
+color = "neutral.900"
+alpha = 0.10

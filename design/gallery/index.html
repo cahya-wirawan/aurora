@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en" data-density="comfortable">
+<head>
+<meta charset="utf-8">
+<title>Aurora — component gallery (skeleton)</title>
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--surface-app);
+    color: var(--text-primary);
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    font-size: var(--type-size-md);
+    line-height: var(--type-line-height-normal);
+  }
+  header {
+    padding: var(--spacing-md);
+    border-bottom: 1px solid var(--border-default);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  header h1 { font-size: var(--type-size-xl); font-weight: var(--type-weight-semibold); margin: 0; }
+  .controls { display: flex; gap: var(--spacing-sm); font-size: var(--type-size-sm); }
+  .controls select {
+    background: var(--surface-sunken);
+    color: var(--text-primary);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    padding: 2px var(--spacing-xs);
+  }
+  main { padding: var(--spacing-md); display: flex; flex-direction: column; gap: var(--spacing-xl); }
+  section h2 {
+    font-size: var(--type-size-lg);
+    font-weight: var(--type-weight-medium);
+    border-bottom: 1px solid var(--border-default);
+    padding-bottom: var(--spacing-xs);
+  }
+  .states {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: var(--spacing-md);
+  }
+  .state-cell {
+    background: var(--surface-panel);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    padding: var(--spacing-sm);
+    display: flex; flex-direction: column; align-items: center; gap: var(--spacing-xs);
+  }
+  .state-cell .label { font-size: var(--type-size-xs); color: var(--text-secondary); }
+
+  /* --- Button --- */
+  .btn {
+    font-size: var(--type-size-sm);
+    font-weight: var(--type-weight-medium);
+    padding: var(--spacing-xs) var(--spacing-md);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-default);
+    background: var(--surface-raised);
+    color: var(--text-primary);
+  }
+  .btn.primary { background: var(--accent-primary); color: var(--text-on-accent); border-color: transparent; }
+  .btn.primary.state-hover, .btn.primary:hover { background: var(--accent-primary-hover); }
+  .btn.primary.state-active, .btn.primary:active { background: var(--accent-primary-active); }
+  .btn.state-focus, .btn:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+  .btn.state-disabled, .btn:disabled { opacity: var(--state-disabled-opacity); }
+  .btn.state-error { border-color: var(--state-error); color: var(--state-error); }
+
+  /* --- Checkbox --- */
+  .checkbox { display: flex; align-items: center; gap: var(--spacing-xs); font-size: var(--type-size-sm); }
+  .checkbox .box {
+    width: 16px; height: 16px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border-default);
+    background: var(--surface-sunken);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .checkbox.checked .box { background: var(--accent-primary); border-color: transparent; color: var(--text-on-accent); font-size: 11px; }
+  .checkbox.state-focus .box { outline: 2px solid var(--border-focus); outline-offset: 1px; }
+  .checkbox.state-disabled { opacity: var(--state-disabled-opacity); }
+
+  /* --- Slider --- */
+  .slider { width: 120px; height: 4px; background: var(--border-default); border-radius: var(--radius-pill); position: relative; }
+  .slider .fill { position: absolute; left: 0; top: 0; bottom: 0; width: 60%; background: var(--accent-primary); border-radius: var(--radius-pill); }
+  .slider .thumb {
+    position: absolute; left: 60%; top: 50%; transform: translate(-50%, -50%);
+    width: 12px; height: 12px; border-radius: var(--radius-pill);
+    background: var(--text-primary);
+  }
+  .slider.state-focus .thumb { outline: 2px solid var(--border-focus); outline-offset: 1px; }
+  .slider.state-disabled { opacity: var(--state-disabled-opacity); }
+
+  /* --- Number field --- */
+  .field {
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    padding: 4px var(--spacing-xs);
+    width: 72px;
+    font-size: var(--type-size-sm);
+  }
+  .field.state-focus { border-color: var(--border-focus); box-shadow: 0 0 0 1px var(--border-focus); }
+  .field.state-disabled { opacity: var(--state-disabled-opacity); }
+  .field.state-error { border-color: var(--state-error); }
+
+  /* --- Dropdown --- */
+  .dropdown {
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    padding: 4px var(--spacing-xs);
+    width: 120px;
+    font-size: var(--type-size-sm);
+  }
+  .dropdown.state-focus { border-color: var(--border-focus); }
+  .dropdown.state-disabled { opacity: var(--state-disabled-opacity); }
+
+  /* --- Tab bar --- */
+  .tabbar { display: flex; gap: var(--spacing-xs); border-bottom: 1px solid var(--border-default); }
+  .tab { padding: var(--spacing-xs) var(--spacing-sm); font-size: var(--type-size-sm); color: var(--text-secondary); border-bottom: 2px solid transparent; }
+  .tab.active { color: var(--text-primary); border-color: var(--accent-primary); }
+  .tab.state-focus { outline: 2px solid var(--border-focus); outline-offset: -2px; }
+
+  /* --- Tooltip --- */
+  .tooltip {
+    background: var(--surface-overlay);
+    color: var(--text-primary);
+    border-radius: var(--radius-sm);
+    padding: var(--spacing-xxs) var(--spacing-xs);
+    font-size: var(--type-size-xs);
+    box-shadow: var(--elevation-1);
+  }
+
+  /* --- Color swatch (color picker primitive) --- */
+  .swatch { width: 32px; height: 32px; border-radius: var(--radius-sm); border: 1px solid var(--border-default); background: var(--accent-primary); }
+  .swatch.state-focus { outline: 2px solid var(--border-focus); outline-offset: 1px; }
+
+  footer { padding: var(--spacing-md); color: var(--text-secondary); font-size: var(--type-size-xs); border-top: 1px solid var(--border-default); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Aurora component gallery — skeleton (draft)</h1>
+  <div class="controls">
+    <label>Density
+      <select onchange="document.documentElement.dataset.density=this.value">
+        <option value="compact">Compact</option>
+        <option value="comfortable" selected>Comfortable</option>
+        <option value="spacious">Spacious</option>
+      </select>
+    </label>
+    <span>Theme: Dark (only built-in theme drafted so far)</span>
+  </div>
+</header>
+<main>
+  <p style="color:var(--text-secondary); max-width: 60ch;">
+    This is the skeleton described in PRD FR-027 deliverable 5 and PLAN.md 0.5:
+    the review surface and golden-image target, not the real
+    <code>aurora-widgets</code> implementation. Every state below is forced
+    with a <code>.state-*</code> modifier class (rather than only
+    <code>:hover</code>/<code>:focus</code>) so it renders identically as a
+    static screenshot — that's what makes this usable as a visual-regression
+    target later. Real widgets, real accesskit nodes, and real interaction
+    land in M1.7; this only fixes what they should look like and which token
+    each state resolves.
+  </p>
+
+  <section>
+    <h2>Button</h2>
+    <div class="states">
+      <div class="state-cell"><button class="btn">Default</button><span class="label">default</span></div>
+      <div class="state-cell"><button class="btn state-hover">Default</button><span class="label">hover</span></div>
+      <div class="state-cell"><button class="btn state-focus">Default</button><span class="label">focused</span></div>
+      <div class="state-cell"><button class="btn state-disabled" disabled>Default</button><span class="label">disabled</span></div>
+      <div class="state-cell"><button class="btn primary">Primary</button><span class="label">primary / default</span></div>
+      <div class="state-cell"><button class="btn primary state-hover">Primary</button><span class="label">primary / hover</span></div>
+      <div class="state-cell"><button class="btn primary state-active">Primary</button><span class="label">primary / active</span></div>
+      <div class="state-cell"><button class="btn state-error">Delete</button><span class="label">error</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Checkbox</h2>
+    <div class="states">
+      <div class="state-cell"><div class="checkbox"><div class="box"></div>Unchecked</div><span class="label">default</span></div>
+      <div class="state-cell"><div class="checkbox checked"><div class="box">✓</div>Checked</div><span class="label">checked</span></div>
+      <div class="state-cell"><div class="checkbox state-focus"><div class="box"></div>Unchecked</div><span class="label">focused</span></div>
+      <div class="state-cell"><div class="checkbox state-disabled"><div class="box"></div>Unchecked</div><span class="label">disabled</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Slider</h2>
+    <div class="states">
+      <div class="state-cell"><div class="slider"><div class="fill"></div><div class="thumb"></div></div><span class="label">default</span></div>
+      <div class="state-cell"><div class="slider state-focus"><div class="fill"></div><div class="thumb"></div></div><span class="label">focused</span></div>
+      <div class="state-cell"><div class="slider state-disabled"><div class="fill"></div><div class="thumb"></div></div><span class="label">disabled</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Number field</h2>
+    <div class="states">
+      <div class="state-cell"><input class="field" value="100%"><span class="label">default</span></div>
+      <div class="state-cell"><input class="field state-focus" value="100%"><span class="label">focused</span></div>
+      <div class="state-cell"><input class="field state-disabled" value="100%" disabled><span class="label">disabled</span></div>
+      <div class="state-cell"><input class="field state-error" value="—"><span class="label">error</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Dropdown</h2>
+    <div class="states">
+      <div class="state-cell"><div class="dropdown">Normal <span>▾</span></div><span class="label">default</span></div>
+      <div class="state-cell"><div class="dropdown state-focus">Normal <span>▾</span></div><span class="label">focused</span></div>
+      <div class="state-cell"><div class="dropdown state-disabled">Normal <span>▾</span></div><span class="label">disabled</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Tab bar</h2>
+    <div class="states">
+      <div class="state-cell">
+        <div class="tabbar">
+          <div class="tab active">Layers</div>
+          <div class="tab">Channels</div>
+          <div class="tab state-focus">Paths</div>
+        </div>
+        <span class="label">active / default / focused</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Tooltip</h2>
+    <div class="states">
+      <div class="state-cell"><div class="tooltip">Opacity: 100%</div><span class="label">default</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Color swatch</h2>
+    <div class="states">
+      <div class="state-cell"><div class="swatch"></div><span class="label">default</span></div>
+      <div class="state-cell"><div class="swatch state-focus"></div><span class="label">focused</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Not yet in this skeleton</h2>
+    <p style="color:var(--text-secondary); font-size: var(--type-size-sm);">
+      Scrollbar, tree, menu, curve editor — need more structural design work
+      than a states grid before a static mockup is meaningful. Left for the
+      next pass rather than stubbed badly.
+    </p>
+  </section>
+</main>
+<footer>
+  Draft — generated from design tokens (../tokens.css), not final visual
+  design. See ../README.md and PLAN.md 0.5.
+</footer>
+</body>
+</html>

@@ -1,0 +1,83 @@
+/* GENERATED FILE — do not hand-edit.
+ * Source: tokens/palette.toml, tokens/scales.toml, themes/dark.toml
+ * Regenerate: python3 build_tokens_css.py > tokens.css
+ */
+:root {
+  --surface-canvas: #141414;
+  --surface-app: #1a1a1b;
+  --surface-panel: #212124;
+  --surface-raised: #28282c;
+  --surface-overlay: #313136;
+  --surface-sunken: #141414;
+  --text-primary: #f5f5f6;
+  --text-secondary: #c1c1c7;
+  --text-disabled: #7a7a83;
+  --text-on-accent: #141414;
+  --icon-default: #e2e2e5;
+  --icon-secondary: #9d9da5;
+  --icon-disabled: #7a7a83;
+  --icon-on-accent: #141414;
+  --border-default: #404048;
+  --border-strong: #6e6e76;
+  --border-focus: #78acff;
+  --accent-primary: #78acff;
+  --accent-primary-hover: #a4c8ff;
+  --accent-primary-active: #5b9bff;
+  --state-error: #ff6b6f;
+  --state-warning: #f0a93e;
+  --state-success: #4cc272;
+  --state-disabled-opacity: 0.4;
+  --state-hover-overlay-color: #f5f5f6;
+  --state-hover-overlay-alpha: 0.06;
+  --state-active-overlay-color: #f5f5f6;
+  --state-active-overlay-alpha: 0.1;
+
+  --type-size-xs: 11px;
+  --type-size-sm: 12px;
+  --type-size-md: 13px;
+  --type-size-lg: 15px;
+  --type-size-xl: 17px;
+  --type-size-xxl: 20px;
+  --type-size-display: 24px;
+  --type-weight-regular: 400;
+  --type-weight-medium: 500;
+  --type-weight-semibold: 600;
+  --type-line-height-tight: 1.2;
+  --type-line-height-normal: 1.4;
+  --type-line-height-relaxed: 1.6;
+
+  --spacing-base: 4px;
+  --spacing-xxs: 4px;
+  --spacing-xs: 8px;
+  --spacing-sm: 12px;
+  --spacing-md: 16px;
+  --spacing-lg: 24px;
+  --spacing-xl: 32px;
+  --spacing-xxl: 48px;
+  --spacing-xxxl: 64px;
+
+  --radius-none: 0px;
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --radius-lg: 8px;
+  --radius-pill: 9999px;
+
+  --elevation-0: 0 0px 0px rgba(0,0,0,0.0);
+  --elevation-1: 0 2px 8px rgba(0,0,0,0.24);
+  --elevation-2: 0 8px 24px rgba(0,0,0,0.32);
+
+  --motion-duration-fast: 100ms;
+  --motion-duration-base: 150ms;
+  --motion-duration-slow: 200ms;
+  --motion-easing-standard: cubic-bezier(0.4, 0.0, 0.2, 1);
+  --motion-easing-entrance: cubic-bezier(0.0, 0.0, 0.2, 1);
+  --motion-easing-exit: cubic-bezier(0.4, 0.0, 1, 1);
+
+  --density-compact: 0.75;
+  --density-comfortable: 1.0;
+  --density-spacious: 1.25;
+}
+
+[data-density="compact"] { --density-current: var(--density-compact); }
+[data-density="comfortable"] { --density-current: var(--density-comfortable); }
+[data-density="spacious"] { --density-current: var(--density-spacious); }

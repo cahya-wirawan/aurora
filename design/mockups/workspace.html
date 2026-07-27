@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en" data-density="comfortable">
+<head>
+<meta charset="utf-8">
+<title>Aurora — workspace mockup (draft)</title>
+<link rel="stylesheet" href="../tokens.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--surface-app);
+    color: var(--text-primary);
+    font-family: -apple-system, "Segoe UI", sans-serif; /* stand-in for the TBD variable font */
+    font-size: var(--type-size-md);
+    line-height: var(--type-line-height-normal);
+  }
+  .note {
+    background: var(--state-warning);
+    color: var(--surface-canvas);
+    font-size: var(--type-size-sm);
+    padding: var(--spacing-xs) var(--spacing-sm);
+  }
+  .app {
+    display: grid;
+    grid-template-rows: auto auto 1fr auto;
+    height: calc(100% - 2.2em);
+  }
+  .menubar, .toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    background: var(--surface-app);
+    border-bottom: 1px solid var(--border-default);
+    padding: 0 var(--spacing-sm);
+    height: calc(28px * var(--density-current, 1));
+    font-size: var(--type-size-sm);
+    color: var(--text-secondary);
+  }
+  .toolbar { height: calc(40px * var(--density-current, 1)); gap: var(--spacing-xs); }
+  .tool {
+    width: calc(28px * var(--density-current, 1));
+    height: calc(28px * var(--density-current, 1));
+    border-radius: var(--radius-md);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--icon-default);
+    border: 1px solid transparent;
+  }
+  .tool.active {
+    background: var(--accent-primary);
+    color: var(--text-on-accent);
+  }
+  .tool:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 1px;
+  }
+  .body { display: grid; grid-template-columns: 1fr auto; overflow: hidden; }
+  .canvas-area {
+    background: var(--surface-canvas);
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+  .canvas-area .doc {
+    width: 60%; aspect-ratio: 4/3;
+    background: linear-gradient(135deg, #3a4a6b, #6b3a55);
+    box-shadow: var(--elevation-2);
+    border-radius: var(--radius-sm);
+  }
+  .rail {
+    display: flex; flex-direction: column;
+    width: 280px;
+    background: var(--surface-panel);
+    border-left: 1px solid var(--border-default);
+    overflow-y: auto;
+  }
+  .panel {
+    border-bottom: 1px solid var(--border-default);
+  }
+  .panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: var(--spacing-xs) var(--spacing-sm);
+    font-size: var(--type-size-sm);
+    font-weight: var(--type-weight-medium);
+    color: var(--text-secondary);
+    background: var(--surface-panel);
+  }
+  .panel-body { padding: var(--spacing-xs) var(--spacing-sm) var(--spacing-sm); }
+
+  /* --- Layers panel --- */
+  .layer-row {
+    display: flex; align-items: center; gap: var(--spacing-xs);
+    padding: var(--spacing-xs);
+    border-radius: var(--radius-sm);
+  }
+  .layer-row.selected {
+    background: var(--accent-primary);
+    color: var(--text-on-accent);
+  }
+  .layer-row.selected .layer-name { color: var(--text-on-accent); }
+  .swatch {
+    width: 28px; height: 28px; border-radius: var(--radius-sm);
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    flex-shrink: 0;
+  }
+  .layer-name { font-size: var(--type-size-sm); flex: 1; }
+  .layer-meta { font-size: var(--type-size-xs); color: var(--text-secondary); }
+  .layer-row.selected .layer-meta { color: var(--text-on-accent); opacity: 0.85; }
+
+  /* --- Properties panel --- */
+  .field-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: var(--spacing-xxs) 0;
+    font-size: var(--type-size-sm);
+  }
+  .field-row label { color: var(--text-secondary); }
+  .field-input {
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    padding: 2px var(--spacing-xs);
+    width: 72px;
+    font-size: var(--type-size-sm);
+  }
+  .field-input:focus {
+    outline: none;
+    border-color: var(--border-focus);
+    box-shadow: 0 0 0 1px var(--border-focus);
+  }
+
+  /* --- History panel --- */
+  .history-row {
+    padding: var(--spacing-xxs) var(--spacing-xs);
+    font-size: var(--type-size-sm);
+    color: var(--text-secondary);
+    border-radius: var(--radius-sm);
+  }
+  .history-row.current {
+    background: var(--state-hover-overlay-color);
+    color: var(--text-primary);
+  }
+
+  .statusbar {
+    display: flex; align-items: center; gap: var(--spacing-md);
+    height: 24px;
+    background: var(--surface-app);
+    border-top: 1px solid var(--border-default);
+    padding: 0 var(--spacing-sm);
+    font-size: var(--type-size-xs);
+    color: var(--text-secondary);
+  }
+</style>
+</head>
+<body>
+<div class="note">
+  DRAFT mockup, not final visual design — structure and token usage for review, PRD FR-027 deliverable 4. See ../README.md.
+</div>
+<div class="app">
+  <div class="menubar">
+    <span>Aurora</span><span>File</span><span>Edit</span><span>Image</span><span>Layer</span><span>Select</span><span>View</span><span>Window</span><span>Help</span>
+  </div>
+  <div class="toolbar">
+    <div class="tool active" tabindex="0" aria-label="Move tool" title="Move">⇢</div>
+    <div class="tool" tabindex="0" aria-label="Marquee select" title="Marquee">▭</div>
+    <div class="tool" tabindex="0" aria-label="Brush" title="Brush">✎</div>
+    <div class="tool" tabindex="0" aria-label="Eyedropper" title="Eyedropper">⏺</div>
+    <div class="tool" tabindex="0" aria-label="Zoom" title="Zoom">🔍</div>
+  </div>
+  <div class="body">
+    <div class="canvas-area">
+      <div class="doc"></div>
+    </div>
+    <div class="rail">
+      <div class="panel">
+        <div class="panel-header"><span>Layers</span><span aria-hidden="true">⋯</span></div>
+        <div class="panel-body">
+          <div class="layer-row selected">
+            <div class="swatch"></div>
+            <div>
+              <div class="layer-name">Retouch — skin</div>
+              <div class="layer-meta">Normal · 100%</div>
+            </div>
+          </div>
+          <div class="layer-row">
+            <div class="swatch"></div>
+            <div>
+              <div class="layer-name">Color balance</div>
+              <div class="layer-meta">Multiply · 80%</div>
+            </div>
+          </div>
+          <div class="layer-row">
+            <div class="swatch"></div>
+            <div>
+              <div class="layer-name">Background</div>
+              <div class="layer-meta">Normal · 100%</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><span>Properties</span><span aria-hidden="true">⋯</span></div>
+        <div class="panel-body">
+          <div class="field-row"><label for="p-opacity">Opacity</label><input id="p-opacity" class="field-input" value="100%"></div>
+          <div class="field-row"><label for="p-blend">Blend mode</label><input id="p-blend" class="field-input" value="Normal"></div>
+          <div class="field-row"><label for="p-fill">Fill</label><input id="p-fill" class="field-input" value="100%"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><span>History</span><span aria-hidden="true">⋯</span></div>
+        <div class="panel-body">
+          <div class="history-row">Open document</div>
+          <div class="history-row">Brush stroke</div>
+          <div class="history-row current">Adjust color balance</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="statusbar">
+    <span>100%</span>
+    <span>Document: 4000 × 3000 px · 16-bit float</span>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,93 @@
+schema_version = 1
+
+# Shared, theme-independent scales (PRD FR-027 deliverable 2). A theme file
+# overrides color only; these numbers are the same in Dark, Light, both
+# high-contrast themes, and Color-Critical. Density modes scale `spacing`
+# (see [spacing.density_multiplier]) but never `type` — resizing type by
+# density reads as a bug, not a density choice.
+
+[type]
+# Variable font family: TBD. Needs a professional UI face with a true
+# variable weight axis and full Latin+CJK-punctuation coverage (CJK text
+# itself renders in a system/document font, not this one). Open decision —
+# not blocking the rest of the token system.
+family = "TBD — variable, weights 400-600"
+ratio = 1.125 # modular scale step (major second)
+
+[type.size]
+# Deliberately smaller than web body text — professional tool chrome, not
+# a reading surface.
+xs      = 11
+sm      = 12
+md      = 13 # default UI text
+lg      = 15
+xl      = 17
+xxl     = 20
+display = 24
+
+[type.weight]
+regular  = 400
+medium   = 500
+semibold = 600
+
+[type.line_height]
+tight   = 1.2
+normal  = 1.4
+relaxed = 1.6
+
+[spacing]
+# Single base unit, fixed multiples only (PRD: "arbitrary pixel values are a
+# review failure"). Widget code may only reference these names, never a
+# literal px value.
+base = 4
+xxs  = 4
+xs   = 8
+sm   = 12
+md   = 16
+lg   = 24
+xl   = 32
+xxl  = 48
+xxxl = 64
+
+[spacing.density_multiplier]
+# Applied to the spacing scale and to minimum interactive control height.
+# Comfortable is the default.
+compact     = 0.75
+comfortable = 1.0
+spacious    = 1.25
+
+[radius]
+none = 0
+sm   = 2
+md   = 4
+lg   = 8
+pill = 9999
+
+# Elevation: a shadow spec per level. In the Dark theme, elevation also
+# lightens the surface one neutral step (see themes/dark.toml surface.raised /
+# surface.overlay) — shadow alone barely reads on a dark background.
+[elevation.0]
+blur  = 0
+y     = 0
+alpha = 0.0
+[elevation.1]
+blur  = 8
+y     = 2
+alpha = 0.24
+[elevation.2]
+blur  = 24
+y     = 8
+alpha = 0.32
+
+# Nothing animates longer than 200ms (PRD FR-027). All durations collapse to
+# 0 under OS reduced-motion — that substitution happens in aurora-theme, not
+# per-widget.
+[motion.duration]
+fast = 100
+base = 150
+slow = 200
+
+[motion.easing]
+standard = "cubic-bezier(0.4, 0.0, 0.2, 1)"
+entrance = "cubic-bezier(0.0, 0.0, 0.2, 1)"
+exit     = "cubic-bezier(0.4, 0.0, 1, 1)"

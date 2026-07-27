@@ -1,0 +1,45 @@
+schema_version = 1
+
+# Primitive color ramps. Themes reference these by name (e.g. "neutral.100");
+# widgets never see or reference this file — they resolve semantic tokens in
+# a theme file (../themes/*.toml), which point in here. Ascending step number
+# = ascending lightness, regardless of which theme (dark or light) ends up
+# using which end of the ramp.
+#
+# Draft — Cahya to revise. Starting point only: one accent hue, minimal
+# semantic (error/warning/success) ramps. Values were adjusted from an initial
+# guess to clear WCAG AA against the Dark theme's surfaces; see
+# ../check_contrast.py and ../CONTRAST.md for the numbers.
+
+[neutral]
+# Very low chroma, near-black to near-white. "The work is the interface" (PRD
+# FR-027) — these must stay quiet enough that they never compete with a
+# user's image.
+0   = "#141414"
+50  = "#1a1a1b"
+100 = "#212124"
+150 = "#28282c"
+200 = "#313136"
+300 = "#404048"
+400 = "#6e6e76"
+500 = "#7a7a83"
+600 = "#9d9da5"
+700 = "#c1c1c7"
+800 = "#e2e2e5"
+900 = "#f5f5f6"
+
+[accent.blue]
+# Single accent hue for v1 (primary actions, active tool, selection, focus
+# ring). Additional accents are a post-Phase-0 decision.
+400 = "#5b9bff"
+500 = "#78acff"
+600 = "#a4c8ff"
+
+[semantic.red]
+500 = "#ff6b6f"
+
+[semantic.amber]
+500 = "#f0a93e"
+
+[semantic.green]
+500 = "#4cc272"
