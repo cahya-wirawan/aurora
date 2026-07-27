@@ -9,11 +9,12 @@ assumption.
 
 ```sh
 cd spike/psd-write
-cargo run                  # writes out/spike.psd (layers + groups + a text layer)
-./verify.sh                # checks it with independent readers (psd-tools; sips on macOS)
-cargo run -- --tysh-demo   # parses + patches a real Photoshop text layer, in isolation
-cargo run -- --glyph-demo  # rasterizes text to out/glyph-demo.ppm (view in any image viewer)
-cargo test                 # round-trip and rasterization tests against real bytes
+cargo run                        # writes out/spike.psd (layers + groups + a text layer)
+cargo run -- --descriptor-audit  # writes out/nested-descriptor.bin (finding 16)
+./verify.sh                      # checks both with independent readers (psd-tools; sips on macOS)
+cargo run -- --tysh-demo         # parses + patches a real Photoshop text layer, in isolation
+cargo run -- --glyph-demo        # rasterizes text to out/glyph-demo.ppm (view in any image viewer)
+cargo test                       # round-trip and rasterization tests against real bytes
 ```
 
 ## Verdict: pixel layers and groups are genuinely easy; text layers are harder than planned
@@ -538,6 +539,56 @@ font-identical rendering. Alpha compositing for a translucent `FillColor` is
 also explicitly not applied (`decode_fill_color` documents this) — the real
 fixture's own color happens to be fully opaque, so it wasn't exercised here.
 
+### 16. `descriptor.rs` audit: `Value::Nested` had zero real-fixture coverage — closed with a synthetic round-trip and an independent-reader cross-check, no bug found this time
+
+Finding 14 caught a real writer bug (`engine_data.rs`'s missing token
+whitespace) that only surfaced once a genuinely independent reader was run
+against the output — every one of this spike's own tests kept passing.
+That raised an obvious question: does `descriptor.rs`'s writer have any
+analogous gap?
+
+**Audit method:** grep all 5 corpus fixtures (`reference/tysh*.bin`) for the
+literal bytes `Objc` — the OSType tag for `Value::Nested`. Zero hits, in any
+of them. Every other `Value` variant (`Str`, `Double`, `Int`, `Enum`, `Raw`)
+appears in every fixture and has been exercised end-to-end through
+`psd-tools` (via findings 14/15's full-file verification); `Value::Nested`
+has **never** been exercised against real data or an independent reader at
+all — a completely untested code path, the same class of risk as finding
+14's bug, just not yet proven to contain one.
+
+**A real, if minor, second finding from the same audit pass**: the
+`Value::Nested` doc comment claimed `warp` was an example of this variant.
+That's wrong — `warp` is a separate top-level `DescriptorBlock` field
+(`TypeToolObjectSetting::read` reads it directly, its own leading version +
+`Descriptor`), never routed through `Value::Nested` at all. A comment
+implying a path is exercised when it isn't is its own small instance of
+false confidence; fixed.
+
+**Confirmed `Value::Nested` is not hypothetical** — real Photoshop files do
+use it, just not for anything text-layer-related: `psd-tools`' own
+`gradient-fill.psd` test fixture has `GRADIENT_FILL_SETTING.Grad`, a nested
+`Descriptor` value inside the gradient-fill descriptor's items. But `Grad`
+also contains a `Clrs` field of List/Array type (`VlLs`), which this
+scoped-to-five-types reader doesn't support — using that exact real fixture
+would mean expanding scope (adding List/Array support) just to get one test,
+which is a feature addition, not a bug audit.
+
+**What was actually done instead**, matching finding 14's exact discipline
+rather than settling for a same-reader round-trip: a synthetic nested
+`Descriptor` (using only the five already-supported types), round-tripped
+through this file's own reader/writer
+(`descriptor::tests::nested_descriptor_value_round_trips`), *and*
+cross-checked against `psd-tools`' own `Descriptor.frombytes()` — a
+genuinely independent reader, the same property that caught finding 14's
+bug (`cargo run -- --descriptor-audit` writes `out/nested-descriptor.bin`;
+`verify.sh` section 3 opens it with `psd-tools`). Result:
+**`psd-tools` accepts it correctly, byte for byte** — `{Name: 'stop', Locn:
+0.5}` reads back exactly as written. No bug found this time. This is a
+meaningfully different, weaker kind of evidence than the real fixtures used
+everywhere else in this spike (synthetic input, not something Photoshop
+itself produced) — recorded as exactly that, not oversold as equivalent to
+finding 14/15's real-file verification.
+
 ## Scope: what this did *not* touch
 
 Groups, the `TySh` container, `EngineData`'s text format, `RunLengthArray`
@@ -559,6 +610,11 @@ and tested against real bytes. Remaining, still untested and unimplemented:
 - **`FillColor` alpha compositing** for a translucent fill — `decode_fill_color`
   reads RGB only; the real fixture's own color happens to be opaque, so this
   hasn't been exercised
+- **List/Array descriptor values** (OSType `VlLs`) — out of scope since day
+  one, but finding 16 surfaced a concrete real-world case that needs it:
+  `GRADIENT_FILL_SETTING.Grad.Clrs` (gradient color stops). Still correctly
+  out of scope for a text-layer-focused spike; noted here because it's now
+  backed by a specific real fixture rather than a hypothetical
 - Layer masks and vector masks
 - Smart objects, embedded and linked
 - Layer styles and effects
@@ -594,14 +650,19 @@ instead of hardcoded constants (finding 15) — closing finding 8's core
 question for that one edit shape. Along the way, finding 14 also caught a
 real bug that a second independent reader's *different* tokenizer surfaced
 and this spike's own tests could not: `engine_data::write` omitted required
-whitespace between tokens. What's still open: full from-scratch `EngineData`
-generation remains higher-risk than assumed (finding 6) — the
-corpus-and-patch approach sidesteps rather than resolves that;
-`RunLengthArray`/style bookkeeping for richer, run-preserving edits (findings
-12/15's own named scope boundary) is real, separate, unstarted work; and
-font *resolution* (the document's actual named font, not the bundled
-stand-in) and `FillColor` alpha compositing remain unstarted — both smaller,
-real remaining work, not the open-ended unknown finding 8 used to be.
+whitespace between tokens. **That prompted an audit of `descriptor.rs` for
+the same class of bug** (finding 16): its one completely untested code path,
+`Value::Nested`, turned out to be correct when actually cross-checked
+against `psd-tools`' own reader — a negative result, but only trustworthy
+because it was actually checked rather than assumed safe by analogy. What's
+still open: full from-scratch `EngineData` generation remains higher-risk
+than assumed (finding 6) — the corpus-and-patch approach sidesteps rather
+than resolves that; `RunLengthArray`/style bookkeeping for richer,
+run-preserving edits (findings 12/15's own named scope boundary) is real,
+separate, unstarted work; font *resolution* (the document's actual named
+font, not the bundled stand-in) and `FillColor` alpha compositing remain
+unstarted; and List/Array descriptor values (finding 16) are a concrete,
+real-fixture-backed gap, still correctly out of scope for this spike.
 
 ## Recommendations for Phase 3
 
@@ -651,3 +712,12 @@ real remaining work, not the open-ended unknown finding 8 used to be.
    Any writer whose only test is "my own reader accepts my own output"
    should be treated as unverified; Phase 3's CI corpus diffing (PLAN 0.7)
    must run against at least one reader nobody on the team wrote.
+10. **After finding one instance of "only tested against our own reader,"
+    audit for siblings rather than assuming it was isolated** (finding 16).
+    Grepping the corpus for a type's OSType tag (`Objc`) is a fast, concrete
+    way to find completely untested code paths — cheaper than it sounds, and
+    it found one. The audit came back clean this time, but only because it
+    was actually run against `psd-tools`, not assumed clean by analogy to
+    the fixed bug. Worth repeating whenever a new writer path is added:
+    is there a real fixture (or, failing that, an independent-reader
+    cross-check) behind every branch, or just this spike's own reader?

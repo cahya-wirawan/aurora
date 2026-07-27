@@ -31,7 +31,18 @@ pub enum Value {
     /// OSType `tdta`: u32 length + raw bytes. Wraps `EngineData` untouched —
     /// its own text-based format is a separate, unimplemented format here.
     Raw(Vec<u8>),
-    /// OSType `Objc`: a nested descriptor (`warp` is one of these).
+    /// OSType `Objc`: a nested descriptor value, appearing as an *item's
+    /// value* within another descriptor's items list — distinct from
+    /// `warp`, which is a separate top-level `DescriptorBlock` field (its
+    /// own leading version + `Descriptor`, read directly by
+    /// `TypeToolObjectSetting::read`, never through this variant at all).
+    /// An earlier version of this comment conflated the two; see
+    /// FINDINGS.md finding 16 for why that distinction matters — this
+    /// variant has zero real-fixture coverage in this spike's corpus, only
+    /// a synthetic round-trip test (`nested_descriptor_value_round_trips`),
+    /// cross-checked against `psd-tools`' own reader rather than just ours.
+    /// A real, if less common, occurrence: `GRADIENT_FILL_SETTING`'s
+    /// `Grad` field nests exactly this shape.
     Nested(Descriptor),
 }
 
@@ -478,6 +489,47 @@ mod tests {
 
         // Confirm patching a field we didn't touch stayed untouched.
         assert_eq!(reparsed.warp.get(b"warpValue"), tysh.warp.get(b"warpValue"));
+    }
+
+    #[test]
+    fn nested_descriptor_value_round_trips() {
+        // Value::Nested (OSType `Objc`) has zero real-fixture coverage in
+        // this spike's corpus -- confirmed by grepping all 5 TySh fixtures
+        // for the literal bytes "Objc": none contain it (audit done for
+        // FINDINGS.md finding 16). It is genuinely present in real
+        // Photoshop files elsewhere (e.g. GRADIENT_FILL_SETTING's `Grad`
+        // field), just not in anything text-layer-related this spike's
+        // corpus happens to cover -- gradient color stops need a List/Array
+        // value type this spike doesn't implement (out of scope, same as
+        // ever), so a real fixture can't be used here without expanding
+        // scope. This is therefore a synthetic round-trip, not a
+        // real-fixture one; see finding 16 for the independent
+        // cross-check (psd-tools' own Descriptor reader, via
+        // `cargo run -- --descriptor-audit` + `verify.sh`) that substitutes
+        // for real-fixture coverage.
+        let inner = Descriptor {
+            name: String::new(),
+            class_id: b"innr".to_vec(),
+            items: vec![
+                (b"Name".to_vec(), Value::Str("stop".into())),
+                (b"Locn".to_vec(), Value::Double(0.5)),
+            ],
+        };
+        let outer = Descriptor {
+            name: String::new(),
+            class_id: b"outr".to_vec(),
+            items: vec![(b"Nest".to_vec(), Value::Nested(inner.clone()))],
+        };
+
+        let mut bytes = Vec::new();
+        outer.write(&mut bytes).expect("write to Vec is infallible");
+        let reparsed =
+            Descriptor::read(&mut Cursor::new(&bytes)).expect("parse synthetic nested descriptor");
+        assert_eq!(reparsed, outer);
+        assert!(
+            matches!(reparsed.get(b"Nest"), Some(Value::Nested(d)) if d == &inner),
+            "nested descriptor value did not survive the round-trip"
+        );
     }
 
     #[test]

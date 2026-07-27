@@ -117,6 +117,34 @@ PY
 [ $? -ne 0 ] && fail=1
 
 echo
+echo "=== 3. Nested descriptor value (Value::Nested/Objc) — independent reader check"
+NESTED_FILE=out/nested-descriptor.bin
+if [ ! -f "$NESTED_FILE" ]; then
+  echo "    SKIPPED — run 'cargo run -- --descriptor-audit' first"
+else
+  python3 - "$NESTED_FILE" <<'PY'
+import sys
+from psd_tools.psd.descriptor import Descriptor
+
+# FINDINGS.md finding 16: Value::Nested (OSType Objc) has zero real-fixture
+# coverage in this spike's TySh corpus. This checks the same synthetic bytes
+# descriptor::tests::nested_descriptor_value_round_trips checks, but against
+# psd-tools' own independent reader instead of just ours -- the exact
+# discipline that caught finding 14's real bug in engine_data.rs.
+try:
+    with open(sys.argv[1], "rb") as f:
+        d = Descriptor.frombytes(f.read())
+    nest = d[b"Nest"]
+    assert dict(nest) == {b"Name": "stop", b"Locn": 0.5}, f"unexpected nested content: {dict(nest)!r}"
+    print(f"    PASS — psd-tools' own Descriptor reader accepts our Value::Nested encoding: {dict(nest)!r}")
+except Exception as e:
+    print(f"    FAIL — {e}")
+    sys.exit(1)
+PY
+  [ $? -ne 0 ] && fail=1
+fi
+
+echo
 if [ $fail -eq 0 ]; then
   echo "PASS — both independent readers accept the file."
   echo "Still outstanding: Photoshop itself. Nothing here proves that."

@@ -54,6 +54,9 @@ fn main() -> std::io::Result<()> {
     if std::env::args().any(|a| a == "--glyph-demo") {
         return glyph_demo();
     }
+    if std::env::args().any(|a| a == "--descriptor-audit") {
+        return descriptor_audit();
+    }
 
     // The first text layer this writer has ever embedded in a real file —
     // every prior TySh patch (--tysh-demo) operated on a standalone
@@ -337,13 +340,52 @@ fn glyph_demo() -> std::io::Result<()> {
     );
 
     println!(
-        "\nThis is rasterization only, standalone. `cargo run`'s own \
-         \"Aurora spike\" text layer now wires this exact rasterizer into a \
-         written PSD alongside a patched TySh block (FINDINGS.md finding \
-         14) — the first genuinely embedded, internally-consistent text \
-         layer this writer has produced. Font and color there are still \
-         hardcoded, same as here; reading a real FillColor/FontSet is \
-         separate, smaller remaining work."
+        "\nThis is rasterization only, standalone (still hardcoded color/size \
+         here, unlike `cargo run`'s own text layer). `cargo run`'s \"Aurora \
+         spike\" text layer wires this exact rasterizer into a written PSD \
+         alongside a patched TySh block, now using that TySh's own real \
+         FontSize/FillColor rather than constants (FINDINGS.md findings 14, \
+         15) — the first genuinely embedded, internally-consistent text \
+         layer this writer has produced. Font *resolution* (the document's \
+         actual named font, vs. the bundled DejaVu stand-in used here and \
+         there) remains unstarted."
+    );
+    Ok(())
+}
+
+/// Cross-checks `descriptor.rs`'s least-tested code path — `Value::Nested`
+/// (OSType `Objc`), which has zero real-fixture coverage in this spike's
+/// corpus (see `descriptor::tests::nested_descriptor_value_round_trips` and
+/// FINDINGS.md finding 16) — against an independent reader, the same
+/// discipline that caught finding 14's real bug in `engine_data.rs`. Writes
+/// `out/nested-descriptor.bin`; `verify.sh` opens it with `psd-tools`' own
+/// `Descriptor` reader.
+fn descriptor_audit() -> std::io::Result<()> {
+    let inner = descriptor::Descriptor {
+        name: String::new(),
+        class_id: b"innr".to_vec(),
+        items: vec![
+            (b"Name".to_vec(), descriptor::Value::Str("stop".into())),
+            (b"Locn".to_vec(), descriptor::Value::Double(0.5)),
+        ],
+    };
+    let outer = descriptor::Descriptor {
+        name: String::new(),
+        class_id: b"outr".to_vec(),
+        items: vec![(b"Nest".to_vec(), descriptor::Value::Nested(inner))],
+    };
+
+    let mut bytes = Vec::new();
+    outer.write(&mut bytes)?;
+
+    std::fs::create_dir_all("out")?;
+    std::fs::write("out/nested-descriptor.bin", &bytes)?;
+    println!(
+        "Wrote out/nested-descriptor.bin ({} bytes): a synthetic Descriptor \
+         with one item whose value is Value::Nested — the untested code \
+         path finding 16 audits. Run ./verify.sh to cross-check it against \
+         psd-tools' own Descriptor reader.",
+        bytes.len()
     );
     Ok(())
 }

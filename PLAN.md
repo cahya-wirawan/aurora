@@ -155,6 +155,7 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
 - [x→scoped] **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s on text edit** — `engine_data::recompute_run_lengths` fixes the exact staleness `--tysh-demo` used to report (`[7, 7, 16]`/`[30]` → `[13]`/`[13]` after the "Aurora spike" patch), reusing the first run's formatting rather than discarding it. **Deliberately scoped to whole-text replacement** — the only edit shape this patch-in-place spike supports; preserving multiple paragraphs/style runs *across* an edit needs a real cursor/selection model, which is Aurora's own text-editing engine's job in Phase 3, not this exercise. Caught one more UTF-16-vs-scalar-count nuance the same way finding 9's bug was caught: confirmed against a real fixture (`RunLengthArray` sums to UTF-16 code units) before writing the code, not assumed from ASCII-only fixtures where the two counts coincide. FINDINGS.md finding 12. 13 tests total, all against real extracted bytes.
 - [x→scoped] **Glyph rendering into pixel channels on text edit — wired into the writer, verified externally.** `src/glyph.rs` rasterizes real text headlessly via `cosmic-text` with a bundled font (finding 13), and `psd.rs` now has a `TySh` slot (`Layer::tysh`) — `cargo run` writes a real PSD whose text layer's descriptor and rendered pixels genuinely agree, confirmed by `psd-tools` reading back the correct text and legible, correctly-encoded pixels (`out/text-layer-psdtools.png`), not just our own writer's say-so. **Caught a real bug only an independent reader surfaced**: `engine_data::write` omitted whitespace between tokens (`<</EngineDict` instead of Photoshop's own `<< /EngineDict`) — every one of this spike's own round-trip tests kept passing throughout, since our reader tolerates it; `psd-tools`' differently-built, whitespace-only tokenizer didn't. Fixed. FINDINGS.md finding 14.
 - [x→scoped] **Real `FontSize`/`FillColor` wired in — no more hardcoded color/size.** `engine_data::first_run_style` reads `StyleRun.RunArray[0].StyleSheet.StyleSheetData`'s `FontSize`/`FillColor` (decoding confirmed against `ag-psd`'s own encoder); the written text layer shrank from 151×29 px to 82×16 px matching the real fixture's `FontSize: 13.0`, and still reads back correctly via `psd-tools` — visually confirmed, not just asserted. **Deliberately still scoped**: font *resolution* (the document's actual named font vs. the bundled `DejaVuSans.ttf` stand-in) and `FillColor` alpha compositing for a translucent fill remain unstarted — both real, smaller remaining work, not open unknowns; same first-run-only boundary as findings 12/14. FINDINGS.md finding 15. 21 tests total, all against real extracted bytes or bundled deterministic assets.
+- [x] **`descriptor.rs` audit for finding 14's bug class — one untested path found, cross-checked clean.** Grepped all 5 corpus fixtures for `Objc` (OSType for `Value::Nested`): zero hits — every other value type appears in every fixture and has been exercised through `psd-tools` via findings 14/15, but `Value::Nested` never had real-fixture or independent-reader coverage at all. Confirmed the type is real (not hypothetical) via `psd-tools`' own `gradient-fill.psd` fixture (`GRADIENT_FILL_SETTING.Grad`), but that fixture also needs List/Array support this reader doesn't have (correctly out of scope) — so closed the gap with a synthetic nested descriptor instead, cross-checked against `psd-tools`' own `Descriptor` reader (`cargo run -- --descriptor-audit` + `verify.sh` section 3), the same independent-reader discipline that caught finding 14. **Result: no bug this time** — `psd-tools` accepts our `Value::Nested` encoding correctly. Also fixed a stale doc comment that incorrectly implied `warp` exercised this code path (it doesn't — `warp` is a separate `DescriptorBlock` field). FINDINGS.md finding 16. 22 tests total.
 - [ ] Layer masks, vector masks, smart objects, layer styles, adjustment layers
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
@@ -364,23 +365,22 @@ here so they are not silently lost between phases.
    (R2f mitigation: a solo design owner has no built-in check) before the
    token vocabulary and Dark theme harden into something every widget
    depends on.
-3. **Font resolution, or the `descriptor.rs` bug audit — the text-layer
-   line of work is now down to smaller, real items, not open unknowns.**
-   `cargo run` writes a full PSD whose text layer's descriptor and rendered
-   pixels genuinely agree, in the descriptor's own font size and color
-   (`FontSize`/`FillColor`, read via `engine_data::first_run_style`), all
-   verified externally by `psd-tools` (FINDINGS.md findings 14, 15). What's
-   left, in no particular order: (a) **font resolution** — render with the
-   document's actual named font (`ResourceDict.FontSet`) instead of the
-   bundled `DejaVuSans.ttf` stand-in; lower-priority, since the
-   internal-consistency question these findings answer doesn't need
+3. **Font resolution, or `FillColor` alpha compositing — the only two real
+   items left in the whole text-layer line of work.** The `descriptor.rs`
+   bug audit is now done: grepped the corpus for `Objc` (zero hits — a
+   completely untested `Value::Nested` path), confirmed the type is real via
+   `psd-tools`' own `gradient-fill.psd`, and closed the gap with a synthetic
+   nested descriptor cross-checked against `psd-tools`' own reader — no bug
+   found this time, but now actually verified rather than assumed safe
+   (FINDINGS.md finding 16). What's left: (a) **font resolution** — render
+   with the document's actual named font (`ResourceDict.FontSet`) instead of
+   the bundled `DejaVuSans.ttf` stand-in; lower-priority, since the
+   internal-consistency question findings 14/15 answer doesn't need
    font-identical output; (b) **`FillColor` alpha compositing** for a
    translucent fill — `decode_fill_color` reads RGB only, untested since the
-   real fixture's own color is opaque; (c) **audit `descriptor.rs`'s writer**
-   for the same class of bug finding 14 caught in `engine_data.rs` — a
-   writer whose only test is its own reader accepting its own output, which
-   passed cleanly right up until `psd-tools`' independently-built tokenizer
-   was actually run against it.
+   real fixture's own color is opaque. Neither is urgent; both are the
+   *last* named gaps in this line of work, everything else having closed
+   over the last several sessions.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
