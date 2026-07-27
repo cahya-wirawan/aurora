@@ -353,7 +353,8 @@ here so they are not silently lost between phases.
    needs a machine with an active graphical login, which was not available
    this pass. Windows (UIA) is fully unstarted. Both are different platform
    APIs entirely and remain the only thing that can still overturn ADR 0001.
-2. **Review the 0.5 design scaffold** ([design/](design/README.md)) — all
+2. **Review the 0.5 design scaffold** ([design/](design/README.md),
+   [b0a7ac8](https://github.com/cahya-wirawan/aurora/commit/b0a7ac8)) — all
    five Phase 0 deliverables now have a first draft (token vocabulary, the
    four scales, a contrast-passing Dark theme, workspace mockup, gallery
    skeleton), but none are ratified. As design owner, revise the token names
