@@ -59,12 +59,17 @@ fn main() -> std::io::Result<()> {
     // every prior TySh patch (--tysh-demo) operated on a standalone
     // extracted block, never inside a written PSD. Shares the exact same
     // patch as --tysh-demo via patch_tysh_text, and the standalone
-    // rasterizer proven in glyph.rs (finding 13) — color and font size are
-    // still hardcoded arguments here, not read from the patched TySh's own
-    // StyleSheetData.FillColor/FontSize; that wiring is the next step, not
-    // this one (see FINDINGS.md finding 14).
-    let text_tysh = patch_tysh_text("Aurora spike")?;
-    let text_raster = glyph::rasterize("Aurora spike", 24.0, (20, 20, 20), None);
+    // rasterizer proven in glyph.rs (finding 13). Font size and color now
+    // come from the patched TySh's own EngineData -- StyleSheetData's
+    // FontSize/FillColor, decoded by engine_data::first_run_style -- rather
+    // than hardcoded constants (finding 15). Font *resolution* (using the
+    // document's actual named font instead of the bundled DejaVu stand-in)
+    // remains unstarted; see glyph.rs's module docs.
+    let (text_tysh, text_engine) = patch_tysh_text("Aurora spike")?;
+    let text_style = engine_data::first_run_style(&text_engine)
+        .expect("a real fixture must have a first style run with FontSize/FillColor");
+    let text_raster =
+        glyph::rasterize("Aurora spike", text_style.font_size, text_style.color, None);
 
     // Written bottom-up throughout: PSD stores the layer list from the bottom
     // of the stack upwards, the opposite of how a layers panel reads. Groups
@@ -178,7 +183,13 @@ fn main() -> std::io::Result<()> {
 /// existing, real convention difference between the two representations,
 /// not a typo; see the original `--tysh-demo` output this was extracted
 /// from.
-fn patch_tysh_text(new_text: &str) -> std::io::Result<descriptor::TypeToolObjectSetting> {
+/// Returns the patched `TySh` together with the final, patched `EngineData`
+/// value (post `recompute_run_lengths`) — the latter is what lets a caller
+/// read the real `FontSize`/`FillColor` (`engine_data::first_run_style`,
+/// finding 15) instead of hardcoding them, without a second parse.
+fn patch_tysh_text(
+    new_text: &str,
+) -> std::io::Result<(descriptor::TypeToolObjectSetting, engine_data::Value)> {
     let real_tysh = include_bytes!("../reference/tysh.bin");
     let mut tysh = descriptor::parse_fixture(real_tysh)?;
     tysh.set_text(format!("{new_text}\u{0}"));
@@ -188,31 +199,32 @@ fn patch_tysh_text(new_text: &str) -> std::io::Result<descriptor::TypeToolObject
     // completely different text-based format, not the Descriptor binary
     // format). Patching both fields is what the Python proof-of-concept in
     // FINDINGS.md finding 7 did at the full-file level.
-    if let descriptor::Value::Raw(engine_bytes) = tysh
+    let descriptor::Value::Raw(engine_bytes) = tysh
         .text_data
         .get(b"EngineData")
         .expect("EngineData field must exist")
         .clone()
-    {
-        let mut engine = engine_data::parse(&engine_bytes)
-            .expect("a real Photoshop EngineData payload must parse");
-        let engine_text = format!("{new_text}\r");
-        if let Some(slot) = engine.get_path_mut("EngineDict.Editor.Text") {
-            *slot = engine_data::Value::Str(engine_text.clone());
-        }
-        // Closes the gap finding 10 named: without this, ParagraphRun/
-        // StyleRun's RunLengthArrays would still sum to the OLD text's
-        // length, which is exactly the internal inconsistency a real writer
-        // must not produce. See engine_data.rs's module docs on
-        // recompute_run_lengths for what this does and doesn't cover.
-        engine_data::recompute_run_lengths(&mut engine, engine_text.encode_utf16().count())
-            .expect("a real fixture must have well-formed ParagraphRun/StyleRun");
-        let new_engine_bytes = engine_data::write(&engine);
-        tysh.text_data
-            .set(b"EngineData", descriptor::Value::Raw(new_engine_bytes));
+    else {
+        panic!("EngineData field must be Raw");
+    };
+    let mut engine =
+        engine_data::parse(&engine_bytes).expect("a real Photoshop EngineData payload must parse");
+    let engine_text = format!("{new_text}\r");
+    if let Some(slot) = engine.get_path_mut("EngineDict.Editor.Text") {
+        *slot = engine_data::Value::Str(engine_text.clone());
     }
+    // Closes the gap finding 10 named: without this, ParagraphRun/
+    // StyleRun's RunLengthArrays would still sum to the OLD text's
+    // length, which is exactly the internal inconsistency a real writer
+    // must not produce. See engine_data.rs's module docs on
+    // recompute_run_lengths for what this does and doesn't cover.
+    engine_data::recompute_run_lengths(&mut engine, engine_text.encode_utf16().count())
+        .expect("a real fixture must have well-formed ParagraphRun/StyleRun");
+    let new_engine_bytes = engine_data::write(&engine);
+    tysh.text_data
+        .set(b"EngineData", descriptor::Value::Raw(new_engine_bytes));
 
-    Ok(tysh)
+    Ok((tysh, engine))
 }
 
 /// Parses a real Photoshop-authored `TySh` block (extracted from psd-tools'
@@ -256,7 +268,7 @@ fn tysh_demo() -> std::io::Result<()> {
         before.len() == real_tysh.len()
     );
 
-    let tysh = patch_tysh_text("Aurora spike")?;
+    let (tysh, _) = patch_tysh_text("Aurora spike")?;
     let after = tysh.to_bytes();
     let reparsed_after = descriptor::parse_fixture(&after)?;
     println!("\nPatched `Txt ` to: {:?}", reparsed_after.text());

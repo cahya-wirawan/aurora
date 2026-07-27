@@ -153,7 +153,8 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
 - [x] **`EngineData`'s own text-format reader/writer** (`src/engine_data.rs`) — implemented and tested, not just patch-in-place on an opaque blob anymore. `--tysh-demo` now patches both the top-level `Txt ` field and the nested `EngineDict.Editor.Text` together. Corpus extended with two `TySh` blocks from `ag-psd` (a second, independently-written library that also *writes* text layers) — including a genuine multi-style-run case — and the existing parser needed **zero changes** to handle them. Caught and fixed one real bug in the process: a Unicode-escaping edge case (codepoints with `)` as their high byte) that would have silently truncated strings; found by a test, not inspection. 9 tests total, all against real extracted bytes.
 - [x] **Corpus extended to paragraph text and warped text** — `reference/tysh-paragraph.bin` (paragraph/area text, vs. every other fixture's point text) and `reference/tysh-warp-arc.bin` (`warpStyle = warpArc`, vs. every other fixture's `warpNone`), both from `ag-psd`'s test suite. `descriptor.rs` needed **zero code changes** for either. Two things confirmed against real bytes rather than assumed: point-vs-paragraph lives inside `EngineData` (`EngineDict.Rendered.Shapes.Children[0].Cookie.Photoshop.ShapeType`), not the outer `TySh` descriptor at all; and `warpRotate`'s enum category is `"Ornt"` (a shared orientation enum), not `"warpRotate"` — a wrong assumption the first draft of the test made and a real-bytes assertion caught immediately. FINDINGS.md finding 11. 12 tests total, all against real extracted bytes.
 - [x→scoped] **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s on text edit** — `engine_data::recompute_run_lengths` fixes the exact staleness `--tysh-demo` used to report (`[7, 7, 16]`/`[30]` → `[13]`/`[13]` after the "Aurora spike" patch), reusing the first run's formatting rather than discarding it. **Deliberately scoped to whole-text replacement** — the only edit shape this patch-in-place spike supports; preserving multiple paragraphs/style runs *across* an edit needs a real cursor/selection model, which is Aurora's own text-editing engine's job in Phase 3, not this exercise. Caught one more UTF-16-vs-scalar-count nuance the same way finding 9's bug was caught: confirmed against a real fixture (`RunLengthArray` sums to UTF-16 code units) before writing the code, not assumed from ASCII-only fixtures where the two counts coincide. FINDINGS.md finding 12. 13 tests total, all against real extracted bytes.
-- [x→scoped] **Glyph rendering into pixel channels on text edit — wired into the writer, verified externally.** `src/glyph.rs` rasterizes real text headlessly via `cosmic-text` with a bundled font (finding 13), and `psd.rs` now has a `TySh` slot (`Layer::tysh`) — `cargo run` writes a real PSD whose text layer's descriptor and rendered pixels genuinely agree, confirmed by `psd-tools` reading back the correct text and legible, correctly-encoded pixels (`out/text-layer-psdtools.png`), not just our own writer's say-so. **Caught a real bug only an independent reader surfaced**: `engine_data::write` omitted whitespace between tokens (`<</EngineDict` instead of Photoshop's own `<< /EngineDict`) — every one of this spike's own round-trip tests kept passing throughout, since our reader tolerates it; `psd-tools`' differently-built, whitespace-only tokenizer didn't. Fixed. Deliberately still scoped: color/font size are hardcoded arguments, not read from the patched `TySh`'s own `FillColor`/`FontSet` (real, smaller remaining work, not an open unknown). FINDINGS.md finding 14. 19 tests total, all against real extracted bytes or bundled deterministic assets.
+- [x→scoped] **Glyph rendering into pixel channels on text edit — wired into the writer, verified externally.** `src/glyph.rs` rasterizes real text headlessly via `cosmic-text` with a bundled font (finding 13), and `psd.rs` now has a `TySh` slot (`Layer::tysh`) — `cargo run` writes a real PSD whose text layer's descriptor and rendered pixels genuinely agree, confirmed by `psd-tools` reading back the correct text and legible, correctly-encoded pixels (`out/text-layer-psdtools.png`), not just our own writer's say-so. **Caught a real bug only an independent reader surfaced**: `engine_data::write` omitted whitespace between tokens (`<</EngineDict` instead of Photoshop's own `<< /EngineDict`) — every one of this spike's own round-trip tests kept passing throughout, since our reader tolerates it; `psd-tools`' differently-built, whitespace-only tokenizer didn't. Fixed. FINDINGS.md finding 14.
+- [x→scoped] **Real `FontSize`/`FillColor` wired in — no more hardcoded color/size.** `engine_data::first_run_style` reads `StyleRun.RunArray[0].StyleSheet.StyleSheetData`'s `FontSize`/`FillColor` (decoding confirmed against `ag-psd`'s own encoder); the written text layer shrank from 151×29 px to 82×16 px matching the real fixture's `FontSize: 13.0`, and still reads back correctly via `psd-tools` — visually confirmed, not just asserted. **Deliberately still scoped**: font *resolution* (the document's actual named font vs. the bundled `DejaVuSans.ttf` stand-in) and `FillColor` alpha compositing for a translucent fill remain unstarted — both real, smaller remaining work, not open unknowns; same first-run-only boundary as findings 12/14. FINDINGS.md finding 15. 21 tests total, all against real extracted bytes or bundled deterministic assets.
 - [ ] Layer masks, vector masks, smart objects, layer styles, adjustment layers
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
@@ -363,24 +364,23 @@ here so they are not silently lost between phases.
    (R2f mitigation: a solo design owner has no built-in check) before the
    token vocabulary and Dark theme harden into something every widget
    depends on.
-3. **Read a real `FillColor`/font size instead of `glyph::rasterize`'s
-   hardcoded arguments.** `cargo run` now writes a full PSD whose text
-   layer's `TySh` descriptor and rendered pixels genuinely agree, verified
-   externally by `psd-tools` (FINDINGS.md finding 14) — the core
-   internal-consistency question finding 8 raised is answered for the
-   whole-text-replacement case. What's left is real but smaller: read the
-   patched `TySh`'s own `StyleSheetData.FillColor` (decoding already done —
-   `{Type:1, Values:[alpha_or_1,R,G,B]}`, confirmed against `ag-psd`'s own
-   encoder) and `FontSize` instead of passing constants to
-   `glyph::rasterize`. Font *resolution* (matching `ResourceDict.FontSet`'s
-   named font rather than the bundled `DejaVuSans.ttf` stand-in) is real but
-   lower-priority — the internal-consistency question doesn't need
-   font-identical output, only legible, correctly-encoded output, which is
-   already true. Separately worth a look: finding 14 caught a real bug
-   (`engine_data::write` missing token whitespace) that none of this spike's
-   own round-trip tests could catch, since our reader tolerated the same
-   mistake our writer made — worth checking whether `descriptor.rs`'s writer
-   has any analogous gap that's only ever been tested against itself.
+3. **Font resolution, or the `descriptor.rs` bug audit — the text-layer
+   line of work is now down to smaller, real items, not open unknowns.**
+   `cargo run` writes a full PSD whose text layer's descriptor and rendered
+   pixels genuinely agree, in the descriptor's own font size and color
+   (`FontSize`/`FillColor`, read via `engine_data::first_run_style`), all
+   verified externally by `psd-tools` (FINDINGS.md findings 14, 15). What's
+   left, in no particular order: (a) **font resolution** — render with the
+   document's actual named font (`ResourceDict.FontSet`) instead of the
+   bundled `DejaVuSans.ttf` stand-in; lower-priority, since the
+   internal-consistency question these findings answer doesn't need
+   font-identical output; (b) **`FillColor` alpha compositing** for a
+   translucent fill — `decode_fill_color` reads RGB only, untested since the
+   real fixture's own color is opaque; (c) **audit `descriptor.rs`'s writer**
+   for the same class of bug finding 14 caught in `engine_data.rs` — a
+   writer whose only test is its own reader accepting its own output, which
+   passed cleanly right up until `psd-tools`' independently-built tokenizer
+   was actually run against it.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`

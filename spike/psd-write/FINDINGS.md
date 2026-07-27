@@ -510,24 +510,55 @@ font-identical output. And this remains the same single-paragraph,
 single-style edit shape findings 12/13 already scoped to; nothing here
 changes that boundary.
 
+### 15. Real `FontSize`/`FillColor` now wired in — the text layer's rendered pixels match its own style, not a hardcoded guess
+
+`engine_data::first_run_style` reads `EngineDict.StyleRun.RunArray[0]
+.StyleSheet.StyleSheetData`'s `FontSize` and `FillColor` (decoded via
+finding 13's `{Type, Values}` scheme) and `main`'s text layer now passes
+those — not hardcoded constants — to `glyph::rasterize`. Confirmed against
+the real fixture before relying on the path: `RunArray[0].StyleSheet
+.StyleSheetData` carries both fields directly, not only on
+`DefaultRunData` (a real fixture's own structure, not assumed).
+
+**Visible, correct effect:** the written text layer shrank from 151×29 px
+(the old hardcoded 24px) to 82×16 px, matching the real fixture's
+`FontSize: 13.0` — and `verify.sh` confirms `psd-tools` still reads back
+`"Aurora spike"` correctly and decodes legible, correctly-colored (opaque
+black, per `FillColor: {Type:1, Values:[1,0,0,0]}`) pixels at the new size.
+Visually inspected, not just asserted — same discipline as finding 14.
+
+**Scope, deliberate, same boundary as findings 12/13:** this reads the
+*first* run's style, matching `recompute_run_lengths`'s own "first run"
+collapse — correct for the one edit shape this spike supports. Font
+*resolution* (rendering with the document's actual named font from
+`ResourceDict.FontSet`, rather than the bundled `DejaVuSans.ttf` stand-in)
+remains unstarted and lower-priority: this finding's question was
+internal consistency between descriptor and pixels, which doesn't require
+font-identical rendering. Alpha compositing for a translucent `FillColor` is
+also explicitly not applied (`decode_fill_color` documents this) — the real
+fixture's own color happens to be fully opaque, so it wasn't exercised here.
+
 ## Scope: what this did *not* touch
 
 Groups, the `TySh` container, `EngineData`'s text format, `RunLengthArray`
-recomputation for whole-text-replacement edits, and a genuinely embedded,
+recomputation for whole-text-replacement edits, a genuinely embedded,
 internally-consistent text layer (descriptor + rendered pixels together, in
-one written file, verified externally) are all now implemented and tested
-against real bytes. Remaining, still untested and unimplemented:
+one written file, verified externally), and reading that layer's real
+`FontSize`/`FillColor` instead of hardcoded values are all now implemented
+and tested against real bytes. Remaining, still untested and unimplemented:
 
-- **General `RunLengthArray` preservation across an edit that keeps multiple
-  paragraphs/style runs** (finding 12) — finding 12 only handles the
-  whole-text-replacement case; a real cursor/selection-aware editor is
-  needed for anything richer
-- **Reading a real `FillColor`/font size/font instead of hardcoded
-  arguments** — finding 14's text layer is internally consistent, but
-  `glyph::rasterize`'s color and size are still call-site constants, not
-  read from the patched `TySh`'s own `StyleSheetData`; and font resolution
-  (matching `ResourceDict.FontSet`'s named font rather than the bundled
-  stand-in) hasn't been attempted at all
+- **General `RunLengthArray`/style preservation across an edit that keeps
+  multiple paragraphs/style runs** (findings 12, 15) — both only handle the
+  whole-text-replacement, first-run case; a real cursor/selection-aware
+  editor is needed for anything richer
+- **Font resolution** — rendering with the document's actual named font
+  (`ResourceDict.FontSet`) rather than the bundled `DejaVuSans.ttf`
+  stand-in; unstarted, and lower-priority than it sounds, since the
+  internal-consistency question findings 14/15 answer doesn't need
+  font-identical rendering
+- **`FillColor` alpha compositing** for a translucent fill — `decode_fill_color`
+  reads RGB only; the real fixture's own color happens to be opaque, so this
+  hasn't been exercised
 - Layer masks and vector masks
 - Smart objects, embedded and linked
 - Layer styles and effects
@@ -546,28 +577,31 @@ against real bytes. Remaining, still untested and unimplemented:
 **Do not read this spike as "PSD write is a solved problem."** But the
 text-layer result now genuinely is closer to solved than not: `cargo run`
 writes a real PSD containing a text layer whose descriptor and rendered
-pixels agree, verified by an independent reader, not just our own writer's
-say-so (finding 14). What's established: the container, layer records,
-channel data, Unicode naming, and groups are tractable from scratch (finding
-5); the `TySh` container and `EngineData` formats are both implemented and
-tested against real, independently-sourced bytes (findings 9, 10); the
-patch-a-real-file strategy is validated end-to-end at the file level
-(finding 7); `RunLengthArray` bookkeeping is correct for the one edit shape
-this spike supports — whole-text replacement (finding 12); Aurora's chosen
-text stack can rasterize real text headlessly and reproducibly (finding
-13); and the writer now embeds a `TySh` block plus matching rendered pixels
-together in one file, externally verified (finding 14) — closing finding
-8's core question for that one edit shape. Along the way, finding 14 also
-caught a real bug that a second independent reader's *different* tokenizer
-surfaced and this spike's own tests could not: `engine_data::write` omitted
-required whitespace between tokens. What's still open: full from-scratch
-`EngineData` generation remains higher-risk than assumed (finding 6) — the
+pixels agree — in the *same font size and color the descriptor itself
+specifies*, not a hardcoded guess — verified by an independent reader, not
+just our own writer's say-so (findings 14, 15). What's established: the
+container, layer records, channel data, Unicode naming, and groups are
+tractable from scratch (finding 5); the `TySh` container and `EngineData`
+formats are both implemented and tested against real, independently-sourced
+bytes (findings 9, 10); the patch-a-real-file strategy is validated
+end-to-end at the file level (finding 7); `RunLengthArray` bookkeeping is
+correct for the one edit shape this spike supports — whole-text replacement
+(finding 12); Aurora's chosen text stack can rasterize real text headlessly
+and reproducibly (finding 13); the writer embeds a `TySh` block plus
+matching rendered pixels together in one file, externally verified (finding
+14); and that rendering now reads the descriptor's own `FontSize`/`FillColor`
+instead of hardcoded constants (finding 15) — closing finding 8's core
+question for that one edit shape. Along the way, finding 14 also caught a
+real bug that a second independent reader's *different* tokenizer surfaced
+and this spike's own tests could not: `engine_data::write` omitted required
+whitespace between tokens. What's still open: full from-scratch `EngineData`
+generation remains higher-risk than assumed (finding 6) — the
 corpus-and-patch approach sidesteps rather than resolves that;
-`RunLengthArray` bookkeeping for richer, run-preserving edits (finding 12's
-own named scope boundary) is real, separate, unstarted work; and finding
-14's text layer still uses a hardcoded color/size/font rather than reading
-the patched `TySh`'s own `FillColor`/`FontSet` — smaller, real remaining
-work, not the open-ended unknown finding 8 used to be.
+`RunLengthArray`/style bookkeeping for richer, run-preserving edits (findings
+12/15's own named scope boundary) is real, separate, unstarted work; and
+font *resolution* (the document's actual named font, not the bundled
+stand-in) and `FillColor` alpha compositing remain unstarted — both smaller,
+real remaining work, not the open-ended unknown finding 8 used to be.
 
 ## Recommendations for Phase 3
 
@@ -589,11 +623,11 @@ work, not the open-ended unknown finding 8 used to be.
    (finding 8) — this is not a follow-on detail, it's required for any text
    edit to produce a non-broken file, and it did not appear in the original
    Phase 3 scoping. **Now done for the core case**: a written PSD's text
-   layer descriptor and rendered pixels genuinely agree, verified externally
-   (finding 14). What's still unbudgeted: reading a real `FillColor`/font
-   size instead of hardcoded values, and resolving `ResourceDict.FontSet`
-   font references to actual font files — both real, but no longer an
-   open-ended unknown.
+   layer descriptor and rendered pixels genuinely agree, in the descriptor's
+   own font size and color, verified externally (findings 14, 15). What's
+   still unbudgeted: resolving `ResourceDict.FontSet` font references to
+   actual font files, and `FillColor` alpha compositing for a translucent
+   fill — both real, but no longer an open-ended unknown.
 6. **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s whenever text
    length changes** (finding 10) — a second, separate piece of mandatory
    bookkeeping alongside finding 8's pixel sync. **Done for whole-text

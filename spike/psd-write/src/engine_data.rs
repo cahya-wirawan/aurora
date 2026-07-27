@@ -430,6 +430,95 @@ pub fn recompute_run_lengths(engine: &mut Value, new_len: usize) -> Result<()> {
     Ok(())
 }
 
+/// A text run's rendering-relevant style: font size (the document's own
+/// point size — used directly as `glyph::rasterize`'s `font_size_px`, no
+/// further scaling needed, since the real fixture's own `TySh.transform`
+/// carries no additional scale factor) and fill color.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunStyle {
+    pub font_size: f32,
+    pub color: (u8, u8, u8),
+}
+
+/// Reads the *first* style run's `FontSize`/`FillColor` from
+/// `EngineDict.StyleRun.RunArray[0].StyleSheet.StyleSheetData` — the
+/// counterpart to `recompute_run_lengths`'s same "first run" scope: correct
+/// for the one edit shape this spike supports (whole-text replacement,
+/// single style), not general multi-run styling.
+///
+/// Confirmed against a real fixture that `RunArray[0].StyleSheet
+/// .StyleSheetData` carries `FontSize`/`FillColor` directly, not only on
+/// `DefaultRunData`, before relying on that path. See FINDINGS.md finding 15.
+pub fn first_run_style(engine: &Value) -> Result<RunStyle> {
+    let Some(Value::List(run_array)) = engine.get_path("EngineDict.StyleRun.RunArray") else {
+        return Err(err("EngineDict.StyleRun.RunArray missing or not a list"));
+    };
+    let first = run_array
+        .first()
+        .ok_or_else(|| err("EngineDict.StyleRun.RunArray is empty"))?;
+
+    let font_size = match first.get_path("StyleSheet.StyleSheetData.FontSize") {
+        Some(Value::Float(f)) => *f as f32,
+        Some(Value::Int(i)) => *i as f32,
+        other => return Err(err(format!("FontSize missing or not numeric: {other:?}"))),
+    };
+
+    let fill_color = first
+        .get_path("StyleSheet.StyleSheetData.FillColor")
+        .ok_or_else(|| err("FillColor missing"))?;
+    let color = decode_fill_color(fill_color)?;
+
+    Ok(RunStyle { font_size, color })
+}
+
+/// Decodes a `FillColor`/`StrokeColor`-shaped `{Type, Values}` dict into
+/// straight RGB. Confirmed against `ag-psd`'s own *encoder* (`text.ts`'s
+/// `encodeColor`), since `psd-tools` doesn't model this field at all and
+/// treats it as opaque: `Type: 1` is RGB, `Values: [alpha_or_1, R, G, B]` in
+/// 0.0-1.0 floats; `Type: 0` is grayscale, `Values: [1, K]`; `Type: 2` is
+/// CMYK, `Values: [1, C, M, Y, K]`. See FINDINGS.md finding 13's note on this
+/// and finding 15.
+///
+/// Alpha (`Values[0]` for the RGB case) is intentionally not applied —
+/// `glyph::rasterize` takes a straight, fully-opaque color; genuine alpha
+/// compositing for a translucent fill is a separate, unstarted concern, the
+/// same scope boundary `glyph.rs`'s module docs already note.
+fn decode_fill_color(v: &Value) -> Result<(u8, u8, u8)> {
+    let Some(Value::Int(color_type)) = v.get("Type") else {
+        return Err(err("FillColor.Type missing or not an integer"));
+    };
+    let Some(Value::List(values)) = v.get("Values") else {
+        return Err(err("FillColor.Values missing or not a list"));
+    };
+    let as_f32 = |i: usize| -> Result<f32> {
+        match values.get(i) {
+            Some(Value::Float(f)) => Ok(*f as f32),
+            Some(Value::Int(n)) => Ok(*n as f32),
+            other => Err(err(format!(
+                "FillColor.Values[{i}] missing or not numeric: {other:?}"
+            ))),
+        }
+    };
+    let to_u8 = |f: f32| -> u8 { (f.clamp(0.0, 1.0) * 255.0).round() as u8 };
+
+    match color_type {
+        1 => Ok((to_u8(as_f32(1)?), to_u8(as_f32(2)?), to_u8(as_f32(3)?))),
+        0 => {
+            let k = to_u8(as_f32(1)?);
+            Ok((k, k, k))
+        }
+        2 => {
+            let (c, m, y, k) = (as_f32(1)?, as_f32(2)?, as_f32(3)?, as_f32(4)?);
+            Ok((
+                to_u8((1.0 - c) * (1.0 - k)),
+                to_u8((1.0 - m) * (1.0 - k)),
+                to_u8((1.0 - y) * (1.0 - k)),
+            ))
+        }
+        other => Err(err(format!("unsupported FillColor.Type {other}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +595,62 @@ mod tests {
             Some(1),
             "reference/tysh-paragraph.bin should be paragraph text"
         );
+    }
+
+    #[test]
+    fn reads_font_size_and_fill_color_from_the_real_fixture() {
+        let v = parse(&real_engine_data()).expect("parse");
+        let style = first_run_style(&v).expect("real fixture must have a first style run");
+        assert_eq!(style.font_size, 13.0);
+        assert_eq!(
+            style.color,
+            (0, 0, 0),
+            "real fixture's FillColor is opaque black"
+        );
+    }
+
+    #[test]
+    fn decodes_fill_color_variants() {
+        // RGB (Type 1): Values = [alpha_or_1, R, G, B].
+        let rgb = Value::Dict(vec![
+            ("Type".into(), Value::Int(1)),
+            (
+                "Values".into(),
+                Value::List(vec![
+                    Value::Float(1.0),
+                    Value::Float(0.2),
+                    Value::Float(0.4),
+                    Value::Float(0.6),
+                ]),
+            ),
+        ]);
+        assert_eq!(decode_fill_color(&rgb).unwrap(), (51, 102, 153));
+
+        // Grayscale (Type 0): Values = [1, K].
+        let gray = Value::Dict(vec![
+            ("Type".into(), Value::Int(0)),
+            (
+                "Values".into(),
+                Value::List(vec![Value::Float(1.0), Value::Float(0.5)]),
+            ),
+        ]);
+        assert_eq!(decode_fill_color(&gray).unwrap(), (128, 128, 128));
+
+        // CMYK (Type 2): Values = [1, C, M, Y, K]. C=1,M=0,Y=1,K=0 -> green.
+        let cmyk = Value::Dict(vec![
+            ("Type".into(), Value::Int(2)),
+            (
+                "Values".into(),
+                Value::List(vec![
+                    Value::Float(1.0),
+                    Value::Float(1.0),
+                    Value::Float(0.0),
+                    Value::Float(1.0),
+                    Value::Float(0.0),
+                ]),
+            ),
+        ]);
+        assert_eq!(decode_fill_color(&cmyk).unwrap(), (0, 255, 0));
     }
 
     #[test]
