@@ -9,3 +9,4 @@ edition = "2024"
 publish = false
 
 [dependencies]
+cosmic-text = "0.19"

@@ -12,7 +12,8 @@ cd spike/psd-write
 cargo run                  # writes out/spike.psd (layers + groups)
 ./verify.sh                # checks it with two independent readers
 cargo run -- --tysh-demo   # parses + patches a real Photoshop text layer
-cargo test                 # descriptor.rs round-trip tests against real bytes
+cargo run -- --glyph-demo  # rasterizes text to out/glyph-demo.ppm (view in any image viewer)
+cargo test                 # round-trip and rasterization tests against real bytes
 ```
 
 ## Verdict: pixel layers and groups are genuinely easy; text layers are harder than planned
@@ -384,6 +385,75 @@ recomputes both arrays, confirms the retained run still carries the
 *original* first run's formatting (not a blanked placeholder), and the
 result still round-trips. 13 tests total now, all against real bytes.
 
+### 13. Glyph rendering: a first, standalone proof that `cosmic-text` can rasterize real text headlessly — not yet wired into the writer
+
+Finding 8 named the single biggest piece of unstarted work this spike
+surfaced: editing a text layer's descriptor without re-rendering its pixel
+channels leaves the file internally inconsistent. `src/glyph.rs` answers the
+narrower first question — can Aurora's chosen text stack (`cosmic-text`, PRD
+§8.3) actually rasterize real text to an RGBA8 buffer, headlessly, with a
+font Aurora controls — before attempting the bigger, riskier step of wiring
+that into `psd.rs`'s layer writer.
+
+**`psd.rs`'s writer has no `TySh` slot at all.** Worth stating plainly: the
+full-file `cargo run` writer (`Layer`/`FlatRecord` in `psd.rs`) only knows
+about plain pixel layers, `luni` names, and `lsct` group markers. All the
+`TySh`/`EngineData` work so far (findings 9–12) operates on a *standalone*
+extracted block via `--tysh-demo`, never embedded in a written PSD. Closing
+finding 8 for real needs a new tagged-block hook in the layer-record writer,
+not just a rasterizer — that's the next step, deliberately not attempted
+this session (see "Scope" below).
+
+**What this proof establishes, via `cargo run -- --glyph-demo` and
+`glyph::tests`:**
+
+- `cosmic-text` renders real, correctly-shaped, legible text headlessly —
+  confirmed by eye (`out/glyph-demo.ppm` for "Aurora spike" is unambiguously
+  legible, not just "some pixels changed") and by four Rust tests: non-trivial
+  glyph coverage, an empty string producing zero ink (rules out
+  unconditional painting), longer text producing a wider canvas, and
+  byte-for-byte deterministic output for identical input.
+- **The font is bundled** (`reference/fonts/DejaVuSans.ttf`, loaded via
+  `FontSystem::new_with_fonts` + `fontdb::Source::Binary`, never touching the
+  host's installed fonts), so rendering is reproducible on any machine or in
+  CI — a real, deliberate choice, not an oversight: matching Photoshop's own
+  chosen font exactly is a separate, harder problem (resolving
+  `ResourceDict.FontSet` names to actual font files) that this proof
+  sidesteps rather than solves.
+- **`cosmic-text`'s `Buffer::draw` callback fires per-subpixel-run, not
+  per-glyph** — confirmed by reading the upstream `terminal` example before
+  writing `glyph.rs`, not assumed. Every run observed from this font/shaper
+  combination is 1×1, matching that example; the code asserts this rather
+  than silently mishandling a wider run if one ever appeared, the same
+  "fail loudly, don't guess" discipline as findings 1, 2, and 9.
+- Canvas size is derived from the shaped layout itself (widest line ×
+  line-height × line count) rather than a fixed box — correct for *point*
+  text, which has no bounding box at all (`reference/tysh.bin`'s own `bbox`
+  is `(0,0,0,0)`). *Paragraph* text's fixed wrap-box case (finding 11) is a
+  real, different problem, out of scope for this proof.
+
+**Scope, deliberate:** this is rasterization only. It does not: read
+`StyleRun`'s actual `FillColor`/font/size and use them (the color/size are
+hardcoded call arguments here); resolve the real font from
+`ResourceDict.FontSet`; handle multiple style runs or paragraph line breaks
+from `EngineData`; or embed the result into a written PSD at all. Each of
+those is real, separate work — the point of doing this narrow slice first
+is the same reason finding 7 did a Python proof-of-concept before findings
+9/10's Rust port: prove the riskiest unknown (can the chosen library even do
+this, headlessly, reproducibly) before spending effort on the integration
+plumbing around it.
+
+One color-encoding fact worth recording now, confirmed against `ag-psd`'s
+own encoder (not just its reader) since `psd-tools` doesn't model this
+field at all — it stays an opaque descriptor to that library:
+`StyleSheetData.FillColor` is `{Type, Values}` where `Type: 1` means RGB and
+`Values` is `[alpha_or_1, R, G, B]` in 0.0–1.0 floats (`Type: 0` = grayscale
+`[1, K]`; `Type: 2` = CMYK `[1, C, M, Y, K]`). The real fixture's
+`{Type: 1, Values: [1.0, 0.0, 0.0, 0.0]}` is therefore opaque black — the
+expected default text color. Needed before `glyph.rs` can read a real
+`FillColor` instead of taking color as a hardcoded argument; not yet wired
+in.
+
 ## Scope: what this did *not* touch
 
 Groups, the `TySh` container, `EngineData`'s text format, and
@@ -396,9 +466,12 @@ unimplemented:
   whole-text-replacement case; a real cursor/selection-aware editor is
   needed for anything richer
 - **Rendering glyphs into pixel channels to keep text layers visually
-  consistent** (finding 8) — still the single most important piece of
-  unstarted work this spike surfaced; nothing in findings 10 or 12 touches
-  this
+  consistent** (finding 8) — finding 13 proves the rasterizer works
+  standalone, but it is **not wired into the writer**: `psd.rs` still has no
+  `TySh` slot at all, `glyph.rs` still takes color/font as hardcoded
+  arguments rather than reading `FillColor`/`ResourceDict.FontSet`, and
+  nothing embeds rendered pixels into a written PSD. Still the single
+  biggest gap between this spike and a real implementation.
 - Layer masks and vector masks
 - Smart objects, embedded and linked
 - Layer styles and effects
@@ -420,15 +493,18 @@ container, layer records, channel data, Unicode naming, and groups are
 tractable from scratch (finding 5); the `TySh` container and `EngineData`
 formats are both implemented and tested against real, independently-sourced
 bytes (findings 9, 10); the patch-a-real-file strategy is validated
-end-to-end at the file level (finding 7); and `RunLengthArray` bookkeeping is
+end-to-end at the file level (finding 7); `RunLengthArray` bookkeeping is
 correct for the one edit shape this spike supports — whole-text replacement
-(finding 12). What's still open: full from-scratch `EngineData` generation
-remains higher-risk than assumed (finding 6) — the corpus-and-patch approach
-sidesteps rather than resolves that; the pixel/vector sync requirement
-(finding 8) is real, mandatory, unstarted engineering work and by far the
-biggest remaining item; and `RunLengthArray` bookkeeping for richer, run-
-preserving edits (finding 12's own named scope boundary) is real, separate,
-unstarted work.
+(finding 12); and Aurora's chosen text stack can rasterize real text
+headlessly and reproducibly (finding 13). What's still open: full
+from-scratch `EngineData` generation remains higher-risk than assumed
+(finding 6) — the corpus-and-patch approach sidesteps rather than resolves
+that; `RunLengthArray` bookkeeping for richer, run-preserving edits (finding
+12's own named scope boundary) is real, separate, unstarted work; and the
+pixel/vector sync requirement (finding 8) has a proven rasterizer (finding
+13) but **no writer integration at all** — `psd.rs` has no `TySh` slot, and
+nothing reads a real `FillColor`/font/layout — which remains by far the
+biggest remaining item.
 
 ## Recommendations for Phase 3
 
@@ -449,7 +525,11 @@ unstarted work.
 5. **Budget real engineering time for glyph rendering into pixel channels**
    (finding 8) — this is not a follow-on detail, it's required for any text
    edit to produce a non-broken file, and it did not appear in the original
-   Phase 3 scoping.
+   Phase 3 scoping. **The rasterizer itself is now proven feasible**
+   (finding 13, `cosmic-text` headless, bundled font) — what's still
+   unbudgeted is the writer-integration work: a `TySh` slot in `psd.rs`,
+   reading real `FillColor`/font/size instead of hardcoded values, and
+   resolving `ResourceDict.FontSet` font references to actual files.
 6. **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s whenever text
    length changes** (finding 10) — a second, separate piece of mandatory
    bookkeeping alongside finding 8's pixel sync. **Done for whole-text

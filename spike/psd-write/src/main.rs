@@ -14,6 +14,7 @@
 
 mod descriptor;
 mod engine_data;
+mod glyph;
 mod psd;
 
 use psd::{Document, Group, Item, Layer};
@@ -49,6 +50,9 @@ fn swatch(w: u32, h: u32, rgb: [u8; 3], feather: f32) -> Vec<u8> {
 fn main() -> std::io::Result<()> {
     if std::env::args().any(|a| a == "--tysh-demo") {
         return tysh_demo();
+    }
+    if std::env::args().any(|a| a == "--glyph-demo") {
+        return glyph_demo();
     }
 
     // Written bottom-up throughout: PSD stores the layer list from the bottom
@@ -239,7 +243,45 @@ fn tysh_demo() -> std::io::Result<()> {
          channels too, or the file is visually inconsistent \
          (FINDINGS.md finding 8) — unaffected by the run-length fix above \
          (finding 12), which only closes the descriptor-level bookkeeping gap \
-         (finding 10)."
+         (finding 10). See --glyph-demo for a first, standalone step toward \
+         closing finding 8 itself (finding 13) — rasterization only, not yet \
+         wired into this patch."
+    );
+    Ok(())
+}
+
+/// Standalone proof that `cosmic-text` can rasterize real text to an RGBA8
+/// buffer headlessly, with a bundled font (see `glyph.rs`'s module docs for
+/// why this is deliberately *not* wired into a written PSD yet — that is the
+/// next step, not this one). Writes `out/glyph-demo.ppm`, viewable in any
+/// image viewer that reads binary PPM (GIMP, `feh`, `eog`, ImageMagick's
+/// `display`, or `magick out/glyph-demo.ppm out/glyph-demo.png` to convert).
+fn glyph_demo() -> std::io::Result<()> {
+    let text = "Aurora spike";
+    let raster = glyph::rasterize(text, 48.0, (20, 20, 20), None);
+
+    let inked: usize = raster.pixels.chunks_exact(4).filter(|px| px[3] > 0).count();
+    println!(
+        "Rasterized {text:?}: {}×{} px, {inked} of {} pixels inked ({:.1}%)",
+        raster.width,
+        raster.height,
+        raster.width * raster.height,
+        100.0 * inked as f64 / (raster.width * raster.height) as f64
+    );
+
+    std::fs::create_dir_all("out")?;
+    let path = std::path::Path::new("out/glyph-demo.ppm");
+    glyph::write_ppm(&raster, path)?;
+    println!(
+        "Wrote {} — open it in an image viewer to confirm the text is legible",
+        path.display()
+    );
+
+    println!(
+        "\nThis is rasterization only — it does not yet write a PSD. Closing \
+         FINDINGS.md finding 8 for real means wiring this into psd.rs's layer \
+         writer, which has no TySh slot at all yet; see finding 13 for what \
+         that next step needs."
     );
     Ok(())
 }

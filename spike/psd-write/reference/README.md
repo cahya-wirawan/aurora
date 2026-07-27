@@ -48,3 +48,19 @@ distinction mattered here specifically).
 
 All fetched from the two upstream projects' own test suites (both MIT
 licensed), used here only for local format research and testing.
+
+## `fonts/`
+
+Not a PSD fixture — a font bundled for `src/glyph.rs`'s standalone glyph
+rasterization proof (FINDINGS.md finding 13), so rendering is reproducible on
+any machine or in CI rather than depending on whatever happens to be
+installed on the host.
+
+- **`DejaVuSans.ttf`** — from the [DejaVu Fonts
+  project](https://dejavu-fonts.github.io/), Bitstream Vera License (see
+  `DejaVu-LICENSE`) — permissive, redistributable, distinct from this
+  project's own MIT licence but compatible with it. Chosen only for being a
+  small, reliable, widely-available Latin font; not a statement about what
+  font Aurora ships with. A real implementation renders whatever font the
+  PSD's own `ResourceDict.FontSet` names, which this proof does not attempt
+  to resolve (see `glyph.rs`'s module docs).

@@ -153,7 +153,7 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
 - [x] **`EngineData`'s own text-format reader/writer** (`src/engine_data.rs`) — implemented and tested, not just patch-in-place on an opaque blob anymore. `--tysh-demo` now patches both the top-level `Txt ` field and the nested `EngineDict.Editor.Text` together. Corpus extended with two `TySh` blocks from `ag-psd` (a second, independently-written library that also *writes* text layers) — including a genuine multi-style-run case — and the existing parser needed **zero changes** to handle them. Caught and fixed one real bug in the process: a Unicode-escaping edge case (codepoints with `)` as their high byte) that would have silently truncated strings; found by a test, not inspection. 9 tests total, all against real extracted bytes.
 - [x] **Corpus extended to paragraph text and warped text** — `reference/tysh-paragraph.bin` (paragraph/area text, vs. every other fixture's point text) and `reference/tysh-warp-arc.bin` (`warpStyle = warpArc`, vs. every other fixture's `warpNone`), both from `ag-psd`'s test suite. `descriptor.rs` needed **zero code changes** for either. Two things confirmed against real bytes rather than assumed: point-vs-paragraph lives inside `EngineData` (`EngineDict.Rendered.Shapes.Children[0].Cookie.Photoshop.ShapeType`), not the outer `TySh` descriptor at all; and `warpRotate`'s enum category is `"Ornt"` (a shared orientation enum), not `"warpRotate"` — a wrong assumption the first draft of the test made and a real-bytes assertion caught immediately. FINDINGS.md finding 11. 12 tests total, all against real extracted bytes.
 - [x→scoped] **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s on text edit** — `engine_data::recompute_run_lengths` fixes the exact staleness `--tysh-demo` used to report (`[7, 7, 16]`/`[30]` → `[13]`/`[13]` after the "Aurora spike" patch), reusing the first run's formatting rather than discarding it. **Deliberately scoped to whole-text replacement** — the only edit shape this patch-in-place spike supports; preserving multiple paragraphs/style runs *across* an edit needs a real cursor/selection model, which is Aurora's own text-editing engine's job in Phase 3, not this exercise. Caught one more UTF-16-vs-scalar-count nuance the same way finding 9's bug was caught: confirmed against a real fixture (`RunLengthArray` sums to UTF-16 code units) before writing the code, not assumed from ASCII-only fixtures where the two counts coincide. FINDINGS.md finding 12. 13 tests total, all against real extracted bytes.
-- [ ] Glyph rendering into pixel channels on text edit — **still the single biggest unstarted item; unaffected by the `EngineData`/run-length work above**
+- [~] **Glyph rendering into pixel channels on text edit — standalone rasterization proven, not wired into the writer.** `src/glyph.rs` rasterizes real text headlessly via `cosmic-text` with a bundled font (`reference/fonts/DejaVuSans.ttf`, so it's reproducible on any machine/CI) — confirmed legible by eye (`out/glyph-demo.ppm`) and by 4 tests (coverage, empty-string, width-scales-with-length, byte-for-byte determinism). Deliberately not yet done: `psd.rs`'s writer has **no `TySh` slot at all** to embed this into; `glyph.rs` takes color/font as hardcoded arguments rather than reading `StyleSheetData.FillColor`/`ResourceDict.FontSet` (FillColor's `{Type, Values}` encoding is now decoded, confirmed against `ag-psd`'s own encoder — see FINDINGS.md finding 13); and nothing embeds rendered pixels into a written PSD yet. FINDINGS.md finding 13. 17 tests total, all against real extracted bytes or bundled deterministic assets.
 - [ ] Layer masks, vector masks, smart objects, layer styles, adjustment layers
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
@@ -363,23 +363,22 @@ here so they are not silently lost between phases.
    (R2f mitigation: a solo design owner has no built-in check) before the
    token vocabulary and Dark theme harden into something every widget
    depends on.
-3. **Glyph rendering into pixel channels is now the one unstarted item in
-   the whole text-layer line of work.** The corpus-plus-patch strategy is
-   proven in Python (full file level) and Rust (`descriptor.rs` +
-   `engine_data.rs`, 13 tests, two independent libraries' fixtures, 5 real
-   `TySh` blocks spanning point/paragraph text, single/multi style runs, and
-   warped text); the named corpus gaps are closed (finding 11); and
-   `RunLengthArray` recomputation is done for the one edit shape this spike
-   supports — whole-text replacement (finding 12). What's left is finding 8:
-   without re-rendering glyphs into the layer's pixel channels on every text
-   edit, the file stays internally inconsistent (descriptor says one thing,
-   the flattened preview shows another) — this needs Aurora's own text stack
-   (`cosmic-text`/`glyphon`) wired in, real engineering work with no
-   shortcut, not another patch-in-place exercise. Secondary, if more corpus
-   work is wanted first instead: vertical text, RTL, and multiple style runs
-   within one paragraph are still untested; and finding 12's own scope
-   boundary (run-preserving edits, not just whole-text replacement) needs a
-   cursor/selection model this spike doesn't have.
+3. **Wire the proven glyph rasterizer into the actual PSD writer.**
+   `src/glyph.rs` (finding 13) proved `cosmic-text` renders real, legible
+   text headlessly with a bundled font — confirmed by eye and by 4 tests.
+   What's left, in rough order: (a) give `psd.rs`'s layer writer a `TySh`
+   tagged-block slot — it currently has none at all, so nothing text-related
+   has ever been embedded in a *written* PSD, only patched standalone via
+   `--tysh-demo`; (b) read a real `StyleSheetData.FillColor` (now decoded —
+   `{Type:1, Values:[alpha_or_1,R,G,B]}` — confirmed against `ag-psd`'s own
+   encoder) and font size instead of `glyph::rasterize`'s hardcoded
+   arguments; (c) write one full PSD with a patched-text layer whose pixels
+   were actually re-rendered, and verify with `psd-tools`/`sips` the same way
+   `verify.sh` already does for the rest of the writer — that's the artifact
+   finding 8 has been about all along. Font *resolution* (matching
+   `ResourceDict.FontSet`'s named font rather than the bundled stand-in) is
+   real but lower-priority — the internal-consistency question doesn't need
+   font-identical output, only legible, correctly-encoded one.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
