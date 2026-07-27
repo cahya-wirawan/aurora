@@ -369,6 +369,53 @@ pub fn write(v: &Value) -> Vec<u8> {
     out
 }
 
+/// Recomputes `EngineDict.ParagraphRun`/`StyleRun`'s `RunLengthArray`s so
+/// they sum to `new_len` (UTF-16 code units — Photoshop's own unit for these,
+/// confirmed against `text-test.psd`'s two-run fixture: `RunLengthArray`
+/// always sums to `EngineDict.Editor.Text`'s UTF-16 length, never its scalar
+/// character count).
+///
+/// **Scope, deliberate:** collapses each run array down to its *first*
+/// existing entry (reusing that entry's `ParagraphSheet`/`StyleSheet`
+/// formatting) and gives it the whole new length. That's correct exactly
+/// when an edit replaces the entire text with a single paragraph in a
+/// single style — which is what `--tysh-demo` actually does, and the case
+/// finding 10 in FINDINGS.md named as still-broken. Preserving multiple
+/// paragraph/style runs *across* an edit (e.g. inserting a character in the
+/// middle of a multi-style word) needs a real cursor/selection model over
+/// the text, which this patch-in-place spike doesn't have — that's Aurora's
+/// own text-editing engine's job in Phase 3, not this exercise. See
+/// FINDINGS.md finding 12.
+pub fn recompute_run_lengths(engine: &mut Value, new_len: usize) -> Result<()> {
+    for run_key in ["ParagraphRun", "StyleRun"] {
+        let path = format!("EngineDict.{run_key}");
+        let run = engine
+            .get_path_mut(&path)
+            .ok_or_else(|| err(format!("{path} missing")))?;
+        let Value::Dict(items) = run else {
+            return Err(err(format!("{path} is not a dict")));
+        };
+
+        match items.iter_mut().find(|(k, _)| k == "RunArray") {
+            Some((_, Value::List(run_array))) if !run_array.is_empty() => {
+                run_array.truncate(1);
+            }
+            _ => {
+                return Err(err(format!(
+                    "{path}.RunArray missing, empty, or not a list"
+                )));
+            }
+        }
+        match items.iter_mut().find(|(k, _)| k == "RunLengthArray") {
+            Some((_, v @ Value::List(_))) => {
+                *v = Value::List(vec![Value::Int(new_len as i64)]);
+            }
+            _ => return Err(err(format!("{path}.RunLengthArray missing or not a list"))),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +524,69 @@ mod tests {
             reparsed.get_path("ResourceDict.KinsokuSet"),
             v.get_path("ResourceDict.KinsokuSet")
         );
+    }
+
+    #[test]
+    fn patches_text_and_recomputes_run_lengths() {
+        // Before the fix (FINDINGS.md finding 10): the real fixture's
+        // ParagraphRun.RunLengthArray is [7, 7, 16] (three paragraphs,
+        // summing to the original 30-char text) and StyleRun.RunLengthArray
+        // is [30] (one style run). Patching Editor.Text alone leaves both
+        // stale — they'd still sum to 30 after the text became 13 chars,
+        // which is exactly the internal inconsistency finding 10 flagged.
+        let mut v = parse(&real_engine_data()).expect("parse");
+        assert_eq!(
+            v.get_path("EngineDict.ParagraphRun.RunLengthArray"),
+            Some(&Value::List(vec![
+                Value::Int(7),
+                Value::Int(7),
+                Value::Int(16)
+            ]))
+        );
+
+        let new_text = "Aurora spike\r";
+        *v.get_path_mut("EngineDict.Editor.Text")
+            .expect("Editor.Text must exist") = Value::Str(new_text.into());
+        recompute_run_lengths(&mut v, new_text.encode_utf16().count())
+            .expect("a real fixture must have well-formed ParagraphRun/StyleRun");
+
+        let new_len = Value::Int(new_text.encode_utf16().count() as i64);
+        assert_eq!(
+            v.get_path("EngineDict.ParagraphRun.RunLengthArray"),
+            Some(&Value::List(vec![new_len.clone()]))
+        );
+        assert_eq!(
+            v.get_path("EngineDict.StyleRun.RunLengthArray"),
+            Some(&Value::List(vec![new_len]))
+        );
+
+        // Formatting is preserved, not discarded — the single remaining run
+        // in each array is still the *first* original run's sheet, not a
+        // blanked-out placeholder. `get_path` doesn't cross `List`s (see
+        // `shape_type` above), so index into RunArray directly.
+        let first_run = |run_key: &str| -> &Value {
+            let Some(Value::List(run_array)) =
+                v.get_path(&format!("EngineDict.{run_key}.RunArray"))
+            else {
+                panic!("{run_key}.RunArray missing or not a list");
+            };
+            run_array
+                .first()
+                .expect("RunArray must have one entry left")
+        };
+        assert_eq!(
+            first_run("ParagraphRun").get_path("ParagraphSheet.Properties.Justification"),
+            Some(&Value::Int(0))
+        );
+        assert_eq!(
+            first_run("StyleRun").get_path("StyleSheet.StyleSheetData.FontSize"),
+            Some(&Value::Float(13.0))
+        );
+
+        // Whole thing still round-trips after the combined patch.
+        let out = write(&v);
+        let reparsed = parse(&out).expect("re-parse after patch + recompute");
+        assert_eq!(reparsed, v);
     }
 
     #[test]

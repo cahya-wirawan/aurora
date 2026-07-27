@@ -308,12 +308,14 @@ to handle. All test fixtures instead use the `EngineData` payload genuinely
 extracted from a Photoshop-authored `TySh` block (`reference/tysh.bin`).
 Recorded in `reference/README.md` so the distinction isn't lost.
 
-**Still not done:** `--tysh-demo`'s own output says so explicitly rather than
-implying more completeness than exists — after patching both text fields,
-the `ParagraphRun`/`StyleRun` `RunLengthArray`s still sum to the *old* text's
-length. A real writer must recompute these against the new text, or
-Photoshop's own run bookkeeping is internally wrong. This is additional,
-separate work from finding 8's pixel/vector sync gap, not the same issue.
+**Was not done as of this finding, closed by finding 12:** `--tysh-demo`'s own
+output said so explicitly rather than implying more completeness than
+existed — after patching both text fields, the `ParagraphRun`/`StyleRun`
+`RunLengthArray`s still summed to the *old* text's length. A real writer must
+recompute these against the new text, or Photoshop's own run bookkeeping is
+internally wrong. This was additional, separate work from finding 8's
+pixel/vector sync gap, not the same issue — finding 8 (glyph rendering) is
+still open.
 
 ### 11. Corpus extended to paragraph text and warped text — container format holds, no code changes needed
 
@@ -348,17 +350,55 @@ assumed:
   against the real bytes (`descriptor::tests::parses_warped_text`) rather
   than writing the assertion from the pattern seen so far.
 
+### 12. `RunLengthArray` recomputation implemented — closes finding 10's named gap, deliberately scoped to whole-text replacement
+
+`engine_data::recompute_run_lengths` fixes the exact inconsistency finding 10
+flagged: after `--tysh-demo` patches `EngineDict.Editor.Text`, the
+`ParagraphRun`/`StyleRun` `RunLengthArray`s now correctly sum to the *new*
+text's length (confirmed: `[7, 7, 16]` → `[13]` and `[30]` → `[13]` for the
+demo's "Aurora spike\r" patch), instead of silently still summing to the old
+30 characters.
+
+**Scope, deliberate, not a corner cut:** this collapses each run array down
+to a single run — the *first* existing entry's `ParagraphSheet`/`StyleSheet`
+formatting, reused, given the whole new length. That's the correct behavior
+exactly when an edit replaces the entire text with one paragraph in one
+style, which is what `--tysh-demo` does and the only edit shape this spike's
+patch-in-place model supports. It is **not** general run-preserving editing
+(e.g. inserting a character in the middle of a multi-style word without
+disturbing the runs around it) — that needs a real cursor/selection model
+over the text, which belongs to Aurora's own text-editing engine in Phase 3,
+not this exercise. Recorded here so a future reader doesn't mistake "the
+demo's specific edit is now internally consistent" for "arbitrary text edits
+are handled."
+
+**One more instance of the same lesson as findings 1, 2, 9, and 10's own bug
+find:** `RunLengthArray` sums to the text's **UTF-16 code unit** count, not
+its Unicode scalar (`char`) count — confirmed against `ag-psd`'s
+`text-test.psd` fixture (`RunLengthArray: [1, 1]` for a 2-run, 2-code-unit
+layer) before writing `recompute_run_lengths`, not assumed from the fact that
+every fixture seen so far happened to be ASCII where the two counts coincide.
+
+Tested in `engine_data::tests::patches_text_and_recomputes_run_lengths`:
+recomputes both arrays, confirms the retained run still carries the
+*original* first run's formatting (not a blanked placeholder), and the
+result still round-trips. 13 tests total now, all against real bytes.
+
 ## Scope: what this did *not* touch
 
-Groups, the `TySh` container, and `EngineData`'s text format are all now
+Groups, the `TySh` container, `EngineData`'s text format, and
+`RunLengthArray` recomputation for whole-text-replacement edits are all now
 implemented and tested against real bytes. Remaining, still untested and
 unimplemented:
 
-- **Recomputing `RunLengthArray`s to match edited text length** (finding 10)
-  — needed alongside the text patch itself, not instead of it
+- **General `RunLengthArray` preservation across an edit that keeps multiple
+  paragraphs/style runs** (finding 12) — finding 12 only handles the
+  whole-text-replacement case; a real cursor/selection-aware editor is
+  needed for anything richer
 - **Rendering glyphs into pixel channels to keep text layers visually
   consistent** (finding 8) — still the single most important piece of
-  unstarted work this spike surfaced; nothing in finding 10 touches this
+  unstarted work this spike surfaced; nothing in findings 10 or 12 touches
+  this
 - Layer masks and vector masks
 - Smart objects, embedded and linked
 - Layer styles and effects
@@ -380,12 +420,15 @@ container, layer records, channel data, Unicode naming, and groups are
 tractable from scratch (finding 5); the `TySh` container and `EngineData`
 formats are both implemented and tested against real, independently-sourced
 bytes (findings 9, 10); the patch-a-real-file strategy is validated
-end-to-end at the file level (finding 7). What's still open: full
-from-scratch `EngineData` generation remains higher-risk than assumed
-(finding 6) — the corpus-and-patch approach sidesteps rather than resolves
-that; the pixel/vector sync requirement (finding 8) is real, mandatory,
-unstarted engineering work; and run-length bookkeeping on edit (finding 10)
-is a real, separate gap from the pixel sync one.
+end-to-end at the file level (finding 7); and `RunLengthArray` bookkeeping is
+correct for the one edit shape this spike supports — whole-text replacement
+(finding 12). What's still open: full from-scratch `EngineData` generation
+remains higher-risk than assumed (finding 6) — the corpus-and-patch approach
+sidesteps rather than resolves that; the pixel/vector sync requirement
+(finding 8) is real, mandatory, unstarted engineering work and by far the
+biggest remaining item; and `RunLengthArray` bookkeeping for richer, run-
+preserving edits (finding 12's own named scope boundary) is real, separate,
+unstarted work.
 
 ## Recommendations for Phase 3
 
@@ -409,9 +452,11 @@ is a real, separate gap from the pixel sync one.
    Phase 3 scoping.
 6. **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s whenever text
    length changes** (finding 10) — a second, separate piece of mandatory
-   bookkeeping alongside finding 8's pixel sync; `--tysh-demo` deliberately
-   leaves this undone and reports so, rather than looking more complete than
-   it is.
+   bookkeeping alongside finding 8's pixel sync. **Done for whole-text
+   replacement** (finding 12, `engine_data::recompute_run_lengths`). Still
+   open: a real editor needs this to work for edits that preserve multiple
+   paragraphs/style runs, not just full replacement — that needs a
+   cursor/selection model this spike doesn't have.
 7. **Get a Photoshop licence for verification.** Nothing else settles ADR 0004,
    and an independent reader agreeing is not evidence that Photoshop will.
 8. **When a binary layout is ambiguous from the spec text alone, read a

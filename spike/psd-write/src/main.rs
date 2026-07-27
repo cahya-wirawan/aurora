@@ -187,9 +187,17 @@ fn tysh_demo() -> std::io::Result<()> {
     {
         let mut engine = engine_data::parse(&engine_bytes)
             .expect("a real Photoshop EngineData payload must parse");
+        let new_text = "Aurora spike\r";
         if let Some(slot) = engine.get_path_mut("EngineDict.Editor.Text") {
-            *slot = engine_data::Value::Str("Aurora spike\r".into());
+            *slot = engine_data::Value::Str(new_text.into());
         }
+        // Closes the gap finding 10 named: without this, ParagraphRun/
+        // StyleRun's RunLengthArrays would still sum to the OLD text's
+        // length (30), which is exactly the internal inconsistency a real
+        // writer must not produce. See engine_data.rs's module docs on
+        // recompute_run_lengths for what this does and doesn't cover.
+        engine_data::recompute_run_lengths(&mut engine, new_text.encode_utf16().count())
+            .expect("a real fixture must have well-formed ParagraphRun/StyleRun");
         let new_engine_bytes = engine_data::write(&engine);
         tysh.text_data
             .set(b"EngineData", descriptor::Value::Raw(new_engine_bytes));
@@ -207,23 +215,31 @@ fn tysh_demo() -> std::io::Result<()> {
                 .get_path("EngineDict.Editor.Text")
                 .and_then(engine_data::Value::as_str)
         );
+        println!(
+            "Recomputed ParagraphRun.RunLengthArray: {:?}",
+            engine.get_path("EngineDict.ParagraphRun.RunLengthArray")
+        );
+        println!(
+            "Recomputed StyleRun.RunLengthArray: {:?}",
+            engine.get_path("EngineDict.StyleRun.RunLengthArray")
+        );
     }
     println!(
-        "New size: {} bytes (was {}) — both the top-level `Txt ` field and the \
-         nested EngineData.Editor.Text now agree; `warp` bytes are untouched",
+        "New size: {} bytes (was {}) — the top-level `Txt ` field, the nested \
+         EngineData.Editor.Text, and both RunLengthArrays now agree; `warp` \
+         bytes are untouched",
         after.len(),
         before.len()
     );
 
     println!(
-        "\nTwo things this demo deliberately leaves inconsistent, both real gaps \
-         for a production writer:\n\
-         \x20 1. ParagraphRun/StyleRun RunLengthArrays still sum to the OLD \
-         text's length (30) -- a real writer must recompute these to match \
-         the new text, or Photoshop's own run bookkeeping is wrong.\n\
-         \x20 2. The layer's rasterized pixel preview is untouched -- a real \
-         implementation must re-render glyphs into the pixel channels too, \
-         or the file is visually inconsistent (FINDINGS.md finding 8)."
+        "\nOne thing this demo still deliberately leaves inconsistent, a real \
+         gap for a production writer: the layer's rasterized pixel preview is \
+         untouched. A real implementation must re-render glyphs into the pixel \
+         channels too, or the file is visually inconsistent \
+         (FINDINGS.md finding 8) — unaffected by the run-length fix above \
+         (finding 12), which only closes the descriptor-level bookkeeping gap \
+         (finding 10)."
     );
     Ok(())
 }

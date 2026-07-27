@@ -152,8 +152,8 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
 - [x→bigger] **Text layer (`TySh`) spike — container format tractable, but scope grew.** Downloaded a real Photoshop-authored text layer (a `psd-tools` test fixture) and read its structure before writing code. `TySh`'s own container is small (6 fields) and its byte layout is implemented in Rust (`src/descriptor.rs`) — parses, patches, and round-trips real Photoshop data correctly. **But `EngineData` (the actual text/styling content) is far richer than expected** — full kinsoku/moji-kumi tables, duplicated resource dicts, even for plain English text — making from-scratch generation genuinely higher-risk than assumed. The validated lower-risk path is patch-a-real-file rather than generate-from-scratch (proven end-to-end in Python, independently verified by `psd-tools` + `sips`). **Found a new, mandatory, previously-unscoped requirement: editing text content requires rendering actual glyphs into the layer's pixel channels**, or the file is internally inconsistent — confirmed by direct visual inspection. This is now the single biggest addition to Phase 3 scope from any spike so far.
 - [x] **`EngineData`'s own text-format reader/writer** (`src/engine_data.rs`) — implemented and tested, not just patch-in-place on an opaque blob anymore. `--tysh-demo` now patches both the top-level `Txt ` field and the nested `EngineDict.Editor.Text` together. Corpus extended with two `TySh` blocks from `ag-psd` (a second, independently-written library that also *writes* text layers) — including a genuine multi-style-run case — and the existing parser needed **zero changes** to handle them. Caught and fixed one real bug in the process: a Unicode-escaping edge case (codepoints with `)` as their high byte) that would have silently truncated strings; found by a test, not inspection. 9 tests total, all against real extracted bytes.
 - [x] **Corpus extended to paragraph text and warped text** — `reference/tysh-paragraph.bin` (paragraph/area text, vs. every other fixture's point text) and `reference/tysh-warp-arc.bin` (`warpStyle = warpArc`, vs. every other fixture's `warpNone`), both from `ag-psd`'s test suite. `descriptor.rs` needed **zero code changes** for either. Two things confirmed against real bytes rather than assumed: point-vs-paragraph lives inside `EngineData` (`EngineDict.Rendered.Shapes.Children[0].Cookie.Photoshop.ShapeType`), not the outer `TySh` descriptor at all; and `warpRotate`'s enum category is `"Ornt"` (a shared orientation enum), not `"warpRotate"` — a wrong assumption the first draft of the test made and a real-bytes assertion caught immediately. FINDINGS.md finding 11. 12 tests total, all against real extracted bytes.
-- [ ] **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s on text edit** — `--tysh-demo` patches text but deliberately leaves these stale and says so; separate, additional bookkeeping from the pixel-sync gap below
-- [ ] Glyph rendering into pixel channels on text edit — **still the single biggest unstarted item; unaffected by the `EngineData` work above**
+- [x→scoped] **Recompute `ParagraphRun`/`StyleRun` `RunLengthArray`s on text edit** — `engine_data::recompute_run_lengths` fixes the exact staleness `--tysh-demo` used to report (`[7, 7, 16]`/`[30]` → `[13]`/`[13]` after the "Aurora spike" patch), reusing the first run's formatting rather than discarding it. **Deliberately scoped to whole-text replacement** — the only edit shape this patch-in-place spike supports; preserving multiple paragraphs/style runs *across* an edit needs a real cursor/selection model, which is Aurora's own text-editing engine's job in Phase 3, not this exercise. Caught one more UTF-16-vs-scalar-count nuance the same way finding 9's bug was caught: confirmed against a real fixture (`RunLengthArray` sums to UTF-16 code units) before writing the code, not assumed from ASCII-only fixtures where the two counts coincide. FINDINGS.md finding 12. 13 tests total, all against real extracted bytes.
+- [ ] Glyph rendering into pixel channels on text edit — **still the single biggest unstarted item; unaffected by the `EngineData`/run-length work above**
 - [ ] Layer masks, vector masks, smart objects, layer styles, adjustment layers
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
@@ -363,18 +363,23 @@ here so they are not silently lost between phases.
    (R2f mitigation: a solo design owner has no built-in check) before the
    token vocabulary and Dark theme harden into something every widget
    depends on.
-3. **Move on to run-length/glyph work, or extend the corpus further.** The
-   corpus-plus-patch strategy is now proven in both Python (full file level)
-   and Rust (`descriptor.rs` + `engine_data.rs`, 12 tests, two independent
-   libraries' fixtures, 5 real `TySh` blocks spanning point/paragraph text,
-   single/multi style runs, and warped text). The named corpus gaps
-   (paragraph-vs-point, warped text) are closed as of FINDINGS.md finding 11.
-   Two concrete gaps remain before this is more than "the mechanics work":
-   recomputing `RunLengthArray`s on text edit, and rendering glyphs into
-   pixel channels (still unstarted, still the bigger of the two) — those are
-   now the natural next step rather than more corpus. Vertical text, RTL, and
-   multiple style runs within one paragraph are still untested if more corpus
-   work is wanted first.
+3. **Glyph rendering into pixel channels is now the one unstarted item in
+   the whole text-layer line of work.** The corpus-plus-patch strategy is
+   proven in Python (full file level) and Rust (`descriptor.rs` +
+   `engine_data.rs`, 13 tests, two independent libraries' fixtures, 5 real
+   `TySh` blocks spanning point/paragraph text, single/multi style runs, and
+   warped text); the named corpus gaps are closed (finding 11); and
+   `RunLengthArray` recomputation is done for the one edit shape this spike
+   supports — whole-text replacement (finding 12). What's left is finding 8:
+   without re-rendering glyphs into the layer's pixel channels on every text
+   edit, the file stays internally inconsistent (descriptor says one thing,
+   the flattened preview shows another) — this needs Aurora's own text stack
+   (`cosmic-text`/`glyphon`) wired in, real engineering work with no
+   shortcut, not another patch-in-place exercise. Secondary, if more corpus
+   work is wanted first instead: vertical text, RTL, and multiple style runs
+   within one paragraph are still untested; and finding 12's own scope
+   boundary (run-preserving edits, not just whole-text replacement) needs a
+   cursor/selection model this spike doesn't have.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
