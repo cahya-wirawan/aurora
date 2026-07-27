@@ -35,7 +35,7 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | Workspace & CI | Built and green |
 | Performance validation | **Measured** — budgets hold, with one correction; re-run on Linux/Vulkan 2026-07-26, same correction reproduces |
 | Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
-| Design language | **First draft of all 5 deliverables** — [design/](design/README.md); none ratified, outside critique still needed |
+| Design language | **Owner-approved draft** — [design/](design/README.md); outside critique still needed before it hardens |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | Not started |
 
@@ -125,20 +125,22 @@ and diagnosed down to a specific, non-structural cause.
 > all. Revisit the escape hatch only if one of those surfaces something
 > AccessKit genuinely cannot express on that platform.
 
-### 0.5 Design language — **first draft of all five deliverables, none ratified**
+### 0.5 Design language — **owner-approved draft; outside critique still open**
 
 Owner: Cahya Wirawan. Blocks all widget code (invariant §7.3.10 — tokens cannot
 be retrofitted cheaply). Runs in parallel with 0.3/0.6; needs no engine code.
 
 Evidence: [design/](design/README.md) (deliberately outside the Cargo
-workspace, same pattern as `spike/`)
+workspace, same pattern as `spike/`), commit
+[b0a7ac8](https://github.com/cahya-wirawan/aurora/commit/b0a7ac8).
+**Reviewed and approved by the design owner, 2026-07-27.**
 
-- [~] Token vocabulary — semantic names widgets resolve against *(highest value; this is the interface everything else is written to)* — drafted, [design/tokens/vocabulary.md](design/tokens/vocabulary.md); needs design-owner review, not yet ratified
-- [~] Type scale, spacing scale, radius, elevation, motion values — drafted, [design/tokens/scales.toml](design/tokens/scales.toml); font family still an open placeholder
-- [~] One complete built-in theme (Dark), all pairs passing contrast — drafted, [design/themes/dark.toml](design/themes/dark.toml); every gated pair passes WCAG 2.1 AA via [design/check_contrast.py](design/check_contrast.py) (17/17 gated pairs pass; `border.default` and disabled text are informational, not gated — see script comments for the WCAG 1.4.11 rationale). Colors are a contrast-checked starting point, not an aesthetic decision yet
-- [~] Static mockups: main workspace + 2–3 panels — drafted, [design/mockups/workspace.html](design/mockups/workspace.html) (Layers/Properties/History docked); HTML/CSS is a Phase 0 review tool only, not how `aurora-widgets` renders
-- [~] Component gallery skeleton — review surface and golden-image target — drafted, [design/gallery/index.html](design/gallery/index.html); covers button/checkbox/slider/field/dropdown/tab bar/tooltip/swatch across forced states; scrollbar/tree/menu/curve editor deliberately left for a later pass
-- [ ] Outside critique on the mockups before they harden (risk R2f mitigation) — not yet done; do this before treating any of the above as settled
+- [x] Token vocabulary — semantic names widgets resolve against *(highest value; this is the interface everything else is written to)* — [design/tokens/vocabulary.md](design/tokens/vocabulary.md), owner-approved
+- [x] Type scale, spacing scale, radius, elevation, motion values — [design/tokens/scales.toml](design/tokens/scales.toml), owner-approved; font family still an open placeholder (`[type].family`), not blocking
+- [x] One complete built-in theme (Dark), all pairs passing contrast — [design/themes/dark.toml](design/themes/dark.toml), owner-approved; every gated pair passes WCAG 2.1 AA via [design/check_contrast.py](design/check_contrast.py) (17/17 gated pairs pass; `border.default` and disabled text are informational, not gated — see script comments for the WCAG 1.4.11 rationale)
+- [x] Static mockups: main workspace + 2–3 panels — [design/mockups/workspace.html](design/mockups/workspace.html) (Layers/Properties/History docked), owner-approved; HTML/CSS is a Phase 0 review tool only, not how `aurora-widgets` renders
+- [x] Component gallery skeleton — review surface and golden-image target — [design/gallery/index.html](design/gallery/index.html), owner-approved; covers button/checkbox/slider/field/dropdown/tab bar/tooltip/swatch across forced states; scrollbar/tree/menu/curve editor deliberately left for a later pass
+- [ ] Outside critique on the mockups before they harden (risk R2f mitigation) — owner sign-off is not a second opinion; this is the one remaining item before 0.5 counts as fully complete
 
 ### 0.6 Format feasibility — PSD partially done
 
@@ -353,14 +355,13 @@ here so they are not silently lost between phases.
    needs a machine with an active graphical login, which was not available
    this pass. Windows (UIA) is fully unstarted. Both are different platform
    APIs entirely and remain the only thing that can still overturn ADR 0001.
-2. **Review the 0.5 design scaffold** ([design/](design/README.md),
+2. **Get outside critique on the 0.5 design scaffold** ([design/](design/README.md),
    [b0a7ac8](https://github.com/cahya-wirawan/aurora/commit/b0a7ac8)) — all
-   five Phase 0 deliverables now have a first draft (token vocabulary, the
-   four scales, a contrast-passing Dark theme, workspace mockup, gallery
-   skeleton), but none are ratified. As design owner, revise the token names
-   and Dark theme's actual colors (currently a contrast-checked starting
-   point, not an aesthetic decision), then get outside critique before it
-   hardens into something every widget depends on (R2f mitigation).
+   five Phase 0 deliverables are drafted and now owner-approved (2026-07-27).
+   The one item left before 0.5 counts as complete is a second opinion
+   (R2f mitigation: a solo design owner has no built-in check) before the
+   token vocabulary and Dark theme harden into something every widget
+   depends on.
 3. **Extend the text-layer corpus further, or move on to run-length/glyph
    work.** The corpus-plus-patch strategy is now proven in both Python
    (full file level) and Rust (`descriptor.rs` + `engine_data.rs`, 9 tests,
