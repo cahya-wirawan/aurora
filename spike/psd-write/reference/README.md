@@ -24,6 +24,20 @@ distinction mattered here specifically).
   truth like `text.psd`. `tysh-multi-run.bin` has two separate style runs
   across two characters — a case `text.psd` doesn't cover (its one style run
   spans all 30 characters).
+- **`tysh-paragraph.bin`** — a `TySh` block from `ag-psd`'s test suite
+  (`test/read/text-paragraph-align/src.psd`). Every other fixture in this
+  directory is **point text**; this one is **paragraph (area) text** —
+  confirmed via `psd_tools`' `TypeLayer.text_type` before extraction, and
+  independently re-confirmed inside Rust by
+  `engine_data::tests::distinguishes_point_from_paragraph_text` (the
+  point/paragraph distinction lives inside `EngineData`, not the outer `TySh`
+  descriptor, so it can't be checked from `descriptor.rs` alone). Closes one
+  of the two corpus gaps named in `FINDINGS.md` recommendation 4 / PLAN.md 0.6.
+- **`tysh-warp-arc.bin`** — a `TySh` block from `ag-psd`'s test suite
+  (`test/read/text-complex/src.psd`). Every other fixture in this directory
+  has `warpStyle = warpNone`; this one has Layer > Type > Warp Text actually
+  applied (`warpStyle = warpArc`, `warpValue = 50.0`, `warpRotate = Hrzn`).
+  Closes the other named corpus gap.
 - **`engineData.txt`** — also from `ag-psd`'s test suite. **Not raw wire-format
   data** — checked directly (`0 in data` is `False` for the whole file) and
   it turned out to be a human-readable pretty-print with no embedded

@@ -379,11 +379,32 @@ mod tests {
     /// `reference/README.md`). This is genuine raw wire-format bytes, unlike
     /// `reference/engineData.txt` — see the note on that file below.
     fn real_engine_data() -> Vec<u8> {
-        let tysh_bytes = include_bytes!("../reference/tysh.bin");
+        engine_data_from_tysh(include_bytes!("../reference/tysh.bin"))
+    }
+
+    /// Same extraction as `real_engine_data`, generalized to any TySh
+    /// fixture — used to reach the paragraph-text fixture's `EngineData`
+    /// too (see `distinguishes_point_from_paragraph_text`).
+    fn engine_data_from_tysh(tysh_bytes: &[u8]) -> Vec<u8> {
         let tysh = crate::descriptor::parse_fixture(tysh_bytes).expect("parse TySh");
         match tysh.text_data.get(b"EngineData") {
             Some(crate::descriptor::Value::Raw(bytes)) => bytes.clone(),
             other => panic!("expected EngineData to be Raw, got {other:?}"),
+        }
+    }
+
+    /// `EngineDict.Rendered.Shapes.Children[0].Cookie.Photoshop.ShapeType`
+    /// — 0 for point text, 1 for paragraph text. Not reachable by
+    /// `Value::get_path` alone since it crosses a `List`, not just `Dict`s;
+    /// confirmed against psd-tools' own `TypeLayer.text_type` property
+    /// (`api/layers.py`) before trusting this path.
+    fn shape_type(v: &Value) -> Option<i64> {
+        let Value::List(children) = v.get_path("EngineDict.Rendered.Shapes.Children")? else {
+            return None;
+        };
+        match children.first()?.get_path("Cookie.Photoshop.ShapeType")? {
+            Value::Int(n) => Some(*n),
+            _ => None,
         }
     }
 
@@ -398,6 +419,32 @@ mod tests {
         // structure, not just the first couple of keys.
         assert!(v.get_path("ResourceDict.KinsokuSet").is_some());
         assert!(v.get_path("EngineDict.ParagraphRun.RunArray").is_some());
+    }
+
+    #[test]
+    fn distinguishes_point_from_paragraph_text() {
+        // reference/tysh.bin (point text) vs. reference/tysh-paragraph.bin
+        // (paragraph/area text, added to close the corpus gap named in
+        // PLAN.md 0.6 / FINDINGS.md recommendation 4). Point-vs-paragraph
+        // is not visible in the outer TySh descriptor at all — only here,
+        // inside EngineData — so this is the one place that distinction
+        // can actually be tested.
+        let point = parse(&real_engine_data()).expect("parse point-text EngineData");
+        let paragraph = parse(&engine_data_from_tysh(include_bytes!(
+            "../reference/tysh-paragraph.bin"
+        )))
+        .expect("parse paragraph-text EngineData");
+
+        assert_eq!(
+            shape_type(&point),
+            Some(0),
+            "reference/tysh.bin should be point text"
+        );
+        assert_eq!(
+            shape_type(&paragraph),
+            Some(1),
+            "reference/tysh-paragraph.bin should be paragraph text"
+        );
     }
 
     #[test]

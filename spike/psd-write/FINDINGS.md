@@ -315,6 +315,39 @@ length. A real writer must recompute these against the new text, or
 Photoshop's own run bookkeeping is internally wrong. This is additional,
 separate work from finding 8's pixel/vector sync gap, not the same issue.
 
+### 11. Corpus extended to paragraph text and warped text — container format holds, no code changes needed
+
+Recommendation 4 (below) named two specific corpus gaps: paragraph-vs-point
+text and warped text (`warpStyle != warpNone`). Both are now covered:
+`reference/tysh-paragraph.bin` and `reference/tysh-warp-arc.bin`, both from
+`ag-psd`'s test suite (`test/read/text-paragraph-align/` and
+`test/read/text-complex/`), same extraction method as `tysh-single-run.bin`/
+`tysh-multi-run.bin` — see `reference/README.md`.
+
+As with finding 10's corpus generalization, **`descriptor.rs` needed zero
+code changes** to parse either fixture — real evidence the `TySh` container
+understanding holds beyond the cases it was built against, not just re-fitting
+to new data. Two things specifically confirmed against real bytes rather than
+assumed:
+
+- **Point vs. paragraph text is not a `TySh`-level field at all.** It's
+  encoded inside `EngineData`, at
+  `EngineDict.Rendered.Shapes.Children[0].Cookie.Photoshop.ShapeType` (`0`
+  for point, `1` for paragraph) — confirmed against `psd_tools`' own
+  `TypeLayer.text_type` property before trusting it, then tested in Rust
+  (`engine_data::tests::distinguishes_point_from_paragraph_text`). Reaching
+  it required `Value::get_path` to cross a `List` (`Children`), which the
+  existing dict-only path walker doesn't do — handled by indexing the list
+  directly in the test rather than widening `get_path`'s contract for one
+  caller.
+- **`warpRotate`'s enum *category* is `"Ornt"`, not `"warpRotate"`.** Every
+  enum seen before this (`warpStyle`, `textGridding`) happened to have its
+  category equal its own item key, which is easy to over-generalize into "the
+  category is always the key name." It isn't — `Ornt` is Photoshop's shared
+  orientation enum, reused across features. Caught immediately by asserting
+  against the real bytes (`descriptor::tests::parses_warped_text`) rather
+  than writing the assertion from the pattern seen so far.
+
 ## Scope: what this did *not* touch
 
 Groups, the `TySh` container, and `EngineData`'s text format are all now
@@ -363,10 +396,13 @@ is a real, separate gap from the pixel sync one.
    every round-trip in CI from the first layer type.
 4. **For text layers, patch real files rather than generate `EngineData`
    from scratch** (finding 7) — collect a small corpus of real Photoshop text
-   layers spanning common cases (multi-style runs, paragraph vs point text,
-   warped text) and build the writer against them, the same way finding 7's
-   proof-of-concept did for the simple case, and finding 10 extended into
-   Rust with a second library's fixtures.
+   layers spanning common cases and build the writer against them, the same
+   way finding 7's proof-of-concept did for the simple case, finding 10
+   extended into Rust with a second library's fixtures, and finding 11 closed
+   the paragraph-vs-point-text and warped-text gaps specifically. Still open:
+   this corpus is 5 fixtures, not the 1,000-file PSD corpus recommendation 3
+   calls for — vertical text, RTL, and multiple simultaneous style runs
+   within one paragraph remain untested.
 5. **Budget real engineering time for glyph rendering into pixel channels**
    (finding 8) — this is not a follow-on detail, it's required for any text
    edit to produce a non-broken file, and it did not appear in the original

@@ -351,6 +351,23 @@ mod tests {
     /// `text.psd` didn't cover (its `StyleRun` was one run for all 30 chars).
     const MULTI_RUN_TYSH: &[u8] = include_bytes!("../reference/tysh-multi-run.bin");
 
+    /// A real Photoshop-authored **paragraph (area) text** layer — every
+    /// other fixture here (including `REAL_TYSH`) is point text. Pulled from
+    /// `ag-psd`'s test suite (`test/read/text-paragraph-align/src.psd`),
+    /// extracted the same way as `SINGLE_RUN_TYSH`/`MULTI_RUN_TYSH`: the raw
+    /// `TySh` tagged-block payload (12-byte `8BIM`/`TySh`/length header
+    /// stripped), via `psd_tools`' own `TaggedBlock.tobytes()`. See
+    /// PLAN.md 0.6 / FINDINGS.md recommendation 4 — "paragraph vs point
+    /// text" was one of the two named corpus gaps.
+    const PARAGRAPH_TYSH: &[u8] = include_bytes!("../reference/tysh-paragraph.bin");
+    /// A real Photoshop-authored layer with **warped text**
+    /// (`warpStyle` = `warpArc`, not `warpNone` like every other fixture
+    /// here). Pulled from `ag-psd`'s test suite
+    /// (`test/read/text-complex/src.psd`), same extraction method as
+    /// `PARAGRAPH_TYSH`. The other named corpus gap from FINDINGS.md
+    /// recommendation 4.
+    const WARPED_TYSH: &[u8] = include_bytes!("../reference/tysh-warp-arc.bin");
+
     #[test]
     fn generalizes_to_an_independent_codebases_fixtures() {
         for (name, bytes, expected_text) in [
@@ -461,6 +478,73 @@ mod tests {
 
         // Confirm patching a field we didn't touch stayed untouched.
         assert_eq!(reparsed.warp.get(b"warpValue"), tysh.warp.get(b"warpValue"));
+    }
+
+    #[test]
+    fn parses_warped_text() {
+        // Every other fixture in this file has warpStyle = warpNone; this is
+        // the corpus's one case of Layer > Type > Warp Text actually applied
+        // (an arc warp, rotated horizontally, at 50% strength).
+        let tysh = parse_fixture(WARPED_TYSH).expect("a real warped-text TySh block must parse");
+        assert_eq!(tysh.text(), Some("Test text aaaa\rxxxxx\r\rOMG !\0"));
+        assert_eq!(
+            tysh.warp.get(b"warpStyle"),
+            Some(&Value::Enum {
+                type_id: b"warpStyle".to_vec(),
+                value: b"warpArc".to_vec(),
+            })
+        );
+        assert_eq!(tysh.warp.get(b"warpValue"), Some(&Value::Double(50.0)));
+        // warpRotate's enum *category* is "Ornt" (Photoshop's shared
+        // orientation enum, also used elsewhere for text orientation) —
+        // not "warpRotate" itself. Confirmed against the real bytes rather
+        // than assumed from the item key name, which is what warpStyle's
+        // category happens to match but this one doesn't.
+        assert_eq!(
+            tysh.warp.get(b"warpRotate"),
+            Some(&Value::Enum {
+                type_id: b"Ornt".to_vec(),
+                value: b"Hrzn".to_vec(),
+            })
+        );
+
+        // Round-trips the same way every other Descriptor fixture does here
+        // (finding 9: same length + semantic identity, not byte-identical).
+        let out = tysh.to_bytes();
+        assert_eq!(out.len(), WARPED_TYSH.len());
+        let reparsed = parse_fixture(&out).expect("re-parse of our own output");
+        assert_eq!(reparsed, tysh);
+    }
+
+    #[test]
+    fn parses_paragraph_text() {
+        // Every other fixture in this file (including REAL_TYSH) is point
+        // text. Confirms the container format handles a genuinely different
+        // TySh shape, not just a different string value in the same shape.
+        let tysh =
+            parse_fixture(PARAGRAPH_TYSH).expect("a real paragraph-text TySh block must parse");
+        assert_eq!(
+            tysh.text(),
+            Some(
+                "Do you think there is an argument that there should be a \u{2018}branchless \
+                 mode\u{2019} on modern cpus. meaning you say to the cpu \u{2018}i cannot use \
+                 an if statement.\0"
+            )
+        );
+        // Point vs. paragraph text is not a TySh-level field — it's encoded
+        // inside EngineData (EngineDict.Rendered.Shapes.Children[0].Cookie
+        // .Photoshop.ShapeType: 0 = point, 1 = paragraph), confirmed against
+        // psd-tools' own TypeLayer.text_type property before writing this
+        // assertion. See engine_data::tests for that check.
+        assert!(matches!(
+            tysh.text_data.get(b"EngineData"),
+            Some(Value::Raw(_))
+        ));
+
+        let out = tysh.to_bytes();
+        assert_eq!(out.len(), PARAGRAPH_TYSH.len());
+        let reparsed = parse_fixture(&out).expect("re-parse of our own output");
+        assert_eq!(reparsed, tysh);
     }
 
     #[test]
