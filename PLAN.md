@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-07-26**.
+Last updated: **2026-07-28**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -31,13 +31,14 @@ and none should yet. CI green on Linux, macOS, and Windows.
 
 | Area | State |
 |---|---|
-| Requirements & architecture | Settled and written down (PRD v1.6, 4 ADRs) |
+| Requirements & architecture | Settled and written down (PRD v1.7, 6 ADRs — 0005/0006 still pending) |
 | Workspace & CI | Built and green |
 | Performance validation | **Measured** — budgets hold, with one correction; re-run on Linux/Vulkan 2026-07-26, same correction reproduces |
 | Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
 | Design language | **Owner-approved draft** — [design/](design/README.md); outside critique still needed before it hardens |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | **Libraries decided (ADR 0007/0008); LGPL packaging mechanism proven on Linux with the actual chosen library** — macOS/Windows and legal review remain |
+| Re-plan (PRD §13 Step 7) | **Durations re-grounded, but Q2's answer (solo) reframes the whole exercise** — Phase 0/3 evidence stands, but §9's ~52+ team-months isn't a solo estimate at any multiplier; scope-vs-timeline is now an open strategic question for Cahya, not a spike output. PRD §13 Step 2 ("define the 95%") surfaced as a previously-untracked gap, now tracked as 0.9 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -59,7 +60,7 @@ CJK composing into a custom text field.
 
 ### 0.1 Decisions and documentation
 
-- [x] PRD written and revised to v1.6 — [PRD.md](PRD.md)
+- [x] PRD written and revised to v1.7 — [PRD.md](PRD.md)
 - [x] ADR 0001 — custom UI toolkit on `wgpu` — [adr/0001](docs/adr/0001-custom-wgpu-ui.md)
 - [x] ADR 0002 — 300,000 px document ceiling (PSB parity) — [adr/0002](docs/adr/0002-document-size-ceiling.md)
 - [x] ADR 0003 — ≥16-bit float precision floor — [adr/0003](docs/adr/0003-float-precision-floor.md)
@@ -175,10 +176,148 @@ Assemble *before* the parsers exist, so the parser is written against reality.
 - [~] **ICC profile set** — two real, CC0-licensed profiles (`sRGB.icc`, `ECI-RGBv2.icc`), same "first, not final" caveat
 - [x] **Fetch scripts (corpora are gitignored — too large to commit)** — `spike/raw-icc/reference/fetch-samples.sh`, same pattern to reuse for the eventual 1,000-PSD corpus
 
-### 0.8 Re-plan — not started
+### 0.8 Re-plan — durations re-grounded 2026-07-28; Q2/Q3 answered, and Q2's answer reframes this whole section
 
-- [ ] Re-ground the §9 phase durations against slice measurements (PRD §13 Step 7)
-- [ ] Answer PRD §12 Q2 (team size) and Q3 (revenue model) — both shape scope
+- [x] **Re-ground the §9 phase durations against slice measurements (PRD §13 Step 7)**
+  — full reasoning below. Revised into PRD.md §9 directly (each phase now
+  carries a short "Re-grounded 2026-07-28" note, same pattern §13 Step 4
+  already uses for the vertical slice's corrections), with the detailed
+  evidence trail here.
+- [x] **Answer PRD §12 Q2 (team size) and Q3 (revenue model)** — answered by
+  Cahya: **solo** (Q2), **revenue model not decided, not a priority right
+  now** (Q3). Resolved in PRD.md §12 inline, matching how Q2b already
+  documents a partial resolution in place. Read the note below before
+  reading the phase-by-phase analysis that follows — it changes what that
+  analysis means, not just what it's missing.
+
+**The solo answer doesn't just fill in a blank — it means every duration
+below, revised or not, is answering the wrong question.** All of §9's
+month figures, including the "likely 4–5" / "likely needs another upward
+revision" language in this section, were reasoned about as *team* months
+(R9: "the durations in §9 assume a staffed team"). A solo developer taking
+on GPU rendering, a first-party UI toolkit, text shaping/IME, accessibility,
+PSD reverse-engineering, color management, RAW decoding, AI integration,
+plugin sandboxing, collaboration, and mobile/web — the full specialist
+breadth R9 already flagged as a *hiring* risk for a team — isn't on a
+scaled-up version of the team timeline; it's on a differently-shaped
+timeline this document doesn't actually have an estimate for. Adding months
+to the team figure below would be false precision layered on top of the
+false precision this section already warns about for Phases 1/2/4/5.
+
+**What the phase-by-phase analysis below is still good for:** which areas
+turned out more (or less) complex than assumed, and why — that evidence
+doesn't change based on team size. **What it is not good for, honestly:**
+a completion estimate for this project as currently scoped. That's a real,
+open strategic question — narrow the ~52-month, 26-FR scope explicitly for
+solo delivery (§3 Non-Goals, §5 MoSCoW), or treat the phase gates as
+open-ended rather than calendar-committed (genuinely viable, given Q3: no
+revenue pressure is forcing a date) — and it's surfaced here rather than
+answered, because it's Cahya's call, not a spike's or an assistant's. See
+PRD §12 Q2's resolution note for the fuller version of this.
+
+**What actually grounds this re-plan:** five spikes exist now (vertical
+slice, a11y/IME, PSD write, RAW/ICC, LGPL packaging), not zero. But three
+of the five phases below (1, 2, 4, 5) have **no spike evidence touching
+them at all** — re-grounding those against "slice measurements" would be
+inventing precision the project doesn't have yet. What follows is honest
+about which phases have real new evidence and which don't.
+
+**Phase 0 (was 3 months) — likely 4–5, and the estimate itself was
+probably always going to be revised upward once Phase 0's real shape
+became visible.** Every one of its five spikes found more than a clean
+"quick spike" turned out to hold:
+
+- a11y/IME is still open after multiple sessions, not because the *engineering*
+  is slow but because it is genuinely **calendar-bound, not effort-bound**
+  — it needs a human at a live desktop session on each of 3 platforms, and
+  this pass never got a Windows machine or a logged-in Linux desktop at all.
+  A 3-month Phase 0 estimate implicitly assumed this would be as fast as
+  the engineering questions it's bundled with; it isn't, structurally.
+- PSD write feasibility surfaced **glyph rendering into pixel channels** —
+  a requirement with zero prior line item anywhere in the PRD before this
+  spike found it (finding 8), now confirmed mandatory. That's not a Phase 0
+  cost directly (it lands in Phase 3), but finding a *new, mandatory,
+  previously invisible requirement* on the very first format spike is a
+  signal about how much more is likely still hiding in the format areas
+  Phase 0 hasn't spiked yet (masks, smart objects, layer styles — see
+  Phase 3 below).
+- RAW/ICC was scoped in PRD §13 Step 5 as "small, fast" spikes. In practice:
+  two feasibility spikes, a real licensing correction (the "prefer pure
+  Rust" framing in PRD §14 turned out not to avoid LGPL for RAW at all —
+  `rawler` is LGPL-2.1 too), and then an *entire additional spike*
+  (`lgpl-packaging`) that didn't exist as a line item anywhere until the
+  licensing finding made it necessary. Small and fast is not what this
+  turned out to be.
+- Two ADRs Phase 0 was always going to need (0005 tile size, 0006 a11y
+  conformance target) are still `[ ]` — not attempted yet, not blocked on
+  anything external, just not reached.
+- **PRD §13 Step 2 ("Define the 95%") has never been tracked in this file
+  at all** — a real gap, not a rounding error. It has no home in 0.1–0.8's
+  numbering, which is itself evidence it was dropped rather than
+  deliberately deferred. Added as 0.9 below,
+  not folded in here, so it stops being invisible.
+
+**Phase 1 (was 9 months, already raised from 6) — no revision; genuinely
+no new evidence yet.** None of M1.1–M1.10 has started. The a11y and
+vertical-slice spikes *inform* Phase 1 (the M1.x breakdown above already
+absorbs their findings — per-tile dirty rects, GPU compositing, the
+hidden-window-then-show constraint, the `Role::Window` navigation quirk),
+but informing a plan and testing it against real M1.x work are different
+things. Leave at 9 months; revisit once M1.1–M1.3 produce real velocity
+data, the same way this re-plan leans on the spikes that exist.
+
+**Phase 2 (8 months) — unchanged, and unusually untested even by this
+project's own standards.** Zero spikes have touched selections, brushes,
+masks, filters, or adjustments. This is the original, purely speculative
+estimate; treat it as such rather than as re-grounded.
+
+**Phase 3 (was 10 months, already raised from 8) — likely needs another
+upward revision, and 10 should be read as a floor, not a ceiling.** The
+one piece of Phase 3 that has been spiked (PSD text layers) went from "assumed
+similar to groups" to **"the single biggest addition to Phase 3 scope from
+any spike so far"** (glyph rendering, `RunLengthArray` recomputation,
+`EngineData`'s real complexity even for plain English text). Basic layers/
+groups/alpha/blend-modes are genuinely tractable (good, real de-risking) —
+but masks, smart objects, layer styles, and adjustment layers are
+**still completely unspiked**, and there is no principled reason to expect
+they'll be easier than text layers were; if anything, smart objects and
+layer styles are comparably under-documented, reverse-engineered surface.
+Separately, RAW's LGPL packaging architecture (now proven mechanically, but
+only on Linux, with macOS/Windows and legal review still open) is real
+engineering work Phase 3's original estimate never itemized as its own
+line, because the licensing finding that required it didn't exist when the
+10-month figure was set.
+
+**Phase 4 (10 months) and Phase 5 (12 months) — unchanged.** Zero spike
+evidence; nothing to re-ground against yet.
+
+**Total ~52 months — do not read a revised total off this section.**
+Computing a new precise sum would be false precision: two phases
+(0, 3) have real upward-pressure evidence, three (1, 2, 4, 5) have none at
+all, and "no evidence" does not mean "the estimate is right," only that it
+hasn't been tested. The honest statement is: **the total is probably higher
+than 52 months**, driven by Phase 0 and Phase 3 specifically, with Phases
+1, 2, 4, and 5 genuinely unknown until they get their own spikes or first
+sprints. Revisit this number again after Phase 1 produces real velocity
+data and after at least one more Phase 3 sub-area (smart objects or layer
+styles, the next-most-likely places for another text-layer-sized surprise)
+gets spiked — one data point (text layers) is a strong yellow flag, not
+yet a pattern confirmed twice.
+
+### 0.9 Define the 95% — not started (PRD §13 Step 2)
+
+Surfaced as a gap during the 0.8 re-plan, not before — it had no home in
+this file's 0.1–0.8 numbering, which is itself the evidence it was dropped
+rather than deliberately deferred.
+
+- [ ] Turn the §10 success metric ("support 95% of common Photoshop
+  workflows") into a written, ranked list of concrete workflows across the
+  §4 personas (photographer, graphic designer, digital artist, UI designer,
+  marketing team) — PRD's own words: "this list becomes the acceptance
+  suite and the arbiter for every 'Could we cut this?' question later."
+  Without it, every scope-cutting decision from Phase 2 onward has no
+  defined arbiter, and PRD §10's success metric stays unmeasurable (open
+  question 10 in PRD §12 says this explicitly).
 
 ---
 
@@ -293,14 +432,19 @@ Detailed when the preceding phase closes; planning further ahead than the
 evidence supports is how the original 6-month Phase 1 estimate happened.
 
 - **Phase 2 (8 mo)** — selections, brush engine, masks, filters, adjustments.
-  *Gate: an illustrator completes a real piece without leaving Aurora.*
+  *Gate: an illustrator completes a real piece without leaving Aurora.* Unchanged, zero spike evidence — see 0.8.
 - **Phase 3 (10 mo)** — smart objects, Camera RAW, colour management, PSD/PSB
   read+write. *Gate: 1,000 PSDs round-trip through Photoshop with no layer loss.*
+  Likely needs another upward revision — treat 10 as a floor, not a ceiling; see 0.8.
 - **Phase 4 (10 mo)** — AI, plugin SDK (WASM), automation, cloud sync.
-  *Gate: a third-party ships a sandboxed plugin from public docs alone.*
-- **Phase 5 (12 mo)** — collaboration, animation, mobile, web.
+  *Gate: a third-party ships a sandboxed plugin from public docs alone.* Unchanged, zero spike evidence — see 0.8.
+- **Phase 5 (12 mo)** — collaboration, animation, mobile, web. Unchanged, zero spike evidence — see 0.8.
 
-Total ~52 months, **estimated before any code existed**. Due for revision (0.8).
+Total ~52 months, **estimated before any code existed**. Re-grounded 2026-07-28
+(0.8) against the five spikes that exist: probably higher than 52, driven
+by Phase 0 and Phase 3 specifically. Not re-computed to a new precise
+figure — that would be false precision given Phases 1, 2, 4, and 5 have no
+spike evidence at all yet. See 0.8 for the full phase-by-phase reasoning.
 
 ---
 
@@ -369,21 +513,14 @@ here so they are not silently lost between phases.
    (R2f mitigation: a solo design owner has no built-in check) before the
    token vocabulary and Dark theme harden into something every widget
    depends on.
-3. **macOS/Windows packaging mechanics, or real legal review — the two
-   remaining items in the whole RAW/ICC/LGPL line of work.** ADR 0007
-   (RAW: LibRaw via FFI) and ADR 0008 (ICC: lcms2 via FFI) are decided; the
-   `cdylib` + `dlopen` LGPL packaging mechanism is now verified on Linux
-   with LibRaw itself, not just `rawler` (`spike/lgpl-packaging` finding 4)
-   — the same host binary, unmodified, loads either backing library, and
-   both satisfy LGPL-2.1 §6(b)'s two conditions independently. What's left:
-   (a) the same mechanics on macOS (`install_name`/`@rpath`) and Windows
-   (DLL search order), unverified so far; (b) real legal review of the
-   relinking obligation, specifically the §6(b)(1) "already present on the
-   user's system" ambiguity, before v1.0 ships; (c) a smaller, undecided
-   build-engineering question — vendor-and-statically-compile LibRaw (as
-   `libraw-shim` does) vs. dynamically link a separately packaged
-   `libraw.so` — both satisfy LGPL equally, so this is about build
-   reproducibility, not licensing.
+3. **Define the 95%** (PRD §13 Step 2, now tracked as 0.9) — surfaced during the 0.8 re-plan as a genuine gap: it had never been
+   started *or tracked* anywhere in this file. Turn PRD §10's success metric
+   into a written, ranked list of concrete Photoshop workflows across the
+   §4 personas. Unlike items 1 and 2, this needs no special hardware and no
+   second reviewer — it's writing/analysis work, available to start now,
+   and PRD's own words say it "becomes the acceptance suite and the arbiter
+   for every 'Could we cut this?' question later." Every later scope
+   decision (Phase 2 onward) is weaker without it.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
@@ -396,9 +533,19 @@ quirk and the live-announcement bug in one change.
   *real* Phase 3 implementation still needs a home in the M1.x/Phase 3
   breakdown once Phase 3 is planned in detail — the spike proves feasibility,
   it isn't the shipped feature.
-- The LGPL packaging architecture question (raw-icc spike finding 2) is now
-  decided and recorded (ADR 0007) — remaining follow-on tracked as item 3
-  above, not repeated here.
+- **macOS/Windows LGPL packaging mechanics and real legal review** — ADR
+  0007/0008 are decided and the packaging mechanism is proven on Linux with
+  LibRaw itself (`spike/lgpl-packaging` finding 4), but macOS
+  (`install_name`/`@rpath`) and Windows (DLL search order) are unverified,
+  and the §6(b)(1) "already present on the user's system" ambiguity still
+  needs real legal review before v1.0 ships. Moved out of the numbered list
+  this round in favor of 0.9, which needs neither a second platform nor a
+  lawyer to make progress — pick this back up when either becomes available.
 - Font resolution (`ResourceDict.FontSet`) and `FillColor` alpha compositing
   remain the two small, non-urgent named gaps in the PSD text-layer line of
   work (findings 14/15) — pick up whenever, not blocking anything.
+- **The solo-vs-scope tension PRD §12 Q2's answer surfaced** (PRD §12 Q2
+  resolution note, PLAN.md 0.8) — not an engineering task, a strategic one:
+  either narrow the ~52-month, 26-FR scope explicitly for solo delivery, or
+  treat the phase gates as open-ended rather than calendar-committed.
+  Genuinely open; whenever Cahya wants to work through it.

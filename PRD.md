@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
 
 **Project:** Aurora  
-**Version:** 1.6  
+**Version:** 1.7  
 **Document Owner:** Product Team  
 **Status:** Draft — pre-implementation  
 **Target Release:** TBD  
@@ -1145,6 +1145,17 @@ Each phase has an **exit criterion** — a measurable gate, not a feature checkl
 
 Duration: 3 months
 
+**Re-grounded 2026-07-28 (PLAN.md 0.8, PRD §13 Step 7): likely 4–5 months.**
+Five spikes now exist (vertical slice, a11y/IME, PSD write, RAW/ICC, LGPL
+packaging), and each found more scope or more calendar-bound work than a
+"quick spike" implied — a11y/IME is genuinely calendar-bound (needs a human
+at a live desktop session per platform, not just engineering time); RAW/ICC
+required an entire additional spike (LGPL packaging) that didn't exist as
+a line item until a licensing finding made it necessary; PSD write found a
+mandatory requirement (glyph rendering) with zero prior line item anywhere.
+Two ADRs (tile size, a11y conformance target) and PRD §13 Step 2 ("define
+the 95%") remain untouched. Full reasoning in PLAN.md 0.8.
+
 ---
 
 ## Phase 1
@@ -1161,6 +1172,11 @@ Duration: 3 months
 
 **Duration: 9 months** (raised from 6). Building the widget toolkit is roughly a third of this phase. The original 6-month estimate assumed an off-the-shelf toolkit; §8.3 makes that work first-party, and the schedule reflects it rather than absorbing it silently.
 
+**Re-grounded 2026-07-28: unchanged.** No spike has started M1.1–M1.10 work
+yet, so there is no new measured evidence to revise this against — the
+a11y and vertical-slice spikes *inform* the M1.x breakdown (PLAN.md) but
+haven't tested it. Revisit once real Phase 1 work produces velocity data.
+
 ---
 
 ## Phase 2
@@ -1175,6 +1191,10 @@ Duration: 3 months
 
 Duration: 8 months
 
+**Re-grounded 2026-07-28: unchanged.** Zero spikes have touched selections,
+brushes, masks, filters, or adjustments — this remains the original,
+purely speculative estimate, not a re-grounded one.
+
 ---
 
 ## Phase 3
@@ -1187,6 +1207,20 @@ Duration: 8 months
 **Exit criterion:** round-trip a corpus of 1,000 real-world PSDs — open in Aurora, edit, save, **reopen in Photoshop** — with no layer loss and composites matching within tolerance. Verification is automated and runs in CI, not sampled by hand.
 
 **Duration: 10 months** (raised from 8). Full PSD *write* (FR-001) is a substantially larger commitment than read, and this phase now owns both directions plus the round-trip harness.
+
+**Re-grounded 2026-07-28: likely needs another upward revision — read 10 as
+a floor, not a ceiling.** The one Phase 3 area actually spiked (PSD text
+layers) went from "assumed similar to groups" to the single biggest scope
+addition any Phase 0 spike has found (glyph rendering into pixel channels,
+`RunLengthArray` recomputation, `EngineData`'s real complexity even for
+plain English text). Basic layers/groups/alpha/blend-modes are genuinely
+tractable — real de-risking, not a correction — but masks, smart objects,
+layer styles, and adjustment layers remain completely unspiked, with no
+principled reason to expect them easier than text layers turned out to be.
+RAW's LGPL packaging architecture (proven mechanically, but only on Linux)
+is real engineering this figure never itemized as its own line, because the
+licensing finding requiring it postdates the original estimate. Full
+reasoning in PLAN.md 0.8.
 
 ---
 
@@ -1201,6 +1235,9 @@ Duration: 8 months
 
 Duration: 10 months
 
+**Re-grounded 2026-07-28: unchanged.** Zero spike evidence touches AI,
+plugins, automation, or cloud sync.
+
 ---
 
 ## Phase 5
@@ -1211,6 +1248,9 @@ Duration: 10 months
 - Web
 
 Duration: 12 months
+
+**Re-grounded 2026-07-28: unchanged.** Zero spike evidence touches this
+phase either.
 
 ---
 
@@ -1265,6 +1305,11 @@ These block or reshape implementation and need owners and answers, most before P
 
 1. **Accessibility conformance target** — WCAG 2.1 AA equivalent, or a specific procurement standard (Section 508 / EN 301 549)? This sets the bar the §9 Phase 1 audit measures against, and custom UI means it is earned widget by widget.
 2. **Team size and funding** — the §9 durations (now 52 months, with Phase 0 and the extended Phases 1 and 3) presuppose a staffed team. What is it? Custom UI adds specialist needs: text input, IME, and accessibility are their own discipline.
+
+    **Resolved 2026-07-28: solo — Cahya Wirawan alone.** This does not mean "the same plan, one person, it'll just take longer" — it means §9's entire duration model needs to be read differently, not merely scaled. R9 already named the risk ("senior Rust + GPU + imaging is a narrow talent pool") as a *hiring* problem for a team; solo development doesn't route around that risk, it concentrates the same specialist breadth (GPU rendering, a first-party UI toolkit, text shaping/IME, accessibility, PSD reverse-engineering, color management, RAW decoding, AI integration, plugin sandboxing, real-time collaboration, mobile/web ports) into one person learning and building all of it in sequence rather than a team building it in parallel. No number of added months to the existing 52-month, team-shaped estimate makes it an honest solo estimate — it is the wrong *shape* of estimate for this situation, not just the wrong number.
+
+    This is a genuine, open strategic tension the project now needs to sit with rather than paper over: either the ~52-month, 26-FR, five-phase scope is revisited explicitly for solo delivery (which likely means narrowing scope hard via §3 Non-Goals and the MoSCoW priorities in §5, sooner and more aggressively than "enforce at phase gates" in R5 currently implies), or the timeline is accepted as open-ended and phase-gated rather than calendar-committed — a legitimate choice for a project with no external revenue pressure (see Q3), but a choice, not a default. Not resolved *by* this PRD revision, only surfaced honestly — this is Cahya's call to make, not an assistant's or a spike's. See PLAN.md 0.8 for where this landed in the Phase 0.8 re-plan.
+
 2b. **Trademark on the name "Aurora"** — MIT grants no trademark rights (§14). Partially investigated 2026-07-25; the name is **retained** for now.
 
     *Findings:* Skylum's *Aurora HDR* — the one same-category collision — is discontinued, folded into Luminar Neo's HDR Merge extension and no longer sold. Trademark rights depend on use in commerce, so an abandoned product weakens the conflict substantially. Several unrelated AURORA marks exist in Nice class 9 (irrigation, energy, drilling software), none for image editing.
@@ -1273,6 +1318,16 @@ These block or reshape implementation and need owners and answers, most before P
 
     *crates.io:* `aurora` (dormant, 2019) and `aurora-core` (claimed 2026-06-08, active) are **taken**. All other `aurora-*` names Aurora needs are free. Decision: keep the current crate names — path dependencies are unaffected, and nothing requires publishing to build or ship the application. Revisit if publishing engine crates becomes desirable (FR-019); the fix then is a registry-name prefix, not a source rename.
 3. **Revenue model** — the licence is settled (MIT, §14), but funding is not. MIT means the application itself cannot be sold under exclusive terms, so anything paying for 52 months of development must come from elsewhere: hosted services, support contracts, sponsorship, or a marketplace cut. This determines whether cloud services (FR-022) and the marketplace (FR-019) are viable, and it is the same question as Q2 (staffing) viewed from the income side.
+
+    **Resolved 2026-07-28: not decided, and explicitly not a priority right
+    now.** Consistent with Q2's answer (solo, no team to fund) — there is no
+    near-term funding pressure driving scope or schedule. Practical
+    consequence, not just a status update: Phase 4's plugin marketplace
+    (FR-019) and Phase 5's cloud sync (FR-022) stay **provisional** — scope
+    items whose business case is genuinely undecided, not merely
+    unscheduled — until a revenue model exists to justify building and
+    operating them. Revisit if that changes; don't build toward either on
+    the assumption it will.
 4. **Tile size and scratch-disk budget** — follows from the resolved precision and ceiling decisions. At 8 bytes/px the tile dimension trades GPU upload efficiency against paging granularity; settle it with the Phase 0 paging prototype.
 5. **Photoshop version target for PSD round-trip** — which Photoshop versions must reopen Aurora-written files? Determines the format features and the composition of the 1,000-file test corpus.
 6. **PSD features with no Aurora equivalent** — on import, are they dropped with a warning, or preserved opaquely and written back untouched on save? The latter is far friendlier to mixed Photoshop/Aurora teams and far harder to build.
@@ -1345,6 +1400,19 @@ Before writing the parsers. Collect the PSD corpus (Phase 3 gate), RAW samples p
 With Steps 1–6 done, revisit §9. The durations are currently estimates made without a prototype; after the vertical slice they can be grounded. Expect them to move.
 
 **Do not begin Phase 1 feature work until Steps 1, 3, and 4 are complete.**
+
+**Status: partially done, 2026-07-28.** Steps 1–6 are *not* all fully
+done — Step 2 ("define the 95%") had never been started or even tracked
+until this pass surfaced it, and Step 6 (test corpora) has only a minimal
+first RAW/ICC set, not the 1,000-file PSD corpus. Re-grounding §9 anyway,
+rather than waiting for literal completion of every prior step, was a
+deliberate choice: five real spikes already exist, and honestly flagging
+*which* phases have new evidence (0, 3) versus which don't (1, 2, 4, 5) is
+more useful now than a false-precision total later. See PLAN.md 0.8 for
+the full phase-by-phase reasoning and PLAN.md 0.9 for the now-tracked
+Step 2 gap. PRD §12 Q2 (team size) and Q3 (revenue model) remain
+unanswered — genuinely waiting on the design/business owner, not
+determinable from a spike.
 
 ---
 
