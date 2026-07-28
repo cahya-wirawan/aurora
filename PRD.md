@@ -103,7 +103,7 @@ Every FR in §5 carries a priority. Where unmarked, assume **Should**.
 | **Won't (yet)** | Deferred past v1.0 by decision, not by oversight |
 
 Must: FR-001, FR-002, FR-003, FR-004, FR-005, FR-007, FR-010, FR-012, FR-021, FR-024, FR-025, FR-026, FR-027.
-Should: FR-006, FR-008, FR-009, FR-011, FR-013, FR-014, FR-016, FR-023.
+Should: FR-006, FR-008, FR-009, FR-011, FR-013, FR-014, FR-016, FR-023, FR-028.
 Could: FR-015, FR-017, FR-018.
 Won't (yet): FR-019, FR-020, FR-022.
 
@@ -113,6 +113,14 @@ was "targeted for v1.0" while its entire build lived inside what was Phase
 solo-development answer to PRD §12 Q2. Keeping it "Should" while deferring
 the phase that builds it was an inconsistency the re-plan surfaced rather
 than left standing.
+
+**FR-028 (Artboards) added, 2026-07-28** — a new requirement, not a
+priority change: the "define the 95%" exercise surfaced a persona need
+(§4 UI Designer) with no owning FR, and Cahya decided it should be a
+first-class feature rather than plain-group round-trip only. Placed at
+**Should**, alongside the other persona/domain-specific features (FR-008,
+FR-009) rather than Must — it's one persona's need, not part of the
+universally-shared core.
 
 ---
 
@@ -160,20 +168,11 @@ Needs
 - Export assets
 
 **Gap surfaced 2026-07-28** ([docs/workflows.md](docs/workflows.md), PLAN
-0.9): "Artboards" has no owning FR in §5 — FR-002 (Canvas) covers guides/
-grid/snap/rulers/multiple tabs and windows but not multiple named boards
-in one document, and FR-008 (Vector Graphics) doesn't mention them either.
-
-**Format-level question resolved 2026-07-28** while assembling the PSD
-test corpus (`spike/psd-write/FINDINGS.md` finding 17, PLAN 0.7): a real
-Photoshop artboard (`psd-tools`' own `artboard.psd` fixture) is a plain
-layer group plus one tagged block (`artb`) holding a `Descriptor` — the
-same container type FR-001's PSD round-trip already needs elsewhere. So
-this is FR-003 (Layer System) + FR-001 (PSD compatibility) scope, not a
-new document primitive requiring a new FR. **Still undecided**: whether
-Aurora exposes artboards as a first-class *product* feature (a boards
-panel, per-board export, device presets) or leaves them as plain groups —
-that's Cahya's call, now a cheaper one than it looked.
+0.9): "Artboards" had no owning FR in §5. **Resolved 2026-07-28**: format
+question answered while assembling the PSD test corpus (an artboard is a
+plain layer group plus one `artb` tagged block, `spike/psd-write/FINDINGS.md`
+finding 17), and Cahya decided the product question — first-class feature,
+not just round-trip fidelity. Now **FR-028 Artboards** (§5, priority Should).
 
 ---
 
@@ -893,6 +892,43 @@ Testable, so "beautiful" does not become unfalsifiable:
 
 ---
 
+# FR-028 Artboards
+
+**Priority: Should.** Added 2026-07-28, resolving the gap the workflows
+exercise surfaced ([docs/workflows.md](docs/workflows.md) UID-1; §4 UI
+Designer): named "Artboards" as a persona need with no owning FR. **Decided:
+first-class feature**, not just format round-trip — a UI Designer opens
+Aurora expecting to lay out multiple named boards in one document and get
+real tooling for it, not a group they have to remember is special.
+
+## Features
+
+- Multiple named artboards in one document
+- Boards panel: create, rename, reorder, navigate between boards
+- Per-board export
+- Device-size presets (common phone/tablet/desktop dimensions)
+- Guides scoped to an individual board
+
+## Relationship to other FRs
+
+Not a new document primitive — built on **FR-003** (Layer System: a board
+is a specialized layer group) and **FR-001** (PSD compatibility: an
+artboard round-trips as an ordinary layer group plus one tagged block,
+confirmed against a real Photoshop-authored fixture, not assumed —
+`spike/psd-write/FINDINGS.md` finding 17). The tagged block
+(`ARTBOARD_DATA1` / `artb`) is a plain `Descriptor` — the same container
+type FR-001's `TySh`/gradient-fill handling already uses — holding the
+board's canvas-relative bounds, which guides belong to it, and an optional
+device-preset name. Boards panel and navigation UI are FR-024 (User
+Interface) scope; per-board export reuses FR-021 (Export).
+
+## Open
+
+Exact device-preset list, and whether boards can nest, are Phase 2/3
+implementation questions, not resolved here.
+
+---
+
 # 6. Non-Functional Requirements
 
 ## Performance
@@ -1376,7 +1412,7 @@ These block or reshape implementation and need owners and answers, most before P
 9. **Minimum GPU baseline** — what hardware must Aurora run on? Sets the `wgpu` feature floor.
 10. **Which Photoshop workflows are the 95%?** The success metric in §10 is currently unmeasurable without this list.
 
-    **Resolved 2026-07-28 (first draft):** [docs/workflows.md](docs/workflows.md) — a tiered, ranked list of concrete workflows per §4 persona, each mapped to the FRs it exercises, with a cross-persona rollup. Explicitly a hypothesis, not a finding — there is no user base yet to have validated it against; Cahya's professional judgment is the only available check for now (PLAN.md 0.9). One gap fell out of writing it: "Artboards" (§4, UI Designer) has no owning FR — see the note under that persona above.
+    **Resolved 2026-07-28 (first draft):** [docs/workflows.md](docs/workflows.md) — a tiered, ranked list of concrete workflows per §4 persona, each mapped to the FRs it exercises, with a cross-persona rollup. Explicitly a hypothesis, not a finding — there is no user base yet to have validated it against; Cahya's professional judgment is the only available check for now (PLAN.md 0.9). One gap fell out of writing it: "Artboards" (§4, UI Designer) had no owning FR — resolved into **FR-028**, see the note under that persona above.
 
 ---
 

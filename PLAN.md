@@ -336,10 +336,11 @@ rather than deliberately deferred.
   (touched by Tier-1 work from 3+ personas) vs. touched by nothing above
   Tier 2 — the latter all landed on FRs already marked Could/Won't-yet in
   §3, which is a consistency check passing, not new information. One real
-  gap fell out of the exercise: "Artboards" is a named UI Designer need in
-  §4 with no owning FR in §5 — flagged in PRD.md, needs Cahya's decision.
-  First draft, explicitly a hypothesis to argue with rather than a
-  finding — there's no user base yet to have interviewed.
+  gap fell out of the exercise: "Artboards" was a named UI Designer need
+  in §4 with no owning FR in §5 — **resolved 2026-07-28** into **FR-028**
+  (first-class feature, PRD.md §5). First draft, explicitly a hypothesis
+  to argue with rather than a finding — there's no user base yet to have
+  interviewed.
 
 ---
 
@@ -461,6 +462,12 @@ evidence supports is how the original 6-month Phase 1 estimate happened.
   loss.* Likely needs another upward revision in relative terms — treat as
   the biggest remaining phase, not a 10-month one; see 0.8.
 
+**New since this outline was written**: FR-028 (Artboards, added
+2026-07-28) needs a home once Phase 2/3 are planned in detail — the boards
+panel and per-board export are Phase 2-shaped UI work, the PSD round-trip
+piece (layer group + `artb` tagged block) is Phase 3-shaped, matching how
+the rest of FR-001's PSD compatibility already splits across both phases.
+
 **Phase 0–3 durations are milestone-based, not calendar-committed, as of
 2026-07-28** (PRD.md §9, following the solo-development answer to PRD §12
 Q2). The month figures above are gone deliberately, not lost — each
@@ -544,16 +551,13 @@ here so they are not silently lost between phases.
    needs a machine with an active graphical login, which was not available
    this pass. Windows (UIA) is fully unstarted. Both are different platform
    APIs entirely and remain the only thing that can still overturn ADR 0001.
-2. **Get Cahya's read on [docs/workflows.md](docs/workflows.md)** — the 95%
-   list is a first draft grounded in general Photoshop usage patterns, not
-   real user input (there are no users yet), and it says so explicitly.
-   Needs a decision, not just a read-through, on two things: whether the
-   Tier-1/2/3 calls match Cahya's own professional judgment before this
-   list starts being used as the scope-cut arbiter for real, and the
-   Artboards question — the *format* half is now answered (layer group +
-   one tagged block, `spike/psd-write/FINDINGS.md` finding 17), but
-   whether Aurora exposes artboards as a first-class UI feature is still
-   an open product call.
+2. **Get Cahya's read on [docs/workflows.md](docs/workflows.md)'s
+   Tier-1/2/3 calls** — the 95% list is a first draft grounded in general
+   Photoshop usage patterns, not real user input (there are no users yet),
+   and it says so explicitly. Needs a decision on whether the tiers match
+   Cahya's own professional judgment before this list starts being used as
+   the scope-cut arbiter for real. (The Artboards half of this item is
+   done — see below.)
 3. **Grow the PSD corpus toward real-world files, or move on** — 0.7 now
    has 319 real (if synthetic-by-design) fixtures; the harder remaining
    piece is genuine real-world PSDs, which raises consent/licensing
@@ -568,6 +572,13 @@ if needed. See 0.5 above.
 ~~Define the 95%~~ — **done 2026-07-28**, see item 2 above and 0.9.
 
 ~~PSD test corpus~~ — **first set done 2026-07-28**, see item 3 above and 0.7.
+
+~~Artboards product decision~~ — **decided 2026-07-28: first-class
+feature**, not just round-trip fidelity. Now **FR-028 Artboards** in
+PRD.md §5 (priority Should) — boards panel, per-board export, device
+presets; round-trips via the layer-group + `artb` tagged block finding 17
+already confirmed. Needs a home in the M1.x/Phase 2-3 breakdown once
+that's planned in detail (0.7's outline note already flags it).
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`

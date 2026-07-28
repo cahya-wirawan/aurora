@@ -147,13 +147,12 @@ breaks, nothing else matters.
 **Tier 1**
 - **UID-1**: Lay out multiple app/web screens as separate boards in one
   document, using vector shapes and icons with consistent spacing via
-  guides. *FR-002, FR-008.* **Gap surfaced by this exercise**: §4 lists
-  "Artboards" as a named need, but no FR in §5 owns multiple named boards
-  in one canvas — FR-002 (Canvas) has guides/grid/snap/rulers/multiple
-  tabs and windows, but not artboards specifically, and FR-008 (Vector
-  Graphics) doesn't mention them either. This is either an implicit
-  sub-feature of FR-002 that was never written down, or a real scope gap.
-  Flagged in PRD.md; needs an owner decision, not an assistant guess.
+  guides. *FR-028 (Artboards), FR-008.* **Gap surfaced by this exercise,
+  now resolved**: §4 named "Artboards" as a need with no owning FR.
+  Format question answered while assembling the PSD corpus (a plain layer
+  group + one tagged block, finding 17); Cahya decided the product
+  question 2026-07-28 — first-class feature, not just round-trip fidelity.
+  Now **FR-028**, priority Should.
 - **UID-2**: Export assets at multiple densities (@1x/2x/3x or similar)
   as PNG/SVG for a dev handoff. *FR-021.*
 
@@ -220,16 +219,14 @@ Tier-1 workflow, *that* would have been a finding worth raising.
 
 ## Gaps this exercise surfaced
 
-- **Artboards (UID-1)** — a named persona need in §4 with no explicit
-  owning feature in §5. **Format-level question resolved 2026-07-28**
-  (`spike/psd-write/FINDINGS.md` finding 17, found while assembling the
-  PSD test corpus): an artboard is a plain layer group plus one
-  `Descriptor`-shaped tagged block (`artb`) this spike's code already
-  knows how to read/write the shape of — FR-003 + FR-001 territory, not a
-  new document primitive. What's still undecided is the *product* question
-  — does Aurora expose artboards as a first-class UI concept, or leave
-  them as plain groups — which is a real decision for Cahya, just a
-  cheaper one than it looked before this was checked.
+- **Artboards (UID-1) — resolved 2026-07-28.** A named persona need in §4
+  with no explicit owning feature in §5. Format question answered while
+  assembling the PSD test corpus (`spike/psd-write/FINDINGS.md` finding
+  17): an artboard is a plain layer group plus one `Descriptor`-shaped
+  tagged block (`artb`), reusing container infrastructure FR-001 already
+  needs. Cahya decided the remaining product question — **first-class
+  feature**, not just round-trip fidelity — so this is now **FR-028
+  Artboards** (§5, priority Should), not an open gap.
 
 ---
 

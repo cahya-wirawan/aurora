@@ -617,16 +617,15 @@ belong to it, and an optional device-preset name (e.g. a phone model),
 empty in this fixture.
 
 **Consequence for scope, not just format trivia**: this is not a new
-canvas/document primitive requiring new FR territory. It's FR-003 (Layer
-System, already Must) plus one more `Descriptor`-shaped tagged block for
-FR-001's round-trip (PSD compatibility, already Must) — infrastructure
-this spike already has, not infrastructure Phase 3 has to invent. What
-*is* still a real, undecided product question (not a format one): whether
-Aurora exposes artboards as a first-class UI concept (a boards panel,
-per-board export, device presets) or leaves them as plain groups on
-import/export. That's Cahya's call — see the PRD.md note under the UI
-Designer persona — but it's now a UI-scope decision with a known-cheap
-format answer, not an open format risk.
+canvas/document primitive requiring new FR territory in the *format*
+sense — it's FR-003 (Layer System, already Must) plus one more
+`Descriptor`-shaped tagged block for FR-001's round-trip (PSD
+compatibility, already Must) — infrastructure this spike already has, not
+infrastructure Phase 3 has to invent. The separate *product* question
+(first-class UI concept vs. plain groups) was Cahya's call, not this
+spike's — **decided 2026-07-28: first-class feature**, now **FR-028
+Artboards** in PRD.md §5. The format answer above is what makes FR-028
+cheap to round-trip rather than an open risk.
 
 **Scope note**: confirmed by reading one real fixture with `psd-tools`,
 not implemented here — no code in this spike reads or writes `artb`. 8 of
