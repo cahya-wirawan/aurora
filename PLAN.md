@@ -35,8 +35,10 @@ device/queue management, the shader library/pipeline cache, GPU tile
 residency (with toroidal slot addressing, the bullet PLAN.md itself
 flagged as risky), and budgeted upload scheduling are all done, verified
 against a real GPU on this machine with actual rendered/uploaded-pixel
-checks. Surface configuration/resize and cross-platform validation
-(DX12/Metal/Vulkan) are next. CI green on Linux, macOS, and
+checks. Surface configuration/resize is implemented but **blocked on
+verification** — no usable display exists in this environment, the same
+"GDM greeter only" gap the a11y Orca leg already hit. Cross-platform
+validation (DX12/Metal/Vulkan) is the one bullet not yet started. CI green on Linux, macOS, and
 Windows. The remaining Phase 0 items (ADR 0006, Windows/300k-px slice
 re-runs, macOS/Windows LGPL packaging, deeper PSD format coverage)
 continue in the background rather than gating Phase 1 — none of them are
@@ -55,7 +57,7 @@ among the three steps PRD §13 actually names as blocking.
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
-| **Phase 1 — M1.2** | **In progress, 2026-07-28.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done, all verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks, not just "it compiled." A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`, see M1.2). Only surface config/resize and platform validation (DX12/Metal/Vulkan) remain. See M1.2 |
+| **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented but **blocked on a live-display verification** this environment can't provide — same "GDM greeter only" gap as the a11y Orca leg. A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). Only cross-platform validation (DX12/Metal/Vulkan) is fully unstarted. See M1.2 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -472,7 +474,7 @@ every widget in every state across all built-in themes with contrast checks gree
 
 ### M1.2 — GPU layer (`aurora-gpu`)
 
-- [~] **Device/queue management** — done 2026-07-28,
+- [x] **Device/queue management** — done 2026-07-28,
   `crates/aurora-gpu/src/{context,error}.rs`, `GpuContext` (`wgpu` 30,
   matching `spike/vertical-slice`'s pin). Headless only (`compatible_surface:
   None`), mirroring the spike's own `--headless` path exactly — same
@@ -480,11 +482,30 @@ every widget in every state across all built-in themes with contrast checks gree
   power preference, no speculative features/limits. Verified with a real
   device on this machine's actual GPU, not a mock: `adapter_info()`
   confirms **NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu** — the same
-  hardware `spike/FINDINGS.md`'s Linux/Vulkan numbers came from. **Surface
-  configuration and resize are still `[ ]`** — deliberately not this
-  pass's scope; the spike has zero resize handling to draw on (confirmed
-  by reading every `WindowEvent` match arm), so that's real, separate
-  design work, not a follow-on detail.
+  hardware `spike/FINDINGS.md`'s Linux/Vulkan numbers came from.
+- [!] **Surface configuration and resize** — implemented 2026-07-29,
+  `crates/aurora-gpu/src/surface.rs`, `GpuContext::create_surface` +
+  `GpuSurface` (`format`/`size`/`resize`/`acquire`). Ports
+  `spike/vertical-slice`'s windowed setup (`get_default_config` + forced
+  `AutoVsync`) exactly; resize is new design (the spike has none, per
+  every `WindowEvent` arm checked). `acquire()` returns wgpu 30's own
+  `CurrentSurfaceTexture` (a 7-variant enum — `Success`/`Suboptimal`/
+  `Timeout`/`Occluded`/`Outdated`/`Lost`/`Validation`) directly rather
+  than the older `Result<SurfaceTexture, SurfaceError>` shape, confirmed
+  by reading wgpu 30's own source rather than assumed from older docs.
+  `resize` no-ops on a zero-sized request (minimized-window guard, a real
+  wgpu gotcha). No new dependency: `impl Into<wgpu::SurfaceTarget<'_>>`
+  is wgpu's own flexible target type, so `aurora-gpu` needs neither
+  `winit` nor `raw-window-handle` directly. **Blocked, same as the a11y
+  Orca leg**: this machine has no usable display to create a real window
+  against — the only X server present (`/tmp/.X11-unix/X0`) is owned by
+  `gdm` with an `Xauthority` this user can't read, the identical "GDM
+  greeter only, no live session" gap `spike/a11y-ime/FINDINGS.md` already
+  named, and no `Xvfb`/virtual display server is installed. The code is
+  real and matches wgpu's documented API and the spike's proven pattern,
+  but is genuinely unverified against an actual window — not silently
+  marked done. Verifying it needs the same live desktop session the Orca
+  leg is waiting on.
 - [x] **Shader library and WGSL pipeline cache** — done 2026-07-28,
   `crates/aurora-gpu/src/{shader,pipeline}.rs`, 3 new tests (4 total in
   the crate). `ShaderLibrary` eagerly compiles named WGSL modules
@@ -728,17 +749,24 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**Phase 1 has started, 2026-07-28** — `aurora-core`'s foundational types
-are done (M1.1). Next up: `aurora-tile`'s actual tile store (sparse
-store, LRU residency, scratch-disk paging, per-tile dirty rectangles,
-compression, background writer, benches) — the rest of M1.1, and the
-largest single win the vertical slice identified (`spike/FINDINGS.md`).
+**M1.1 is complete; M1.2 is nearly complete** — device/queue management,
+the shader library/pipeline cache, GPU tile residency, budgeted upload
+scheduling, and surface configuration/resize are all implemented and
+(except surface/resize) verified against this machine's real GPU. Next
+up in M1.2: **validate on DX12, Metal, Vulkan** — the one bullet not yet
+started, and genuinely not doable from this machine alone (needs Windows
+and macOS hardware, same cross-platform constraint the vertical slice and
+a11y spikes have hit throughout Phase 0).
 
-**Not forgotten, just no longer gating**: the human a11y/IME check below
-is still a real, open task — pick it up whenever Linux/Windows hardware
-with a live desktop session is actually available. It moved out of "next
-action" because Cahya explicitly decided not to block Phase 1 start on it
-(PLAN.md 0.4), not because it got resolved.
+**A live desktop session, whenever one is available, now has two things
+waiting on it, not one** — bundle them: the a11y/Orca check below, and a
+real windowed smoke-test of `aurora-gpu`'s `GpuSurface` (create a window,
+configure a surface, resize it, confirm `acquire()` returns
+`Success`/`Suboptimal` rather than an error). Neither blocks Phase 1
+(Cahya explicitly decided not to block on the a11y check, PLAN.md 0.4;
+`GpuSurface`'s own code is complete, just unverified) — both are real,
+open verification tasks for whenever a genuine graphical login exists on
+a Linux box, plus separately on Windows and macOS.
 
 - **Run the human/Orca leg of the a11y/IME checklist on Linux, and the whole
   checklist on Windows** — macOS is done (9/10,
@@ -748,6 +776,14 @@ action" because Cahya explicitly decided not to block Phase 1 start on it
   needs a machine with an active graphical login, which was not available
   this pass. Windows (UIA) is fully unstarted. Both are different platform
   APIs entirely and remain the only thing that can still overturn ADR 0001.
+- **Smoke-test `GpuSurface` against a real window** — `crates/aurora-gpu/src/surface.rs`
+  is implemented and passes the full local CI gate, but has never created
+  an actual `wgpu::Surface` against a real window: this machine's only X
+  server is owned by `gdm` with an unreadable `Xauthority` (no live user
+  session), the same gap blocking the Orca leg above, and no virtual
+  display server (`Xvfb` etc.) is installed. Not a design risk like the
+  toroidal-addressing bullet was — it's a direct port of the spike's own
+  proven windowed setup — but genuinely unverified, not assumed working.
 
 ~~Get outside critique on the 0.5 design scaffold~~ — **done 2026-07-28**: a
 colleague reviewed it and signed off as fine for a start, revisable later

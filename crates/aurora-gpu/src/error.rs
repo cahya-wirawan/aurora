@@ -15,4 +15,11 @@ pub enum GpuError {
     /// An adapter was found, but requesting a device/queue from it failed.
     #[error("GPU device request failed: {0}")]
     DeviceRequestFailed(#[source] wgpu::RequestDeviceError),
+    /// The window target couldn't be turned into a `wgpu::Surface` at all.
+    #[error("failed to create a surface: {0}")]
+    SurfaceCreation(#[source] wgpu::CreateSurfaceError),
+    /// A surface was created, but the adapter has no usable configuration
+    /// for it (`Surface::get_default_config` returned `None`).
+    #[error("adapter does not support presenting to this surface")]
+    SurfaceUnsupported,
 }

@@ -89,12 +89,19 @@ impl GpuContext {
         self.adapter.get_info()
     }
 
-    /// The instance this context was created from — needed later to
-    /// create a surface compatible with the same adapter/device
-    /// (surface configuration is separate, follow-on M1.2 work).
+    /// The instance this context was created from — used by
+    /// [`crate::GpuContext::create_surface`] to create a surface
+    /// compatible with this same adapter/device.
     #[must_use]
     pub fn instance(&self) -> &wgpu::Instance {
         &self.instance
+    }
+
+    /// Not part of the public API — [`crate::surface`] needs the raw
+    /// adapter to query surface capabilities; nothing outside the crate
+    /// has needed it so far.
+    pub(crate) const fn adapter(&self) -> &wgpu::Adapter {
+        &self.adapter
     }
 }
 
