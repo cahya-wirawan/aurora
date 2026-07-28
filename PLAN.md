@@ -35,7 +35,7 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | Workspace & CI | Built and green |
 | Performance validation | **Measured** — budgets hold, with one correction; re-run on Linux/Vulkan 2026-07-26, same correction reproduces |
 | Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
-| Design language | **Owner-approved draft** — [design/](design/README.md); outside critique still needed before it hardens |
+| Design language | **Complete** — [design/](design/README.md); owner-approved and outside-reviewed (2026-07-28) |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | **Libraries decided (ADR 0007/0008); LGPL packaging mechanism proven on Linux with the actual chosen library** — macOS/Windows and legal review remain |
 | Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. PRD §13 Step 2 ("define the 95%") surfaced as a previously-untracked gap along the way, now tracked as 0.9 |
@@ -128,7 +128,7 @@ and diagnosed down to a specific, non-structural cause.
 > all. Revisit the escape hatch only if one of those surfaces something
 > AccessKit genuinely cannot express on that platform.
 
-### 0.5 Design language — **owner-approved draft; outside critique still open**
+### 0.5 Design language — **complete**
 
 Owner: Cahya Wirawan. Blocks all widget code (invariant §7.3.10 — tokens cannot
 be retrofitted cheaply). Runs in parallel with 0.3/0.6; needs no engine code.
@@ -143,7 +143,7 @@ workspace, same pattern as `spike/`), commit
 - [x] One complete built-in theme (Dark), all pairs passing contrast — [design/themes/dark.toml](design/themes/dark.toml), owner-approved; every gated pair passes WCAG 2.1 AA via [design/check_contrast.py](design/check_contrast.py) (17/17 gated pairs pass; `border.default` and disabled text are informational, not gated — see script comments for the WCAG 1.4.11 rationale)
 - [x] Static mockups: main workspace + 2–3 panels — [design/mockups/workspace.html](design/mockups/workspace.html) (Layers/Properties/History docked), owner-approved; HTML/CSS is a Phase 0 review tool only, not how `aurora-widgets` renders
 - [x] Component gallery skeleton — review surface and golden-image target — [design/gallery/index.html](design/gallery/index.html), owner-approved; covers button/checkbox/slider/field/dropdown/tab bar/tooltip/swatch across forced states; scrollbar/tree/menu/curve editor deliberately left for a later pass
-- [ ] Outside critique on the mockups before they harden (risk R2f mitigation) — owner sign-off is not a second opinion; this is the one remaining item before 0.5 counts as fully complete
+- [x] Outside critique on the mockups (risk R2f mitigation) — **2026-07-28: a colleague reviewed the scaffold and signed off as fine for a start**, with the explicit understanding it can be revised later if needed. Not a formal design-professional audit, but it satisfies R2f's actual gap (no second opinion at all) — good enough to unblock widget work; deeper critique can still happen opportunistically as the token system gets exercised for real.
 
 ### 0.6 Format feasibility — PSD partially done; RAW/ICC spiked
 
@@ -526,21 +526,20 @@ here so they are not silently lost between phases.
    needs a machine with an active graphical login, which was not available
    this pass. Windows (UIA) is fully unstarted. Both are different platform
    APIs entirely and remain the only thing that can still overturn ADR 0001.
-2. **Get outside critique on the 0.5 design scaffold** ([design/](design/README.md),
-   [b0a7ac8](https://github.com/cahya-wirawan/aurora/commit/b0a7ac8)) — all
-   five Phase 0 deliverables are drafted and now owner-approved (2026-07-27).
-   The one item left before 0.5 counts as complete is a second opinion
-   (R2f mitigation: a solo design owner has no built-in check) before the
-   token vocabulary and Dark theme harden into something every widget
-   depends on.
-3. **Define the 95%** (PRD §13 Step 2, now tracked as 0.9) — surfaced during the 0.8 re-plan as a genuine gap: it had never been
-   started *or tracked* anywhere in this file. Turn PRD §10's success metric
-   into a written, ranked list of concrete Photoshop workflows across the
-   §4 personas. Unlike items 1 and 2, this needs no special hardware and no
-   second reviewer — it's writing/analysis work, available to start now,
-   and PRD's own words say it "becomes the acceptance suite and the arbiter
-   for every 'Could we cut this?' question later." Every later scope
-   decision (Phase 2 onward) is weaker without it.
+2. **Define the 95%** (PRD §13 Step 2, now tracked as 0.9) — surfaced during
+   the 0.8 re-plan as a genuine gap: it had never been started *or tracked*
+   anywhere in this file. Turn PRD §10's success metric into a written,
+   ranked list of concrete Photoshop workflows across the §4 personas.
+   Unlike item 1, this needs no special hardware — it's writing/analysis
+   work, available to start now, and PRD's own words say it "becomes the
+   acceptance suite and the arbiter for every 'Could we cut this?' question
+   later." Every later scope decision (Phase 2 onward) is weaker without it.
+
+~~Get outside critique on the 0.5 design scaffold~~ — **done 2026-07-28**: a
+colleague reviewed it and signed off as fine for a start, revisable later
+if needed. See 0.5 above; this frees a slot in the list above (candidates
+in "Newly surfaced" below, e.g. the PSD test corpus in 0.7 or the
+macOS/Windows LGPL packaging work).
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
