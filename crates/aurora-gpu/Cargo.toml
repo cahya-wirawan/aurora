@@ -19,3 +19,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
+
+[dev-dependencies]
+half = { workspace = true }

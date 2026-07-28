@@ -30,10 +30,11 @@ than the tidiness.
 (PRD §13 Steps 1/3/4) is now satisfied and Phase 1 has started, 2026-07-28.**
 **M1.1 is complete** — `aurora-core`'s foundational types and
 `aurora-tile`'s sparse/LRU/compressed/paging store, with ADR 0005 (tile
-size) settled alongside it. **M1.2 (`aurora-gpu`) has started**:
-device/queue management is done, verified against a real GPU on this
-machine; surface configuration, resize, the shader library, GPU tile
-residency, and upload scheduling are next. CI green on Linux, macOS, and
+size) settled alongside it. **M1.2 (`aurora-gpu`) is in progress**:
+device/queue management and the shader library/pipeline cache are done,
+both verified against a real GPU on this machine (the pipeline cache with
+an actual rendered-pixel readback); surface configuration, resize, GPU
+tile residency, and upload scheduling are next. CI green on Linux, macOS, and
 Windows. The remaining Phase 0 items (ADR 0006, Windows/300k-px slice
 re-runs, macOS/Windows LGPL packaging, deeper PSD format coverage)
 continue in the background rather than gating Phase 1 — none of them are
@@ -52,7 +53,7 @@ among the three steps PRD §13 actually names as blocking.
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
-| **Phase 1 — M1.2** | **Started 2026-07-28.** `GpuContext` device/queue management done, verified against this machine's real RTX 3090 (Vulkan). Surface config, resize, shader library, tile residency, upload scheduling still open. See M1.2 |
+| **Phase 1 — M1.2** | **In progress, 2026-07-28.** Device/queue management (`GpuContext`) and shader library/pipeline cache (`ShaderLibrary`/`PipelineCache`) done, both verified against this machine's real RTX 3090 (Vulkan) — the pipeline cache with an actual rendered-pixel check, not just "it compiled." Surface config, resize, tile residency, upload scheduling still open. See M1.2 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -482,7 +483,23 @@ every widget in every state across all built-in themes with contrast checks gree
   pass's scope; the spike has zero resize handling to draw on (confirmed
   by reading every `WindowEvent` match arm), so that's real, separate
   design work, not a follow-on detail.
-- [ ] Shader library and WGSL pipeline cache
+- [x] **Shader library and WGSL pipeline cache** — done 2026-07-28,
+  `crates/aurora-gpu/src/{shader,pipeline}.rs`, 3 new tests (4 total in
+  the crate). `ShaderLibrary` eagerly compiles named WGSL modules
+  (`shaders/canvas.wgsl`, the `vs_canvas`/`fs_canvas` pair ported from
+  `spike/vertical-slice`'s shader — the UI-rect half was deliberately
+  **not** ported, since it hardcodes colours, exactly what invariant
+  §7.3.10 forbids; that half needs `aurora-theme`'s tokens first).
+  `PipelineCache` memoizes `wgpu::RenderPipeline`s by a small hashable
+  `PipelineKey` (shader/entry points/target format/blend) via
+  `HashMap::entry().or_insert_with()` — no prior art existed for this
+  (the spike built its two pipelines once at startup with no cache
+  concept at all). **Verified with a real render, not a mock**: a test
+  actually draws the canvas shader into an offscreen texture and reads
+  back the pixels, confirming correct output (opaque red in, opaque red
+  out — the checkerboard-behind-transparency logic correctly contributes
+  nothing when alpha = 1); a separate test confirms the cache actually
+  caches (identical key → no rebuild; different key → rebuilds).
 - [ ] GPU tile residency with toroidal slot addressing *(from the slice — awkward to retrofit)*
 - [ ] Upload scheduling with a per-frame budget
 - [ ] Validate on DX12, Metal, Vulkan

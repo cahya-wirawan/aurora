@@ -167,6 +167,7 @@ version = "0.0.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
+ "half",
  "pollster",
  "thiserror",
  "tracing",
