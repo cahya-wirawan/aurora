@@ -1,24 +1,17 @@
 //! Geometry, colour types, pixel formats, error types, and IDs shared by every crate.
 //!
 //! See PRD §7.2 for where this crate sits in the workspace layering, and
-//! `docs/adr/` for the decisions that shape it.
-//!
-//! This crate is a skeleton: no functionality is implemented yet.
+//! `docs/adr/` for the decisions that shape it. `aurora-core` depends on
+//! nothing else in the workspace (`scripts/layering.json`) — it is the
+//! foundation every other crate builds on, so it stays free of anything
+//! crate-specific (no pixel storage, no tile concept, no document model).
 
-/// Placeholder so the crate compiles and CI has something to check.
-///
-/// Remove once real types land.
-#[must_use]
-pub const fn crate_name() -> &'static str {
-    "aurora-core"
-}
+pub mod color;
+pub mod error;
+pub mod geometry;
+pub mod id;
 
-#[cfg(test)]
-mod tests {
-    use super::crate_name;
-
-    #[test]
-    fn reports_its_name() {
-        assert_eq!(crate_name(), "aurora-core");
-    }
-}
+pub use color::{Channels, ColorSpace, PixelFormat, SampleFormat};
+pub use error::CoreError;
+pub use geometry::{MAX_DOCUMENT_EXTENT, Rect, Size};
+pub use id::{Id, IdGenerator};

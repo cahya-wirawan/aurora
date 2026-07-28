@@ -26,29 +26,40 @@ than the tidiness.
 
 ## Where we are
 
-**Phase 0 (technical de-risking) — roughly half done.** No product features exist
-and none should yet. CI green on Linux, macOS, and Windows.
+**Phase 0 (technical de-risking) — roughly half done, but its Phase-1 gate
+(PRD §13 Steps 1/3/4) is now satisfied and Phase 1 has started, 2026-07-28.**
+`aurora-core`'s foundational types are the first real product code in the
+workspace — M1.1's `aurora-core` half is done, `aurora-tile`'s tile store
+is next. CI green on Linux, macOS, and Windows. The remaining Phase 0
+items (ADRs 0005/0006, Windows/300k-px slice re-runs, macOS/Windows LGPL
+packaging, deeper PSD format coverage) continue in the background rather
+than gating Phase 1 — none of them are among the three steps PRD §13
+actually names as blocking.
 
 | Area | State |
 |---|---|
 | Requirements & architecture | Settled and written down (PRD v1.8, 6 ADRs — 0005/0006 still pending) |
 | Workspace & CI | Built and green |
 | Performance validation | **Measured** — budgets hold, with one correction; re-run on Linux/Vulkan 2026-07-26, same correction reproduces |
-| Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
+| Accessibility & IME | **macOS verified (9/10)**; Linux/Windows human verification unverified but **risk accepted 2026-07-28** to unblock Phase 1 — see 0.4 |
 | Design language | **Complete** — [design/](design/README.md); owner-approved and outside-reviewed (2026-07-28) |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | **Libraries decided (ADR 0007/0008); LGPL packaging mechanism proven on Linux with the actual chosen library** — macOS/Windows and legal review remain |
 | Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. |
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
+| **Phase 1 — M1.1** | **Started 2026-07-28.** `aurora-core`'s foundational types done (geometry, colour descriptors, IDs, errors), 16 tests, full local CI gate clean. `aurora-tile`'s tile store is next. See M1.1 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
 2026-07-25/26, [full results](spike/a11y-ime/FINDINGS.md). Nothing found rises to
-[ADR 0001](docs/adr/0001-custom-wgpu-ui.md)'s structural escape-hatch trigger. What
-remains open is **Windows (UIA) and Linux (AT-SPI)** — different APIs entirely,
-and macOS passing says nothing about them — plus one real but non-structural bug
-(live value-change announcements don't reach VoiceOver).
+[ADR 0001](docs/adr/0001-custom-wgpu-ui.md)'s structural escape-hatch trigger.
+**Windows (UIA) and Linux (AT-SPI)** remain genuinely unverified — different
+APIs entirely, and macOS passing says nothing about them — plus one real but
+non-structural bug (live value-change announcements don't reach VoiceOver).
+**Risk accepted 2026-07-28**: Cahya chose not to block Phase 1 start on the
+human Linux/Windows verification (see 0.4) — still open, not resolved, just
+no longer gating.
 
 ---
 
@@ -98,7 +109,7 @@ Evidence: [spike/FINDINGS.md](spike/FINDINGS.md), `spike/vertical-slice/`
 - [x] Run on Linux — Vulkan/NVIDIA RTX 3090, 6 runs, 2026-07-26 — [spike/FINDINGS.md](spike/FINDINGS.md#second-platform-linux--vulkan-2026-07-26). Stroke latency and idle-frame budgets pass with more headroom than macOS; pan-while-painting is marginal (straddles the 16.7 ms budget across runs on this shared machine) rather than a clean pass — same architectural bottleneck as macOS (finding 1), not a new one
 - [ ] Re-run at the 300,000 px ceiling *(only 100,000 px tested)*
 
-### 0.4 Accessibility and IME spike — **macOS verified (9/10); Windows/Linux outstanding**
+### 0.4 Accessibility and IME spike — **macOS verified (9/10); Windows/Linux unverified, risk accepted 2026-07-28 to unblock Phase 1**
 
 Evidence: [spike/a11y-ime/FINDINGS.md](spike/a11y-ime/FINDINGS.md)
 
@@ -116,8 +127,24 @@ and diagnosed down to a specific, non-structural cause.
 - [x] **VoiceOver announces the field (macOS)** — role, label, value, focus all PASS
 - [x] **CJK composition commits correctly (macOS)** — preedit, commit both PASS
 - [x] **IME candidate window appears at the field (macOS)** — PASS, `set_ime_cursor_area` confirmed working
-- [!] **Narrator announces the field (Windows, UIA — a different API; macOS success does not carry over)** — not run, no Windows machine tested yet
-- [!] **Orca announces the field (Linux, AT-SPI)** — build clean on Linux 1.97.1, `accesskit`'s AT-SPI backend (`accesskit_atspi_common`/`accesskit_unix`) compiles in, `--dump-tree` shows correct role/label/value/composition-state with no window needed — see [FINDINGS.md](spike/a11y-ime/FINDINGS.md#linux--build-and-tree-construction-confirmed-orca-leg-still-blocked). Still blocked: the decisive human-plus-Orca test needs a live logged-in desktop session, which this machine did not have (GDM greeter only, no user session) — not yet run
+- [!] **Narrator announces the field (Windows, UIA — a different API; macOS success does not carry over)** — not run, no Windows machine tested yet. **Verification deferred by decision, 2026-07-28**: Cahya chose not to block Phase 1 start on hardware access — see the risk-acceptance note below. Still genuinely unverified, not assumed equivalent to a pass; re-open if Phase 1's own accessibility audit (which re-tests every platform anyway, see the Phase 1 exit criterion) surfaces a problem.
+- [!] **Orca announces the field (Linux, AT-SPI)** — build clean on Linux 1.97.1, `accesskit`'s AT-SPI backend (`accesskit_atspi_common`/`accesskit_unix`) compiles in, `--dump-tree` shows correct role/label/value/composition-state with no window needed — see [FINDINGS.md](spike/a11y-ime/FINDINGS.md#linux--build-and-tree-construction-confirmed-orca-leg-still-blocked). Still blocked: the decisive human-plus-Orca test needs a live logged-in desktop session, which this machine did not have (GDM greeter only, no user session) — not yet run. **Same 2026-07-28 deferral as Windows above.**
+
+**Risk accepted 2026-07-28: Phase 1 start is no longer gated on the human
+Linux/Windows verification above.** Cahya's call, not a spike output —
+the honest basis for it is that macOS passed cleanly on the same
+`accesskit`/`winit` abstraction (a cross-platform library over three
+different native APIs by design), the Linux build and tree construction
+already confirm the plumbing compiles and produces a correct tree, and
+Windows/Linux hardware access wasn't available across several passes
+already. This is **not** a verification and the two items above stay
+marked `[!]`, not `[x]` — no evidence exists for either platform's actual
+screen-reader behavior. It's a named, deliberate risk acceptance:
+low-likelihood given macOS's result and `accesskit`'s architecture, but
+real, and the fallback (ADR 0001's CXX-Qt escape hatch) exists precisely
+for the case this turns out wrong. Revisit opportunistically — first time
+either platform's hardware is actually available — rather than blocking
+on it.
 - [x→bug] **Live value-change announcements (macOS)** — FAILS; typing updates the tree correctly every keystroke (confirmed via debug logging) but VoiceOver never announces it. Traced into `accesskit_macos` source — looks like a real, narrow implementation bug, not a platform inability. Candidate root cause: `Role::Window` nested inside a real native window (same suspect as the navigation-depth finding below)
 - [~] **Screen-reader linear navigation (macOS)** — reaches the label, but only via VoiceOver's "interact" command, not plain arrow keys; confirmed present via the Rotor. Worth a quick experiment: try a plainer root role than `Role::Window`
 - [ ] Screen-reader-driven actions (set value, navigate by word/line)
@@ -358,7 +385,11 @@ rather than deliberately deferred.
 ## Phase 1 — Document, canvas, layers, rendering, shell
 
 **9 months.** Do not start feature work until 0.2 (CI), 0.3 (slice), 0.4
-(a11y verdict), and 0.5 (tokens) are complete.
+(a11y verdict), and 0.5 (tokens) are complete. **Unblocked 2026-07-28**:
+0.2/0.3/0.5 have real evidence; 0.4 is unblocked by an explicit risk
+acceptance (macOS verified, Windows/Linux human verification deferred, not
+faked as done — see 0.4) rather than by waiting further on hardware
+access. Phase 1 feature work starts now.
 
 **Exit criterion:** create, edit, save, reopen, and export a multi-layer document
 with blend modes and unlimited undo at 60 FPS — *and* pass an accessibility audit
@@ -367,8 +398,23 @@ every widget in every state across all built-in themes with contrast checks gree
 
 ### M1.1 — Core and tile store (`aurora-core`, `aurora-tile`)
 
-- [ ] Geometry, colour types, pixel formats, IDs, error types
-- [ ] Coordinate types sized for 300,000 px with defined overflow behaviour
+- [x] **Geometry, colour types, pixel formats, IDs, error types** — done
+  2026-07-28, `crates/aurora-core/src/{geometry,color,id,error}.rs`, 16
+  tests, `cargo fmt`/clippy (`-D warnings`, workspace + all targets/
+  features)/layering all clean. `Size`/`Rect` (geometry), `ColorSpace`/
+  `Channels`/`SampleFormat`/`PixelFormat` (descriptors only, no pixel
+  storage — that stays in `aurora-tile`), `Id<T>`/`IdGenerator<T>`
+  (phantom-typed, hand-implemented traits, not derived — derive would
+  wrongly require `T: Trait`), `CoreError`. First real product code in the
+  project; `crate_name()` placeholder removed.
+- [x] **Coordinate types sized for 300,000 px with defined overflow
+  behaviour** — `Size`/`Rect` use `u32` for extents (300,000 fits with
+  ~14,000× headroom past `u32::MAX`; `u16` was explicitly rejected in ADR
+  0002) and `u64` for derived area/byte-count arithmetic, which does
+  overflow `u32` at the ceiling (300,000² ≈ 9×10^10). `Rect.x`/`.y` are
+  signed (`i64`) since a layer's bounds can go negative or past the
+  ceiling mid-transform, unlike a document's own `Size`, which is always
+  validated in-range via `Size::new`.
 - [ ] Sparse tile store, LRU residency, scratch-disk paging
 - [ ] **Per-tile dirty rectangles** — the largest single win from the slice
 - [ ] Tile compression (`zstd`/`lz4`) — the memory budget already assumes it
@@ -554,17 +600,26 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-Down to one live item — everything else queued alongside it this round
-got resolved rather than replaced (see the struck-through list below).
+**Phase 1 has started, 2026-07-28** — `aurora-core`'s foundational types
+are done (M1.1). Next up: `aurora-tile`'s actual tile store (sparse
+store, LRU residency, scratch-disk paging, per-tile dirty rectangles,
+compression, background writer, benches) — the rest of M1.1, and the
+largest single win the vertical slice identified (`spike/FINDINGS.md`).
 
-1. **Run the human/Orca leg of the a11y/IME checklist on Linux, and the whole
-   checklist on Windows** — macOS is done (9/10,
-   [full results](spike/a11y-ime/FINDINGS.md)). Linux build and standalone
-   tree construction are now confirmed (2026-07-26), but the decisive test —
-   a human at a live desktop session with Orca actually speaking — still
-   needs a machine with an active graphical login, which was not available
-   this pass. Windows (UIA) is fully unstarted. Both are different platform
-   APIs entirely and remain the only thing that can still overturn ADR 0001.
+**Not forgotten, just no longer gating**: the human a11y/IME check below
+is still a real, open task — pick it up whenever Linux/Windows hardware
+with a live desktop session is actually available. It moved out of "next
+action" because Cahya explicitly decided not to block Phase 1 start on it
+(PLAN.md 0.4), not because it got resolved.
+
+- **Run the human/Orca leg of the a11y/IME checklist on Linux, and the whole
+  checklist on Windows** — macOS is done (9/10,
+  [full results](spike/a11y-ime/FINDINGS.md)). Linux build and standalone
+  tree construction are now confirmed (2026-07-26), but the decisive test —
+  a human at a live desktop session with Orca actually speaking — still
+  needs a machine with an active graphical login, which was not available
+  this pass. Windows (UIA) is fully unstarted. Both are different platform
+  APIs entirely and remain the only thing that can still overturn ADR 0001.
 
 ~~Get outside critique on the 0.5 design scaffold~~ — **done 2026-07-28**: a
 colleague reviewed it and signed off as fine for a start, revisable later

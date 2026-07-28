@@ -45,3 +45,14 @@ The toolkit lives in `aurora-widgets`, which knows nothing about documents or la
 - The Phase 1 accessibility or IME audit fails and the gap looks structural rather than incomplete
 
 The contained fallback is to keep the custom canvas and host it inside Qt 6 via CXX-Qt for chrome only. This is why `aurora-ui`'s widget API stays free of `wgpu`-specific assumptions — the renderer must be swappable without rewriting panel logic.
+
+## Status update, 2026-07-28
+
+macOS is human-verified (screen reader + CJK IME both pass; PLAN.md 0.4,
+`spike/a11y-ime/FINDINGS.md`) and nothing found rises to the reconsider
+triggers above. Windows (UIA) and Linux (AT-SPI) remain genuinely
+unverified by a human — Cahya decided to accept this as a named risk
+rather than block Phase 1 on further hardware access, on the basis that
+macOS passed cleanly on the same cross-platform `accesskit`/`winit`
+abstraction. This does not resolve the reconsider triggers; it defers
+verifying them, opportunistically, rather than pretending they passed.
