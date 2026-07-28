@@ -163,9 +163,17 @@ Needs
 0.9): "Artboards" has no owning FR in §5 — FR-002 (Canvas) covers guides/
 grid/snap/rulers/multiple tabs and windows but not multiple named boards
 in one document, and FR-008 (Vector Graphics) doesn't mention them either.
-Either this is an implicit sub-feature of FR-002 nobody wrote down, or a
-genuine missing requirement. Undecided — needs Cahya's call, not an
-assistant's guess.
+
+**Format-level question resolved 2026-07-28** while assembling the PSD
+test corpus (`spike/psd-write/FINDINGS.md` finding 17, PLAN 0.7): a real
+Photoshop artboard (`psd-tools`' own `artboard.psd` fixture) is a plain
+layer group plus one tagged block (`artb`) holding a `Descriptor` — the
+same container type FR-001's PSD round-trip already needs elsewhere. So
+this is FR-003 (Layer System) + FR-001 (PSD compatibility) scope, not a
+new document primitive requiring a new FR. **Still undecided**: whether
+Aurora exposes artboards as a first-class *product* feature (a boards
+panel, per-board export, device presets) or leaves them as plain groups —
+that's Cahya's call, now a cheaper one than it looked.
 
 ---
 

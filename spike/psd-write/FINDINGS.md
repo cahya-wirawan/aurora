@@ -589,6 +589,50 @@ everywhere else in this spike (synthetic input, not something Photoshop
 itself produced) — recorded as exactly that, not oversold as equivalent to
 finding 14/15's real-file verification.
 
+### 17. Artboards are a layer group plus one tagged-block `Descriptor` — not a new document primitive, and this spike's existing code already reads its shape
+
+Surfaced while assembling the PSD test corpus (PLAN 0.7,
+`corpora/psd/reference/`), not while working the text-layer line — but it
+answers a real open question from PRD §4/§13 Step 2
+([docs/workflows.md](../../docs/workflows.md) UID-1): does "Artboards" (a
+named UI Designer need with no owning FR) require new document-model
+scope, or does the format already have a home for it?
+
+**Format-level answer, confirmed against a real fixture**
+(`psd-tools-fixtures/artboard.psd`, opened with `psd-tools`, not assumed
+from documentation): an artboard is an ordinary layer **group**
+(`SECTION_DIVIDER_SETTING` / `lsct`, the exact same mechanism finding 5
+already documents for groups generally) that additionally carries an
+`ARTBOARD_DATA1` tagged block (`artb`). That block's payload is a plain
+`Descriptor` — the same OSType-tagged key/value container this spike's
+`descriptor.rs` already reads and writes for `TySh` and gradient fills —
+containing:
+
+```
+{artboardRect: {Top, Left, Btom, Rght}, guideIndeces: [...], artboardPresetName: <string>}
+```
+
+i.e. the board's bounds within the document canvas, which document guides
+belong to it, and an optional device-preset name (e.g. a phone model),
+empty in this fixture.
+
+**Consequence for scope, not just format trivia**: this is not a new
+canvas/document primitive requiring new FR territory. It's FR-003 (Layer
+System, already Must) plus one more `Descriptor`-shaped tagged block for
+FR-001's round-trip (PSD compatibility, already Must) — infrastructure
+this spike already has, not infrastructure Phase 3 has to invent. What
+*is* still a real, undecided product question (not a format one): whether
+Aurora exposes artboards as a first-class UI concept (a boards panel,
+per-board export, device presets) or leaves them as plain groups on
+import/export. That's Cahya's call — see the PRD.md note under the UI
+Designer persona — but it's now a UI-scope decision with a known-cheap
+format answer, not an open format risk.
+
+**Scope note**: confirmed by reading one real fixture with `psd-tools`,
+not implemented here — no code in this spike reads or writes `artb`. 8 of
+the 319 corpus fixtures carry this tagged block (`corpora/psd/reference/inventory.md`), which is enough real coverage to build against whenever
+Phase 3 gets there.
+
 ## Scope: what this did *not* touch
 
 Groups, the `TySh` container, `EngineData`'s text format, `RunLengthArray`
@@ -670,7 +714,13 @@ real-fixture-backed gap, still correctly out of scope for this spike.
 2. **Write the flatten through the real render graph**, so preview and canvas
    cannot diverge (finding 2).
 3. **Build the 1,000-file corpus before the writer**, per PLAN 0.7, and diff
-   every round-trip in CI from the first layer type.
+   every round-trip in CI from the first layer type. **First set assembled
+   2026-07-28**: 319 real, structurally-diverse PSD/PSB fixtures
+   (`corpora/psd/reference/`, MIT-licensed, opened 272/272 with an
+   independent reader). Still short of 1,000, and still authored test
+   fixtures rather than real-world client files — see that corpus's
+   README for the honest gap between "useful now" and "satisfies the
+   Phase 3 exit criterion."
 4. **For text layers, patch real files rather than generate `EngineData`
    from scratch** (finding 7) — collect a small corpus of real Photoshop text
    layers spanning common cases and build the writer against them, the same

@@ -221,8 +221,15 @@ Tier-1 workflow, *that* would have been a finding worth raising.
 ## Gaps this exercise surfaced
 
 - **Artboards (UID-1)** — a named persona need in §4 with no explicit
-  owning feature in §5. Needs a decision: extend FR-002, extend FR-008, or
-  a new FR. Not resolved here — flagged in PRD.md for Cahya to decide.
+  owning feature in §5. **Format-level question resolved 2026-07-28**
+  (`spike/psd-write/FINDINGS.md` finding 17, found while assembling the
+  PSD test corpus): an artboard is a plain layer group plus one
+  `Descriptor`-shaped tagged block (`artb`) this spike's code already
+  knows how to read/write the shape of — FR-003 + FR-001 territory, not a
+  new document primitive. What's still undecided is the *product* question
+  — does Aurora expose artboards as a first-class UI concept, or leave
+  them as plain groups — which is a real decision for Cahya, just a
+  cheaper one than it looked before this was checked.
 
 ---
 

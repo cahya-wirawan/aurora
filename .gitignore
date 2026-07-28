@@ -21,8 +21,11 @@ criterion/
 **/tests/**/*.diff.png
 /target/nextest/
 
-# Large binary corpora — fetched by script, never committed (PRD §13 Step 6)
-/corpora/
+# Large binary corpora — fetched by script, never committed (PRD §13 Step 6).
+# Ignore the fetched fixture trees specifically, not the whole /corpora/ dir,
+# so the small fetch scripts/manifests/generated inventories stay tracked —
+# same split as /spike/raw-icc/reference/raw-samples/ below.
+/corpora/psd/reference/psd-tools-fixtures/
 /assets/samples/
 
 # Local development

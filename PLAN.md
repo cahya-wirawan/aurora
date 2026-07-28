@@ -40,6 +40,7 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | RAW / ICC feasibility | **Libraries decided (ADR 0007/0008); LGPL packaging mechanism proven on Linux with the actual chosen library** — macOS/Windows and legal review remain |
 | Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. |
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. First-draft, not user-validated; see 0.9 |
+| PSD test corpus (Step 6) | **First real set** — 319 fixtures, 272/272 open with an independent reader; not the 1,000-file gate. See 0.7 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -168,14 +169,25 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md),
 - [x] **Decide RAW and ICC libraries, record as ADRs** — [ADR 0007](docs/adr/0007-raw-library-libraw.md) (LibRaw via FFI) and [ADR 0008](docs/adr/0008-icc-library-lcms2.md) (lcms2 via FFI), both Cahya's decision, both informed by the evidence above rather than a spike recommendation alone.
 - [x→bigger] **LGPL packaging architecture — proven mechanically on Linux with both `rawler` and, later, LibRaw itself.** [spike/lgpl-packaging/](spike/lgpl-packaging/FINDINGS.md): a `cdylib` (`raw-shim`, the only crate touching `rawler`) behind a hand-written `extern "C"` ABI, loaded at run time via `dlopen` (`libloading`, through a separate `host` binary with **zero** `rawler`/LGPL dependency — confirmed with `ldd`/`nm`, not assumed). Both conditions of LGPL-2.1 §6(b) (quoted directly from the license text, not a summary) verified concretely: (1) genuinely dynamic, no build-time link, checked with `file`/`ldd`/`nm`; (2) a modified `raw-shim` (`.so` rebuilt with one line changed) worked correctly with the **same, unmodified, un-recompiled** `host` binary. All three real RAW files from the raw-icc spike decoded identically through this mechanism as decoding them directly. **Re-verified with LibRaw itself (finding 4)** after ADR 0007 named the gap: a second shim, `libraw-shim` (via `libraw_rs_vendor`, vendoring LibRaw's own source — no system `libraw-dev` needed), exports the identical ABI, and the **same, unchanged `host` binary** loads either one — both LGPL-2.1 conditions re-verified independently, and decode results cross-checked between the two independently-coded libraries (exact match on Canon, within single digits on Nikon/Sony — recorded honestly, not rounded up). **Scope, deliberate: Linux-only, no ABI-versioning story, no macOS/Windows, and this is engineering verification, not legal sign-off** — one specific ambiguity flagged honestly rather than glossed over (§6(b)(1)'s "already present on the user's system" language reads more naturally as a pre-existing system package than an app-bundled file; industry practice treats bundling as sufficient, but that's a judgment call, not a legal conclusion). Also still open: `libraw-shim` vendors+statically-compiles LibRaw rather than dynamically linking a separately packaged `libraw.so` — both satisfy LGPL, which is preferable is a build-engineering question, not decided here.
 
-### 0.7 Test corpora — PSD not started; RAW/ICC have a first, minimal set
+### 0.7 Test corpora — PSD has a first, real set; RAW/ICC have a first, minimal set
 
 Assemble *before* the parsers exist, so the parser is written against reality.
 
-- [ ] 1,000 real-world PSDs (Phase 3 gate)
+- [~] **1,000 real-world PSDs (Phase 3 gate)** — first set assembled
+  2026-07-28: 319 real PSD/PSB fixtures from `psd-tools`' own MIT-licensed
+  test suite, pinned to a commit (`corpora/psd/reference/`), 272/272
+  opened successfully with an independent reader (`inventory.md`), real
+  coverage across every PSD color mode, most adjustment-layer types, smart
+  objects, groups, and artboards. **Not the Phase 3 gate itself** — 319,
+  not 1,000, and authored test fixtures, not real-world client files; the
+  README states this gap explicitly rather than letting the file count
+  imply more than it proves. One concrete finding fell out of assembling
+  it: artboards are a layer group + one `Descriptor`-shaped tagged block,
+  not a new document primitive (`spike/psd-write/FINDINGS.md` finding 17,
+  closing part of the Artboards gap `docs/workflows.md` surfaced).
 - [~] **RAW samples per camera vendor** — one real file each for Canon, Nikon, Sony (`spike/raw-icc/reference/`), enough to answer "does this decode major vendors at all," far short of the eventual multi-body/multi-vendor breadth this item is really asking for
 - [~] **ICC profile set** — two real, CC0-licensed profiles (`sRGB.icc`, `ECI-RGBv2.icc`), same "first, not final" caveat
-- [x] **Fetch scripts (corpora are gitignored — too large to commit)** — `spike/raw-icc/reference/fetch-samples.sh`, same pattern to reuse for the eventual 1,000-PSD corpus
+- [x] **Fetch scripts (corpora are gitignored — too large to commit)** — `spike/raw-icc/reference/fetch-samples.sh`, and now `corpora/psd/reference/fetch-samples.sh` reusing the same pattern (manifest + pinned commit + re-fetch script)
 
 ### 0.8 Re-plan — durations re-grounded 2026-07-28; Q2/Q3 answered, and Q2's answer reframes this whole section
 
@@ -535,19 +547,27 @@ here so they are not silently lost between phases.
 2. **Get Cahya's read on [docs/workflows.md](docs/workflows.md)** — the 95%
    list is a first draft grounded in general Photoshop usage patterns, not
    real user input (there are no users yet), and it says so explicitly.
-   Two things specifically need a decision, not just a read-through: the
-   Artboards gap it surfaced (§4 names it as a UI Designer need; no FR in
-   §5 owns it), and whether the Tier-1/2/3 calls match Cahya's own
-   professional judgment before this list starts being used as the
-   scope-cut arbiter for real.
+   Needs a decision, not just a read-through, on two things: whether the
+   Tier-1/2/3 calls match Cahya's own professional judgment before this
+   list starts being used as the scope-cut arbiter for real, and the
+   Artboards question — the *format* half is now answered (layer group +
+   one tagged block, `spike/psd-write/FINDINGS.md` finding 17), but
+   whether Aurora exposes artboards as a first-class UI feature is still
+   an open product call.
+3. **Grow the PSD corpus toward real-world files, or move on** — 0.7 now
+   has 319 real (if synthetic-by-design) fixtures; the harder remaining
+   piece is genuine real-world PSDs, which raises consent/licensing
+   questions the RAW corpus never had (client artwork, not camera
+   samples). Worth a deliberate decision on where those 1,000 files
+   actually come from before defaulting to "gather more later."
 
 ~~Get outside critique on the 0.5 design scaffold~~ — **done 2026-07-28**: a
 colleague reviewed it and signed off as fine for a start, revisable later
 if needed. See 0.5 above.
 
-~~Define the 95%~~ — **done 2026-07-28**, see item 2 above and 0.9. This
-frees a slot in the list (candidates in "Newly surfaced" below, e.g. the
-PSD test corpus in 0.7 or the macOS/Windows LGPL packaging work).
+~~Define the 95%~~ — **done 2026-07-28**, see item 2 above and 0.9.
+
+~~PSD test corpus~~ — **first set done 2026-07-28**, see item 3 above and 0.7.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
