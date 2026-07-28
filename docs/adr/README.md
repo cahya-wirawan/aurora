@@ -17,6 +17,8 @@ Each ADR records one decision that is expensive to reverse: what was decided, wh
 | [0002](0002-document-size-ceiling.md) | Document size ceiling of 300,000 px | Accepted |
 | [0003](0003-float-precision-floor.md) | Float precision floor (≥16-bit, no 8-bit path) | Accepted |
 | [0004](0004-psd-full-write.md) | Full layered PSD/PSB write | Accepted |
+| [0007](0007-raw-library-libraw.md) | RAW decode library: LibRaw via FFI | Accepted |
+| [0008](0008-icc-library-lcms2.md) | ICC transform library: lcms2 via FFI | Accepted |
 
 ## Writing a new one
 
