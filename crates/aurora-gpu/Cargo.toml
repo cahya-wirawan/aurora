@@ -17,3 +17,5 @@ aurora-core = { workspace = true }
 aurora-tile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }

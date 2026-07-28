@@ -30,12 +30,14 @@ than the tidiness.
 (PRD §13 Steps 1/3/4) is now satisfied and Phase 1 has started, 2026-07-28.**
 **M1.1 is complete** — `aurora-core`'s foundational types and
 `aurora-tile`'s sparse/LRU/compressed/paging store, with ADR 0005 (tile
-size) settled alongside it. `aurora-gpu` (M1.2) is next. CI green on
-Linux, macOS, and Windows. The remaining Phase 0 items (ADR 0006,
-Windows/300k-px slice re-runs, macOS/Windows LGPL packaging, deeper PSD
-format coverage) continue in the background rather than gating Phase 1 —
-none of them are among the three steps PRD §13 actually names as
-blocking.
+size) settled alongside it. **M1.2 (`aurora-gpu`) has started**:
+device/queue management is done, verified against a real GPU on this
+machine; surface configuration, resize, the shader library, GPU tile
+residency, and upload scheduling are next. CI green on Linux, macOS, and
+Windows. The remaining Phase 0 items (ADR 0006, Windows/300k-px slice
+re-runs, macOS/Windows LGPL packaging, deeper PSD format coverage)
+continue in the background rather than gating Phase 1 — none of them are
+among the three steps PRD §13 actually names as blocking.
 
 | Area | State |
 |---|---|
@@ -49,7 +51,8 @@ blocking.
 | Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. |
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
-| **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. `aurora-gpu` (M1.2) is next. See M1.1 |
+| **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
+| **Phase 1 — M1.2** | **Started 2026-07-28.** `GpuContext` device/queue management done, verified against this machine's real RTX 3090 (Vulkan). Surface config, resize, shader library, tile residency, upload scheduling still open. See M1.2 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -466,7 +469,19 @@ every widget in every state across all built-in themes with contrast checks gree
 
 ### M1.2 — GPU layer (`aurora-gpu`)
 
-- [ ] Device/queue management, surface configuration, resize
+- [~] **Device/queue management** — done 2026-07-28,
+  `crates/aurora-gpu/src/{context,error}.rs`, `GpuContext` (`wgpu` 30,
+  matching `spike/vertical-slice`'s pin). Headless only (`compatible_surface:
+  None`), mirroring the spike's own `--headless` path exactly — same
+  `RequestAdapterOptions`/`DeviceDescriptor` fields, `HighPerformance`
+  power preference, no speculative features/limits. Verified with a real
+  device on this machine's actual GPU, not a mock: `adapter_info()`
+  confirms **NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu** — the same
+  hardware `spike/FINDINGS.md`'s Linux/Vulkan numbers came from. **Surface
+  configuration and resize are still `[ ]`** — deliberately not this
+  pass's scope; the spike has zero resize handling to draw on (confirmed
+  by reading every `WindowEvent` match arm), so that's real, separate
+  design work, not a follow-on detail.
 - [ ] Shader library and WGSL pipeline cache
 - [ ] GPU tile residency with toroidal slot addressing *(from the slice — awkward to retrofit)*
 - [ ] Upload scheduling with a per-frame budget

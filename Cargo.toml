@@ -50,6 +50,8 @@ lru = "0.12"
 lz4_flex = "0.11"
 tempfile = "3"
 criterion = "0.5"
+wgpu = "30"
+pollster = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
