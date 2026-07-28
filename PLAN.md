@@ -31,14 +31,14 @@ and none should yet. CI green on Linux, macOS, and Windows.
 
 | Area | State |
 |---|---|
-| Requirements & architecture | Settled and written down (PRD v1.7, 6 ADRs — 0005/0006 still pending) |
+| Requirements & architecture | Settled and written down (PRD v1.8, 6 ADRs — 0005/0006 still pending) |
 | Workspace & CI | Built and green |
 | Performance validation | **Measured** — budgets hold, with one correction; re-run on Linux/Vulkan 2026-07-26, same correction reproduces |
 | Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
 | Design language | **Owner-approved draft** — [design/](design/README.md); outside critique still needed before it hardens |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | **Libraries decided (ADR 0007/0008); LGPL packaging mechanism proven on Linux with the actual chosen library** — macOS/Windows and legal review remain |
-| Re-plan (PRD §13 Step 7) | **Durations re-grounded, but Q2's answer (solo) reframes the whole exercise** — Phase 0/3 evidence stands, but §9's ~52+ team-months isn't a solo estimate at any multiplier; scope-vs-timeline is now an open strategic question for Cahya, not a spike output. PRD §13 Step 2 ("define the 95%") surfaced as a previously-untracked gap, now tracked as 0.9 |
+| Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. PRD §13 Step 2 ("define the 95%") surfaced as a previously-untracked gap along the way, now tracked as 0.9 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -60,7 +60,7 @@ CJK composing into a custom text field.
 
 ### 0.1 Decisions and documentation
 
-- [x] PRD written and revised to v1.7 — [PRD.md](PRD.md)
+- [x] PRD written and revised to v1.8 — [PRD.md](PRD.md)
 - [x] ADR 0001 — custom UI toolkit on `wgpu` — [adr/0001](docs/adr/0001-custom-wgpu-ui.md)
 - [x] ADR 0002 — 300,000 px document ceiling (PSB parity) — [adr/0002](docs/adr/0002-document-size-ceiling.md)
 - [x] ADR 0003 — ≥16-bit float precision floor — [adr/0003](docs/adr/0003-float-precision-floor.md)
@@ -206,14 +206,15 @@ false precision this section already warns about for Phases 1/2/4/5.
 
 **What the phase-by-phase analysis below is still good for:** which areas
 turned out more (or less) complex than assumed, and why — that evidence
-doesn't change based on team size. **What it is not good for, honestly:**
-a completion estimate for this project as currently scoped. That's a real,
-open strategic question — narrow the ~52-month, 26-FR scope explicitly for
-solo delivery (§3 Non-Goals, §5 MoSCoW), or treat the phase gates as
-open-ended rather than calendar-committed (genuinely viable, given Q3: no
-revenue pressure is forcing a date) — and it's surfaced here rather than
-answered, because it's Cahya's call, not a spike's or an assistant's. See
-PRD §12 Q2's resolution note for the fuller version of this.
+doesn't change based on team size. **What it was not good for: a
+completion estimate for this project as currently scoped — resolved
+2026-07-28, not left open.** Cahya's answer: both narrow the scope *and*
+drop the calendar commitment. Phases 4 and 5 (~22 months of team-scoped
+work, mapping almost entirely to FRs §3 already marked Could/Won't-yet)
+are cut from the plan entirely — see PRD.md §9's "Beyond v1.0" section and
+PLAN.md's Phase 2–3 outline below. Phases 0–3 keep their exit criteria but
+lose the calendar commitment: milestone-based, not dated. See PRD §12 Q2's
+resolution note for the fuller version of this.
 
 **What actually grounds this re-plan:** five spikes exist now (vertical
 slice, a11y/IME, PSD write, RAW/ICC, LGPL packaging), not zero. But three
@@ -288,21 +289,24 @@ engineering work Phase 3's original estimate never itemized as its own
 line, because the licensing finding that required it didn't exist when the
 10-month figure was set.
 
-**Phase 4 (10 months) and Phase 5 (12 months) — unchanged.** Zero spike
-evidence; nothing to re-ground against yet.
+**Phase 4 (was 10 months) and Phase 5 (was 12 months) — cut from the
+committed plan 2026-07-28, not re-grounded.** Zero spike evidence existed
+for either at the time of this analysis, and none was ever going to be
+worth gathering: both mapped almost entirely to FRs §3 already marked
+Could/Won't-yet. Rather than carry ~22 team-months of speculative estimate
+for already-deprioritized work, they moved to §9's uncommitted "Beyond
+v1.0" section — see the outline below. The relative-complexity read above
+(text layers surprising Phase 3, Phase 2 untested, etc.) stands as historical
+evidence regardless of that cut.
 
-**Total ~52 months — do not read a revised total off this section.**
-Computing a new precise sum would be false precision: two phases
-(0, 3) have real upward-pressure evidence, three (1, 2, 4, 5) have none at
-all, and "no evidence" does not mean "the estimate is right," only that it
-hasn't been tested. The honest statement is: **the total is probably higher
-than 52 months**, driven by Phase 0 and Phase 3 specifically, with Phases
-1, 2, 4, and 5 genuinely unknown until they get their own spikes or first
-sprints. Revisit this number again after Phase 1 produces real velocity
-data and after at least one more Phase 3 sub-area (smart objects or layer
-styles, the next-most-likely places for another text-layer-sized surprise)
-gets spiked — one data point (text layers) is a strong yellow flag, not
-yet a pattern confirmed twice.
+**Total ~52 months — retired, not revised.** This section's phase-by-phase
+notes remain useful as relative signal (which areas are riskier than
+assumed), but a summed total stopped being the right output the moment Q2
+(solo) and Q3 (no funding pressure) were answered: Phases 0–3 are now
+milestone-based rather than calendar-committed (PRD.md §9), and Phases 4/5
+are cut entirely. There is no revised number to compute, honest or
+otherwise — see PRD §12 Q2's resolution note and the "Beyond v1.0" outline
+below for where this landed.
 
 ### 0.9 Define the 95% — not started (PRD §13 Step 2)
 
@@ -426,25 +430,41 @@ every widget in every state across all built-in themes with contrast checks gree
 
 ---
 
-## Phases 2–5 — outline
+## Phase 2–3 — outline
 
 Detailed when the preceding phase closes; planning further ahead than the
 evidence supports is how the original 6-month Phase 1 estimate happened.
 
-- **Phase 2 (8 mo)** — selections, brush engine, masks, filters, adjustments.
-  *Gate: an illustrator completes a real piece without leaving Aurora.* Unchanged, zero spike evidence — see 0.8.
-- **Phase 3 (10 mo)** — smart objects, Camera RAW, colour management, PSD/PSB
-  read+write. *Gate: 1,000 PSDs round-trip through Photoshop with no layer loss.*
-  Likely needs another upward revision — treat 10 as a floor, not a ceiling; see 0.8.
-- **Phase 4 (10 mo)** — AI, plugin SDK (WASM), automation, cloud sync.
-  *Gate: a third-party ships a sandboxed plugin from public docs alone.* Unchanged, zero spike evidence — see 0.8.
-- **Phase 5 (12 mo)** — collaboration, animation, mobile, web. Unchanged, zero spike evidence — see 0.8.
+- **Phase 2** — selections, brush engine, masks, filters, adjustments.
+  *Gate: an illustrator completes a real piece without leaving Aurora.*
+  Unchanged, zero spike evidence — see 0.8.
+- **Phase 3** — smart objects, Camera RAW, colour management, PSD/PSB
+  read+write. *Gate: 1,000 PSDs round-trip through Photoshop with no layer
+  loss.* Likely needs another upward revision in relative terms — treat as
+  the biggest remaining phase, not a 10-month one; see 0.8.
 
-Total ~52 months, **estimated before any code existed**. Re-grounded 2026-07-28
-(0.8) against the five spikes that exist: probably higher than 52, driven
-by Phase 0 and Phase 3 specifically. Not re-computed to a new precise
-figure — that would be false precision given Phases 1, 2, 4, and 5 have no
-spike evidence at all yet. See 0.8 for the full phase-by-phase reasoning.
+**Phase 0–3 durations are milestone-based, not calendar-committed, as of
+2026-07-28** (PRD.md §9, following the solo-development answer to PRD §12
+Q2). The month figures above are gone deliberately, not lost — each
+phase's exit criterion is still the real gate.
+
+## Beyond v1.0 — not currently planned
+
+**Cut from the committed plan 2026-07-28**, not merely deprioritized:
+AI features, the plugin SDK/marketplace, automation, cloud sync,
+real-time collaboration, animation, and mobile/web ports. What were
+"Phase 4" and "Phase 5" (~22 months of team-scoped work) mapped almost
+entirely to FRs PRD §3 already marked **Could** or **Won't (yet)** — the
+phase numbers were carrying a commitment the priority table never actually
+made. FR-019 (Plugin SDK) was the one inconsistency (marked "Should" while
+living entirely inside a now-cut phase) — moved to Won't (yet) alongside
+the rest. None of this is deleted; see PRD.md's "Beyond v1.0" section
+(§9) for the full list, kept as an explicitly uncommitted backlog to
+revisit only if there's a real reason to (traction, contributors, or a
+revenue model — PRD §12 Q3 — that would justify the investment).
+
+Total duration figure retired along with the calendar commitment above —
+see PRD.md §9 and PLAN.md 0.8 for the full reasoning trail.
 
 ---
 
@@ -544,8 +564,7 @@ quirk and the live-announcement bug in one change.
 - Font resolution (`ResourceDict.FontSet`) and `FillColor` alpha compositing
   remain the two small, non-urgent named gaps in the PSD text-layer line of
   work (findings 14/15) — pick up whenever, not blocking anything.
-- **The solo-vs-scope tension PRD §12 Q2's answer surfaced** (PRD §12 Q2
-  resolution note, PLAN.md 0.8) — not an engineering task, a strategic one:
-  either narrow the ~52-month, 26-FR scope explicitly for solo delivery, or
-  treat the phase gates as open-ended rather than calendar-committed.
-  Genuinely open; whenever Cahya wants to work through it.
+- ~~The solo-vs-scope tension PRD §12 Q2's answer surfaced~~ — **resolved
+  2026-07-28** (PRD §12 Q2 resolution note, PLAN.md 0.8): both narrow the
+  scope and drop the calendar. Phases 4/5 moved to §9's uncommitted "Beyond
+  v1.0" backlog; Phases 0–3 are milestone-based, not calendar-committed.

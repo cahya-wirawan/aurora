@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD)
 
 **Project:** Aurora  
-**Version:** 1.7  
+**Version:** 1.8  
 **Document Owner:** Product Team  
 **Status:** Draft — pre-implementation  
 **Target Release:** TBD  
@@ -83,7 +83,12 @@ Explicitly out of scope for the first shipping release. Listing these prevents s
 - 3D modelling, texturing, or procedural materials
 - Node-based compositing UI (the render graph is internal; no user-facing node editor)
 - Full Photoshop plugin binary compatibility (.8bf) — Aurora ships its own SDK
-- Real-time multiplayer editing (Phase 5; v1.0 ships cloud documents + comments only)
+- Any collaboration, cloud documents, or comments (FR-022) — **updated
+  2026-07-28**: previously read "v1.0 ships cloud documents + comments
+  only," a partial commitment that no longer holds now that this content
+  has moved to §9's "Beyond v1.0" (uncommitted) section entirely
+- A plugin marketplace or SDK (FR-019) — **added 2026-07-28**, moved from
+  "Should" to "Won't (yet)" alongside the rest of §9's now-deferred content
 - DAM / asset management beyond the local asset libraries in FR-023
 
 ## Requirement Priorities
@@ -98,9 +103,16 @@ Every FR in §5 carries a priority. Where unmarked, assume **Should**.
 | **Won't (yet)** | Deferred past v1.0 by decision, not by oversight |
 
 Must: FR-001, FR-002, FR-003, FR-004, FR-005, FR-007, FR-010, FR-012, FR-021, FR-024, FR-025, FR-026, FR-027.
-Should: FR-006, FR-008, FR-009, FR-011, FR-013, FR-014, FR-016, FR-019, FR-023.
+Should: FR-006, FR-008, FR-009, FR-011, FR-013, FR-014, FR-016, FR-023.
 Could: FR-015, FR-017, FR-018.
-Won't (yet): FR-020, FR-022.
+Won't (yet): FR-019, FR-020, FR-022.
+
+**FR-019 (Plugin SDK) moved from Should to Won't (yet), 2026-07-28** — it
+was "targeted for v1.0" while its entire build lived inside what was Phase
+4, a phase now moved wholesale to §9's "Beyond v1.0" section following the
+solo-development answer to PRD §12 Q2. Keeping it "Should" while deferring
+the phase that builds it was an inconsistency the re-plan surfaced rather
+than left standing.
 
 ---
 
@@ -1143,18 +1155,21 @@ Each phase has an **exit criterion** — a measurable gate, not a feature checkl
 
 **Exit criterion:** a throwaway prototype paints a stroke onto a 100,000 × 100,000 px **half-float** tiled document at 60 FPS with sub-10 ms input latency on Windows, macOS, and Linux, with custom-rendered docked panels in the same frame; a screen reader reads a panel's controls on each platform; CJK text is composed into a custom text field. Every §8 entry marked "risk" is resolved in a written decision record.
 
-Duration: 3 months
+~~Duration: 3 months~~ — **milestone-based, not calendar-committed, as of
+2026-07-28** (PRD §12 Q2: solo development; see below). The exit criterion
+above is still the gate; there is no date attached to it.
 
-**Re-grounded 2026-07-28 (PLAN.md 0.8, PRD §13 Step 7): likely 4–5 months.**
-Five spikes now exist (vertical slice, a11y/IME, PSD write, RAW/ICC, LGPL
-packaging), and each found more scope or more calendar-bound work than a
-"quick spike" implied — a11y/IME is genuinely calendar-bound (needs a human
-at a live desktop session per platform, not just engineering time); RAW/ICC
-required an entire additional spike (LGPL packaging) that didn't exist as
-a line item until a licensing finding made it necessary; PSD write found a
-mandatory requirement (glyph rendering) with zero prior line item anywhere.
-Two ADRs (tile size, a11y conformance target) and PRD §13 Step 2 ("define
-the 95%") remain untouched. Full reasoning in PLAN.md 0.8.
+**Re-grounded 2026-07-28 (PLAN.md 0.8, PRD §13 Step 7):** still useful as
+relative signal even without a calendar target. Five spikes now exist
+(vertical slice, a11y/IME, PSD write, RAW/ICC, LGPL packaging), and each
+found more scope or more calendar-bound work than a "quick spike" implied
+— a11y/IME is genuinely calendar-bound (needs a human at a live desktop
+session per platform, not just engineering time); RAW/ICC required an
+entire additional spike (LGPL packaging) that didn't exist as a line item
+until a licensing finding made it necessary; PSD write found a mandatory
+requirement (glyph rendering) with zero prior line item anywhere. Two ADRs
+(tile size, a11y conformance target) and PRD §13 Step 2 ("define the 95%")
+remain untouched. Full reasoning in PLAN.md 0.8.
 
 ---
 
@@ -1170,7 +1185,13 @@ the 95%") remain untouched. Full reasoning in PLAN.md 0.8.
 
 **Exit criterion:** create, edit, save, reopen, and export a multi-layer document with blend modes and unlimited undo, holding 60 FPS at the Phase 0 document size — *and* the shell passes an accessibility audit (screen reader navigation of all panels) and an IME audit (CJK entry into every text field) on all three platforms — *and* the component gallery renders every widget in every state across all built-in themes with the automated contrast check passing (FR-027).
 
-**Duration: 9 months** (raised from 6). Building the widget toolkit is roughly a third of this phase. The original 6-month estimate assumed an off-the-shelf toolkit; §8.3 makes that work first-party, and the schedule reflects it rather than absorbing it silently.
+~~**Duration: 9 months** (raised from 6).~~ **Milestone-based, not
+calendar-committed, as of 2026-07-28** (solo development, PRD §12 Q2).
+Building the widget toolkit is roughly a third of this phase — still true
+and still useful for sequencing, just no longer a date. The original
+6-month estimate assumed an off-the-shelf toolkit; §8.3 makes that work
+first-party, and the relative sizing reflects it rather than absorbing it
+silently.
 
 **Re-grounded 2026-07-28: unchanged.** No spike has started M1.1–M1.10 work
 yet, so there is no new measured evidence to revise this against — the
@@ -1189,7 +1210,8 @@ haven't tested it. Revisit once real Phase 1 work produces velocity data.
 
 **Exit criterion:** a professional illustrator completes a real piece end to end in Aurora without leaving for another tool.
 
-Duration: 8 months
+~~Duration: 8 months~~ — **milestone-based, not calendar-committed, as of
+2026-07-28** (solo development, PRD §12 Q2).
 
 **Re-grounded 2026-07-28: unchanged.** Zero spikes have touched selections,
 brushes, masks, filters, or adjustments — this remains the original,
@@ -1206,10 +1228,15 @@ purely speculative estimate, not a re-grounded one.
 
 **Exit criterion:** round-trip a corpus of 1,000 real-world PSDs — open in Aurora, edit, save, **reopen in Photoshop** — with no layer loss and composites matching within tolerance. Verification is automated and runs in CI, not sampled by hand.
 
-**Duration: 10 months** (raised from 8). Full PSD *write* (FR-001) is a substantially larger commitment than read, and this phase now owns both directions plus the round-trip harness.
+~~**Duration: 10 months** (raised from 8).~~ **Milestone-based, not
+calendar-committed, as of 2026-07-28** (solo development, PRD §12 Q2).
+Full PSD *write* (FR-001) is a substantially larger commitment than read,
+and this phase now owns both directions plus the round-trip harness — that
+relative sizing still holds even without a date attached.
 
 **Re-grounded 2026-07-28: likely needs another upward revision — read 10 as
-a floor, not a ceiling.** The one Phase 3 area actually spiked (PSD text
+a floor, not a ceiling** (in relative terms — see above, there's no longer
+a calendar to add months to). The one Phase 3 area actually spiked (PSD text
 layers) went from "assumed similar to groups" to the single biggest scope
 addition any Phase 0 spike has found (glyph rendering into pixel channels,
 `RunLengthArray` recomputation, `EngineData`'s real complexity even for
@@ -1224,33 +1251,29 @@ reasoning in PLAN.md 0.8.
 
 ---
 
-## Phase 4
+## Beyond v1.0 — not currently planned
 
-- AI Features
-- Plugin SDK
-- Automation
-- Cloud Sync
+**Added 2026-07-28**, replacing what were previously "Phase 4" and "Phase
+5" as committed, dated phases. Following the solo-development answer to
+PRD §12 Q2: this content mostly maps to FRs already marked **Could** or
+**Won't (yet)** in §3's priority table (AI Features, Automation are
+Could; Animation, Collaboration are Won't yet — see §3 for the one
+inconsistency this cleanup fixed, FR-019 Plugin SDK). Carrying ~22 months
+of team-scoped commitment for work the project's own priority table
+already treats as cuttable was the actual problem, not the phase numbers.
+The ideas aren't discarded — they're moved here, explicitly uncommitted,
+to be revisited only if there's a real reason to (traction, contributors,
+or a revenue model — PRD §12 Q3 — that would justify the investment).
 
-**Exit criterion:** a third-party developer ships a working sandboxed plugin using only public documentation.
+Nothing below has an exit criterion, a duration, or a phase number,
+because none of it is part of the current plan:
 
-Duration: 10 months
-
-**Re-grounded 2026-07-28: unchanged.** Zero spike evidence touches AI,
-plugins, automation, or cloud sync.
-
----
-
-## Phase 5
-
-- Collaboration
-- Animation
-- Mobile
-- Web
-
-Duration: 12 months
-
-**Re-grounded 2026-07-28: unchanged.** Zero spike evidence touches this
-phase either.
+- **AI Features** (FR-017, Could) — generative fill, AI-assisted editing, model hosting questions (R7)
+- **Plugin SDK** (FR-019) — WASM sandboxed plugins, marketplace. Priority note: this was "Should" (targeted for v1.0) while living entirely inside a now-deferred phase — an inconsistency the solo re-plan surfaced rather than left standing; **downgraded to Won't (yet)**, consistent with the rest of this section, until there's a reason to build a plugin ecosystem for an audience of one
+- **Automation** (FR-018, Could)
+- **Cloud Sync / Collaboration** (FR-022, already Won't (yet)) — cloud documents, comments, live collaboration, version history, shared assets
+- **Animation** (FR-020, already Won't (yet)) — timeline, frame animation, keyframes, GIF/MP4 export
+- **Mobile and Web** — platform ports, no corresponding FR number in §5; always the least-scoped item in the original plan and the least defensible to keep committed now
 
 ---
 
@@ -1308,7 +1331,7 @@ These block or reshape implementation and need owners and answers, most before P
 
     **Resolved 2026-07-28: solo — Cahya Wirawan alone.** This does not mean "the same plan, one person, it'll just take longer" — it means §9's entire duration model needs to be read differently, not merely scaled. R9 already named the risk ("senior Rust + GPU + imaging is a narrow talent pool") as a *hiring* problem for a team; solo development doesn't route around that risk, it concentrates the same specialist breadth (GPU rendering, a first-party UI toolkit, text shaping/IME, accessibility, PSD reverse-engineering, color management, RAW decoding, AI integration, plugin sandboxing, real-time collaboration, mobile/web ports) into one person learning and building all of it in sequence rather than a team building it in parallel. No number of added months to the existing 52-month, team-shaped estimate makes it an honest solo estimate — it is the wrong *shape* of estimate for this situation, not just the wrong number.
 
-    This is a genuine, open strategic tension the project now needs to sit with rather than paper over: either the ~52-month, 26-FR, five-phase scope is revisited explicitly for solo delivery (which likely means narrowing scope hard via §3 Non-Goals and the MoSCoW priorities in §5, sooner and more aggressively than "enforce at phase gates" in R5 currently implies), or the timeline is accepted as open-ended and phase-gated rather than calendar-committed — a legitimate choice for a project with no external revenue pressure (see Q3), but a choice, not a default. Not resolved *by* this PRD revision, only surfaced honestly — this is Cahya's call to make, not an assistant's or a spike's. See PLAN.md 0.8 for where this landed in the Phase 0.8 re-plan.
+    This was a genuine, open strategic tension when first surfaced — either narrow the ~52-month, 26-FR, five-phase scope explicitly for solo delivery, or accept the timeline as open-ended and phase-gated rather than calendar-committed. **Decided 2026-07-28: both.** Phases 4 and 5 (AI, plugins, automation, cloud sync, collaboration, animation, mobile, web) are moved out of the committed plan entirely — see §9's "Beyond v1.0" section and the corresponding priority changes (FR-019 moved to Won't (yet)) — rather than carried as ~22 months of team-scoped commitment for work §3's own priority table already treated as cuttable. The phases that remain (0–3) keep their exit criteria as real gates but drop the calendar commitment: milestone-based, not dated, consistent with solo development and no external deadline pressure (Q3). See PLAN.md 0.8 for the full trail.
 
 2b. **Trademark on the name "Aurora"** — MIT grants no trademark rights (§14). Partially investigated 2026-07-25; the name is **retained** for now.
 
@@ -1322,12 +1345,13 @@ These block or reshape implementation and need owners and answers, most before P
     **Resolved 2026-07-28: not decided, and explicitly not a priority right
     now.** Consistent with Q2's answer (solo, no team to fund) — there is no
     near-term funding pressure driving scope or schedule. Practical
-    consequence, not just a status update: Phase 4's plugin marketplace
-    (FR-019) and Phase 5's cloud sync (FR-022) stay **provisional** — scope
-    items whose business case is genuinely undecided, not merely
-    unscheduled — until a revenue model exists to justify building and
-    operating them. Revisit if that changes; don't build toward either on
-    the assumption it will.
+    consequence, not just a status update: the plugin marketplace (FR-019)
+    and cloud sync/collaboration (FR-022) are two of the items now moved to
+    §9's "Beyond v1.0" section (not merely unscheduled *phases* anymore —
+    both FRs also moved to Won't (yet) priority in §3) — their business case
+    is genuinely undecided, not just their timing. Revisit if a revenue
+    model emerges that would justify building and operating either; don't
+    build toward them on the assumption one will.
 4. **Tile size and scratch-disk budget** — follows from the resolved precision and ceiling decisions. At 8 bytes/px the tile dimension trades GPU upload efficiency against paging granularity; settle it with the Phase 0 paging prototype.
 5. **Photoshop version target for PSD round-trip** — which Photoshop versions must reopen Aurora-written files? Determines the format features and the composition of the 1,000-file test corpus.
 6. **PSD features with no Aurora equivalent** — on import, are they dropped with a warning, or preserved opaquely and written back untouched on save? The latter is far friendlier to mixed Photoshop/Aurora teams and far harder to build.
