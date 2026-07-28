@@ -159,6 +159,14 @@ Needs
 - Vector graphics
 - Export assets
 
+**Gap surfaced 2026-07-28** ([docs/workflows.md](docs/workflows.md), PLAN
+0.9): "Artboards" has no owning FR in §5 — FR-002 (Canvas) covers guides/
+grid/snap/rulers/multiple tabs and windows but not multiple named boards
+in one document, and FR-008 (Vector Graphics) doesn't mention them either.
+Either this is an implicit sub-feature of FR-002 nobody wrote down, or a
+genuine missing requirement. Undecided — needs Cahya's call, not an
+assistant's guess.
+
 ---
 
 ## Marketing Team
@@ -1359,6 +1367,8 @@ These block or reshape implementation and need owners and answers, most before P
 8. **AI models** — first-party, bundled third-party, or bring-your-own? Licensing and download size follow from this.
 9. **Minimum GPU baseline** — what hardware must Aurora run on? Sets the `wgpu` feature floor.
 10. **Which Photoshop workflows are the 95%?** The success metric in §10 is currently unmeasurable without this list.
+
+    **Resolved 2026-07-28 (first draft):** [docs/workflows.md](docs/workflows.md) — a tiered, ranked list of concrete workflows per §4 persona, each mapped to the FRs it exercises, with a cross-persona rollup. Explicitly a hypothesis, not a finding — there is no user base yet to have validated it against; Cahya's professional judgment is the only available check for now (PLAN.md 0.9). One gap fell out of writing it: "Artboards" (§4, UI Designer) has no owning FR — see the note under that persona above.
 
 ---
 

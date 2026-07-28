@@ -38,7 +38,8 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | Design language | **Complete** — [design/](design/README.md); owner-approved and outside-reviewed (2026-07-28) |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | **Libraries decided (ADR 0007/0008); LGPL packaging mechanism proven on Linux with the actual chosen library** — macOS/Windows and legal review remain |
-| Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. PRD §13 Step 2 ("define the 95%") surfaced as a previously-untracked gap along the way, now tracked as 0.9 |
+| Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. |
+| Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. First-draft, not user-validated; see 0.9 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -308,20 +309,25 @@ are cut entirely. There is no revised number to compute, honest or
 otherwise — see PRD §12 Q2's resolution note and the "Beyond v1.0" outline
 below for where this landed.
 
-### 0.9 Define the 95% — not started (PRD §13 Step 2)
+### 0.9 Define the 95% — done (PRD §13 Step 2)
 
 Surfaced as a gap during the 0.8 re-plan, not before — it had no home in
 this file's 0.1–0.8 numbering, which is itself the evidence it was dropped
 rather than deliberately deferred.
 
-- [ ] Turn the §10 success metric ("support 95% of common Photoshop
+- [x] Turn the §10 success metric ("support 95% of common Photoshop
   workflows") into a written, ranked list of concrete workflows across the
   §4 personas (photographer, graphic designer, digital artist, UI designer,
-  marketing team) — PRD's own words: "this list becomes the acceptance
-  suite and the arbiter for every 'Could we cut this?' question later."
-  Without it, every scope-cutting decision from Phase 2 onward has no
-  defined arbiter, and PRD §10's success metric stays unmeasurable (open
-  question 10 in PRD §12 says this explicitly).
+  marketing team) — [docs/workflows.md](docs/workflows.md), 2026-07-28.
+  Tier-1/2/3 per persona, each workflow mapped to the FRs it exercises,
+  plus a cross-persona rollup identifying which FRs are load-bearing
+  (touched by Tier-1 work from 3+ personas) vs. touched by nothing above
+  Tier 2 — the latter all landed on FRs already marked Could/Won't-yet in
+  §3, which is a consistency check passing, not new information. One real
+  gap fell out of the exercise: "Artboards" is a named UI Designer need in
+  §4 with no owning FR in §5 — flagged in PRD.md, needs Cahya's decision.
+  First draft, explicitly a hypothesis to argue with rather than a
+  finding — there's no user base yet to have interviewed.
 
 ---
 
@@ -526,20 +532,22 @@ here so they are not silently lost between phases.
    needs a machine with an active graphical login, which was not available
    this pass. Windows (UIA) is fully unstarted. Both are different platform
    APIs entirely and remain the only thing that can still overturn ADR 0001.
-2. **Define the 95%** (PRD §13 Step 2, now tracked as 0.9) — surfaced during
-   the 0.8 re-plan as a genuine gap: it had never been started *or tracked*
-   anywhere in this file. Turn PRD §10's success metric into a written,
-   ranked list of concrete Photoshop workflows across the §4 personas.
-   Unlike item 1, this needs no special hardware — it's writing/analysis
-   work, available to start now, and PRD's own words say it "becomes the
-   acceptance suite and the arbiter for every 'Could we cut this?' question
-   later." Every later scope decision (Phase 2 onward) is weaker without it.
+2. **Get Cahya's read on [docs/workflows.md](docs/workflows.md)** — the 95%
+   list is a first draft grounded in general Photoshop usage patterns, not
+   real user input (there are no users yet), and it says so explicitly.
+   Two things specifically need a decision, not just a read-through: the
+   Artboards gap it surfaced (§4 names it as a UI Designer need; no FR in
+   §5 owns it), and whether the Tier-1/2/3 calls match Cahya's own
+   professional judgment before this list starts being used as the
+   scope-cut arbiter for real.
 
 ~~Get outside critique on the 0.5 design scaffold~~ — **done 2026-07-28**: a
 colleague reviewed it and signed off as fine for a start, revisable later
-if needed. See 0.5 above; this frees a slot in the list above (candidates
-in "Newly surfaced" below, e.g. the PSD test corpus in 0.7 or the
-macOS/Windows LGPL packaging work).
+if needed. See 0.5 above.
+
+~~Define the 95%~~ — **done 2026-07-28**, see item 2 above and 0.9. This
+frees a slot in the list (candidates in "Newly surfaced" below, e.g. the
+PSD test corpus in 0.7 or the macOS/Windows LGPL packaging work).
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
