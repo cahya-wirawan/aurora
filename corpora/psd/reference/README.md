@@ -53,6 +53,18 @@ Photoshop"). Two gaps, not one:
   something real to develop the reader against before Phase 3 starts,"
   which is what Step 6 actually asks for at this stage.
 
+**Growing this toward the real-world 1,000-file gate is deliberately
+deferred to Phase 3** (decided 2026-07-28, PLAN.md 0.7) rather than kept
+as open Phase 0 work. Considered and rejected for now: sourcing from
+"free PSD" template sites (most have EULAs that don't clearly cover
+redistributing the raw file as a test corpus — the same license-laundering
+risk this project already avoids for LGPL dependencies). Live options when
+Phase 3 actually starts: Cahya's own real files (clean ownership, limited
+volume), or permissively-licensed real design work from GitHub (same
+per-file license diligence as above, slower, more volume). Not solved
+here — Phase 0's job was the first real set to develop against, not the
+acquisition problem for the eventual gate.
+
 ## Files
 
 - **`manifest.txt`** — the 319 relative paths fetched, one per line; the
