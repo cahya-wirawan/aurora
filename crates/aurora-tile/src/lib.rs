@@ -1,24 +1,20 @@
 //! Tile store: paging to scratch disk, LRU image cache, half-float tile storage.
 //!
 //! See PRD §7.2 for where this crate sits in the workspace layering, and
-//! `docs/adr/` for the decisions that shape it.
+//! `docs/adr/` for the decisions that shape it — [ADR 0005](../../../docs/adr/0005-tile-size-scratch-budget.md)
+//! settles the 256×256 px tile size and scratch-disk budget model this
+//! crate implements.
 //!
-//! This crate is a skeleton: no functionality is implemented yet.
+//! Compositing/blending is deliberately **not** this crate's job (that's
+//! `aurora-graph`/`aurora-brush`) — this crate owns storage, paging,
+//! compression, and dirty-rectangle *carrying* only.
 
-/// Placeholder so the crate compiles and CI has something to check.
-///
-/// Remove once real types land.
-#[must_use]
-pub const fn crate_name() -> &'static str {
-    "aurora-tile"
-}
+mod codec;
+mod error;
+mod store;
+mod tile;
+mod writer;
 
-#[cfg(test)]
-mod tests {
-    use super::crate_name;
-
-    #[test]
-    fn reports_its_name() {
-        assert_eq!(crate_name(), "aurora-tile");
-    }
-}
+pub use error::TileError;
+pub use store::{Stats, TileStore};
+pub use tile::{CHANNELS, SAMPLES, TEXELS, TILE, Tile, TileId};

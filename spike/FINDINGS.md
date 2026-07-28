@@ -62,7 +62,10 @@ Round-trip verified **bit-exact** — f16 in, f16 out, no conversion anywhere.
 Going in, the assumed risk was disk paging. It is not: page-in panning runs at
 7 ms. The real cost is CPU compositing — 65 % of a painting frame — because
 `end_stroke` merges **whole tiles** regardless of how little the stroke touched,
-converting f16 → f32 → f16 scalar over 262,144 texels per tile.
+converting f16 → f32 → f16 scalar over 65,536 texels per tile (256×256, `tiles.rs`'s
+`TILE` constant — corrected 2026-07-28 from an earlier "262,144" here, which was
+512×512 and never matched the actual tile size used anywhere else in this file
+or the code).
 
 Consequences for the real implementation, none of which are surprising in
 hindsight but all of which were unbudgeted:

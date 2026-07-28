@@ -28,17 +28,18 @@ than the tidiness.
 
 **Phase 0 (technical de-risking) — roughly half done, but its Phase-1 gate
 (PRD §13 Steps 1/3/4) is now satisfied and Phase 1 has started, 2026-07-28.**
-`aurora-core`'s foundational types are the first real product code in the
-workspace — M1.1's `aurora-core` half is done, `aurora-tile`'s tile store
-is next. CI green on Linux, macOS, and Windows. The remaining Phase 0
-items (ADRs 0005/0006, Windows/300k-px slice re-runs, macOS/Windows LGPL
-packaging, deeper PSD format coverage) continue in the background rather
-than gating Phase 1 — none of them are among the three steps PRD §13
-actually names as blocking.
+**M1.1 is complete** — `aurora-core`'s foundational types and
+`aurora-tile`'s sparse/LRU/compressed/paging store, with ADR 0005 (tile
+size) settled alongside it. `aurora-gpu` (M1.2) is next. CI green on
+Linux, macOS, and Windows. The remaining Phase 0 items (ADR 0006,
+Windows/300k-px slice re-runs, macOS/Windows LGPL packaging, deeper PSD
+format coverage) continue in the background rather than gating Phase 1 —
+none of them are among the three steps PRD §13 actually names as
+blocking.
 
 | Area | State |
 |---|---|
-| Requirements & architecture | Settled and written down (PRD v1.8, 6 ADRs — 0005/0006 still pending) |
+| Requirements & architecture | Settled and written down (PRD v1.8, 7 ADRs — 0006 still pending) |
 | Workspace & CI | Built and green |
 | Performance validation | **Measured** — budgets hold, with one correction; re-run on Linux/Vulkan 2026-07-26, same correction reproduces |
 | Accessibility & IME | **macOS verified (9/10)**; Linux/Windows human verification unverified but **risk accepted 2026-07-28** to unblock Phase 1 — see 0.4 |
@@ -48,7 +49,7 @@ actually names as blocking.
 | Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. |
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
-| **Phase 1 — M1.1** | **Started 2026-07-28.** `aurora-core`'s foundational types done (geometry, colour descriptors, IDs, errors), 16 tests, full local CI gate clean. `aurora-tile`'s tile store is next. See M1.1 |
+| **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. `aurora-gpu` (M1.2) is next. See M1.1 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -81,7 +82,7 @@ CJK composing into a custom text field.
 - [x] Licence chosen: MIT — [LICENSE](LICENSE), PRD §14
 - [x] Design owner named: Cahya Wirawan — PRD FR-027 *Ownership*
 - [x] Name/trademark investigated — PRD §12 Q2b (retained; not a legal clearance)
-- [ ] ADR 0005 — tile size and scratch-disk budget *(needs 0.4 numbers)*
+- [x] ADR 0005 — tile size (256×256 px) and scratch-disk budget mechanism — [adr/0005](docs/adr/0005-tile-size-scratch-budget.md), 2026-07-28. **Correction**: this line previously said "needs 0.4 numbers" — 0.4 is the accessibility spike, unrelated to tile sizing; the real numbers were in 0.3 (vertical slice) all along, and §0.8 already said this wasn't blocked on anything. Written alongside the real `aurora-tile` implementation (M1.1).
 - [ ] ADR 0006 — accessibility conformance target (WCAG 2.1 AA / Section 508 / EN 301 549)
 - [x] ADR 0007 — RAW decode library: LibRaw via FFI — [adr/0007](docs/adr/0007-raw-library-libraw.md); Cahya's decision, informed by `spike/raw-icc` and `spike/lgpl-packaging`
 - [x] ADR 0008 — ICC transform library: lcms2 via FFI — [adr/0008](docs/adr/0008-icc-library-lcms2.md); no packaging complexity, unlike ADR 0007 — Little CMS's core is MIT
@@ -300,8 +301,11 @@ became visible.** Every one of its five spikes found more than a clean
   licensing finding made it necessary. Small and fast is not what this
   turned out to be.
 - Two ADRs Phase 0 was always going to need (0005 tile size, 0006 a11y
-  conformance target) are still `[ ]` — not attempted yet, not blocked on
-  anything external, just not reached.
+  conformance target) were still `[ ]` at the time of this re-plan — not
+  attempted yet, not blocked on anything external, just not reached. **ADR
+  0005 written 2026-07-28**, alongside the real `aurora-tile` implementation
+  (M1.1) — confirming this section's own read that it was never actually
+  blocked. 0006 remains not reached.
 - **PRD §13 Step 2 ("Define the 95%") has never been tracked in this file
   at all** — a real gap, not a rounding error. It has no home in 0.1–0.8's
   numbering, which is itself evidence it was dropped rather than
@@ -415,11 +419,50 @@ every widget in every state across all built-in themes with contrast checks gree
   signed (`i64`) since a layer's bounds can go negative or past the
   ceiling mid-transform, unlike a document's own `Size`, which is always
   validated in-range via `Size::new`.
-- [ ] Sparse tile store, LRU residency, scratch-disk paging
-- [ ] **Per-tile dirty rectangles** — the largest single win from the slice
-- [ ] Tile compression (`zstd`/`lz4`) — the memory budget already assumes it
-- [ ] Background writer so eviction does not block the frame
-- [ ] Bench: paging throughput, eviction cost, compression ratio
+- [x] **Sparse tile store, LRU residency, scratch-disk paging** — done
+  2026-07-28, `crates/aurora-tile/src/{tile,store,codec,writer,error}.rs`,
+  12 tests. Tiles created lazily on first touch (sparse); `lru::LruCache`
+  replaces the spike's O(n) `Vec` scan with real O(1) LRU ops and an
+  explicit `pop_lru()` hand-off to eviction (not relying on `put`'s
+  internal auto-eviction, which doesn't return the evicted value); paging
+  round-trips bit-exact through compression (same property
+  `spike/FINDINGS.md` proved for the uncompressed format). Tile size
+  settled in **ADR 0005** (256×256 px, matching what the spike actually
+  measured) — written alongside this work, closing a real Phase 0 gap
+  (see 0.1).
+- [x] **Per-tile dirty rectangles** — the largest single win from the
+  slice. `Tile::mark_dirty`/`take_dirty` accumulate a tile-local
+  `aurora_core::Rect` via `Rect::union`, so a future consumer (GPU
+  upload, `aurora-graph`) touches only the accumulated region instead of
+  the whole tile (`spike/FINDINGS.md` finding #1: whole-tile merges were
+  65% of a painting frame). **Known, accepted limitation**: dirty state
+  does not survive eviction — documented on `TileStore`, not silently
+  left unstated.
+- [x] **Tile compression (`lz4_flex`, not `zstd`)** — pure Rust (no C
+  FFI), chosen for decompression speed over best-in-class ratio since
+  page-in during panning is already budget-tight
+  (`spike/FINDINGS.md`: 7–16.7 ms against a 16.7 ms budget). On-disk
+  format is a small versioned header (magic/version/compressed-flag) plus
+  an `lz4_flex`-compressed payload, with a **raw fallback** when
+  compression would expand the data (confirmed by a real test: uniform
+  tiles compress to ~0.4% of raw size, gradient ~0.5%, random noise
+  correctly falls back to raw at a 1.000 ratio rather than storing an
+  expanded blob).
+- [x] **Background writer so eviction does not block the frame** — a
+  dedicated `std::thread` draining an unbounded `std::sync::mpsc` queue
+  (`crates/aurora-tile/src/writer.rs`), not `tokio` — one thread draining
+  one queue doesn't need an async runtime, and pulling one into a crate 7
+  others depend on is a real, avoidable cost. `submit()` never blocks by
+  construction (unbounded channel); `flush()` joins the writer and
+  surfaces the first write failure (logging every failure via
+  `tracing::error!`, not just the first) before a document save.
+- [x] **Bench: paging throughput, eviction cost, compression ratio** —
+  `crates/aurora-tile/benches/tile_store.rs` (criterion). Measured
+  2026-07-28 on this machine: paging throughput (32 tiles against a
+  16-tile budget) ~8.2 ms/cycle; forced eviction ~253 µs/tile; compression
+  ratios 0.004 (uniform), 0.005 (gradient), 1.000 (noise, correctly
+  raw-fallback). Indicative, not a cross-platform result — same caveat
+  the vertical slice's own numbers carry.
 
 ### M1.2 — GPU layer (`aurora-gpu`)
 
