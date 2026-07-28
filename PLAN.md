@@ -31,10 +31,11 @@ than the tidiness.
 **M1.1 is complete** — `aurora-core`'s foundational types and
 `aurora-tile`'s sparse/LRU/compressed/paging store, with ADR 0005 (tile
 size) settled alongside it. **M1.2 (`aurora-gpu`) is in progress**:
-device/queue management and the shader library/pipeline cache are done,
-both verified against a real GPU on this machine (the pipeline cache with
-an actual rendered-pixel readback); surface configuration, resize, GPU
-tile residency, and upload scheduling are next. CI green on Linux, macOS, and
+device/queue management, the shader library/pipeline cache, and GPU tile
+residency (with toroidal slot addressing, the bullet PLAN.md itself
+flagged as risky) are done, all verified against a real GPU on this
+machine with actual rendered/uploaded-pixel checks. Surface
+configuration, resize, and upload scheduling are next. CI green on Linux, macOS, and
 Windows. The remaining Phase 0 items (ADR 0006, Windows/300k-px slice
 re-runs, macOS/Windows LGPL packaging, deeper PSD format coverage)
 continue in the background rather than gating Phase 1 — none of them are
@@ -53,7 +54,7 @@ among the three steps PRD §13 actually names as blocking.
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
-| **Phase 1 — M1.2** | **In progress, 2026-07-28.** Device/queue management (`GpuContext`) and shader library/pipeline cache (`ShaderLibrary`/`PipelineCache`) done, both verified against this machine's real RTX 3090 (Vulkan) — the pipeline cache with an actual rendered-pixel check, not just "it compiled." Surface config, resize, tile residency, upload scheduling still open. See M1.2 |
+| **Phase 1 — M1.2** | **In progress, 2026-07-28.** Device/queue management, shader library/pipeline cache, and GPU tile residency (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done, all verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks, not just "it compiled." A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`, see M1.2). Surface config, resize, upload scheduling still open. See M1.2 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -500,7 +501,41 @@ every widget in every state across all built-in themes with contrast checks gree
   out — the checkerboard-behind-transparency logic correctly contributes
   nothing when alpha = 1); a separate test confirms the cache actually
   caches (identical key → no rebuild; different key → rebuilds).
-- [ ] GPU tile residency with toroidal slot addressing *(from the slice — awkward to retrofit)*
+- [x] **GPU tile residency with toroidal slot addressing** — done
+  2026-07-28, `crates/aurora-gpu/src/residency.rs`, `TileResidency`, 2 new
+  tests (6 total in the crate). Ports `spike/vertical-slice`'s proven
+  `sync_tiles`/`set_view` design (a tile-aligned `Rgba16Float` atlas sized
+  to the viewport + one tile margin, slots addressed as `tile index mod
+  grid size`, wraparound delegated to the sampler's `AddressMode::Repeat`
+  — not WGSL math) against the real `aurora_tile::TileStore` API, which
+  needed no new methods on `aurora-tile` at all: the spike's batch
+  `take_dirty(limit)`/`exists(id)` calls turn out unnecessary once the
+  upload loop iterates the small, bounded visible-slot grid (~4–35 tiles)
+  and calls the real single-tile `take_dirty(id)`/`get(id)` directly.
+  **Verified with real GPU work, not call counts alone**: one test proves
+  the actual toroidal-addressing benefit finding #4 named — full grid
+  uploads on first sync, zero uploads on an unchanged second sync,
+  exactly one row/column's worth on a one-tile pan, not the whole grid —
+  and a second test reads the atlas texture back and confirms a painted
+  tile's colour lands in the *correct* slot region, catching the
+  off-by-one/wrong-axis bug class a count-only test would miss.
+  Deliberately does not handle resize (recreating the atlas at a new
+  size) — that's the still-open "surface configuration, resize" bullet
+  above.
+
+  **A real, reproducible bug found and fixed along the way, not just in
+  this new code**: with 6 real-GPU tests now in the crate, `cargo test`'s
+  default multi-threaded runner deadlocked — several tests each creating
+  their own `wgpu::Instance`/`Device` and submitting real work at the
+  same time. Confirmed real, not assumed: reproduced reliably, isolated
+  by checking `nvidia-smi` (the GPU sat idle while the test process spun,
+  ruling out "just slow"), and confirmed absent under
+  `--test-threads=1`. Fixed with a crate-test-wide `Mutex` serializing
+  every real-GPU test (`crates/aurora-gpu/src/test_support.rs`), rather
+  than assuming `cargo-nextest` (which isolates tests per-process and
+  might well not hit this at all) would be the runner used — this crate
+  needs to be correct under plain `cargo test` too, since that's what's
+  actually installed in this environment.
 - [ ] Upload scheduling with a per-frame budget
 - [ ] Validate on DX12, Metal, Vulkan
 

@@ -108,46 +108,23 @@ impl std::fmt::Debug for GpuContext {
 
 #[cfg(test)]
 mod tests {
-    use super::GpuContext;
+    use crate::test_support::real_context;
 
     #[test]
     fn creates_a_real_headless_device() {
         // Real verification, not a mock -- matching this project's
         // general practice (spike/FINDINGS.md's whole existence is built
-        // on measuring real behavior). `NoSuitableAdapter` is treated as
-        // an inconclusive skip rather than a failure: this pass can only
-        // confirm real device creation on this dev machine's actual GPU
-        // (see spike/FINDINGS.md's Linux/Vulkan/RTX 3090 run) -- whether
-        // every CI runner image has a usable GPU or software adapter is
-        // genuinely unverified, not assumed. `DeviceRequestFailed` (an
-        // adapter was found but device creation itself failed) is a real
-        // bug and does fail the test.
-        match GpuContext::new() {
-            Ok(context) => {
-                let info = context.adapter_info();
-                eprintln!(
-                    "adapter: {} ({:?}, {:?})",
-                    info.name, info.backend, info.device_type
-                );
-                assert!(!info.name.is_empty(), "adapter must report a name");
-            }
-            Err(super::GpuError::NoSuitableAdapter) => {
-                eprintln!("SKIPPED: no GPU adapter available on this machine/CI runner");
-            }
-            Err(err) => {
-                // A real, reachable failure -- not the "this can't
-                // happen" case `unreachable!()` is for elsewhere in this
-                // codebase, so a plain `assert!(false, ..)` (which
-                // clippy flags as always-false and suggests `panic!()`
-                // for) would be dishonest either way. This is the one
-                // deliberate, visible `panic!` in the crate: an adapter
-                // was found but device creation itself failed, which is
-                // a real bug this test exists to catch.
-                #[allow(clippy::panic)]
-                {
-                    panic!("device request failed with a real adapter present: {err}");
-                }
-            }
-        }
+        // on measuring real behavior). `real_context()` treats a missing
+        // adapter as an inconclusive skip and a real device-request
+        // failure as a hard test failure -- see its own doc comment.
+        let Some(context) = real_context() else {
+            return;
+        };
+        let info = context.adapter_info();
+        eprintln!(
+            "adapter: {} ({:?}, {:?})",
+            info.name, info.backend, info.device_type
+        );
+        assert!(!info.name.is_empty(), "adapter must report a name");
     }
 }

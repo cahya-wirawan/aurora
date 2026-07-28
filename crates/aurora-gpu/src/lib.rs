@@ -5,8 +5,8 @@
 //! and invariant §7.3.8 are why UI and canvas share one [`GpuContext`]
 //! rather than each owning a separate device.
 //!
-//! Device/queue management and the shader library/pipeline cache are
-//! implemented; surface configuration, resize, GPU tile residency, and
+//! Device/queue management, the shader library/pipeline cache, and GPU
+//! tile residency are implemented; surface configuration, resize, and
 //! upload scheduling are the rest of PLAN.md M1.2, not yet started.
 
 mod context;
@@ -14,6 +14,9 @@ mod error;
 mod pipeline;
 #[cfg(test)]
 mod render_test;
+mod residency;
+#[cfg(test)]
+mod residency_test;
 mod shader;
 #[cfg(test)]
 mod test_support;
@@ -21,4 +24,5 @@ mod test_support;
 pub use context::GpuContext;
 pub use error::GpuError;
 pub use pipeline::{Blend, PipelineCache, PipelineKey};
+pub use residency::TileResidency;
 pub use shader::ShaderLibrary;
