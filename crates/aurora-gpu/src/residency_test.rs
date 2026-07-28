@@ -12,6 +12,11 @@ use aurora_tile::{TILE, TileId};
 use half::f16;
 
 #[test]
+// One linear setup-render-readback flow for a single real GPU test --
+// splitting it into helper functions would just relocate the same lines
+// without reducing the actual complexity (texture, buffer, bind group,
+// pass, readback) -- same call already made for render_test.rs.
+#[allow(clippy::too_many_lines)]
 fn upload_lands_in_the_correct_slot() {
     let Some(context) = real_context() else {
         return;
@@ -49,8 +54,11 @@ fn upload_lands_in_the_correct_slot() {
         });
     }
 
-    let uploaded = residency.sync(queue, &mut store, false);
-    assert_eq!(uploaded, 4, "first sync uploads the whole visible grid");
+    let stats = residency.sync(queue, &mut store, false, usize::MAX);
+    assert_eq!(
+        stats.uploaded, 4,
+        "first sync uploads the whole visible grid"
+    );
 
     // Read back exactly the slot-(1,0) region: x in [256, 512), y in [0, 256).
     let bytes_per_row = TILE * 8; // Rgba16Float = 8 bytes/px; 256*8 = 2048, already

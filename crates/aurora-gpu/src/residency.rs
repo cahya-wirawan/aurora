@@ -5,11 +5,29 @@
 
 use std::collections::HashMap;
 
-use aurora_tile::{TILE, TileId, TileStore};
+use aurora_tile::{SAMPLES, TILE, TileId, TileStore};
 
 /// The `Canvas` uniform `canvas.wgsl` expects: `uv_offset`/`uv_scale`,
 /// two `vec2<f32>`s, 16 bytes total.
 const UNIFORM_SIZE: u64 = 16;
+
+/// Bytes one tile upload costs — `f16` samples, `SAMPLES` per tile.
+const TILE_BYTES: usize = SAMPLES * 2;
+
+/// The result of one [`TileResidency::sync`] call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    pub uploaded: u32,
+    pub bytes_uploaded: u64,
+    /// Tiles that still need upload after this call — budget-limited or
+    /// errored. Non-zero means: request another frame, don't consider
+    /// this view fully caught up yet.
+    pub remaining: u32,
+    /// Subset of `remaining` that failed to load (not merely
+    /// budget-skipped) — a distinct, exceptional condition worth
+    /// surfacing separately from "just not enough budget this frame."
+    pub errors: u32,
+}
 
 /// A GPU-resident window over a tile store: a tile-aligned atlas texture
 /// sized to a viewport (plus one tile of margin), whose slots are
@@ -145,18 +163,34 @@ impl TileResidency {
         queue.write_buffer(&self.uniform_buffer, 0, &bytes);
     }
 
-    /// Uploads every visible slot that doesn't already hold the correct,
-    /// clean tile. Returns the number of tiles actually uploaded — this
-    /// count is the direct, measurable proof that panning by one tile
-    /// invalidates one row/column, not the whole texture.
+    /// Uploads visible slots that don't already hold the correct, clean
+    /// tile, up to `byte_budget` bytes this call — a fast pan can expose
+    /// far more tiles than fit in one frame's bandwidth
+    /// (`spike/FINDINGS.md` finding #3: "~18 MB per screenful"), so this
+    /// caps the cost per call rather than uploading everything at once.
+    ///
+    /// Tiles that don't fit in the budget (or fail to load) aren't
+    /// marked resident, so the *next* call's own resident check finds
+    /// them again automatically — no separate pending-tile queue needed.
+    /// Iterating the grid in the same fixed order every call means a
+    /// budget smaller than the full backlog fills in from the start of
+    /// that order forward, one call at a time, converging to
+    /// `remaining == 0` rather than starving any tile.
     ///
     /// `force`: re-upload every visible slot unconditionally, for the
     /// future resize case (not exercised by anything yet, since resize
     /// itself is separate, still-open M1.2 work — the parameter exists
     /// now because retrofitting it later is exactly what this bullet is
     /// about avoiding).
-    pub fn sync(&mut self, queue: &wgpu::Queue, store: &mut TileStore, force: bool) -> u32 {
-        let mut uploads = 0;
+    pub fn sync(
+        &mut self,
+        queue: &wgpu::Queue,
+        store: &mut TileStore,
+        force: bool,
+        byte_budget: usize,
+    ) -> SyncStats {
+        let mut stats = SyncStats::default();
+        let mut bytes_left = byte_budget;
         for gy in 0..self.grid.1 {
             for gx in 0..self.grid.0 {
                 let id = TileId {
@@ -169,13 +203,21 @@ impl TileResidency {
                 if !force && resident && !dirty {
                     continue;
                 }
+                if bytes_left < TILE_BYTES {
+                    stats.remaining += 1;
+                    continue;
+                }
                 let tile = match store.get(id) {
                     Ok(tile) => tile,
                     Err(err) => {
                         // One bad tile shouldn't abort uploading the
                         // rest of the visible grid this frame; there is
                         // nothing more localized to retry against here.
+                        // Still needs a real upload attempt later, same
+                        // as a budget-skipped tile.
                         tracing::warn!(?id, %err, "skipping tile for this frame's upload");
+                        stats.remaining += 1;
+                        stats.errors += 1;
                         continue;
                     }
                 };
@@ -207,10 +249,12 @@ impl TileResidency {
                     },
                 );
                 self.slots.insert(slot, id);
-                uploads += 1;
+                bytes_left -= TILE_BYTES;
+                stats.uploaded += 1;
+                stats.bytes_uploaded += TILE_BYTES as u64;
             }
         }
-        uploads
+        stats
     }
 
     /// Exposes the atlas texture for `residency_test.rs`'s real
@@ -234,7 +278,7 @@ impl std::fmt::Debug for TileResidency {
 
 #[cfg(test)]
 mod tests {
-    use super::TileResidency;
+    use super::{TILE_BYTES, TileResidency};
     use crate::test_support::{real_context, real_tile_store};
     use aurora_tile::TileId;
     use half::f16;
@@ -280,13 +324,20 @@ mod tests {
         }
 
         // Nothing resident yet: every visible slot must upload.
-        let first = residency.sync(context.queue(), &mut store, false);
-        assert_eq!(first, 4, "first sync must upload the whole visible grid");
+        let first = residency.sync(context.queue(), &mut store, false, usize::MAX);
+        assert_eq!(
+            first.uploaded, 4,
+            "first sync must upload the whole visible grid"
+        );
+        assert_eq!(
+            first.remaining, 0,
+            "unlimited budget must leave nothing pending"
+        );
 
         // Unchanged: nothing should re-upload.
-        let second = residency.sync(context.queue(), &mut store, false);
+        let second = residency.sync(context.queue(), &mut store, false, usize::MAX);
         assert_eq!(
-            second, 0,
+            second.uploaded, 0,
             "unchanged, resident, clean tiles must not re-upload"
         );
 
@@ -295,10 +346,56 @@ mod tests {
         paint(&mut store, TileId { x: 2, y: 0 }, [0.0, 1.0, 0.0, 1.0]);
         paint(&mut store, TileId { x: 2, y: 1 }, [0.0, 1.0, 0.0, 1.0]);
         residency.set_origin(context.queue(), TileId { x: 1, y: 0 }, viewport);
-        let third = residency.sync(context.queue(), &mut store, false);
+        let third = residency.sync(context.queue(), &mut store, false, usize::MAX);
         assert_eq!(
-            third, 2,
+            third.uploaded, 2,
             "panning by one tile must invalidate exactly one column, not the whole grid"
         );
+    }
+
+    #[test]
+    fn budget_limited_sync_converges_over_multiple_calls() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store(64);
+
+        // 2x2 grid, 4 tiles total, all painted up front.
+        let viewport = (256, 256);
+        let mut residency = TileResidency::new(context.device(), context.queue(), viewport);
+        for gy in 0..2 {
+            for gx in 0..2 {
+                paint(&mut store, TileId { x: gx, y: gy }, [0.0, 0.0, 1.0, 1.0]);
+            }
+        }
+
+        // Budget for exactly 2 tiles' worth of bytes.
+        let budget = TILE_BYTES * 2;
+
+        let first = residency.sync(context.queue(), &mut store, false, budget);
+        assert_eq!(first.uploaded, 2, "budget must cap uploads to what fits");
+        assert_eq!(
+            first.remaining, 2,
+            "the other two must be reported as still pending"
+        );
+        assert_eq!(first.bytes_uploaded, (TILE_BYTES * 2) as u64);
+        assert_eq!(first.errors, 0);
+
+        // Same small budget again, nothing else changed: must pick up
+        // exactly the two left over, not re-touch the first two.
+        let second = residency.sync(context.queue(), &mut store, false, budget);
+        assert_eq!(
+            second.uploaded, 2,
+            "second call must finish the backlog, not restart it"
+        );
+        assert_eq!(
+            second.remaining, 0,
+            "fully caught up after two budget-limited calls"
+        );
+
+        // Steady state: nothing left to do, even with the same tight budget.
+        let third = residency.sync(context.queue(), &mut store, false, budget);
+        assert_eq!(third.uploaded, 0);
+        assert_eq!(third.remaining, 0);
     }
 }

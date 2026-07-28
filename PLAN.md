@@ -31,11 +31,12 @@ than the tidiness.
 **M1.1 is complete** — `aurora-core`'s foundational types and
 `aurora-tile`'s sparse/LRU/compressed/paging store, with ADR 0005 (tile
 size) settled alongside it. **M1.2 (`aurora-gpu`) is in progress**:
-device/queue management, the shader library/pipeline cache, and GPU tile
+device/queue management, the shader library/pipeline cache, GPU tile
 residency (with toroidal slot addressing, the bullet PLAN.md itself
-flagged as risky) are done, all verified against a real GPU on this
-machine with actual rendered/uploaded-pixel checks. Surface
-configuration, resize, and upload scheduling are next. CI green on Linux, macOS, and
+flagged as risky), and budgeted upload scheduling are all done, verified
+against a real GPU on this machine with actual rendered/uploaded-pixel
+checks. Surface configuration/resize and cross-platform validation
+(DX12/Metal/Vulkan) are next. CI green on Linux, macOS, and
 Windows. The remaining Phase 0 items (ADR 0006, Windows/300k-px slice
 re-runs, macOS/Windows LGPL packaging, deeper PSD format coverage)
 continue in the background rather than gating Phase 1 — none of them are
@@ -54,7 +55,7 @@ among the three steps PRD §13 actually names as blocking.
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
-| **Phase 1 — M1.2** | **In progress, 2026-07-28.** Device/queue management, shader library/pipeline cache, and GPU tile residency (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done, all verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks, not just "it compiled." A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`, see M1.2). Surface config, resize, upload scheduling still open. See M1.2 |
+| **Phase 1 — M1.2** | **In progress, 2026-07-28.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done, all verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks, not just "it compiled." A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`, see M1.2). Only surface config/resize and platform validation (DX12/Metal/Vulkan) remain. See M1.2 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -536,7 +537,24 @@ every widget in every state across all built-in themes with contrast checks gree
   might well not hit this at all) would be the runner used — this crate
   needs to be correct under plain `cargo test` too, since that's what's
   actually installed in this environment.
-- [ ] Upload scheduling with a per-frame budget
+- [x] **Upload scheduling with a per-frame budget** — done 2026-07-28,
+  `TileResidency::sync` now takes a `byte_budget` and returns `SyncStats`
+  (`uploaded`, `bytes_uploaded`, `remaining`, `errors`) instead of a bare
+  count. Directly answers `spike/FINDINGS.md` finding #3 ("a fast fling
+  exposes a full screenful per frame... ~18 MB") for the `aurora-gpu`-local
+  half of the fix — the mip/progressive-rendering half stays M1.3 scope,
+  unchanged. **No new bookkeeping needed for carrying a budget-skipped
+  tile to the next frame**: a skipped tile's slot is just left unrecorded,
+  so the existing `resident` check already retries it next call — one
+  fixed iteration order means a tight budget fills in from the start of
+  the grid forward across calls, converging to `remaining == 0` rather
+  than starving anything. Deliberately no invented default budget number
+  (same reasoning as ADR 0005's scratch-disk budget) — that's a tuning
+  question for whoever calls this once the render pipeline exists.
+  **Verified with a real multi-call convergence test**, not just that
+  budgeting exists: a 4-tile grid with a 2-tile budget uploads 2 the
+  first call (`remaining == 2`), the other 2 the second call
+  (`remaining == 0`), and 0 the third (steady state).
 - [ ] Validate on DX12, Metal, Vulkan
 
 ### M1.3 — Render graph and renderer (`aurora-graph`, `aurora-render`)
