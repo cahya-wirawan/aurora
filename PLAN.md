@@ -37,7 +37,7 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
 | Design language | **Owner-approved draft** — [design/](design/README.md); outside critique still needed before it hardens |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
-| RAW / ICC feasibility | **RAW decodes on all 3 vendors; ICC cross-validated; LGPL packaging mechanism proven on Linux** — RAW licensing worse than assumed, but now has a working answer, not just a named risk |
+| RAW / ICC feasibility | **Libraries decided (ADR 0007/0008); LGPL packaging mechanism proven on Linux with the actual chosen library** — macOS/Windows and legal review remain |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -163,8 +163,8 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md),
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
 - [x→bigger] **RAW decode spike — decodes real files on all 3 major vendors; licensing worse than PRD §14 assumed.** `rawler` (pure Rust) decoded real, unedited Canon CR3, Nikon NEF, and Sony ARW files (from raw.pixls.us) correctly on the first attempt — confirmed by rendering each to a crude preview and looking at it, not just checking `decode_file` returned `Ok` (all three are unambiguously real photographs). **But `rawler` itself is LGPL-2.1** — checked directly (`cargo info rawler`), and no permissively-licensed full-featured alternative exists (checked `zenraw` AGPL-3.0, `raw_preview_rs` GPL-3.0, `rawlib` MIT-but-thumbnail-only). This contradicts PRD §14's framing, which discussed LGPL risk only for the FFI option (LibRaw) and treated "prefer pure Rust" as if it avoided the obligation — it doesn't, and Rust's lack of a stable dylib ABI arguably makes the relinking obligation *harder* to satisfy than LibRaw's C-library case, not easier. `deny.toml`'s comment updated to stop implying this risk is C-library-specific. FINDINGS.md findings 1–2.
 - [x→scoped] **ICC transform spike — Little CMS's core is MIT (not LGPL); pure-Rust `moxcms` cross-validated exactly against it.** Checked directly rather than assumed grouped with RAW's risk: Little CMS's core engine is MIT-licensed (only an unused optional plugin is GPL-3), and `lcms2-sys` vendors/statically compiles it — no dynamic-linking packaging burden at all, the cleaner of the two library choices this pair of spikes covered. Cross-validated `moxcms` (pure Rust, already a transitive dependency of `rawler` itself) against `lcms2` on a real sRGB→ECI-RGBv2 transform: **exact agreement to 4 decimal places on every test color**, including out-of-gamut extended-range values — but only after finding `moxcms`'s `allow_extended_range_rgb_xyz` option (off by default; without it, out-of-gamut values silently clamp to [0,1], which would violate invariant §7.3.1b's HDR-values-preserved requirement). Corrects PRD's "no mature pure-Rust ICC engine" risk note. FINDINGS.md findings 3–4.
-- [x] **Decide RAW and ICC libraries, record as ADRs** — [ADR 0007](docs/adr/0007-raw-library-libraw.md) (LibRaw via FFI) and [ADR 0008](docs/adr/0008-icc-library-lcms2.md) (lcms2 via FFI), both Cahya's decision, both informed by the evidence above rather than a spike recommendation alone. Follow-on, not blocking: re-verify the `lgpl-packaging` mechanism with LibRaw specifically (the spike prototyped it with `rawler`), macOS/Windows packaging, and legal review of the relinking obligation before v1.0 ships.
-- [x→bigger] **LGPL packaging architecture — proven mechanically on Linux, not just designed.** [spike/lgpl-packaging/](spike/lgpl-packaging/FINDINGS.md): a `cdylib` (`raw-shim`, the only crate touching `rawler`) behind a hand-written `extern "C"` ABI, loaded at run time via `dlopen` (`libloading`, through a separate `host` binary with **zero** `rawler`/LGPL dependency — confirmed with `ldd`/`nm`, not assumed). Both conditions of LGPL-2.1 §6(b) (quoted directly from the license text, not a summary) verified concretely: (1) genuinely dynamic, no build-time link, checked with `file`/`ldd`/`nm`; (2) a modified `raw-shim` (`.so` rebuilt with one line changed) worked correctly with the **same, unmodified, un-recompiled** `host` binary — the actual property the license requires, demonstrated rather than argued. All three real RAW files from the raw-icc spike decoded identically through this mechanism as decoding them directly. **Scope, deliberate: Linux-only, no ABI-versioning story, no macOS/Windows, and this is engineering verification, not legal sign-off** — one specific ambiguity flagged honestly rather than glossed over (§6(b)(1)'s "already present on the user's system" language reads more naturally as a pre-existing system package than an app-bundled file; industry practice treats bundling as sufficient, but that's a judgment call, not a legal conclusion).
+- [x] **Decide RAW and ICC libraries, record as ADRs** — [ADR 0007](docs/adr/0007-raw-library-libraw.md) (LibRaw via FFI) and [ADR 0008](docs/adr/0008-icc-library-lcms2.md) (lcms2 via FFI), both Cahya's decision, both informed by the evidence above rather than a spike recommendation alone.
+- [x→bigger] **LGPL packaging architecture — proven mechanically on Linux with both `rawler` and, later, LibRaw itself.** [spike/lgpl-packaging/](spike/lgpl-packaging/FINDINGS.md): a `cdylib` (`raw-shim`, the only crate touching `rawler`) behind a hand-written `extern "C"` ABI, loaded at run time via `dlopen` (`libloading`, through a separate `host` binary with **zero** `rawler`/LGPL dependency — confirmed with `ldd`/`nm`, not assumed). Both conditions of LGPL-2.1 §6(b) (quoted directly from the license text, not a summary) verified concretely: (1) genuinely dynamic, no build-time link, checked with `file`/`ldd`/`nm`; (2) a modified `raw-shim` (`.so` rebuilt with one line changed) worked correctly with the **same, unmodified, un-recompiled** `host` binary. All three real RAW files from the raw-icc spike decoded identically through this mechanism as decoding them directly. **Re-verified with LibRaw itself (finding 4)** after ADR 0007 named the gap: a second shim, `libraw-shim` (via `libraw_rs_vendor`, vendoring LibRaw's own source — no system `libraw-dev` needed), exports the identical ABI, and the **same, unchanged `host` binary** loads either one — both LGPL-2.1 conditions re-verified independently, and decode results cross-checked between the two independently-coded libraries (exact match on Canon, within single digits on Nikon/Sony — recorded honestly, not rounded up). **Scope, deliberate: Linux-only, no ABI-versioning story, no macOS/Windows, and this is engineering verification, not legal sign-off** — one specific ambiguity flagged honestly rather than glossed over (§6(b)(1)'s "already present on the user's system" language reads more naturally as a pre-existing system package than an app-bundled file; industry practice treats bundling as sufficient, but that's a judgment call, not a legal conclusion). Also still open: `libraw-shim` vendors+statically-compiles LibRaw rather than dynamically linking a separately packaged `libraw.so` — both satisfy LGPL, which is preferable is a build-engineering question, not decided here.
 
 ### 0.7 Test corpora — PSD not started; RAW/ICC have a first, minimal set
 
@@ -369,17 +369,21 @@ here so they are not silently lost between phases.
    (R2f mitigation: a solo design owner has no built-in check) before the
    token vocabulary and Dark theme harden into something every widget
    depends on.
-3. **Re-verify the LGPL packaging mechanism with LibRaw itself.**
-   [ADR 0007](docs/adr/0007-raw-library-libraw.md) (RAW: LibRaw via FFI) and
-   [ADR 0008](docs/adr/0008-icc-library-lcms2.md) (ICC: lcms2 via FFI) are
-   now decided and recorded — Cahya's call, informed by the evidence, not a
-   spike recommendation alone. The one gap ADR 0007 names explicitly:
-   `spike/lgpl-packaging` prototyped the `cdylib` + `dlopen` mechanism using
-   `rawler`, not LibRaw — the argument that LibRaw's case is simpler (its
-   own C API is already the stable interface, no hand-rolled ABI needed) is
-   sound but not independently re-verified with LibRaw specifically. After
-   that: macOS/Windows packaging mechanics (only Linux verified so far),
-   and real legal review of the relinking obligation before v1.0 ships.
+3. **macOS/Windows packaging mechanics, or real legal review — the two
+   remaining items in the whole RAW/ICC/LGPL line of work.** ADR 0007
+   (RAW: LibRaw via FFI) and ADR 0008 (ICC: lcms2 via FFI) are decided; the
+   `cdylib` + `dlopen` LGPL packaging mechanism is now verified on Linux
+   with LibRaw itself, not just `rawler` (`spike/lgpl-packaging` finding 4)
+   — the same host binary, unmodified, loads either backing library, and
+   both satisfy LGPL-2.1 §6(b)'s two conditions independently. What's left:
+   (a) the same mechanics on macOS (`install_name`/`@rpath`) and Windows
+   (DLL search order), unverified so far; (b) real legal review of the
+   relinking obligation, specifically the §6(b)(1) "already present on the
+   user's system" ambiguity, before v1.0 ships; (c) a smaller, undecided
+   build-engineering question — vendor-and-statically-compile LibRaw (as
+   `libraw-shim` does) vs. dynamically link a separately packaged
+   `libraw.so` — both satisfy LGPL equally, so this is about build
+   reproducibility, not licensing.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`

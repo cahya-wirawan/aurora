@@ -1,6 +1,7 @@
 # LGPL packaging architecture spike — findings
 
-PLAN 0.6 follow-up. Built 2026-07-28, same day as `spike/raw-icc`.
+PLAN 0.6 follow-up. Built 2026-07-28, same day as `spike/raw-icc`. Extended
+2026-07-28 (finding 4) after ADR 0007/0008 to re-verify with LibRaw itself.
 
 `spike/raw-icc/FINDINGS.md` finding 2 established that every viable
 full-featured RAW decoder (`rawler`, LibRaw) is LGPL, and that Rust's lack
@@ -8,13 +9,16 @@ of a stable cross-compiler dylib ABI makes the standard "just dynamically
 link a `.so`" story less automatic than it is for a C library. This spike
 prototypes the actual mechanism, rather than just discussing it, and
 verifies it against the license text directly rather than against
-secondhand summaries of what LGPL requires.
+secondhand summaries of what LGPL requires — first with `rawler`, then
+(finding 4) with LibRaw, the library ADR 0007 actually chose.
 
 ```sh
 cd spike/lgpl-packaging
 cargo build --release
 ./target/release/host ./target/release/libraw_shim.so \
-    ../raw-icc/reference/raw-samples/canon-eos-m200.cr3
+    ../raw-icc/reference/raw-samples/canon-eos-m200.cr3      # rawler-backed
+./target/release/host ./target/release/liblibraw_shim.so \
+    ../raw-icc/reference/raw-samples/canon-eos-m200.cr3      # LibRaw-backed — same host binary, unchanged
 ```
 
 ## Verdict: the mechanism works, verified concretely, on Linux — cross-platform packaging and legal sign-off are separate, real work still ahead
@@ -119,6 +123,48 @@ shim; every dimension/CFA/range/mean value matches the direct
 No precision or correctness cost from crossing the FFI/dynamic-loading
 boundary.
 
+## 4. Re-verified with LibRaw itself, not just `rawler` — same host binary, unchanged
+
+ADR 0007 (RAW: LibRaw via FFI, decided after this spike's first pass) named
+a specific gap: the mechanism above was proven with `rawler`, but the
+library actually chosen was LibRaw, and the argument that LibRaw's case is
+simpler was sound reasoning, not independent verification. Closed directly
+rather than left as an assumption: a second shim, `libraw-shim`, wraps
+LibRaw's own C API (via `libraw_rs_vendor`, which vendors and statically
+compiles LibRaw's actual source — no system `libraw-dev` headers needed,
+the same property that made `lcms2-sys` build cleanly in `spike/raw-icc`)
+behind the **identical** `RawImageFfi` layout and exported symbol names as
+`raw-shim`. `host` — the exact same binary, not rebuilt or even
+recompiled — loads either `.so` by path and works with both. That by
+itself is a real, additional confirmation of the design: the C ABI
+boundary is genuinely what matters, not anything specific to `rawler`.
+
+**Both LGPL-2.1 §6(b) conditions re-verified against `liblibraw_shim.so`**,
+the same way as finding 3: `file`/`ldd`/`nm` confirm a real shared object
+with no build-time link and zero LibRaw symbols in `host`; a one-line
+modification (`cfa = *b"MOD!"`), rebuilding only `libraw-shim`, worked
+correctly with the same unmodified `host` binary, exactly reproducing the
+hot-swap result finding 3 got with `rawler`.
+
+**Decode correctness, cross-checked between two independently-coded
+libraries, not just against itself:**
+
+| File | `rawler` (via `raw-shim`) | LibRaw (via `libraw-shim`) |
+|---|---|---|
+| Canon CR3 | 6288×4056, RGGB, [482,16383], mean 1630 | 6288×4056, RGBG, [482,16383], mean 1630 — **exact** |
+| Nikon NEF | 3904×2606, RGGB, [0,4037], mean 500 | 3904×2606, RGBG, [0,4035], mean 500 — max off by 2 |
+| Sony ARW | 6048×4024, RGGB, [475,16380], mean 1804 | 6048×4024, RGBG, [476,16372], mean 1805 — min/max/mean each off by ≤8 |
+
+Dimensions and CFA *pattern* (only the label string differs — `RGGB` vs.
+`RGBG` describe the same physical 2×2 arrangement read in a different
+convention, not a different pattern) match on all three files; pixel
+statistics match exactly on one and closely (single-digit differences, out
+of a 12–14-bit range) on the other two — plausibly different black-level or
+saturation handling between the two decoders, not investigated further
+since it's outside this spike's actual question (packaging mechanism, not
+decoder-accuracy comparison). Recorded honestly rather than rounded up to
+"identical."
+
 ## Scope: what this did *not* touch
 
 - **Only Linux tested.** The same principle (a real shared library, loaded
@@ -136,14 +182,18 @@ boundary.
   works. This proof used the same compiler and same struct layout on both
   sides; real interface compatibility across different builds, is a
   separate, harder property to guarantee and wasn't tested.
-- **LibRaw wasn't prototyped, only `rawler`.** LibRaw is already a mature
-  C++ library with native shared-library build support and its own
-  already-stable C API (no hand-rolled ABI needed) — if Aurora picks LibRaw
-  over `rawler`, this same architecture applies but is *simpler*: link
-  dynamically against `libraw.so`/`.dylib`/`.dll` directly, no custom
-  Rust-side `cdylib` wrapper required at all. This spike deliberately
-  tested the harder case (a pure-Rust LGPL library, which has no native
-  shared-library story at all without exactly this kind of wrapper).
+- **LibRaw was re-verified (finding 4), with one remaining nuance.**
+  `libraw-shim` proves the `cdylib` + hand-written-ABI + `dlopen` mechanism
+  works with LibRaw's own decode calls, not just `rawler`'s — but it does so
+  via `libraw_rs_vendor`, which vendors and *statically* compiles LibRaw's
+  C++ source into the shim `.so`. The even simpler variant ADR 0007
+  describes — linking `aurora-io` dynamically against a *separately
+  packaged* `libraw.so`/`.dylib`/`.dll`, with no custom Rust wrapper at all
+  — is a different, plausible, and probably still-simpler architecture that
+  remains unverified. Both satisfy §6(b) the same way (the LGPL code ends
+  up in its own dynamically-loaded shared object either way); which is
+  preferable is a packaging-convenience question, not a licensing one, and
+  wasn't decided here.
 - **`libheif`** (PRD §14's other named LGPL dependency) — untested; likely
   the same architecture applies (it's already a C library with native
   shared-library support, so closer to the "simpler" LibRaw case above),
@@ -172,23 +222,26 @@ boundary.
 
 ## Recommendations for Phase 3 / ADR 0005+
 
-1. **This architecture (or the simpler LibRaw-native-shared-library variant)
-   is the way to satisfy LGPL for RAW, and is now proven to work
-   mechanically on Linux, not just designed.** Extend to macOS/Windows and
-   define the ABI-versioning story before committing further.
+1. **This architecture is the way to satisfy LGPL for RAW, and is now proven
+   to work mechanically on Linux with the actual chosen library (LibRaw,
+   ADR 0007), not just by analogy from `rawler`.** Extend to macOS/Windows
+   and define the ABI-versioning story before committing further.
 2. **Get real legal review specifically on the §6(b)(1) "already present on
    the user's system" question** before shipping — this spike's reading
    (bundled-but-separate-file satisfies it) is an engineering judgment
    informed by common practice, not a legal conclusion.
-3. **If `rawler` is the RAW library decision, budget the `cdylib` wrapper
-   as real, ongoing engineering** — every new decoder feature `aurora-io`
-   needs from `rawler` needs a corresponding stable C ABI addition to
-   `raw-shim`, maintained across releases. If LibRaw is chosen instead,
-   this cost mostly disappears (its own C API is already the stable
-   interface) — a genuine point in LibRaw's favor that PRD §14's original
-   "prefer pure Rust" framing didn't weigh, because it assumed the
-   licensing question was avoided by choosing Rust rather than made *more*
-   expensive by it (see `spike/raw-icc/FINDINGS.md` finding 2).
+3. **Decide between `libraw-shim`'s vendored-and-statically-compiled
+   approach and a direct dynamic link against a separately packaged
+   `libraw.so`/`.dylib`/`.dll`** — finding 4's remaining open nuance. Both
+   satisfy LGPL the same way; the choice is about build reproducibility
+   (vendoring pins the exact LibRaw version and needs no system package) vs.
+   avoiding a from-source C++ build of LibRaw in Aurora's own build (using
+   whatever the OS/package manager already provides). Since LibRaw already
+   has its own stable C API either way, this is a build-engineering decision
+   with no ongoing hand-rolled-ABI cost regardless of which way it goes —
+   the point PRD §14's "prefer pure Rust" framing missed (see
+   `spike/raw-icc/FINDINGS.md` finding 2): that cost is specific to wrapping
+   `rawler`, not to choosing FFI at all.
 4. **Same discipline as every finding in the PSD and RAW/ICC spikes**: verify
    the actual claim with the actual tool (`file`, `ldd`, `nm`, and a real
    before/after swap test), don't accept "it's a cdylib, therefore it must

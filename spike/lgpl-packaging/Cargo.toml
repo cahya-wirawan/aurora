@@ -8,5 +8,5 @@
 # C ABI, loaded at runtime via dlopen (through `libloading`), not linked
 # into the consuming binary at all.
 [workspace]
-members = ["raw-shim", "host"]
+members = ["raw-shim", "libraw-shim", "host"]
 resolver = "2"

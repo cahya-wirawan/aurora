@@ -1,0 +1,15 @@
+# The LibRaw-backed counterpart to raw-shim -- proves the SAME `host`
+# binary, unchanged, can dlopen either backing library through the
+# identical C ABI. The only crate here touching libraw_rs_vendor (which
+# vendors LibRaw's own LGPL-2.1/CDDL source directly, hence its license).
+[package]
+name = "libraw-shim"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libraw_rs_vendor = "1.0.0"
