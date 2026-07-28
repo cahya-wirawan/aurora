@@ -37,7 +37,7 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
 | Design language | **Owner-approved draft** — [design/](design/README.md); outside critique still needed before it hardens |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
-| RAW / ICC feasibility | Not started |
+| RAW / ICC feasibility | **RAW decodes on all 3 vendors; ICC cross-validated** — but RAW licensing is worse than assumed (finding 2) |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -142,9 +142,10 @@ workspace, same pattern as `spike/`), commit
 - [x] Component gallery skeleton — review surface and golden-image target — [design/gallery/index.html](design/gallery/index.html), owner-approved; covers button/checkbox/slider/field/dropdown/tab bar/tooltip/swatch across forced states; scrollbar/tree/menu/curve editor deliberately left for a later pass
 - [ ] Outside critique on the mockups before they harden (risk R2f mitigation) — owner sign-off is not a second opinion; this is the one remaining item before 0.5 counts as fully complete
 
-### 0.6 Format feasibility — PSD partially done
+### 0.6 Format feasibility — PSD partially done; RAW/ICC spiked
 
-Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
+Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md),
+[spike/raw-icc/FINDINGS.md](spike/raw-icc/FINDINGS.md)
 
 - [x] PSD write spike — layer file with names, alpha, opacity, blend modes, visibility, Unicode names; verified by two independent readers with layer pixels checked
 - [x] **Layer groups** — 2-level nesting, open/closed state, membership, and multiply-blend compositing through nested groups; structural assertions in `verify.sh`, pixel math checked by hand, not just eyeballed
@@ -158,18 +159,18 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md)
 - [x] **`descriptor.rs` audit for finding 14's bug class — one untested path found, cross-checked clean.** Grepped all 5 corpus fixtures for `Objc` (OSType for `Value::Nested`): zero hits — every other value type appears in every fixture and has been exercised through `psd-tools` via findings 14/15, but `Value::Nested` never had real-fixture or independent-reader coverage at all. Confirmed the type is real (not hypothetical) via `psd-tools`' own `gradient-fill.psd` fixture (`GRADIENT_FILL_SETTING.Grad`), but that fixture also needs List/Array support this reader doesn't have (correctly out of scope) — so closed the gap with a synthetic nested descriptor instead, cross-checked against `psd-tools`' own `Descriptor` reader (`cargo run -- --descriptor-audit` + `verify.sh` section 3), the same independent-reader discipline that caught finding 14. **Result: no bug this time** — `psd-tools` accepts our `Value::Nested` encoding correctly. Also fixed a stale doc comment that incorrectly implied `warp` exercised this code path (it doesn't — `warp` is a separate `DescriptorBlock` field). FINDINGS.md finding 16. 22 tests total.
 - [ ] Layer masks, vector masks, smart objects, layer styles, adjustment layers
 - [ ] RLE/ZIP compression, 16/32-bit, CMYK/Lab, PSB
-- [ ] RAW decode spike — `rawler` vs LibRaw FFI, one file per major vendor
-- [ ] ICC transform spike — `lcms2` binding, and the LGPL linking question (PRD §14)
-- [ ] Decide RAW and ICC libraries, record as ADRs
+- [x→bigger] **RAW decode spike — decodes real files on all 3 major vendors; licensing worse than PRD §14 assumed.** `rawler` (pure Rust) decoded real, unedited Canon CR3, Nikon NEF, and Sony ARW files (from raw.pixls.us) correctly on the first attempt — confirmed by rendering each to a crude preview and looking at it, not just checking `decode_file` returned `Ok` (all three are unambiguously real photographs). **But `rawler` itself is LGPL-2.1** — checked directly (`cargo info rawler`), and no permissively-licensed full-featured alternative exists (checked `zenraw` AGPL-3.0, `raw_preview_rs` GPL-3.0, `rawlib` MIT-but-thumbnail-only). This contradicts PRD §14's framing, which discussed LGPL risk only for the FFI option (LibRaw) and treated "prefer pure Rust" as if it avoided the obligation — it doesn't, and Rust's lack of a stable dylib ABI arguably makes the relinking obligation *harder* to satisfy than LibRaw's C-library case, not easier. `deny.toml`'s comment updated to stop implying this risk is C-library-specific. FINDINGS.md findings 1–2.
+- [x→scoped] **ICC transform spike — Little CMS's core is MIT (not LGPL); pure-Rust `moxcms` cross-validated exactly against it.** Checked directly rather than assumed grouped with RAW's risk: Little CMS's core engine is MIT-licensed (only an unused optional plugin is GPL-3), and `lcms2-sys` vendors/statically compiles it — no dynamic-linking packaging burden at all, the cleaner of the two library choices this pair of spikes covered. Cross-validated `moxcms` (pure Rust, already a transitive dependency of `rawler` itself) against `lcms2` on a real sRGB→ECI-RGBv2 transform: **exact agreement to 4 decimal places on every test color**, including out-of-gamut extended-range values — but only after finding `moxcms`'s `allow_extended_range_rgb_xyz` option (off by default; without it, out-of-gamut values silently clamp to [0,1], which would violate invariant §7.3.1b's HDR-values-preserved requirement). Corrects PRD's "no mature pure-Rust ICC engine" risk note. FINDINGS.md findings 3–4.
+- [ ] Decide RAW and ICC libraries, record as ADRs — evidence is now in place (FINDINGS.md); the RAW decision specifically needs Cahya's sign-off given the now-confirmed-unavoidable LGPL packaging architecture question, not just a spike recommendation
 
-### 0.7 Test corpora — not started
+### 0.7 Test corpora — PSD not started; RAW/ICC have a first, minimal set
 
 Assemble *before* the parsers exist, so the parser is written against reality.
 
 - [ ] 1,000 real-world PSDs (Phase 3 gate)
-- [ ] RAW samples per camera vendor
-- [ ] ICC profile set
-- [ ] Fetch scripts (corpora are gitignored — too large to commit)
+- [~] **RAW samples per camera vendor** — one real file each for Canon, Nikon, Sony (`spike/raw-icc/reference/`), enough to answer "does this decode major vendors at all," far short of the eventual multi-body/multi-vendor breadth this item is really asking for
+- [~] **ICC profile set** — two real, CC0-licensed profiles (`sRGB.icc`, `ECI-RGBv2.icc`), same "first, not final" caveat
+- [x] **Fetch scripts (corpora are gitignored — too large to commit)** — `spike/raw-icc/reference/fetch-samples.sh`, same pattern to reuse for the eventual 1,000-PSD corpus
 
 ### 0.8 Re-plan — not started
 
@@ -365,29 +366,35 @@ here so they are not silently lost between phases.
    (R2f mitigation: a solo design owner has no built-in check) before the
    token vocabulary and Dark theme harden into something every widget
    depends on.
-3. **Font resolution, or `FillColor` alpha compositing — the only two real
-   items left in the whole text-layer line of work.** The `descriptor.rs`
-   bug audit is now done: grepped the corpus for `Objc` (zero hits — a
-   completely untested `Value::Nested` path), confirmed the type is real via
-   `psd-tools`' own `gradient-fill.psd`, and closed the gap with a synthetic
-   nested descriptor cross-checked against `psd-tools`' own reader — no bug
-   found this time, but now actually verified rather than assumed safe
-   (FINDINGS.md finding 16). What's left: (a) **font resolution** — render
-   with the document's actual named font (`ResourceDict.FontSet`) instead of
-   the bundled `DejaVuSans.ttf` stand-in; lower-priority, since the
-   internal-consistency question findings 14/15 answer doesn't need
-   font-identical output; (b) **`FillColor` alpha compositing** for a
-   translucent fill — `decode_fill_color` reads RGB only, untested since the
-   real fixture's own color is opaque. Neither is urgent; both are the
-   *last* named gaps in this line of work, everything else having closed
-   over the last several sessions.
+3. **Decide RAW and ICC libraries, record as ADRs** — `spike/raw-icc/FINDINGS.md`
+   now has the evidence: `rawler` decodes real Canon/Nikon/Sony files
+   correctly but is LGPL-2.1 (no permissive full-featured alternative
+   exists); `lcms2` is the licensing-cleaner choice for ICC (Little CMS's
+   core is MIT, vendored/statically compiled, no dynamic-linking burden),
+   and pure-Rust `moxcms` is a real, numerically-verified alternative if a
+   pure-Rust ICC stack is preferred for other reasons. The RAW decision
+   specifically needs Cahya's sign-off, not just a spike recommendation —
+   every viable full-featured option is LGPL, and Rust's lack of a stable
+   dylib ABI makes the relinking-architecture question real regardless of
+   which one is picked, not a cost specific to choosing LibRaw.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
 (finding 5/6 in the a11y results) to see if it fixes both the navigation-depth
 quirk and the live-announcement bug in one change.
 
-**Newly surfaced, not yet scheduled:** glyph rendering into pixel channels on
-text edit (PSD spike finding 8) is mandatory Phase 3 work with no prior line
-item — needs a home in the M1.x/Phase 3 breakdown once Phase 3 is planned in
-detail.
+**Newly surfaced, not yet scheduled:**
+- Glyph rendering into pixel channels on text edit (PSD spike finding 8) is
+  now implemented and externally verified in the spike (finding 14), but the
+  *real* Phase 3 implementation still needs a home in the M1.x/Phase 3
+  breakdown once Phase 3 is planned in detail — the spike proves feasibility,
+  it isn't the shipped feature.
+- **A dynamically-loadable-component packaging architecture for LGPL
+  dependencies** (raw-icc spike finding 2) — required for RAW regardless of
+  library choice, and likely for `libheif` too (untested this session). Not
+  designed or prototyped yet; PRD §14 discussed the *obligation* but not
+  *how* Aurora's build/packaging would actually satisfy it for a
+  statically-linked-by-default Rust binary.
+- Font resolution (`ResourceDict.FontSet`) and `FillColor` alpha compositing
+  remain the two small, non-urgent named gaps in the PSD text-layer line of
+  work (findings 14/15) — pick up whenever, not blocking anything.

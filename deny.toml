@@ -34,6 +34,12 @@ unused-allowed-license = "allow"
 # are permissible only when dynamically linked, which cargo-deny cannot verify.
 # If one is introduced, add a documented exception here alongside an ADR
 # recording how the LGPL relinking obligation is satisfied in packaging.
+#
+# This risk is not C-library-specific: spike/raw-icc/FINDINGS.md finding 2
+# found rawler (the flagship pure-Rust RAW decoder) is ALSO LGPL-2.1, and
+# argued Rust static linking makes the relinking obligation harder to
+# satisfy than the LibRaw/C case this comment originally had in mind, not
+# easier. "Pure Rust" does not imply "avoids this list."
 exceptions = []
 
 [bans]

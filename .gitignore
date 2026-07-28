@@ -57,3 +57,8 @@ crash-reports/
 /spike/*/target/
 /spike/psd-write/out/
 /spike/a11y-ime/result-*.md
+/spike/raw-icc/out/
+# Real camera RAW samples: multi-MB each, PLAN 0.7's "corpora are gitignored"
+# rule. Re-fetch with reference/fetch-samples.sh. ICC profiles in the same
+# reference/ tree are small (CC0) and are committed normally.
+/spike/raw-icc/reference/raw-samples/
