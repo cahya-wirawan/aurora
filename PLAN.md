@@ -39,7 +39,7 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
 | RAW / ICC feasibility | **Libraries decided (ADR 0007/0008); LGPL packaging mechanism proven on Linux with the actual chosen library** — macOS/Windows and legal review remain |
 | Re-plan (PRD §13 Step 7) | **Done.** Durations re-grounded against spike evidence; Q2's answer (solo) reframed the exercise, and the resulting scope question is resolved — Phases 4/5 cut to §9's uncommitted "Beyond v1.0" backlog, Phases 0–3 milestone-based rather than calendar-committed. |
-| Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. First-draft, not user-validated; see 0.9 |
+| Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **First real set** — 319 fixtures, 272/272 open with an independent reader; not the 1,000-file gate. See 0.7 |
 
 **The single most important open item, updated:** on macOS, a screen reader
@@ -340,7 +340,8 @@ rather than deliberately deferred.
   in §4 with no owning FR in §5 — **resolved 2026-07-28** into **FR-028**
   (first-class feature, PRD.md §5). First draft, explicitly a hypothesis
   to argue with rather than a finding — there's no user base yet to have
-  interviewed.
+  interviewed. **Cahya reviewed the Tier-1/2/3 tiering itself 2026-07-28
+  and confirmed no changes needed.**
 
 ---
 
@@ -551,14 +552,7 @@ here so they are not silently lost between phases.
    needs a machine with an active graphical login, which was not available
    this pass. Windows (UIA) is fully unstarted. Both are different platform
    APIs entirely and remain the only thing that can still overturn ADR 0001.
-2. **Get Cahya's read on [docs/workflows.md](docs/workflows.md)'s
-   Tier-1/2/3 calls** — the 95% list is a first draft grounded in general
-   Photoshop usage patterns, not real user input (there are no users yet),
-   and it says so explicitly. Needs a decision on whether the tiers match
-   Cahya's own professional judgment before this list starts being used as
-   the scope-cut arbiter for real. (The Artboards half of this item is
-   done — see below.)
-3. **Grow the PSD corpus toward real-world files, or move on** — 0.7 now
+2. **Grow the PSD corpus toward real-world files, or move on** — 0.7 now
    has 319 real (if synthetic-by-design) fixtures; the harder remaining
    piece is genuine real-world PSDs, which raises consent/licensing
    questions the RAW corpus never had (client artwork, not camera
@@ -569,9 +563,13 @@ here so they are not silently lost between phases.
 colleague reviewed it and signed off as fine for a start, revisable later
 if needed. See 0.5 above.
 
-~~Define the 95%~~ — **done 2026-07-28**, see item 2 above and 0.9.
+~~Define the 95%~~ — **done 2026-07-28**, see 0.9.
 
-~~PSD test corpus~~ — **first set done 2026-07-28**, see item 3 above and 0.7.
+~~PSD test corpus~~ — **first set done 2026-07-28**, see item 2 above and 0.7.
+
+~~Get Cahya's read on docs/workflows.md's Tier-1/2/3 calls~~ — **done
+2026-07-28**: reviewed, no changes needed. The Artboards half was already
+closed as FR-028; this closes the rest of the item.
 
 ~~Artboards product decision~~ — **decided 2026-07-28: first-class
 feature**, not just round-trip fidelity. Now **FR-028 Artboards** in
