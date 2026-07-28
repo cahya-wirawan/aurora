@@ -1,0 +1,14 @@
+# The ONLY crate in this spike that touches an LGPL dependency (rawler).
+# Compiled as a cdylib -- a genuine OS shared library with a hand-written,
+# version-independent C ABI -- never statically linked into anything.
+[package]
+name = "raw-shim"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rawler = "0.7.2"

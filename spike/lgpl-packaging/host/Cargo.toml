@@ -1,0 +1,12 @@
+# Deliberately has NO dependency on rawler or any other LGPL crate -- this
+# binary must contain zero LGPL code. It reaches RAW-decode functionality
+# only by dlopen-ing raw-shim's .so at run time via libloading (ISC
+# licensed), the same mechanism LGPL-2.1 §6(b) describes.
+[package]
+name = "host"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libloading = "0.8"

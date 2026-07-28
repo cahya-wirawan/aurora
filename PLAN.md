@@ -37,7 +37,7 @@ and none should yet. CI green on Linux, macOS, and Windows.
 | Accessibility & IME | **macOS verified (9/10)** — Linux build/tree confirmed, human/Orca leg still outstanding; Windows outstanding |
 | Design language | **Owner-approved draft** — [design/](design/README.md); outside critique still needed before it hardens |
 | PSD write feasibility | Pixel layers/groups **tractable**; text layers **harder than planned** — new mandatory scope found (glyph rendering) |
-| RAW / ICC feasibility | **RAW decodes on all 3 vendors; ICC cross-validated** — but RAW licensing is worse than assumed (finding 2) |
+| RAW / ICC feasibility | **RAW decodes on all 3 vendors; ICC cross-validated; LGPL packaging mechanism proven on Linux** — RAW licensing worse than assumed, but now has a working answer, not just a named risk |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -162,6 +162,7 @@ Evidence: [spike/psd-write/FINDINGS.md](spike/psd-write/FINDINGS.md),
 - [x→bigger] **RAW decode spike — decodes real files on all 3 major vendors; licensing worse than PRD §14 assumed.** `rawler` (pure Rust) decoded real, unedited Canon CR3, Nikon NEF, and Sony ARW files (from raw.pixls.us) correctly on the first attempt — confirmed by rendering each to a crude preview and looking at it, not just checking `decode_file` returned `Ok` (all three are unambiguously real photographs). **But `rawler` itself is LGPL-2.1** — checked directly (`cargo info rawler`), and no permissively-licensed full-featured alternative exists (checked `zenraw` AGPL-3.0, `raw_preview_rs` GPL-3.0, `rawlib` MIT-but-thumbnail-only). This contradicts PRD §14's framing, which discussed LGPL risk only for the FFI option (LibRaw) and treated "prefer pure Rust" as if it avoided the obligation — it doesn't, and Rust's lack of a stable dylib ABI arguably makes the relinking obligation *harder* to satisfy than LibRaw's C-library case, not easier. `deny.toml`'s comment updated to stop implying this risk is C-library-specific. FINDINGS.md findings 1–2.
 - [x→scoped] **ICC transform spike — Little CMS's core is MIT (not LGPL); pure-Rust `moxcms` cross-validated exactly against it.** Checked directly rather than assumed grouped with RAW's risk: Little CMS's core engine is MIT-licensed (only an unused optional plugin is GPL-3), and `lcms2-sys` vendors/statically compiles it — no dynamic-linking packaging burden at all, the cleaner of the two library choices this pair of spikes covered. Cross-validated `moxcms` (pure Rust, already a transitive dependency of `rawler` itself) against `lcms2` on a real sRGB→ECI-RGBv2 transform: **exact agreement to 4 decimal places on every test color**, including out-of-gamut extended-range values — but only after finding `moxcms`'s `allow_extended_range_rgb_xyz` option (off by default; without it, out-of-gamut values silently clamp to [0,1], which would violate invariant §7.3.1b's HDR-values-preserved requirement). Corrects PRD's "no mature pure-Rust ICC engine" risk note. FINDINGS.md findings 3–4.
 - [ ] Decide RAW and ICC libraries, record as ADRs — evidence is now in place (FINDINGS.md); the RAW decision specifically needs Cahya's sign-off given the now-confirmed-unavoidable LGPL packaging architecture question, not just a spike recommendation
+- [x→bigger] **LGPL packaging architecture — proven mechanically on Linux, not just designed.** [spike/lgpl-packaging/](spike/lgpl-packaging/FINDINGS.md): a `cdylib` (`raw-shim`, the only crate touching `rawler`) behind a hand-written `extern "C"` ABI, loaded at run time via `dlopen` (`libloading`, through a separate `host` binary with **zero** `rawler`/LGPL dependency — confirmed with `ldd`/`nm`, not assumed). Both conditions of LGPL-2.1 §6(b) (quoted directly from the license text, not a summary) verified concretely: (1) genuinely dynamic, no build-time link, checked with `file`/`ldd`/`nm`; (2) a modified `raw-shim` (`.so` rebuilt with one line changed) worked correctly with the **same, unmodified, un-recompiled** `host` binary — the actual property the license requires, demonstrated rather than argued. All three real RAW files from the raw-icc spike decoded identically through this mechanism as decoding them directly. **Scope, deliberate: Linux-only, no ABI-versioning story, no macOS/Windows, and this is engineering verification, not legal sign-off** — one specific ambiguity flagged honestly rather than glossed over (§6(b)(1)'s "already present on the user's system" language reads more naturally as a pre-existing system package than an app-bundled file; industry practice treats bundling as sufficient, but that's a judgment call, not a legal conclusion).
 
 ### 0.7 Test corpora — PSD not started; RAW/ICC have a first, minimal set
 
@@ -366,17 +367,20 @@ here so they are not silently lost between phases.
    (R2f mitigation: a solo design owner has no built-in check) before the
    token vocabulary and Dark theme harden into something every widget
    depends on.
-3. **Decide RAW and ICC libraries, record as ADRs** — `spike/raw-icc/FINDINGS.md`
-   now has the evidence: `rawler` decodes real Canon/Nikon/Sony files
-   correctly but is LGPL-2.1 (no permissive full-featured alternative
-   exists); `lcms2` is the licensing-cleaner choice for ICC (Little CMS's
-   core is MIT, vendored/statically compiled, no dynamic-linking burden),
-   and pure-Rust `moxcms` is a real, numerically-verified alternative if a
-   pure-Rust ICC stack is preferred for other reasons. The RAW decision
-   specifically needs Cahya's sign-off, not just a spike recommendation —
-   every viable full-featured option is LGPL, and Rust's lack of a stable
-   dylib ABI makes the relinking-architecture question real regardless of
-   which one is picked, not a cost specific to choosing LibRaw.
+3. **Decide RAW and ICC libraries, record as ADRs** — the evidence is now
+   fully in place across two spikes: `spike/raw-icc/FINDINGS.md` (`rawler`
+   decodes real Canon/Nikon/Sony files correctly but is LGPL-2.1, no
+   permissive full-featured alternative exists; `lcms2` is the
+   licensing-cleaner ICC choice, `moxcms` a real pure-Rust alternative) and
+   `spike/lgpl-packaging/FINDINGS.md` (the LGPL packaging mechanism itself,
+   proven mechanically on Linux — a `cdylib` + hand-written C ABI + `dlopen`
+   satisfies both conditions of LGPL-2.1 §6(b), demonstrated concretely
+   rather than argued). What's left before the ADRs can be written: extend
+   the packaging prototype to macOS/Windows, and get Cahya's sign-off — not
+   just on which crate name to pick, but on the packaging architecture and
+   the one flagged legal ambiguity (§6(b)(1)'s "already present on the
+   user's system" wording), since every viable full-featured RAW option is
+   LGPL and this cost doesn't go away by picking a different library.
 
 Also worth a short, cheap follow-up whenever `aurora-widgets` work starts:
 retry the a11y spike's root node with a plainer role than `Role::Window`
@@ -390,11 +394,18 @@ quirk and the live-announcement bug in one change.
   breakdown once Phase 3 is planned in detail — the spike proves feasibility,
   it isn't the shipped feature.
 - **A dynamically-loadable-component packaging architecture for LGPL
-  dependencies** (raw-icc spike finding 2) — required for RAW regardless of
-  library choice, and likely for `libheif` too (untested this session). Not
-  designed or prototyped yet; PRD §14 discussed the *obligation* but not
-  *how* Aurora's build/packaging would actually satisfy it for a
-  statically-linked-by-default Rust binary.
+  dependencies** (raw-icc spike finding 2) — **now prototyped and verified
+  mechanically on Linux** ([spike/lgpl-packaging/](spike/lgpl-packaging/FINDINGS.md)):
+  a `cdylib` behind a hand-written C ABI, loaded via `dlopen`, both LGPL-2.1
+  §6(b) conditions demonstrated concretely (not just argued). Still open:
+  macOS/`.dylib` and Windows/`.dll` equivalents (same principle, different
+  OS-level mechanics — `install_name`/`RPATH`/DLL search order — all
+  unverified); an ABI-versioning story for real interface-compatibility
+  across independently-built versions, not just this spike's one-line
+  same-compiler edit; and real legal review, specifically on whether
+  bundling the `.so` in Aurora's own installer satisfies §6(b)(1)'s "already
+  present on the user's system" language as cleanly as engineering judgment
+  suggests it does.
 - Font resolution (`ResourceDict.FontSet`) and `FillColor` alpha compositing
   remain the two small, non-urgent named gaps in the PSD text-layer line of
   work (findings 14/15) — pick up whenever, not blocking anything.

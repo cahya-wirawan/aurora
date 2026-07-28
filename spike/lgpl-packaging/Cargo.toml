@@ -1,0 +1,12 @@
+# THROWAWAY. Outside the workspace, like the other spikes.
+#
+# PLAN 0.6 follow-up (raw-icc spike finding 2): LGPL-2.1 §6(b) requires a
+# "suitable shared library mechanism" -- loaded at run time rather than
+# copied into the executable, and replaceable by an interface-compatible
+# modified version. Rust has no stable cross-compiler dylib ABI, so this
+# prototypes the mechanism that does work: a cdylib behind a hand-written
+# C ABI, loaded at runtime via dlopen (through `libloading`), not linked
+# into the consuming binary at all.
+[workspace]
+members = ["raw-shim", "host"]
+resolver = "2"
