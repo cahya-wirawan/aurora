@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-07-28**.
+Last updated: **2026-07-29**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -60,7 +60,7 @@ among the three steps PRD §13 actually names as blocking.
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
-| **Phase 1 — M1.3** | **Started, 2026-07-29.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. Generic over a caller-supplied node payload — this crate is only allowed to depend on `aurora-core`/`aurora-tile`, so it can't know what a node computes, only its shape and dirty state. Tile-granular scheduling, GPU-side compositing, progressive rendering, and async evaluation (all `aurora-render`, which doesn't exist as real code yet) remain. See M1.3 |
+| **Phase 1 — M1.3** | **In progress, 2026-07-29.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render` now has its first real code: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (`ScheduledWork`), 9 tests. GPU-side compositing, progressive rendering, and async evaluation remain — see M1.3 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -643,7 +643,28 @@ every widget in every state across all built-in themes with contrast checks gree
   adjustment mid-stack) — real usage patterns should come from
   `aurora-doc`'s layer-tree integration (M1.4) rather than guessing the
   right shape now without a concrete consumer.
-- [ ] Tile-granular scheduling
+- [x] **Tile-granular scheduling** — done 2026-07-29,
+  `crates/aurora-render/src/schedule.rs` (`aurora-render`'s first real
+  code — the `crate_name()` placeholder is gone), 9 tests. `schedule()`
+  walks a `RenderGraph<N>` in its own topological (insertion) order and,
+  for every node with a dirty region, converts that node-granular
+  document-space `Rect` into the exact grid of 256×256px `TileId`s it
+  overlaps (`tiles_for_rect`) — the translation step between M1.3's
+  already-done node-granular dirty propagation and per-tile execution.
+  Handles the case `aurora_core::Rect`'s own doc comment names (a layer's
+  bounds can extend off-canvas, negative coordinates) by clipping to the
+  document's non-negative tile-index space before converting, rather than
+  panicking or wrapping — covered by a dedicated test alongside single-tile,
+  boundary-crossing, and fully-off-canvas cases. **Deliberately
+  non-destructive** (`peek_dirty`, not `take_dirty`): `RenderGraph` tracks
+  one dirty `Rect` per node, not one per tile, so nothing here can record
+  partial per-tile completion without losing the rest — the same shape of
+  problem `aurora-gpu`'s `TileResidency` upload budgeting was careful to
+  avoid by never marking a skipped tile falsely done. Clearing a node's
+  dirty state is left to whichever future executor (GPU compositing,
+  progressive rendering, async evaluation — all still below) actually
+  commits every tile in its `ScheduledWork`. Full local CI gate
+  (`fmt`/layering/clippy/`cargo test --workspace`) clean.
 - [ ] **GPU-side compositing** — CPU path is the fallback, not the default
 - [ ] Progressive rendering: low mip while interacting, refine when still
 - [ ] Async evaluation — the UI thread never blocks (§7.3.4)

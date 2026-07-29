@@ -3,22 +3,13 @@
 //! See PRD §7.2 for where this crate sits in the workspace layering, and
 //! `docs/adr/` for the decisions that shape it.
 //!
-//! This crate is a skeleton: no functionality is implemented yet.
+//! [`schedule`] is the first piece implemented (PLAN.md M1.3): translating
+//! an `aurora_graph::RenderGraph`'s node-granular dirty regions into
+//! tile-granular work lists. GPU-side compositing, progressive rendering,
+//! and async evaluation are not yet implemented — see [`schedule`]'s own
+//! doc comment for the node-vs-tile dirty-granularity gap those still
+//! need to close.
 
-/// Placeholder so the crate compiles and CI has something to check.
-///
-/// Remove once real types land.
-#[must_use]
-pub const fn crate_name() -> &'static str {
-    "aurora-render"
-}
+mod schedule;
 
-#[cfg(test)]
-mod tests {
-    use super::crate_name;
-
-    #[test]
-    fn reports_its_name() {
-        assert_eq!(crate_name(), "aurora-render");
-    }
-}
+pub use schedule::{ScheduledWork, schedule, tiles_for_rect};
