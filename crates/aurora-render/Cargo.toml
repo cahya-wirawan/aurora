@@ -17,9 +17,7 @@ aurora-core = { workspace = true }
 aurora-tile = { workspace = true }
 aurora-graph = { workspace = true }
 aurora-gpu = { workspace = true }
+half = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 wgpu = { workspace = true }
-
-[dev-dependencies]
-half = { workspace = true }
