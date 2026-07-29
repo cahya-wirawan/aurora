@@ -52,7 +52,19 @@ tempfile = "3"
 criterion = "0.5"
 wgpu = "30"
 pollster = "1"
-winit = "0.30"
+# Default features minus `wayland-csd-adwaita`, plus `wayland-csd-adwaita-crossfont`:
+# the stock feature renders Wayland's fallback window-decoration title text via
+# `sctk-adwaita`'s `ab_glyph` backend, which pulls in `ttf-parser` — confirmed
+# unmaintained (RUSTSEC-2026-0192, `cargo deny check advisories`), no safe upgrade
+# available. `crossfont` (system font libraries, no `ttf-parser`) is winit's own
+# alternative for the same feature, not a fork or a deny.toml exception.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+    "wayland-csd-adwaita-crossfont",
+] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
