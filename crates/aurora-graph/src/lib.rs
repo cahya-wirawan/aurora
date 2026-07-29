@@ -1,24 +1,23 @@
 //! Render graph: node definitions, dirty tracking, and scheduling.
 //!
 //! See PRD §7.2 for where this crate sits in the workspace layering, and
-//! `docs/adr/` for the decisions that shape it.
+//! `docs/adr/` for the decisions that shape it. `aurora-graph` may depend
+//! only on `aurora-core` and `aurora-tile` — it owns the *shape* of the
+//! render graph (nodes, dependency edges, dirty regions) and has no
+//! opinion on what a node actually computes. That's `aurora-render`'s job
+//! to execute and `aurora-filters`'/`aurora-doc`'s job to define, both
+//! layered above this crate — [`RenderGraph`] is generic over a
+//! caller-supplied payload for exactly that reason.
 //!
-//! This crate is a skeleton: no functionality is implemented yet.
+//! Node definitions, the dependency DAG, and dirty-region propagation
+//! (PLAN.md M1.3) are implemented. Node removal/edge rewiring and
+//! tile-granular scheduling are not yet — see `RenderGraph`'s own doc
+//! comment.
 
-/// Placeholder so the crate compiles and CI has something to check.
-///
-/// Remove once real types land.
-#[must_use]
-pub const fn crate_name() -> &'static str {
-    "aurora-graph"
-}
+mod error;
+mod graph;
+mod node;
 
-#[cfg(test)]
-mod tests {
-    use super::crate_name;
-
-    #[test]
-    fn reports_its_name() {
-        assert_eq!(crate_name(), "aurora-graph");
-    }
-}
+pub use error::GraphError;
+pub use graph::RenderGraph;
+pub use node::{Node, NodeId};

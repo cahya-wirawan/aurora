@@ -60,6 +60,7 @@ among the three steps PRD §13 actually names as blocking.
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
+| **Phase 1 — M1.3** | **Started, 2026-07-29.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. Generic over a caller-supplied node payload — this crate is only allowed to depend on `aurora-core`/`aurora-tile`, so it can't know what a node computes, only its shape and dirty state. Tile-granular scheduling, GPU-side compositing, progressive rendering, and async evaluation (all `aurora-render`, which doesn't exist as real code yet) remain. See M1.3 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -611,7 +612,37 @@ every widget in every state across all built-in themes with contrast checks gree
 
 ### M1.3 — Render graph and renderer (`aurora-graph`, `aurora-render`)
 
-- [ ] Node definitions, dependency graph, dirty propagation
+- [x] **Node definitions, dependency graph, dirty propagation** — done
+  2026-07-29, `crates/aurora-graph/src/{node,graph,error}.rs`, 12 tests.
+  `RenderGraph<N>` is generic over a caller-supplied payload `N` rather
+  than defining concrete node kinds itself — `aurora-graph` may only
+  depend on `aurora-core`/`aurora-tile` (PRD §7.2), so it structurally
+  cannot know what a "curves adjustment" or "smart object" node computes;
+  that's `aurora-filters`'/`aurora-doc`'s job, layered above it, with
+  `aurora-render` executing whatever the payload turns out to be. Reuses
+  `aurora_core::Id<Node>` directly (its own doc comment already named
+  `Id<Node>` as an intended use case) rather than inventing a new id type.
+  DAG-by-construction, not by a separate cycle check: `add_node` requires
+  every input to already exist, so a node can only ever depend on nodes
+  created before it — a cycle back to an ancestor is structurally
+  unreachable, and the same property makes insertion order always a
+  valid topological order for free (`RenderGraph::iter`). Dirty
+  propagation (`mark_dirty`/`take_dirty`/`peek_dirty`) mirrors
+  `aurora_tile::Tile`'s own `Option<Rect>` + `Rect::union` accumulation
+  idiom exactly, BFS'd forward to every transitive dependent with a
+  `visited` set (needed for diamond-shaped dependencies — two paths
+  reconverging on one node — so a shared descendant is unioned into once
+  per call, not once per incoming path). **Deliberately conservative**:
+  propagates the same region unchanged at every step rather than growing
+  it per node (e.g. a blur widening its footprint by its radius) — this
+  crate has no way to know what a node computes, so identity propagation
+  is the safe default; a kernel-aware growth hook is future work once
+  `aurora-filters` node payloads can answer "how far does this operation's
+  influence reach." **Deliberately out of scope for this pass**: node
+  removal and edge rewiring (delete a layer, reorder, insert an
+  adjustment mid-stack) — real usage patterns should come from
+  `aurora-doc`'s layer-tree integration (M1.4) rather than guessing the
+  right shape now without a concrete consumer.
 - [ ] Tile-granular scheduling
 - [ ] **GPU-side compositing** — CPU path is the fallback, not the default
 - [ ] Progressive rendering: low mip while interacting, refine when still
@@ -780,16 +811,21 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**M1.1 is complete; M1.2 is nearly complete** — device/queue management,
-the shader library/pipeline cache, GPU tile residency, budgeted upload
-scheduling, and surface configuration/resize are all implemented and
-verified against real GPU hardware — the crate's own test suite and the
-new `examples/surface_smoke.rs` both now pass against a real Metal GPU
-(2026-07-29), on top of the existing Vulkan verification. Next up in
-M1.2: **DX12 (Windows)** — the only backend with zero real-GPU runs
-against this crate, and genuinely not doable from this machine alone
-(needs Windows hardware, same cross-platform constraint the vertical
-slice and a11y spikes have hit throughout Phase 0).
+**M1.1 is complete; M1.2 is nearly complete; M1.3 has started** —
+device/queue management, the shader library/pipeline cache, GPU tile
+residency, budgeted upload scheduling, and surface configuration/resize
+are all implemented and verified against real GPU hardware — the crate's
+own test suite and the new `examples/surface_smoke.rs` both now pass
+against a real Metal GPU (2026-07-29), on top of the existing Vulkan
+verification. The only thing left in M1.2 is **DX12 (Windows)** — the
+only backend with zero real-GPU runs against this crate, and genuinely
+not doable from this machine alone (needs Windows hardware, same
+cross-platform constraint the vertical slice and a11y spikes have hit
+throughout Phase 0). In parallel, `aurora-graph`'s node definitions,
+dependency DAG, and dirty-region propagation are done (2026-07-29, 12
+tests) — next up in M1.3 is tile-granular scheduling, then handing off to
+`aurora-render` (GPU-side compositing, progressive rendering, async
+evaluation), none of which exists as real code yet.
 
 **A live desktop session, whenever one is available, still has one thing
 waiting on it**: the a11y human/Orca leg below. The other item that used
