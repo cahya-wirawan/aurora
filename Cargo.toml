@@ -52,6 +52,7 @@ tempfile = "3"
 criterion = "0.5"
 wgpu = "30"
 pollster = "1"
+winit = "0.30"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

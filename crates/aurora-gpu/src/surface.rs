@@ -1,14 +1,20 @@
 //! Windowed presentation: a configured `wgpu::Surface` plus resize
 //! handling.
 //!
-//! **Unverified against a real window in this environment** — this
-//! machine has no usable display (the only X server present is owned by
-//! `gdm` with an `Xauthority` this user can't read, the same "GDM
-//! greeter only, no live session" gap `spike/a11y-ime/FINDINGS.md`
-//! already documented blocking the Linux Orca leg). The code follows
-//! `spike/vertical-slice`'s own proven windowed setup and wgpu's
-//! documented API; real end-to-end verification needs a live desktop
-//! session, tracked in `PLAN.md` alongside that same Orca-leg gap.
+//! **Verified against a real window, 2026-07-29** — `examples/surface_smoke.rs`
+//! opens a real `winit` window on a live macOS desktop session (a different
+//! machine than the one that wrote this file originally; that one had no
+//! usable display, the same "GDM greeter only" gap `spike/a11y-ime/FINDINGS.md`
+//! documented for the Linux Orca leg). Two runs confirmed: `create_surface`
+//! against the same headless-created adapter this crate already uses
+//! (`AMD Radeon Pro 5300M`, Metal — the vertical slice's own GPU) succeeds
+//! and configures correctly (`Bgra8UnormSrgb`, physical size reflecting the
+//! display's 2x scale factor); `resize` handles both a real `WindowEvent::Resized`
+//! and the synchronous-return case `request_inner_size` can take instead
+//! (see that method's doc comment — no event follows on some platforms);
+//! and 150 acquire/clear/present cycles ran with no panics and a clean
+//! exit. Not yet run on Windows/Linux with a live session, or against
+//! DX12/Vulkan — see `PLAN.md` M1.2.
 
 use crate::GpuError;
 use crate::context::GpuContext;

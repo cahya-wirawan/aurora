@@ -33,12 +33,14 @@ than the tidiness.
 size) settled alongside it. **M1.2 (`aurora-gpu`) is in progress**:
 device/queue management, the shader library/pipeline cache, GPU tile
 residency (with toroidal slot addressing, the bullet PLAN.md itself
-flagged as risky), and budgeted upload scheduling are all done, verified
-against a real GPU on this machine with actual rendered/uploaded-pixel
-checks. Surface configuration/resize is implemented but **blocked on
-verification** — no usable display exists in this environment, the same
-"GDM greeter only" gap the a11y Orca leg already hit. Cross-platform
-validation (DX12/Metal/Vulkan) is the one bullet not yet started. CI green on Linux, macOS, and
+flagged as risky), budgeted upload scheduling, and surface configuration/
+resize are all done and verified against real GPU hardware — the first
+four on this machine's Vulkan GPU, surface configuration/resize on a
+different machine's live macOS/Metal session (2026-07-29,
+`examples/surface_smoke.rs`) once that display finally became available,
+closing the "GDM greeter only" gap the a11y Orca leg also hit. Only
+cross-platform validation (DX12 specifically — Vulkan and Metal are now
+both real) is not yet started. CI green on Linux, macOS, and
 Windows. The remaining Phase 0 items (ADR 0006, Windows/300k-px slice
 re-runs, macOS/Windows LGPL packaging, deeper PSD format coverage)
 continue in the background rather than gating Phase 1 — none of them are
@@ -57,7 +59,7 @@ among the three steps PRD §13 actually names as blocking.
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
-| **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented but **blocked on a live-display verification** this environment can't provide — same "GDM greeter only" gap as the a11y Orca leg. A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). Only cross-platform validation (DX12/Metal/Vulkan) is fully unstarted. See M1.2 |
+| **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -483,7 +485,7 @@ every widget in every state across all built-in themes with contrast checks gree
   device on this machine's actual GPU, not a mock: `adapter_info()`
   confirms **NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu** — the same
   hardware `spike/FINDINGS.md`'s Linux/Vulkan numbers came from.
-- [!] **Surface configuration and resize** — implemented 2026-07-29,
+- [x] **Surface configuration and resize** — implemented 2026-07-29,
   `crates/aurora-gpu/src/surface.rs`, `GpuContext::create_surface` +
   `GpuSurface` (`format`/`size`/`resize`/`acquire`). Ports
   `spike/vertical-slice`'s windowed setup (`get_default_config` + forced
@@ -494,18 +496,40 @@ every widget in every state across all built-in themes with contrast checks gree
   than the older `Result<SurfaceTexture, SurfaceError>` shape, confirmed
   by reading wgpu 30's own source rather than assumed from older docs.
   `resize` no-ops on a zero-sized request (minimized-window guard, a real
-  wgpu gotcha). No new dependency: `impl Into<wgpu::SurfaceTarget<'_>>`
-  is wgpu's own flexible target type, so `aurora-gpu` needs neither
-  `winit` nor `raw-window-handle` directly. **Blocked, same as the a11y
-  Orca leg**: this machine has no usable display to create a real window
-  against — the only X server present (`/tmp/.X11-unix/X0`) is owned by
-  `gdm` with an `Xauthority` this user can't read, the identical "GDM
-  greeter only, no live session" gap `spike/a11y-ime/FINDINGS.md` already
-  named, and no `Xvfb`/virtual display server is installed. The code is
-  real and matches wgpu's documented API and the spike's proven pattern,
-  but is genuinely unverified against an actual window — not silently
-  marked done. Verifying it needs the same live desktop session the Orca
-  leg is waiting on.
+  wgpu gotcha). No new dependency in the library crate itself: `impl
+  Into<wgpu::SurfaceTarget<'_>>` is wgpu's own flexible target type, so
+  `aurora-gpu` needs neither `winit` nor `raw-window-handle` directly.
+  **Verified 2026-07-29 against a real window** — this bullet was
+  previously blocked by the same "GDM greeter only, no live session" gap
+  `spike/a11y-ime/FINDINGS.md` documented for the Linux Orca leg, on the
+  machine that wrote this code. This verification pass ran on a
+  different machine with a real, logged-in macOS desktop session (the
+  same one `spike/FINDINGS.md`'s macOS numbers and the a11y spike's
+  VoiceOver pass came from), so the blocker didn't apply. Added `winit`
+  as a dev-dependency (`workspace.dependencies`, reused by `aurora-app`
+  when M1.8 needs it — declared centrally per this project's own stated
+  practice rather than pinned twice) and
+  `crates/aurora-gpu/examples/surface_smoke.rs`: opens a real window,
+  creates the surface against the same headless-created adapter this
+  crate already uses (confirmed: `AMD Radeon Pro 5300M`, Metal — the
+  vertical slice's own GPU, so the adapter this crate requests with
+  `compatible_surface: None` does turn out to support presenting on this
+  hardware, though `context.rs`'s own comment is right that this isn't
+  guaranteed by the API), runs 150 acquire/clear/present cycles, and
+  triggers two real resizes via `request_inner_size`. One thing the first
+  run caught that a written-blind implementation wouldn't have surfaced:
+  `request_inner_size` can apply synchronously and skip the
+  `WindowEvent::Resized` event entirely (confirmed in its own doc
+  comment) — `surface_smoke.rs` handles both paths through one shared
+  `apply_resize` rather than assuming the event always fires. Two runs,
+  same result both times: adapter/format/size logged correctly (physical
+  size reflects the display's 2x Retina scale factor), 4 resize events
+  processed (2 harmless same-size ones from window creation itself, then
+  the 2 intentional ones, both landing at the requested physical size),
+  zero panics, clean exit. Not yet run on Windows with a live session
+  (this crate's whole real-GPU test suite passed on this same Metal
+  machine too, see below), and DX12 remains the one backend with no real
+  runs at all.
 - [x] **Shader library and WGSL pipeline cache** — done 2026-07-28,
   `crates/aurora-gpu/src/{shader,pipeline}.rs`, 3 new tests (4 total in
   the crate). `ShaderLibrary` eagerly compiles named WGSL modules
@@ -576,7 +600,14 @@ every widget in every state across all built-in themes with contrast checks gree
   budgeting exists: a 4-tile grid with a 2-tile budget uploads 2 the
   first call (`remaining == 2`), the other 2 the second call
   (`remaining == 0`), and 0 the third (steady state).
-- [ ] Validate on DX12, Metal, Vulkan
+- [~] **Validate on DX12, Metal, Vulkan** — Vulkan done (this machine's
+  RTX 3090, all of M1.2). **Metal done, 2026-07-29**: all 7 of this
+  crate's real-GPU tests (`context`, `pipeline`, `render_test`,
+  `residency` ×2, `residency_test`, `shader`) pass against a real `AMD
+  Radeon Pro 5300M`, plus the new `examples/surface_smoke.rs` windowed
+  check above — same machine as the vertical slice's and a11y spike's
+  macOS numbers. **DX12 (Windows) is the only backend with zero real-GPU
+  runs against this crate so far.**
 
 ### M1.3 — Render graph and renderer (`aurora-graph`, `aurora-render`)
 
@@ -752,21 +783,22 @@ here so they are not silently lost between phases.
 **M1.1 is complete; M1.2 is nearly complete** — device/queue management,
 the shader library/pipeline cache, GPU tile residency, budgeted upload
 scheduling, and surface configuration/resize are all implemented and
-(except surface/resize) verified against this machine's real GPU. Next
-up in M1.2: **validate on DX12, Metal, Vulkan** — the one bullet not yet
-started, and genuinely not doable from this machine alone (needs Windows
-and macOS hardware, same cross-platform constraint the vertical slice and
-a11y spikes have hit throughout Phase 0).
+verified against real GPU hardware — the crate's own test suite and the
+new `examples/surface_smoke.rs` both now pass against a real Metal GPU
+(2026-07-29), on top of the existing Vulkan verification. Next up in
+M1.2: **DX12 (Windows)** — the only backend with zero real-GPU runs
+against this crate, and genuinely not doable from this machine alone
+(needs Windows hardware, same cross-platform constraint the vertical
+slice and a11y spikes have hit throughout Phase 0).
 
-**A live desktop session, whenever one is available, now has two things
-waiting on it, not one** — bundle them: the a11y/Orca check below, and a
-real windowed smoke-test of `aurora-gpu`'s `GpuSurface` (create a window,
-configure a surface, resize it, confirm `acquire()` returns
-`Success`/`Suboptimal` rather than an error). Neither blocks Phase 1
-(Cahya explicitly decided not to block on the a11y check, PLAN.md 0.4;
-`GpuSurface`'s own code is complete, just unverified) — both are real,
-open verification tasks for whenever a genuine graphical login exists on
-a Linux box, plus separately on Windows and macOS.
+**A live desktop session, whenever one is available, still has one thing
+waiting on it**: the a11y human/Orca leg below. The other item that used
+to be listed here — a real windowed smoke-test of `aurora-gpu`'s
+`GpuSurface` — **is done, 2026-07-29** (see M1.2 above and
+`crates/aurora-gpu/examples/surface_smoke.rs`): a different machine than
+the one that wrote the surface code turned out to have a real, logged-in
+macOS session, the same kind of access the Orca leg is still waiting for
+on Linux/Windows.
 
 - **Run the human/Orca leg of the a11y/IME checklist on Linux, and the whole
   checklist on Windows** — macOS is done (9/10,
@@ -776,14 +808,12 @@ a Linux box, plus separately on Windows and macOS.
   needs a machine with an active graphical login, which was not available
   this pass. Windows (UIA) is fully unstarted. Both are different platform
   APIs entirely and remain the only thing that can still overturn ADR 0001.
-- **Smoke-test `GpuSurface` against a real window** — `crates/aurora-gpu/src/surface.rs`
-  is implemented and passes the full local CI gate, but has never created
-  an actual `wgpu::Surface` against a real window: this machine's only X
-  server is owned by `gdm` with an unreadable `Xauthority` (no live user
-  session), the same gap blocking the Orca leg above, and no virtual
-  display server (`Xvfb` etc.) is installed. Not a design risk like the
-  toroidal-addressing bullet was — it's a direct port of the spike's own
-  proven windowed setup — but genuinely unverified, not assumed working.
+
+~~Smoke-test `GpuSurface` against a real window~~ — **done 2026-07-29**:
+`examples/surface_smoke.rs` opened a real window on a live macOS session,
+configured a surface against this crate's existing headless-created
+adapter, ran 150 acquire/clear/present cycles, and handled two real
+resizes with no panics. See M1.2 above and `surface.rs`'s module doc.
 
 ~~Get outside critique on the 0.5 design scaffold~~ — **done 2026-07-28**: a
 colleague reviewed it and signed off as fine for a start, revisable later

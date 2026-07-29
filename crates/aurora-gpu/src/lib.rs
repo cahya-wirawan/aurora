@@ -7,9 +7,12 @@
 //!
 //! Device/queue management, the shader library/pipeline cache, GPU tile
 //! residency, budgeted upload scheduling, and surface configuration/resize
-//! are all implemented — M1.2 is complete. The surface/resize path
-//! ([`GpuSurface`]) is real but unverified against an actual window in
-//! this environment; see its module doc.
+//! are all implemented and verified against real GPU hardware — the
+//! surface/resize path ([`GpuSurface`]) against a real window, on a live
+//! macOS desktop session (`examples/surface_smoke.rs`); see its module doc.
+//! Every module has now run against real hardware on Vulkan (Linux) and
+//! Metal (macOS); only DX12 (Windows) remains unvalidated — see `PLAN.md`
+//! M1.2.
 
 mod context;
 mod error;
