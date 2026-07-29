@@ -60,7 +60,7 @@ among the three steps PRD §13 actually names as blocking.
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
-| **Phase 1 — M1.3** | **In progress, 2026-07-29.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render` now has its first real code: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (`ScheduledWork`), 9 tests. GPU-side compositing, progressive rendering, and async evaluation remain — see M1.3 |
+| **Phase 1 — M1.3** | **In progress, 2026-07-29.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests), and `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware). Progressive rendering and async evaluation remain — see M1.3 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -665,7 +665,33 @@ every widget in every state across all built-in themes with contrast checks gree
   progressive rendering, async evaluation — all still below) actually
   commits every tile in its `ScheduledWork`. Full local CI gate
   (`fmt`/layering/clippy/`cargo test --workspace`) clean.
-- [ ] **GPU-side compositing** — CPU path is the fallback, not the default
+- [x] **GPU-side compositing** — done 2026-07-29,
+  `crates/aurora-render/src/composite.rs` (`TileCompositor`) +
+  `src/shaders/composite.wgsl`, 3 tests, all against real GPU hardware
+  (this machine's RTX 3090/Vulkan). Directly answers `spike/FINDINGS.md`
+  finding #1 (CPU per-tile merging measured at ~20ms, the real
+  compositing bottleneck, not disk I/O): blends a source tile over a
+  destination tile via the GPU's fixed-function alpha blend unit
+  (`aurora_gpu::Blend::AlphaBlending`, `LoadOp::Load` to preserve the
+  destination's existing content) instead of a CPU pixel loop. Verified
+  with real pixel-readback checks, not just "it ran": opaque-over-blended
+  math confirmed to the exact expected half-float value, a
+  fully-transparent source confirmed to leave the destination bit-for-bit
+  unchanged (catches a "blend ignored" regression a same-color test
+  couldn't), and a third test confirms the pipeline cache actually caches
+  (`PipelineCache::get_or_create_with`, reused unchanged from `aurora-gpu`).
+  Self-contained, same shape as `TileResidency` — owns its own shader
+  module, bind group layout, sampler, and pipeline cache, since nothing
+  yet coordinates multiple GPU passes across a frame. **Deliberately
+  minimal**: blends exactly one tile over one tile with no blend-mode or
+  opacity parameter — those are a layer's properties, and `aurora-doc`'s
+  layer model (M1.4) doesn't exist yet; `aurora-render` sits below it in
+  the layering and structurally cannot know either. This is the primitive
+  real layer compositing will call once that model exists, not a
+  document-level compositor on its own. `aurora-render`'s own real-GPU
+  test lock (`src/test_support.rs`) duplicates `aurora-gpu`'s — a separate
+  test binary, so `aurora-gpu`'s own lock doesn't cover it. Full local CI
+  gate clean.
 - [ ] Progressive rendering: low mip while interacting, refine when still
 - [ ] Async evaluation — the UI thread never blocks (§7.3.4)
 
@@ -844,9 +870,11 @@ not doable from this machine alone (needs Windows hardware, same
 cross-platform constraint the vertical slice and a11y spikes have hit
 throughout Phase 0). In parallel, `aurora-graph`'s node definitions,
 dependency DAG, and dirty-region propagation are done (2026-07-29, 12
-tests) — next up in M1.3 is tile-granular scheduling, then handing off to
-`aurora-render` (GPU-side compositing, progressive rendering, async
-evaluation), none of which exists as real code yet.
+tests), and `aurora-render` now has real code on top of it: `schedule()`
+(node-granular dirty `Rect`s → tile-granular work lists) and
+`TileCompositor` (GPU source-over blending of one tile over another,
+real-hardware-verified) — 12 tests total. Progressive rendering and async
+evaluation remain before M1.3 is done.
 
 **A live desktop session, whenever one is available, still has one thing
 waiting on it**: the a11y human/Orca leg below. The other item that used

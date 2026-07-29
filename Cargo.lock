@@ -273,8 +273,10 @@ dependencies = [
  "aurora-gpu",
  "aurora-graph",
  "aurora-tile",
+ "half",
  "thiserror 2.0.19",
  "tracing",
+ "wgpu",
 ]
 
 [[package]]

@@ -3,13 +3,18 @@
 //! See PRD §7.2 for where this crate sits in the workspace layering, and
 //! `docs/adr/` for the decisions that shape it.
 //!
-//! [`schedule`] is the first piece implemented (PLAN.md M1.3): translating
-//! an `aurora_graph::RenderGraph`'s node-granular dirty regions into
-//! tile-granular work lists. GPU-side compositing, progressive rendering,
-//! and async evaluation are not yet implemented — see [`schedule`]'s own
-//! doc comment for the node-vs-tile dirty-granularity gap those still
-//! need to close.
+//! [`schedule`] translates an `aurora_graph::RenderGraph`'s node-granular
+//! dirty regions into tile-granular work lists (PLAN.md M1.3).
+//! [`TileCompositor`] executes the GPU half of that work: blending one
+//! tile over another via the GPU's fixed-function alpha blend unit,
+//! replacing the CPU per-pixel merge `spike/FINDINGS.md` finding #1 named
+//! as the real compositing bottleneck. Progressive rendering and async
+//! evaluation are not yet implemented.
 
+mod composite;
 mod schedule;
+#[cfg(test)]
+mod test_support;
 
+pub use composite::TileCompositor;
 pub use schedule::{ScheduledWork, schedule, tiles_for_rect};

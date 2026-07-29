@@ -19,3 +19,7 @@ aurora-graph = { workspace = true }
 aurora-gpu = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+wgpu = { workspace = true }
+
+[dev-dependencies]
+half = { workspace = true }
