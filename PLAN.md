@@ -60,7 +60,7 @@ among the three steps PRD §13 actually names as blocking.
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
-| **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` (box-filters a tile down to a `MipLevel`, 7 tests) and `preview::upload_preview` (wires a downsampled tile through to `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware, 2 tests) are both done. Picking a level from interaction state and async evaluation remain — see M1.3 |
+| **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -756,7 +756,36 @@ every widget in every state across all built-in themes with contrast checks gree
     an actual interactive canvas exists to drive them, which is later
     Phase 1 work (`aurora-doc`, `aurora-app`).
   Full local CI gate clean throughout.
-- [ ] Async evaluation — the UI thread never blocks (§7.3.4)
+- [~] **Async evaluation — the UI thread never blocks (§7.3.4)** —
+  first piece done 2026-07-30, `crates/aurora-render/src/executor.rs`
+  (`Executor`, `TaskId`), 5 tests. A dedicated background thread runs
+  submitted work; `submit` never blocks (unbounded channel, so a caller
+  is never stalled queuing work) and `drain_completed` never blocks
+  either (reports whatever finished so far). Deliberately the same shape
+  as `aurora_tile::writer::BackgroundWriter`, which already proved this
+  exact pattern for scratch-disk writes — generalized here to arbitrary
+  render work. Deliberately **not** `tokio`: one thread draining one
+  queue doesn't need an async runtime, and CLAUDE.md is explicit that
+  `tokio` is for I/O/background work, not the render loop. Runs plain
+  closures rather than a typed "render task," mirroring why
+  `RenderGraph<N>` stays generic over its node payload: what "evaluating
+  a node" means needs `aurora-doc`/`aurora-filters` to define, and
+  neither exists yet. Verified deterministically — `join()` blocks until
+  submitted work has actually run, so tests confirm real execution and
+  `drain_completed` reporting without any sleep-based polling — plus the
+  same "1000 submits complete in well under a second" non-blocking proof
+  `BackgroundWriter`'s own test uses. **Known, accepted limitation
+  documented on the type**: a panicking task kills the background
+  thread's loop, silently dropping every task submitted afterward — same
+  failure shape `BackgroundWriter` already has, not solved here for the
+  same reason (this workspace denies `panic`/`unwrap`/`expect`
+  everywhere, so a task panicking is a caller bug, not a condition to
+  route around). **Not yet done**: nothing actually runs *through*
+  `Executor` yet — no caller submits real render work to it, because
+  there is no real render-graph node evaluation to submit until
+  `aurora-doc`/`aurora-filters` exist. This is the same "primitive built,
+  no concrete consumer yet" shape progressive rendering's still-open
+  policy work is in. Full local CI gate clean.
 
 ### M1.4 — Document model (`aurora-doc`)
 
@@ -941,10 +970,17 @@ and progressive rendering's CPU half (`mip::downsample`) and GPU half
 added to `aurora_gpu::TileResidency`'s atlas — `upload_mip`, verified
 end-to-end against real hardware, store through to atlas readback) — 21
 tests in `aurora-render`, plus 2 new validation tests and a real
-pixel-readback test in `aurora-gpu` itself (10 total there now). Only the
-interaction-state policy (when to actually request a lower level) is left
-of progressive rendering, and it has no consumer to drive it yet — no
-input/app layer exists. Async evaluation hasn't started.
+pixel-readback test in `aurora-gpu` itself (10 total there now).
+`aurora-render` also has async evaluation's first piece now:
+`Executor`, a background thread that runs submitted work without
+blocking the caller (`submit`/`drain_completed` both non-blocking, same
+shape as `aurora_tile::writer::BackgroundWriter`), 5 tests — 26 total in
+`aurora-render`. **M1.3's remaining gap in both progressive rendering and
+async evaluation is the same shape**: real primitives exist
+(downsampling, atlas upload, a background executor) but nothing yet
+calls them with real work, because there's no render-graph node
+evaluation to call them *with* — that needs `aurora-doc`/`aurora-filters`,
+neither of which exists. M1.4 (`aurora-doc`) is the natural next step.
 
 **A live desktop session, whenever one is available, still has one thing
 waiting on it**: the a11y human/Orca leg below. The other item that used
