@@ -274,6 +274,7 @@ dependencies = [
  "aurora-graph",
  "aurora-tile",
  "half",
+ "tempfile",
  "thiserror 2.0.19",
  "tracing",
  "wgpu",

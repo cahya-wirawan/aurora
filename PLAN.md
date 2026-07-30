@@ -59,8 +59,8 @@ among the three steps PRD §13 actually names as blocking.
 | Define the 95% (PRD §13 Step 2) | **Done** — [docs/workflows.md](docs/workflows.md), 2026-07-28. Cahya-reviewed, tiering confirmed; see 0.9 |
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
-| **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
-| **Phase 1 — M1.3** | **In progress, 2026-07-29.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); `mip::downsample` box-filters a tile down to a `MipLevel`, progressive rendering's first piece (6 tests). Wiring a downsampled tile into the GPU atlas, picking a level from interaction state, and async evaluation remain — see M1.3 |
+| **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
+| **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` (box-filters a tile down to a `MipLevel`, 7 tests) and `preview::upload_preview` (wires a downsampled tile through to `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware, 2 tests) are both done. Picking a level from interaction state and async evaluation remain — see M1.3 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -693,29 +693,69 @@ every widget in every state across all built-in themes with contrast checks gree
   test binary, so `aurora-gpu`'s own lock doesn't cover it. Full local CI
   gate clean.
 - [~] **Progressive rendering: low mip while interacting, refine when still**
-  — started 2026-07-29, `crates/aurora-render/src/mip.rs` (`MipLevel`,
-  `downsample`), 6 tests. This is the resolution-reduction primitive
-  `spike/FINDINGS.md` finding #3 calls for directly ("rendering a
-  lower-resolution mip while panning fast, refining when motion stops" —
-  named as the mitigation for the ~18 MB/screenful upload-bandwidth
-  ceiling a fast pan hits): box-filters a tile's texels down to a closed
-  set of power-of-two levels (`Full`/`Half`/`Quarter`/`Eighth`, each an
-  exact divisor of `TILE` by construction, so no remainder handling
-  anywhere). Summed in `f32` per ADR 0003's compute-precision floor, not
-  accumulated in `f16`. Verified with real numeric checks, not just
-  shape: a uniform tile stays exactly uniform under any level (values
-  chosen with exact `f16` representations, a real bit-exact check); a
-  row-alternating checkerboard averages to exactly the midpoint at
-  `Half`, where each 2×2 source block provably contains one of each
-  colour; and a row-index-encoded gradient confirms the *correct* source
-  block is read (catches an off-by-one or shifted-range bug a
-  uniform-input test can't). **Not yet done, and explicitly still open**:
-  choosing a `MipLevel` from real interaction state (that policy needs an
-  "is the user actively panning" signal this crate doesn't have any
-  source for yet), and the GPU half — uploading a downsampled tile into
-  `aurora_gpu::TileResidency`'s atlas and sampling it back at reduced
-  resolution, which touches that crate's atlas/texture and `canvas.wgsl`
-  and hasn't been started. Full local CI gate clean.
+  — CPU and GPU halves both done 2026-07-30; only the interaction-state
+  policy remains. This is `spike/FINDINGS.md` finding #3's direct
+  mitigation ("rendering a lower-resolution mip while panning fast,
+  refining when motion stops" — named for the ~18 MB/screenful
+  upload-bandwidth ceiling a fast pan hits).
+  - [x] **CPU half: `crates/aurora-render/src/mip.rs`** (`MipLevel`,
+    `downsample`), 7 tests. Box-filters a tile's texels down to a closed
+    set of power-of-two levels (`Full`/`Half`/`Quarter`/`Eighth`, each an
+    exact divisor of `TILE` by construction, so no remainder handling
+    anywhere). Summed in `f32` per ADR 0003's compute-precision floor,
+    not accumulated in `f16`. Verified with real numeric checks, not
+    just shape: a uniform tile stays exactly uniform under any level
+    (exact `f16`-representable values, a real bit-exact check); a
+    row-alternating checkerboard averages to exactly the midpoint at
+    `Half`, where each 2×2 source block provably contains one of each
+    colour; a row-index-encoded gradient confirms the *correct* source
+    block is read (catches an off-by-one or shifted-range bug a
+    uniform-input test can't); and `MipLevel::index()` maps each level to
+    the atlas mip index below.
+  - [x] **GPU half: `aurora_gpu::TileResidency::upload_mip`** — the
+    atlas texture now carries a real 4-level mip chain
+    (`mip_level_count: 4`, one level per `MipLevel` variant by
+    convention — `aurora-gpu` doesn't depend on `aurora-render`, so nothing
+    enforces this beyond both sides' doc comments naming it), and
+    `upload_mip(queue, id, mip_level, texels)` writes texels into a
+    tile's slot at any level using the same toroidal addressing `sync`
+    uses. Deliberately doesn't touch `sync`'s dirty/slot bookkeeping —
+    real callers still use `sync` for full-resolution uploads; this is
+    only for the lower levels progressive rendering needs. New
+    `GpuError::InvalidMipLevel`/`InvalidTileUpload` variants reject an
+    out-of-range level or a mismatched texel count rather than trusting
+    the caller. `half` promoted from a dev- to a real dependency of
+    `aurora-gpu` (the method's signature needs `f16` outside tests now).
+    `TileResidency::texture()` promoted from a `#[cfg(test)]`
+    `pub(crate)` accessor to a real public one — the old one couldn't
+    have been reused across the crate boundary regardless of visibility,
+    since `#[cfg(test)]` items don't exist in the compiled artifact a
+    downstream crate links against; the atlas was already created with
+    `COPY_SRC` anticipating exactly this "debugging/inspection tooling"
+    need. 2 new tests in `aurora-gpu` (an out-of-range level, a
+    mismatched texel count) plus a real pixel-readback test in
+    `residency_test.rs` proving an upload lands in the correct slot *and*
+    mip level, not just that the call succeeds.
+  - [x] **Wiring: `aurora-render`'s `preview::upload_preview`** — ties
+    `TileStore::get` → `mip::downsample` → `TileResidency::upload_mip`
+    into one call, rejecting `MipLevel::Full` (that's `sync`'s job, with
+    dirty tracking and budgeting this function doesn't replicate) as a
+    caller error rather than silently accepting it. Verified end-to-end
+    against real hardware: paints a tile in a real `TileStore`, uploads
+    it as a `Quarter`-level preview, and reads the atlas back at mip
+    level 2 to confirm the downsampled colour landed in the *correct*
+    slot — the full store-to-atlas path, not each piece in isolation.
+    2 tests.
+  - [ ] **Still open**: choosing a `MipLevel` from real interaction state
+    — that policy needs an "is the user actively panning" signal this
+    crate has no source for yet (no input/app layer exists) — and
+    sampling the atlas back at reduced resolution in a shader (explicit
+    LOD selection, not automatic mipmapping: the point is showing a
+    coarse preview even at 1:1 zoom while a better one uploads, which
+    automatic derivative-based LOD doesn't do). Neither is needed until
+    an actual interactive canvas exists to drive them, which is later
+    Phase 1 work (`aurora-doc`, `aurora-app`).
+  Full local CI gate clean throughout.
 - [ ] Async evaluation — the UI thread never blocks (§7.3.4)
 
 ### M1.4 — Document model (`aurora-doc`)
@@ -896,10 +936,15 @@ dependency DAG, and dirty-region propagation are done (2026-07-29, 12
 tests), and `aurora-render` now has real code on top of it: `schedule()`
 (node-granular dirty `Rect`s → tile-granular work lists), `TileCompositor`
 (GPU source-over blending of one tile over another, real-hardware-verified),
-and `mip::downsample` (box-filtering a tile down to a `MipLevel` —
-progressive rendering's first piece, started but not finished: the
-interaction-state policy and the GPU atlas/shader half are still open) —
-18 tests total. Async evaluation hasn't started.
+and progressive rendering's CPU half (`mip::downsample`) and GPU half
+(`preview::upload_preview`, wired through a real 4-level mip chain now
+added to `aurora_gpu::TileResidency`'s atlas — `upload_mip`, verified
+end-to-end against real hardware, store through to atlas readback) — 21
+tests in `aurora-render`, plus 2 new validation tests and a real
+pixel-readback test in `aurora-gpu` itself (10 total there now). Only the
+interaction-state policy (when to actually request a lower level) is left
+of progressive rendering, and it has no consumer to drive it yet — no
+input/app layer exists. Async evaluation hasn't started.
 
 **A live desktop session, whenever one is available, still has one thing
 waiting on it**: the a11y human/Orca leg below. The other item that used

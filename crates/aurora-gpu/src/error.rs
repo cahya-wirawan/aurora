@@ -22,4 +22,18 @@ pub enum GpuError {
     /// for it (`Surface::get_default_config` returned `None`).
     #[error("adapter does not support presenting to this surface")]
     SurfaceUnsupported,
+    /// `mip_level` passed to [`crate::TileResidency::upload_mip`] is
+    /// outside the atlas's mip chain.
+    #[error("mip level {0} is out of range for this atlas")]
+    InvalidMipLevel(u32),
+    /// The texel buffer passed to [`crate::TileResidency::upload_mip`]
+    /// doesn't match the size `mip_level` expects.
+    #[error(
+        "invalid tile upload at mip level {mip_level}: expected {expected} f16 samples, got {actual}"
+    )]
+    InvalidTileUpload {
+        mip_level: u32,
+        expected: usize,
+        actual: usize,
+    },
 }

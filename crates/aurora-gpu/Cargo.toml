@@ -15,12 +15,12 @@ workspace = true
 [dependencies]
 aurora-core = { workspace = true }
 aurora-tile = { workspace = true }
+half = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 
 [dev-dependencies]
-half = { workspace = true }
 tempfile = { workspace = true }
 winit = { workspace = true }

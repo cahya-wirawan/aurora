@@ -74,7 +74,7 @@ fn upload_lands_in_the_correct_slot() {
     });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: residency.texture_for_test(),
+            texture: residency.texture(),
             mip_level: 0,
             origin: wgpu::Origin3d {
                 x: TILE,
@@ -128,6 +128,118 @@ fn upload_lands_in_the_correct_slot() {
                 (r, g, b, a),
                 (0.0, 1.0, 0.0, 1.0),
                 "slot (1,0) must hold the painted tile's own colour, not a neighbour's"
+            );
+        }
+        _ => unreachable!("sliced exactly 8 bytes"),
+    }
+    drop(data);
+    readback.unmap();
+}
+
+#[test]
+// Same linear setup-upload-readback shape as `upload_lands_in_the_correct_slot`
+// above, targeting `upload_mip`'s non-zero mip level instead of `sync`'s
+// mip level 0 -- proves the progressive-rendering GPU wiring lands
+// downsampled bytes in the *correct* slot and level, not just that the
+// call succeeds.
+#[allow(clippy::too_many_lines)]
+fn upload_mip_lands_in_the_correct_slot_and_level() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+
+    // 256x256 viewport -> grid (2, 2): tile (1, 0) maps to slot (1, 0).
+    let viewport = (256, 256);
+    let residency = TileResidency::new(device, queue, viewport);
+
+    // Mip level 1 ("Half" in aurora-render's MipLevel): TILE/2 = 128.
+    let level = 1u32;
+    let size = TILE / 2;
+    let mut texels = Vec::with_capacity((size * size * 4) as usize);
+    for _ in 0..(size * size) {
+        // Opaque magenta -- distinct from this file's other test colour
+        // (green) and from a blank tile, so a wrong slot/level reads as
+        // visibly wrong, not coincidentally right.
+        for channel in [1.0, 0.0, 1.0, 1.0] {
+            texels.push(f16::from_f32(channel));
+        }
+    }
+
+    let target_tile = TileId { x: 1, y: 0 };
+    if let Err(err) = residency.upload_mip(queue, target_tile, level, &texels) {
+        unreachable!("a correctly-sized texel buffer at a valid level must upload: {err}");
+    }
+
+    // Read back mip level 1's slot-(1,0) region: x in [128, 256), y in [0, 128).
+    let bytes_per_row = size * 8; // Rgba16Float = 8 bytes/px; 128*8 = 1024,
+    // already a multiple of wgpu's 256-byte copy alignment.
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("residency-mip-readback"),
+        size: u64::from(bytes_per_row) * u64::from(size),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("residency-mip-readback"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: residency.texture(),
+            mip_level: level,
+            origin: wgpu::Origin3d {
+                x: size,
+                y: 0,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(size),
+            },
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    let Ok(Ok(())) = rx.recv() else {
+        unreachable!("map_async must complete once the device has been polled to idle");
+    };
+
+    let Ok(data) = slice.get_mapped_range() else {
+        unreachable!("the buffer was just confirmed mapped successfully above");
+    };
+    let Some(first_texel) = data.get(0..8) else {
+        unreachable!("a 128x128 Rgba16Float readback buffer is at least 8 bytes");
+    };
+    match first_texel {
+        [r0, r1, g0, g1, b0, b1, a0, a1] => {
+            let r = f16::from_le_bytes([*r0, *r1]).to_f32();
+            let g = f16::from_le_bytes([*g0, *g1]).to_f32();
+            let b = f16::from_le_bytes([*b0, *b1]).to_f32();
+            let a = f16::from_le_bytes([*a0, *a1]).to_f32();
+            assert_eq!(
+                (r, g, b, a),
+                (1.0, 0.0, 1.0, 1.0),
+                "slot (1,0) at mip level 1 must hold the uploaded preview's own colour"
             );
         }
         _ => unreachable!("sliced exactly 8 bytes"),

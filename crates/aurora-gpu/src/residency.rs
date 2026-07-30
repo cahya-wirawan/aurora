@@ -5,7 +5,10 @@
 
 use std::collections::HashMap;
 
-use aurora_tile::{SAMPLES, TILE, TileId, TileStore};
+use aurora_tile::{CHANNELS, SAMPLES, TILE, TileId, TileStore};
+use half::f16;
+
+use crate::error::GpuError;
 
 /// The `Canvas` uniform `canvas.wgsl` expects: `uv_offset`/`uv_scale`,
 /// two `vec2<f32>`s, 16 bytes total.
@@ -13,6 +16,13 @@ const UNIFORM_SIZE: u64 = 16;
 
 /// Bytes one tile upload costs — `f16` samples, `SAMPLES` per tile.
 const TILE_BYTES: usize = SAMPLES * 2;
+
+/// Mip levels the atlas carries: level 0 is full resolution ([`TILE`] ×
+/// [`TILE`]), each level above halves the side length. Fixed at 4 rather
+/// than configurable — nothing needs more, and this crate doesn't depend
+/// on `aurora-render`'s `MipLevel` enum, but the correspondence is exact
+/// by convention: 0 = Full, 1 = Half, 2 = Quarter, 3 = Eighth.
+const MIP_LEVELS: u32 = 4;
 
 /// The result of one [`TileResidency::sync`] call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -71,7 +81,7 @@ impl TileResidency {
                 height: grid.1 * TILE,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: MIP_LEVELS,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
@@ -257,11 +267,90 @@ impl TileResidency {
         stats
     }
 
-    /// Exposes the atlas texture for `residency_test.rs`'s real
-    /// pixel-readback check — not part of the public API (real callers
-    /// only need [`Self::view`]/[`Self::sampler`] to draw).
-    #[cfg(test)]
-    pub(crate) fn texture_for_test(&self) -> &wgpu::Texture {
+    /// Writes `texels` into the region of the atlas that `id`'s current
+    /// slot occupies at `mip_level`, using the same toroidal slot
+    /// addressing [`Self::sync`] uses. `mip_level` 0 is full resolution
+    /// ([`TILE`] × [`TILE`]); each level above halves the side length.
+    ///
+    /// This is the GPU half of progressive rendering
+    /// (`spike/FINDINGS.md` finding #3: "render a lower-resolution mip
+    /// while panning fast, refining when motion stops"). The caller
+    /// (`aurora-render`'s `mip::downsample`) produces the
+    /// lower-resolution texels; this method lands them in the atlas at
+    /// the matching mip level.
+    ///
+    /// Deliberately doesn't touch [`Self::slots`] or consult tile
+    /// dirtiness the way [`Self::sync`] does — this is a direct,
+    /// caller-driven write for a resolution the caller has already
+    /// decided to show, not part of the budgeted full-resolution
+    /// catch-up loop. Real callers should keep using [`Self::sync`] for
+    /// full-resolution (mip level 0) uploads and this only for the lower
+    /// levels progressive rendering needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::InvalidMipLevel`] if `mip_level` is not in
+    /// `0..4`, or [`GpuError::InvalidTileUpload`] if `texels`'s length
+    /// doesn't match what that level's tile size expects.
+    pub fn upload_mip(
+        &self,
+        queue: &wgpu::Queue,
+        id: TileId,
+        mip_level: u32,
+        texels: &[f16],
+    ) -> Result<(), GpuError> {
+        if mip_level >= MIP_LEVELS {
+            return Err(GpuError::InvalidMipLevel(mip_level));
+        }
+        let size = TILE >> mip_level;
+        let expected = (size as usize) * (size as usize) * CHANNELS;
+        if texels.len() != expected {
+            return Err(GpuError::InvalidTileUpload {
+                mip_level,
+                expected,
+                actual: texels.len(),
+            });
+        }
+
+        let slot = (id.x % self.grid.0, id.y % self.grid.1);
+        let mut bytes = Vec::with_capacity(texels.len() * 2);
+        for sample in texels {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level,
+                origin: wgpu::Origin3d {
+                    x: slot.0 * size,
+                    y: slot.1 * size,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 8),
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// The atlas texture itself, beyond the [`Self::view`]/[`Self::sampler`]
+    /// pair real drawing needs — for reading it back (`residency_test.rs`'s
+    /// own pixel-readback checks, and `aurora-render`'s progressive-rendering
+    /// tests, both real consumers) or copying into a different target.
+    /// A real, non-test-only accessor: the atlas texture is created with
+    /// `COPY_SRC` specifically so this is possible.
+    #[must_use]
+    pub fn texture(&self) -> &wgpu::Texture {
         &self.texture
     }
 }
@@ -397,5 +486,36 @@ mod tests {
         let third = residency.sync(context.queue(), &mut store, false, budget);
         assert_eq!(third.uploaded, 0);
         assert_eq!(third.remaining, 0);
+    }
+
+    #[test]
+    fn upload_mip_rejects_an_out_of_range_level() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        let texels = vec![f16::from_f32(0.0); 4];
+        match residency.upload_mip(context.queue(), TileId { x: 0, y: 0 }, 4, &texels) {
+            Err(crate::GpuError::InvalidMipLevel(4)) => {}
+            other => unreachable!("expected InvalidMipLevel(4), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upload_mip_rejects_a_mismatched_texel_count() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        // Level 1 (Half) expects (TILE/2)^2 * 4 samples, not 4.
+        let texels = vec![f16::from_f32(0.0); 4];
+        match residency.upload_mip(context.queue(), TileId { x: 0, y: 0 }, 1, &texels) {
+            Err(crate::GpuError::InvalidTileUpload {
+                mip_level: 1,
+                actual: 4,
+                ..
+            }) => {}
+            other => unreachable!("expected InvalidTileUpload, got {other:?}"),
+        }
     }
 }

@@ -48,6 +48,21 @@ impl MipLevel {
     pub const fn size(self) -> u32 {
         TILE / self.factor()
     }
+
+    /// The atlas mip-level index `aurora_gpu::TileResidency::upload_mip`
+    /// expects: `Full` → 0 … `Eighth` → 3. `aurora-gpu` doesn't depend on
+    /// this crate, so the atlas's fixed 4-level mip chain and this enum
+    /// agree by convention, not by a shared type — documented on both
+    /// sides (see `TileResidency`'s own `MIP_LEVELS` comment).
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        match self {
+            Self::Full => 0,
+            Self::Half => 1,
+            Self::Quarter => 2,
+            Self::Eighth => 3,
+        }
+    }
 }
 
 /// Box-filters a full-resolution tile's texels (`TILE` × `TILE` RGBA,
@@ -119,6 +134,14 @@ mod tests {
         assert_eq!(MipLevel::Quarter.size(), TILE / 4);
         assert_eq!(MipLevel::Eighth.factor(), 8);
         assert_eq!(MipLevel::Eighth.size(), TILE / 8);
+    }
+
+    #[test]
+    fn mip_level_index_matches_the_atlas_convention() {
+        assert_eq!(MipLevel::Full.index(), 0);
+        assert_eq!(MipLevel::Half.index(), 1);
+        assert_eq!(MipLevel::Quarter.index(), 2);
+        assert_eq!(MipLevel::Eighth.index(), 3);
     }
 
     fn solid_texels(rgba: [f32; 4]) -> Vec<f16> {
