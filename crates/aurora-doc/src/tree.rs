@@ -8,6 +8,30 @@ use aurora_core::{IdGenerator, Rect};
 use crate::error::DocError;
 use crate::layer::{BlendMode, Layer, LayerEntry, LayerId, LayerKind, LayerLock, LayerMask};
 
+/// A layer (and, if it was a group, its whole subtree) detached from a
+/// [`LayerTree`] by [`LayerTree::remove_capturing`], with enough recorded
+/// to put it back exactly via [`LayerTree::restore`] — same id(s),
+/// same position, same properties. Not a document snapshot (§7.3.3):
+/// scoped to exactly the layer(s) one `remove` call deleted, not the
+/// whole tree. [`crate::History`]'s building block for undoing a remove
+/// and, symmetrically (`restore` and `remove_capturing` are each other's
+/// inverse), for undoing an add.
+///
+/// `entries` is a flat `(id, LayerEntry)` list — root first, then
+/// descendants — rather than a recursive shape, because each captured
+/// `LayerEntry` already carries everything needed to reconstruct the
+/// tree shape itself: its own `parent` field, and (for a group) its own
+/// `children` list. Restoring is just re-inserting every entry under its
+/// original id and re-linking the root into its old parent's sibling
+/// list; every descendant's own recorded fields already point at the
+/// right (also-being-restored) ids.
+pub(crate) struct RemovedSubtree {
+    pub(crate) root: LayerId,
+    pub(crate) parent: Option<LayerId>,
+    pub(crate) index: usize,
+    pub(crate) entries: Vec<(LayerId, LayerEntry)>,
+}
+
 /// A forest of layers: pixel layers and groups, nested to any depth.
 ///
 /// **Ordering convention, used throughout this crate**: sibling lists
@@ -126,33 +150,111 @@ impl LayerTree {
     ///
     /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist.
     pub fn remove(&mut self, id: LayerId) -> Result<(), DocError> {
-        let entry = self.layers.remove(&id).ok_or(DocError::UnknownLayer(id))?;
-
-        let siblings = match self.sibling_list_mut(entry.parent) {
-            Ok(list) => list,
-            Err(err) => unreachable!("id's own recorded parent must be valid: {err:?}"),
-        };
-        siblings.retain(|&sibling| sibling != id);
-
-        self.remove_subtree_contents(entry.kind);
+        self.remove_capturing(id)?;
         Ok(())
     }
 
-    /// Removes every descendant named by `kind` (a moved-out, already-
-    /// detached `LayerKind`), without touching any sibling list — by the
-    /// time a grandchild is reached, its immediate parent's own entry (and
-    /// thus the list a naive detach would look for) is already gone.
-    fn remove_subtree_contents(&mut self, kind: LayerKind) {
-        if let LayerKind::Group { children } = kind {
-            for child in children {
-                let Some(child_entry) = self.layers.remove(&child) else {
-                    unreachable!(
-                        "a group's recorded children must exist in the tree by construction"
-                    );
-                };
-                self.remove_subtree_contents(child_entry.kind);
+    /// Same as [`Self::remove`], but keeps every removed entry (root plus,
+    /// for a group, its whole subtree) instead of discarding it —
+    /// [`crate::History`]'s own building block for undoing a remove (and,
+    /// symmetrically, for undoing an add: see [`Self::restore`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist.
+    pub(crate) fn remove_capturing(&mut self, id: LayerId) -> Result<RemovedSubtree, DocError> {
+        let parent = self
+            .layers
+            .get(&id)
+            .ok_or(DocError::UnknownLayer(id))?
+            .parent;
+
+        let siblings = match self.sibling_list_mut(parent) {
+            Ok(list) => list,
+            Err(err) => unreachable!("id's own recorded parent must be valid: {err:?}"),
+        };
+        let Some(index) = siblings.iter().position(|&sibling| sibling == id) else {
+            unreachable!("id's own recorded parent must list id as one of its children");
+        };
+        siblings.remove(index);
+
+        let mut entries = Vec::new();
+        self.capture_subtree(id, &mut entries);
+
+        Ok(RemovedSubtree {
+            root: id,
+            parent,
+            index,
+            entries,
+        })
+    }
+
+    /// Removes `id` and, recursively, every descendant, appending each
+    /// `(id, LayerEntry)` pair to `out` — the flat capture
+    /// [`Self::remove_capturing`]/[`Self::restore`] round-trip through. A
+    /// descendant's own recorded `parent`/(for a group) `children` fields
+    /// are already exactly what's needed to reconstruct the subtree, so
+    /// no separate tree shape needs to be recorded alongside the entries.
+    fn capture_subtree(&mut self, id: LayerId, out: &mut Vec<(LayerId, LayerEntry)>) {
+        let Some(entry) = self.layers.remove(&id) else {
+            unreachable!("a group's recorded children must exist in the tree by construction");
+        };
+        let children = match &entry.kind {
+            LayerKind::Group { children } => children.clone(),
+            LayerKind::Pixel { .. } => Vec::new(),
+        };
+        out.push((id, entry));
+        for child in children {
+            self.capture_subtree(child, out);
+        }
+    }
+
+    /// Restores a subtree previously detached by [`Self::remove_capturing`]
+    /// — every layer comes back at its original id, so anything outside
+    /// this tree that already referenced those ids (a saved selection, a
+    /// pending [`crate::History`] redo entry) stays valid. Returns the
+    /// restored root's id (same as [`RemovedSubtree::root`], returned for
+    /// convenience).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if the subtree's recorded parent
+    /// no longer exists, or [`DocError::NotAGroup`] if it now names a
+    /// pixel layer — both only reachable if something removed or replaced
+    /// that parent after this subtree was captured, since normal
+    /// [`crate::History`] undo/redo never reaches here out of order.
+    /// Nothing is changed when this happens.
+    pub(crate) fn restore(&mut self, removed: RemovedSubtree) -> Result<LayerId, DocError> {
+        let RemovedSubtree {
+            root,
+            parent,
+            index,
+            entries,
+        } = removed;
+
+        // Validate before mutating anything -- same "all or nothing"
+        // discipline `insert` uses for its own `parent` argument.
+        if let Some(parent_id) = parent {
+            match self.layers.get(&parent_id) {
+                None => return Err(DocError::UnknownLayer(parent_id)),
+                Some(entry) if !entry.kind.is_group() => {
+                    return Err(DocError::NotAGroup(parent_id));
+                }
+                Some(_) => {}
             }
         }
+
+        for (id, entry) in entries {
+            self.layers.insert(id, entry);
+        }
+
+        let siblings = match self.sibling_list_mut(parent) {
+            Ok(list) => list,
+            Err(err) => unreachable!("just validated above: {err:?}"),
+        };
+        let clamped = index.min(siblings.len());
+        siblings.insert(clamped, root);
+        Ok(root)
     }
 
     /// Moves `id` (and, if it's a group, its whole subtree) to be a child
@@ -433,10 +535,34 @@ impl LayerTree {
     /// [`DocError::NoMask`] if it has none. Nothing is changed when this
     /// happens.
     pub fn remove_mask(&mut self, id: LayerId) -> Result<(), DocError> {
+        self.take_mask(id)?;
+        Ok(())
+    }
+
+    /// Same as [`Self::remove_mask`], but returns the removed
+    /// [`LayerMask`] instead of discarding it — [`crate::History`]'s own
+    /// building block for undoing a `remove_mask` (and, symmetrically,
+    /// for undoing an `add_mask`: see [`Self::restore_mask`]).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::remove_mask`].
+    pub(crate) fn take_mask(&mut self, id: LayerId) -> Result<LayerMask, DocError> {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
-        if entry.mask.take().is_none() {
-            return Err(DocError::NoMask(id));
-        }
+        entry.mask.take().ok_or(DocError::NoMask(id))
+    }
+
+    /// Puts back a mask previously removed by [`Self::take_mask`], with
+    /// its exact `enabled`/`inverted` state — unlike [`Self::add_mask`],
+    /// which always creates a fresh, enabled, uninverted one, this is for
+    /// restoring one that may have been toggled before it was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist.
+    pub(crate) fn restore_mask(&mut self, id: LayerId, mask: LayerMask) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        entry.mask = Some(mask);
         Ok(())
     }
 

@@ -9,14 +9,17 @@
 //! here yet); per-layer opacity, fill opacity, blend mode, visibility,
 //! and locking; and per-layer masks ([`LayerMask`]). [`SelectionSet`] is
 //! the fourth: the document's current selection plus any named ones
-//! saved for later. History is still open — see PLAN.md M1.4.
+//! saved for later. [`History`] is the fifth: reversible operations plus
+//! dirtied regions, unlimited undo/redo (§7.3.3) over a [`LayerTree`].
 
 mod error;
+mod history;
 mod layer;
 mod selection;
 mod tree;
 
 pub use error::DocError;
+pub use history::History;
 pub use layer::{BlendMode, Layer, LayerId, LayerKind, LayerLock, LayerMask};
 pub use selection::{Selection, SelectionSet};
 pub use tree::LayerTree;
