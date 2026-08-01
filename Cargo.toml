@@ -45,6 +45,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 half = "2"
 # ADR 0008: statically linked via lcms2-sys's vendored build (no dynamic-link
 # packaging burden, unlike ADR 0007's RAW decision) -- see spike/raw-icc.

@@ -63,6 +63,7 @@ among the three steps PRD §13 actually names as blocking.
 | **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
 | **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. History (`History` — mirrors all 14 `LayerTree` mutators with undo-recording versions, unlimited undo/redo, §7.3.3) done 2026-08-01, 20 more tests (70 total) — add/remove turned out to be exact inverses of two new id-preserving `LayerTree` primitives (`remove_capturing`/`restore`), one symmetric apply function drives both undo and redo, and dirtied `Rect`s are reported when knowable (pixel bounds, or a union over a removed subtree) and honestly `None` for group-level changes. Crash recovery journal's **in-memory half** (`History::replay`, an ever-growing chronological op log distinct from the undo/redo stacks) done 2026-08-01, 8 more tests (78 total) — proven to reflect *current* state after undo/redo, not just full history; **durable disk persistence deliberately deferred**, no on-disk encoding decided (see M1.4). fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. See M1.4 |
 | **Phase 1 — M1.5** | **Complete, 2026-08-01.** `aurora-color`'s ICC transforms (`IccProfile`, `Transform`, `RenderingIntent`) wiring in `lcms2` per ADR 0008 — `Gray`/`Rgb`/`Rgba`/`Cmyk` channel layouts, verified against real, committed CC0 ICC profiles (`corpora/icc/`, copied from `spike/raw-icc`'s own fixtures), reproducing `spike/raw-icc/FINDINGS.md`'s cross-validated sRGB→ECI-RGBv2 values plus the permanent extended-range/no-clamping regression test that spike's finding 4 asked for (`cargo deny check all` clean with the new dependency; `Cmyk` wired but untested against a real CMYK profile — honest gap, none in the corpus yet). Colour-space descriptor tagging (§7.3.6) was already done from M1.1. Linear-light conversion (`linear_to_srgb`/`srgb_to_linear`, IEC 61966-2-1's real curve, HDR/negative-safe) — an explicit working-space *policy* type stays deliberately undesigned until a real compositor/filter consumer exists. Promote-on-import/dither-on-export (`promote_u8`/`quantize_u8`/`dither_quantize`, classic 8×8 Bayer ordered dithering generated from its recursive definition and cross-checked against the published 4×4 table, not a hand-transcribed 64-entry table) — exhaustive 256-value round-trip test, dedicated test confirming dithering actually breaks up banding. 22 tests total. fmt/clippy (`-D warnings`)/`cargo test -p aurora-color`/`cargo deny check all` all verified clean throughout. See M1.5 |
+| **Phase 1 — M1.6** | **In progress, 2026-08-01.** `aurora-theme`'s token types (`Color`, `SurfaceTokens`/`TextTokens`/`IconTokens`/`BorderTokens`/`AccentTokens`/`StateTokens`, `Scales`) match the already owner-approved `design/tokens/vocabulary.md`/`scales.toml` exactly. `Palette`/`ThemeSet` parse real TOML (`toml` added to `[workspace.dependencies]` — `serde`'s first real use), resolve dotted palette references generically, and merge an `extends` inheritance chain (child overrides parent) — verified against the real, committed Dark theme end to end, plus a synthetic child theme proving the merge logic without inventing a real second design. `contrast::check_gated_pairs` is the real, CI-enforced version of `design/check_contrast.py`'s Phase-0 prototype (same 17 gated pairs, same WCAG formula reusing `aurora_color::srgb_to_linear`) — independently reproduces that script's own prior "17/17 pass" finding. 23 tests total. **Blocked**: Light/high-contrast/Colour-Critical themes need Cahya's own design work (FR-027 *Ownership*) before they can exist, not an engineering gap. **Deferred, no consumer yet**: hot-reload file-watching, and the CI lint rejecting hardcoded style values (needs real widget code to lint against). fmt/clippy (`-D warnings`)/`cargo test -p aurora-theme`/`cargo deny check licenses` all verified clean. See M1.6 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -1099,11 +1100,66 @@ every widget in every state across all built-in themes with contrast checks gree
 
 ### M1.6 — Design system (`aurora-theme`)
 
-- [ ] Token types and semantic vocabulary from 0.5
-- [ ] TOML theme parsing, inheritance, hot reload
-- [ ] Built-in themes: Dark, Light, 2× high contrast, Colour-Critical
-- [ ] Automated WCAG contrast validation over the token set
-- [ ] CI lint rejecting hardcoded style values (§7.3.10)
+- [x] **Token types and semantic vocabulary from 0.5** — done 2026-08-01,
+  `crates/aurora-theme/src/{color,theme,scales}.rs` (`Color`,
+  `SurfaceTokens`/`TextTokens`/`IconTokens`/`BorderTokens`/
+  `AccentTokens`/`StateTokens`/`Overlay` matching
+  `design/tokens/vocabulary.md`'s sections exactly; `Scales` matching
+  `design/tokens/scales.toml`'s type/spacing/radius/elevation/motion
+  shape). Real Rust types for an already owner-approved vocabulary, not
+  an invented one.
+- [x] **TOML theme parsing, inheritance** — done 2026-08-01,
+  `crates/aurora-theme/src/{palette,theme}.rs` (`Palette`, `ThemeSet`),
+  added `toml` to `[workspace.dependencies]` (`serde`'s first real use
+  in the workspace — previously declared but unused). `Palette` resolves
+  dotted references (`"neutral.100"`, `"accent.blue.500"`) through a
+  generic `toml::Value` tree, since ramp nesting depth genuinely varies;
+  `ThemeSet` flattens each registered theme's own fields to dotted keys
+  and merges an `extends` chain root-first (child overwrites inherited),
+  then extracts the fixed vocabulary into a `Theme`. Tested against the
+  real, committed `design/tokens/palette.toml` and
+  `design/themes/dark.toml` (`include_str!`, not synthetic fixtures) —
+  plus a synthetic child theme to prove the merge logic generically,
+  deliberately not a real second design (inventing Light/HC/
+  Colour-Critical's actual colours is Cahya's call per FR-027
+  *Ownership*, not an engineering detail to fill in while building the
+  parser). Cycle detection (`ThemeError::CyclicExtends`) and
+  missing-token reporting both covered by dedicated tests.
+  **Hot reload deliberately not wired up**: `ThemeSet::register` already
+  supports re-parsing and replacing a theme (the part that actually
+  matters), but watching the filesystem and calling it automatically is
+  thin glue with no caller to drive it yet (`aurora-widgets` is still a
+  skeleton) — same "primitive built, real consumer decides the rest
+  later" shape used elsewhere.
+- [!] **Built-in themes: Dark, Light, 2× high contrast, Colour-Critical**
+  — Dark already existed (owner-approved, PLAN 0.5) and is what the
+  parser above is verified against end to end. **Blocked on Cahya
+  designing the other three** (PRD FR-027 *Ownership*) — this pass
+  deliberately didn't invent their colours (see above), so the parser
+  being generic over any correctly-shaped theme file isn't the same as
+  the other three themes actually existing. The parser needs no changes
+  to accept them once designed.
+- [x] **Automated WCAG contrast validation over the token set** — done
+  2026-08-01, `crates/aurora-theme/src/contrast.rs`
+  (`contrast_ratio`, `check_gated_pairs`). The real, CI-enforced version
+  of `design/check_contrast.py`'s Phase-0 prototype — that script's own
+  docstring already named this exact follow-on. Same 17 gated pairs,
+  same WCAG 2.1 relative-luminance formula (reusing
+  `aurora_color::srgb_to_linear` for the channel-linearization step,
+  since it's the identical IEC 61966-2-1 curve). `the_real_dark_theme_
+  passes_every_gated_pair` independently reproduces `check_contrast.py`'s
+  own prior finding (17/17 pass) — two independent implementations
+  agreeing, the same cross-check discipline this project's spikes use
+  throughout.
+- [ ] CI lint rejecting hardcoded style values (§7.3.10) — needs real
+  widget code to lint against, which doesn't exist yet (`aurora-widgets`
+  is still a skeleton); deferred for the same "no consumer yet" reason
+  as hot reload, not forgotten.
+
+23 tests total in `aurora-theme`. Verified: `cargo fmt --all --check`
+clean, `cargo clippy -p aurora-theme --all-targets --all-features -- -D
+warnings` clean, `cargo test -p aurora-theme` — 23/23 passed, `cargo deny
+check licenses` clean with the new `toml` dependency.
 
 ### M1.7 — Widget toolkit (`aurora-widgets`)
 

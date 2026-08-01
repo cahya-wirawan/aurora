@@ -17,3 +17,5 @@ aurora-core = { workspace = true }
 aurora-color = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
