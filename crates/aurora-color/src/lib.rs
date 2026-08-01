@@ -13,14 +13,21 @@
 //! An explicit working-space *policy* type has no concrete consumer yet
 //! (`aurora-filters`/`aurora-render`'s colour wiring don't exist), so
 //! it's deliberately not designed speculatively — see `linear`'s own doc
-//! comment. Promote-on-import/dither-on-export are still open — see
-//! PLAN.md M1.5.
+//! comment. [`promote_u8`]/[`dither_quantize`] are the third: the 8-bit
+//! import/export boundary invariant §7.3.1b names — this crate provides
+//! the conversion math; `aurora-io` (still a skeleton) will call it once
+//! a real image format reader/writer exists.
+//!
+//! This crate is M1.5's home; PLAN.md tracks what's done and what's
+//! still open there.
 
+mod dither;
 mod error;
 mod linear;
 mod profile;
 mod transform;
 
+pub use dither::{dither_quantize, promote_u8, quantize_u8};
 pub use error::ColorError;
 pub use linear::{linear_to_srgb, srgb_to_linear};
 pub use profile::IccProfile;
