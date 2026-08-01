@@ -1,5 +1,6 @@
 //! History: reversible operations plus dirtied regions, unlimited
-//! undo/redo (§7.3.3). PLAN.md M1.4's fifth piece.
+//! undo/redo (§7.3.3), and an in-memory crash-recovery journal.
+//! PLAN.md M1.4's fifth and sixth pieces.
 //!
 //! [`History`] mirrors every mutating [`LayerTree`] method with one that
 //! also records how to undo it. It does not wrap [`LayerTree`] (own it,
@@ -7,23 +8,51 @@
 //! a selection set, and a history together, so `History` and `LayerTree`
 //! stay siblings, each call taking `&mut LayerTree` explicitly. A future
 //! `Document` can compose them.
+//!
+//! **The journal, and what's deliberately not built yet.** Every op
+//! `History` ever applies — whether from a fresh call, an undo, or a
+//! redo — is also appended, in real chronological order, to an
+//! ever-growing in-memory log. [`History::replay`] rebuilds a fresh
+//! `LayerTree` purely from that log, proving it's a sufficient,
+//! order-correct record of the *current* state (not the undo stack's
+//! shape — undoing something and never redoing it means the journal's
+//! replay reflects the undone state, matching what the user actually has
+//! open). This is the risky, easy-to-get-subtly-wrong half of "crash
+//! recovery journal" (§7.3.3), and it's done and tested. **What's
+//! deliberately not here: writing this journal to disk**, which is what
+//! would actually let it survive the crash it's named for. That needs a
+//! chosen on-disk encoding for `LayerOp`'s recursive shape (nested
+//! entries, strings, ids) — a real, first-party format decision, same
+//! *kind* of choice as `aurora-tile`'s own hand-rolled tile codec, but
+//! this pass didn't reach it, and forcing one without evidence is exactly
+//! the mistake `spike/raw-icc/FINDINGS.md` already caught once (a
+//! "small, fast" persistence detail turning out to need its own real
+//! design pass). Tracked as the next step on this bullet, not silently
+//! skipped.
 
 use aurora_core::Rect;
 
 use crate::error::DocError;
-use crate::layer::{BlendMode, LayerId, LayerKind, LayerLock, LayerMask};
+use crate::layer::{BlendMode, LayerEntry, LayerId, LayerKind, LayerLock, LayerMask};
 use crate::tree::{LayerTree, RemovedSubtree};
 
-/// One recorded step, always stored as *how to undo the step that's
-/// currently on top* — never "what the user did," which would need a
-/// separate, parallel "how to undo it" derivation at undo time. Applying
-/// an op (see [`apply`]) both performs it and returns its own inverse,
-/// which is exactly what the opposite stack needs — so `undo` and `redo`
-/// share one function.
+/// One recorded step. On the undo/redo stacks, stored as *how to undo the
+/// step that's currently on top* — never "what the user did," which
+/// would need a separate, parallel "how to undo it" derivation at undo
+/// time. Applying an op (see [`apply`]) both performs it and returns its
+/// own inverse, which is exactly what the opposite stack needs — so
+/// `undo` and `redo` share one function. In `History`'s own journal
+/// (a separate, ever-growing `Vec`, not one of the two stacks), the same
+/// type instead records *what was just applied*, in real chronological
+/// order — see [`History::replay`].
 ///
 /// Every variant stores just the one changed value (or, for a structural
 /// change, exactly the removed subtree) — never a whole-document
 /// snapshot (§7.3.3).
+///
+/// `Clone`: the journal needs its own independent copy of each op (the
+/// stacks' copies get consumed by [`apply`]).
+#[derive(Clone)]
 enum LayerOp {
     /// Remove `LayerId` (capturing it fresh at apply time, which becomes
     /// the paired [`LayerOp::Restore`] pushed onto the other stack). The
@@ -232,9 +261,14 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
 ///
 /// New activity through this type's own methods always clears the redo
 /// stack, matching every mainstream editor's undo/redo behaviour.
+///
+/// Also keeps the in-memory crash-recovery journal described in this
+/// module's own doc comment — a separate, ever-growing log, unaffected by
+/// undo/redo clearing the redo stack.
 pub struct History {
     undo_stack: Vec<LayerOp>,
     redo_stack: Vec<LayerOp>,
+    journal: Vec<LayerOp>,
 }
 
 impl History {
@@ -243,6 +277,7 @@ impl History {
         Self {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            journal: Vec::new(),
         }
     }
 
@@ -254,6 +289,32 @@ impl History {
     #[must_use]
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
+    }
+
+    /// How many ops the journal has recorded so far — mostly useful for
+    /// tests; the journal has no public way to inspect individual entries
+    /// yet (see this module's own doc comment for why).
+    #[must_use]
+    pub fn journal_len(&self) -> usize {
+        self.journal.len()
+    }
+
+    /// Rebuilds a fresh [`LayerTree`] purely by replaying this history's
+    /// own journal from empty, in the exact order every op was actually
+    /// applied — see this module's own doc comment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if replaying the journal fails — should not
+    /// happen for a `History` only ever mutated through its own methods
+    /// (see this type's own doc comment about mixing in direct
+    /// `LayerTree` calls).
+    pub fn replay(&self) -> Result<LayerTree, DocError> {
+        let mut tree = LayerTree::new();
+        for op in self.journal.clone() {
+            apply(&mut tree, op)?;
+        }
+        Ok(tree)
     }
 
     fn push(&mut self, op: LayerOp) {
@@ -273,7 +334,17 @@ impl History {
         bounds: Rect,
         parent: Option<LayerId>,
     ) -> Result<LayerId, DocError> {
-        let id = tree.add_pixel_layer(name, bounds, parent)?;
+        let name = name.into();
+        let id = tree.add_pixel_layer(name.clone(), bounds, parent)?;
+        self.journal.push(LayerOp::Restore(RemovedSubtree {
+            root: id,
+            parent,
+            index: 0,
+            entries: vec![(
+                id,
+                LayerEntry::new(name, parent, LayerKind::Pixel { bounds }),
+            )],
+        }));
         self.push(LayerOp::RemoveById(id));
         Ok(id)
     }
@@ -289,7 +360,23 @@ impl History {
         name: impl Into<String>,
         parent: Option<LayerId>,
     ) -> Result<LayerId, DocError> {
-        let id = tree.add_group(name, parent)?;
+        let name = name.into();
+        let id = tree.add_group(name.clone(), parent)?;
+        self.journal.push(LayerOp::Restore(RemovedSubtree {
+            root: id,
+            parent,
+            index: 0,
+            entries: vec![(
+                id,
+                LayerEntry::new(
+                    name,
+                    parent,
+                    LayerKind::Group {
+                        children: Vec::new(),
+                    },
+                ),
+            )],
+        }));
         self.push(LayerOp::RemoveById(id));
         Ok(id)
     }
@@ -303,6 +390,7 @@ impl History {
     pub fn remove(&mut self, tree: &mut LayerTree, id: LayerId) -> Result<Option<Rect>, DocError> {
         let removed = tree.remove_capturing(id)?;
         let dirty = subtree_dirty_rect(&removed);
+        self.journal.push(LayerOp::RemoveById(id));
         self.push(LayerOp::Restore(removed));
         Ok(dirty)
     }
@@ -322,6 +410,11 @@ impl History {
         let old_parent = tree.parent(id);
         let old_index = current_index(tree, id, old_parent).ok_or(DocError::UnknownLayer(id))?;
         tree.reparent(id, new_parent, index)?;
+        self.journal.push(LayerOp::Reparent {
+            id,
+            parent: new_parent,
+            index,
+        });
         self.push(LayerOp::Reparent {
             id,
             parent: old_parent,
@@ -341,8 +434,10 @@ impl History {
         id: LayerId,
         name: impl Into<String>,
     ) -> Result<(), DocError> {
+        let name = name.into();
         let old = tree.name(id).ok_or(DocError::UnknownLayer(id))?.to_owned();
-        tree.set_name(id, name)?;
+        tree.set_name(id, name.clone())?;
+        self.journal.push(LayerOp::Rename { id, name });
         self.push(LayerOp::Rename { id, name: old });
         Ok(())
     }
@@ -361,6 +456,7 @@ impl History {
     ) -> Result<Option<Rect>, DocError> {
         let old = tree.opacity(id).ok_or(DocError::UnknownLayer(id))?;
         tree.set_opacity(id, value)?;
+        self.journal.push(LayerOp::SetOpacity { id, value });
         self.push(LayerOp::SetOpacity { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
@@ -378,6 +474,7 @@ impl History {
     ) -> Result<Option<Rect>, DocError> {
         let old = tree.fill_opacity(id).ok_or(DocError::UnknownLayer(id))?;
         tree.set_fill_opacity(id, value)?;
+        self.journal.push(LayerOp::SetFillOpacity { id, value });
         self.push(LayerOp::SetFillOpacity { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
@@ -395,6 +492,7 @@ impl History {
     ) -> Result<Option<Rect>, DocError> {
         let old = tree.blend_mode(id).ok_or(DocError::UnknownLayer(id))?;
         tree.set_blend_mode(id, value)?;
+        self.journal.push(LayerOp::SetBlendMode { id, value });
         self.push(LayerOp::SetBlendMode { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
@@ -412,6 +510,7 @@ impl History {
     ) -> Result<Option<Rect>, DocError> {
         let old = tree.visible(id).ok_or(DocError::UnknownLayer(id))?;
         tree.set_visible(id, value)?;
+        self.journal.push(LayerOp::SetVisible { id, value });
         self.push(LayerOp::SetVisible { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
@@ -429,6 +528,7 @@ impl History {
     ) -> Result<Option<Rect>, DocError> {
         let old = tree.lock(id).ok_or(DocError::UnknownLayer(id))?;
         tree.set_lock(id, value)?;
+        self.journal.push(LayerOp::SetLock { id, value });
         self.push(LayerOp::SetLock { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
@@ -445,6 +545,14 @@ impl History {
         bounds: Rect,
     ) -> Result<Option<Rect>, DocError> {
         tree.add_mask(id, bounds)?;
+        self.journal.push(LayerOp::RestoreMask(
+            id,
+            LayerMask {
+                bounds,
+                enabled: true,
+                inverted: false,
+            },
+        ));
         self.push(LayerOp::RemoveMask(id));
         Ok(layer_dirty_rect(tree, id))
     }
@@ -460,6 +568,7 @@ impl History {
         id: LayerId,
     ) -> Result<Option<Rect>, DocError> {
         let mask = tree.take_mask(id)?;
+        self.journal.push(LayerOp::RemoveMask(id));
         self.push(LayerOp::RestoreMask(id, mask));
         Ok(layer_dirty_rect(tree, id))
     }
@@ -477,6 +586,7 @@ impl History {
     ) -> Result<Option<Rect>, DocError> {
         let old = tree.mask(id).ok_or(DocError::NoMask(id))?.enabled;
         tree.set_mask_enabled(id, value)?;
+        self.journal.push(LayerOp::SetMaskEnabled { id, value });
         self.push(LayerOp::SetMaskEnabled { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
@@ -494,6 +604,7 @@ impl History {
     ) -> Result<Option<Rect>, DocError> {
         let old = tree.mask(id).ok_or(DocError::NoMask(id))?.inverted;
         tree.set_mask_inverted(id, value)?;
+        self.journal.push(LayerOp::SetMaskInverted { id, value });
         self.push(LayerOp::SetMaskInverted { id, value: old });
         Ok(layer_dirty_rect(tree, id))
     }
@@ -513,7 +624,9 @@ impl History {
         let Some(op) = self.undo_stack.pop() else {
             return Ok(None);
         };
+        let forward = op.clone();
         let (inverse, dirty) = apply(tree, op)?;
+        self.journal.push(forward);
         self.redo_stack.push(inverse);
         Ok(dirty)
     }
@@ -529,7 +642,9 @@ impl History {
         let Some(op) = self.redo_stack.pop() else {
             return Ok(None);
         };
+        let forward = op.clone();
         let (inverse, dirty) = apply(tree, op)?;
+        self.journal.push(forward);
         self.undo_stack.push(inverse);
         Ok(dirty)
     }
@@ -546,6 +661,7 @@ impl std::fmt::Debug for History {
         f.debug_struct("History")
             .field("undo_len", &self.undo_stack.len())
             .field("redo_len", &self.redo_stack.len())
+            .field("journal_len", &self.journal.len())
             .finish_non_exhaustive()
     }
 }
@@ -574,6 +690,197 @@ mod tests {
             width: 20,
             height: 20,
         }
+    }
+
+    #[test]
+    fn replay_of_an_empty_history_is_an_empty_tree() {
+        let history = History::new();
+        assert_eq!(history.journal_len(), 0);
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(replayed.is_empty());
+    }
+
+    #[test]
+    fn replay_reconstructs_a_simple_add_with_the_same_id_and_bounds() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(replayed.contains(id));
+        assert_eq!(
+            replayed.kind(id),
+            Some(&LayerKind::Pixel { bounds: bounds() })
+        );
+        assert_eq!(replayed.roots(), tree.roots());
+    }
+
+    #[test]
+    fn replay_reflects_current_state_after_an_undo_not_the_original_history() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let a = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match history.add_pixel_layer(&mut tree, "b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        // Live tree now has only `a` -- `b` was undone.
+        assert!(!tree.contains(b));
+
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            replayed.contains(a),
+            "the surviving layer must still be there"
+        );
+        assert!(
+            !replayed.contains(b),
+            "replay must reflect the undone state, not resurrect what the user undid"
+        );
+        assert_eq!(replayed.roots(), tree.roots());
+    }
+
+    #[test]
+    fn replay_reflects_a_redo_bringing_a_layer_back() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(replayed.contains(id));
+    }
+
+    #[test]
+    // Exact-literal round-trip, no arithmetic -- same reasoning as
+    // `tree::tests`' own float_cmp allows.
+    #[allow(clippy::float_cmp)]
+    fn replay_reconstructs_property_changes() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_opacity(&mut tree, id, 0.5) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_blend_mode(&mut tree, id, BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_visible(&mut tree, id, false) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_lock(&mut tree, id, LayerLock::all()) {
+            unreachable!("{err:?}");
+        }
+
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.opacity(id), Some(0.5));
+        assert_eq!(replayed.blend_mode(id), Some(BlendMode::Multiply));
+        assert_eq!(replayed.visible(id), Some(false));
+        assert_eq!(replayed.lock(id), Some(LayerLock::all()));
+    }
+
+    #[test]
+    fn replay_reconstructs_a_nested_group_with_correct_parent_links() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match history.add_pixel_layer(&mut tree, "c", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.parent(child), Some(group));
+        assert_eq!(replayed.children(group), Some([child].as_slice()));
+    }
+
+    #[test]
+    fn replay_reconstructs_a_mask_with_its_exact_state() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.add_mask(&mut tree, id, other_bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_mask_inverted(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mask = replayed
+            .mask(id)
+            .unwrap_or_else(|| unreachable!("mask must survive replay"));
+        assert_eq!(mask.bounds, other_bounds());
+        assert!(mask.enabled);
+        assert!(mask.inverted);
+    }
+
+    #[test]
+    fn journal_len_grows_with_every_action_undo_and_redo() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        assert_eq!(history.journal_len(), 0);
+
+        if let Err(err) = history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(history.journal_len(), 1);
+
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(history.journal_len(), 2, "undo is itself a journaled step");
+
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(history.journal_len(), 3, "so is redo");
     }
 
     #[test]

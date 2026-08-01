@@ -25,6 +25,14 @@ use crate::layer::{BlendMode, Layer, LayerEntry, LayerId, LayerKind, LayerLock, 
 /// original id and re-linking the root into its old parent's sibling
 /// list; every descendant's own recorded fields already point at the
 /// right (also-being-restored) ids.
+///
+/// `Clone`: [`crate::History`]'s in-memory journal needs its own copy of
+/// a captured subtree independent of the one actually consumed by
+/// [`LayerTree::restore`] (one is replayed into the tree, the other kept
+/// for [`crate::History::replay`]'s later use) — see that type's own doc
+/// comment for why replaying it back into a *disk file* is a separate,
+/// not-yet-built piece.
+#[derive(Clone)]
 pub(crate) struct RemovedSubtree {
     pub(crate) root: LayerId,
     pub(crate) parent: Option<LayerId>,

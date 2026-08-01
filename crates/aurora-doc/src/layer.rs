@@ -155,6 +155,10 @@ pub struct LayerMask {
 }
 
 /// One layer's bookkeeping: identity data plus its position in the tree.
+///
+/// `Clone`: needed by [`crate::tree::RemovedSubtree`]'s own `Clone` impl,
+/// in turn needed by [`crate::History`]'s in-memory journal.
+#[derive(Clone)]
 pub(crate) struct LayerEntry {
     pub(crate) name: String,
     pub(crate) parent: Option<LayerId>,

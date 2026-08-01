@@ -9,8 +9,11 @@
 //! here yet); per-layer opacity, fill opacity, blend mode, visibility,
 //! and locking; and per-layer masks ([`LayerMask`]). [`SelectionSet`] is
 //! the fourth: the document's current selection plus any named ones
-//! saved for later. [`History`] is the fifth: reversible operations plus
-//! dirtied regions, unlimited undo/redo (§7.3.3) over a [`LayerTree`].
+//! saved for later. [`History`] is the fifth and sixth: reversible
+//! operations plus dirtied regions, unlimited undo/redo (§7.3.3) over a
+//! [`LayerTree`], plus an in-memory crash-recovery journal
+//! ([`History::replay`]) — see that module's own doc comment for the
+//! durable-persistence half deliberately not yet built.
 
 mod error;
 mod history;

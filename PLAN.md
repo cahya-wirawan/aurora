@@ -61,7 +61,7 @@ among the three steps PRD §13 actually names as blocking.
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
 | **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
-| **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. History (`History` — mirrors all 14 `LayerTree` mutators with undo-recording versions, unlimited undo/redo, §7.3.3) done 2026-08-01, 20 more tests (70 total) — add/remove turned out to be exact inverses of two new id-preserving `LayerTree` primitives (`remove_capturing`/`restore`), one symmetric apply function drives both undo and redo, and dirtied `Rect`s are reported when knowable (pixel bounds, or a union over a removed subtree) and honestly `None` for group-level changes. fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. Crash recovery journal remains. See M1.4 |
+| **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. History (`History` — mirrors all 14 `LayerTree` mutators with undo-recording versions, unlimited undo/redo, §7.3.3) done 2026-08-01, 20 more tests (70 total) — add/remove turned out to be exact inverses of two new id-preserving `LayerTree` primitives (`remove_capturing`/`restore`), one symmetric apply function drives both undo and redo, and dirtied `Rect`s are reported when knowable (pixel bounds, or a union over a removed subtree) and honestly `None` for group-level changes. Crash recovery journal's **in-memory half** (`History::replay`, an ever-growing chronological op log distinct from the undo/redo stacks) done 2026-08-01, 8 more tests (78 total) — proven to reflect *current* state after undo/redo, not just full history; **durable disk persistence deliberately deferred**, no on-disk encoding decided (see M1.4). fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. See M1.4 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -976,7 +976,37 @@ every widget in every state across all built-in themes with contrast checks gree
   already have been undone first). Verified: `cargo fmt --all --check`
   clean, `cargo clippy -p aurora-doc --all-targets --all-features -- -D
   warnings` clean, `cargo test -p aurora-doc` — 70/70 passed.
-- [ ] Crash recovery journal
+- [~] **Crash recovery journal** — in-memory half done 2026-08-01, same
+  `crates/aurora-doc/src/history.rs`, 8 more tests (78 total in the
+  crate). Every op `History` ever applies — fresh action, undo, *or*
+  redo — is also appended, in real chronological order, to an
+  ever-growing `journal: Vec<LayerOp>` distinct from the undo/redo
+  stacks; `History::replay` rebuilds a fresh `LayerTree` purely from that
+  log, proving it's sufficient and order-correct. **The critical
+  property, and the one a naive "just log the undo stack" design would
+  get wrong**: replay reflects the *current* state, not the full history
+  — a dedicated test
+  (`replay_reflects_current_state_after_an_undo_not_the_original_history`)
+  adds two layers, undoes the second, and confirms replay reconstructs
+  only the first; a paired test confirms a subsequent redo brings the
+  second back through replay too. `RemovedSubtree`/`LayerEntry`/`LayerOp`
+  all gained `Clone` to support this (the journal keeps its own copy
+  independent of whatever the undo/redo stacks consume).
+  **Deliberately not built: writing the journal to disk** — the actual
+  "survives a crash" property this bullet is named for. That needs a
+  chosen on-disk encoding for `LayerOp`'s recursive shape (nested entries,
+  strings, ids): a real, first-party format decision, the same *kind* of
+  choice as `aurora-tile`'s own hand-rolled tile codec, but with no spike
+  or evidence behind it yet, and `serde` (declared in workspace deps but,
+  checked directly, not actually used by any crate yet) doesn't resolve
+  the choice by itself — it has no concrete binary-format crate paired
+  with it. Forcing an encoding here without that evidence is exactly the
+  mistake `spike/raw-icc/FINDINGS.md` already caught once (a "small,
+  fast" persistence detail that turned out to need its own real design
+  pass) — deferred deliberately, not silently skipped. Verified: `cargo
+  fmt --all --check` clean, `cargo clippy -p aurora-doc --all-targets
+  --all-features -- -D warnings` clean, `cargo test -p aurora-doc` —
+  78/78 passed.
 
 ### M1.5 — Colour (`aurora-color`)
 
