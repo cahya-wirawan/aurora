@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-07-29**.
+Last updated: **2026-07-30**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -61,6 +61,7 @@ among the three steps PRD §13 actually names as blocking.
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
 | **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
+| **Phase 1 — M1.4** | **Started, 2026-07-30.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 25 tests — the concrete consumer M1.3's progressive-rendering/async-evaluation primitives were waiting for still doesn't exist yet (that's compositing/rendering wiring, not this bullet). Opacity/blend modes/visibility/locking, masks, selections, and history remain. See M1.4 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -789,7 +790,50 @@ every widget in every state across all built-in themes with contrast checks gree
 
 ### M1.4 — Document model (`aurora-doc`)
 
-- [ ] Layer tree: pixel, group, nesting, ordering
+- [x] **Layer tree: pixel, group, nesting, ordering** — done 2026-07-30,
+  `crates/aurora-doc/src/{layer,tree,error}.rs` (`LayerId`, `LayerKind`,
+  `LayerTree`), 25 tests. `LayerId` is `aurora_core::Id<Layer>` — the
+  same phantom-typed pattern `aurora_graph::NodeId` already uses, and
+  `aurora_core::id.rs`'s own test module had already named `Layer` as
+  exactly this kind of use case. **Deliberately only two layer kinds**
+  (`Pixel`, `Group`): FR-003 names nine more (Text, Shape, Smart Object,
+  Adjustment, Fill, Gradient, Pattern, Video, Frame), but every one needs
+  content types this crate structurally cannot reference —
+  `aurora-doc` may only depend on `aurora-core`/`aurora-tile`/
+  `aurora-graph` (PRD §7.2), not `aurora-text`/`aurora-vector`/
+  `aurora-filters`/`aurora-ai`. A pixel layer carries `bounds: Rect` but
+  deliberately does **not** yet own an `aurora_tile::TileStore` — whether
+  pixel storage is one store per layer (simple, but `TileStore::new`
+  spawns a background-writer thread, so an unlimited-layers document
+  would mean an unlimited number of OS threads) or one store shared some
+  other way is a real resource-management question left open rather than
+  decided silently while "starting the layer tree."
+  **Ordering convention fixed and documented**: sibling lists are
+  top-to-bottom as a layers panel displays them (index 0 = topmost,
+  painted last/on top) — the opposite of PSD's on-disk order (bottom
+  layer first), which `aurora-io` will need to reverse when it exists. A
+  new layer is inserted at index 0, matching every mainstream editor's
+  "new layer appears above the current one." `reparent(id, new_parent,
+  index)` is one unified primitive for both reordering-within-a-parent
+  and moving-into-a-different-group (nesting), rather than separate
+  move-up/move-down/reparent methods — clamps an out-of-range `index` to
+  the end (a UI drop target's forgiving behaviour) rather than erroring,
+  and rejects a cycle (`new_parent` is `id` itself or one of its own
+  descendants) by walking `id`'s ancestor chain, which is bounded by tree
+  depth rather than scanning `id`'s whole subtree. `remove` cascades: 
+  deleting a group deletes its contents, matching every mainstream
+  editor's actual plain-delete behaviour (no implicit flatten-up-a-level).
+  Every mutating method validates before mutating anything, so a failed
+  call changes nothing — same "all or nothing" discipline
+  `RenderGraph::add_node` already established. Full local CI gate clean.
+  **Not this bullet's job, and explicitly still open**: this is
+  identity/nesting/ordering only — no opacity, blend mode, visibility,
+  locking (the next bullet), no wiring to a `RenderGraph` node (that
+  needs blend-mode semantics to mean anything), and no real pixel
+  storage (see above). M1.3's progressive-rendering/async-evaluation
+  primitives (`mip::downsample`, `Executor`) still have no real
+  consumer — a layer *tree* existing doesn't yet mean anything renders;
+  that needs this bullet's own follow-ons plus `aurora-render` wiring.
 - [ ] Opacity, fill opacity, blend modes, visibility, locking
 - [ ] Layer masks
 - [ ] Selection representation
@@ -979,8 +1023,15 @@ shape as `aurora_tile::writer::BackgroundWriter`), 5 tests — 26 total in
 async evaluation is the same shape**: real primitives exist
 (downsampling, atlas upload, a background executor) but nothing yet
 calls them with real work, because there's no render-graph node
-evaluation to call them *with* — that needs `aurora-doc`/`aurora-filters`,
-neither of which exists. M1.4 (`aurora-doc`) is the natural next step.
+evaluation to call them *with* — that needs `aurora-doc`/`aurora-filters`.
+**M1.4 has now started, 2026-07-30**: `aurora-doc`'s `LayerTree`
+(`Pixel`/`Group` layers, nesting, ordering, cascading delete,
+cycle-checked reparenting) is done, 25 tests — but it's identity/
+nesting/ordering only, with no opacity/blend-mode/visibility/locking, no
+`RenderGraph` wiring, and no real pixel storage yet (a pixel layer
+records `bounds`, deliberately not an owned `TileStore` — see M1.4 for
+why). A layer tree existing doesn't yet give M1.3's primitives a real
+consumer; that still needs this crate's next few bullets.
 
 **A live desktop session, whenever one is available, still has one thing
 waiting on it**: the a11y human/Orca leg below. The other item that used
