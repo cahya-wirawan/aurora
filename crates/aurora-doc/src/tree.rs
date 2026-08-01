@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use aurora_core::{IdGenerator, Rect};
 
 use crate::error::DocError;
-use crate::layer::{Layer, LayerEntry, LayerId, LayerKind};
+use crate::layer::{BlendMode, Layer, LayerEntry, LayerId, LayerKind, LayerLock, LayerMask};
 
 /// A forest of layers: pixel layers and groups, nested to any depth.
 ///
@@ -21,8 +21,12 @@ use crate::layer::{Layer, LayerEntry, LayerId, LayerKind};
 ///
 /// Deliberately just two layer kinds (`Pixel`, `Group`) — see
 /// [`LayerKind`]'s own doc comment for why the other nine FR-003 names
-/// aren't here yet. Deliberately no opacity, blend mode, visibility, or
-/// locking either — those are PLAN.md M1.4's next bullet, not this one.
+/// aren't here yet. Every layer carries opacity, fill opacity, blend mode,
+/// visibility, and locking (see [`Self::set_opacity`] and neighbours) —
+/// stored state only, since nothing yet composites or paints to actually
+/// interpret them. Any layer, pixel or group, may also carry one
+/// [`LayerMask`] (see [`Self::add_mask`] and neighbours) — likewise
+/// stored state only, no real mask pixels yet.
 pub struct LayerTree {
     ids: IdGenerator<Layer>,
     layers: HashMap<LayerId, LayerEntry>,
@@ -304,6 +308,160 @@ impl LayerTree {
         Ok(())
     }
 
+    #[must_use]
+    pub fn opacity(&self, id: LayerId) -> Option<f32> {
+        self.layers.get(&id).map(|entry| entry.opacity)
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist, or
+    /// [`DocError::OpacityOutOfRange`] if `opacity` is outside
+    /// `0.0..=1.0`. Nothing is changed when this happens.
+    pub fn set_opacity(&mut self, id: LayerId, opacity: f32) -> Result<(), DocError> {
+        if !(0.0..=1.0).contains(&opacity) {
+            return Err(DocError::OpacityOutOfRange(opacity));
+        }
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        entry.opacity = opacity;
+        Ok(())
+    }
+
+    /// The layer's *fill* opacity — distinct from [`Self::opacity`] in
+    /// exactly the way Photoshop's own "Fill" slider is: it fades the
+    /// layer's own pixels but, unlike [`Self::opacity`], does not fade
+    /// layer styles applied on top (a distinction this crate stores now
+    /// and a future compositor/layer-style consumer gives meaning to).
+    #[must_use]
+    pub fn fill_opacity(&self, id: LayerId) -> Option<f32> {
+        self.layers.get(&id).map(|entry| entry.fill_opacity)
+    }
+
+    /// # Errors
+    ///
+    /// Same as [`Self::set_opacity`].
+    pub fn set_fill_opacity(&mut self, id: LayerId, fill_opacity: f32) -> Result<(), DocError> {
+        if !(0.0..=1.0).contains(&fill_opacity) {
+            return Err(DocError::OpacityOutOfRange(fill_opacity));
+        }
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        entry.fill_opacity = fill_opacity;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn blend_mode(&self, id: LayerId) -> Option<BlendMode> {
+        self.layers.get(&id).map(|entry| entry.blend_mode)
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist.
+    pub fn set_blend_mode(&mut self, id: LayerId, blend_mode: BlendMode) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        entry.blend_mode = blend_mode;
+        Ok(())
+    }
+
+    /// This layer's *own* visibility flag — not whether it actually shows
+    /// up in the final composite, which also depends on every ancestor
+    /// group's own visibility. Computing that combined answer needs a
+    /// concrete tree-walking consumer this crate doesn't have yet (same
+    /// reasoning `spike/psd-write/FINDINGS.md` already recorded: an
+    /// invisible group hides its whole subtree).
+    #[must_use]
+    pub fn visible(&self, id: LayerId) -> Option<bool> {
+        self.layers.get(&id).map(|entry| entry.visible)
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist.
+    pub fn set_visible(&mut self, id: LayerId, visible: bool) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        entry.visible = visible;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn lock(&self, id: LayerId) -> Option<LayerLock> {
+        self.layers.get(&id).map(|entry| entry.lock)
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist.
+    pub fn set_lock(&mut self, id: LayerId, lock: LayerLock) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        entry.lock = lock;
+        Ok(())
+    }
+
+    /// `None` both when `id` doesn't exist and when it exists but has no
+    /// mask — same conflated shape [`Self::parent`] already documents;
+    /// callers that need to tell those apart should check
+    /// [`Self::contains`] first.
+    #[must_use]
+    pub fn mask(&self, id: LayerId) -> Option<&LayerMask> {
+        self.layers.get(&id)?.mask.as_ref()
+    }
+
+    /// Adds a mask to `id`, enabled and not inverted, covering `bounds` in
+    /// document space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist, or
+    /// [`DocError::MaskAlreadyExists`] if it already has a mask. Nothing
+    /// is changed when this happens.
+    pub fn add_mask(&mut self, id: LayerId, bounds: Rect) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        if entry.mask.is_some() {
+            return Err(DocError::MaskAlreadyExists(id));
+        }
+        entry.mask = Some(LayerMask {
+            bounds,
+            enabled: true,
+            inverted: false,
+        });
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist, or
+    /// [`DocError::NoMask`] if it has none. Nothing is changed when this
+    /// happens.
+    pub fn remove_mask(&mut self, id: LayerId) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        if entry.mask.take().is_none() {
+            return Err(DocError::NoMask(id));
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist, or
+    /// [`DocError::NoMask`] if it has none. Nothing is changed when this
+    /// happens.
+    pub fn set_mask_enabled(&mut self, id: LayerId, enabled: bool) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        let mask = entry.mask.as_mut().ok_or(DocError::NoMask(id))?;
+        mask.enabled = enabled;
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Same as [`Self::set_mask_enabled`].
+    pub fn set_mask_inverted(&mut self, id: LayerId, inverted: bool) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        let mask = entry.mask.as_mut().ok_or(DocError::NoMask(id))?;
+        mask.inverted = inverted;
+        Ok(())
+    }
+
     /// Root-level layers, top-to-bottom (see this type's own doc comment
     /// for the ordering convention).
     #[must_use]
@@ -344,7 +502,7 @@ impl std::fmt::Debug for LayerTree {
 mod tests {
     use super::LayerTree;
     use crate::DocError;
-    use crate::layer::{Layer, LayerKind};
+    use crate::layer::{BlendMode, Layer, LayerKind, LayerLock, LayerMask};
     use aurora_core::{Id, Rect};
 
     fn bounds() -> Rect {
@@ -737,6 +895,314 @@ mod tests {
             }
             .is_group()
         );
+    }
+
+    #[test]
+    fn fresh_layer_has_the_documented_defaults() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.opacity(id), Some(1.0));
+        assert_eq!(tree.fill_opacity(id), Some(1.0));
+        assert_eq!(tree.blend_mode(id), Some(BlendMode::Normal));
+        assert_eq!(tree.visible(id), Some(true));
+        assert_eq!(tree.lock(id), Some(LayerLock::none()));
+    }
+
+    #[test]
+    // The values under test are the exact literals passed a few lines
+    // above, round-tripped through `DocError::OpacityOutOfRange` with no
+    // arithmetic in between -- exact comparison is correct here, not the
+    // "accumulated rounding error" case clippy::float_cmp warns about
+    // (same reasoning `aurora_tile::store`'s own tests already document).
+    #[allow(clippy::float_cmp)]
+    fn set_opacity_updates_and_rejects_out_of_range() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        if let Err(err) = tree.set_opacity(id, 0.5) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.opacity(id), Some(0.5));
+
+        match tree.set_opacity(id, 1.5) {
+            Err(DocError::OpacityOutOfRange(v)) => assert_eq!(v, 1.5),
+            other => unreachable!("expected OpacityOutOfRange, got {other:?}"),
+        }
+        // A rejected value must not have been applied.
+        assert_eq!(tree.opacity(id), Some(0.5));
+
+        match tree.set_opacity(id, -0.1) {
+            Err(DocError::OpacityOutOfRange(v)) => assert_eq!(v, -0.1),
+            other => unreachable!("expected OpacityOutOfRange, got {other:?}"),
+        }
+
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.set_opacity(bogus, 0.5) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // Same exact-literal-round-trip reasoning as
+    // `set_opacity_updates_and_rejects_out_of_range` above.
+    #[allow(clippy::float_cmp)]
+    fn set_fill_opacity_updates_independently_of_opacity() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        if let Err(err) = tree.set_fill_opacity(id, 0.25) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.fill_opacity(id), Some(0.25));
+        assert_eq!(tree.opacity(id), Some(1.0), "must not affect layer opacity");
+
+        match tree.set_fill_opacity(id, 2.0) {
+            Err(DocError::OpacityOutOfRange(v)) => assert_eq!(v, 2.0),
+            other => unreachable!("expected OpacityOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_blend_mode_updates_and_rejects_unknown_id() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_blend_mode(id, BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.blend_mode(id), Some(BlendMode::Multiply));
+
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.set_blend_mode(bogus, BlendMode::Screen) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_visible_updates_and_rejects_unknown_id() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_visible(id, false) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.visible(id), Some(false));
+
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.set_visible(bogus, true) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_lock_updates_and_rejects_unknown_id() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_lock(id, LayerLock::all()) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.lock(id), Some(LayerLock::all()));
+
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.set_lock(bogus, LayerLock::none()) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer_lock_none_and_all_and_is_any() {
+        assert!(!LayerLock::none().is_any());
+        assert_eq!(LayerLock::none(), LayerLock::default());
+        let all = LayerLock::all();
+        assert!(all.transparency && all.pixels && all.position);
+        assert!(all.is_any());
+
+        let partial = LayerLock {
+            transparency: true,
+            pixels: false,
+            position: false,
+        };
+        assert!(partial.is_any());
+    }
+
+    #[test]
+    fn fresh_layer_has_no_mask() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.mask(id), None);
+    }
+
+    #[test]
+    fn add_mask_creates_an_enabled_uninverted_mask_and_rejects_duplicates() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mask_bounds = bounds();
+
+        if let Err(err) = tree.add_mask(id, mask_bounds) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.mask(id),
+            Some(&LayerMask {
+                bounds: mask_bounds,
+                enabled: true,
+                inverted: false,
+            })
+        );
+
+        match tree.add_mask(id, mask_bounds) {
+            Err(DocError::MaskAlreadyExists(got)) => assert_eq!(got, id),
+            other => unreachable!("expected MaskAlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_mask_works_on_a_group_too() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.add_mask(group, bounds()) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.mask(group).is_some());
+    }
+
+    #[test]
+    fn add_mask_rejects_an_unknown_layer() {
+        let mut tree = LayerTree::new();
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.add_mask(bogus, bounds()) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_mask_clears_it_and_rejects_when_absent() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        match tree.remove_mask(id) {
+            Err(DocError::NoMask(got)) => assert_eq!(got, id),
+            other => unreachable!("expected NoMask, got {other:?}"),
+        }
+
+        if let Err(err) = tree.add_mask(id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.remove_mask(id) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.mask(id), None);
+
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.remove_mask(bogus) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removing_a_layer_takes_its_mask_with_it() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.add_mask(id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.remove(id) {
+            unreachable!("{err:?}");
+        }
+        assert!(!tree.contains(id));
+    }
+
+    #[test]
+    fn set_mask_enabled_updates_and_rejects_when_absent_or_unknown() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        match tree.set_mask_enabled(id, false) {
+            Err(DocError::NoMask(got)) => assert_eq!(got, id),
+            other => unreachable!("expected NoMask, got {other:?}"),
+        }
+
+        if let Err(err) = tree.add_mask(id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_mask_enabled(id, false) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.mask(id).map(|m| m.enabled), Some(false));
+
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.set_mask_enabled(bogus, true) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_mask_inverted_updates_and_rejects_when_absent_or_unknown() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        match tree.set_mask_inverted(id, true) {
+            Err(DocError::NoMask(got)) => assert_eq!(got, id),
+            other => unreachable!("expected NoMask, got {other:?}"),
+        }
+
+        if let Err(err) = tree.add_mask(id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_mask_inverted(id, true) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.mask(id).map(|m| m.inverted), Some(true));
+
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.set_mask_inverted(bogus, true) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
     }
 
     /// Not a functional test -- `Layer` is a zero-variant marker type only

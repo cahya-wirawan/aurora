@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-07-30**.
+Last updated: **2026-08-01**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -61,7 +61,7 @@ among the three steps PRD §13 actually names as blocking.
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
 | **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
-| **Phase 1 — M1.4** | **Started, 2026-07-30.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 25 tests — the concrete consumer M1.3's progressive-rendering/async-evaluation primitives were waiting for still doesn't exist yet (that's compositing/rendering wiring, not this bullet). Opacity/blend modes/visibility/locking, masks, selections, and history remain. See M1.4 |
+| **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean once a Rust toolchain was installed partway through this work, see M1.4. The concrete consumer M1.3's progressive-rendering/async-evaluation primitives were waiting for still doesn't exist yet (that's compositing/rendering wiring, not these bullets). Selections and history remain. See M1.4 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -834,8 +834,69 @@ every widget in every state across all built-in themes with contrast checks gree
   primitives (`mip::downsample`, `Executor`) still have no real
   consumer — a layer *tree* existing doesn't yet mean anything renders;
   that needs this bullet's own follow-ons plus `aurora-render` wiring.
-- [ ] Opacity, fill opacity, blend modes, visibility, locking
-- [ ] Layer masks
+- [x] **Opacity, fill opacity, blend modes, visibility, locking** —
+  done 2026-08-01, `crates/aurora-doc/src/layer.rs`
+  (`BlendMode`, `LayerLock`) and `tree.rs` (per-layer
+  `opacity`/`fill_opacity`/`blend_mode`/`visible`/`lock` getters and
+  validating setters), 7 new tests (32 total in the crate). `BlendMode`
+  is the full standard 27-mode Photoshop set (FR-003) — purely
+  descriptive, since `aurora-doc` structurally cannot depend on
+  `aurora-render`/`aurora-gpu` to implement the actual blend math (same
+  "data now, a future consumer interprets it" shape `RenderGraph<N>`'s
+  generic payload already established). `LayerLock` mirrors PSD's own
+  `lspf` (Protected Setting) tagged block bit-for-bit
+  (transparency/pixels/position) rather than inventing a shape
+  `aurora-io` would need to translate later — stored state only, nothing
+  yet enforces it (no paint/move tool exists to refuse). `opacity`/
+  `fill_opacity` are `f32` in `0.0..=1.0` (matching ADR 0003's `f32`
+  compute-precision floor, not PSD's on-disk `u8`), validated by the
+  setters (`DocError::OpacityOutOfRange`) rather than silently clamped —
+  same "all or nothing, nothing silently coerced" discipline the rest of
+  this crate already uses. New layers default to opacity 1.0, `Normal`,
+  visible, unlocked. **Verified 2026-08-01** once a Rust toolchain was
+  installed in this environment (initially absent — `cargo`/`rustc` not
+  found — the first pass of this bullet was written and manually re-read
+  against the lint set but honestly left `[~]` until a real run was
+  possible): `cargo fmt --all --check` clean, `cargo clippy -p aurora-doc
+  --all-targets --all-features -- -D warnings` clean (pedantic, `-D
+  warnings`), `cargo test -p aurora-doc` — 32/32 passed. Workspace-wide
+  `cargo clippy --workspace` and `check_layering.py` did not run in this
+  pass (a pre-existing, unrelated environment gap — `yeslogic-fontconfig-sys`
+  needs `pkg-config`, not installed; `python3` also isn't on this machine)
+  — neither is a regression risk here since this bullet touched no
+  `Cargo.toml` and only `aurora-doc`'s own crate.
+- [x] **Layer masks** — done 2026-08-01, `crates/aurora-doc/src/layer.rs`
+  (`LayerMask`) and `tree.rs` (`mask`/`add_mask`/`remove_mask`/
+  `set_mask_enabled`/`set_mask_inverted`), 8 new tests (40 total in the
+  crate). Lives on `LayerEntry` itself, not inside `LayerKind` — Photoshop
+  allows a mask on both pixel layers and groups (a group mask clips the
+  whole subtree), so it can't be a `Pixel`-only field; a dedicated test
+  (`add_mask_works_on_a_group_too`) confirms this. **Deliberately no real
+  mask pixels yet** — same open resource-management question
+  `LayerKind::Pixel`'s own `bounds` field already flagged, and masks are
+  still genuinely unspiked on the PSD side
+  (`spike/psd-write/FINDINGS.md`: "Layer masks, vector masks, smart
+  objects, layer styles, adjustment layers" all unstarted) — so
+  `LayerMask` carries only `bounds`/`enabled`/`inverted`, the two toggles
+  the modern Photoshop UI actually exposes, not the full `lspf` byte
+  layout (density/feather/position-relative-to-layer are legacy fields
+  left out rather than guessed at, same honesty `LayerLock`'s doc comment
+  already used for its own narrower-than-PSD scope). `add_mask` rejects a
+  second mask (`DocError::MaskAlreadyExists`) rather than silently
+  overwriting one, matching Photoshop's own UI (which swaps "Add Layer
+  Mask" for "Delete Layer Mask" once one exists); `remove_mask`/
+  `set_mask_enabled`/`set_mask_inverted` reject a missing mask
+  (`DocError::NoMask`) with the same "all or nothing" discipline every
+  other mutator in this crate already uses. Removing a layer removes its
+  mask for free (no extra cleanup code needed — the mask is just a field
+  on the `LayerEntry` `remove`/`remove_subtree_contents` already delete),
+  confirmed by `removing_a_layer_takes_its_mask_with_it`. **Verified**:
+  `cargo fmt --all --check` clean, `cargo clippy -p aurora-doc
+  --all-targets --all-features -- -D warnings` clean, `cargo test -p
+  aurora-doc` — 40/40 passed. Same environment caveat as the previous
+  bullet: workspace-wide clippy/`check_layering.py` didn't run
+  (pre-existing, unrelated gaps — missing `pkg-config`/`python3`), not a
+  regression risk since no `Cargo.toml` changed.
 - [ ] Selection representation
 - [ ] History as reversible operations + dirtied tiles (§7.3.3), unlimited undo/redo
 - [ ] Crash recovery journal

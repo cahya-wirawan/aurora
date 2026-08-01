@@ -27,4 +27,20 @@ pub enum DocError {
         "cannot move layer {id:?} under {new_parent:?}: {new_parent:?} is {id:?} or one of its own descendants"
     )]
     CycleDetected { id: LayerId, new_parent: LayerId },
+    /// An opacity or fill-opacity value passed to `LayerTree` was outside
+    /// the valid `0.0..=1.0` range.
+    #[error("opacity {0} is out of range: must be within 0.0..=1.0")]
+    OpacityOutOfRange(f32),
+    /// [`crate::LayerTree::add_mask`] was called on a layer that already
+    /// has one — matching Photoshop's own UI, which replaces "Add Layer
+    /// Mask" with "Delete Layer Mask" once one exists rather than letting
+    /// a second one silently overwrite it.
+    #[error("layer {0:?} already has a mask")]
+    MaskAlreadyExists(LayerId),
+    /// A mask-only operation ([`crate::LayerTree::remove_mask`],
+    /// [`crate::LayerTree::set_mask_enabled`],
+    /// [`crate::LayerTree::set_mask_inverted`]) was called on a layer that
+    /// exists but has no mask.
+    #[error("layer {0:?} has no mask")]
+    NoMask(LayerId),
 }
