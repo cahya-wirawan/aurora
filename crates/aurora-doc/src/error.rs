@@ -43,4 +43,14 @@ pub enum DocError {
     /// exists but has no mask.
     #[error("layer {0:?} has no mask")]
     NoMask(LayerId),
+    /// A [`crate::SelectionSet`] operation ([`crate::SelectionSet::invert`],
+    /// [`crate::SelectionSet::save_active`]) needed an active selection,
+    /// but none exists.
+    #[error("no active selection")]
+    NoActiveSelection,
+    /// [`crate::SelectionSet::load`] or
+    /// [`crate::SelectionSet::delete_saved`] named a selection that was
+    /// never saved (or was already deleted).
+    #[error("no selection saved under {0:?}")]
+    UnknownSavedSelection(String),
 }

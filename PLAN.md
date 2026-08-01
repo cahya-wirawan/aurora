@@ -61,7 +61,7 @@ among the three steps PRD §13 actually names as blocking.
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 12 tests, ADR 0005). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
 | **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
-| **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean once a Rust toolchain was installed partway through this work, see M1.4. The concrete consumer M1.3's progressive-rendering/async-evaluation primitives were waiting for still doesn't exist yet (that's compositing/rendering wiring, not these bullets). Selections and history remain. See M1.4 |
+| **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. History remains. See M1.4 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -897,7 +897,30 @@ every widget in every state across all built-in themes with contrast checks gree
   bullet: workspace-wide clippy/`check_layering.py` didn't run
   (pre-existing, unrelated gaps — missing `pkg-config`/`python3`), not a
   regression risk since no `Cargo.toml` changed.
-- [ ] Selection representation
+- [x] **Selection representation** — done 2026-08-01,
+  `crates/aurora-doc/src/selection.rs` (`Selection`, `SelectionSet`), 11
+  new tests (51 total in the crate). Document-level, not per-layer — a
+  new module rather than a `LayerTree` method, since Photoshop's active
+  selection isn't attached to any one layer. `Selection` is deliberately
+  just a bounding `Rect` plus an `inverted` flag, not a real raster mask:
+  no selection tool (rectangle/ellipse/lasso/magic wand, all FR-004, all
+  Phase 2 scope) exists yet to produce anything but a bounding box, and
+  there's no real pixel storage for antialiased/feathered coverage even
+  if one did — same open question `LayerKind::Pixel`'s `bounds` and
+  `LayerMask` already flagged. `SelectionSet` holds the current active
+  selection (`Option<Selection>`, `None` = nothing selected) plus named
+  saved ones (`save_active`/`load`/`delete_saved`/`saved_names`),
+  answering FR-004's "Save Selection"/"Load Selection" commands the way
+  Photoshop's own saved-selection alpha channels do; `invert` flips the
+  active selection's flag, answering "Inverse". **Deliberately out of
+  scope**: Feather/Expand/Contract/Border (FR-004's remaining selection
+  commands) all need to reshape a real raster region, meaningless on a
+  bounding box; saving over an existing name always replaces it outright
+  rather than implementing Photoshop's add/subtract/intersect
+  combine-with-channel modes, which need the same real boolean-region math
+  this pass doesn't have. Verified: `cargo fmt --all --check` clean,
+  `cargo clippy -p aurora-doc --all-targets --all-features -- -D
+  warnings` clean, `cargo test -p aurora-doc` — 51/51 passed.
 - [ ] History as reversible operations + dirtied tiles (§7.3.3), unlimited undo/redo
 - [ ] Crash recovery journal
 

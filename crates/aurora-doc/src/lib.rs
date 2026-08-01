@@ -7,13 +7,16 @@
 //! and ordering for the two layer kinds this crate can currently express
 //! ([`LayerKind`] explains why the other nine FR-003 layer types aren't
 //! here yet); per-layer opacity, fill opacity, blend mode, visibility,
-//! and locking; and per-layer masks ([`LayerMask`]). Selections and
-//! history are still open — see PLAN.md M1.4.
+//! and locking; and per-layer masks ([`LayerMask`]). [`SelectionSet`] is
+//! the fourth: the document's current selection plus any named ones
+//! saved for later. History is still open — see PLAN.md M1.4.
 
 mod error;
 mod layer;
+mod selection;
 mod tree;
 
 pub use error::DocError;
 pub use layer::{BlendMode, Layer, LayerId, LayerKind, LayerLock, LayerMask};
+pub use selection::{Selection, SelectionSet};
 pub use tree::LayerTree;
