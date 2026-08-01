@@ -3,22 +3,18 @@
 //! See PRD §7.2 for where this crate sits in the workspace layering, and
 //! `docs/adr/` for the decisions that shape it.
 //!
-//! This crate is a skeleton: no functionality is implemented yet.
+//! [`IccProfile`]/[`Transform`] are M1.5's first piece: ICC transforms via
+//! ADR 0008's `lcms2` decision. Colour-space *descriptors*
+//! ([`aurora_core::ColorSpace`]/[`aurora_core::PixelFormat`]) already
+//! exist from M1.1 — this crate is what actually interprets an ICC
+//! profile and moves pixel data between colour spaces. Working spaces,
+//! linear-light conversion, and promote-on-import/dither-on-export are
+//! still open — see PLAN.md M1.5.
 
-/// Placeholder so the crate compiles and CI has something to check.
-///
-/// Remove once real types land.
-#[must_use]
-pub const fn crate_name() -> &'static str {
-    "aurora-color"
-}
+mod error;
+mod profile;
+mod transform;
 
-#[cfg(test)]
-mod tests {
-    use super::crate_name;
-
-    #[test]
-    fn reports_its_name() {
-        assert_eq!(crate_name(), "aurora-color");
-    }
-}
+pub use error::ColorError;
+pub use profile::IccProfile;
+pub use transform::{RenderingIntent, Transform};

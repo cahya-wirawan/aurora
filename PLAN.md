@@ -62,6 +62,7 @@ among the three steps PRD §13 actually names as blocking.
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
 | **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
 | **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. History (`History` — mirrors all 14 `LayerTree` mutators with undo-recording versions, unlimited undo/redo, §7.3.3) done 2026-08-01, 20 more tests (70 total) — add/remove turned out to be exact inverses of two new id-preserving `LayerTree` primitives (`remove_capturing`/`restore`), one symmetric apply function drives both undo and redo, and dirtied `Rect`s are reported when knowable (pixel bounds, or a union over a removed subtree) and honestly `None` for group-level changes. Crash recovery journal's **in-memory half** (`History::replay`, an ever-growing chronological op log distinct from the undo/redo stacks) done 2026-08-01, 8 more tests (78 total) — proven to reflect *current* state after undo/redo, not just full history; **durable disk persistence deliberately deferred**, no on-disk encoding decided (see M1.4). fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. See M1.4 |
+| **Phase 1 — M1.5** | **In progress, 2026-08-01.** `aurora-color`'s ICC transforms (`IccProfile`, `Transform`, `RenderingIntent`) done, wiring in `lcms2` per ADR 0008 — `Gray`/`Rgb`/`Rgba`/`Cmyk` channel layouts, 9 tests against real, committed CC0 ICC profiles (`corpora/icc/`, copied from `spike/raw-icc`'s own fixtures). Reproduces `spike/raw-icc/FINDINGS.md`'s cross-validated sRGB→ECI-RGBv2 values and adds the permanent extended-range/no-clamping regression test that spike's finding 4 asked for. `cargo deny check all` clean with the new dependency. `Cmyk` wired but untested against a real CMYK profile (none in the corpus yet) — honest gap, not closed by testing the wrong profile type. Colour-space descriptor tagging (§7.3.6) was already done from M1.1. Working spaces/linear-light conversion and promote-on-import/dither-on-export remain. See M1.5 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -1010,8 +1011,49 @@ every widget in every state across all built-in themes with contrast checks gree
 
 ### M1.5 — Colour (`aurora-color`)
 
-- [ ] Colour space types; every buffer tagged (§7.3.6)
-- [ ] ICC transforms via the 0.6 decision
+- [x] **Colour space types; every buffer tagged (§7.3.6)** — mostly
+  already done from M1.1: `aurora_core::{ColorSpace, Channels,
+  SampleFormat, PixelFormat}` are the descriptors every buffer carries.
+  This bullet's own remaining piece — actually *interpreting* an ICC
+  profile, not just tagging a named colour space — is the next bullet.
+- [x] **ICC transforms via the 0.6 decision** — done 2026-08-01,
+  `crates/aurora-color/src/{profile,transform,error}.rs` (`IccProfile`,
+  `Transform`, `RenderingIntent`, `ColorError`), 9 tests. Wires in
+  `lcms2` (ADR 0008), added to `[workspace.dependencies]` and to this
+  crate — `cargo build` fetches and statically compiles `lcms2-sys`'s
+  vendored Little CMS C source cleanly, confirmed on this machine (a C
+  compiler was available). `cargo deny check all` clean with the new
+  dependency (licenses/advisories/bans/sources all `ok`).
+  `Transform` covers `Gray`/`Rgb`/`Rgba`/`Cmyk` — four of
+  `aurora_core::Channels`' six variants; `GrayAlpha`/`CmykAlpha` are
+  deliberately not wired up (no ready-made `lcms2` float pixel-format
+  constant for either, would need hand-building `lcms2`'s own bitfield
+  encoding — real but avoidable scope with no caller needing it yet,
+  rejected with `ColorError::UnsupportedChannels` rather than silently
+  doing something else). New `corpora/icc/` (the same CC0-licensed
+  `sRGB.icc`/`ECI-RGBv2.icc` `spike/raw-icc` already used, copied rather
+  than referenced in place so a real crate doesn't reach into the
+  deliberately-isolated `spike/` directory) backs real tests, not
+  synthetic ones: `matches_the_spikes_own_cross_validated_results`
+  reproduces `spike/raw-icc/FINDINGS.md`'s own recorded sRGB→ECI-RGBv2
+  values to 4 decimal places, and
+  `extended_range_values_survive_rather_than_clamp` is the permanent
+  regression test that FINDINGS.md finding 4 named as remaining
+  work — confirms `lcms2` preserves an out-of-gamut negative channel
+  value (§7.3.1b) rather than clamping to 0, needing no special flag
+  (unlike `moxcms`, which needed `allow_extended_range_rgb_xyz`). **Honest
+  gap carried forward**: `Cmyk` compiles and follows the identical code
+  path as the other three, but `corpora/icc/` has no real CMYK ICC
+  profile yet, so it's untested against one — ADR 0008's own follow-on
+  ("test CMYK and LUT-based profile transforms directly") remains open,
+  not silently closed by testing the wrong profile type. Verified:
+  `cargo fmt --all --check` clean, `cargo clippy -p aurora-color
+  --all-targets --all-features -- -D warnings` clean, `cargo test -p
+  aurora-color` — 9/9 passed, `cargo deny check all` clean. Workspace-wide
+  clippy/`check_layering.py` didn't run in this pass (pre-existing,
+  unrelated gaps — missing `pkg-config`/`python3`); layering itself isn't
+  at risk here since `lcms2` is a third-party dependency, not a new
+  `aurora-*` one, so `scripts/layering.json` didn't change.
 - [ ] Working spaces, linear-light conversion
 - [ ] Promote-on-import, dither-on-export
 
