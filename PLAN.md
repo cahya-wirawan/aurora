@@ -43,9 +43,10 @@ cross-platform validation (DX12 specifically — Vulkan and Metal are now
 both real) is not yet started. CI green on Linux, macOS, and
 Windows. The brush-latency regression test 0.2 flagged as required
 "before Phase 1 feature work" is now done too (2026-08-02, overdue
-against its own stated gate — see 0.2). The remaining Phase 0 items (ADR
-0006, Windows/300k-px slice re-runs, macOS/Windows LGPL packaging,
-deeper PSD format coverage, the golden-image diff harness) continue in
+against its own stated gate — see 0.2), and so is the golden-image diff
+harness (`aurora-testkit`, a new 20th workspace crate — see 0.2). The
+remaining Phase 0 items (ADR 0006, Windows/300k-px slice re-runs,
+macOS/Windows LGPL packaging, deeper PSD format coverage) continue in
 the background rather than gating Phase 1 — none of them are among the
 three steps PRD §13 actually names as blocking.
 
@@ -63,7 +64,7 @@ three steps PRD §13 actually names as blocking.
 | PSD test corpus (Step 6) | **Phase 0's share done** — 319 fixtures, 272/272 open with an independent reader. The 1,000-file real-world gate is deliberately deferred to Phase 3, not carried as Phase 0 debt. See 0.7 |
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 13 tests, ADR 0005 — 12 original plus one CI-gated latency regression test added 2026-08-02, see 0.2). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **In progress, 2026-07-29.** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
-| **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). A CI-gated GPU-dependent latency regression test (`latency.rs`, 1 more test, 27 total) added 2026-08-02 — see 0.2. What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
+| **Phase 1 — M1.3** | **In progress, 2026-07-30.** `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware, plus a fourth added 2026-08-02 comparing the whole composited tile against a golden image via the new `aurora-testkit` harness — see 0.2); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). A CI-gated GPU-dependent latency regression test (`latency.rs`, 1 more test) added 2026-08-02 — see 0.2. 28 tests total in the crate. What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
 | **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. History (`History` — mirrors all 14 `LayerTree` mutators with undo-recording versions, unlimited undo/redo, §7.3.3) done 2026-08-01, 20 more tests (70 total) — add/remove turned out to be exact inverses of two new id-preserving `LayerTree` primitives (`remove_capturing`/`restore`), one symmetric apply function drives both undo and redo, and dirtied `Rect`s are reported when knowable (pixel bounds, or a union over a removed subtree) and honestly `None` for group-level changes. Crash recovery journal's **in-memory half** (`History::replay`, an ever-growing chronological op log distinct from the undo/redo stacks) done 2026-08-01, 8 more tests (78 total) — proven to reflect *current* state after undo/redo, not just full history; **durable disk persistence deliberately deferred**, no on-disk encoding decided (see M1.4). fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. See M1.4 |
 | **Phase 1 — M1.5** | **Complete, 2026-08-01.** `aurora-color`'s ICC transforms (`IccProfile`, `Transform`, `RenderingIntent`) wiring in `lcms2` per ADR 0008 — `Gray`/`Rgb`/`Rgba`/`Cmyk` channel layouts, verified against real, committed CC0 ICC profiles (`corpora/icc/`, copied from `spike/raw-icc`'s own fixtures), reproducing `spike/raw-icc/FINDINGS.md`'s cross-validated sRGB→ECI-RGBv2 values plus the permanent extended-range/no-clamping regression test that spike's finding 4 asked for (`cargo deny check all` clean with the new dependency; `Cmyk` wired but untested against a real CMYK profile — honest gap, none in the corpus yet). Colour-space descriptor tagging (§7.3.6) was already done from M1.1. Linear-light conversion (`linear_to_srgb`/`srgb_to_linear`, IEC 61966-2-1's real curve, HDR/negative-safe) — an explicit working-space *policy* type stays deliberately undesigned until a real compositor/filter consumer exists. Promote-on-import/dither-on-export (`promote_u8`/`quantize_u8`/`dither_quantize`, classic 8×8 Bayer ordered dithering generated from its recursive definition and cross-checked against the published 4×4 table, not a hand-transcribed 64-entry table) — exhaustive 256-value round-trip test, dedicated test confirming dithering actually breaks up banding. 22 tests total. fmt/clippy (`-D warnings`)/`cargo test -p aurora-color`/`cargo deny check all` all verified clean throughout. See M1.5 |
 | **Phase 1 — M1.6** | **In progress, 2026-08-01.** `aurora-theme`'s token types (`Color`, `SurfaceTokens`/`TextTokens`/`IconTokens`/`BorderTokens`/`AccentTokens`/`StateTokens`, `Scales`) match the already owner-approved `design/tokens/vocabulary.md`/`scales.toml` exactly. `Palette`/`ThemeSet` parse real TOML (`toml` added to `[workspace.dependencies]` — `serde`'s first real use), resolve dotted palette references generically, and merge an `extends` inheritance chain (child overrides parent) — verified against the real, committed Dark theme end to end, plus a synthetic child theme proving the merge logic without inventing a real second design. `contrast::check_gated_pairs` is the real, CI-enforced version of `design/check_contrast.py`'s Phase-0 prototype (same 17 gated pairs, same WCAG formula reusing `aurora_color::srgb_to_linear`) — independently reproduces that script's own prior "17/17 pass" finding. 23 tests total. **Blocked**: Light/high-contrast/Colour-Critical themes need Cahya's own design work (FR-027 *Ownership*) before they can exist, not an engineering gap. **Deferred, no consumer yet**: hot-reload file-watching, and the CI lint rejecting hardcoded style values (needs real widget code to lint against). fmt/clippy (`-D warnings`)/`cargo test -p aurora-theme`/`cargo deny check licenses` all verified clean. See M1.6 |
@@ -107,7 +108,10 @@ CJK composing into a custom text field.
 
 ### 0.2 Workspace and CI
 
-- [x] Cargo workspace, 19 crates, layered per PRD §7.2
+- [x] Cargo workspace, 19 crates, layered per PRD §7.2 (plus
+  `aurora-testkit`, a 20th, dev-dependency-only crate added 2026-08-02
+  — see this section's own golden-image diff harness bullet for why it
+  didn't fit inside the original 19)
 - [x] Layering rule enforced mechanically — `scripts/check_layering.py`
 - [x] Lints: `unwrap`/`expect`/`panic`/`indexing_slicing` denied workspace-wide
 - [x] CI: fmt, clippy, layering, tests, rustdoc, `cargo-deny` on Linux/macOS/Windows
@@ -161,7 +165,102 @@ CJK composing into a custom text field.
     passed (the GPU test skips gracefully in this sandbox, which has no
     adapter — same documented gap as every other real-GPU test here),
     `cargo deny check licenses` clean.
-- [ ] Golden-image diff harness *(needed before the first filter)*
+- [x] **Golden-image diff harness** — done 2026-08-02
+  (`crates/aurora-testkit`, a new crate — see below for why). PRD §8.5
+  frames this as CI/test infrastructure two *different* future
+  consumers need: `aurora-filters` (render correctness, PRD §13 Step 5)
+  and `aurora-widgets`' still-open component gallery (M1.7's own
+  bullet). Per `scripts/layering.json`, those two sit in different
+  branches of the layering tree — `aurora-widgets` cannot depend on
+  `aurora-render`, where a shared helper would otherwise most naturally
+  live — so no existing crate is reachable by both. Rather than guess
+  which one, or duplicate a shared piece into each (the `test_support.rs`
+  pattern `aurora-gpu`/`aurora-render` already use for something much
+  smaller), this became a new, 20th workspace crate,
+  `aurora-testkit`, deliberately dependency-free of the rest of the
+  workspace (its own `layering.json` entry: `[]`) so both future
+  consumers can reach it from the bottom of the stack as a
+  `[dev-dependencies]`-only entry — never a real dependency of shipped
+  code, stated in its own `Cargo.toml` description and `lib.rs` doc
+  comment.
+  - `Image` (`width`/`height`/`rgba: Vec<u8>`, always `Rgba8`) is the
+    common currency; converting a pipeline's own precision (`aurora-tile`'s
+    `f16` tiles, for instance) down to that is each caller's own job —
+    this crate has no way to do it itself without a dependency neither
+    of its two branches share.
+  - `compare_to_golden(path, actual, tolerance)`: per-pixel, per-channel
+    absolute-difference comparison against a golden PNG on disk.
+    `tolerance` accounts for real GPU/driver numerical noise (the same
+    class `aurora-color`'s own lcms2 tests already had to tolerate) —
+    `0` demands a bit-exact match. A missing golden is always an error
+    (`GoldenMissing`) unless `AURORA_BLESS_GOLDEN` is set, so a first CI
+    run can never silently accept an unreviewed baseline as truth; a
+    dimension mismatch is its own distinct error
+    (`DimensionMismatch`); a tolerance violation
+    (`PixelMismatch`) writes `<name>.actual.png` and `<name>.diff.png`
+    (a white/black per-pixel mask) alongside the golden for a human to
+    open side by side, not just a mismatch count. **A real, foreseeable
+    case explicitly handled, not assumed away**: a golden a human placed
+    by hand from another tool might not decode as 8-bit RGBA (e.g. a
+    grayscale export) — `GoldenWrongFormat` is a distinct, real error
+    for that, not an `unreachable!()`, with its own test (a hand-written
+    grayscale PNG) proving it's actually reachable.
+  - Bless mode (`compare_to_golden`'s env-var read) is split from the
+    real comparison logic (`golden::compare`, `pub(crate)`, taking
+    `bless: bool` explicitly) specifically so this crate's own tests
+    never need `std::env::set_var` — unsafe as of the 2024 edition,
+    for the exact cross-thread hazard `cargo test`'s default parallel
+    runner would create between tests toggling shared process state.
+    This keeps `unsafe_code = "deny"` satisfied via the workspace lint
+    with no override needed anywhere in this crate, rather than opening
+    the exception CLAUDE.md reserves for a real FFI need (`aurora-gpu`)
+    for a testing convenience instead.
+  - **A real bug a test caught**: the first test fixture used a pure
+    white pixel; `saturating_add`-based nudging silently no-ops on an
+    already-saturated channel, so a "nudge every pixel" test only
+    actually changed 3 of 4 — caught immediately by an exact expected-count
+    assertion, fixed by using a fixture with headroom in every channel
+    instead.
+  - **First real consumer wired, not just built and left unused**:
+    `crates/aurora-render/src/composite.rs`'s new
+    `composite_over_matches_the_golden_image` test (`aurora-testkit`
+    added as `aurora-render`'s first real `[dev-dependencies]` entry,
+    `scripts/layering.json` updated accordingly — `aurora-widgets`
+    deliberately *not* granted the same permission yet, since it has no
+    real consumer either, the same discipline just re-applied after
+    removing `aurora-widgets`' own unused `aurora-gpu`/`aurora-vector`/
+    `aurora-text` dependencies earlier this same day) reads back the
+    *whole* composited tile from real GPU hardware and compares it
+    against a checked-in golden
+    (`crates/aurora-render/tests/golden/composite_basic.png`), not just
+    the single first-texel spot-check the existing pixel-math test
+    already did. The golden itself was generated from the exact,
+    already-real-GPU-verified constant that test's own math predicts
+    (`(0.5, 0, 0.5, 1.0)` — solid `(0,0,1,1)` under solid `(1,0,0,0.5)`
+    "source over"), via a throwaway `AURORA_BLESS_GOLDEN=1` example run
+    once and deleted immediately after — not blessed from an actual
+    render, since this sandbox has no GPU to run one; the checked-in PNG
+    is the same value real hardware already confirmed, encoded by hand
+    rather than captured from a render this environment can't perform.
+    Verified via the harness's own round-trip (a throwaway
+    non-bless-mode run against the same constant, confirming the PNG
+    this crate wrote actually decodes back to a match) before the
+    generator was deleted.
+  - Verified: `cargo fmt --all --check` clean, `cargo clippy -p
+    aurora-testkit -p aurora-render --all-targets --all-features -- -D
+    warnings` clean, `RUSTDOCFLAGS="-D warnings" cargo doc -p
+    aurora-testkit -p aurora-render --no-deps --all-features` clean,
+    `cargo build --workspace` clean, `cargo test -p aurora-testkit -p
+    aurora-render` — 8/8 and 28/28 passed (the new golden-image GPU test
+    skips gracefully in this sandbox, which has no adapter — same
+    documented gap as every other real-GPU test here, so it has not
+    actually been confirmed against a real render; that's the one
+    honest gap in this pass, closeable the moment someone runs it on
+    real GPU hardware), `cargo deny check all` clean (new dependency:
+    `png`, MIT/Apache-2.0, image-rs's own PNG-only crate). `python3`
+    remains absent in this sandbox, so `scripts/check_layering.py`
+    itself still can't run here; the new `aurora-testkit`/`aurora-render`
+    entries were checked by hand against the script's own logic instead.
 
 ### 0.3 Vertical slice — **done**
 

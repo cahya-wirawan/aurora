@@ -1,6 +1,6 @@
 [package]
-name = "aurora-render"
-description = "Executes the render graph on GPU or CPU, producing progressive tiled output."
+name = "aurora-testkit"
+description = "Golden-image diff harness for render-correctness regression tests. Dev-dependency only, never a real dependency of shipped code."
 version.workspace = true
 publish.workspace = true
 edition.workspace = true
@@ -13,15 +13,9 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-aurora-core = { workspace = true }
-aurora-tile = { workspace = true }
-aurora-graph = { workspace = true }
-aurora-gpu = { workspace = true }
-half = { workspace = true }
+png = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-wgpu = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-aurora-testkit = { workspace = true }

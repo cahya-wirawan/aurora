@@ -314,6 +314,127 @@ mod tests {
         result
     }
 
+    /// Reads back the whole `TILE`x`TILE` texture as `Rgba8` (each `f16`
+    /// channel clamped to `0.0..=1.0` and rounded) — what a golden-image
+    /// comparison needs, unlike [`read_first_texel`]'s single-pixel
+    /// sanity check.
+    fn read_rgba8(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<u8> {
+        let bytes_per_row = TILE * 8; // Rgba16Float, already 256-byte aligned.
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("golden-readback"),
+            size: u64::from(bytes_per_row) * u64::from(TILE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("golden-readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(TILE),
+                },
+            },
+            wgpu::Extent3d {
+                width: TILE,
+                height: TILE,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let Ok(Ok(())) = rx.recv() else {
+            unreachable!("map_async must complete once the device has been polled to idle");
+        };
+        let Ok(data) = slice.get_mapped_range() else {
+            unreachable!("the buffer was just confirmed mapped successfully above");
+        };
+        let rgba8 = data
+            .chunks_exact(2)
+            .map(|bytes| {
+                let Ok(bytes) = <[u8; 2]>::try_from(bytes) else {
+                    unreachable!("chunks_exact(2) always yields a 2-byte slice");
+                };
+                let value = f16::from_le_bytes(bytes).to_f32().clamp(0.0, 1.0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    (value * 255.0).round() as u8
+                }
+            })
+            .collect();
+        drop(data);
+        readback.unmap();
+        rgba8
+    }
+
+    /// A real golden-image regression test, `aurora-testkit`'s first
+    /// consumer (PLAN.md 0.2, "golden-image diff harness ... needed
+    /// before the first filter"): renders the same source-over blend
+    /// [`composite_over_blends_source_over_destination`] already proved
+    /// correct via a pixel-math assertion, but here compares the *whole*
+    /// composited tile against a checked-in golden PNG
+    /// (`tests/golden/composite_basic.png`) instead of reading back one
+    /// texel. Tolerance is `1` (out of 255): `0.5` and `1.0` round
+    /// trip exactly through `f16`, so any real driver/GPU numerical
+    /// noise would still need to be at least 1/255 to matter here, and
+    /// this is not asserting bit-exactness the way the plain pixel-math
+    /// test does.
+    #[test]
+    fn composite_over_matches_the_golden_image() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let dst = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 1.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let src = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 0.5],
+            wgpu::TextureUsages::empty(),
+        );
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        compositor.composite_over(&context, &dst_view, &src_view);
+
+        let rgba8 = read_rgba8(device, queue, &dst);
+        let actual = match aurora_testkit::Image::new(TILE, TILE, rgba8) {
+            Ok(image) => image,
+            Err(err) => unreachable!("read_rgba8 always returns TILE*TILE*4 bytes: {err}"),
+        };
+        let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/composite_basic.png");
+        if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &actual, 1) {
+            unreachable!("{err}");
+        }
+    }
+
     #[test]
     fn composite_over_blends_source_over_destination() {
         let Some(context) = real_context() else {

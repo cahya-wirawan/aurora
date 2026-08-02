@@ -1,5 +1,6 @@
 {
   "aurora-core": [],
+  "aurora-testkit": [],
   "aurora-tile": [
     "aurora-core"
   ],
@@ -15,7 +16,8 @@
     "aurora-core",
     "aurora-tile",
     "aurora-graph",
-    "aurora-gpu"
+    "aurora-gpu",
+    "aurora-testkit"
   ],
   "aurora-doc": [
     "aurora-core",

@@ -38,6 +38,9 @@ aurora-plugin = { path = "crates/aurora-plugin" }
 aurora-theme = { path = "crates/aurora-theme" }
 aurora-widgets = { path = "crates/aurora-widgets" }
 aurora-ui = { path = "crates/aurora-ui" }
+# Dev-dependency only, for every crate that needs it -- never a real
+# dependency of shipped code. See scripts/layering.json.
+aurora-testkit = { path = "crates/aurora-testkit" }
 
 # External. Versions are declared centrally so crates cannot drift apart.
 thiserror = "2"
@@ -62,6 +65,10 @@ taffy = "0.12"
 unicode-segmentation = "1"
 tempfile = "3"
 criterion = "0.5"
+# PRD §8.5's "image-diff golden tests for render correctness" (aurora-testkit):
+# encode/decode for golden/actual/diff PNGs. image-rs's own PNG-only crate --
+# lighter than the full `image` crate, which this doesn't need.
+png = "0.17"
 wgpu = "30"
 pollster = "1"
 # Default features minus `wayland-csd-adwaita`, plus `wayland-csd-adwaita-crossfont`:
