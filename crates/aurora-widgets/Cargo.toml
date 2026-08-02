@@ -13,10 +13,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+# aurora-gpu/aurora-vector/aurora-text are allowed here (see
+# scripts/layering.json) for the still-open "vector-first rendering"
+# M1.7 bullet, but nothing in this crate uses them yet -- add them back
+# exactly when that work starts. Keeping them out until then makes
+# "headlessly testable" a checkable fact about this crate's own
+# dependency graph (`cargo tree -p aurora-widgets -i wgpu` finds
+# nothing), not just an inferred property of what happens not to be
+# called at runtime.
 aurora-core = { workspace = true }
-aurora-gpu = { workspace = true }
-aurora-vector = { workspace = true }
-aurora-text = { workspace = true }
 aurora-theme = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

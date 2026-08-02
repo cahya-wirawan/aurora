@@ -365,10 +365,7 @@ version = "0.0.0"
 dependencies = [
  "accesskit",
  "aurora-core",
- "aurora-gpu",
- "aurora-text",
  "aurora-theme",
- "aurora-vector",
  "taffy",
  "thiserror 2.0.19",
  "tracing",
