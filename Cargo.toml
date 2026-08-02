@@ -58,6 +58,12 @@ lz4_flex = "0.11"
 # Same pin `spike/a11y-ime` already proved works (accessibility spike,
 # PRD §13 Step 4 / ADR 0001's escape-hatch check).
 accesskit = "0.24"
+# Same pin `spike/a11y-ime` already proved works against accesskit 0.24 --
+# the `winit` integration layer aurora-app's window/event loop needs for
+# the "create hidden -> attach adapter -> show" ordering ADR 0001's
+# escape-hatch check found (accesskit_winit panics if the adapter is
+# built after the window is first shown).
+accesskit_winit = "0.33"
 # PLAN.md M1.7's own suggestion ("flexbox-style; taffy if it fits").
 taffy = "0.12"
 # Correct Unicode word-boundary motion for the text field widget, not a

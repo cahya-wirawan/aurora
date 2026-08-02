@@ -30,8 +30,12 @@ aurora-plugin = { workspace = true }
 aurora-theme = { workspace = true }
 aurora-widgets = { workspace = true }
 aurora-ui = { workspace = true }
+anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+accesskit_winit = { workspace = true }
+winit = { workspace = true }
+taffy = { workspace = true }
 
 [[bin]]
 name = "aurora-app"

@@ -69,6 +69,7 @@ three steps PRD §13 actually names as blocking.
 | **Phase 1 — M1.5** | **Complete, 2026-08-01.** `aurora-color`'s ICC transforms (`IccProfile`, `Transform`, `RenderingIntent`) wiring in `lcms2` per ADR 0008 — `Gray`/`Rgb`/`Rgba`/`Cmyk` channel layouts, verified against real, committed CC0 ICC profiles (`corpora/icc/`, copied from `spike/raw-icc`'s own fixtures), reproducing `spike/raw-icc/FINDINGS.md`'s cross-validated sRGB→ECI-RGBv2 values plus the permanent extended-range/no-clamping regression test that spike's finding 4 asked for (`cargo deny check all` clean with the new dependency; `Cmyk` wired but untested against a real CMYK profile — honest gap, none in the corpus yet). Colour-space descriptor tagging (§7.3.6) was already done from M1.1. Linear-light conversion (`linear_to_srgb`/`srgb_to_linear`, IEC 61966-2-1's real curve, HDR/negative-safe) — an explicit working-space *policy* type stays deliberately undesigned until a real compositor/filter consumer exists. Promote-on-import/dither-on-export (`promote_u8`/`quantize_u8`/`dither_quantize`, classic 8×8 Bayer ordered dithering generated from its recursive definition and cross-checked against the published 4×4 table, not a hand-transcribed 64-entry table) — exhaustive 256-value round-trip test, dedicated test confirming dithering actually breaks up banding. 22 tests total. fmt/clippy (`-D warnings`)/`cargo test -p aurora-color`/`cargo deny check all` all verified clean throughout. See M1.5 |
 | **Phase 1 — M1.6** | **In progress, 2026-08-01.** `aurora-theme`'s token types (`Color`, `SurfaceTokens`/`TextTokens`/`IconTokens`/`BorderTokens`/`AccentTokens`/`StateTokens`, `Scales`) match the already owner-approved `design/tokens/vocabulary.md`/`scales.toml` exactly. `Palette`/`ThemeSet` parse real TOML (`toml` added to `[workspace.dependencies]` — `serde`'s first real use), resolve dotted palette references generically, and merge an `extends` inheritance chain (child overrides parent) — verified against the real, committed Dark theme end to end, plus a synthetic child theme proving the merge logic without inventing a real second design. `contrast::check_gated_pairs` is the real, CI-enforced version of `design/check_contrast.py`'s Phase-0 prototype (same 17 gated pairs, same WCAG formula reusing `aurora_color::srgb_to_linear`) — independently reproduces that script's own prior "17/17 pass" finding. 23 tests total. **Blocked**: Light/high-contrast/Colour-Critical themes need Cahya's own design work (FR-027 *Ownership*) before they can exist, not an engineering gap. **Deferred, no consumer yet**: hot-reload file-watching, and the CI lint rejecting hardcoded style values (needs real widget code to lint against). fmt/clippy (`-D warnings`)/`cargo test -p aurora-theme`/`cargo deny check licenses` all verified clean. See M1.6 |
 | **Phase 1 — M1.7** | **In progress, 2026-08-02.** `aurora-widgets`' `WidgetTree<W>` (generic over payload, same shape `RenderGraph<N>` uses) done: identity/nesting (one root, children appended in paint/tab order — a deliberate departure from `LayerTree`'s "newest on top"), damage tracking (`aurora_tile::Tile`'s own `Option<Rect>`/`Rect::union` idiom, per-widget and tree-wide), a *required* `accesskit::Node` per widget from creation (`WidgetId` **is** `accesskit::NodeId`, not a wrapper — no second id space, `accessibility_update` matches `spike/a11y-ime`'s own proven `TreeUpdate` shape), and a `taffy`-backed flexbox layout engine (`compute_layout` — style in, absolute bounds out, rebuilding `taffy`'s own tree fresh each call rather than keeping two trees in sync). Found and verified, not assumed: an `Auto`-sized childless root does **not** implicitly fill the viewport in `taffy` (no CSS-body-100%-style default) — both that and the `percent(1.0)` opt-in are now permanent regression tests. Input routing/focus (`hit_test`, `FocusManager`) done 2026-08-02, 18 more tests (38 total) — platform-agnostic (document-space point + `Tab`/`Shift+Tab` steps, not `winit::WindowEvent`s), reuses `accesskit`'s own `Action::Focus` for "focusable" rather than a parallel flag, `focus_at` bubbles a hit-test to the nearest focusable ancestor. Concrete widget set: a first slice (`WidgetKind`, `Button`/`Checkbox`/`Slider` — 3 of 12 named widgets, covering three genuinely different interaction shapes) done 2026-08-02, 20 more tests (58 total) — layout resolved from `aurora_theme::Scales` per invariant §7.3.10, `Checkbox` reuses `accesskit::Toggled` directly rather than a parallel enum, no rendering yet (blocked on `aurora-vector`). A real bug (`toggle_checkbox`'s indeterminate-state resolution contradicting its own doc comment) was caught by its own test before commit. Text field (`TextFieldState` — selection, grapheme-cluster-aware caret motion, Unicode word motion, text-buffer clipboard, per-widget undo/redo) done 2026-08-02, 28 more tests (86 total) — one generic `with_text_field_mut` rather than a hand-written wrapper per operation, given how many mutating methods this widget alone has; `accesskit::TextSelection` deliberately left unexposed, inheriting an already-known gap from `spike/a11y-ime/FINDINGS.md` rather than introducing a new one. IME composition (`Composition`, `UnderlineStyle`, `composition_segments`, `set_composition`/`commit_composition`) done 2026-08-02, 15 more tests (101 total) — mirrors `winit::event::Ime::Preedit`/`Commit` exactly, composition updates are not undo steps except the one real content change (removing a selection to start a fresh composition), `composition_segments` produces thin/thick underline-style *data* for a future renderer (this crate still draws nothing), and composing state is announced via `set_description` — the exact mechanism `spike/a11y-ime` already proved reaches VoiceOver, closing that finding's own recorded follow-up. A real bug (`composition_segments` emitting two abutting segments for a degenerate empty target range) was caught by its own test before commit. Headless mode as an explicit, checked feature done 2026-08-02: found `aurora-gpu`/`aurora-vector`/`aurora-text` declared as dependencies but never actually used anywhere in the crate's source — real `wgpu` was in this crate's own dependency graph despite its doc comments claiming headlessness. Removed all three (each goes back exactly when vector-first rendering starts; `scripts/layering.json` already allows them and didn't need to change); `cargo tree -p aurora-widgets -i wgpu` now finds no match at all. Added `crates/aurora-widgets/tests/headless.rs`, a real integration test (new pattern for this workspace) proving the whole pipeline — tree, layout, focus/hit-test, all four widgets, IME — end to end through the crate's public API alone, 102 tests total (101 unit + 1 integration). fmt/clippy (`-D warnings`)/rustdoc (`-D warnings`)/`cargo build --workspace`/`cargo test -p aurora-widgets`/`cargo deny check licenses` all verified clean throughout. The other 9 named widgets, vector-first rendering, and the component gallery all remain — each blocked on infrastructure (scrolling, popover layering, `aurora-vector`) that doesn't exist yet, not a natural next slice. See M1.7 |
+| **Phase 1 — M1.8** | **Started, 2026-08-02, blocked on real-hardware verification.** `aurora-app`'s first real code (was a placeholder `main()`): a real `winit::ApplicationHandler` implementing the "create hidden → attach `accesskit_winit` adapter → show" ordering ADR 0001's escape-hatch check found, reusing `aurora-gpu`'s already-proven `GpuContext`/`GpuSurface` and `aurora-widgets`' `WidgetTree`/`FocusManager` for a (currently content-free) accessibility tree rather than hand-rolling either. Real error handling throughout, `main` now fallible. **Not run even once**: this sandbox has neither a display server nor `pkg-config` (no root access to install it), so this has only been written against proven precedent (`spike/a11y-ime`, `aurora-gpu`'s own `examples/surface_smoke.rs`) and syntax-checked via `cargo fmt`, never actually compiled. Marked `[!]` in M1.8, not `[x]` — needs `pkg-config`/`libfontconfig1-dev` (CI already has both) to even build, then a human on a real desktop session on each platform. Docking, panels, canvas, tools, input routing, IME, native menus, DPI, and crash recovery all remain, each a separate bullet. See M1.8 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -1580,7 +1581,59 @@ check licenses` clean with the new `toml` dependency.
 
 ### M1.8 — Application shell (`aurora-ui`, `aurora-app`)
 
-- [ ] Window/event loop; **create hidden → attach a11y adapter → show** *(from the a11y spike)*
+- [!] **Window/event loop; create hidden → attach a11y adapter → show**
+  *(from the a11y spike)* — written 2026-08-02,
+  `crates/aurora-app/src/{lib,main}.rs` (new — this crate had only a
+  placeholder `main()` before), blocked on real-hardware verification,
+  not on more engineering: **this sandbox has no display server
+  (`$DISPLAY`/`$WAYLAND_DISPLAY` both empty) and no `pkg-config`
+  (`winit`'s fontconfig feature needs it) with no root access to install
+  it** (confirmed: `apt-get install` fails with "Permission denied... are
+  you root?"), so `aurora-app` has never actually been compiled, let
+  alone run, in this environment — a strictly larger gap than the
+  no-GPU-adapter case every real-GPU test in this workspace already
+  handles gracefully, since this blocks compilation itself, not just
+  runtime hardware access. Written carefully against `accesskit_winit`
+  0.33.2's own fetched source (confirms the exact pin `spike/a11y-ime`
+  already proved: `Adapter::with_event_loop_proxy`/`process_event`/
+  `update_if_active`) and the two closest proven precedents in this
+  repo: `spike/a11y-ime`'s windowed app (the create-hidden-then-adapt-
+  then-show ordering itself) and `aurora-gpu`'s own
+  `examples/surface_smoke.rs` (the window/`GpuContext`/`GpuSurface`
+  lifecycle, itself unverified for two days in this same project until
+  someone ran it on a live macOS session — see M1.2 — so this is the
+  same class of gap recurring, not a new kind of risk). Real
+  error-handling throughout (no `unwrap`/`expect`/`panic!` anywhere,
+  matching every other crate) — `main` is now fallible
+  (`-> anyhow::Result<()>`), exactly what this crate's own prior
+  placeholder doc comment said would happen "once it does anything that
+  can fail." Reuses `aurora_widgets::widgets::new_tree`/`WidgetTree::
+  accessibility_update`/`FocusManager` for the (currently content-free,
+  single-root-container) accessibility tree rather than hand-rolling a
+  parallel `accesskit::Node` construction — the first real integration
+  of `aurora-widgets` into an actual window, even though it has no
+  content yet. **Deliberately out of scope for this bullet, left to
+  M1.8's other, separate ones**: docking/panels/canvas/tools content,
+  input routing beyond `accesskit_winit`'s own action-request forwarding
+  (logged, not routed anywhere — there is nothing to route to yet),
+  IME, native menus, DPI handling, crash recovery; the redraw loop only
+  clears the surface to a placeholder colour. One piece verified
+  headlessly: `build_tree` (pure, no window needed) produces exactly a
+  one-node tree, 1 test. Marked `[!]` (blocked), not `[x]`: `cargo fmt
+  --all --check` is clean (confirms syntactically valid Rust, not more),
+  `cargo deny check all` is clean (confirms the new `accesskit_winit`
+  0.33 dependency tree's licenses), and the rest of the workspace still
+  builds/lints clean with this crate excluded — but `cargo build -p
+  aurora-app`, `cargo clippy -p aurora-app`, and any real run have not
+  succeeded even once anywhere in this session. **Needs, in order: (1)
+  someone with root access or a pre-provisioned image to install
+  `pkg-config`/`libfontconfig1-dev` (exactly what `ci.yml` already
+  installs, so CI itself should build this cleanly) and confirm a clean
+  compile; (2) a human on a real desktop session on each of Windows,
+  macOS, and Linux to confirm the window actually appears, hidden then
+  shown, with a screen reader able to reach it** — the same kind of
+  human verification `spike/a11y-ime/FINDINGS.md` and
+  `examples/surface_smoke.rs` both eventually needed and got.
 - [ ] Docking, panels, custom workspaces
 - [ ] Canvas: infinite zoom, rotation, pan, rulers, guides, grid, snap
 - [ ] Layers, history, tool-options panels
