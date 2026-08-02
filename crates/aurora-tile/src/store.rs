@@ -214,7 +214,7 @@ impl TileStore {
 #[cfg(test)]
 mod tests {
     use super::TileStore;
-    use crate::tile::TileId;
+    use crate::tile::{CHANNELS, TILE, TileId};
     use std::num::NonZeroUsize;
 
     fn store(budget: usize) -> (tempfile::TempDir, TileStore) {
@@ -312,5 +312,100 @@ mod tests {
         }
         assert_eq!(store.take_dirty(id), Some(rect));
         assert_eq!(store.take_dirty(id), None);
+    }
+
+    /// CI-gated regression check for `spike/FINDINGS.md`'s own
+    /// recommendation ("a latency regression test in CI... since the
+    /// brush budget has under 1ms of margin"). Measures only the
+    /// pure-CPU slice of the stroke pipeline this crate owns — writing a
+    /// brush-sized region of texels into one already-resident tile and
+    /// accumulating its dirty rect — deliberately, not the full "input
+    /// to frame submitted" number the spike measured: that needs a real
+    /// window/present loop (`aurora-app`, still M1.8), which doesn't
+    /// exist yet. This piece is worth gating on its own because it's the
+    /// one most exposed to an accidental algorithmic regression (e.g. a
+    /// future change that scans every resident tile instead of touching
+    /// one) and the one whose cost genuinely doesn't depend on what GPU,
+    /// if any, a CI runner happens to have — unlike the GPU-dependent
+    /// upload/composite half, which has its own, deliberately looser
+    /// check in `aurora-render` (see that crate's `latency` module for
+    /// why the threshold differs).
+    ///
+    /// Asserts on the median (p50), not p99: a single scheduler
+    /// preemption on a shared CI runner can spike one sample without
+    /// indicating a real regression, and the median is far more robust
+    /// to that than a tail percentile while still moving if the
+    /// underlying cost genuinely grows. p95/p99 are still computed and
+    /// printed for visibility, just not asserted on.
+    #[test]
+    fn paint_and_dirty_round_trip_stays_within_a_tight_cpu_budget() {
+        // A brush-sized dirty region, in line with the ~24px-radius
+        // brush `spike/FINDINGS.md` measured (finding #2) -- comfortably
+        // inside the tile's own 256x256 bounds. Kept as plain `u32`s for
+        // the pixel-index math below, with `brush` (the `i64`/`u32`
+        // `aurora_core::Rect` `mark_dirty` needs) derived from them via
+        // a lossless widening cast.
+        const BRUSH_X: u32 = 100;
+        const BRUSH_Y: u32 = 100;
+        const BRUSH_SIZE: u32 = 48;
+        const ITERATIONS: usize = 1000;
+
+        let (_dir, mut store) = store(4);
+        let id = TileId { x: 0, y: 0 };
+        let brush = aurora_core::Rect {
+            x: i64::from(BRUSH_X),
+            y: i64::from(BRUSH_Y),
+            width: BRUSH_SIZE,
+            height: BRUSH_SIZE,
+        };
+
+        let mut samples = Vec::with_capacity(ITERATIONS);
+        for i in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+            let Ok(tile) = store.get_mut(id) else {
+                unreachable!(
+                    "id stays resident for the whole loop: budget is 4, only one tile is ever touched"
+                );
+            };
+            let value = half::f16::from_f32(f32::from(u8::from(i % 2 == 0)));
+            let texels = tile.texels_mut();
+            for dy in 0..BRUSH_SIZE {
+                for dx in 0..BRUSH_SIZE {
+                    let x = BRUSH_X + dx;
+                    let y = BRUSH_Y + dy;
+                    let base = ((y * TILE + x) as usize) * CHANNELS;
+                    for channel in 0..CHANNELS {
+                        if let Some(sample) = texels.get_mut(base + channel) {
+                            *sample = value;
+                        }
+                    }
+                }
+            }
+            tile.mark_dirty(brush);
+            let _ = store.take_dirty(id);
+            samples.push(start.elapsed());
+        }
+
+        samples.sort_unstable();
+        let percentile = |pct: usize| -> std::time::Duration {
+            let index = (samples.len() * pct / 100).min(samples.len() - 1);
+            match samples.get(index) {
+                Some(&value) => value,
+                None => unreachable!("samples is non-empty: ITERATIONS > 0"),
+            }
+        };
+        let (p50, p95, p99) = (percentile(50), percentile(95), percentile(99));
+        eprintln!(
+            "paint+dirty round trip over {ITERATIONS} iterations: p50={p50:?} p95={p95:?} p99={p99:?}"
+        );
+
+        // 500us is generous by roughly three orders of magnitude against
+        // a single in-memory 48x48 tile write plus one Rect::union call
+        // -- a trip-wire for a real algorithmic regression, not a tight
+        // enforcement of the 10ms brush budget itself.
+        assert!(
+            p50 < std::time::Duration::from_micros(500),
+            "median paint+dirty latency regressed: {p50:?} (budget: 500us); p95={p95:?} p99={p99:?}"
+        );
     }
 }

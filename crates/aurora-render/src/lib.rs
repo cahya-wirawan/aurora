@@ -20,6 +20,8 @@
 
 mod composite;
 mod executor;
+#[cfg(test)]
+mod latency;
 mod mip;
 mod preview;
 mod schedule;
