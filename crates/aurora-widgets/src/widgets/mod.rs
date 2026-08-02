@@ -3,7 +3,8 @@
 //! **Scope, stated honestly**: this is a first slice, not the full
 //! 12-widget list PLAN.md names (button, checkbox, slider, number field,
 //! dropdown, scrollbar, tree, tab bar, menu, tooltip, colour picker,
-//! curve editor). [`Button`], [`Checkbox`], and [`Slider`] cover three
+//! curve editor). `Button` ([`ButtonState`]), `Checkbox`
+//! ([`CheckboxState`]), and `Slider` ([`SliderState`]) cover three
 //! genuinely different interaction shapes — a discrete trigger, a
 //! toggle, and a continuous drag — which is enough to validate the
 //! pattern every other widget will follow. The rest need infrastructure

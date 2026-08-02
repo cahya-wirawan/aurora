@@ -134,7 +134,7 @@ impl LayerLock {
 
 /// A layer mask: grayscale, and optional on *any* layer regardless of kind
 /// (Photoshop allows one on both pixel layers and groups, clipping the
-/// whole group in the latter case) — so this lives on [`LayerEntry`]
+/// whole group in the latter case) — so this lives on `LayerEntry`
 /// itself rather than inside [`LayerKind`]. Deliberately no real pixel
 /// storage yet, the same open resource-management question
 /// `LayerKind::Pixel`'s own `bounds` field already flagged (one store per

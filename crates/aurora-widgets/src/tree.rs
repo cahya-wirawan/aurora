@@ -53,7 +53,7 @@ struct WidgetNode<W> {
 }
 
 /// A retained-mode tree of widgets: exactly one root (unlike
-/// [`aurora_doc::LayerTree`]'s multiple top-level layers — an
+/// `aurora_doc::LayerTree`'s multiple top-level layers — an
 /// application has one root window, not several independent ones),
 /// arbitrary nesting below it, per-widget damage tracking, and a
 /// required [`accesskit::Node`] on every widget from the moment it's
@@ -79,7 +79,7 @@ impl<W> WidgetTree<W> {
     /// `style`, described by `accessibility`. Returns the tree and the
     /// root's id (always `NodeId(0)`, but returned rather than assumed,
     /// so callers never hardcode it). The root's bounds are
-    /// [`UNLAID_OUT`] until [`Self::compute_layout`] runs.
+    /// `UNLAID_OUT` until [`Self::compute_layout`] runs.
     #[must_use]
     pub fn new(
         accessibility: AccessibilityNode,
@@ -133,7 +133,7 @@ impl<W> WidgetTree<W> {
 
     /// Adds a new widget as the last child of `parent`, laid out per
     /// `style`, described by `accessibility`. Its bounds are
-    /// [`UNLAID_OUT`] until [`Self::compute_layout`] runs — inserting a
+    /// `UNLAID_OUT` until [`Self::compute_layout`] runs — inserting a
     /// widget dirties `parent`'s subtree (its layout may now change) but
     /// not a specific screen region, since the new widget doesn't have
     /// screen bounds yet.

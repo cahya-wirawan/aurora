@@ -255,7 +255,7 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
 /// calling the tree directly (bypassing `History`) is invisible to it,
 /// and mixing the two can leave a recorded step referring to a layer (or
 /// position) that direct calls already changed out from under it -- see
-/// [`LayerTree::restore`]'s own doc comment for the specific errors that
+/// `LayerTree::restore`'s own doc comment for the specific errors that
 /// can then surface. Normal use (only ever mutating through one
 /// `History`) never hits this.
 ///
@@ -382,7 +382,7 @@ impl History {
     }
 
     /// Same as [`LayerTree::remove`], recorded for undo. Returns the
-    /// region the removal dirtied, if known (see [`layer_dirty_rect`]).
+    /// region the removal dirtied, if known (see `layer_dirty_rect`).
     ///
     /// # Errors
     ///
@@ -611,7 +611,7 @@ impl History {
 
     /// Undoes the most recent step, if any. `None` both when there was
     /// nothing to undo, and when there was but its dirtied region isn't
-    /// knowable (see [`layer_dirty_rect`]) — same conflated shape
+    /// knowable (see `layer_dirty_rect`) — same conflated shape
     /// [`LayerTree::parent`] already documents; callers that need to
     /// tell those apart should check [`Self::can_undo`] first.
     ///

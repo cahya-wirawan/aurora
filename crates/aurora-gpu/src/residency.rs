@@ -279,7 +279,7 @@ impl TileResidency {
     /// lower-resolution texels; this method lands them in the atlas at
     /// the matching mip level.
     ///
-    /// Deliberately doesn't touch [`Self::slots`] or consult tile
+    /// Deliberately doesn't touch `slots` or consult tile
     /// dirtiness the way [`Self::sync`] does — this is a direct,
     /// caller-driven write for a resolution the caller has already
     /// decided to show, not part of the budgeted full-resolution
