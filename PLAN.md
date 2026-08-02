@@ -1625,7 +1625,22 @@ check licenses` clean with the new `toml` dependency.
   0.33 dependency tree's licenses), and the rest of the workspace still
   builds/lints clean with this crate excluded — but `cargo build -p
   aurora-app`, `cargo clippy -p aurora-app`, and any real run have not
-  succeeded even once anywhere in this session. **Needs, in order: (1)
+  succeeded even once anywhere in this session.
+
+  **First real CI run (2026-08-02) immediately caught a real bug** this
+  sandbox's lack of `pkg-config` prevented catching locally: `wgpu` was
+  used directly throughout `redraw` (`CurrentSurfaceTexture`/`LoadOp`/
+  `Color`/etc., mirroring `surface_smoke.rs`) but never declared as a
+  dependency in `Cargo.toml` — CI got as far as compiling `winit` and
+  `accesskit_winit` successfully (confirming this environment's
+  fontconfig setup works) before failing on the missing `wgpu` crate.
+  Fixed by adding it and re-verifying every other external crate path
+  in `src/*.rs` against `Cargo.toml` by hand (`cargo tree -p aurora-app
+  -i wgpu` now resolves cleanly). This is the exact risk flagged above
+  from writing this without local compilation — confirmed real, caught
+  by CI as intended, fixed the same day.
+
+  **Needs, in order: (1)
   someone with root access or a pre-provisioned image to install
   `pkg-config`/`libfontconfig1-dev` (exactly what `ci.yml` already
   installs, so CI itself should build this cleanly) and confirm a clean
