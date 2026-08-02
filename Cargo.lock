@@ -433,6 +433,7 @@ dependencies = [
  "taffy",
  "tracing",
  "tracing-subscriber",
+ "wgpu",
  "winit",
 ]
 
