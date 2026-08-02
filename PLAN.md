@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-08-01**.
+Last updated: **2026-08-02**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -64,6 +64,7 @@ among the three steps PRD §13 actually names as blocking.
 | **Phase 1 — M1.4** | **In progress, 2026-08-01.** `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. History (`History` — mirrors all 14 `LayerTree` mutators with undo-recording versions, unlimited undo/redo, §7.3.3) done 2026-08-01, 20 more tests (70 total) — add/remove turned out to be exact inverses of two new id-preserving `LayerTree` primitives (`remove_capturing`/`restore`), one symmetric apply function drives both undo and redo, and dirtied `Rect`s are reported when knowable (pixel bounds, or a union over a removed subtree) and honestly `None` for group-level changes. Crash recovery journal's **in-memory half** (`History::replay`, an ever-growing chronological op log distinct from the undo/redo stacks) done 2026-08-01, 8 more tests (78 total) — proven to reflect *current* state after undo/redo, not just full history; **durable disk persistence deliberately deferred**, no on-disk encoding decided (see M1.4). fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. See M1.4 |
 | **Phase 1 — M1.5** | **Complete, 2026-08-01.** `aurora-color`'s ICC transforms (`IccProfile`, `Transform`, `RenderingIntent`) wiring in `lcms2` per ADR 0008 — `Gray`/`Rgb`/`Rgba`/`Cmyk` channel layouts, verified against real, committed CC0 ICC profiles (`corpora/icc/`, copied from `spike/raw-icc`'s own fixtures), reproducing `spike/raw-icc/FINDINGS.md`'s cross-validated sRGB→ECI-RGBv2 values plus the permanent extended-range/no-clamping regression test that spike's finding 4 asked for (`cargo deny check all` clean with the new dependency; `Cmyk` wired but untested against a real CMYK profile — honest gap, none in the corpus yet). Colour-space descriptor tagging (§7.3.6) was already done from M1.1. Linear-light conversion (`linear_to_srgb`/`srgb_to_linear`, IEC 61966-2-1's real curve, HDR/negative-safe) — an explicit working-space *policy* type stays deliberately undesigned until a real compositor/filter consumer exists. Promote-on-import/dither-on-export (`promote_u8`/`quantize_u8`/`dither_quantize`, classic 8×8 Bayer ordered dithering generated from its recursive definition and cross-checked against the published 4×4 table, not a hand-transcribed 64-entry table) — exhaustive 256-value round-trip test, dedicated test confirming dithering actually breaks up banding. 22 tests total. fmt/clippy (`-D warnings`)/`cargo test -p aurora-color`/`cargo deny check all` all verified clean throughout. See M1.5 |
 | **Phase 1 — M1.6** | **In progress, 2026-08-01.** `aurora-theme`'s token types (`Color`, `SurfaceTokens`/`TextTokens`/`IconTokens`/`BorderTokens`/`AccentTokens`/`StateTokens`, `Scales`) match the already owner-approved `design/tokens/vocabulary.md`/`scales.toml` exactly. `Palette`/`ThemeSet` parse real TOML (`toml` added to `[workspace.dependencies]` — `serde`'s first real use), resolve dotted palette references generically, and merge an `extends` inheritance chain (child overrides parent) — verified against the real, committed Dark theme end to end, plus a synthetic child theme proving the merge logic without inventing a real second design. `contrast::check_gated_pairs` is the real, CI-enforced version of `design/check_contrast.py`'s Phase-0 prototype (same 17 gated pairs, same WCAG formula reusing `aurora_color::srgb_to_linear`) — independently reproduces that script's own prior "17/17 pass" finding. 23 tests total. **Blocked**: Light/high-contrast/Colour-Critical themes need Cahya's own design work (FR-027 *Ownership*) before they can exist, not an engineering gap. **Deferred, no consumer yet**: hot-reload file-watching, and the CI lint rejecting hardcoded style values (needs real widget code to lint against). fmt/clippy (`-D warnings`)/`cargo test -p aurora-theme`/`cargo deny check licenses` all verified clean. See M1.6 |
+| **Phase 1 — M1.7** | **Started, 2026-08-02.** `aurora-widgets`' `WidgetTree<W>` (generic over payload, same shape `RenderGraph<N>` uses) done: identity/nesting (one root, children appended in paint/tab order — a deliberate departure from `LayerTree`'s "newest on top"), damage tracking (`aurora_tile::Tile`'s own `Option<Rect>`/`Rect::union` idiom, per-widget and tree-wide), and a *required* `accesskit::Node` per widget from creation (`WidgetId` **is** `accesskit::NodeId`, not a wrapper — no second id space) — `accessibility_update` builds a real `TreeUpdate` matching `spike/a11y-ime`'s own proven shape, `accesskit` pinned to the exact version that spike already verified. 14 tests, all headless (no window/GPU/platform adapter) — proving out "headless mode for automated UI tests" as a property this crate already has, not a later mode to bolt on. fmt/clippy (`-D warnings`)/`cargo test -p aurora-widgets`/`cargo deny check licenses` all verified clean. Layout, input/focus routing, IME, the concrete widget set, vector-first rendering, the component gallery, and headless test *mode* as an explicit feature all remain. See M1.7 |
 
 **The single most important open item, updated:** on macOS, a screen reader
 does speak a custom-drawn text field, and CJK composition works — human-verified
@@ -1165,10 +1166,44 @@ check licenses` clean with the new `toml` dependency.
 
 *Roughly a third of Phase 1. Document-agnostic and headlessly testable.*
 
-- [ ] Layout engine (flexbox-style; `taffy` if it fits)
-- [ ] Retained-mode tree with damage tracking
+- [ ] Layout engine (flexbox-style; `taffy` if it fits) — deliberately
+  built second, not first: needed the tree structure to lay out before
+  writing a layout pass over it. Not started; `taffy` not yet added as a
+  dependency.
+- [x] **Retained-mode tree with damage tracking** — done 2026-08-02,
+  `crates/aurora-widgets/src/tree.rs` (`WidgetTree<W>`, `WidgetId`), 14
+  tests. Exactly one root (unlike `aurora_doc::LayerTree`'s multiple
+  top-level layers — an application has one root window, not several),
+  arbitrary nesting below it, generic over a payload `W` the same way
+  `aurora_graph::RenderGraph<N>` is (this crate can't know what a
+  concrete "button" or "checkbox" is yet — that's this milestone's own
+  later "widget set" bullet). Children are appended at the end
+  (paint/tab order), a deliberate departure from `LayerTree`'s
+  "newest-on-top, insert at index 0" — a fresh widget has no natural "on
+  top" the way a new image layer does. Damage tracking reuses
+  `aurora_tile::Tile::mark_dirty`/`take_dirty`'s exact `Option<Rect>` +
+  `Rect::union` idiom, both per-widget (`is_dirty`) and tree-wide
+  (`take_damage`, what a renderer actually consumes); `set_bounds`
+  correctly dirties both the vacated and newly-occupied regions, not
+  just the new position.
+- [x] **`accesskit` node per widget — part of the definition, not a pass
+  (§7.3.9)** — done alongside the tree above, not bolted on after:
+  `WidgetId` **is** `accesskit::NodeId` (a type alias, not a wrapper),
+  so the tree's own identity and a widget's accessibility identity are
+  the literal same value with no second id space to keep in sync or
+  forget to populate. `insert`/`new` require an `accesskit::Node`
+  up front — there is no code path that creates a widget without one.
+  `accessibility_update` builds a real `accesskit::TreeUpdate` (same
+  shape `spike/a11y-ime`'s own proven `tree.rs` already used:
+  `nodes`/`tree`/`tree_id`/`focus`) from every widget's own node —
+  what a platform adapter (`accesskit_winit`) will actually consume once
+  `aurora-app` exists. `accesskit` pinned to `0.24`, the exact version
+  the a11y spike already proved works. Headlessly verified throughout —
+  every test builds a real `TreeUpdate` and inspects it directly, no
+  window or platform adapter needed, which is what "headless mode for
+  automated UI tests" (this milestone's own later bullet) is really
+  asking this crate to already be.
 - [ ] Input routing, focus management, keyboard navigation
-- [ ] `accesskit` node per widget — part of the definition, not a pass (§7.3.9)
 - [ ] Text field: selection, caret, word motion, clipboard, undo
 - [ ] IME composition rendering (platform underline styles)
 - [ ] Widget set: button, checkbox, slider, number field, dropdown, scrollbar, tree, tab bar, menu, tooltip, colour picker, curve editor
