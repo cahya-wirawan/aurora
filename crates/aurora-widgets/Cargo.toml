@@ -21,3 +21,4 @@ aurora-theme = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 accesskit = { workspace = true }
+taffy = { workspace = true }

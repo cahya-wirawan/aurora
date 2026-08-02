@@ -55,6 +55,8 @@ lz4_flex = "0.11"
 # Same pin `spike/a11y-ime` already proved works (accessibility spike,
 # PRD §13 Step 4 / ADR 0001's escape-hatch check).
 accesskit = "0.24"
+# PLAN.md M1.7's own suggestion ("flexbox-style; taffy if it fits").
+taffy = "0.12"
 tempfile = "3"
 criterion = "0.5"
 wgpu = "30"

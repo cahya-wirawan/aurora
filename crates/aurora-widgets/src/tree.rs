@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use accesskit::{Node as AccessibilityNode, NodeId, Tree, TreeId, TreeUpdate};
 use aurora_core::Rect;
+use taffy::{AvailableSpace, Size as LayoutSize, Style as LayoutStyle, TaffyTree};
 
 use crate::error::WidgetError;
 
@@ -16,6 +17,16 @@ use crate::error::WidgetError;
 /// means there is no separate id space to keep in sync or forget to.
 pub type WidgetId = NodeId;
 
+/// A widget with no computed layout yet — [`WidgetTree::new`]/
+/// [`WidgetTree::insert`]'s initial `bounds` before the first
+/// [`WidgetTree::compute_layout`] call.
+const UNLAID_OUT: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+};
+
 struct WidgetNode<W> {
     parent: Option<WidgetId>,
     /// Paint/tab order, first to last — unlike `aurora_doc::LayerTree`'s
@@ -25,6 +36,16 @@ struct WidgetNode<W> {
     /// `Node::push_child` (this module's `insert`) and every mainstream
     /// UI toolkit's "append child" already use.
     children: Vec<WidgetId>,
+    /// This widget's layout *input* — flex properties, sizing, spacing.
+    /// [`WidgetTree::compute_layout`] is the only thing that reads it;
+    /// [`Self::bounds`] is the (derived, cached) output.
+    style: LayoutStyle,
+    /// This widget's last-computed screen-space bounds — [`UNLAID_OUT`]
+    /// until [`WidgetTree::compute_layout`] has run at least once.
+    /// `set_bounds` remains a public escape hatch for a widget that
+    /// manages its own placement outside the flex layout system (e.g. an
+    /// absolutely-positioned overlay), but the normal path is `style` in,
+    /// `compute_layout` out.
     bounds: Rect,
     accessibility: AccessibilityNode,
     dirty: bool,
@@ -38,10 +59,10 @@ struct WidgetNode<W> {
 /// required [`accesskit::Node`] on every widget from the moment it's
 /// created.
 ///
-/// Layout (this crate's own layout engine, PLAN.md M1.7) and input/focus
-/// routing are separate, later pieces layered on top of this structure —
-/// this type owns identity, nesting, bounds, damage, and accessibility
-/// content only.
+/// Input/focus routing is a separate, later piece layered on top of this
+/// structure — this type owns identity, nesting, layout (style in,
+/// bounds out — see [`Self::compute_layout`]), damage, and accessibility
+/// content.
 pub struct WidgetTree<W> {
     nodes: HashMap<WidgetId, WidgetNode<W>>,
     root: WidgetId,
@@ -54,12 +75,17 @@ pub struct WidgetTree<W> {
 }
 
 impl<W> WidgetTree<W> {
-    /// Creates a new tree with `payload` as its root widget, covering
-    /// `bounds`, described by `accessibility`. Returns the tree and the
+    /// Creates a new tree with `payload` as its root widget, laid out per
+    /// `style`, described by `accessibility`. Returns the tree and the
     /// root's id (always `NodeId(0)`, but returned rather than assumed,
-    /// so callers never hardcode it).
+    /// so callers never hardcode it). The root's bounds are
+    /// [`UNLAID_OUT`] until [`Self::compute_layout`] runs.
     #[must_use]
-    pub fn new(accessibility: AccessibilityNode, bounds: Rect, payload: W) -> (Self, WidgetId) {
+    pub fn new(
+        accessibility: AccessibilityNode,
+        style: LayoutStyle,
+        payload: W,
+    ) -> (Self, WidgetId) {
         let root = WidgetId::from(0);
         let mut nodes = HashMap::new();
         nodes.insert(
@@ -67,7 +93,8 @@ impl<W> WidgetTree<W> {
             WidgetNode {
                 parent: None,
                 children: Vec::new(),
-                bounds,
+                style,
+                bounds: UNLAID_OUT,
                 accessibility,
                 dirty: true,
                 payload,
@@ -78,7 +105,7 @@ impl<W> WidgetTree<W> {
                 nodes,
                 root,
                 next_id: 1,
-                damage: Some(bounds),
+                damage: None,
             },
             root,
         )
@@ -104,9 +131,12 @@ impl<W> WidgetTree<W> {
         self.nodes.is_empty()
     }
 
-    /// Adds a new widget as the last child of `parent`, covering `bounds`,
-    /// described by `accessibility`. Marks the new widget's own bounds
-    /// dirty.
+    /// Adds a new widget as the last child of `parent`, laid out per
+    /// `style`, described by `accessibility`. Its bounds are
+    /// [`UNLAID_OUT`] until [`Self::compute_layout`] runs — inserting a
+    /// widget dirties `parent`'s subtree (its layout may now change) but
+    /// not a specific screen region, since the new widget doesn't have
+    /// screen bounds yet.
     ///
     /// # Errors
     ///
@@ -115,7 +145,7 @@ impl<W> WidgetTree<W> {
     pub fn insert(
         &mut self,
         parent: WidgetId,
-        bounds: Rect,
+        style: LayoutStyle,
         accessibility: AccessibilityNode,
         payload: W,
     ) -> Result<WidgetId, WidgetError> {
@@ -130,7 +160,8 @@ impl<W> WidgetTree<W> {
             WidgetNode {
                 parent: Some(parent),
                 children: Vec::new(),
-                bounds,
+                style,
+                bounds: UNLAID_OUT,
                 accessibility,
                 dirty: true,
                 payload,
@@ -142,7 +173,6 @@ impl<W> WidgetTree<W> {
         };
         parent_node.children.push(id);
 
-        self.mark_region_dirty(bounds);
         Ok(id)
     }
 
@@ -217,6 +247,28 @@ impl<W> WidgetTree<W> {
         // repainting, not just the new position.
         self.mark_region_dirty(old_bounds);
         self.mark_region_dirty(bounds);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn style(&self, id: WidgetId) -> Option<&LayoutStyle> {
+        self.nodes.get(&id).map(|node| &node.style)
+    }
+
+    /// Replaces `id`'s layout style — takes effect on the next
+    /// [`Self::compute_layout`] call, not immediately (unlike
+    /// [`Self::set_bounds`], a style change alone doesn't know what the
+    /// new bounds would be without re-running layout).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist.
+    pub fn set_style(&mut self, id: WidgetId, style: LayoutStyle) -> Result<(), WidgetError> {
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(WidgetError::UnknownWidget(id))?;
+        node.style = style;
         Ok(())
     }
 
@@ -296,6 +348,120 @@ impl<W> WidgetTree<W> {
         });
     }
 
+    /// Recomputes every widget's bounds from its own `style`, treating
+    /// `width`/`height` as the root's available space (typically the
+    /// window's current client size). Rebuilds a fresh internal `taffy`
+    /// tree on every call rather than keeping one permanently in sync
+    /// with this tree's own structure — this tree stays the single
+    /// source of truth for identity/nesting, and re-deriving layout from
+    /// it fresh is the same "recomputed on demand from a source of
+    /// truth" shape `aurora_doc::History::replay` already uses for its
+    /// own journal. Each widget's bounds are set via [`Self::set_bounds`]
+    /// internally, so the usual dirty-marking (both vacated and newly
+    /// occupied regions) applies here too, not a separate code path.
+    pub fn compute_layout(&mut self, width: f32, height: f32) {
+        let mut taffy = TaffyTree::<()>::new();
+        let mut taffy_ids = HashMap::new();
+        self.build_taffy_node(self.root, &mut taffy, &mut taffy_ids);
+
+        let Some(&taffy_root) = taffy_ids.get(&self.root) else {
+            unreachable!("build_taffy_node always inserts the node it was called with");
+        };
+        let available = LayoutSize {
+            width: AvailableSpace::Definite(width),
+            height: AvailableSpace::Definite(height),
+        };
+        if taffy.compute_layout(taffy_root, available).is_err() {
+            unreachable!(
+                "TaffyError only occurs for a node id from a different tree, \
+                 which this method never constructs"
+            );
+        }
+
+        self.apply_taffy_layout(self.root, &taffy, &taffy_ids, 0.0, 0.0);
+    }
+
+    /// Builds `id`'s subtree in `taffy`, children first (`taffy::TaffyTree`
+    /// needs a node's children to already exist before the node itself can
+    /// reference them), recording each widget's corresponding
+    /// `taffy::NodeId` in `taffy_ids`.
+    fn build_taffy_node(
+        &self,
+        id: WidgetId,
+        taffy: &mut TaffyTree<()>,
+        taffy_ids: &mut HashMap<WidgetId, taffy::NodeId>,
+    ) {
+        let Some(node) = self.nodes.get(&id) else {
+            unreachable!("build_taffy_node is only ever called with ids known to exist");
+        };
+        let mut taffy_children = Vec::with_capacity(node.children.len());
+        for &child in &node.children {
+            self.build_taffy_node(child, taffy, taffy_ids);
+            let Some(&taffy_child) = taffy_ids.get(&child) else {
+                unreachable!("just inserted by the recursive call above");
+            };
+            taffy_children.push(taffy_child);
+        }
+
+        let result = if taffy_children.is_empty() {
+            taffy.new_leaf(node.style.clone())
+        } else {
+            taffy.new_with_children(node.style.clone(), &taffy_children)
+        };
+        let Ok(taffy_id) = result else {
+            unreachable!(
+                "a style value and freshly-created children in this same taffy \
+                 tree are always valid"
+            );
+        };
+        taffy_ids.insert(id, taffy_id);
+    }
+
+    /// Walks `id`'s subtree top-down, converting `taffy`'s parent-relative
+    /// `Layout::location` into this tree's absolute screen-space bounds
+    /// (`parent_x`/`parent_y` is the already-accumulated absolute origin
+    /// of `id`'s own parent), and writes each widget's new bounds back via
+    /// [`Self::set_bounds`].
+    fn apply_taffy_layout(
+        &mut self,
+        id: WidgetId,
+        taffy: &TaffyTree<()>,
+        taffy_ids: &HashMap<WidgetId, taffy::NodeId>,
+        parent_x: f32,
+        parent_y: f32,
+    ) {
+        let Some(&taffy_id) = taffy_ids.get(&id) else {
+            unreachable!("every widget id has a corresponding taffy node from build_taffy_node");
+        };
+        let Ok(layout) = taffy.layout(taffy_id) else {
+            unreachable!("layout was just computed for exactly this taffy tree");
+        };
+        let abs_x = parent_x + layout.location.x;
+        let abs_y = parent_y + layout.location.y;
+        // `.max(0.0)` before the cast makes the sign-loss clippy warns
+        // about unreachable in practice, but not provable statically.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let bounds = Rect {
+            x: abs_x as i64,
+            y: abs_y as i64,
+            width: layout.size.width.max(0.0) as u32,
+            height: layout.size.height.max(0.0) as u32,
+        };
+
+        let children = match self.nodes.get(&id) {
+            Some(node) => node.children.clone(),
+            None => unreachable!("id is known to exist: it was just looked up via taffy_ids"),
+        };
+
+        if let Err(err) = self.set_bounds(id, bounds) {
+            unreachable!("id is known to exist: {err:?}");
+        }
+
+        for child in children {
+            self.apply_taffy_layout(child, taffy, taffy_ids, abs_x, abs_y);
+        }
+    }
+
     /// Takes and clears the accumulated screen-space damage region, and
     /// clears every widget's own per-widget dirty flag — e.g. right
     /// before a repaint, so a widget touched again afterward is tracked
@@ -342,6 +508,8 @@ mod tests {
     use crate::WidgetError;
     use accesskit::{Node, Role};
     use aurora_core::Rect;
+    use taffy::style_helpers::{length, percent};
+    use taffy::{FlexDirection, Size, Style};
 
     fn bounds(x: i64, y: i64, w: u32, h: u32) -> Rect {
         Rect {
@@ -358,9 +526,22 @@ mod tests {
         node
     }
 
+    /// A style with an explicit, fixed pixel size — the common case for
+    /// these tests, which mostly care about layout math, not exercising
+    /// every style property.
+    fn sized(width: f32, height: f32) -> Style {
+        Style {
+            size: Size {
+                width: length(width),
+                height: length(height),
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn new_tree_has_exactly_the_root() {
-        let (tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
+        let (tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
         assert_eq!(tree.len(), 1);
         assert!(!tree.is_empty());
         assert_eq!(tree.root(), root);
@@ -368,16 +549,21 @@ mod tests {
         assert_eq!(tree.parent(root), None);
         assert_eq!(tree.children(root), Some([].as_slice()));
         assert_eq!(tree.payload(root), Some(&"root"));
+        assert_eq!(
+            tree.bounds(root),
+            Some(bounds(0, 0, 0, 0)),
+            "unlaid-out bounds until compute_layout runs"
+        );
     }
 
     #[test]
     fn insert_adds_a_child_at_the_end_and_marks_it_dirty() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
-        let a = match tree.insert(root, bounds(0, 0, 10, 10), label("a"), "a") {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        let b = match tree.insert(root, bounds(10, 0, 10, 10), label("b"), "b") {
+        let b = match tree.insert(root, Style::default(), label("b"), "b") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -388,9 +574,9 @@ mod tests {
 
     #[test]
     fn insert_rejects_an_unknown_parent() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
         let bogus = accesskit::NodeId(999);
-        match tree.insert(bogus, bounds(0, 0, 1, 1), label("x"), "x") {
+        match tree.insert(bogus, Style::default(), label("x"), "x") {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
@@ -400,8 +586,8 @@ mod tests {
 
     #[test]
     fn remove_detaches_a_leaf_and_updates_the_parent() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
-        let a = match tree.insert(root, bounds(0, 0, 10, 10), label("a"), "a") {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -414,12 +600,12 @@ mod tests {
 
     #[test]
     fn remove_cascades_into_every_descendant() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
-        let group = match tree.insert(root, bounds(0, 0, 50, 50), label("group"), "group") {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let group = match tree.insert(root, Style::default(), label("group"), "group") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        let leaf = match tree.insert(group, bounds(0, 0, 10, 10), label("leaf"), "leaf") {
+        let leaf = match tree.insert(group, Style::default(), label("leaf"), "leaf") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -433,7 +619,7 @@ mod tests {
 
     #[test]
     fn remove_rejects_the_root() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
         match tree.remove(root) {
             Err(WidgetError::CannotRemoveRoot(id)) => assert_eq!(id, root),
             other => unreachable!("expected CannotRemoveRoot, got {other:?}"),
@@ -443,7 +629,7 @@ mod tests {
 
     #[test]
     fn remove_rejects_an_unknown_id() {
-        let (mut tree, _root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
+        let (mut tree, _root) = WidgetTree::new(label("root"), Style::default(), "root");
         let bogus = accesskit::NodeId(999);
         match tree.remove(bogus) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
@@ -453,12 +639,12 @@ mod tests {
 
     #[test]
     fn set_bounds_updates_and_marks_dirty() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
-        let a = match tree.insert(root, bounds(0, 0, 10, 10), label("a"), "a") {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        tree.take_damage(); // clear the insert's own damage first.
+        tree.take_damage();
 
         if let Err(err) = tree.set_bounds(a, bounds(5, 5, 10, 10)) {
             unreachable!("{err:?}");
@@ -469,7 +655,7 @@ mod tests {
 
     #[test]
     fn set_bounds_rejects_an_unknown_id() {
-        let (mut tree, _root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
+        let (mut tree, _root) = WidgetTree::new(label("root"), Style::default(), "root");
         let bogus = accesskit::NodeId(999);
         match tree.set_bounds(bogus, bounds(0, 0, 1, 1)) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
@@ -478,37 +664,27 @@ mod tests {
     }
 
     #[test]
-    fn take_damage_accumulates_via_union_and_clears() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 10, 10), "root");
-        // The root's own creation already dirtied (0,0,10,10). Clear it
-        // first so this test's own assertions are about its own inserts.
+    fn set_bounds_dirties_both_the_old_and_new_region() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        if let Err(err) = tree.set_bounds(root, bounds(0, 0, 5, 5)) {
+            unreachable!("{err:?}");
+        }
         tree.take_damage();
 
-        if let Err(err) = tree.insert(root, bounds(0, 0, 5, 5), label("a"), "a") {
+        if let Err(err) = tree.set_bounds(root, bounds(20, 20, 5, 5)) {
             unreachable!("{err:?}");
         }
-        if let Err(err) = tree.insert(root, bounds(20, 20, 5, 5), label("b"), "b") {
-            unreachable!("{err:?}");
-        }
-
-        let damage = tree.take_damage();
-        assert_eq!(
-            damage,
-            Some(bounds(0, 0, 5, 5).union(&bounds(20, 20, 5, 5))),
-            "damage must be the union of every dirtied region since the last take"
-        );
-
         assert_eq!(
             tree.take_damage(),
-            None,
-            "damage must be cleared after being taken"
+            Some(bounds(0, 0, 5, 5).union(&bounds(20, 20, 5, 5))),
+            "both the vacated and the newly occupied region must be dirtied"
         );
     }
 
     #[test]
     fn take_damage_clears_every_widgets_own_dirty_flag() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 10, 10), "root");
-        let a = match tree.insert(root, bounds(0, 0, 5, 5), label("a"), "a") {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -520,8 +696,8 @@ mod tests {
 
     #[test]
     fn accessibility_update_includes_every_widget_and_the_given_focus() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
-        let a = match tree.insert(root, bounds(0, 0, 10, 10), label("a"), "a") {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -539,8 +715,8 @@ mod tests {
 
     #[test]
     fn set_accessibility_replaces_the_node_and_marks_dirty() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
-        let a = match tree.insert(root, bounds(0, 0, 10, 10), label("a"), "a") {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -558,10 +734,134 @@ mod tests {
 
     #[test]
     fn payload_mut_allows_updating_the_widgets_own_data() {
-        let (mut tree, root) = WidgetTree::new(label("root"), bounds(0, 0, 100, 100), "root");
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
         if let Some(payload) = tree.payload_mut(root) {
             *payload = "renamed root";
         }
         assert_eq!(tree.payload(root), Some(&"renamed root"));
+    }
+
+    #[test]
+    fn style_can_be_read_back_and_replaced() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        assert_eq!(tree.style(root), Some(&Style::default()));
+
+        if let Err(err) = tree.set_style(root, sized(50.0, 50.0)) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.style(root), Some(&sized(50.0, 50.0)));
+    }
+
+    #[test]
+    // `taffy` does not implicitly stretch an `Auto`-sized, childless root to
+    // fill the available space -- confirmed by running this test with the
+    // opposite assertion first and seeing (0, 0, 0, 0) come back, not
+    // (0, 0, 300, 150). `Auto` sizes to content, and a childless root has
+    // no content; there is no built-in "root fills the viewport" the way
+    // CSS's `html, body { width: 100% }` convention provides. A caller
+    // that wants the root to fill its window must ask for that explicitly
+    // (see the `percent`-sized test right below), the same way a real web
+    // page does.
+    fn compute_layout_auto_root_with_no_children_stays_content_sized() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        tree.compute_layout(300.0, 150.0);
+        assert_eq!(tree.bounds(root), Some(bounds(0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn compute_layout_a_percent_sized_root_fills_the_available_space() {
+        let root_style = Style {
+            size: Size {
+                width: percent(1.0_f32),
+                height: percent(1.0_f32),
+            },
+            ..Default::default()
+        };
+        let (mut tree, root) = WidgetTree::new(label("root"), root_style, "root");
+        tree.compute_layout(300.0, 150.0);
+        assert_eq!(tree.bounds(root), Some(bounds(0, 0, 300, 150)));
+    }
+
+    #[test]
+    fn compute_layout_lays_out_a_row_of_fixed_size_children_left_to_right() {
+        let root_style = Style {
+            flex_direction: FlexDirection::Row,
+            ..Default::default()
+        };
+        let (mut tree, root) = WidgetTree::new(label("root"), root_style, "root");
+        let a = match tree.insert(root, sized(40.0, 20.0), label("a"), "a") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match tree.insert(root, sized(30.0, 20.0), label("b"), "b") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        tree.compute_layout(300.0, 150.0);
+
+        assert_eq!(tree.bounds(a), Some(bounds(0, 0, 40, 20)));
+        assert_eq!(
+            tree.bounds(b),
+            Some(bounds(40, 0, 30, 20)),
+            "b must start exactly where a ends"
+        );
+    }
+
+    #[test]
+    fn compute_layout_accumulates_absolute_position_through_nested_groups() {
+        let root_style = Style {
+            flex_direction: FlexDirection::Row,
+            padding: taffy::Rect {
+                left: length(10.0_f32),
+                top: length(5.0_f32),
+                right: length(0.0_f32),
+                bottom: length(0.0_f32),
+            },
+            ..Default::default()
+        };
+        let (mut tree, root) = WidgetTree::new(label("root"), root_style, "root");
+        let group = match tree.insert(root, sized(100.0, 100.0), label("group"), "group") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let leaf = match tree.insert(group, sized(20.0, 20.0), label("leaf"), "leaf") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        tree.compute_layout(300.0, 150.0);
+
+        assert_eq!(
+            tree.bounds(group),
+            Some(bounds(10, 5, 100, 100)),
+            "the group must be offset by the root's own padding"
+        );
+        assert_eq!(
+            tree.bounds(leaf),
+            Some(bounds(10, 5, 20, 20)),
+            "the leaf's absolute position must include its ancestors' offsets too"
+        );
+    }
+
+    #[test]
+    fn compute_layout_marks_changed_widgets_dirty() {
+        let root_style = Style {
+            size: Size {
+                width: percent(1.0_f32),
+                height: percent(1.0_f32),
+            },
+            ..Default::default()
+        };
+        let (mut tree, _root) = WidgetTree::new(label("root"), root_style, "root");
+        tree.compute_layout(100.0, 100.0);
+        tree.take_damage();
+
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(
+            tree.take_damage(),
+            Some(bounds(0, 0, 100, 100).union(&bounds(0, 0, 200, 200))),
+            "resizing the root must dirty both the old and new region"
+        );
     }
 }
