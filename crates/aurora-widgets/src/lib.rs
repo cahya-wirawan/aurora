@@ -11,9 +11,12 @@
 //! hit-testing and keyboard focus/`Tab` navigation, deliberately in terms
 //! of a document-space point and abstract focus steps rather than
 //! `winit::WindowEvent`s — translating real platform input into these is
-//! `aurora-app`'s job. IME, the concrete widget set, vector-first
-//! rendering, the component gallery, and headless test mode as an
-//! explicit feature are all still open — see PLAN.md M1.7.
+//! `aurora-app`'s job. [`widgets`] is the third: a first slice of the
+//! concrete widget set (`Button`/`Checkbox`/`Slider`) — see that module's
+//! own doc comment for exactly what's covered and what's deliberately
+//! not. IME, vector-first rendering, the component gallery, and headless
+//! test mode as an explicit feature are all still open — see PLAN.md
+//! M1.7.
 //!
 //! This crate knows nothing about documents or layers (`aurora-doc` is a
 //! layer above it) and must stay headlessly testable — every test in
@@ -25,6 +28,7 @@
 mod error;
 mod input;
 mod tree;
+pub mod widgets;
 
 pub use error::WidgetError;
 pub use input::{FocusManager, hit_test};

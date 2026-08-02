@@ -26,4 +26,13 @@ pub enum WidgetError {
     /// parallel flag.
     #[error("widget {0:?} does not support the accesskit Focus action")]
     NotFocusable(WidgetId),
+    /// A concrete widget function (`widgets::toggle_checkbox`,
+    /// `widgets::set_slider_value`, ...) was called on a real, existing
+    /// widget that isn't the kind that function operates on.
+    #[error("widget {0:?} exists but is not the expected widget kind")]
+    WrongWidgetKind(WidgetId),
+    /// A concrete widget function was asked to interact with (click,
+    /// toggle, drag) a widget whose own state marks it disabled.
+    #[error("widget {0:?} is disabled")]
+    WidgetDisabled(WidgetId),
 }
