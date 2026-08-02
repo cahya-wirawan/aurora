@@ -31,10 +31,15 @@
 mod button;
 mod checkbox;
 mod slider;
+mod text_field;
 
 pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
 pub use checkbox::{CheckboxState, insert_checkbox, set_checkbox_disabled, toggle_checkbox};
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
+pub use text_field::{
+    TextFieldState, insert_text_field, set_text_field_disabled, text_field_state,
+    with_text_field_mut,
+};
 
 use accesskit::{Node, Role};
 #[cfg(test)]
@@ -56,6 +61,7 @@ pub enum WidgetKind {
     Button(ButtonState),
     Checkbox(CheckboxState),
     Slider(SliderState),
+    TextField(TextFieldState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

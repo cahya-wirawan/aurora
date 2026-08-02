@@ -57,6 +57,9 @@ lz4_flex = "0.11"
 accesskit = "0.24"
 # PLAN.md M1.7's own suggestion ("flexbox-style; taffy if it fits").
 taffy = "0.12"
+# Correct Unicode word-boundary motion for the text field widget, not a
+# hand-rolled whitespace heuristic.
+unicode-segmentation = "1"
 tempfile = "3"
 criterion = "0.5"
 wgpu = "30"
