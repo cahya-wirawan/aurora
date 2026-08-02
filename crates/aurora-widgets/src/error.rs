@@ -20,4 +20,10 @@ pub enum WidgetError {
     /// it would leave the tree without one rather than a smaller tree.
     #[error("cannot remove {0:?}: it is this tree's root")]
     CannotRemoveRoot(WidgetId),
+    /// [`crate::FocusManager::focus`] was asked to focus a widget whose
+    /// own `accesskit::Node` doesn't declare `Action::Focus` — reusing
+    /// `accesskit`'s own vocabulary for "focusable" rather than a second,
+    /// parallel flag.
+    #[error("widget {0:?} does not support the accesskit Focus action")]
+    NotFocusable(WidgetId),
 }
