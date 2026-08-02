@@ -1,20 +1,43 @@
 //! A single-line text field: selection, caret motion (character and
-//! word, grapheme-cluster aware), clipboard-shaped operations, and
-//! per-field undo/redo.
+//! word, grapheme-cluster aware), clipboard-shaped operations,
+//! per-field undo/redo, and IME composition state.
 //!
-//! **No rendering, no real clipboard, no IME** — this is the logical text
+//! **No pixel rendering, no real clipboard** — this is the logical text
 //! buffer only, the same "no rendering yet" scope every widget in this
 //! module has (see `widgets`' own doc comment). "Clipboard" here means
 //! [`TextFieldState::copy`]/[`TextFieldState::cut`]/[`TextFieldState::paste`]
 //! as pure text-buffer operations returning/taking a plain `String` —
 //! actually reading/writing the OS clipboard is platform-specific and
 //! belongs in `aurora-app`, the same seam [`crate::hit_test`]/
-//! [`crate::FocusManager`] already draw around real input. IME
-//! composition rendering is a separate, still-open M1.7 bullet.
-//! `accesskit::TextSelection` isn't exposed yet either — `spike/a11y-ime`
+//! [`crate::FocusManager`] already draw around real input.
+//!
+//! **IME composition** ([`TextFieldState::set_composition`]/
+//! [`TextFieldState::commit_composition`]) mirrors `winit::event::Ime`
+//! (`Preedit(text, cursor_range)` / `Commit(text)`, the same shape
+//! `spike/a11y-ime/src/field.rs`'s `TextField` already proved out by
+//! hand): uncommitted composition text is kept separate from `content`
+//! until committed, never touches undo/redo on its own (only a commit
+//! is a real edit), and starting a fresh composition replaces any active
+//! selection first (typing over a selection — composition is what
+//! typing looks like once an IME is involved). [`composition_segments`]
+//! turns a [`Composition`] into byte-range segments with the underline
+//! style each should render with ([`UnderlineStyle::Plain`] for
+//! unconverted text, [`UnderlineStyle::Target`] for the clause the
+//! candidate window is acting on — the distinction Windows TSF, macOS,
+//! and `IBus` each draw under different names). Actually drawing either
+//! style is an `aurora-text`/`aurora-vector` concern (both still
+//! skeletons); this is the styled-segment *data* a future renderer would
+//! consume — "rendering" in the same data-not-pixels sense every widget
+//! in this module already uses.
+//!
+//! `accesskit::TextSelection` isn't exposed yet — `spike/a11y-ime`
 //! already named that as unverified/open on its own (`FINDINGS.md`:
 //! "`TextSelection` exposed in the tree"), so this doesn't newly defer
-//! it, it inherits an already-known gap.
+//! it, it inherits an already-known gap. Composition is announced via
+//! `set_description`, the exact mechanism `spike/a11y-ime/src/tree.rs`
+//! already proved reaches `VoiceOver` (finding 2's "the spike sets a
+//! description" — this module is that finding's own follow-up design
+//! work).
 
 use std::ops::Range;
 
@@ -35,6 +58,60 @@ struct Snapshot {
     selection_anchor: Option<usize>,
 }
 
+/// In-progress, uncommitted IME composition text — not part of
+/// [`TextFieldState::content`] until [`TextFieldState::commit_composition`]
+/// is called.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composition {
+    pub text: String,
+    /// Byte range within `text` (not `content`) marking the IME's
+    /// current *target* clause — the segment the candidate window is
+    /// acting on. Windows TSF's `ATTR_TARGET_CONVERTED`/
+    /// `ATTR_TARGET_NOTCONVERTED`, macOS's thicker-marked range, and
+    /// `IBus`'s "selected" preedit attribute all name the same concept
+    /// under different terms. `None` when the platform reported no
+    /// target (`winit::event::Ime::Preedit`'s cursor-position pair is
+    /// `None`) — the whole composition then uses the plain style. A
+    /// plain `(usize, usize)` rather than `Range<usize>`, so
+    /// `Composition` (and `TextFieldState`, which embeds it) can still
+    /// derive `Eq` — `Range` deliberately does not implement it.
+    pub target_range: Option<(usize, usize)>,
+}
+
+/// The two underline styles every mainstream IME convention
+/// distinguishes. See this module's own doc comment for what "style"
+/// means here — data for a future renderer, not a drawn pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    /// Uncommitted, unconverted (or already-converted-but-not-targeted)
+    /// composition text.
+    Plain,
+    /// The clause currently targeted by the IME's candidate window.
+    Target,
+}
+
+/// Splits `composition.text` into byte-range segments paired with the
+/// underline style each should render with.
+#[must_use]
+pub fn composition_segments(composition: &Composition) -> Vec<(Range<usize>, UnderlineStyle)> {
+    let len = composition.text.len();
+    let target = composition.target_range.filter(|(start, end)| start < end);
+    let Some((start, end)) = target else {
+        // No target, or a degenerate empty one (conveys no distinct
+        // clause) -- either way, one plain segment for the whole text.
+        return vec![(0..len, UnderlineStyle::Plain)];
+    };
+    let mut segments = Vec::with_capacity(3);
+    if start > 0 {
+        segments.push((0..start, UnderlineStyle::Plain));
+    }
+    segments.push((start..end, UnderlineStyle::Target));
+    if end < len {
+        segments.push((end..len, UnderlineStyle::Plain));
+    }
+    segments
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextFieldState {
     pub label: String,
@@ -46,6 +123,9 @@ pub struct TextFieldState {
     /// `cursor`.
     pub selection_anchor: Option<usize>,
     pub disabled: bool,
+    /// In-progress IME composition, anchored at `cursor`. `None` when
+    /// there's no composition underway.
+    pub composition: Option<Composition>,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
 }
@@ -59,6 +139,7 @@ impl TextFieldState {
             cursor,
             selection_anchor: None,
             disabled: false,
+            composition: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }
@@ -254,6 +335,49 @@ impl TextFieldState {
     pub fn paste(&mut self, text: &str) {
         self.insert_str(text);
     }
+
+    /// Sets (or replaces) the in-progress IME composition, anchored at
+    /// the current cursor position — the handler for
+    /// `winit::event::Ime::Preedit(text, cursor_range)`. An empty `text`
+    /// clears the composition (winit's own documented synthetic-clear
+    /// shape, `Ime::Preedit("", None)`). Starting a fresh composition
+    /// (there was none before this call) first removes any active
+    /// selection, the same "typing replaces the selection" rule any
+    /// other content-changing input follows — composition is what
+    /// typing looks like once an IME is involved. Not itself an undo
+    /// step (composition is transient, like caret motion), except for
+    /// that one selection-removal, which is a real content change.
+    pub fn set_composition(
+        &mut self,
+        text: impl Into<String>,
+        target_range: Option<(usize, usize)>,
+    ) {
+        let text = text.into();
+        if text.is_empty() {
+            self.composition = None;
+            return;
+        }
+        if self.composition.is_none()
+            && let Some(range) = self.selection_range()
+        {
+            self.push_undo();
+            self.content.replace_range(range.clone(), "");
+            self.cursor = range.start;
+            self.selection_anchor = None;
+        }
+        self.composition = Some(Composition { text, target_range });
+    }
+
+    /// Clears any in-progress composition and inserts `text` at the
+    /// cursor (or over the active selection) — the handler for
+    /// `winit::event::Ime::Commit`. Unlike [`Self::set_composition`],
+    /// this is a real, undoable edit (it goes through
+    /// [`Self::insert_str`]), matching every other content-changing
+    /// method in this type.
+    pub fn commit_composition(&mut self, text: &str) {
+        self.composition = None;
+        self.insert_str(text);
+    }
 }
 
 /// The start byte of the grapheme cluster immediately before `from`, or
@@ -298,6 +422,12 @@ fn node(state: &TextFieldState) -> Node {
     let mut node = Node::new(Role::TextInput);
     node.set_label(state.label.clone());
     node.set_value(state.content.clone());
+    if let Some(composition) = &state.composition {
+        // Composition in progress: announce it, or a screen-reader user
+        // hears nothing while typing CJK -- the exact mechanism
+        // `spike/a11y-ime/src/tree.rs` already proved reaches VoiceOver.
+        node.set_description(format!("composing: {}", composition.text));
+    }
     if state.disabled {
         node.set_disabled();
     } else {
@@ -431,8 +561,8 @@ pub fn set_text_field_disabled(
 #[cfg(test)]
 mod tests {
     use super::{
-        TextFieldState, insert_text_field, set_text_field_disabled, text_field_state,
-        with_text_field_mut,
+        Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
+        set_text_field_disabled, text_field_state, with_text_field_mut,
     };
     use crate::WidgetError;
     use crate::widgets::{new_tree, test_scales};
@@ -789,5 +919,198 @@ mod tests {
         fn redo_stack_has_entries_for_test(&self) -> bool {
             !self.redo_stack.is_empty()
         }
+    }
+
+    // -- IME composition --
+
+    #[test]
+    fn set_composition_stores_text_without_touching_content() {
+        let mut f = field("hello");
+        f.set_composition("ni", Some((0, 2)));
+        assert_eq!(f.content, "hello", "composition must not touch content");
+        match &f.composition {
+            Some(c) => {
+                assert_eq!(c.text, "ni");
+                assert_eq!(c.target_range, Some((0, 2)));
+            }
+            None => unreachable!("composition must be set"),
+        }
+    }
+
+    #[test]
+    fn set_composition_with_empty_text_clears_it() {
+        let mut f = field("hello");
+        f.set_composition("ni", Some((0, 2)));
+        f.set_composition("", None);
+        assert!(f.composition.is_none());
+    }
+
+    #[test]
+    fn set_composition_is_not_undoable_on_its_own() {
+        let mut f = field("hello");
+        f.set_composition("ni", None);
+        f.set_composition("nih", None);
+        f.set_composition("", None);
+        assert!(!f.undo(), "composition updates must not push undo entries");
+        assert_eq!(f.content, "hello");
+    }
+
+    #[test]
+    fn starting_a_composition_replaces_an_active_selection() {
+        let mut f = field("hello world");
+        f.selection_anchor = Some(0);
+        f.cursor = 5; // "hello" selected
+        f.set_composition("ni", Some((0, 2)));
+        assert_eq!(
+            f.content, " world",
+            "starting composition must remove the selected text, like typing would"
+        );
+        assert_eq!(f.selection_anchor, None);
+        assert_eq!(f.cursor, 0);
+    }
+
+    #[test]
+    fn removing_a_selection_to_start_composition_is_undoable() {
+        let mut f = field("hello world");
+        f.selection_anchor = Some(0);
+        f.cursor = 5;
+        f.set_composition("ni", Some((0, 2)));
+        assert!(f.undo(), "the selection removal is a real content change");
+        assert_eq!(f.content, "hello world");
+    }
+
+    #[test]
+    fn continuing_a_composition_does_not_re_check_for_a_selection() {
+        let mut f = field("hello world");
+        f.selection_anchor = Some(0);
+        f.cursor = 5;
+        f.set_composition("n", None); // starts composition, removes selection
+        f.selection_anchor = Some(0); // simulate stale selection state
+        f.set_composition("ni", None); // continuing, must not remove again
+        assert_eq!(f.content, " world");
+    }
+
+    #[test]
+    fn commit_composition_clears_composition_and_inserts_the_final_text() {
+        let mut f = field("");
+        f.set_composition("ni", Some((0, 2)));
+        f.commit_composition("你");
+        assert!(f.composition.is_none());
+        assert_eq!(f.content, "你");
+        assert_eq!(f.cursor, "你".len());
+    }
+
+    #[test]
+    fn commit_composition_is_undoable() {
+        let mut f = field("");
+        f.set_composition("ni", Some((0, 2)));
+        f.commit_composition("你");
+        assert!(f.undo());
+        assert_eq!(f.content, "");
+    }
+
+    #[test]
+    fn commit_composition_replaces_a_selection_even_without_a_prior_preedit() {
+        // winit documents Commit as always preceded by an empty Preedit,
+        // but a defensive check costs nothing: commit alone must still
+        // replace a selection via the same path insert_str already
+        // provides.
+        let mut f = field("hello world");
+        f.selection_anchor = Some(0);
+        f.cursor = 5;
+        f.commit_composition("hi");
+        assert_eq!(f.content, "hi world");
+    }
+
+    #[test]
+    fn composition_segments_with_no_target_is_one_plain_segment() {
+        let composition = Composition {
+            text: "nihao".to_owned(),
+            target_range: None,
+        };
+        assert_eq!(
+            composition_segments(&composition),
+            vec![(0..5, UnderlineStyle::Plain)]
+        );
+    }
+
+    #[test]
+    fn composition_segments_splits_around_the_target_clause() {
+        let composition = Composition {
+            text: "nihao".to_owned(),
+            target_range: Some((2, 5)), // "hao" targeted
+        };
+        assert_eq!(
+            composition_segments(&composition),
+            vec![
+                (0..2, UnderlineStyle::Plain),
+                (2..5, UnderlineStyle::Target),
+            ]
+        );
+    }
+
+    #[test]
+    fn composition_segments_target_covering_the_whole_text_is_one_segment() {
+        let composition = Composition {
+            text: "hao".to_owned(),
+            target_range: Some((0, 3)),
+        };
+        assert_eq!(
+            composition_segments(&composition),
+            vec![(0..3, UnderlineStyle::Target)]
+        );
+    }
+
+    #[test]
+    fn composition_segments_empty_target_range_is_skipped() {
+        // A zero-width target (cursor hidden, per winit's own doc
+        // comment: "When it's None, the cursor should be hidden" --
+        // this covers the degenerate non-None-but-empty case) must not
+        // emit a spurious empty Target segment.
+        let composition = Composition {
+            text: "nihao".to_owned(),
+            target_range: Some((3, 3)),
+        };
+        assert_eq!(
+            composition_segments(&composition),
+            vec![(0..5, UnderlineStyle::Plain)]
+        );
+    }
+
+    #[test]
+    fn node_announces_composition_via_description() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match insert_text_field(&mut tree, root, &scales, "Name", "") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = with_text_field_mut(&mut tree, id, |f| f.set_composition("ni", None)) {
+            unreachable!("{err:?}");
+        }
+        let Some(accessibility) = tree.accessibility(id) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(accessibility.description(), Some("composing: ni"));
+    }
+
+    #[test]
+    fn node_has_no_description_once_composition_clears() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match insert_text_field(&mut tree, root, &scales, "Name", "") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = with_text_field_mut(&mut tree, id, |f| f.set_composition("ni", None)) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = with_text_field_mut(&mut tree, id, |f| f.commit_composition("你")) {
+            unreachable!("{err:?}");
+        }
+        let Some(accessibility) = tree.accessibility(id) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(accessibility.description(), None);
     }
 }

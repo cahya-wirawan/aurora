@@ -37,8 +37,8 @@ pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pre
 pub use checkbox::{CheckboxState, insert_checkbox, set_checkbox_disabled, toggle_checkbox};
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
 pub use text_field::{
-    TextFieldState, insert_text_field, set_text_field_disabled, text_field_state,
-    with_text_field_mut,
+    Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
+    set_text_field_disabled, text_field_state, with_text_field_mut,
 };
 
 use accesskit::{Node, Role};
