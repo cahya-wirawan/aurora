@@ -660,6 +660,7 @@ name = "aurora-widgets"
 version = "0.0.0"
 dependencies = [
  "accesskit",
+ "accesskit_consumer",
  "aurora-core",
  "aurora-theme",
  "taffy",

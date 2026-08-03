@@ -64,6 +64,15 @@ accesskit = "0.24"
 # escape-hatch check found (accesskit_winit panics if the adapter is
 # built after the window is first shown).
 accesskit_winit = "0.33"
+# Real structural validation for aurora-widgets' own accesskit::TreeUpdate
+# output (dev-dependency only) -- the exact library accesskit_winit's
+# adapter uses internally, and the one that caught a real "disconnected
+# tree" bug (accessibility_update never set node.children) via a crash on
+# real macOS hardware. Pure-Rust, no platform backends of its own -- only
+# depends on accesskit + hashbrown, so this doesn't compromise the
+# headless dependency-graph guarantee `aurora-widgets` documents for its
+# own real [dependencies].
+accesskit_consumer = "0.38"
 # PLAN.md M1.7's own suggestion ("flexbox-style; taffy if it fits").
 taffy = "0.12"
 # Correct Unicode word-boundary motion for the text field widget, not a

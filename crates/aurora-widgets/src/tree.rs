@@ -476,13 +476,25 @@ impl<W> WidgetTree<W> {
 
     /// Builds a full [`accesskit::TreeUpdate`] from every widget's own
     /// accessibility node — what a platform adapter (`accesskit_winit`,
-    /// per the a11y spike) actually sends to the screen reader.
+    /// per the a11y spike) actually sends to the screen reader. Each
+    /// node's `children` is set here, from this tree's own real
+    /// structure — a widget's stored [`AccessibilityNode`] never carries
+    /// it itself (nothing else in this module ever sets it), so without
+    /// this every node but the root would come out with no declared
+    /// children, and `accesskit_consumer` rejects that as a
+    /// disconnected tree (confirmed via a real crash on real macOS
+    /// hardware: "N nodes which are neither in the current tree nor a
+    /// child of another node from the update").
     #[must_use]
     pub fn accessibility_update(&self, focus: WidgetId) -> TreeUpdate {
         let nodes = self
             .nodes
             .iter()
-            .map(|(&id, node)| (id, node.accessibility.clone()))
+            .map(|(&id, node)| {
+                let mut accessibility = node.accessibility.clone();
+                accessibility.set_children(node.children.clone());
+                (id, accessibility)
+            })
             .collect();
         TreeUpdate {
             nodes,
@@ -711,6 +723,36 @@ mod tests {
             Some(t) => assert_eq!(t.root, root),
             None => unreachable!("expected Some(Tree)"),
         }
+    }
+
+    /// A real, structural regression test for a real bug: the first
+    /// version of `accessibility_update` never set each node's
+    /// `children`, so every node but the root came out looking
+    /// disconnected — `accesskit_consumer` (the library
+    /// `accesskit_winit`'s adapter uses internally) rejects that,
+    /// confirmed by an actual crash on real macOS hardware running
+    /// `aurora-app`: "`TreeUpdate` includes N nodes which are neither in
+    /// the current tree nor a child of another node from the update."
+    /// This is exactly the validation neither this file's own prior
+    /// tests nor `aurora-widgets/tests/headless.rs` ever exercised —
+    /// both checked node *count*/individual field values, never real
+    /// parent-child connectivity. `accesskit_consumer::Tree::new` panics
+    /// on a disconnected tree, so a plain call here (no `unwrap`/
+    /// `expect` needed) is the whole test: if this regresses, the test
+    /// fails with that same panic.
+    #[test]
+    fn accessibility_update_produces_a_tree_accesskit_consumer_accepts() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let group = match tree.insert(root, Style::default(), label("group"), "group") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.insert(group, Style::default(), label("leaf"), "leaf") {
+            unreachable!("{err:?}");
+        }
+
+        let update = tree.accessibility_update(root);
+        let _consumer_tree = accesskit_consumer::Tree::new(update, true);
     }
 
     #[test]

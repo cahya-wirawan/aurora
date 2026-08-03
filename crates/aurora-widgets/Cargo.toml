@@ -28,3 +28,6 @@ tracing = { workspace = true }
 accesskit = { workspace = true }
 taffy = { workspace = true }
 unicode-segmentation = { workspace = true }
+
+[dev-dependencies]
+accesskit_consumer = { workspace = true }
