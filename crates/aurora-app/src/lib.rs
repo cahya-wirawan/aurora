@@ -74,6 +74,47 @@ fn load_background_color() -> anyhow::Result<wgpu::Color> {
     })
 }
 
+/// A small, clearly-fake `LayerTree` — there is no real "open a
+/// document" flow in this crate yet (separate, still-open M1.9 work),
+/// so this exists purely to give the Layers panel real content to
+/// expose, rather than an empty region. Illustrative names matching
+/// `design/mockups/workspace.html`'s own example layers, which are
+/// explicitly "structure and token usage for review," not real content
+/// either. `add_pixel_layer` inserts each new layer as the new topmost
+/// root, so inserting Background, then Color balance, then Retouch
+/// leaves them in that same top-to-bottom order the mockup shows.
+#[must_use]
+fn demo_layers() -> aurora_doc::LayerTree {
+    let canvas = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 4000,
+        height: 3000,
+    };
+    let mut layers = aurora_doc::LayerTree::new();
+
+    if let Err(err) = layers.add_pixel_layer("Background", canvas, None) {
+        unreachable!("a fresh tree with parent: None cannot fail: {err:?}");
+    }
+
+    let color_balance = match layers.add_pixel_layer("Color balance", canvas, None) {
+        Ok(id) => id,
+        Err(err) => unreachable!("a fresh tree with parent: None cannot fail: {err:?}"),
+    };
+    if let Err(err) = layers.set_blend_mode(color_balance, aurora_doc::BlendMode::Multiply) {
+        unreachable!("color_balance was just created in this same tree: {err:?}");
+    }
+    if let Err(err) = layers.set_opacity(color_balance, 0.8) {
+        unreachable!("0.8 is within 0.0..=1.0 and color_balance exists: {err:?}");
+    }
+
+    if let Err(err) = layers.add_pixel_layer("Retouch — skin", canvas, None) {
+        unreachable!("a fresh tree with parent: None cannot fail: {err:?}");
+    }
+
+    layers
+}
+
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
@@ -105,13 +146,21 @@ struct App {
 impl App {
     #[must_use]
     fn new(proxy: EventLoopProxy<accesskit_winit::Event>, background: wgpu::Color) -> Self {
+        let mut workspace = aurora_ui::build_workspace();
+        let demo = demo_layers();
+        if let Err(err) =
+            aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, &demo)
+        {
+            unreachable!("workspace.layers was just built by build_workspace above: {err:?}");
+        }
+
         Self {
             window: None,
             gpu: None,
             surface: None,
             adapter: None,
             proxy,
-            workspace: aurora_ui::build_workspace(),
+            workspace,
             focus: FocusManager::default(),
             background,
             failed: false,
@@ -364,7 +413,7 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_background_color;
+    use super::{demo_layers, load_background_color};
 
     /// The workspace structure itself (`aurora_ui::build_workspace`) has
     /// its own, thorough tests in `aurora-ui` — nothing app-specific to
@@ -407,5 +456,37 @@ mod tests {
             color.r < 0.5 && color.g < 0.5 && color.b < 0.5,
             "expected a dark background from the Dark theme, got {color:?}"
         );
+    }
+
+    /// The other headlessly-answerable, app-specific piece: `demo_layers`
+    /// needs no window either. Checks the real top-to-bottom order
+    /// `add_pixel_layer`'s "new topmost root" rule produces (Retouch,
+    /// then Color balance, then Background — insertion order reversed),
+    /// not just a layer count.
+    #[test]
+    fn demo_layers_puts_retouch_on_top_with_color_balance_multiplied() {
+        let layers = demo_layers();
+        let roots = layers.roots();
+        assert_eq!(roots.len(), 3);
+        let names: Vec<&str> = roots
+            .iter()
+            .map(|&id| match layers.name(id) {
+                Some(name) => name,
+                None => unreachable!("every root id in this tree must resolve to a name"),
+            })
+            .collect();
+        assert_eq!(names, vec!["Retouch — skin", "Color balance", "Background"]);
+
+        let Some(&color_balance) = roots.get(1) else {
+            unreachable!("just asserted 3 roots");
+        };
+        assert_eq!(
+            layers.blend_mode(color_balance),
+            Some(aurora_doc::BlendMode::Multiply)
+        );
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(layers.opacity(color_balance), Some(0.8));
+        }
     }
 }
