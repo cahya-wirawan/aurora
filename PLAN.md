@@ -1804,6 +1804,43 @@ check licenses` clean with the new `toml` dependency.
   session multi-widget content (first `tests/headless.rs`, now this
   bullet) exposed a real defect that trivial single-node fixtures
   couldn't — a pattern worth remembering for whatever comes after this.
+
+  **Second real finding from the same hardware session, 2026-08-03,
+  fix applied but not yet re-verified**: even with the `set_children`
+  crash fixed, Cahya found the workspace tree completely unreachable
+  from VoiceOver — worse than "some empty containers along the way,"
+  the Rotor's "Window Spots" category came back *entirely empty*, not
+  even showing the window's own title (compared side by side against
+  `spike/a11y-ime`, run fresh in the same session, whose "Window
+  Spots" correctly lists both its title and its labeled text field).
+  Diagnosed via a systematic comparison, not guessed: confirmed
+  VoiceOver itself was working normally (the spike behaved exactly per
+  its own `FINDINGS.md`), which narrowed the difference to this tree's
+  own structure. Root cause: `aurora_widgets::widgets::new_tree`'s
+  default root role is `Role::GenericContainer` — reasonable for a
+  nested/internal container, but this tree's root *is* the whole
+  window's content, and a plain container there apparently never
+  anchors into the native window's own accessibility hierarchy at all
+  on macOS. `build_workspace` now overrides its own root's
+  accessibility node to `Role::Window` (labeled "Aurora") right after
+  creating the tree, matching `spike/a11y-ime`'s own proven root
+  exactly, plus a new test confirming the override. **Not yet
+  re-verified on real hardware** — this is a strong, evidence-based
+  hypothesis (isolated via a careful side-by-side comparison, not a
+  guess), not a confirmed fix; whether the Rotor now lists the window
+  title and the three panels needs the same real-VoiceOver check
+  repeated. Worth naming honestly: `Role::GenericContainer` was
+  originally chosen based on `spike/a11y-ime/FINDINGS.md` finding #5's
+  own *speculative* suggestion ("worth testing a plainer root role") —
+  a hypothesis that was never actually validated in the spike itself,
+  and turned out to trade a smaller, documented annoyance (finding
+  #5's navigation-depth issue) for a much larger, undocumented one
+  (no window-level accessibility attachment at all). `cargo test -p
+  aurora-ui`/`cargo clippy -p aurora-ui --all-targets --all-features
+  -- -D warnings`/`RUSTDOCFLAGS="-D warnings" cargo doc -p aurora-ui
+  --no-deps --all-features` all clean; `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` and `cargo test
+  --workspace` both clean too, 0 failures across every crate.
 - [ ] Canvas: infinite zoom, rotation, pan, rulers, guides, grid, snap
 - [ ] Layers, history, tool-options panels
 - [ ] Command palette, keyboard shortcuts

@@ -16,6 +16,7 @@
 //! layout (once [`WidgetTree::compute_layout`] runs) and a real
 //! accessibility tree; nothing here draws a pixel.
 
+use accesskit::{Node, Role};
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetId, WidgetTree};
 use taffy::{FlexDirection, Style};
@@ -69,6 +70,22 @@ pub fn build_workspace() -> Workspace {
         ..Default::default()
     });
 
+    // `new_tree`'s own default root role is `Role::GenericContainer` --
+    // right for a nested/internal container, but this tree's root *is*
+    // the whole application window's content, and a `GenericContainer`
+    // there means the tree never anchors into the native window's own
+    // accessibility hierarchy at all: confirmed on real macOS hardware
+    // -- VoiceOver's Rotor ("Window Spots") came back completely empty,
+    // not even showing the window's own title, where the same check
+    // against `spike/a11y-ime`'s `Role::Window` root correctly listed
+    // both the title and a labeled field. `Role::Window` here matches
+    // that proven configuration.
+    let mut window_node = Node::new(Role::Window);
+    window_node.set_label("Aurora");
+    if let Err(err) = tree.set_accessibility(root, window_node) {
+        unreachable!("root was just created by new_tree above: {err:?}");
+    }
+
     let canvas_area = match widgets::insert_container(
         &mut tree,
         root,
@@ -121,6 +138,21 @@ pub fn build_workspace() -> Workspace {
 #[cfg(test)]
 mod tests {
     use super::build_workspace;
+
+    /// Real bug, found on real macOS hardware: a `Role::GenericContainer`
+    /// root never anchored into the native window's own accessibility
+    /// hierarchy at all (`VoiceOver`'s Rotor came back completely empty,
+    /// not even the window title) -- `Role::Window`, matching
+    /// `spike/a11y-ime`'s own proven root, is what actually fixed it.
+    #[test]
+    fn build_workspace_roots_the_tree_as_a_labeled_window() {
+        let ws = build_workspace();
+        let Some(accessibility) = ws.tree.accessibility(ws.root) else {
+            unreachable!("just built");
+        };
+        assert_eq!(accessibility.role(), accesskit::Role::Window);
+        assert_eq!(accessibility.label(), Some("Aurora"));
+    }
 
     #[test]
     fn build_workspace_has_a_canvas_area_and_three_docked_panels() {
