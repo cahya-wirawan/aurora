@@ -6,15 +6,17 @@
 //! **Scope, stated honestly.** This is the "create hidden → attach
 //! adapter → show" ordering ADR 0001's escape-hatch check found
 //! (`spike/a11y-ime/FINDINGS.md` finding #1) as real, production code —
-//! not yet the actual application. The accessibility tree `build_tree`
-//! returns is a single content-free root container
-//! (`aurora_widgets::widgets::new_tree`); the window's background is a
-//! real theme token (`design/themes/dark.toml`'s `surface.app`, the
-//! only built-in theme that exists as a real design yet), but there is
-//! still no actual widget/panel content rendered. Docking, panels, the
-//! canvas, tools, input routing, IME, native menus, DPI handling, and
-//! crash recovery are this milestone's other, separate, still-open
-//! bullets — this module doesn't reach for any of them.
+//! not yet the actual application. The accessibility tree is
+//! `aurora_ui::build_workspace`'s real (but still static — no
+//! drag-to-redock, resize, or persisted layouts yet) canvas-area +
+//! docked-panel structure, matching the owner-approved workspace
+//! mockup; the window's background is a real theme token
+//! (`design/themes/dark.toml`'s `surface.app`, the only built-in theme
+//! that exists as a real design yet). Still nothing renders visually
+//! beyond the background clear — real panel *content* (layer rows,
+//! property fields, history entries), the canvas itself, tools, input
+//! routing, IME, native menus, DPI handling, and crash recovery are
+//! this milestone's other, separate, still-open bullets.
 //!
 //! **Human-verified on macOS, 2026-08-03** (real hardware, real desktop
 //! session): the window opens, resizes without crashing, and `VoiceOver`
@@ -26,8 +28,7 @@ use std::sync::Arc;
 
 use aurora_gpu::{GpuContext, GpuSurface};
 use aurora_theme::{Palette, ThemeSet};
-use aurora_widgets::widgets::{self, WidgetKind};
-use aurora_widgets::{FocusManager, WidgetId, WidgetTree};
+use aurora_widgets::FocusManager;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -73,18 +74,6 @@ fn load_background_color() -> anyhow::Result<wgpu::Color> {
     })
 }
 
-/// The (currently content-free) accessibility tree a fresh window
-/// starts with — a single root container, via
-/// `aurora_widgets::widgets::new_tree`. Real panel/widget content is
-/// separate, still-open M1.8 work; this exists so the window/event-loop
-/// lifecycle has something real to feed the accessibility adapter,
-/// rather than a hand-rolled `accesskit::Node` this crate would have to
-/// throw away once real content exists.
-#[must_use]
-fn build_tree() -> (WidgetTree<WidgetKind>, WidgetId) {
-    widgets::new_tree(taffy::Style::default())
-}
-
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
@@ -94,8 +83,12 @@ struct App {
     surface: Option<GpuSurface<'static>>,
     adapter: Option<accesskit_winit::Adapter>,
     proxy: EventLoopProxy<accesskit_winit::Event>,
-    tree: WidgetTree<WidgetKind>,
-    root: WidgetId,
+    /// The real workspace layout (`aurora_ui::build_workspace` — canvas
+    /// area + the Layers/Properties/History dock, matching the
+    /// owner-approved workspace mockup) — a static structure for now,
+    /// no drag-to-redock/resize/persisted layouts yet; see that
+    /// function's own doc comment.
+    workspace: aurora_ui::Workspace,
     focus: FocusManager,
     /// The window's background clear colour, resolved from
     /// `design/themes/dark.toml`'s `surface.app` token
@@ -112,15 +105,13 @@ struct App {
 impl App {
     #[must_use]
     fn new(proxy: EventLoopProxy<accesskit_winit::Event>, background: wgpu::Color) -> Self {
-        let (tree, root) = build_tree();
         Self {
             window: None,
             gpu: None,
             surface: None,
             adapter: None,
             proxy,
-            tree,
-            root,
+            workspace: aurora_ui::build_workspace(),
             focus: FocusManager::default(),
             background,
             failed: false,
@@ -143,8 +134,8 @@ impl App {
         let Some(adapter) = self.adapter.as_mut() else {
             return;
         };
-        let tree = &self.tree;
-        let focused = self.focus.focused().unwrap_or(self.root);
+        let tree = &self.workspace.tree;
+        let focused = self.focus.focused().unwrap_or(self.workspace.root);
         adapter.update_if_active(|| tree.accessibility_update(focused));
     }
 
@@ -159,7 +150,16 @@ impl App {
         el.exit();
     }
 
+    /// Recomputes the workspace layout for `size`, then reconfigures the
+    /// presentation surface to match — layout is pure geometry (no GPU
+    /// needed) and stays current even before a window/device exist,
+    /// unlike the surface resize below, which does need both.
     fn apply_resize(&mut self, size: (u32, u32)) {
+        #[allow(clippy::cast_precision_loss)]
+        self.workspace
+            .tree
+            .compute_layout(size.0 as f32, size.1 as f32);
+
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -264,6 +264,11 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             accesskit_winit::Adapter::with_event_loop_proxy(el, &window, self.proxy.clone());
         window.set_visible(true);
 
+        #[allow(clippy::cast_precision_loss)]
+        self.workspace
+            .tree
+            .compute_layout(size.width as f32, size.height as f32);
+
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.surface = Some(surface);
@@ -359,23 +364,12 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tree, load_background_color};
+    use super::load_background_color;
 
-    /// The one piece of this module answerable without a real window:
-    /// the accessibility tree a fresh app starts with is exactly the
-    /// content-free root `aurora_widgets::widgets::new_tree` produces.
-    /// Everything else here is an `ApplicationHandler` callback, which
-    /// has no meaningful headless test double in `winit` — see this
-    /// module's own doc comment for what remains unverified in this
-    /// sandbox and why.
-    #[test]
-    fn build_tree_starts_with_exactly_the_root() {
-        let (tree, root) = build_tree();
-        assert_eq!(tree.len(), 1);
-        assert_eq!(tree.root(), root);
-    }
-
-    /// The other headlessly-answerable piece: loading the real Dark
+    /// The workspace structure itself (`aurora_ui::build_workspace`) has
+    /// its own, thorough tests in `aurora-ui` — nothing app-specific to
+    /// add here beyond wiring it in. The headlessly-answerable piece
+    /// that *is* specific to this crate: loading the real Dark
     /// theme and converting its `surface.app` token to a clear colour
     /// doesn't need a window either. Checks real, known values from
     /// `design/themes/dark.toml`/`design/tokens/palette.toml` — not

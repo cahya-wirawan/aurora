@@ -35,7 +35,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 accesskit_winit = { workspace = true }
 winit = { workspace = true }
-taffy = { workspace = true }
 wgpu = { workspace = true }
 
 [[bin]]

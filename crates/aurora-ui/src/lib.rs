@@ -3,22 +3,17 @@
 //! See PRD §7.2 for where this crate sits in the workspace layering, and
 //! `docs/adr/` for the decisions that shape it.
 //!
-//! This crate is a skeleton: no functionality is implemented yet.
+//! First real code: [`panel::insert_panel`] and
+//! [`workspace::build_workspace`], a static first slice of PLAN.md
+//! M1.8's "docking, panels, custom workspaces" bullet, matching the
+//! structure of the owner-approved workspace mockup
+//! (`design/mockups/workspace.html`). See both modules' own doc
+//! comments for exactly what's built and what's deliberately still
+//! open (drag-to-redock, resize, persisted layouts, real panel
+//! content, the menubar/toolbar/status bar).
 
-/// Placeholder so the crate compiles and CI has something to check.
-///
-/// Remove once real types land.
-#[must_use]
-pub const fn crate_name() -> &'static str {
-    "aurora-ui"
-}
+pub mod panel;
+pub mod workspace;
 
-#[cfg(test)]
-mod tests {
-    use super::crate_name;
-
-    #[test]
-    fn reports_its_name() {
-        assert_eq!(crate_name(), "aurora-ui");
-    }
-}
+pub use panel::{PanelHandle, insert_panel};
+pub use workspace::{Workspace, build_workspace};

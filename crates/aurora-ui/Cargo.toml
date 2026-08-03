@@ -31,3 +31,5 @@ aurora-theme = { workspace = true }
 aurora-widgets = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+accesskit = { workspace = true }
+taffy = { workspace = true }
