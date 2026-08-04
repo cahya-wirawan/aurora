@@ -74,17 +74,21 @@ fn load_background_color() -> anyhow::Result<wgpu::Color> {
     })
 }
 
-/// A small, clearly-fake `LayerTree` — there is no real "open a
-/// document" flow in this crate yet (separate, still-open M1.9 work),
-/// so this exists purely to give the Layers panel real content to
-/// expose, rather than an empty region. Illustrative names matching
+/// A small, clearly-fake document — there is no real "open a document"
+/// flow in this crate yet (separate, still-open M1.9 work), so this
+/// exists purely to give the Layers *and* History panels real content
+/// to expose, rather than empty regions. Illustrative names matching
 /// `design/mockups/workspace.html`'s own example layers, which are
 /// explicitly "structure and token usage for review," not real content
-/// either. `add_pixel_layer` inserts each new layer as the new topmost
-/// root, so inserting Background, then Color balance, then Retouch
-/// leaves them in that same top-to-bottom order the mockup shows.
+/// either. Built entirely through `History`'s own methods, not direct
+/// `LayerTree` calls, specifically so its journal (what the History
+/// panel reads) is a real, meaningful record of these actions rather
+/// than empty. `add_pixel_layer` inserts each new layer as the new
+/// topmost root, so inserting Background, then Color balance, then
+/// Retouch leaves them in that same top-to-bottom order the mockup
+/// shows.
 #[must_use]
-fn demo_layers() -> aurora_doc::LayerTree {
+fn demo_document() -> (aurora_doc::LayerTree, aurora_doc::History) {
     let canvas = aurora_core::Rect {
         x: 0,
         y: 0,
@@ -92,27 +96,30 @@ fn demo_layers() -> aurora_doc::LayerTree {
         height: 3000,
     };
     let mut layers = aurora_doc::LayerTree::new();
+    let mut history = aurora_doc::History::new();
 
-    if let Err(err) = layers.add_pixel_layer("Background", canvas, None) {
+    if let Err(err) = history.add_pixel_layer(&mut layers, "Background", canvas, None) {
         unreachable!("a fresh tree with parent: None cannot fail: {err:?}");
     }
 
-    let color_balance = match layers.add_pixel_layer("Color balance", canvas, None) {
+    let color_balance = match history.add_pixel_layer(&mut layers, "Color balance", canvas, None) {
         Ok(id) => id,
         Err(err) => unreachable!("a fresh tree with parent: None cannot fail: {err:?}"),
     };
-    if let Err(err) = layers.set_blend_mode(color_balance, aurora_doc::BlendMode::Multiply) {
+    if let Err(err) =
+        history.set_blend_mode(&mut layers, color_balance, aurora_doc::BlendMode::Multiply)
+    {
         unreachable!("color_balance was just created in this same tree: {err:?}");
     }
-    if let Err(err) = layers.set_opacity(color_balance, 0.8) {
+    if let Err(err) = history.set_opacity(&mut layers, color_balance, 0.8) {
         unreachable!("0.8 is within 0.0..=1.0 and color_balance exists: {err:?}");
     }
 
-    if let Err(err) = layers.add_pixel_layer("Retouch — skin", canvas, None) {
+    if let Err(err) = history.add_pixel_layer(&mut layers, "Retouch — skin", canvas, None) {
         unreachable!("a fresh tree with parent: None cannot fail: {err:?}");
     }
 
-    layers
+    (layers, history)
 }
 
 /// Owns the window, GPU device/surface, and accessibility adapter for
@@ -147,11 +154,16 @@ impl App {
     #[must_use]
     fn new(proxy: EventLoopProxy<accesskit_winit::Event>, background: wgpu::Color) -> Self {
         let mut workspace = aurora_ui::build_workspace();
-        let demo = demo_layers();
+        let (layers, history) = demo_document();
         if let Err(err) =
-            aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, &demo)
+            aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, &layers)
         {
             unreachable!("workspace.layers was just built by build_workspace above: {err:?}");
+        }
+        if let Err(err) =
+            aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &history)
+        {
+            unreachable!("workspace.history was just built by build_workspace above: {err:?}");
         }
 
         Self {
@@ -413,7 +425,7 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{demo_layers, load_background_color};
+    use super::{demo_document, load_background_color};
 
     /// The workspace structure itself (`aurora_ui::build_workspace`) has
     /// its own, thorough tests in `aurora-ui` — nothing app-specific to
@@ -458,14 +470,14 @@ mod tests {
         );
     }
 
-    /// The other headlessly-answerable, app-specific piece: `demo_layers`
+    /// The other headlessly-answerable, app-specific piece: `demo_document`
     /// needs no window either. Checks the real top-to-bottom order
     /// `add_pixel_layer`'s "new topmost root" rule produces (Retouch,
     /// then Color balance, then Background — insertion order reversed),
     /// not just a layer count.
     #[test]
-    fn demo_layers_puts_retouch_on_top_with_color_balance_multiplied() {
-        let layers = demo_layers();
+    fn demo_document_puts_retouch_on_top_with_color_balance_multiplied() {
+        let (layers, _history) = demo_document();
         let roots = layers.roots();
         assert_eq!(roots.len(), 3);
         let names: Vec<&str> = roots
@@ -488,5 +500,28 @@ mod tests {
         {
             assert_eq!(layers.opacity(color_balance), Some(0.8));
         }
+    }
+
+    /// `demo_document`'s whole point (unlike a plain `LayerTree` built
+    /// directly) is that its `History` has a real, meaningful journal
+    /// for the History panel to show — confirms that, not just that
+    /// the layers themselves are right.
+    #[test]
+    fn demo_document_history_describes_every_demo_action() {
+        let (_layers, history) = demo_document();
+        let descriptions = history.journal_descriptions();
+        // Layer ids are process-local and monotonic (0, 1, 2, ...) for a
+        // fresh tree, so "Color balance" (the second layer added) is
+        // always id 1 -- a real, deterministic value, not a guess.
+        assert_eq!(
+            descriptions,
+            vec![
+                "Added layer \"Background\"".to_owned(),
+                "Added layer \"Color balance\"".to_owned(),
+                "Set blend mode of layer #1 to Multiply".to_owned(),
+                "Set opacity of layer #1 to 80%".to_owned(),
+                "Added layer \"Retouch — skin\"".to_owned(),
+            ]
+        );
     }
 }

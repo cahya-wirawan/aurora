@@ -248,6 +248,68 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
     }
 }
 
+/// A one-line, human-readable description of one journal entry — see
+/// [`History::journal_descriptions`]'s own doc comment for why this
+/// deliberately doesn't take a `&LayerTree` to resolve names beyond
+/// what an entry itself already captured.
+fn describe(op: &LayerOp) -> String {
+    match op {
+        LayerOp::RemoveById(id) => format!("Removed layer #{}", id.to_raw()),
+        LayerOp::Restore(removed) => {
+            let name = removed
+                .entries
+                .iter()
+                .find(|(entry_id, _)| *entry_id == removed.root)
+                .map_or("layer", |(_, entry)| entry.name.as_str());
+            format!("Added layer \"{name}\"")
+        }
+        LayerOp::Reparent { id, .. } => format!("Moved layer #{}", id.to_raw()),
+        LayerOp::Rename { id, name } => {
+            format!("Renamed layer #{} to \"{name}\"", id.to_raw())
+        }
+        LayerOp::SetOpacity { id, value } => {
+            format!(
+                "Set opacity of layer #{} to {}%",
+                id.to_raw(),
+                percent(*value)
+            )
+        }
+        LayerOp::SetFillOpacity { id, value } => {
+            format!(
+                "Set fill opacity of layer #{} to {}%",
+                id.to_raw(),
+                percent(*value)
+            )
+        }
+        LayerOp::SetBlendMode { id, value } => {
+            format!("Set blend mode of layer #{} to {value:?}", id.to_raw())
+        }
+        LayerOp::SetVisible { id, value } => {
+            let verb = if *value { "Shown" } else { "Hidden" };
+            format!("{verb} layer #{}", id.to_raw())
+        }
+        LayerOp::SetLock { id, .. } => {
+            format!("Changed lock settings for layer #{}", id.to_raw())
+        }
+        LayerOp::RemoveMask(id) => format!("Removed mask from layer #{}", id.to_raw()),
+        LayerOp::RestoreMask(id, _) => format!("Added mask to layer #{}", id.to_raw()),
+        LayerOp::SetMaskEnabled { id, value } => {
+            let verb = if *value { "Enabled" } else { "Disabled" };
+            format!("{verb} mask on layer #{}", id.to_raw())
+        }
+        LayerOp::SetMaskInverted { id, value } => {
+            let verb = if *value { "Inverted" } else { "Un-inverted" };
+            format!("{verb} mask on layer #{}", id.to_raw())
+        }
+    }
+}
+
+/// `0.0..=1.0` as a rounded whole percentage, for a description string.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn percent(value: f32) -> i32 {
+    (value * 100.0).round() as i32
+}
+
 /// Unlimited undo/redo over a [`LayerTree`] (§7.3.3): every mutating
 /// `LayerTree` method has a mirror here that performs the same change
 /// and records how to reverse it. A step recorded through this type's
@@ -292,11 +354,35 @@ impl History {
     }
 
     /// How many ops the journal has recorded so far — mostly useful for
-    /// tests; the journal has no public way to inspect individual entries
-    /// yet (see this module's own doc comment for why).
+    /// tests; see [`Self::journal_descriptions`] for reading individual
+    /// entries.
     #[must_use]
     pub fn journal_len(&self) -> usize {
         self.journal.len()
+    }
+
+    /// One human-readable, one-line description per journal entry, in
+    /// the same chronological order [`Self::replay`] itself uses — what
+    /// a History panel actually shows (PLAN.md M1.8's own "History...
+    /// panels" bullet). Not a `Display`/`Debug` impl on `LayerOp`
+    /// itself, which stays private (its exact shape is this crate's own
+    /// implementation detail, not something a caller should match on)
+    /// — this is the one, deliberate seam through which its content
+    /// becomes externally visible.
+    ///
+    /// Deliberately self-contained (no `&LayerTree` parameter): a
+    /// description only ever names the one layer a `Rename`/`Restore`
+    /// entry itself captured a name for, falling back to a numeric
+    /// `layer #N` reference otherwise — accepting less friendly text
+    /// over the alternative of resolving names against a live tree
+    /// (which layer names have changed since is genuinely ambiguous —
+    /// Photoshop's own History panel shows a name as of when the step
+    /// happened, not retroactively updated later ones — and `History`
+    /// deliberately doesn't hold a tree reference of its own; see this
+    /// module's own doc comment).
+    #[must_use]
+    pub fn journal_descriptions(&self) -> Vec<String> {
+        self.journal.iter().map(describe).collect()
     }
 
     /// Rebuilds a fresh [`LayerTree`] purely by replaying this history's
@@ -881,6 +967,57 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert_eq!(history.journal_len(), 3, "so is redo");
+    }
+
+    #[test]
+    fn journal_descriptions_names_added_layers_and_reports_state_changes() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let id = match history.add_pixel_layer(&mut tree, "Background", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_opacity(&mut tree, id, 0.8) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_blend_mode(&mut tree, id, BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.set_visible(&mut tree, id, false) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+
+        let descriptions = history.journal_descriptions();
+        assert_eq!(descriptions.len(), 5, "4 actions plus the undo itself");
+        let Some(added) = descriptions.first() else {
+            unreachable!("just asserted len() == 5");
+        };
+        assert_eq!(added, "Added layer \"Background\"");
+        let Some(opacity) = descriptions.get(1) else {
+            unreachable!("just asserted len() == 5");
+        };
+        assert!(opacity.contains("80%"), "{descriptions:?}");
+        let Some(blend) = descriptions.get(2) else {
+            unreachable!("just asserted len() == 5");
+        };
+        assert!(blend.contains("Multiply"), "{descriptions:?}");
+        let Some(hidden) = descriptions.get(3) else {
+            unreachable!("just asserted len() == 5");
+        };
+        assert_eq!(hidden, &format!("Hidden layer #{}", id.to_raw()));
+        // The undo of "Hidden" is itself journaled as the inverse action
+        // actually applied -- "Shown", not a second "Hidden" entry and
+        // not some special "undo" marker (History's own doc comment:
+        // the journal records what was *applied*, whichever stack it
+        // came from).
+        let Some(shown) = descriptions.get(4) else {
+            unreachable!("just asserted len() == 5");
+        };
+        assert_eq!(shown, &format!("Shown layer #{}", id.to_raw()));
     }
 
     #[test]
