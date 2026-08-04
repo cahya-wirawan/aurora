@@ -44,9 +44,10 @@ both real) is not yet started. CI green on Linux, macOS, and
 Windows. The brush-latency regression test 0.2 flagged as required
 "before Phase 1 feature work" is now done too (2026-08-02, overdue
 against its own stated gate — see 0.2), and so is the golden-image diff
-harness (`aurora-testkit`, a new 20th workspace crate — see 0.2). The
-remaining Phase 0 items (ADR 0006, Windows/300k-px slice re-runs,
-macOS/Windows LGPL packaging, deeper PSD format coverage) continue in
+harness (`aurora-testkit`, a new 20th workspace crate — see 0.2), and
+ADR 0006 (accessibility conformance target: WCAG 2.1 AA — see 0.1).
+The remaining Phase 0 items (Windows/300k-px slice re-runs, macOS/
+Windows LGPL packaging, deeper PSD format coverage) continue in
 the background rather than gating Phase 1 — none of them are among the
 three steps PRD §13 actually names as blocking.
 
@@ -105,7 +106,29 @@ CJK composing into a custom text field.
 - [x] Design owner named: Cahya Wirawan — PRD FR-027 *Ownership*
 - [x] Name/trademark investigated — PRD §12 Q2b (retained; not a legal clearance)
 - [x] ADR 0005 — tile size (256×256 px) and scratch-disk budget mechanism — [adr/0005](docs/adr/0005-tile-size-scratch-budget.md), 2026-07-28. **Correction**: this line previously said "needs 0.4 numbers" — 0.4 is the accessibility spike, unrelated to tile sizing; the real numbers were in 0.3 (vertical slice) all along, and §0.8 already said this wasn't blocked on anything. Written alongside the real `aurora-tile` implementation (M1.1).
-- [ ] ADR 0006 — accessibility conformance target (WCAG 2.1 AA / Section 508 / EN 301 549)
+- [x] **ADR 0006 — accessibility conformance target: WCAG 2.1 AA** —
+  [adr/0006](docs/adr/0006-accessibility-conformance-target.md),
+  2026-08-04. WCAG 2.1 AA's success criteria, reinterpreted per
+  criterion for desktop software, chosen because it's the substantive
+  floor both named alternatives already build on — Section 508's 2017
+  refresh applies WCAG 2.0 AA to non-web software, and EN 301 549 (the
+  EU's 2025 European Accessibility Act's own basis) is built on WCAG
+  2.1 AA — so it's the one target that substantively satisfies all
+  three framings PRD §12 Q1 named, not a claim of formal conformance to
+  either procurement standard. Consistent with, and extends, FR-027's
+  own already-shipping WCAG 2.1 AA contrast requirement
+  (`check_gated_pairs`) rather than inventing a second bar alongside
+  it. Explicitly informed by real evidence, not decided in the
+  abstract: `spike/a11y-ime/FINDINGS.md` and this project's own live
+  macOS testing (0.4, M1.8) — both the live-announcement bug and the
+  deep-nesting VoiceOver keyboard-navigation gap are named directly in
+  the ADR's own consequences as exactly the class of problem a
+  criteria-only audit could miss without live, human, multi-platform
+  testing. Follow-on work named explicitly: a Phase 1 audit checklist
+  extending `check_contrast.py`'s discipline to keyboard operability,
+  name/role/value, and focus visibility across the component gallery,
+  and treating the deep-nesting navigation gap as in-scope for that
+  audit (WCAG 2.4.3/4.1.2), not a side issue.
 - [x] ADR 0007 — RAW decode library: LibRaw via FFI — [adr/0007](docs/adr/0007-raw-library-libraw.md); Cahya's decision, informed by `spike/raw-icc` and `spike/lgpl-packaging`
 - [x] ADR 0008 — ICC transform library: lcms2 via FFI — [adr/0008](docs/adr/0008-icc-library-lcms2.md); no packaging complexity, unlike ADR 0007 — Little CMS's core is MIT
 
@@ -1991,7 +2014,14 @@ check licenses` clean with the new `toml` dependency.
 
 ### M1.10 — Phase 1 gate
 
-- [ ] Accessibility audit passes on all three platforms
+- [ ] Accessibility audit passes on all three platforms — against WCAG
+  2.1 AA's success criteria, reinterpreted per criterion for desktop
+  software (ADR 0006, 2026-08-04): a checklist extending
+  `check_contrast.py`'s already-shipping discipline (contrast, FR-027)
+  to keyboard operability, name/role/value, and focus visibility across
+  the component gallery, including the deep-nesting VoiceOver
+  keyboard-navigation gap found and recorded in M1.8 (WCAG
+  2.4.3/4.1.2) — not just "a screen reader announces something."
 - [ ] IME audit passes on all three platforms
 - [ ] 60 FPS at the Phase 0 document size
 - [ ] Brush latency regression test green in CI
