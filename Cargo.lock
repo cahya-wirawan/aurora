@@ -411,6 +411,7 @@ dependencies = [
 name = "aurora-app"
 version = "0.0.0"
 dependencies = [
+ "accesskit",
  "accesskit_winit",
  "anyhow",
  "aurora-ai",

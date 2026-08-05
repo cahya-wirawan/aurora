@@ -16,7 +16,12 @@
 //! last with full IME composition support) — see that module's own doc
 //! comment for exactly what's covered and what's deliberately not.
 //! Vector-first rendering and the component gallery are still open — see
-//! PLAN.md M1.7.
+//! PLAN.md M1.7. [`shortcut`] (M1.8) rounds out keyboard input: a small,
+//! platform-agnostic [`KeyChord`] vocabulary plus a chord ->
+//! generic-command [`ShortcutRegistry`], and
+//! [`widgets::insert_command_palette`] is the searchable-command-list
+//! widget a shortcut typically opens — both keep the same "abstract
+//! steps, not `winit` types" seam as `FocusManager`/`hit_test`.
 //!
 //! This crate knows nothing about documents or layers (`aurora-doc` is a
 //! layer above it) and must stay headlessly testable — every test in
@@ -38,9 +43,11 @@
 
 mod error;
 mod input;
+pub mod shortcut;
 mod tree;
 pub mod widgets;
 
 pub use error::WidgetError;
 pub use input::{FocusManager, hit_test};
+pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
 pub use tree::{WidgetId, WidgetTree};

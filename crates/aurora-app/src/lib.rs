@@ -10,27 +10,48 @@
 //! `aurora_ui::build_workspace`'s real (but still static — no
 //! drag-to-redock, resize, or persisted layouts yet) canvas-area +
 //! docked-panel structure, matching the owner-approved workspace
-//! mockup; the window's background is a real theme token
-//! (`design/themes/dark.toml`'s `surface.app`, the only built-in theme
-//! that exists as a real design yet). Still nothing renders visually
-//! beyond the background clear — real panel *content* (layer rows,
-//! property fields, history entries), the canvas itself, tools, input
-//! routing, IME, native menus, DPI handling, and crash recovery are
-//! this milestone's other, separate, still-open bullets.
+//! mockup, with real Layers/History panel content
+//! (`aurora_ui::populate_layers_panel`/`populate_history_panel`) built
+//! from a small, clearly-fake demo document; the window's background is
+//! a real theme token (`design/themes/dark.toml`'s `surface.app`, the
+//! only built-in theme that exists as a real design yet). Still nothing
+//! renders visually beyond the background clear — the canvas itself,
+//! tools, IME, native menus, DPI handling, and crash recovery are this
+//! milestone's other, separate, still-open bullets.
+//!
+//! **Real keyboard input, for the first time in this crate**: a fixed
+//! set of global shortcuts (`default_shortcuts` — `Tab`/`Shift+Tab` for
+//! `aurora_widgets::FocusManager` navigation, `Ctrl+Shift+P` to open a
+//! real command palette), and the palette itself
+//! (`aurora_widgets::widgets::command_palette`) captures the keyboard
+//! while open to filter-as-you-type and `Enter`/`Escape`/arrow-key
+//! navigate its results. Every bit of the dispatch logic (`handle_key`
+//! and everything it calls) is deliberately free of `winit`'s own event-
+//! loop/window types so it's headlessly testable in this sandbox (no
+//! display server — see below); only `translate_key`/
+//! `translate_modifiers` touch real `winit::keyboard` types, and those
+//! are plain data, constructible with no window either.
 //!
 //! **Human-verified on macOS, 2026-08-03** (real hardware, real desktop
 //! session): the window opens, resizes without crashing, and `VoiceOver`
 //! announces it — the create-hidden → attach-adapter → show ordering
 //! and the accessibility tree both reach a real screen reader. Windows
-//! and Linux remain unverified on real hardware — see PLAN.md M1.8.
+//! and Linux remain unverified on real hardware — see PLAN.md M1.8. The
+//! keyboard-shortcut/command-palette work above has not yet had its own
+//! real-hardware pass.
 
 use std::sync::Arc;
 
 use aurora_gpu::{GpuContext, GpuSurface};
 use aurora_theme::{Palette, ThemeSet};
-use aurora_widgets::FocusManager;
+use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey, ShortcutRegistry};
+use aurora_widgets::widgets::{
+    CommandEntry, command_palette_state, insert_command_palette, move_command_palette_selection,
+    set_command_palette_query,
+};
+use aurora_widgets::{FocusManager, WidgetId};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
@@ -122,6 +143,326 @@ fn demo_document() -> (aurora_doc::LayerTree, aurora_doc::History) {
     (layers, history)
 }
 
+// -- Command dispatch: keyboard shortcuts and the command palette --
+//
+// PLAN.md M1.8's "command palette, keyboard shortcuts" bullet. Every
+// function below is deliberately free (not a method on `App`) and
+// platform-free (`aurora_widgets`/`aurora_ui` types only, no
+// `winit::event_loop`/GPU state) — the same "pure logic, headlessly
+// testable" shape `demo_document`/`load_background_color` already use,
+// so this crate's first real keyboard-input routing doesn't need a live
+// window, `EventLoopProxy`, or display server to test (this sandbox has
+// none of those — see this crate's own doc comment). `translate_key`/
+// `translate_modifiers` are the one seam that does touch `winit` types,
+// but only plain data ones (`winit::keyboard::Key`/`ModifiersState`),
+// which are constructible with no window either.
+
+/// One command this crate's own keyboard shortcuts and command-palette
+/// entries can name. Deliberately small: `FocusNext`/`FocusPrevious` are
+/// the first time `aurora_widgets::FocusManager` (built in M1.7, never
+/// wired to a real key event until now) actually reaches a keyboard, and
+/// `ToggleCommandPalette` is the one entry point into the palette
+/// itself. More commands (undo/redo, save, tool switches) are real,
+/// separate follow-on work once this crate has real actions for them to
+/// invoke — inventing placeholder commands with nothing behind them
+/// would be exactly the kind of half-finished feature CLAUDE.md warns
+/// against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppCommand {
+    FocusNext,
+    FocusPrevious,
+    ToggleCommandPalette,
+}
+
+/// This build's fixed, checked-in global shortcut bindings. Not (yet)
+/// user-configurable — `KeyChord::parse` on a literal string here is
+/// exactly the same mechanism a future settings-driven rebind would use,
+/// just with the source string checked in rather than read from
+/// preferences.
+fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
+    let bindings = [
+        ("Tab", AppCommand::FocusNext),
+        ("Shift+Tab", AppCommand::FocusPrevious),
+        ("Ctrl+Shift+P", AppCommand::ToggleCommandPalette),
+    ];
+    let mut registry = ShortcutRegistry::new();
+    for (source, command) in bindings {
+        let chord = match KeyChord::parse(source) {
+            Ok(chord) => chord,
+            Err(err) => unreachable!("{source:?} is a fixed, checked-in shortcut string: {err:?}"),
+        };
+        if let Err(err) = registry.bind(chord, command) {
+            unreachable!("fixed, checked-in shortcuts don't collide with each other: {err:?}");
+        }
+    }
+    registry
+}
+
+/// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
+/// CommandEntry::id` is opaque to `aurora-widgets` itself (see that
+/// module's own doc comment); these constants are where this crate
+/// gives its own ids meaning, matched in [`command_target`].
+const COMMAND_FOCUS_LAYERS: &str = "view.focus_layers";
+const COMMAND_FOCUS_PROPERTIES: &str = "view.focus_properties";
+const COMMAND_FOCUS_HISTORY: &str = "view.focus_history";
+
+/// The command palette's own, real content: one command per docked
+/// panel, focusing it. Genuine, not placeholder — each command moves
+/// real keyboard focus to a real, already-focusable panel region (see
+/// `aurora-ui`'s `insert_panel`), verifiable the same way any other
+/// focus change is (`push_accessibility`). A richer command set (undo,
+/// save, tool switches) waits on this crate having real actions behind
+/// them.
+fn palette_commands() -> Vec<CommandEntry> {
+    vec![
+        CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
+        CommandEntry::new(COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
+        CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
+    ]
+}
+
+/// Resolves an activated command-palette entry's own `id` (one of the
+/// `COMMAND_*` constants above) to the widget it should focus. `None`
+/// for an id this build doesn't recognise — defensive; every id
+/// [`palette_commands`] itself emits is handled here.
+fn command_target(workspace: &aurora_ui::Workspace, id: &str) -> Option<WidgetId> {
+    match id {
+        COMMAND_FOCUS_LAYERS => Some(workspace.layers.root),
+        COMMAND_FOCUS_PROPERTIES => Some(workspace.properties.root),
+        COMMAND_FOCUS_HISTORY => Some(workspace.history.root),
+        _ => None,
+    }
+}
+
+/// Opens the command palette (a no-op if one is already open): inserts
+/// it into `workspace.tree` under `workspace.root` with
+/// [`palette_commands`]'s own list, then moves keyboard focus to it.
+fn open_command_palette(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+) {
+    if palette.is_some() {
+        return;
+    }
+    let root = match insert_command_palette(&mut workspace.tree, workspace.root, palette_commands())
+    {
+        Ok(root) => root,
+        Err(err) => {
+            tracing::warn!(?err, "failed to open the command palette");
+            return;
+        }
+    };
+    if let Err(err) = focus.focus(&mut workspace.tree, root) {
+        tracing::warn!(?err, "failed to focus the newly opened command palette");
+    }
+    *palette = Some(root);
+}
+
+/// Closes the command palette (a no-op if none is open): removes it
+/// from `workspace.tree` and clears any focus left dangling on it —
+/// [`FocusManager::validate`] is exactly the "focus target was removed
+/// out from under the manager" case that method's own doc comment
+/// describes.
+fn close_command_palette(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+) {
+    let Some(root) = palette.take() else {
+        return;
+    };
+    if let Err(err) = workspace.tree.remove(root) {
+        tracing::warn!(?err, "failed to close the command palette");
+    }
+    focus.validate(&workspace.tree);
+}
+
+fn toggle_command_palette(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+) {
+    if palette.is_some() {
+        close_command_palette(workspace, focus, palette);
+    } else {
+        open_command_palette(workspace, focus, palette);
+    }
+}
+
+/// Runs a global shortcut's own command — [`handle_key`]'s dispatch
+/// target once a [`KeyChord`] resolves via [`ShortcutRegistry::resolve`].
+fn run_command(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+    command: AppCommand,
+) {
+    match command {
+        AppCommand::FocusNext => {
+            focus.focus_next(&mut workspace.tree);
+        }
+        AppCommand::FocusPrevious => {
+            focus.focus_previous(&mut workspace.tree);
+        }
+        AppCommand::ToggleCommandPalette => toggle_command_palette(workspace, focus, palette),
+    }
+}
+
+/// Routes one key press while the command palette is open — captures
+/// input directly rather than going through [`ShortcutRegistry`], the
+/// same "a modal dialog owns the keyboard while open" behaviour every
+/// mainstream command palette (VS Code, Sublime) uses. A no-op if
+/// `palette` is `None` (defensive; [`handle_key`] only calls this when
+/// it's `Some`).
+fn handle_palette_key(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+    chord: KeyChord,
+    text: Option<&str>,
+) {
+    let Some(root) = *palette else {
+        return;
+    };
+    match chord.key {
+        Key::Named(NamedKey::Escape) => close_command_palette(workspace, focus, palette),
+        Key::Named(NamedKey::ArrowDown) => {
+            if let Err(err) = move_command_palette_selection(&mut workspace.tree, root, true) {
+                tracing::warn!(?err, "failed to move command palette selection");
+            }
+        }
+        Key::Named(NamedKey::ArrowUp) => {
+            if let Err(err) = move_command_palette_selection(&mut workspace.tree, root, false) {
+                tracing::warn!(?err, "failed to move command palette selection");
+            }
+        }
+        Key::Named(NamedKey::Enter) => {
+            let selected = command_palette_state(&workspace.tree, root)
+                .ok()
+                .and_then(|state| state.selected())
+                .map(|entry| entry.id.clone());
+            close_command_palette(workspace, focus, palette);
+            if let Some(id) = selected
+                && let Some(target) = command_target(workspace, &id)
+                && let Err(err) = focus.focus(&mut workspace.tree, target)
+            {
+                tracing::warn!(?err, "activated command's target isn't focusable");
+            }
+        }
+        Key::Named(NamedKey::Backspace) => {
+            if let Ok(state) = command_palette_state(&workspace.tree, root) {
+                let mut query = state.query().to_owned();
+                query.pop();
+                if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
+                    tracing::warn!(?err, "failed to update command palette query");
+                }
+            }
+        }
+        // A plain, unmodified character types into the query. A
+        // `Ctrl`/`Alt`/`Cmd`-held character is presumably some other
+        // shortcut attempt, not text -- left unhandled rather than
+        // typed literally, the same restraint a real text field would
+        // apply.
+        Key::Character(_)
+            if !chord.modifiers.control && !chord.modifiers.alt && !chord.modifiers.meta =>
+        {
+            if let (Ok(state), Some(text)) = (command_palette_state(&workspace.tree, root), text) {
+                let query = format!("{}{text}", state.query());
+                if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
+                    tracing::warn!(?err, "failed to update command palette query");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One key press's full routing: while the command palette is open, it
+/// owns the keyboard ([`handle_palette_key`]); otherwise a chord that
+/// resolves in `shortcuts` runs its command ([`run_command`]). Anything
+/// else (an unbound chord, with no palette open) is silently ignored —
+/// there's no text field or canvas tool to fall back to routing into
+/// yet.
+fn handle_key(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+    shortcuts: &ShortcutRegistry<AppCommand>,
+    modifiers: Modifiers,
+    key: Key,
+    text: Option<&str>,
+) {
+    let chord = KeyChord::new(modifiers, key);
+    if palette.is_some() {
+        handle_palette_key(workspace, focus, palette, chord, text);
+        return;
+    }
+    if let Some(&command) = shortcuts.resolve(chord) {
+        run_command(workspace, focus, palette, command);
+    }
+}
+
+/// Translates a real `winit::keyboard::Key` into this crate's own,
+/// platform-free [`Key`] — `aurora_widgets::shortcut`'s own doc comment
+/// names this exact translation as `aurora-app`'s job. Only the
+/// characters/named keys [`NamedKey`] itself covers are recognised;
+/// anything else (dead keys, `Key::Unidentified`, media keys, ...)
+/// yields `None`, the same "not every platform key needs a shortcut
+/// vocabulary entry yet" scope `NamedKey`'s own `#[non_exhaustive]`
+/// documents.
+fn translate_key(key: &winit::keyboard::Key) -> Option<Key> {
+    match key {
+        winit::keyboard::Key::Character(text) => text
+            .chars()
+            .next()
+            .map(|ch| Key::Character(ch.to_ascii_lowercase())),
+        winit::keyboard::Key::Named(named) => translate_named_key(*named).map(Key::Named),
+        _ => None,
+    }
+}
+
+fn translate_named_key(named: winit::keyboard::NamedKey) -> Option<NamedKey> {
+    use winit::keyboard::NamedKey as Winit;
+    Some(match named {
+        Winit::Enter => NamedKey::Enter,
+        Winit::Escape => NamedKey::Escape,
+        Winit::Tab => NamedKey::Tab,
+        Winit::Backspace => NamedKey::Backspace,
+        Winit::Delete => NamedKey::Delete,
+        Winit::Space => NamedKey::Space,
+        Winit::ArrowUp => NamedKey::ArrowUp,
+        Winit::ArrowDown => NamedKey::ArrowDown,
+        Winit::ArrowLeft => NamedKey::ArrowLeft,
+        Winit::ArrowRight => NamedKey::ArrowRight,
+        Winit::F1 => NamedKey::F1,
+        Winit::F2 => NamedKey::F2,
+        Winit::F3 => NamedKey::F3,
+        Winit::F4 => NamedKey::F4,
+        Winit::F5 => NamedKey::F5,
+        Winit::F6 => NamedKey::F6,
+        Winit::F7 => NamedKey::F7,
+        Winit::F8 => NamedKey::F8,
+        Winit::F9 => NamedKey::F9,
+        Winit::F10 => NamedKey::F10,
+        Winit::F11 => NamedKey::F11,
+        Winit::F12 => NamedKey::F12,
+        _ => return None,
+    })
+}
+
+/// Translates a real `winit::keyboard::ModifiersState` into this crate's
+/// own, platform-free [`Modifiers`] — the `ModifiersChanged` half of the
+/// same translation seam [`translate_key`] documents.
+fn translate_modifiers(state: winit::keyboard::ModifiersState) -> Modifiers {
+    Modifiers {
+        control: state.control_key(),
+        shift: state.shift_key(),
+        alt: state.alt_key(),
+        meta: state.super_key(),
+    }
+}
+
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
@@ -138,6 +479,19 @@ struct App {
     /// function's own doc comment.
     workspace: aurora_ui::Workspace,
     focus: FocusManager,
+    /// This build's fixed global keyboard shortcuts ([`default_shortcuts`]).
+    shortcuts: ShortcutRegistry<AppCommand>,
+    /// The modifier keys currently held down, tracked from
+    /// `WindowEvent::ModifiersChanged` — winit reports modifiers and key
+    /// presses as separate events, so this is the only way a later
+    /// `KeyboardInput` handler knows whether `Ctrl`/`Shift`/... was held
+    /// alongside it.
+    modifiers: Modifiers,
+    /// The open command palette's own root widget, if one is open —
+    /// `None` is "closed"; there's no separate visibility flag to keep
+    /// in sync (see `aurora_widgets::widgets::command_palette`'s own doc
+    /// comment).
+    command_palette: Option<WidgetId>,
     /// The window's background clear colour, resolved from
     /// `design/themes/dark.toml`'s `surface.app` token
     /// (`load_background_color`) — invariant §7.3.10 (no hardcoded
@@ -174,6 +528,9 @@ impl App {
             proxy,
             workspace,
             focus: FocusManager::default(),
+            shortcuts: default_shortcuts(),
+            modifiers: Modifiers::none(),
+            command_palette: None,
             background,
             failed: false,
         }
@@ -198,6 +555,31 @@ impl App {
         let tree = &self.workspace.tree;
         let focused = self.focus.focused().unwrap_or(self.workspace.root);
         adapter.update_if_active(|| tree.accessibility_update(focused));
+    }
+
+    /// A real `winit::event::KeyEvent`'s full handling: ignores key-up
+    /// (only a press should trigger a shortcut or type a character —
+    /// otherwise every binding would fire twice), translates it into
+    /// this crate's own platform-free vocabulary, and routes it via
+    /// [`handle_key`] — the pure logic this method exists only to feed
+    /// real platform input into.
+    fn handle_key_event(&mut self, event: &winit::event::KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let Some(key) = translate_key(&event.logical_key) else {
+            return;
+        };
+        handle_key(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            &self.shortcuts,
+            self.modifiers,
+            key,
+            event.text.as_deref(),
+        );
+        self.push_accessibility();
     }
 
     /// Logs `message`, marks this run as failed, and asks the event loop
@@ -366,6 +748,10 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => self.apply_resize((size.width, size.height)),
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = translate_modifiers(modifiers.state());
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.handle_key_event(&event),
             _ => {}
         }
     }
@@ -425,7 +811,13 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{demo_document, load_background_color};
+    use super::{
+        AppCommand, COMMAND_FOCUS_LAYERS, Key, KeyChord, Modifiers, NamedKey,
+        close_command_palette, default_shortcuts, demo_document, handle_key, handle_palette_key,
+        load_background_color, open_command_palette, run_command, toggle_command_palette,
+        translate_key, translate_modifiers,
+    };
+    use aurora_widgets::FocusManager;
 
     /// The workspace structure itself (`aurora_ui::build_workspace`) has
     /// its own, thorough tests in `aurora-ui` — nothing app-specific to
@@ -523,5 +915,317 @@ mod tests {
                 "Added layer \"Retouch — skin\"".to_owned(),
             ]
         );
+    }
+
+    // -- keyboard shortcuts and the command palette --
+    //
+    // Every function under test here is deliberately free of `winit`
+    // window/event-loop types (see this module's own doc comment), so
+    // these run with no window, no `EventLoopProxy`, and no display
+    // server -- exactly what this sandbox has never had for the rest of
+    // this crate's own real-hardware-gated pieces.
+
+    #[test]
+    fn default_shortcuts_binds_tab_shift_tab_and_toggle_palette() {
+        let shortcuts = default_shortcuts();
+        let tab = match KeyChord::parse("Tab") {
+            Ok(chord) => chord,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let shift_tab = match KeyChord::parse("Shift+Tab") {
+            Ok(chord) => chord,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let toggle = match KeyChord::parse("Ctrl+Shift+P") {
+            Ok(chord) => chord,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(shortcuts.resolve(tab), Some(&AppCommand::FocusNext));
+        assert_eq!(
+            shortcuts.resolve(shift_tab),
+            Some(&AppCommand::FocusPrevious)
+        );
+        assert_eq!(
+            shortcuts.resolve(toggle),
+            Some(&AppCommand::ToggleCommandPalette)
+        );
+    }
+
+    #[test]
+    fn translate_key_lowercases_a_character_and_maps_named_keys() {
+        assert_eq!(
+            translate_key(&winit::keyboard::Key::Character("P".into())),
+            Some(Key::Character('p'))
+        );
+        assert_eq!(
+            translate_key(&winit::keyboard::Key::Named(
+                winit::keyboard::NamedKey::Escape
+            )),
+            Some(Key::Named(NamedKey::Escape))
+        );
+    }
+
+    #[test]
+    fn translate_key_returns_none_for_a_key_with_no_shortcut_vocabulary_entry() {
+        // `CapsLock` is a real `winit::keyboard::NamedKey` variant with
+        // deliberately no `aurora_widgets::shortcut::NamedKey`
+        // counterpart (see that type's own doc comment) -- confirms the
+        // fallback is a real `None`, not a panic or a silent wrong
+        // mapping.
+        assert_eq!(
+            translate_key(&winit::keyboard::Key::Named(
+                winit::keyboard::NamedKey::CapsLock
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn translate_modifiers_reads_every_flag_independently() {
+        let state =
+            winit::keyboard::ModifiersState::CONTROL | winit::keyboard::ModifiersState::SHIFT;
+        let modifiers = translate_modifiers(state);
+        assert!(modifiers.control);
+        assert!(modifiers.shift);
+        assert!(!modifiers.alt);
+        assert!(!modifiers.meta);
+    }
+
+    #[test]
+    fn run_command_focus_next_visits_every_docked_panel_in_order() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            AppCommand::FocusNext,
+        );
+        assert_eq!(focus.focused(), Some(workspace.layers.root));
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            AppCommand::FocusNext,
+        );
+        assert_eq!(focus.focused(), Some(workspace.properties.root));
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            AppCommand::FocusNext,
+        );
+        assert_eq!(focus.focused(), Some(workspace.history.root));
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            AppCommand::FocusPrevious,
+        );
+        assert_eq!(
+            focus.focused(),
+            Some(workspace.properties.root),
+            "Shift+Tab must step backward through the same order"
+        );
+    }
+
+    #[test]
+    fn toggle_command_palette_opens_then_closes() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+
+        toggle_command_palette(&mut workspace, &mut focus, &mut palette);
+        let Some(root) = palette else {
+            unreachable!("toggling from closed must open the palette");
+        };
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(root)
+                .map(accesskit::Node::role),
+            Some(accesskit::Role::TextInput)
+        );
+        assert_eq!(
+            focus.focused(),
+            Some(root),
+            "opening the palette must focus it"
+        );
+
+        toggle_command_palette(&mut workspace, &mut focus, &mut palette);
+        assert_eq!(palette, None);
+        assert!(
+            !workspace.tree.contains(root),
+            "closing must remove the palette from the tree, not just hide it"
+        );
+        assert_eq!(
+            focus.focused(),
+            None,
+            "focus left on the now-removed palette must be cleared"
+        );
+    }
+
+    #[test]
+    fn opening_the_palette_a_second_time_is_a_no_op() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let first = palette;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        assert_eq!(palette, first, "already open must not reopen or replace it");
+    }
+
+    #[test]
+    fn typing_into_the_open_palette_filters_to_a_matching_command() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+
+        for ch in ['l', 'a', 'y'] {
+            handle_palette_key(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                KeyChord::new(Modifiers::none(), Key::Character(ch)),
+                Some(&ch.to_string()),
+            );
+        }
+
+        let Some(root) = palette else {
+            unreachable!("typing must not close the palette");
+        };
+        let state = match aurora_widgets::widgets::command_palette_state(&workspace.tree, root) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state.query(), "lay");
+        assert_eq!(state.results().len(), 1);
+        assert_eq!(
+            state.selected().map(|entry| entry.id.as_str()),
+            Some(COMMAND_FOCUS_LAYERS)
+        );
+    }
+
+    #[test]
+    fn activating_a_command_with_enter_closes_the_palette_and_focuses_its_target() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        // The first result (`palette_commands`' own order) is already
+        // "Focus Layers Panel" -- activate it directly, no typing needed.
+        handle_palette_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Enter)),
+            None,
+        );
+
+        assert_eq!(palette, None, "activating a command must close the palette");
+        assert_eq!(
+            focus.focused(),
+            Some(workspace.layers.root),
+            "the activated command's own target must end up focused"
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_palette_without_focusing_any_command_target() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        handle_palette_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
+            None,
+        );
+        assert_eq!(palette, None);
+        assert_eq!(focus.focused(), None);
+    }
+
+    #[test]
+    fn close_command_palette_on_an_already_closed_palette_is_a_no_op() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        close_command_palette(&mut workspace, &mut focus, &mut palette);
+        assert_eq!(palette, None);
+    }
+
+    #[test]
+    fn handle_key_routes_tab_to_focus_next_when_the_palette_is_closed() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let shortcuts = default_shortcuts();
+        handle_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &shortcuts,
+            Modifiers::none(),
+            Key::Named(NamedKey::Tab),
+            None,
+        );
+        assert_eq!(focus.focused(), Some(workspace.layers.root));
+    }
+
+    #[test]
+    fn handle_key_ignores_an_unbound_chord() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let shortcuts = default_shortcuts();
+        handle_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &shortcuts,
+            Modifiers::none(),
+            Key::Character('z'),
+            Some("z"),
+        );
+        assert_eq!(focus.focused(), None);
+        assert_eq!(palette, None);
+    }
+
+    #[test]
+    fn handle_key_routes_typing_to_the_palette_instead_of_shortcuts_while_open() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let shortcuts = default_shortcuts();
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+
+        // `p` alone isn't a bound shortcut (`Ctrl+Shift+P` is), so this
+        // also confirms typing a plain character doesn't accidentally
+        // fall through to shortcut resolution while the palette is open.
+        handle_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &shortcuts,
+            Modifiers::none(),
+            Key::Character('p'),
+            Some("p"),
+        );
+
+        let Some(root) = palette else {
+            unreachable!("typing must not close the palette");
+        };
+        let state = match aurora_widgets::widgets::command_palette_state(&workspace.tree, root) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state.query(), "p");
     }
 }

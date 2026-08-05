@@ -37,6 +37,9 @@ accesskit_winit = { workspace = true }
 winit = { workspace = true }
 wgpu = { workspace = true }
 
+[dev-dependencies]
+accesskit = { workspace = true }
+
 [[bin]]
 name = "aurora-app"
 path = "src/main.rs"

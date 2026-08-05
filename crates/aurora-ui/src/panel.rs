@@ -11,7 +11,7 @@
 //! machinery this first pass doesn't build. What exists here is the
 //! structural piece everything else will attach to.
 
-use accesskit::{Node, Role};
+use accesskit::{Action, Node, Role};
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::Style;
@@ -32,7 +32,12 @@ pub struct PanelHandle {
 ///
 /// `Role::Region` (not `Role::GenericContainer`) — the ARIA concept of
 /// a perceivable, nameable section a user would want to navigate
-/// directly to, which is exactly what a docked panel is.
+/// directly to, which is exactly what a docked panel is. Carries
+/// `Action::Focus` so it's a real `Tab` stop
+/// (`aurora_widgets::FocusManager`) — real content *within* a panel
+/// (individual layer/history rows) isn't focusable yet, matching this
+/// module's own "static skeleton" scope; landing on the panel itself is
+/// the first real, honest keyboard-navigation target that exists.
 ///
 /// # Errors
 ///
@@ -44,6 +49,7 @@ pub fn insert_panel(
 ) -> Result<PanelHandle, WidgetError> {
     let mut root_node = Node::new(Role::Region);
     root_node.set_label(title.into());
+    root_node.add_action(Action::Focus);
     let root = tree.insert(
         parent,
         Style {
@@ -78,6 +84,7 @@ mod tests {
         };
         assert_eq!(accessibility.role(), accesskit::Role::Region);
         assert_eq!(accessibility.label(), Some("Layers"));
+        assert!(accessibility.supports_action(accesskit::Action::Focus));
         assert_eq!(tree.payload(panel.root), Some(&WidgetKind::Container));
         assert_eq!(tree.children(panel.body), Some([].as_slice()));
         assert_eq!(tree.parent(panel.body), Some(panel.root));

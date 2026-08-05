@@ -30,11 +30,16 @@
 
 mod button;
 mod checkbox;
+mod command_palette;
 mod slider;
 mod text_field;
 
 pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
 pub use checkbox::{CheckboxState, insert_checkbox, set_checkbox_disabled, toggle_checkbox};
+pub use command_palette::{
+    CommandEntry, CommandPaletteState, command_palette_state, insert_command_palette,
+    move_command_palette_selection, set_command_palette_query,
+};
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
 pub use text_field::{
     Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
@@ -62,6 +67,7 @@ pub enum WidgetKind {
     Checkbox(CheckboxState),
     Slider(SliderState),
     TextField(TextFieldState),
+    CommandPalette(CommandPaletteState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]
