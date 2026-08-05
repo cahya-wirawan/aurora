@@ -39,6 +39,7 @@ wgpu = { workspace = true }
 
 [dev-dependencies]
 accesskit = { workspace = true }
+tempfile = { workspace = true }
 
 [[bin]]
 name = "aurora-app"

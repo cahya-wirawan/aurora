@@ -431,6 +431,7 @@ dependencies = [
  "aurora-ui",
  "aurora-vector",
  "aurora-widgets",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "wgpu",

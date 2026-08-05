@@ -20,8 +20,10 @@
 //! platform-agnostic [`KeyChord`] vocabulary plus a chord ->
 //! generic-command [`ShortcutRegistry`], and
 //! [`widgets::insert_command_palette`] is the searchable-command-list
-//! widget a shortcut typically opens — both keep the same "abstract
-//! steps, not `winit` types" seam as `FocusManager`/`hit_test`.
+//! widget a shortcut typically opens; [`widgets::insert_dialog`] is a
+//! generic modal alert/confirmation (the mechanism a crash-recovery
+//! prompt is built from) — both keep the same "abstract steps, not
+//! `winit` types" seam as `FocusManager`/`hit_test`.
 //!
 //! This crate knows nothing about documents or layers (`aurora-doc` is a
 //! layer above it) and must stay headlessly testable — every test in

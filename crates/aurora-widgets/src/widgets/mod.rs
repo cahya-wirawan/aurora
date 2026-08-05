@@ -31,6 +31,7 @@
 mod button;
 mod checkbox;
 mod command_palette;
+mod dialog;
 mod slider;
 mod text_field;
 
@@ -40,6 +41,7 @@ pub use command_palette::{
     CommandEntry, CommandPaletteState, command_palette_state, insert_command_palette,
     move_command_palette_selection, set_command_palette_query,
 };
+pub use dialog::{DialogAction, DialogHandle, insert_dialog};
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
 pub use text_field::{
     Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,

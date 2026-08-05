@@ -16,8 +16,8 @@
 //! a real theme token (`design/themes/dark.toml`'s `surface.app`, the
 //! only built-in theme that exists as a real design yet). Still nothing
 //! renders visually beyond the background clear — the canvas itself,
-//! tools, IME, native menus, DPI handling, and crash recovery are this
-//! milestone's other, separate, still-open bullets.
+//! tools, IME, native menus, and DPI handling are this milestone's
+//! other, separate, still-open bullets.
 //!
 //! **Real keyboard input, for the first time in this crate**: a fixed
 //! set of global shortcuts (`default_shortcuts` — `Tab`/`Shift+Tab` for
@@ -32,22 +32,34 @@
 //! `translate_modifiers` touch real `winit::keyboard` types, and those
 //! are plain data, constructible with no window either.
 //!
+//! **Crash recovery, narrowly scoped and honest about it**: `run` writes
+//! a small marker file (`std::env::temp_dir()`) at startup and clears it
+//! on a clean `WindowEvent::CloseRequested` shutdown; if a *previous*
+//! run's marker is still there, this run shows a real, modal
+//! `Role::AlertDialog` (`aurora_widgets::widgets::dialog`) saying so.
+//! What it deliberately does **not** do is restore any document state —
+//! `aurora-doc`'s own crash-recovery journal has no on-disk encoding
+//! decided yet (see that crate's M1.4 notes), so the dialog's one action
+//! is "Continue," not "Recover Document." See this module's own "crash
+//! recovery" section for the full reasoning.
+//!
 //! **Human-verified on macOS, 2026-08-03** (real hardware, real desktop
 //! session): the window opens, resizes without crashing, and `VoiceOver`
 //! announces it — the create-hidden → attach-adapter → show ordering
 //! and the accessibility tree both reach a real screen reader. Windows
 //! and Linux remain unverified on real hardware — see PLAN.md M1.8. The
-//! keyboard-shortcut/command-palette work above has not yet had its own
-//! real-hardware pass.
+//! keyboard-shortcut/command-palette/crash-recovery work above has not
+//! yet had its own real-hardware pass.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aurora_gpu::{GpuContext, GpuSurface};
-use aurora_theme::{Palette, ThemeSet};
+use aurora_theme::{Palette, Scales, ThemeSet};
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey, ShortcutRegistry};
 use aurora_widgets::widgets::{
-    CommandEntry, command_palette_state, insert_command_palette, move_command_palette_selection,
-    set_command_palette_query,
+    CommandEntry, DialogAction, DialogHandle, command_palette_state, insert_command_palette,
+    insert_dialog, move_command_palette_selection, set_command_palette_query,
 };
 use aurora_widgets::{FocusManager, WidgetId};
 use winit::application::ApplicationHandler;
@@ -57,6 +69,7 @@ use winit::window::{Window, WindowId};
 
 const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
 const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
+const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 
 /// Loads the real, owner-approved Dark theme (`design/themes/dark.toml`
 /// — the only built-in theme that exists as a real design yet; Light/
@@ -93,6 +106,22 @@ fn load_background_color() -> anyhow::Result<wgpu::Color> {
         b: f64::from(aurora_color::srgb_to_linear(b)),
         a: 1.0,
     })
+}
+
+/// Loads the real, owner-approved scales (`design/tokens/scales.toml`)
+/// — needed by any widget with real chrome (buttons, the crash-recovery
+/// dialog built from them) per invariant §7.3.10, the same "resolve
+/// from tokens, never a literal" discipline `load_background_color`
+/// already applies to colour.
+///
+/// # Errors
+///
+/// Returns an error if the built-in scales TOML fails to parse — same
+/// caveat as [`load_background_color`]: this would mean the checked-in
+/// design file itself is broken, not a runtime condition a user could
+/// hit.
+fn load_scales() -> anyhow::Result<Scales> {
+    Ok(Scales::from_toml_str(SCALES_TOML)?)
 }
 
 /// A small, clearly-fake document — there is no real "open a document"
@@ -141,6 +170,154 @@ fn demo_document() -> (aurora_doc::LayerTree, aurora_doc::History) {
     }
 
     (layers, history)
+}
+
+// -- Crash recovery: an unclosed-session marker on disk --
+//
+// PLAN.md M1.8's "crash recovery UI" bullet. Deliberately narrow: this
+// detects whether the *previous* run reached its own clean-shutdown
+// step — a real, useful signal on its own — but does **not** restore
+// any actual document state. `aurora-doc`'s crash-recovery journal only
+// has its in-memory half built so far (`History::replay`); durable
+// on-disk persistence is deliberately deferred there because no on-disk
+// encoding for `LayerOp`'s recursive shape has been decided yet (see
+// that crate's own M1.4 notes) — inventing one here, as a side effect of
+// this bullet, would be exactly the kind of forced-without-evidence
+// format decision `spike/raw-icc/FINDINGS.md` already warned against
+// once. So the dialog below is honest about what it can and can't do:
+// its one action is "Continue," not "Recover Document."
+//
+// The marker itself lives in `std::env::temp_dir()` under a fixed name
+// — deliberately not a proper per-platform app-support directory (no
+// `directories`-style crate is a dependency yet), since a boolean marker
+// doesn't need one; a real location decision belongs together with the
+// actual journal's, once that exists.
+
+/// Where this run's own "I'm still running" marker lives.
+fn marker_path() -> PathBuf {
+    std::env::temp_dir().join("aurora-session.marker")
+}
+
+/// True if a marker from a *previous* run is still present at `path` —
+/// meaning that run never reached [`clear_session_marker`], i.e. it
+/// didn't shut down cleanly (a crash, a force-quit, a killed process).
+#[must_use]
+fn previous_session_left_a_marker(path: &Path) -> bool {
+    path.exists()
+}
+
+/// Writes this run's own marker at `path` — call once, early, before
+/// [`previous_session_left_a_marker`] would see it as a *previous*
+/// run's. Errors are logged, not fatal: failing to write a marker file
+/// must never stop the application starting.
+fn write_session_marker(path: &Path) {
+    if let Err(err) = std::fs::write(path, []) {
+        tracing::warn!(?err, path = %path.display(), "failed to write the crash-recovery session marker");
+    }
+}
+
+/// Removes this run's own marker at `path` — call on a clean shutdown.
+/// If this never runs, the marker left behind is exactly the signal the
+/// *next* run's [`previous_session_left_a_marker`] needs. A missing
+/// marker is not an error (e.g. shutting down twice, or a marker that
+/// was never successfully written in the first place).
+fn clear_session_marker(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %path.display(), "failed to remove the crash-recovery session marker");
+    }
+}
+
+const CRASH_RECOVERY_CONTINUE: &str = "recovery.continue";
+
+/// The crash-recovery dialog's own, honest content — see this section's
+/// own doc comment for why "Continue" and not "Recover Document."
+fn crash_recovery_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(CRASH_RECOVERY_CONTINUE, "Continue")]
+}
+
+/// Opens the crash-recovery dialog (a no-op if one is already open):
+/// inserts it into `workspace.tree` under `workspace.root` and moves
+/// keyboard focus to its first (only, today) action.
+fn open_crash_recovery_dialog(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+    scales: &Scales,
+) {
+    if dialog.is_some() {
+        return;
+    }
+    let handle = match insert_dialog(
+        &mut workspace.tree,
+        workspace.root,
+        scales,
+        "Aurora Didn't Close Properly",
+        "The previous session didn't shut down cleanly. Document recovery \
+         isn't available yet, but this is recorded so it can be added later.",
+        crash_recovery_dialog_actions(),
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(?err, "failed to open the crash recovery dialog");
+            return;
+        }
+    };
+    if let Some(button) = handle.first_action()
+        && let Err(err) = focus.focus(&mut workspace.tree, button)
+    {
+        tracing::warn!(?err, "failed to focus the crash recovery dialog");
+    }
+    *dialog = Some(handle);
+}
+
+/// Closes the crash-recovery dialog (a no-op if none is open): removes
+/// it from `workspace.tree` and clears any focus left dangling on it —
+/// the same [`FocusManager::validate`] pattern
+/// [`close_command_palette`] already uses.
+fn close_crash_recovery_dialog(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+) {
+    let Some(handle) = dialog.take() else {
+        return;
+    };
+    if let Err(err) = workspace.tree.remove(handle.root) {
+        tracing::warn!(?err, "failed to close the crash recovery dialog");
+    }
+    focus.validate(&workspace.tree);
+}
+
+/// Routes one key press while the crash-recovery dialog is open —
+/// captures the keyboard directly, the same modal precedence
+/// [`handle_palette_key`] uses for the command palette (and, per
+/// [`handle_key`]'s own routing order, this dialog takes priority over
+/// the palette: a modal alert blocks everything else).
+fn handle_dialog_key(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+    chord: KeyChord,
+) {
+    let Some(handle) = dialog.as_ref() else {
+        return;
+    };
+    match chord.key {
+        Key::Named(NamedKey::Escape) => close_crash_recovery_dialog(workspace, focus, dialog),
+        Key::Named(NamedKey::Enter) => {
+            let action = focus
+                .focused()
+                .and_then(|id| handle.action_id(id))
+                .map(str::to_owned);
+            close_crash_recovery_dialog(workspace, focus, dialog);
+            if let Some(action) = action {
+                tracing::info!(action, "crash recovery dialog action chosen");
+            }
+        }
+        _ => {}
+    }
 }
 
 // -- Command dispatch: keyboard shortcuts and the command palette --
@@ -378,15 +555,19 @@ fn handle_palette_key(
     }
 }
 
-/// One key press's full routing: while the command palette is open, it
-/// owns the keyboard ([`handle_palette_key`]); otherwise a chord that
-/// resolves in `shortcuts` runs its command ([`run_command`]). Anything
-/// else (an unbound chord, with no palette open) is silently ignored —
-/// there's no text field or canvas tool to fall back to routing into
-/// yet.
+/// One key press's full routing, most-modal-first: the crash-recovery
+/// dialog owns the keyboard while open ([`handle_dialog_key`]) — a modal
+/// alert blocks everything else, including the palette; otherwise the
+/// command palette owns it while open ([`handle_palette_key`]);
+/// otherwise a chord that resolves in `shortcuts` runs its command
+/// ([`run_command`]). Anything else (an unbound chord, with nothing
+/// modal open) is silently ignored — there's no text field or canvas
+/// tool to fall back to routing into yet.
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
     palette: &mut Option<WidgetId>,
     shortcuts: &ShortcutRegistry<AppCommand>,
     modifiers: Modifiers,
@@ -394,6 +575,10 @@ fn handle_key(
     text: Option<&str>,
 ) {
     let chord = KeyChord::new(modifiers, key);
+    if dialog.is_some() {
+        handle_dialog_key(workspace, focus, dialog, chord);
+        return;
+    }
     if palette.is_some() {
         handle_palette_key(workspace, focus, palette, chord, text);
         return;
@@ -492,6 +677,16 @@ struct App {
     /// in sync (see `aurora_widgets::widgets::command_palette`'s own doc
     /// comment).
     command_palette: Option<WidgetId>,
+    /// The open crash-recovery dialog, if one is open — `None` is
+    /// "closed" or "never needed one," the same "no separate visibility
+    /// flag" shape `command_palette` field above already uses. Opened
+    /// once, at construction, if [`previous_session_left_a_marker`] said
+    /// so — see this crate's own "crash recovery" section.
+    crash_recovery_dialog: Option<DialogHandle>,
+    /// This run's own "still running" marker file — written in [`run`]
+    /// before this `App` is built, cleared on a clean shutdown
+    /// (`WindowEvent::CloseRequested`).
+    marker_path: PathBuf,
     /// The window's background clear colour, resolved from
     /// `design/themes/dark.toml`'s `surface.app` token
     /// (`load_background_color`) — invariant §7.3.10 (no hardcoded
@@ -506,7 +701,13 @@ struct App {
 
 impl App {
     #[must_use]
-    fn new(proxy: EventLoopProxy<accesskit_winit::Event>, background: wgpu::Color) -> Self {
+    fn new(
+        proxy: EventLoopProxy<accesskit_winit::Event>,
+        background: wgpu::Color,
+        scales: &Scales,
+        marker_path: PathBuf,
+        had_previous_marker: bool,
+    ) -> Self {
         let mut workspace = aurora_ui::build_workspace();
         let (layers, history) = demo_document();
         if let Err(err) =
@@ -520,6 +721,17 @@ impl App {
             unreachable!("workspace.history was just built by build_workspace above: {err:?}");
         }
 
+        let mut focus = FocusManager::default();
+        let mut crash_recovery_dialog = None;
+        if had_previous_marker {
+            open_crash_recovery_dialog(
+                &mut workspace,
+                &mut focus,
+                &mut crash_recovery_dialog,
+                scales,
+            );
+        }
+
         Self {
             window: None,
             gpu: None,
@@ -527,10 +739,12 @@ impl App {
             adapter: None,
             proxy,
             workspace,
-            focus: FocusManager::default(),
+            focus,
             shortcuts: default_shortcuts(),
             modifiers: Modifiers::none(),
             command_palette: None,
+            crash_recovery_dialog,
+            marker_path,
             background,
             failed: false,
         }
@@ -573,6 +787,7 @@ impl App {
         handle_key(
             &mut self.workspace,
             &mut self.focus,
+            &mut self.crash_recovery_dialog,
             &mut self.command_palette,
             &self.shortcuts,
             self.modifiers,
@@ -745,7 +960,14 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                // A clean shutdown -- clear this run's own marker so the
+                // *next* run's `previous_session_left_a_marker` reads
+                // false, not true (see this crate's own "crash
+                // recovery" section).
+                clear_session_marker(&self.marker_path);
+                el.exit();
+            }
             WindowEvent::Resized(size) => self.apply_resize((size.width, size.height)),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -791,13 +1013,21 @@ impl std::fmt::Debug for App {
 /// device, or surface creation failing).
 pub fn run() -> anyhow::Result<()> {
     let background = load_background_color()?;
+    let scales = load_scales()?;
+    let marker_path = marker_path();
+    // Checked *before* writing this run's own marker below -- otherwise
+    // every run would see its own, brand-new marker and think the
+    // *previous* run crashed.
+    let had_previous_marker = previous_session_left_a_marker(&marker_path);
+    write_session_marker(&marker_path);
+
     let event_loop = EventLoop::<accesskit_winit::Event>::with_user_event()
         .build()
         .map_err(|err| anyhow::anyhow!("event loop creation failed: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    let mut app = App::new(proxy, background);
+    let mut app = App::new(proxy, background, &scales, marker_path, had_previous_marker);
     event_loop
         .run_app(&mut app)
         .map_err(|err| anyhow::anyhow!("event loop run failed: {err}"))?;
@@ -812,10 +1042,12 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppCommand, COMMAND_FOCUS_LAYERS, Key, KeyChord, Modifiers, NamedKey,
-        close_command_palette, default_shortcuts, demo_document, handle_key, handle_palette_key,
-        load_background_color, open_command_palette, run_command, toggle_command_palette,
-        translate_key, translate_modifiers,
+        AppCommand, COMMAND_FOCUS_LAYERS, CRASH_RECOVERY_CONTINUE, Key, KeyChord, Modifiers,
+        NamedKey, clear_session_marker, close_command_palette, close_crash_recovery_dialog,
+        default_shortcuts, demo_document, handle_dialog_key, handle_key, handle_palette_key,
+        load_background_color, load_scales, open_command_palette, open_crash_recovery_dialog,
+        previous_session_left_a_marker, run_command, toggle_command_palette, translate_key,
+        translate_modifiers, write_session_marker,
     };
     use aurora_widgets::FocusManager;
 
@@ -1165,11 +1397,13 @@ mod tests {
     fn handle_key_routes_tab_to_focus_next_when_the_palette_is_closed() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
+        let mut dialog = None;
         let mut palette = None;
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
             &mut focus,
+            &mut dialog,
             &mut palette,
             &shortcuts,
             Modifiers::none(),
@@ -1183,11 +1417,13 @@ mod tests {
     fn handle_key_ignores_an_unbound_chord() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
+        let mut dialog = None;
         let mut palette = None;
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
             &mut focus,
+            &mut dialog,
             &mut palette,
             &shortcuts,
             Modifiers::none(),
@@ -1202,6 +1438,7 @@ mod tests {
     fn handle_key_routes_typing_to_the_palette_instead_of_shortcuts_while_open() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
+        let mut dialog = None;
         let mut palette = None;
         let shortcuts = default_shortcuts();
         open_command_palette(&mut workspace, &mut focus, &mut palette);
@@ -1212,6 +1449,7 @@ mod tests {
         handle_key(
             &mut workspace,
             &mut focus,
+            &mut dialog,
             &mut palette,
             &shortcuts,
             Modifiers::none(),
@@ -1227,5 +1465,206 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(state.query(), "p");
+    }
+
+    // -- crash recovery --
+    //
+    // The marker-file functions do real filesystem I/O, so they're
+    // tested against a real `tempfile::TempDir` rather than mocked --
+    // consistent with how the rest of this session has preferred real
+    // I/O over mocks (`aurora-testkit`'s golden-image tests are the
+    // nearest precedent). The dialog/dispatch functions are pure
+    // `WidgetTree` logic, same as the command-palette tests above.
+
+    #[test]
+    fn load_scales_resolves_the_checked_in_design_file() {
+        if let Err(err) = load_scales() {
+            unreachable!("the checked-in design file must parse: {err}");
+        }
+    }
+
+    #[test]
+    fn a_marker_that_was_never_written_is_not_seen_as_a_previous_session() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-session.marker");
+        assert!(!previous_session_left_a_marker(&path));
+    }
+
+    #[test]
+    fn writing_then_checking_the_marker_reports_a_previous_session() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-session.marker");
+        write_session_marker(&path);
+        assert!(previous_session_left_a_marker(&path));
+    }
+
+    #[test]
+    fn clearing_the_marker_makes_it_look_like_a_clean_shutdown_again() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-session.marker");
+        write_session_marker(&path);
+        clear_session_marker(&path);
+        assert!(!previous_session_left_a_marker(&path));
+    }
+
+    #[test]
+    fn clearing_a_marker_that_was_never_written_does_not_panic() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-session.marker");
+        clear_session_marker(&path);
+        assert!(!previous_session_left_a_marker(&path));
+    }
+
+    #[test]
+    fn open_crash_recovery_dialog_focuses_its_only_action() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+
+        let Some(handle) = dialog else {
+            unreachable!("must open");
+        };
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .map(accesskit::Node::role),
+            Some(accesskit::Role::AlertDialog)
+        );
+        assert_eq!(focus.focused(), handle.first_action());
+        assert_eq!(handle.actions.len(), 1);
+        let Some((id, _)) = handle.actions.first() else {
+            unreachable!("just asserted len() == 1");
+        };
+        assert_eq!(id, CRASH_RECOVERY_CONTINUE);
+    }
+
+    #[test]
+    fn opening_the_crash_recovery_dialog_a_second_time_is_a_no_op() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        let first = dialog.clone();
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        assert_eq!(dialog, first, "already open must not reopen or replace it");
+    }
+
+    #[test]
+    fn enter_on_the_focused_action_closes_the_dialog() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Enter)),
+        );
+
+        assert_eq!(dialog, None);
+        assert!(!workspace.tree.contains(handle.root));
+        assert_eq!(focus.focused(), None);
+    }
+
+    #[test]
+    fn escape_also_closes_the_dialog() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
+        );
+
+        assert_eq!(dialog, None);
+    }
+
+    #[test]
+    fn close_crash_recovery_dialog_on_an_already_closed_dialog_is_a_no_op() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        close_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog);
+        assert_eq!(dialog, None);
+    }
+
+    #[test]
+    fn handle_key_routes_to_the_dialog_before_the_palette_when_both_could_be_open() {
+        // The dialog takes priority per `handle_key`'s own routing order
+        // -- a modal alert blocks everything else. Since only one can
+        // ever actually be open in practice (the dialog only opens at
+        // startup, before any shortcut could open the palette), this
+        // confirms the *routing rule itself*, not a reachable real
+        // scenario.
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let mut palette = None;
+        let shortcuts = default_shortcuts();
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+
+        handle_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &mut palette,
+            &shortcuts,
+            Modifiers::none(),
+            Key::Named(NamedKey::Escape),
+            None,
+        );
+
+        assert_eq!(
+            dialog, None,
+            "Escape must close the dialog, not the palette"
+        );
+        assert!(
+            palette.is_some(),
+            "the palette must be untouched while the dialog was still open"
+        );
     }
 }
