@@ -16,8 +16,24 @@
 //! a real theme token (`design/themes/dark.toml`'s `surface.app`, the
 //! only built-in theme that exists as a real design yet). Still nothing
 //! renders visually beyond the background clear — the canvas itself,
-//! tools, IME, and native menus are this milestone's other, separate,
-//! still-open bullets.
+//! tools, IME, native menus, and drag & drop are this milestone's other,
+//! separate, still-open bullets.
+//!
+//! **System clipboard and native file dialogs**: `rfd`/`arboard`,
+//! PRD §8.3's own pre-decided choices. The command palette's
+//! `Ctrl+C`/`Ctrl+V` read and write the real system clipboard, and its
+//! "Open File…" entry shows a real, native `rfd::FileDialog`. Both are
+//! real platform calls with no meaningful headless behaviour, so
+//! `handle_palette_key` takes them as `&mut dyn ClipboardAccess`/
+//! `&mut dyn FileDialogAccess` rather than calling `arboard`/`rfd`
+//! directly — the same "keep the pure dispatch logic testable, isolate
+//! the untestable platform call" seam `translate_key`/
+//! `translate_modifiers` already use for keyboard input, just for two
+//! more platform calls. **Honest about its own limit**: a file chosen
+//! via "Open File…" is only recorded (`App::pending_open_path`), not
+//! imported — `aurora-io` remains an empty skeleton (separate M1.9
+//! work), the same "detect a real signal, defer the action" pattern
+//! this crate's own crash-recovery marker already uses.
 //!
 //! **DPI/scale-factor aware layout**: `logical_size` divides a real
 //! physical window size by `Window::scale_factor` before it reaches
@@ -61,8 +77,9 @@
 //! announces it — the create-hidden → attach-adapter → show ordering
 //! and the accessibility tree both reach a real screen reader. Windows
 //! and Linux remain unverified on real hardware — see PLAN.md M1.8. The
-//! keyboard-shortcut/command-palette/crash-recovery/DPI-scaling work
-//! above has not yet had its own real-hardware pass.
+//! keyboard-shortcut/command-palette/crash-recovery/DPI-scaling/
+//! clipboard/file-dialog work above has not yet had its own
+//! real-hardware pass.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -388,6 +405,98 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
     registry
 }
 
+// -- Native platform access: clipboard and file dialogs --
+//
+// PLAN.md M1.8's "clipboard"/"file dialogs" bullets — PRD §8.3's own
+// pre-decided choices (`rfd` for native dialogs; `arboard`, text-only,
+// for the system clipboard — image support is a real, separate need
+// this crate has none of yet). Both are real, synchronous platform
+// calls with no meaningful headless behaviour (no display server, no
+// clipboard owner in this sandbox), so — the same "keep the pure
+// dispatch logic testable, isolate the untestable platform call behind
+// a small seam" shape `translate_key`/`translate_modifiers` already
+// established for keyboard input — [`handle_palette_key`] takes these
+// as `&mut dyn` trait objects rather than calling `arboard`/`rfd`
+// directly, so a test can inject a fake and never touch the real OS.
+
+/// Whatever the caller uses to read/write the system clipboard —
+/// [`SystemClipboard`] in real use, a fake in tests.
+trait ClipboardAccess {
+    fn get_text(&mut self) -> Option<String>;
+    fn set_text(&mut self, text: String);
+}
+
+/// The real system clipboard, via `arboard`. Construction can fail (no
+/// clipboard owner on this platform/session — exactly this sandbox's
+/// own situation, no display server at all), so this lazily retries
+/// once per process: if `arboard::Clipboard::new()` fails, that failure
+/// is logged once and remembered (`unavailable`), not retried on every
+/// keystroke.
+struct SystemClipboard {
+    inner: Option<arboard::Clipboard>,
+    unavailable: bool,
+}
+
+impl SystemClipboard {
+    fn new() -> Self {
+        Self {
+            inner: None,
+            unavailable: false,
+        }
+    }
+
+    fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
+        if self.inner.is_none() && !self.unavailable {
+            match arboard::Clipboard::new() {
+                Ok(clipboard) => self.inner = Some(clipboard),
+                Err(err) => {
+                    tracing::warn!(?err, "system clipboard unavailable");
+                    self.unavailable = true;
+                }
+            }
+        }
+        self.inner.as_mut()
+    }
+}
+
+impl ClipboardAccess for SystemClipboard {
+    fn get_text(&mut self) -> Option<String> {
+        match self.clipboard()?.get_text() {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::warn!(?err, "failed to read the system clipboard");
+                None
+            }
+        }
+    }
+
+    fn set_text(&mut self, text: String) {
+        if let Some(clipboard) = self.clipboard()
+            && let Err(err) = clipboard.set_text(text)
+        {
+            tracing::warn!(?err, "failed to write to the system clipboard");
+        }
+    }
+}
+
+/// Whatever the caller uses to show a native "open file" dialog —
+/// [`SystemFileDialog`] in real use, a fake in tests.
+trait FileDialogAccess {
+    fn pick_file(&mut self) -> Option<PathBuf>;
+}
+
+/// The real native file picker, via `rfd`. Synchronous — the call
+/// blocks this thread until the user picks a file or cancels, which is
+/// how every desktop platform's own native modal file dialog behaves;
+/// there is no async runtime in this crate to hand it off to.
+struct SystemFileDialog;
+
+impl FileDialogAccess for SystemFileDialog {
+    fn pick_file(&mut self) -> Option<PathBuf> {
+        rfd::FileDialog::new().pick_file()
+    }
+}
+
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
 /// CommandEntry::id` is opaque to `aurora-widgets` itself (see that
 /// module's own doc comment); these constants are where this crate
@@ -395,19 +504,27 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
 const COMMAND_FOCUS_LAYERS: &str = "view.focus_layers";
 const COMMAND_FOCUS_PROPERTIES: &str = "view.focus_properties";
 const COMMAND_FOCUS_HISTORY: &str = "view.focus_history";
+const COMMAND_FILE_OPEN: &str = "file.open";
 
 /// The command palette's own, real content: one command per docked
-/// panel, focusing it. Genuine, not placeholder — each command moves
-/// real keyboard focus to a real, already-focusable panel region (see
-/// `aurora-ui`'s `insert_panel`), verifiable the same way any other
-/// focus change is (`push_accessibility`). A richer command set (undo,
-/// save, tool switches) waits on this crate having real actions behind
-/// them.
+/// panel, focusing it, plus a real native "Open File…" picker. Genuine,
+/// not placeholder — each focus command moves real keyboard focus to a
+/// real, already-focusable panel region (see `aurora-ui`'s
+/// `insert_panel`), verifiable the same way any other focus change is
+/// (`push_accessibility`); `COMMAND_FILE_OPEN` shows a real, native
+/// `rfd::FileDialog`. **Honest about its own limit**: there is still no
+/// document-import pipeline (`aurora-io` remains an empty skeleton,
+/// separate M1.9 work), so a chosen path is only recorded
+/// (`App::pending_open_path`), the same "detect a real signal, defer
+/// the action" pattern this crate's own crash-recovery marker already
+/// uses. A richer command set (undo, save, tool switches) waits on
+/// those real actions existing.
 fn palette_commands() -> Vec<CommandEntry> {
     vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
         CommandEntry::new(COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
         CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
+        CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
     ]
 }
 
@@ -505,16 +622,24 @@ fn run_command(
 /// mainstream command palette (VS Code, Sublime) uses. A no-op if
 /// `palette` is `None` (defensive; [`handle_key`] only calls this when
 /// it's `Some`).
+/// Routes one key press while the command palette is open. Returns
+/// `Some(path)` only when `Enter` just activated [`COMMAND_FILE_OPEN`]
+/// and the user picked a real file — the one case this function can't
+/// fully resolve itself (there's no import pipeline for it to hand the
+/// path to yet; see [`palette_commands`]'s own doc comment), so it
+/// hands the path back up to [`handle_key`]/`App` instead. Every other
+/// case returns `None`.
+#[allow(clippy::too_many_arguments)]
 fn handle_palette_key(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     palette: &mut Option<WidgetId>,
     chord: KeyChord,
     text: Option<&str>,
-) {
-    let Some(root) = *palette else {
-        return;
-    };
+    clipboard: &mut dyn ClipboardAccess,
+    file_dialog: &mut dyn FileDialogAccess,
+) -> Option<PathBuf> {
+    let root = (*palette)?;
     match chord.key {
         Key::Named(NamedKey::Escape) => close_command_palette(workspace, focus, palette),
         Key::Named(NamedKey::ArrowDown) => {
@@ -533,17 +658,42 @@ fn handle_palette_key(
                 .and_then(|state| state.selected())
                 .map(|entry| entry.id.clone());
             close_command_palette(workspace, focus, palette);
-            if let Some(id) = selected
-                && let Some(target) = command_target(workspace, &id)
-                && let Err(err) = focus.focus(&mut workspace.tree, target)
-            {
-                tracing::warn!(?err, "activated command's target isn't focusable");
+            let id = selected?;
+            if let Some(target) = command_target(workspace, &id) {
+                if let Err(err) = focus.focus(&mut workspace.tree, target) {
+                    tracing::warn!(?err, "activated command's target isn't focusable");
+                }
+                return None;
             }
+            if id == COMMAND_FILE_OPEN {
+                return file_dialog.pick_file();
+            }
+            tracing::warn!(command = id, "unknown command activated");
         }
         Key::Named(NamedKey::Backspace) => {
             if let Ok(state) = command_palette_state(&workspace.tree, root) {
                 let mut query = state.query().to_owned();
                 query.pop();
+                if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
+                    tracing::warn!(?err, "failed to update command palette query");
+                }
+            }
+        }
+        // `Ctrl+C`/`Ctrl+V` against the real system clipboard. Paste
+        // appends at the query's own end, matching how typing a plain
+        // character already works below -- this palette has no cursor
+        // position of its own to insert at.
+        Key::Character('c') if chord.modifiers.control => {
+            if let Ok(state) = command_palette_state(&workspace.tree, root) {
+                clipboard.set_text(state.query().to_owned());
+            }
+        }
+        Key::Character('v') if chord.modifiers.control => {
+            if let (Ok(state), Some(pasted)) = (
+                command_palette_state(&workspace.tree, root),
+                clipboard.get_text(),
+            ) {
+                let query = format!("{}{pasted}", state.query());
                 if let Err(err) = set_command_palette_query(&mut workspace.tree, root, &query) {
                     tracing::warn!(?err, "failed to update command palette query");
                 }
@@ -566,6 +716,7 @@ fn handle_palette_key(
         }
         _ => {}
     }
+    None
 }
 
 /// One key press's full routing, most-modal-first: the crash-recovery
@@ -576,6 +727,13 @@ fn handle_palette_key(
 /// ([`run_command`]). Anything else (an unbound chord, with nothing
 /// modal open) is silently ignored — there's no text field or canvas
 /// tool to fall back to routing into yet.
+///
+/// Returns `Some(path)` only in the one case no pure `WidgetTree`
+/// mutation can finish on its own: the palette's `Open File…` command
+/// was just activated and the user picked a real file via
+/// `file_dialog` — see [`handle_palette_key`]'s own doc comment. The
+/// caller (`App::handle_key_event`) is what actually has somewhere to
+/// put it.
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     workspace: &mut aurora_ui::Workspace,
@@ -586,19 +744,29 @@ fn handle_key(
     modifiers: Modifiers,
     key: Key,
     text: Option<&str>,
-) {
+    clipboard: &mut dyn ClipboardAccess,
+    file_dialog: &mut dyn FileDialogAccess,
+) -> Option<PathBuf> {
     let chord = KeyChord::new(modifiers, key);
     if dialog.is_some() {
         handle_dialog_key(workspace, focus, dialog, chord);
-        return;
+        return None;
     }
     if palette.is_some() {
-        handle_palette_key(workspace, focus, palette, chord, text);
-        return;
+        return handle_palette_key(
+            workspace,
+            focus,
+            palette,
+            chord,
+            text,
+            clipboard,
+            file_dialog,
+        );
     }
     if let Some(&command) = shortcuts.resolve(chord) {
         run_command(workspace, focus, palette, command);
     }
+    None
 }
 
 /// Translates a real `winit::keyboard::Key` into this crate's own,
@@ -732,6 +900,17 @@ struct App {
     /// monitor with a different scale. `1.0` until a window exists,
     /// matching `winit`'s own default for a not-yet-realized window.
     scale_factor: f64,
+    /// The real system clipboard — [`ClipboardAccess`]'s real
+    /// implementation, used by the command palette's `Ctrl+C`/`Ctrl+V`.
+    clipboard: SystemClipboard,
+    /// The real native file picker — [`FileDialogAccess`]'s real
+    /// implementation, used by [`COMMAND_FILE_OPEN`].
+    file_dialog: SystemFileDialog,
+    /// The most recent path chosen via [`COMMAND_FILE_OPEN`], if any —
+    /// there is no document-import pipeline yet to hand it to (see
+    /// [`palette_commands`]'s own doc comment), so this is only ever
+    /// recorded and logged, ready for whenever that pipeline exists.
+    pending_open_path: Option<PathBuf>,
     /// The window's background clear colour, resolved from
     /// `design/themes/dark.toml`'s `surface.app` token
     /// (`load_background_color`) — invariant §7.3.10 (no hardcoded
@@ -791,6 +970,9 @@ impl App {
             crash_recovery_dialog,
             marker_path,
             scale_factor: 1.0,
+            clipboard: SystemClipboard::new(),
+            file_dialog: SystemFileDialog,
+            pending_open_path: None,
             background,
             failed: false,
         }
@@ -830,7 +1012,7 @@ impl App {
         let Some(key) = translate_key(&event.logical_key) else {
             return;
         };
-        handle_key(
+        let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
             &mut self.crash_recovery_dialog,
@@ -839,7 +1021,13 @@ impl App {
             self.modifiers,
             key,
             event.text.as_deref(),
+            &mut self.clipboard,
+            &mut self.file_dialog,
         );
+        if let Some(path) = picked {
+            tracing::info!(path = %path.display(), "file chosen (no import pipeline yet)");
+            self.pending_open_path = Some(path);
+        }
         self.push_accessibility();
     }
 
@@ -1111,7 +1299,8 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppCommand, COMMAND_FOCUS_LAYERS, CRASH_RECOVERY_CONTINUE, Key, KeyChord, Modifiers,
+        AppCommand, COMMAND_FILE_OPEN, COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS,
+        CRASH_RECOVERY_CONTINUE, ClipboardAccess, FileDialogAccess, Key, KeyChord, Modifiers,
         NamedKey, clear_session_marker, close_command_palette, close_crash_recovery_dialog,
         default_shortcuts, demo_document, handle_dialog_key, handle_key, handle_palette_key,
         load_background_color, load_scales, logical_size, open_command_palette,
@@ -1119,6 +1308,39 @@ mod tests {
         toggle_command_palette, translate_key, translate_modifiers, write_session_marker,
     };
     use aurora_widgets::FocusManager;
+    use std::path::PathBuf;
+
+    /// [`ClipboardAccess`]'s test double — a plain in-memory slot, no
+    /// real OS clipboard involved (this sandbox has no display server
+    /// for a real one to attach to anyway).
+    #[derive(Debug, Default)]
+    struct FakeClipboard {
+        contents: Option<String>,
+    }
+
+    impl ClipboardAccess for FakeClipboard {
+        fn get_text(&mut self) -> Option<String> {
+            self.contents.clone()
+        }
+
+        fn set_text(&mut self, text: String) {
+            self.contents = Some(text);
+        }
+    }
+
+    /// [`FileDialogAccess`]'s test double — returns a canned path (or
+    /// none, simulating a cancelled dialog) instead of showing a real
+    /// native picker.
+    #[derive(Debug, Default)]
+    struct FakeFileDialog {
+        next_pick: Option<PathBuf>,
+    }
+
+    impl FileDialogAccess for FakeFileDialog {
+        fn pick_file(&mut self) -> Option<PathBuf> {
+            self.next_pick.take()
+        }
+    }
 
     /// The workspace structure itself (`aurora_ui::build_workspace`) has
     /// its own, thorough tests in `aurora-ui` — nothing app-specific to
@@ -1429,6 +1651,8 @@ mod tests {
         let mut palette = None;
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
+        let mut clipboard = FakeClipboard::default();
+        let mut file_dialog = FakeFileDialog::default();
         for ch in ['l', 'a', 'y'] {
             handle_palette_key(
                 &mut workspace,
@@ -1436,6 +1660,8 @@ mod tests {
                 &mut palette,
                 KeyChord::new(Modifiers::none(), Key::Character(ch)),
                 Some(&ch.to_string()),
+                &mut clipboard,
+                &mut file_dialog,
             );
         }
 
@@ -1468,6 +1694,8 @@ mod tests {
             &mut palette,
             KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Enter)),
             None,
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
         );
 
         assert_eq!(palette, None, "activating a command must close the palette");
@@ -1490,6 +1718,8 @@ mod tests {
             &mut palette,
             KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
             None,
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
         );
         assert_eq!(palette, None);
         assert_eq!(focus.focused(), None);
@@ -1520,6 +1750,8 @@ mod tests {
             Modifiers::none(),
             Key::Named(NamedKey::Tab),
             None,
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
         );
         assert_eq!(focus.focused(), Some(workspace.layers.root));
     }
@@ -1540,6 +1772,8 @@ mod tests {
             Modifiers::none(),
             Key::Character('z'),
             Some("z"),
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
         );
         assert_eq!(focus.focused(), None);
         assert_eq!(palette, None);
@@ -1566,6 +1800,8 @@ mod tests {
             Modifiers::none(),
             Key::Character('p'),
             Some("p"),
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
         );
 
         let Some(root) = palette else {
@@ -1576,6 +1812,214 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(state.query(), "p");
+    }
+
+    // -- clipboard and file dialogs (M1.8) --
+    //
+    // `handle_palette_key` takes its clipboard/file-dialog access as
+    // trait objects specifically so these can run against
+    // `FakeClipboard`/`FakeFileDialog` -- no real OS clipboard or
+    // native picker involved, matching this module's own doc comment.
+
+    #[test]
+    fn ctrl_c_copies_the_current_query_to_the_clipboard() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard::default();
+        let mut file_dialog = FakeFileDialog::default();
+
+        for ch in ['l', 'a', 'y'] {
+            handle_palette_key(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                KeyChord::new(Modifiers::none(), Key::Character(ch)),
+                Some(&ch.to_string()),
+                &mut clipboard,
+                &mut file_dialog,
+            );
+        }
+        handle_palette_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            KeyChord::new(
+                Modifiers {
+                    control: true,
+                    ..Modifiers::none()
+                },
+                Key::Character('c'),
+            ),
+            None,
+            &mut clipboard,
+            &mut file_dialog,
+        );
+
+        assert_eq!(clipboard.get_text().as_deref(), Some("lay"));
+        assert!(palette.is_some(), "copying must not close the palette");
+    }
+
+    #[test]
+    fn ctrl_v_pastes_the_clipboard_into_the_query() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard {
+            contents: Some("history".to_owned()),
+        };
+        let mut file_dialog = FakeFileDialog::default();
+
+        handle_palette_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            KeyChord::new(
+                Modifiers {
+                    control: true,
+                    ..Modifiers::none()
+                },
+                Key::Character('v'),
+            ),
+            None,
+            &mut clipboard,
+            &mut file_dialog,
+        );
+
+        let Some(root) = palette else {
+            unreachable!("pasting must not close the palette");
+        };
+        let state = match aurora_widgets::widgets::command_palette_state(&workspace.tree, root) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state.query(), "history");
+        assert_eq!(
+            state.selected().map(|entry| entry.id.as_str()),
+            Some(COMMAND_FOCUS_HISTORY)
+        );
+    }
+
+    #[test]
+    fn pasting_an_empty_clipboard_leaves_the_query_unchanged() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard::default();
+        let mut file_dialog = FakeFileDialog::default();
+
+        handle_palette_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            KeyChord::new(
+                Modifiers {
+                    control: true,
+                    ..Modifiers::none()
+                },
+                Key::Character('v'),
+            ),
+            None,
+            &mut clipboard,
+            &mut file_dialog,
+        );
+
+        let Some(root) = palette else {
+            unreachable!("pasting must not close the palette");
+        };
+        let state = match aurora_widgets::widgets::command_palette_state(&workspace.tree, root) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state.query(), "");
+    }
+
+    #[test]
+    fn activating_open_file_returns_the_picked_path() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard::default();
+        let mut file_dialog = FakeFileDialog {
+            next_pick: Some(PathBuf::from("/tmp/example.psd")),
+        };
+
+        for ch in "open file".chars() {
+            handle_palette_key(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                KeyChord::new(Modifiers::none(), Key::Character(ch)),
+                Some(&ch.to_string()),
+                &mut clipboard,
+                &mut file_dialog,
+            );
+        }
+        let Some(root) = palette else {
+            unreachable!("typing must not close the palette");
+        };
+        let state = match aurora_widgets::widgets::command_palette_state(&workspace.tree, root) {
+            Ok(state) => state,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            state.selected().map(|entry| entry.id.as_str()),
+            Some(COMMAND_FILE_OPEN),
+            "sanity check: the query must actually narrow to the Open File command"
+        );
+
+        let picked = handle_palette_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Enter)),
+            None,
+            &mut clipboard,
+            &mut file_dialog,
+        );
+
+        assert_eq!(picked, Some(PathBuf::from("/tmp/example.psd")));
+        assert_eq!(palette, None, "activating a command must close the palette");
+    }
+
+    #[test]
+    fn cancelling_the_file_dialog_returns_none_and_still_closes_the_palette() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let mut clipboard = FakeClipboard::default();
+        // `next_pick: None` -- simulates the user cancelling the native
+        // dialog rather than picking a file.
+        let mut file_dialog = FakeFileDialog::default();
+
+        for ch in "open file".chars() {
+            handle_palette_key(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                KeyChord::new(Modifiers::none(), Key::Character(ch)),
+                Some(&ch.to_string()),
+                &mut clipboard,
+                &mut file_dialog,
+            );
+        }
+        let picked = handle_palette_key(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Enter)),
+            None,
+            &mut clipboard,
+            &mut file_dialog,
+        );
+
+        assert_eq!(picked, None);
+        assert_eq!(palette, None, "must still close, even on a cancelled pick");
     }
 
     // -- crash recovery --
@@ -1767,6 +2211,8 @@ mod tests {
             Modifiers::none(),
             Key::Named(NamedKey::Escape),
             None,
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
         );
 
         assert_eq!(

@@ -24,6 +24,11 @@ allow = [
     "Unicode-3.0",
     "CC0-1.0",
     "Unlicense",
+    # OSI-approved, FSF-libre, permissive (no attribution obligation beyond
+    # keeping the notice in source redistributions) -- pulled in by
+    # `clipboard-win`/`error-code` (arboard's Windows clipboard backend,
+    # PRD §7's "clipboard is our work" / M1.8).
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
 # The allow list is deliberately forward-looking: most entries are not hit yet

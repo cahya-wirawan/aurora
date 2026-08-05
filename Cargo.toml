@@ -99,6 +99,17 @@ winit = { version = "0.30", default-features = false, features = [
     "wayland-dlopen",
     "wayland-csd-adwaita-crossfont",
 ] }
+# PRD §8.3/§14 table: the pre-decided native-dialog crate ("Native
+# dialogs | rfd"). Default features (xdg-portal/wayland on Linux) match
+# what every other windowing feature in this workspace already opts
+# into.
+rfd = "0.17"
+# System clipboard access (PRD §7's "clipboard is our work, not
+# inherited"). Default features off: they pull in `image`/`image-data`
+# support this workspace has no use for yet (nothing copies/pastes
+# pixels) -- text only, the same "declare only what's used" discipline
+# `aurora-widgets`' own headless-mode work already established.
+arboard = { version = "3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
