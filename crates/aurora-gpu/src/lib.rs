@@ -13,7 +13,15 @@
 //! Every module has now run against real hardware on Vulkan (Linux) and
 //! Metal (macOS); only DX12 (Windows) remains unvalidated — see `PLAN.md`
 //! M1.2.
+//!
+//! [`CanvasPipeline`] draws a [`TileResidency`]'s own atlas as a real,
+//! on-screen fullscreen triangle (`spike/vertical-slice`'s own proven
+//! `vs_canvas`/`fs_canvas` shader) — the bind-group-layout/pipeline
+//! logic this crate's own tests had already been exercising privately
+//! (`render_test.rs`) is now real, public production API, for
+//! `aurora-app`'s own canvas rendering (PLAN.md M1.8) to use.
 
+mod canvas;
 mod context;
 mod error;
 mod pipeline;
@@ -27,6 +35,7 @@ mod surface;
 #[cfg(test)]
 mod test_support;
 
+pub use canvas::CanvasPipeline;
 pub use context::GpuContext;
 pub use error::GpuError;
 pub use pipeline::{Blend, PipelineCache, PipelineKey};
