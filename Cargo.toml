@@ -129,6 +129,11 @@ zune-jpeg = "0.5"
 # `zune-jpeg` is decode-only; encoding needs a separate pure-Rust crate.
 # `jpeg-encoder` matches the same "focused, single-purpose" shape.
 jpeg-encoder = "0.7"
+# `tiff` (`image-tiff` upstream) -- the same image-rs organisation as the
+# `png` entry above, and PRD §8.2's own pre-decided pair covers TIFF too
+# ("PNG/JPG/TIFF/WebP/GIF/BMP | `image`, `zune-image`"). One crate here
+# covers both decode and encode, unlike JPEG's two-crate split.
+tiff = "0.11"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

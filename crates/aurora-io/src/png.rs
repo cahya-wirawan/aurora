@@ -90,31 +90,10 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
     let samples = if channels == 4 {
         promoted
     } else {
-        expand_gray_alpha_to_rgba(&promoted)
+        crate::channels::gray_alpha_to_rgba(&promoted)
     };
 
     Image::new(info.width, info.height, IccProfile::srgb(), samples)
-}
-
-/// Expands `Gray, Alpha` pairs into `Red, Green, Blue, Alpha` quads —
-/// the one real post-`EXPAND`/`ALPHA` layout besides RGBA itself (see
-/// [`decode`]'s own doc comment for why grayscale doesn't come out as
-/// RGBA directly).
-fn expand_gray_alpha_to_rgba(samples: &[f16]) -> Vec<f16> {
-    let mut out = Vec::with_capacity(samples.len() * 2);
-    for pair in samples.chunks_exact(2) {
-        let Some(&gray) = pair.first() else {
-            unreachable!("chunks_exact(2) always yields length-2 slices");
-        };
-        let Some(&alpha) = pair.get(1) else {
-            unreachable!("chunks_exact(2) always yields length-2 slices");
-        };
-        out.push(gray);
-        out.push(gray);
-        out.push(gray);
-        out.push(alpha);
-    }
-    out
 }
 
 /// Encodes `image` as an 8-bit PNG (see this module's own doc comment

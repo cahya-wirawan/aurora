@@ -35,6 +35,21 @@ pub enum IoError {
     /// shortcoming.
     #[error("image is {width}x{height}, which exceeds JPEG's own 65535x65535 dimension limit")]
     JpegDimensionsTooLarge { width: u32, height: u32 },
+    #[error("failed to decode TIFF: {0}")]
+    TiffDecode(#[from] tiff::TiffError),
+    #[error("failed to encode TIFF: {0}")]
+    TiffEncode(tiff::TiffError),
+    /// The decoded TIFF's own pixel layout (`tiff::ColorType`) is one
+    /// this crate doesn't handle yet — see `tiff` module doc comment
+    /// for exactly which layouts are covered (real, checked scope, not
+    /// every TIFF variant that exists).
+    #[error("decoded TIFF has an unsupported colour layout: {0:?}")]
+    UnsupportedTiffColorType(tiff::ColorType),
+    /// The decoded TIFF's own sample format (`tiff::decoder::DecodingResult`'s
+    /// variant — e.g. 32-bit float) isn't one of the two this crate
+    /// promotes from (8-bit or 16-bit unsigned integer samples).
+    #[error("decoded TIFF uses an unsupported sample format: {0}")]
+    UnsupportedTiffSampleFormat(&'static str),
     /// [`crate::Image::new`] was given a sample buffer whose length
     /// doesn't match `width * height * 4`.
     #[error("image is {width}x{height} (expects {expected} samples) but got {actual} samples")]
