@@ -137,12 +137,20 @@
 //! holds, painted or not) and draws it within that area's own viewport,
 //! in the same pass that already clears the background — a Brush stroke
 //! is now actually visible, not just written into an otherwise-invisible
-//! store. **Scope, stated honestly**: only `CanvasView`'s pan is
-//! reflected (`tile_origin_for_view` deliberately ignores zoom —
-//! `TileResidency` has no scale support); the atlas is sized once at
+//! store. **Zoom followed the same way pan did**: `redraw` now passes
+//! `canvas_view.zoom()` into `aurora_gpu::TileResidency::set_origin`,
+//! which shrinks/grows the atlas's own sampled `uv_scale` by that
+//! factor (shader-side scaling — no bigger upload, no mip selection);
+//! `tile_origin_for_view` goes through `CanvasView::to_document` instead
+//! of assuming `zoom() == 1.0`, so panning while zoomed picks the right
+//! tile too. **Scope, stated honestly**: the atlas's own uv offset is
+//! still only tile-granular (no sub-tile fractional scroll — see
+//! `tile_origin_for_view`'s own doc comment); the atlas is sized once at
 //! startup and does not resize with the window
-//! (`TileResidency`'s own documented limitation); rotation, rulers,
-//! guides, grid, and snap remain this bullet's own still-open remainder.
+//! (`TileResidency`'s own documented limitation); rendering a lower mip
+//! while zoomed out or panning (`spike/FINDINGS.md`'s own progressive-
+//! rendering finding), rotation, rulers, guides, grid, and snap all
+//! remain this bullet's own still-open remainder.
 //! Not yet real-hardware-verified (this sandbox has no display server;
 //! real GPU tests pass here, but nothing has shown this crate's own
 //! window on an actual screen since M1.8's original human-verification
@@ -1524,13 +1532,20 @@ const ERASER_RADIUS: f32 = 24.0;
 // atlas from the live store and draws it within that area's own
 // viewport, inside the same pass that already clears the background.
 //
-// Scope, stated honestly: only pan is reflected (`CanvasView`'s own
-// `zoom`, and rotation/rulers/guides/grid/snap, are not -- this bullet's
-// own still-open remainder); the atlas is sized once at startup and
-// does not resize with the window (`TileResidency`'s own documented
-// limitation); and infinite zoom, rotation, rulers, guides, grid, and
-// snap are all still separately open, exactly as the bullet's own name
-// says.
+// `CanvasView`'s own `zoom` is reflected too, added the same week:
+// `redraw` passes `canvas_view.zoom()` into `TileResidency::set_origin`,
+// which now scales the atlas's own sampled `uv_scale` by it (shader-side
+// magnification -- no bigger upload, no mip selection), and
+// `tile_origin_for_view` picks the right tile via `CanvasView::to_document`
+// instead of assuming 100% zoom.
+//
+// Scope, stated honestly: the atlas's own uv offset is still only
+// tile-granular (no sub-tile fractional scroll); the atlas is sized once
+// at startup and does not resize with the window (`TileResidency`'s own
+// documented limitation); and rendering a lower mip while zoomed out or
+// panning (the progressive-rendering finding `spike/FINDINGS.md` names),
+// rotation, rulers, guides, grid, and snap are all still separately
+// open, exactly as the bullet's own name says.
 
 /// The canvas dock area's own on-screen rectangle, in physical pixels
 /// (`bounds`'s logical units scaled by `scale_factor`) — `(x, y, width,
@@ -1579,15 +1594,21 @@ fn canvas_area_physical_size(
 }
 
 /// The document-space point currently at the canvas area's own top-left
-/// corner, given `view`'s own pan — the [`aurora_tile::TileId`] this
-/// maps to is where [`aurora_gpu::TileResidency::set_origin`] should
-/// point the atlas.
+/// corner, given `view`'s own pan *and zoom* — the [`aurora_tile::TileId`]
+/// this maps to is where [`aurora_gpu::TileResidency::set_origin`]
+/// should point the atlas.
 ///
-/// **Zoom is deliberately not reflected here** — `TileResidency` has no
-/// scale support (it samples its atlas 1:1 into the viewport), so this
-/// assumes `view.zoom() == 1.0` regardless of its real value; real
-/// zoom-aware rendering needs either shader-side scaling or mip-level
-/// selection tied to zoom, separate follow-on work this bullet's own
+/// Goes through [`aurora_ui::CanvasView::to_document`] rather than
+/// dividing `view.pan()` by [`aurora_tile::TILE`] directly, so a
+/// non-100% zoom is accounted for too (`to_document` already divides by
+/// `view.zoom()`) — real zoom-aware panning, not the "assumes
+/// `view.zoom() == 1.0`" approximation this function used before
+/// [`aurora_gpu::TileResidency::set_origin`] gained real scale support.
+/// Still only tile-*granular*, though: the atlas's own uv offset always
+/// starts at a whole tile's own top-left corner, so any sub-tile
+/// fractional scroll within that tile isn't reflected — a real fix
+/// needs a fractional uv offset alongside `TileResidency`'s existing
+/// zoom-scaled `uv_scale`, separate follow-on work this bullet's own
 /// "infinite zoom" remainder still names. Negative document coordinates
 /// (panning above/left of the document's own origin) clamp to `0` —
 /// `TileId`'s own fields are unsigned, so there is no tile to point to
@@ -1596,11 +1617,11 @@ fn canvas_area_physical_size(
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn tile_origin_for_view(view: &aurora_ui::CanvasView) -> aurora_tile::TileId {
-    let (pan_x, pan_y) = view.pan();
+    let (doc_x, doc_y) = view.to_document((0.0, 0.0));
     #[allow(clippy::cast_precision_loss)]
     let tile_size = aurora_tile::TILE as f32;
-    let x = (-pan_x / tile_size).floor().max(0.0);
-    let y = (-pan_y / tile_size).floor().max(0.0);
+    let x = (doc_x / tile_size).floor().max(0.0);
+    let y = (doc_y / tile_size).floor().max(0.0);
     aurora_tile::TileId {
         x: x as u32,
         y: y as u32,
@@ -2161,6 +2182,7 @@ impl App {
                             gpu.queue(),
                             tile_origin_for_view(&self.canvas_view),
                             canvas_size,
+                            self.canvas_view.zoom(),
                         );
                     }
                     if let (Some(layer_id), Some(store)) =
@@ -3873,6 +3895,22 @@ mod tests {
         // pixels *past* one whole tile -- origin must advance to (1, 1).
         let mut view = CanvasView::new();
         view.pan_by((-300.0, -300.0));
+        assert_eq!(
+            tile_origin_for_view(&view),
+            aurora_tile::TileId { x: 1, y: 1 }
+        );
+    }
+
+    #[test]
+    fn tile_origin_for_view_accounts_for_zoom_not_just_pan() {
+        // The same 600px pan means a different document-space top-left
+        // depending on zoom (`to_document` divides by `zoom`) -- at 2x
+        // zoom, 600 screen px is only 300 document px, landing in tile
+        // (1, 1), not the (2, 2) a zoom-blind computation (dividing pan
+        // by `TILE` directly, as this function used to) would give.
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 2.0);
+        view.pan_by((-600.0, -600.0));
         assert_eq!(
             tile_origin_for_view(&view),
             aurora_tile::TileId { x: 1, y: 1 }

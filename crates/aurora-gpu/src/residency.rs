@@ -121,7 +121,7 @@ impl TileResidency {
             slots: HashMap::new(),
             origin: TileId { x: 0, y: 0 },
         };
-        residency.write_uniform(queue, viewport_px);
+        residency.write_uniform(queue, viewport_px, 1.0);
         residency
     }
 
@@ -148,15 +148,33 @@ impl TileResidency {
         self.origin
     }
 
-    /// Call when the visible top-left tile changes (panning). Updates
-    /// the UV uniform immediately; the texture itself is only touched by
-    /// the next [`Self::sync`].
-    pub fn set_origin(&mut self, queue: &wgpu::Queue, origin: TileId, viewport_px: (u32, u32)) {
+    /// Call when the visible top-left tile changes (panning) or `zoom`
+    /// itself changes. Updates the UV uniform immediately; the texture
+    /// itself is only touched by the next [`Self::sync`].
+    ///
+    /// `zoom`: document pixels per logical screen pixel, matching
+    /// `aurora_ui::CanvasView::zoom`'s own convention (`1.0` = 100%,
+    /// `> 1.0` magnifies). Shrinks `uv_scale` by this factor — at 200%
+    /// zoom, half as many atlas texels stretch across the same
+    /// viewport, magnifying them — the shader-side scaling this
+    /// texture-sliding-window design needs instead of an actual bigger
+    /// upload (the atlas itself is still sized in document pixels, one
+    /// tile of margin at 100%, unrelated to `zoom`). Callers must pass a
+    /// positive `zoom`; `aurora_ui::CanvasView` already clamps to
+    /// `[MIN_ZOOM, MAX_ZOOM]`, both comfortably positive, so there is no
+    /// zero/negative case to guard against here.
+    pub fn set_origin(
+        &mut self,
+        queue: &wgpu::Queue,
+        origin: TileId,
+        viewport_px: (u32, u32),
+        zoom: f32,
+    ) {
         self.origin = origin;
-        self.write_uniform(queue, viewport_px);
+        self.write_uniform(queue, viewport_px, zoom);
     }
 
-    fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32)) {
+    fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32), zoom: f32) {
         let tex_w = (self.grid.0 * TILE) as f32;
         let tex_h = (self.grid.1 * TILE) as f32;
         // Absolute scroll (origin in pixels), wrapped by the repeat
@@ -165,7 +183,10 @@ impl TileResidency {
         let scroll = (self.origin.x * TILE, self.origin.y * TILE);
         let u = (scroll.0 % (self.grid.0 * TILE)) as f32 / tex_w;
         let v = (scroll.1 % (self.grid.1 * TILE)) as f32 / tex_h;
-        let uv_scale = [viewport_px.0 as f32 / tex_w, viewport_px.1 as f32 / tex_h];
+        let uv_scale = [
+            viewport_px.0 as f32 / zoom / tex_w,
+            viewport_px.1 as f32 / zoom / tex_h,
+        ];
         let mut bytes = Vec::with_capacity(16);
         for value in [u, v, uv_scale[0], uv_scale[1]] {
             bytes.extend_from_slice(&value.to_le_bytes());
@@ -450,7 +471,7 @@ mod tests {
         // column so it has real content to upload.
         paint(&mut store, TileId { x: 2, y: 0 }, [0.0, 1.0, 0.0, 1.0]);
         paint(&mut store, TileId { x: 2, y: 1 }, [0.0, 1.0, 0.0, 1.0]);
-        residency.set_origin(context.queue(), TileId { x: 1, y: 0 }, viewport);
+        residency.set_origin(context.queue(), TileId { x: 1, y: 0 }, viewport, 1.0);
         let third = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
         assert_eq!(
             third.uploaded, 2,
