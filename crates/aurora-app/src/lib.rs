@@ -16,24 +16,28 @@
 //! a real theme token (`design/themes/dark.toml`'s `surface.app`, the
 //! only built-in theme that exists as a real design yet). Still nothing
 //! renders visually beyond the background clear — the canvas itself,
-//! tools, IME, native menus, and drag & drop are this milestone's other,
-//! separate, still-open bullets.
+//! tools, IME, and native menus are this milestone's other, separate,
+//! still-open bullets.
 //!
-//! **System clipboard and native file dialogs**: `rfd`/`arboard`,
-//! PRD §8.3's own pre-decided choices. The command palette's
-//! `Ctrl+C`/`Ctrl+V` read and write the real system clipboard, and its
-//! "Open File…" entry shows a real, native `rfd::FileDialog`. Both are
-//! real platform calls with no meaningful headless behaviour, so
-//! `handle_palette_key` takes them as `&mut dyn ClipboardAccess`/
-//! `&mut dyn FileDialogAccess` rather than calling `arboard`/`rfd`
-//! directly — the same "keep the pure dispatch logic testable, isolate
-//! the untestable platform call" seam `translate_key`/
-//! `translate_modifiers` already use for keyboard input, just for two
-//! more platform calls. **Honest about its own limit**: a file chosen
-//! via "Open File…" is only recorded (`App::pending_open_path`), not
-//! imported — `aurora-io` remains an empty skeleton (separate M1.9
-//! work), the same "detect a real signal, defer the action" pattern
-//! this crate's own crash-recovery marker already uses.
+//! **System clipboard, native file dialogs, and drag & drop**:
+//! `rfd`/`arboard`, PRD §8.3's own pre-decided choices, plus `winit`'s
+//! own native `WindowEvent::DroppedFile` (no extra dependency needed).
+//! The command palette's `Ctrl+C`/`Ctrl+V` read and write the real
+//! system clipboard, and its "Open File…" entry shows a real, native
+//! `rfd::FileDialog`; a real drag-and-dropped file is recorded the same
+//! way. Both `arboard`/`rfd` are real platform calls with no meaningful
+//! headless behaviour, so `handle_palette_key` takes them as
+//! `&mut dyn ClipboardAccess`/`&mut dyn FileDialogAccess` rather than
+//! calling them directly — the same "keep the pure dispatch logic
+//! testable, isolate the untestable platform call" seam `translate_key`/
+//! `translate_modifiers` already use for keyboard input. **Honest about
+//! its own limit**: a file chosen via "Open File…" *or* dropped onto the
+//! window is only recorded (`App::pending_open_path` — the same slot
+//! either route writes to, since both are the same "the user wants to
+//! open this" signal), not imported — `aurora-io` remains an empty
+//! skeleton (separate M1.9 work), the same "detect a real signal, defer
+//! the action" pattern this crate's own crash-recovery marker already
+//! uses.
 //!
 //! **DPI/scale-factor aware layout**: `logical_size` divides a real
 //! physical window size by `Window::scale_factor` before it reaches
@@ -78,8 +82,8 @@
 //! and the accessibility tree both reach a real screen reader. Windows
 //! and Linux remain unverified on real hardware — see PLAN.md M1.8. The
 //! keyboard-shortcut/command-palette/crash-recovery/DPI-scaling/
-//! clipboard/file-dialog work above has not yet had its own
-//! real-hardware pass.
+//! clipboard/file-dialog/drag-and-drop work above has not yet had its
+//! own real-hardware pass.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1031,6 +1035,19 @@ impl App {
         self.push_accessibility();
     }
 
+    /// Records a real, native `WindowEvent::DroppedFile` — the same
+    /// "detect a real signal, defer the action" honesty
+    /// [`COMMAND_FILE_OPEN`] already applies: there is no import
+    /// pipeline yet for a dropped path to feed into, so this only
+    /// records it (reusing the exact same [`Self::pending_open_path`]
+    /// slot the palette's "Open File…" command already writes to — a
+    /// dropped file and a chosen one are the same kind of "the user
+    /// wants to open this" signal, whichever route it arrived by).
+    fn handle_dropped_file(&mut self, path: PathBuf) {
+        tracing::info!(path = %path.display(), "file dropped (no import pipeline yet)");
+        self.pending_open_path = Some(path);
+    }
+
     /// Logs `message`, marks this run as failed, and asks the event loop
     /// to exit — the one way an `ApplicationHandler` callback (all of
     /// which are `&mut self` with no `Result` return) can surface an
@@ -1230,6 +1247,17 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                     let size = window.inner_size();
                     self.apply_resize((size.width, size.height));
                 }
+            }
+            WindowEvent::DroppedFile(path) => self.handle_dropped_file(path),
+            // No drop-target visual affordance exists yet (nothing
+            // renders a pixel in this crate regardless of drag state),
+            // so a hover just gets a debug-level trace -- there's
+            // nothing else to react to it with yet.
+            WindowEvent::HoveredFile(path) => {
+                tracing::debug!(path = %path.display(), "file hovered over the window");
+            }
+            WindowEvent::HoveredFileCancelled => {
+                tracing::debug!("file drag cancelled");
             }
             _ => {}
         }
