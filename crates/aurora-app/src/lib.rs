@@ -16,8 +16,21 @@
 //! a real theme token (`design/themes/dark.toml`'s `surface.app`, the
 //! only built-in theme that exists as a real design yet). Still nothing
 //! renders visually beyond the background clear — the canvas itself,
-//! tools, IME, native menus, and DPI handling are this milestone's
-//! other, separate, still-open bullets.
+//! tools, IME, and native menus are this milestone's other, separate,
+//! still-open bullets.
+//!
+//! **DPI/scale-factor aware layout**: `logical_size` divides a real
+//! physical window size by `Window::scale_factor` before it reaches
+//! `WidgetTree::compute_layout` — every widget's own layout style is
+//! defined in logical, DPI-independent units
+//! (`aurora_theme::Scales`-derived), so feeding it raw physical pixels
+//! would make widgets the wrong on-screen size on any display where
+//! `scale_factor != 1.0`. Kept current via
+//! `WindowEvent::ScaleFactorChanged` (e.g. the window moves to a
+//! monitor with a different DPI), which is the same mechanism a genuine
+//! multi-monitor, mixed-DPI setup relies on — real and exercised for a
+//! single monitor's scale factor changing, though not yet verified on
+//! actual multi-monitor hardware.
 //!
 //! **Real keyboard input, for the first time in this crate**: a fixed
 //! set of global shortcuts (`default_shortcuts` — `Tab`/`Shift+Tab` for
@@ -48,8 +61,8 @@
 //! announces it — the create-hidden → attach-adapter → show ordering
 //! and the accessibility tree both reach a real screen reader. Windows
 //! and Linux remain unverified on real hardware — see PLAN.md M1.8. The
-//! keyboard-shortcut/command-palette/crash-recovery work above has not
-//! yet had its own real-hardware pass.
+//! keyboard-shortcut/command-palette/crash-recovery/DPI-scaling work
+//! above has not yet had its own real-hardware pass.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -648,6 +661,32 @@ fn translate_modifiers(state: winit::keyboard::ModifiersState) -> Modifiers {
     }
 }
 
+/// Converts a real, physical-pixel window size into the logical pixels
+/// `aurora_widgets::WidgetTree::compute_layout` expects, dividing out
+/// `scale_factor` — `winit`'s own physical/logical distinction
+/// (`winit::dpi`'s own doc module), applied at the one seam in this
+/// crate where a physical size reaches layout. Fractional scale factors
+/// below `1.0` are real (some Linux compositors allow scaling down, not
+/// just up), so this only falls back to `1.0` for a value `winit` should
+/// never actually report — non-positive or non-finite — rather than
+/// clamping every small-but-legitimate factor to `1.0` and getting the
+/// conversion wrong for them.
+#[must_use]
+fn logical_size(physical: (u32, u32), scale_factor: f64) -> (f32, f32) {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let (width, height) = (f64::from(physical.0), f64::from(physical.1));
+    #[allow(clippy::cast_possible_truncation)]
+    (
+        (width / scale_factor) as f32,
+        (height / scale_factor) as f32,
+    )
+}
+
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
@@ -687,6 +726,12 @@ struct App {
     /// before this `App` is built, cleared on a clean shutdown
     /// (`WindowEvent::CloseRequested`).
     marker_path: PathBuf,
+    /// The window's current DPI scale factor (`Window::scale_factor`) —
+    /// read once the real window exists (`resumed`) and kept current via
+    /// `WindowEvent::ScaleFactorChanged`, e.g. when the window moves to a
+    /// monitor with a different scale. `1.0` until a window exists,
+    /// matching `winit`'s own default for a not-yet-realized window.
+    scale_factor: f64,
     /// The window's background clear colour, resolved from
     /// `design/themes/dark.toml`'s `surface.app` token
     /// (`load_background_color`) — invariant §7.3.10 (no hardcoded
@@ -745,6 +790,7 @@ impl App {
             command_palette: None,
             crash_recovery_dialog,
             marker_path,
+            scale_factor: 1.0,
             background,
             failed: false,
         }
@@ -808,20 +854,31 @@ impl App {
         el.exit();
     }
 
-    /// Recomputes the workspace layout for `size`, then reconfigures the
-    /// presentation surface to match — layout is pure geometry (no GPU
-    /// needed) and stays current even before a window/device exist,
-    /// unlike the surface resize below, which does need both.
-    fn apply_resize(&mut self, size: (u32, u32)) {
-        #[allow(clippy::cast_precision_loss)]
-        self.workspace
-            .tree
-            .compute_layout(size.0 as f32, size.1 as f32);
+    /// Recomputes the workspace layout for `physical_size`, then
+    /// reconfigures the presentation surface to match — layout is pure
+    /// geometry (no GPU needed) and stays current even before a
+    /// window/device exist, unlike the surface resize below, which does
+    /// need both.
+    ///
+    /// `physical_size` is converted to logical pixels via
+    /// [`logical_size`]/`self.scale_factor` before it reaches
+    /// `compute_layout`: every widget's own layout style
+    /// (`aurora_theme::Scales`-derived padding/spacing) is defined in
+    /// logical, DPI-independent units, so feeding it raw physical pixels
+    /// would make widgets balloon to the wrong on-screen size on any
+    /// display where `scale_factor != 1.0` — exactly the class of bug
+    /// PLAN.md M1.8's "per-monitor DPI and fractional scaling" bullet is
+    /// named for. The GPU surface itself still resizes to the real
+    /// physical size — a render target's pixel dimensions are never
+    /// logical.
+    fn apply_resize(&mut self, physical_size: (u32, u32)) {
+        let (width, height) = logical_size(physical_size, self.scale_factor);
+        self.workspace.tree.compute_layout(width, height);
 
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };
-        surface.resize(gpu.device(), size);
+        surface.resize(gpu.device(), physical_size);
     }
 
     /// Clears the surface to the real theme background colour and
@@ -922,10 +979,9 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             accesskit_winit::Adapter::with_event_loop_proxy(el, &window, self.proxy.clone());
         window.set_visible(true);
 
-        #[allow(clippy::cast_precision_loss)]
-        self.workspace
-            .tree
-            .compute_layout(size.width as f32, size.height as f32);
+        self.scale_factor = window.scale_factor();
+        let (width, height) = logical_size((size.width, size.height), self.scale_factor);
+        self.workspace.tree.compute_layout(width, height);
 
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -974,6 +1030,19 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 self.modifiers = translate_modifiers(modifiers.state());
             }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key_event(&event),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // e.g. the window moved to a monitor with a different
+                // DPI scale -- the physical size winit reports for the
+                // *same* window may not have changed at all, but the
+                // logical size `apply_resize` computes from it has, so
+                // this always re-applies even when `inner_size` itself
+                // is unchanged.
+                self.scale_factor = scale_factor;
+                if let Some(window) = self.window.as_ref() {
+                    let size = window.inner_size();
+                    self.apply_resize((size.width, size.height));
+                }
+            }
             _ => {}
         }
     }
@@ -1045,9 +1114,9 @@ mod tests {
         AppCommand, COMMAND_FOCUS_LAYERS, CRASH_RECOVERY_CONTINUE, Key, KeyChord, Modifiers,
         NamedKey, clear_session_marker, close_command_palette, close_crash_recovery_dialog,
         default_shortcuts, demo_document, handle_dialog_key, handle_key, handle_palette_key,
-        load_background_color, load_scales, open_command_palette, open_crash_recovery_dialog,
-        previous_session_left_a_marker, run_command, toggle_command_palette, translate_key,
-        translate_modifiers, write_session_marker,
+        load_background_color, load_scales, logical_size, open_command_palette,
+        open_crash_recovery_dialog, previous_session_left_a_marker, run_command,
+        toggle_command_palette, translate_key, translate_modifiers, write_session_marker,
     };
     use aurora_widgets::FocusManager;
 
@@ -1221,6 +1290,48 @@ mod tests {
         assert!(modifiers.shift);
         assert!(!modifiers.alt);
         assert!(!modifiers.meta);
+    }
+
+    // -- DPI/scale-factor conversion --
+
+    #[test]
+    fn logical_size_is_unchanged_at_a_scale_factor_of_one() {
+        assert_eq!(logical_size((1280, 800), 1.0), (1280.0, 800.0));
+    }
+
+    #[test]
+    fn logical_size_divides_out_a_scale_factor_above_one() {
+        // A real, common HiDPI factor -- 2560x1600 physical at 2.0x is
+        // exactly the 1280x800 logical size `resumed`'s own initial
+        // window request asks for.
+        assert_eq!(logical_size((2560, 1600), 2.0), (1280.0, 800.0));
+    }
+
+    #[test]
+    fn logical_size_handles_a_fractional_scale_factor() {
+        assert_eq!(logical_size((1920, 1080), 1.25), (1536.0, 864.0));
+    }
+
+    #[test]
+    fn logical_size_handles_a_scale_factor_below_one() {
+        // Real on some Linux compositors that allow scaling down, not
+        // just up -- must divide, not silently clamp to 1.0.
+        assert_eq!(logical_size((800, 600), 0.8), (1000.0, 750.0));
+    }
+
+    #[test]
+    fn logical_size_falls_back_to_one_for_a_non_positive_scale_factor() {
+        // Not a value `winit` should ever actually report, but this
+        // function stays total (no division by zero or a negative
+        // result) rather than trusting an external value blindly.
+        assert_eq!(logical_size((1280, 800), 0.0), (1280.0, 800.0));
+        assert_eq!(logical_size((1280, 800), -2.0), (1280.0, 800.0));
+    }
+
+    #[test]
+    fn logical_size_falls_back_to_one_for_a_non_finite_scale_factor() {
+        assert_eq!(logical_size((1280, 800), f64::NAN), (1280.0, 800.0));
+        assert_eq!(logical_size((1280, 800), f64::INFINITY), (1280.0, 800.0));
     }
 
     #[test]
