@@ -139,6 +139,116 @@ pub fn stamp_dab(
     Ok(touched)
 }
 
+/// Erases within one dab centered at `center` (surface-pixel
+/// coordinates, same space [`stamp_dab`] uses), by the same smooth
+/// radial falloff `stamp_dab` computes for `a`, into `store`'s
+/// `surface` — PLAN.md M1.9's "basic brush and eraser" bullet's other
+/// half. **Subtractive, not blended**: reduces existing alpha
+/// multiplicatively toward zero (`new_alpha = dst_alpha * (1.0 - a)`)
+/// rather than painting a `colour` in; a dab centered on an already-
+/// opaque texel erases it outright (`a` reaches `1.0` at dead center),
+/// while one at the falloff's edge only thins it. Leaves RGB
+/// untouched — this store's alpha is straight (unassociated), so a
+/// channel behind a fully-erased pixel carries no meaning until
+/// something is painted there again.
+///
+/// Touches the same tiles [`stamp_dab`] would for the same
+/// `center`/`radius`, marking each touched tile's dirty rectangle so a
+/// later GPU upload only re-reads what actually changed. A texel
+/// already fully transparent (`dst_alpha <= 0.0`) is skipped rather
+/// than marked dirty, since erasing it further is a no-op. Returns the
+/// number of tiles touched.
+///
+/// `radius <= 0.0` touches nothing and returns `0`, matching
+/// [`stamp_dab`].
+///
+/// # Errors
+///
+/// Returns [`TileError`] if paging a touched tile in from the scratch
+/// disk fails.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn erase_dab(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+) -> Result<usize, TileError> {
+    if radius <= 0.0 {
+        return Ok(0);
+    }
+    let (cx, cy) = center;
+    let min_x = (cx - radius).floor().max(0.0) as u32;
+    let min_y = (cy - radius).floor().max(0.0) as u32;
+    let max_x = (cx + radius).ceil().max(0.0) as u32;
+    let max_y = (cy + radius).ceil().max(0.0) as u32;
+
+    let t0 = TileId {
+        x: min_x / TILE,
+        y: min_y / TILE,
+    };
+    let t1 = TileId {
+        x: max_x / TILE,
+        y: max_y / TILE,
+    };
+    let mut touched = 0;
+
+    for ty in t0.y..=t1.y {
+        for tx in t0.x..=t1.x {
+            let id = TileId { x: tx, y: ty };
+            let origin_x = tx * TILE;
+            let origin_y = ty * TILE;
+            let tile = store.get_mut(surface, id)?;
+            touched += 1;
+
+            let lx0 = min_x.saturating_sub(origin_x).min(TILE - 1);
+            let ly0 = min_y.saturating_sub(origin_y).min(TILE - 1);
+            let lx1 = max_x.saturating_sub(origin_x).min(TILE - 1);
+            let ly1 = max_y.saturating_sub(origin_y).min(TILE - 1);
+            let mut touched_this_tile = false;
+            let texels = tile.texels_mut();
+
+            for ly in ly0..=ly1 {
+                for lx in lx0..=lx1 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let px = (origin_x + lx) as f32 + 0.5;
+                    #[allow(clippy::cast_precision_loss)]
+                    let py = (origin_y + ly) as f32 + 0.5;
+                    let d = (px - cx).hypot(py - cy);
+                    if d > radius {
+                        continue;
+                    }
+                    let a = (1.0 - (d / radius)).clamp(0.0, 1.0).powf(1.5);
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    let index = texel_index(lx, ly);
+                    let Some(&dst_a) = texels.get(index + 3) else {
+                        continue;
+                    };
+                    let dst_a = dst_a.to_f32();
+                    if dst_a <= 0.0 {
+                        continue;
+                    }
+                    let new_a = dst_a * (1.0 - a);
+                    if let Some(sample) = texels.get_mut(index + 3) {
+                        *sample = f16::from_f32(new_a);
+                    }
+                    touched_this_tile = true;
+                }
+            }
+            if touched_this_tile {
+                tile.mark_dirty(Rect {
+                    x: i64::from(lx0),
+                    y: i64::from(ly0),
+                    width: lx1 - lx0 + 1,
+                    height: ly1 - ly0 + 1,
+                });
+            }
+        }
+    }
+    Ok(touched)
+}
+
 /// Stamps a whole stroke: [`crate::dabs_along_path`]'s own dab centers,
 /// each via [`stamp_dab`], in order. The actual "wire `dabs_along_path`
 /// into real dab-stamping" step `dab`'s own doc comment named.
@@ -163,9 +273,32 @@ pub fn stamp_stroke(
     Ok(touched)
 }
 
+/// Erases a whole stroke: [`crate::dabs_along_path`]'s own dab centers,
+/// each via [`erase_dab`], in order — [`stamp_stroke`]'s subtractive
+/// counterpart.
+///
+/// # Errors
+///
+/// Returns [`TileError`] if any dab's own [`erase_dab`] call fails —
+/// stops at the first failure rather than continuing to erase a
+/// surface a scratch-disk error has already been raised against.
+pub fn erase_stroke(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    points: &[(f32, f32)],
+    radius: f32,
+    spacing: f32,
+) -> Result<usize, TileError> {
+    let mut touched = 0;
+    for dab in crate::dabs_along_path(points, radius, spacing) {
+        touched += erase_dab(store, surface, dab, radius)?;
+    }
+    Ok(touched)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{stamp_dab, stamp_stroke};
+    use super::{erase_dab, erase_stroke, stamp_dab, stamp_stroke};
     use aurora_tile::{SurfaceId, TileId, TileStore};
     use std::num::NonZeroUsize;
 
@@ -336,6 +469,176 @@ mod tests {
         assert!(
             tile_b.texels().iter().all(|s| s.to_f32() == 0.0),
             "surface_b must be untouched by a dab stamped on surface_a"
+        );
+    }
+
+    #[test]
+    fn zero_radius_erase_touches_nothing() {
+        let (_dir, mut store) = store();
+        let touched = match erase_dab(&mut store, surface(), (10.0, 10.0), 0.0) {
+            Ok(touched) => touched,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(touched, 0);
+        assert_eq!(store.resident_len(), 0, "must not even touch a tile");
+    }
+
+    #[test]
+    fn erasing_an_untouched_pixel_is_a_no_op() {
+        let (_dir, mut store) = store();
+        if let Err(err) = erase_dab(&mut store, surface(), (10.0, 10.0), 20.0) {
+            unreachable!("{err:?}");
+        }
+        let tile = match store.get(surface(), TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            tile.texels().iter().all(|s| s.to_f32() == 0.0),
+            "erasing already-transparent pixels must leave them exactly as they were"
+        );
+    }
+
+    #[test]
+    fn erase_dab_centered_on_an_opaque_texel_erases_it_outright() {
+        let (_dir, mut store) = store();
+        // (10.5, 10.5) lands exactly on texel (10, 10)'s own sample
+        // point (`stamp_dab`'s `px`/`py` add 0.5), so `d == 0` and the
+        // falloff `a` is exactly `1.0` -- genuinely dead center, not
+        // just close to it.
+        if let Err(err) = stamp_dab(&mut store, surface(), (10.5, 10.5), 20.0, [1.0, 0.0, 0.0]) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = erase_dab(&mut store, surface(), (10.5, 10.5), 20.0) {
+            unreachable!("{err:?}");
+        }
+        let tile = match store.get(surface(), TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let index = (10 * aurora_tile::TILE + 10) as usize * aurora_tile::CHANNELS;
+        let Some(&a) = tile.texels().get(index + 3) else {
+            unreachable!("index is in bounds for a full tile");
+        };
+        assert!(
+            a.to_f32() < 0.01,
+            "a dab centered dead-on an opaque texel (falloff a == 1.0) must erase it to ~0: {a:?}"
+        );
+    }
+
+    #[test]
+    fn erase_dab_leaves_rgb_untouched() {
+        let (_dir, mut store) = store();
+        if let Err(err) = stamp_dab(&mut store, surface(), (10.0, 10.0), 20.0, [0.0, 1.0, 0.0]) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = erase_dab(&mut store, surface(), (10.0, 10.0), 20.0) {
+            unreachable!("{err:?}");
+        }
+        let tile = match store.get(surface(), TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let index = (10 * aurora_tile::TILE + 10) as usize * aurora_tile::CHANNELS;
+        let Some(&g) = tile.texels().get(index + 1) else {
+            unreachable!("index is in bounds for a full tile");
+        };
+        assert!(
+            g.to_f32() > 0.5,
+            "erasing must reduce alpha only, leaving the RGB channels as they were: {g:?}"
+        );
+    }
+
+    #[test]
+    fn erase_dab_at_the_falloff_edge_only_thins_a_texel_not_erase_it_outright() {
+        let (_dir, mut store) = store();
+        if let Err(err) = stamp_dab(&mut store, surface(), (10.0, 10.0), 20.0, [1.0, 0.0, 0.0]) {
+            unreachable!("{err:?}");
+        }
+        let index = (10 * aurora_tile::TILE + 10) as usize * aurora_tile::CHANNELS;
+        let before = {
+            let tile = match store.get(surface(), TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(&a) = tile.texels().get(index + 3) else {
+                unreachable!("index is in bounds for a full tile");
+            };
+            a.to_f32()
+        };
+        // A small eraser radius centered a few pixels away from (10, 10)
+        // reaches it only near the falloff's own edge (small `a`), so it
+        // should thin rather than fully clear it.
+        if let Err(err) = erase_dab(&mut store, surface(), (13.0, 10.0), 4.0) {
+            unreachable!("{err:?}");
+        }
+        let tile = match store.get(surface(), TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(&after) = tile.texels().get(index + 3) else {
+            unreachable!("index is in bounds for a full tile");
+        };
+        let after = after.to_f32();
+        assert!(
+            after < before,
+            "must have thinned the alpha at all: {after} vs {before}"
+        );
+        assert!(
+            after > 0.1,
+            "an edge-of-falloff erase must not fully clear the texel: {after}"
+        );
+    }
+
+    #[test]
+    fn erase_stroke_touches_every_dab_along_the_path() {
+        let (_dir, mut store) = store();
+        if let Err(err) = stamp_stroke(
+            &mut store,
+            surface(),
+            &[(0.0, 0.0), (10.0, 0.0)],
+            10.0,
+            0.25,
+            [1.0, 1.0, 1.0],
+        ) {
+            unreachable!("{err:?}");
+        }
+        let touched = match erase_stroke(
+            &mut store,
+            surface(),
+            &[(0.0, 0.0), (10.0, 0.0)],
+            10.0,
+            0.25,
+        ) {
+            Ok(touched) => touched,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Same path/radius/spacing as `stamp_stroke_touches_every_dab_along_the_path`:
+        // 5 dabs, each landing in the same one already-touched tile.
+        assert_eq!(touched, 5);
+    }
+
+    #[test]
+    fn erasing_two_different_surfaces_does_not_cross_contaminate() {
+        let (_dir, mut store) = store();
+        let (surface_a, surface_b) = (SurfaceId::from_raw(1), SurfaceId::from_raw(2));
+        if let Err(err) = stamp_dab(&mut store, surface_b, (10.0, 10.0), 8.0, [1.0, 0.0, 0.0]) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = erase_dab(&mut store, surface_a, (10.0, 10.0), 8.0) {
+            unreachable!("{err:?}");
+        }
+        let tile_b = match store.get(surface_b, TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let index = (10 * aurora_tile::TILE + 10) as usize * aurora_tile::CHANNELS;
+        let Some(&a) = tile_b.texels().get(index + 3) else {
+            unreachable!("index is in bounds for a full tile");
+        };
+        assert!(
+            a.to_f32() > 0.5,
+            "erasing surface_a must not have touched surface_b's own opaque pixel: {a:?}"
         );
     }
 }

@@ -1,8 +1,8 @@
 //! Which interactive canvas tool is active, and the pure geometry each
 //! one needs. PLAN.md M1.9's "basic tools" bullet: Move, Marquee Select,
-//! Zoom, Pan, Eyedropper — plus `Brush` (M1.9's separate "basic brush
-//! and eraser" bullet), included here since it's a canvas tool like any
-//! other.
+//! Zoom, Pan, Eyedropper — plus `Brush`/`Eraser` (M1.9's separate "basic
+//! brush and eraser" bullet), included here since they're canvas tools
+//! like any other.
 //!
 //! **Scope, stated honestly.** This module is deliberately just the tool
 //! identity and the coordinate math a caller (`aurora-app`, which owns
@@ -12,21 +12,22 @@
 //! already draw. Zoom and Pan are pure view-transform operations
 //! ([`crate::CanvasView`] itself) and need nothing from this module
 //! beyond the enum variant. Marquee Select needs [`marquee_rect`], real
-//! and tested here. `Brush` is real too, but its actual stamping logic
-//! (`aurora_brush::stamp_dab`) needs a live `aurora_tile::TileStore` this
-//! crate has no reason to own — that lives in `aurora-app`, the one
-//! place a live document and a live store both exist. **Move and
-//! Eyedropper are not wired to anything yet**: Move needs a notion of
-//! "the active layer" a user can *change* — click-to-select routing now
-//! exists (`aurora_ui::layers_panel`'s own rows are real, clickable
-//! widgets, and `aurora_widgets::WidgetTree::hit_test` plus
-//! `aurora-app`'s own `select_layer` turn a click into "this is now the
-//! active layer") — but Move's own drag-to-reposition-bounds logic still
-//! isn't built on top of it; Eyedropper needs to sample a real pixel,
-//! which is real now (`aurora_tile::TileStore`, ADR 0010) but has no
-//! sampling function built yet. Both are real, selectable tool variants
-//! — so a user (or test) can switch to them — but their pointer handling
-//! is deliberately a no-op today, not a faked partial behaviour.
+//! and tested here. `Brush`/`Eraser` are real too, but their actual
+//! pixel math (`aurora_brush::stamp_dab`/`erase_dab`) needs a live
+//! `aurora_tile::TileStore` this crate has no reason to own — that lives
+//! in `aurora-app`, the one place a live document and a live store both
+//! exist. **Move and Eyedropper are not wired to anything yet**: Move
+//! needs a notion of "the active layer" a user can *change* —
+//! click-to-select routing now exists (`aurora_ui::layers_panel`'s own
+//! rows are real, clickable widgets, and
+//! `aurora_widgets::WidgetTree::hit_test` plus `aurora-app`'s own
+//! `select_layer` turn a click into "this is now the active layer") —
+//! but Move's own drag-to-reposition-bounds logic still isn't built on
+//! top of it; Eyedropper needs to sample a real pixel, which is real now
+//! (`aurora_tile::TileStore`, ADR 0010) but has no sampling function
+//! built yet. Both are real, selectable tool variants — so a user (or
+//! test) can switch to them — but their pointer handling is deliberately
+//! a no-op today, not a faked partial behaviour.
 
 use aurora_core::Rect;
 
@@ -64,19 +65,25 @@ pub enum Tool {
     /// active layer. See this module's own doc comment for why the
     /// actual stamping logic lives there, not here.
     Brush,
+    /// Erases — real, via `aurora_brush::erase_dab`/`erase_stroke`
+    /// against the same live `aurora_tile::TileStore` and active layer
+    /// `Brush` uses, subtractive instead of blended. Same reason the
+    /// actual erasing logic lives in `aurora-app`, not here.
+    Eraser,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
-    /// Select, Zoom, Pan, Eyedropper, then Brush).
-    pub const ALL: [Self; 6] = [
+    /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser).
+    pub const ALL: [Self; 7] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::Zoom,
         Self::Pan,
         Self::Eyedropper,
         Self::Brush,
+        Self::Eraser,
     ];
 
     /// A short, human-readable label — for a future tool palette/status
@@ -90,6 +97,7 @@ impl Tool {
             Self::Pan => "Pan",
             Self::Eyedropper => "Eyedropper",
             Self::Brush => "Brush",
+            Self::Eraser => "Eraser",
         }
     }
 }
@@ -130,11 +138,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 6);
+        assert_eq!(Tool::ALL.len(), 7);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 6, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 7, "ALL must not repeat a variant");
     }
 
     #[test]

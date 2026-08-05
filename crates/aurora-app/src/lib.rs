@@ -101,27 +101,33 @@
 //! editing loop yet to re-trigger it from. See this module's own "crash
 //! recovery" section for the full reasoning.
 //!
-//! **Basic tools and brush painting** (PLAN.md M1.9): this crate's first
-//! pointer input at all (`CursorMoved`/`MouseInput`/`MouseWheel`) drives
-//! `aurora_ui::Tool`'s six variants — Zoom (click and scroll-wheel),
-//! Pan (drag), and Marquee Select (drag, into a real
-//! `aurora_doc::SelectionSet`) are fully wired; Brush is too, as of the
-//! same milestone's "wire a live document" step: `App` now keeps its own
-//! `LayerTree` alive (previously built, used to populate the panels, and
-//! discarded every run) plus a real `aurora_tile::TileStore` (ADR 0010),
-//! and a Brush drag calls `aurora_brush::stamp_dab`/`advance_segment`
-//! against the topmost pixel layer's own surface — a real mouse drag
-//! really paints real pixels into a real, live document for the first
-//! time in this project. **Active-layer selection followed the same
-//! milestone**: `aurora_ui::layers_panel`'s own rows are now real,
-//! non-zero-sized, clickable widgets (`aurora_widgets::WidgetTree::hit_test`,
-//! new for this), so clicking one calls `select_layer` — updates
-//! `active_layer` (what Brush paints into) and marks the row accessibly
+//! **Basic tools, brush painting, and eraser** (PLAN.md M1.9): this
+//! crate's first pointer input at all
+//! (`CursorMoved`/`MouseInput`/`MouseWheel`) drives `aurora_ui::Tool`'s
+//! seven variants — Zoom (click and scroll-wheel), Pan (drag), and
+//! Marquee Select (drag, into a real `aurora_doc::SelectionSet`) are
+//! fully wired; Brush is too, as of the same milestone's "wire a live
+//! document" step: `App` now keeps its own `LayerTree` alive (previously
+//! built, used to populate the panels, and discarded every run) plus a
+//! real `aurora_tile::TileStore` (ADR 0010), and a Brush drag calls
+//! `aurora_brush::stamp_dab`/`advance_segment` against the active pixel
+//! layer's own surface — a real mouse drag really paints real pixels
+//! into a real, live document for the first time in this project.
+//! **Eraser followed the same day**: the same drag/dab-spacing
+//! machinery, a new `Drag::Eraser` variant alongside `Drag::Brush`, and
+//! `aurora_brush::erase_dab`/`erase_stroke` (subtractive — reduces
+//! existing alpha instead of blending a colour) in place of
+//! `stamp_dab`/`stamp_stroke`; bound to `e`, matching `b` for Brush.
+//! **Active-layer selection followed the brush milestone**:
+//! `aurora_ui::layers_panel`'s own rows are now real, non-zero-sized,
+//! clickable widgets (`aurora_widgets::WidgetTree::hit_test`, new for
+//! this), so clicking one calls `select_layer` — updates `active_layer`
+//! (what Brush/Eraser paint/erase into) and marks the row accessibly
 //! selected, both instead of always targeting the topmost pixel layer
 //! with no way to change it. Eyedropper remains a real, selectable,
 //! inert tool (no colour-sampling function built on `tile_store` yet);
-//! eraser and undo-as-you-drag are separate, still-open follow-on work.
-//! See `aurora_ui::tool`'s own doc comment and this module's "brush
+//! undo-as-you-drag is separate, still-open follow-on work. See
+//! `aurora_ui::tool`'s own doc comment and this module's "brush
 //! painting"/"layer selection" sections for the full reasoning.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
@@ -557,6 +563,7 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         ("h", AppCommand::SelectTool(aurora_ui::Tool::Pan)),
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
         ("b", AppCommand::SelectTool(aurora_ui::Tool::Brush)),
+        ("e", AppCommand::SelectTool(aurora_ui::Tool::Eraser)),
     ];
     let mut registry = ShortcutRegistry::new();
     for (source, command) in bindings {
@@ -1201,19 +1208,24 @@ fn pointer_in_canvas(
 /// point from a moving view on every event would be circular); `Marquee`
 /// tracks the fixed document-space point the drag started at, since a
 /// selection rectangle is defined in document space regardless of how
-/// the view is panned/zoomed mid-drag; `Brush` tracks the last
-/// document-space point painted, the same "delta since last event"
-/// shape `Pan` uses, plus `carry` — how far the stroke has already
-/// travelled past the last placed dab
+/// the view is panned/zoomed mid-drag; `Brush`/`Eraser` track the last
+/// document-space point painted/erased, the same "delta since last
+/// event" shape `Pan` uses, plus `carry` — how far the stroke has
+/// already travelled past the last placed dab
 /// (`aurora_brush::advance_segment`'s own carry parameter) — so spacing
 /// stays correct across many small move events, not just within one
 /// event's own segment (see [`continue_drag`]'s own doc comment for why
-/// this matters).
+/// this matters). `Eraser` is otherwise identical to `Brush` — same
+/// dab-spacing math, different pixel operation once a dab lands (see
+/// [`App::erase_dab`]) — so it gets its own variant rather than reusing
+/// `Brush`'s, keeping "which pixel operation to perform" a property of
+/// the active `Drag`, not a runtime flag alongside it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Drag {
     Pan { last_screen: (f32, f32) },
     Marquee { start_doc: (f32, f32) },
     Brush { last_doc: (f32, f32), carry: f32 },
+    Eraser { last_doc: (f32, f32), carry: f32 },
 }
 
 /// Starts a drag for `tool`/`button` at `canvas_point` (already
@@ -1223,11 +1235,11 @@ enum Drag {
 /// convention professional raster editors already use as a universal
 /// pan gesture.
 ///
-/// `Brush` starts unconditionally on a primary click, regardless of
-/// whether there's actually anywhere to paint (a live store, an active
-/// layer) — that check happens where the real painting does
-/// (`App::paint_dab`), keeping this function pure and not needing to
-/// know about either.
+/// `Brush`/`Eraser` start unconditionally on a primary click, regardless
+/// of whether there's actually anywhere to paint/erase (a live store, an
+/// active layer) — that check happens where the real pixel work does
+/// (`App::paint_dab`/`App::erase_dab`), keeping this function pure and
+/// not needing to know about either.
 #[must_use]
 fn begin_drag(
     tool: aurora_ui::Tool,
@@ -1248,6 +1260,10 @@ fn begin_drag(
             last_doc: view.to_document(canvas_point),
             carry: 0.0,
         }),
+        (aurora_ui::Tool::Eraser, PointerButton::Primary) => Some(Drag::Eraser {
+            last_doc: view.to_document(canvas_point),
+            carry: 0.0,
+        }),
         _ => None,
     }
 }
@@ -1257,22 +1273,24 @@ fn begin_drag(
 /// selection to the marquee rectangle spanned so far
 /// (`aurora_ui::tool::marquee_rect`) — live, so the selection visibly
 /// grows/shrinks as the user drags, not just once on release — or, for
-/// `Brush`, returns the document-space dab centers this event's own new
-/// segment placed, via `aurora_brush::advance_segment` (**not**
-/// `dabs_along_path` on a fresh two-point slice each time, which would
-/// restart spacing's own `carry` at `0.0` on every single move event —
-/// for a slow drag whose per-event segments are each shorter than one
-/// dab's own spacing, that would silently place no dabs at all past the
-/// first, despite real distance covered over many events;
-/// `advance_segment` carries `Drag::Brush`'s own `carry` field forward
-/// across events instead, exactly the problem it exists to solve).
+/// `Brush`/`Eraser`, returns the document-space dab centers this
+/// event's own new segment placed, via `aurora_brush::advance_segment`
+/// (**not** `dabs_along_path` on a fresh two-point slice each time,
+/// which would restart spacing's own `carry` at `0.0` on every single
+/// move event — for a slow drag whose per-event segments are each
+/// shorter than one dab's own spacing, that would silently place no
+/// dabs at all past the first, despite real distance covered over many
+/// events; `advance_segment` carries `Drag::Brush`/`Drag::Eraser`'s own
+/// `carry` field forward across events instead, exactly the problem it
+/// exists to solve).
 ///
 /// Deliberately returns dab positions as plain data rather than
-/// stamping them itself: stamping needs a live `aurora_tile::TileStore`
+/// stamping/erasing them itself: that needs a live `aurora_tile::TileStore`
 /// and the active layer's bounds, neither of which this function (or
 /// `Drag`/`begin_drag` above) needs to know about to stay exactly as
 /// pure and testable as `Pan`/`Marquee` already are — the caller
-/// (`App::handle_pointer_moved`) does the actual painting.
+/// (`App::handle_pointer_moved`) does the actual pixel work, and which
+/// of `paint_dab`/`erase_dab` to call for each returned position.
 #[must_use]
 fn continue_drag(
     drag: &mut Drag,
@@ -1299,6 +1317,15 @@ fn continue_drag(
         Drag::Brush { last_doc, carry } => {
             let current_doc = view.to_document(canvas_point);
             let step = aurora_brush::dab_step(BRUSH_RADIUS, aurora_brush::DEFAULT_SPACING);
+            let (dabs, new_carry) =
+                aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
+            *last_doc = current_doc;
+            *carry = new_carry;
+            dabs
+        }
+        Drag::Eraser { last_doc, carry } => {
+            let current_doc = view.to_document(canvas_point);
+            let step = aurora_brush::dab_step(ERASER_RADIUS, aurora_brush::DEFAULT_SPACING);
             let (dabs, new_carry) =
                 aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
             *last_doc = current_doc;
@@ -1363,21 +1390,25 @@ fn handle_zoom_tool_click(
     view.zoom_at(canvas_point, view.zoom() * factor);
 }
 
-// -- Brush painting and layer selection: a live document, a live tile
-// -- store, and a way to pick which layer is active --
+// -- Brush painting, eraser, and layer selection: a live document, a
+// -- live tile store, and a way to pick which layer is active --
 //
 // PLAN.md M1.9's "basic brush and eraser" bullet, picking up exactly
 // where `aurora_brush::stamp_dab`/`stamp_stroke` (ADR 0010) left off:
 // this crate's first *live* document (`App::layers`, kept alive instead
 // of being discarded after populating the panels, as it was through
-// M1.8/M1.9 until now) and first real `aurora_tile::TileStore`.
-// `select_layer` closes the other half: `active_layer` no longer just
-// defaults to the topmost pixel layer and stays there forever -- a real
-// click on a real, clickable Layers-panel row (`aurora_ui::layers_panel`,
-// `aurora_widgets::WidgetTree::hit_test`) changes it, live. Eraser and
-// undo-as-you-drag remain separate, still-open follow-on work; so does
-// Move's own drag-to-reposition logic, even though its *blocker*
-// (no active-layer selection) is what this section just resolved.
+// M1.8/M1.9 until now) and first real `aurora_tile::TileStore`. Eraser
+// (`App::erase_dab`, `Drag::Eraser`) reuses that same live store and
+// active layer, calling `aurora_brush::erase_dab`/`erase_stroke` instead
+// of `stamp_dab`/`stamp_stroke` -- the bullet's other named half, now
+// closed. `select_layer` closes the layer-selection half: `active_layer`
+// no longer just defaults to the topmost pixel layer and stays there
+// forever -- a real click on a real, clickable Layers-panel row
+// (`aurora_ui::layers_panel`, `aurora_widgets::WidgetTree::hit_test`)
+// changes it, live. Undo-as-you-drag remains separate, still-open
+// follow-on work; so does Move's own drag-to-reposition logic, even
+// though its *blocker* (no active-layer selection) is what this section
+// already resolved.
 
 /// The topmost pixel layer in `layers` — [`App::active_layer`]'s own
 /// initial value. `layers.roots()` is already ordered top-to-bottom
@@ -1474,6 +1505,12 @@ fn layer_local_point(bounds: aurora_core::Rect, doc_point: (f32, f32)) -> (f32, 
 /// PLAN.md's own "(real engine is Phase 2)" framing on this bullet).
 const BRUSH_RADIUS: f32 = 24.0;
 const BRUSH_COLOUR: [f32; 3] = [0.0, 0.0, 0.0];
+
+/// The Eraser tool's fixed radius — same reasoning and same value as
+/// [`BRUSH_RADIUS`] (no options UI yet), kept as its own named constant
+/// rather than reusing `BRUSH_RADIUS` directly so the two tools' sizes
+/// can diverge later without one silently changing the other.
+const ERASER_RADIUS: f32 = 24.0;
 
 // -- Canvas rendering: drawing the live document to the screen --
 //
@@ -1627,8 +1664,8 @@ struct App {
     /// recorded and logged, ready for whenever that pipeline exists.
     pending_open_path: Option<PathBuf>,
     /// PLAN.md M1.9's "basic tools" bullet — see `aurora_ui::tool`'s own
-    /// doc comment for exactly which of the six named tools (Move,
-    /// Marquee Select, Zoom, Pan, Eyedropper, Brush) actually do
+    /// doc comment for exactly which of the seven named tools (Move,
+    /// Marquee Select, Zoom, Pan, Eyedropper, Brush, Eraser) actually do
     /// anything yet.
     tool: aurora_ui::Tool,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]) —
@@ -1650,7 +1687,7 @@ struct App {
     /// what [`Self::active_layer`]/[`LayerTree::surface_id`] read to find
     /// somewhere for the Brush tool to actually paint.
     layers: aurora_doc::LayerTree,
-    /// The layer the Brush tool paints into, if any — the topmost pixel
+    /// The layer the Brush/Eraser tools paint/erase into, if any — the topmost pixel
     /// layer of `layers` at construction time
     /// ([`topmost_pixel_layer`]), real-time-changeable now by clicking a
     /// row in the Layers panel ([`Self::layer_rows`],
@@ -1693,9 +1730,10 @@ struct App {
     /// space (already DPI-adjusted — see [`logical_point`]) — `None`
     /// before the first `CursorMoved`, or after `CursorLeft`.
     pointer_position: Option<(f32, f32)>,
-    /// An in-progress pointer drag (Pan, Marquee Select, or Brush), if
-    /// any — `None` is "not dragging," the same "no separate flag" shape
-    /// `command_palette`/`crash_recovery_dialog` above already use.
+    /// An in-progress pointer drag (Pan, Marquee Select, Brush, or
+    /// Eraser), if any — `None` is "not dragging," the same "no separate
+    /// flag" shape `command_palette`/`crash_recovery_dialog` above
+    /// already use.
     drag: Option<Drag>,
     /// The native menu bar — macOS only, see this crate's own "native
     /// menu bar" section for why Windows/Linux aren't included. Built
@@ -1876,8 +1914,10 @@ impl App {
 
     /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
     /// position and, if a drag is in progress, advances it
-    /// ([`continue_drag`]), painting any dab positions it returns
-    /// ([`Self::paint_dab`]) — empty for every drag but `Brush`.
+    /// ([`continue_drag`]), painting or erasing any dab positions it
+    /// returns ([`Self::paint_dab`]/[`Self::erase_dab`], chosen by which
+    /// `Drag` variant is active) — empty for every drag but
+    /// `Brush`/`Eraser`.
     fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
@@ -1885,6 +1925,7 @@ impl App {
             return;
         };
         if let Some(drag) = self.drag.as_mut() {
+            let erasing = matches!(drag, Drag::Eraser { .. });
             let dabs = continue_drag(
                 drag,
                 canvas_point,
@@ -1892,7 +1933,11 @@ impl App {
                 &mut self.selection,
             );
             for doc_point in dabs {
-                self.paint_dab(doc_point);
+                if erasing {
+                    self.erase_dab(doc_point);
+                } else {
+                    self.paint_dab(doc_point);
+                }
             }
         }
     }
@@ -1900,9 +1945,10 @@ impl App {
     /// A real `WindowEvent::MouseInput { state: Pressed, .. }`: either
     /// performs the active Zoom tool's click-to-zoom
     /// ([`handle_zoom_tool_click`]), or starts a drag ([`begin_drag`]) —
-    /// never both for the same press. A fresh `Brush` drag paints its
-    /// own starting point immediately ([`Self::paint_dab`]), so a plain
-    /// click (no drag at all) still paints something.
+    /// never both for the same press. A fresh `Brush`/`Eraser` drag
+    /// paints/erases its own starting point immediately
+    /// ([`Self::paint_dab`]/[`Self::erase_dab`]), so a plain click (no
+    /// drag at all) still does something.
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
         let Some(button) = translate_pointer_button(button) else {
             return;
@@ -1938,8 +1984,10 @@ impl App {
             return;
         }
         self.drag = begin_drag(self.tool, button, canvas_point, &self.canvas_view);
-        if let Some(Drag::Brush { last_doc, .. }) = self.drag {
-            self.paint_dab(last_doc);
+        match self.drag {
+            Some(Drag::Brush { last_doc, .. }) => self.paint_dab(last_doc),
+            Some(Drag::Eraser { last_doc, .. }) => self.erase_dab(last_doc),
+            _ => {}
         }
     }
 
@@ -1973,6 +2021,31 @@ impl App {
         if let Err(err) = aurora_brush::stamp_dab(store, surface, local, BRUSH_RADIUS, BRUSH_COLOUR)
         {
             tracing::warn!(?err, "failed to stamp a brush dab");
+        }
+    }
+
+    /// Erases one dab at `doc_point` (document space) from the active
+    /// layer's own surface in the live tile store — `aurora_brush::erase_dab`,
+    /// [`Self::paint_dab`]'s subtractive counterpart, sharing every one
+    /// of its preconditions and silent-no-op cases (no live store, no
+    /// active layer, or that layer isn't a pixel layer).
+    fn erase_dab(&mut self, doc_point: (f32, f32)) {
+        let Some(layer_id) = self.active_layer else {
+            return;
+        };
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
+        else {
+            return;
+        };
+        let Some(surface) = self.layers.surface_id(layer_id) else {
+            return;
+        };
+        let Some(store) = self.tile_store.as_mut() else {
+            return;
+        };
+        let local = layer_local_point(bounds, doc_point);
+        if let Err(err) = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS) {
+            tracing::warn!(?err, "failed to erase a dab");
         }
     }
 
@@ -3885,6 +3958,18 @@ mod tests {
     }
 
     #[test]
+    fn begin_drag_with_eraser_tool_and_primary_button_starts_an_eraser_drag_at_zero_carry() {
+        let view = CanvasView::new();
+        assert_eq!(
+            begin_drag(Tool::Eraser, PointerButton::Primary, (10.0, 20.0), &view),
+            Some(Drag::Eraser {
+                last_doc: (10.0, 20.0),
+                carry: 0.0
+            })
+        );
+    }
+
+    #[test]
     fn begin_drag_with_zoom_tool_and_secondary_button_does_nothing() {
         let view = CanvasView::new();
         assert_eq!(
@@ -3990,6 +4075,29 @@ mod tests {
         // sub-step event was not lost.
         let second = continue_drag(&mut drag, (7.0, 0.0), &mut view, &mut selection);
         assert_eq!(second, vec![(6.0, 0.0)]);
+    }
+
+    #[test]
+    fn continue_drag_eraser_returns_the_new_segments_dabs() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Eraser {
+            last_doc: (0.0, 0.0),
+            carry: 0.0,
+        };
+        // Same radius/spacing as Brush (ERASER_RADIUS == BRUSH_RADIUS ==
+        // 24, DEFAULT_SPACING 0.25 -> step 6), so the same dab positions
+        // land for the same segment.
+        let dabs = continue_drag(&mut drag, (12.0, 0.0), &mut view, &mut selection);
+        assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
+        assert_eq!(
+            drag,
+            Drag::Eraser {
+                last_doc: (12.0, 0.0),
+                carry: 0.0
+            },
+            "must advance its own last-known point and carry for the next event"
+        );
     }
 
     #[test]
