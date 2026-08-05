@@ -13,19 +13,24 @@
 //! upstream, the same image-rs family `png` belongs to) — one crate
 //! covers both decode and encode, unlike JPEG's two-crate split.
 //! [`Image`] is this crate's own, self-contained pixel representation
-//! for all three — see that type's own doc comment for why it's
-//! deliberately not wired into `aurora_doc::LayerTree`/
-//! `aurora_tile::TileStore` yet. `channels` (private) holds the
+//! for all three. `channels` (private) holds the
 //! grayscale/grayscale-with-alpha/RGB → RGBA expansion helpers `png`
-//! and `tiff` both need. PSD/PSB and the real document-pixel-storage
-//! wiring remain open.
+//! and `tiff` both need. [`import`] is the real document-pixel-storage
+//! wiring `Image`'s own doc comment used to name as open:
+//! [`import::write_into_store`] writes a decoded `Image` into a
+//! document layer's own `aurora_tile::TileStore` surface (ADR 0010),
+//! and [`import::decode_by_extension`] picks `png`/`jpeg`/`tiff::decode`
+//! by a file's own extension — the dispatcher a real "Open File" flow
+//! needs. PSD/PSB remains open.
 
 mod channels;
 mod error;
 mod image;
+pub mod import;
 pub mod jpeg;
 pub mod png;
 pub mod tiff;
 
 pub use error::IoError;
 pub use image::Image;
+pub use import::{decode_by_extension, write_into_store};

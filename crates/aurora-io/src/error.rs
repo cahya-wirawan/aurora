@@ -59,4 +59,14 @@ pub enum IoError {
         expected: usize,
         actual: usize,
     },
+    /// [`crate::import::write_into_store`] failed to page a touched tile
+    /// in from the scratch disk.
+    #[error("failed to write image into the tile store: {0}")]
+    Tile(#[from] aurora_tile::TileError),
+    /// [`crate::import::decode_by_extension`] was given a path whose
+    /// extension names a format this crate doesn't decode (or has no
+    /// extension at all) — real, checked scope, not every image format
+    /// that exists.
+    #[error("unsupported file extension: {0:?}")]
+    UnsupportedExtension(String),
 }

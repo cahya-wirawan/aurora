@@ -3,14 +3,13 @@
 //! immediately on import, never held as 8-bit) tagged with a real
 //! colour space (never left untagged).
 //!
-//! Deliberately standalone, not wired into `aurora_doc::LayerTree`/
-//! `aurora_tile::TileStore` yet: a layer doesn't own real pixel storage
-//! yet either (see `aurora_doc::LayerKind`'s own doc comment on that
-//! gap), so how an imported image becomes a document's actual layer
-//! pixels is real, separate, still-open work. This type is this crate's
-//! own, self-contained in-memory representation for round-tripping a
-//! file — real for what it is used for today, not a placeholder for
-//! something bigger that doesn't exist yet.
+//! Standalone from `aurora_doc::LayerTree`/`aurora_tile::TileStore` on
+//! purpose, even now that [`crate::import::write_into_store`] bridges
+//! one into the other (ADR 0010 gave a pixel layer real storage to
+//! bridge into): this type is this crate's own, self-contained
+//! in-memory representation for round-tripping a file, independent of
+//! whatever document-model shape the caller eventually puts its samples
+//! into.
 
 use aurora_color::IccProfile;
 use half::f16;
