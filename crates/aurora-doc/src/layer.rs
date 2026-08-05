@@ -27,14 +27,15 @@ pub type LayerId = Id<Layer>;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LayerKind {
     /// Raw pixel content, positioned at `bounds` in document space.
-    /// Deliberately does not yet own any real pixel storage — **decided**
-    /// (one shared `aurora_tile::TileStore` per document, addressed by a
-    /// `SurfaceId` reused from this layer's own `LayerId` — [ADR
-    /// 0010](../../../docs/adr/0010-layer-pixel-storage.md)), but not yet
-    /// *implemented*: this variant doesn't hold a `SurfaceId` field yet,
-    /// and neither `aurora-tile`'s `SurfaceId` type nor the shared
-    /// store's own compound-key API exist yet either. Real, separate
-    /// follow-on work, same as ADR 0010's own doc says.
+    /// Does not hold its own pixel storage directly — a pixel layer's
+    /// content lives in the document's shared `aurora_tile::TileStore`,
+    /// addressed by [`crate::LayerTree::surface_id`], which reuses this
+    /// layer's own `LayerId` rather than storing a redundant second id
+    /// ([ADR 0010](../../../docs/adr/0010-layer-pixel-storage.md)). What
+    /// doesn't exist yet: the document type that actually owns a live
+    /// `TileStore` instance, and anything that paints real pixels into
+    /// one (`aurora_brush`'s own dab-stamping) — real, separate,
+    /// still-open follow-on work.
     Pixel { bounds: Rect },
     /// A group containing other layers, top-to-bottom (index 0 is
     /// topmost — see [`crate::LayerTree`]'s own doc comment for the

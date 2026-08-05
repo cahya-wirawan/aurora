@@ -404,6 +404,25 @@ impl LayerTree {
         self.layers.get(&id).map(|entry| &entry.kind)
     }
 
+    /// The [`aurora_tile::SurfaceId`] `id`'s own pixel content is
+    /// addressed under in the document's shared `aurora_tile::TileStore`
+    /// ([ADR 0010](../../../docs/adr/0010-layer-pixel-storage.md)) —
+    /// reused directly from `id`'s own raw value
+    /// (`SurfaceId::from_raw(id.to_raw())`), not independently
+    /// allocated, so there is no second id-allocation scheme to keep in
+    /// sync with this tree's own [`IdGenerator`].
+    ///
+    /// Returns `None` for an unknown `id`, or one that names a
+    /// [`LayerKind::Group`] — a group has no pixels of its own to store,
+    /// so it never needs a surface.
+    #[must_use]
+    pub fn surface_id(&self, id: LayerId) -> Option<aurora_tile::SurfaceId> {
+        match self.kind(id)? {
+            LayerKind::Pixel { .. } => Some(aurora_tile::SurfaceId::from_raw(id.to_raw())),
+            LayerKind::Group { .. } => None,
+        }
+    }
+
     #[must_use]
     pub fn name(&self, id: LayerId) -> Option<&str> {
         self.layers.get(&id).map(|entry| entry.name.as_str())
@@ -683,6 +702,50 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(tree.kind(id), Some(&LayerKind::Pixel { bounds: rect }));
+    }
+
+    #[test]
+    fn surface_id_of_a_pixel_layer_reuses_its_own_raw_layer_id() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            tree.surface_id(id),
+            Some(aurora_tile::SurfaceId::from_raw(id.to_raw()))
+        );
+    }
+
+    #[test]
+    fn surface_id_is_none_for_a_group() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.surface_id(group), None);
+    }
+
+    #[test]
+    fn surface_id_is_none_for_an_unknown_id() {
+        let tree = LayerTree::new();
+        let bogus: super::LayerId = Id::from_raw(0);
+        assert_eq!(tree.surface_id(bogus), None);
+    }
+
+    #[test]
+    fn surface_id_is_distinct_for_two_different_pixel_layers() {
+        let mut tree = LayerTree::new();
+        let a = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match tree.add_pixel_layer("b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_ne!(tree.surface_id(a), tree.surface_id(b));
     }
 
     #[test]
