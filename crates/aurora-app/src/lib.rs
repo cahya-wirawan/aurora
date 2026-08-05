@@ -101,6 +101,23 @@
 //! editing loop yet to re-trigger it from. See this module's own "crash
 //! recovery" section for the full reasoning.
 //!
+//! **Basic tools and brush painting** (PLAN.md M1.9): this crate's first
+//! pointer input at all (`CursorMoved`/`MouseInput`/`MouseWheel`) drives
+//! `aurora_ui::Tool`'s six variants — Zoom (click and scroll-wheel),
+//! Pan (drag), and Marquee Select (drag, into a real
+//! `aurora_doc::SelectionSet`) are fully wired; Brush is too, as of the
+//! same milestone's "wire a live document" step: `App` now keeps its own
+//! `LayerTree` alive (previously built, used to populate the panels, and
+//! discarded every run) plus a real `aurora_tile::TileStore` (ADR 0010),
+//! and a Brush drag calls `aurora_brush::stamp_dab`/`advance_segment`
+//! against the topmost pixel layer's own surface — a real mouse drag
+//! really paints real pixels into a real, live document for the first
+//! time in this project. Move and Eyedropper remain real, selectable,
+//! inert tools (no active-layer-selection UI, no colour-sampling
+//! function); eraser and undo-as-you-drag are separate, still-open
+//! follow-on work. See `aurora_ui::tool`'s own doc comment and this
+//! module's "brush painting" section for the full reasoning.
+//!
 //! **Human-verified on macOS, 2026-08-03** (real hardware, real desktop
 //! session): the window opens, resizes without crashing, and `VoiceOver`
 //! announces it — the create-hidden → attach-adapter → show ordering
@@ -514,6 +531,7 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         ("z", AppCommand::SelectTool(aurora_ui::Tool::Zoom)),
         ("h", AppCommand::SelectTool(aurora_ui::Tool::Pan)),
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
+        ("b", AppCommand::SelectTool(aurora_ui::Tool::Brush)),
     ];
     let mut registry = ShortcutRegistry::new();
     for (source, command) in bindings {
@@ -1158,11 +1176,19 @@ fn pointer_in_canvas(
 /// point from a moving view on every event would be circular); `Marquee`
 /// tracks the fixed document-space point the drag started at, since a
 /// selection rectangle is defined in document space regardless of how
-/// the view is panned/zoomed mid-drag.
+/// the view is panned/zoomed mid-drag; `Brush` tracks the last
+/// document-space point painted, the same "delta since last event"
+/// shape `Pan` uses, plus `carry` — how far the stroke has already
+/// travelled past the last placed dab
+/// (`aurora_brush::advance_segment`'s own carry parameter) — so spacing
+/// stays correct across many small move events, not just within one
+/// event's own segment (see [`continue_drag`]'s own doc comment for why
+/// this matters).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Drag {
     Pan { last_screen: (f32, f32) },
     Marquee { start_doc: (f32, f32) },
+    Brush { last_doc: (f32, f32), carry: f32 },
 }
 
 /// Starts a drag for `tool`/`button` at `canvas_point` (already
@@ -1171,6 +1197,12 @@ enum Drag {
 /// pans, regardless of the active tool — the usual "hand tool"
 /// convention professional raster editors already use as a universal
 /// pan gesture.
+///
+/// `Brush` starts unconditionally on a primary click, regardless of
+/// whether there's actually anywhere to paint (a live store, an active
+/// layer) — that check happens where the real painting does
+/// (`App::paint_dab`), keeping this function pure and not needing to
+/// know about either.
 #[must_use]
 fn begin_drag(
     tool: aurora_ui::Tool,
@@ -1187,21 +1219,42 @@ fn begin_drag(
         (aurora_ui::Tool::MarqueeSelect, PointerButton::Primary) => Some(Drag::Marquee {
             start_doc: view.to_document(canvas_point),
         }),
+        (aurora_ui::Tool::Brush, PointerButton::Primary) => Some(Drag::Brush {
+            last_doc: view.to_document(canvas_point),
+            carry: 0.0,
+        }),
         _ => None,
     }
 }
 
 /// Advances an in-progress `drag` to `canvas_point`: pans the view by
-/// the screen-space delta since the last event, or updates the active
+/// the screen-space delta since the last event, updates the active
 /// selection to the marquee rectangle spanned so far
 /// (`aurora_ui::tool::marquee_rect`) — live, so the selection visibly
-/// grows/shrinks as the user drags, not just once on release.
+/// grows/shrinks as the user drags, not just once on release — or, for
+/// `Brush`, returns the document-space dab centers this event's own new
+/// segment placed, via `aurora_brush::advance_segment` (**not**
+/// `dabs_along_path` on a fresh two-point slice each time, which would
+/// restart spacing's own `carry` at `0.0` on every single move event —
+/// for a slow drag whose per-event segments are each shorter than one
+/// dab's own spacing, that would silently place no dabs at all past the
+/// first, despite real distance covered over many events;
+/// `advance_segment` carries `Drag::Brush`'s own `carry` field forward
+/// across events instead, exactly the problem it exists to solve).
+///
+/// Deliberately returns dab positions as plain data rather than
+/// stamping them itself: stamping needs a live `aurora_tile::TileStore`
+/// and the active layer's bounds, neither of which this function (or
+/// `Drag`/`begin_drag` above) needs to know about to stay exactly as
+/// pure and testable as `Pan`/`Marquee` already are — the caller
+/// (`App::handle_pointer_moved`) does the actual painting.
+#[must_use]
 fn continue_drag(
     drag: &mut Drag,
     canvas_point: (f32, f32),
     view: &mut aurora_ui::CanvasView,
     selection: &mut aurora_doc::SelectionSet,
-) {
+) -> Vec<(f32, f32)> {
     match drag {
         Drag::Pan { last_screen } => {
             let delta = (
@@ -1210,11 +1263,22 @@ fn continue_drag(
             );
             view.pan_by(delta);
             *last_screen = canvas_point;
+            Vec::new()
         }
         Drag::Marquee { start_doc } => {
             let current_doc = view.to_document(canvas_point);
             let rect = aurora_ui::tool::marquee_rect(*start_doc, current_doc);
             selection.select(aurora_doc::Selection::new(rect));
+            Vec::new()
+        }
+        Drag::Brush { last_doc, carry } => {
+            let current_doc = view.to_document(canvas_point);
+            let step = aurora_brush::dab_step(BRUSH_RADIUS, aurora_brush::DEFAULT_SPACING);
+            let (dabs, new_carry) =
+                aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
+            *last_doc = current_doc;
+            *carry = new_carry;
+            dabs
         }
     }
 }
@@ -1274,6 +1338,85 @@ fn handle_zoom_tool_click(
     view.zoom_at(canvas_point, view.zoom() * factor);
 }
 
+// -- Brush painting: a live document and a live tile store --
+//
+// PLAN.md M1.9's "basic brush and eraser" bullet, picking up exactly
+// where `aurora_brush::stamp_dab`/`stamp_stroke` (ADR 0010) left off:
+// this crate's first *live* document (`App::layers`, kept alive instead
+// of being discarded after populating the panels, as it was through
+// M1.8/M1.9 until now) and first real `aurora_tile::TileStore`. Eraser,
+// undo-as-you-drag, and a way to *change* which layer is active (the
+// same click-to-select gap the Move tool has) all remain separate,
+// still-open follow-on work -- this section closes exactly the "no live
+// document to paint into" gap ADR 0010's own doc named, nothing more.
+
+/// The topmost pixel layer in `layers` — [`App::active_layer`]'s own
+/// initial value. `layers.roots()` is already ordered top-to-bottom
+/// (index 0 topmost, matching every panel in this workspace), so the
+/// first root that's a pixel layer (skipping any group) is it. `None`
+/// for a document with no pixel layer at all.
+#[must_use]
+fn topmost_pixel_layer(layers: &aurora_doc::LayerTree) -> Option<aurora_doc::LayerId> {
+    layers
+        .roots()
+        .iter()
+        .copied()
+        .find(|&id| matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. })))
+}
+
+/// Where this session's shared tile store keeps its scratch files —
+/// analogous to [`marker_path`]/[`autosave_path`], and for the same
+/// reason not a proper per-platform app-support directory yet.
+fn tile_store_scratch_dir() -> PathBuf {
+    std::env::temp_dir().join("aurora-tiles")
+}
+
+/// A practical resident-tile budget for this crate's first live store —
+/// 256 tiles, 128 MiB at ADR 0005's fixed 512 KiB/tile — not a
+/// considered, user-facing default (that's FR-026's own, still-open
+/// scratch-disk-size preference); enough to paint comfortably in one
+/// session without constantly evicting.
+const TILE_BUDGET: usize = 256;
+
+/// Opens this session's shared tile store at [`tile_store_scratch_dir`].
+/// Errors are logged, not fatal -- the same "must never stop the
+/// application starting" shape [`write_session_marker`]'s own I/O
+/// already uses; a store that fails to open just means painting is
+/// silently disabled for the session, not a crash.
+fn open_tile_store() -> Option<aurora_tile::TileStore> {
+    let Some(budget) = std::num::NonZeroUsize::new(TILE_BUDGET) else {
+        unreachable!("TILE_BUDGET is a fixed, non-zero constant");
+    };
+    match aurora_tile::TileStore::new(tile_store_scratch_dir(), budget) {
+        Ok(store) => Some(store),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to open the tile store; painting is disabled this session"
+            );
+            None
+        }
+    }
+}
+
+/// Converts a document-space point into a pixel layer's own local
+/// space — `bounds`'s own `(x, y)` is that layer's position in document
+/// space (`aurora_doc::LayerKind::Pixel`'s own field), and
+/// `aurora_tile::TileStore` addresses each surface from its own local
+/// `(0, 0)`, not the document's.
+#[must_use]
+fn layer_local_point(bounds: aurora_core::Rect, doc_point: (f32, f32)) -> (f32, f32) {
+    #[allow(clippy::cast_precision_loss)]
+    (doc_point.0 - bounds.x as f32, doc_point.1 - bounds.y as f32)
+}
+
+/// The Brush tool's fixed radius and colour — real defaults, not a
+/// placeholder, but not a considered one either: there is no brush
+/// options UI yet (size/colour picker, real engine, Phase 2 per
+/// PLAN.md's own "(real engine is Phase 2)" framing on this bullet).
+const BRUSH_RADIUS: f32 = 24.0;
+const BRUSH_COLOUR: [f32; 3] = [0.0, 0.0, 0.0];
+
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
@@ -1331,12 +1474,12 @@ struct App {
     /// recorded and logged, ready for whenever that pipeline exists.
     pending_open_path: Option<PathBuf>,
     /// PLAN.md M1.9's "basic tools" bullet — see `aurora_ui::tool`'s own
-    /// doc comment for exactly which of the five named tools (Move,
-    /// Marquee Select, Zoom, Pan, Eyedropper) actually do anything yet.
+    /// doc comment for exactly which of the six named tools (Move,
+    /// Marquee Select, Zoom, Pan, Eyedropper, Brush) actually do
+    /// anything yet.
     tool: aurora_ui::Tool,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]) —
-    /// deliberately not tied to any particular document (there is no
-    /// live document held here at all; see [`demo_document`]'s own doc
+    /// deliberately not tied to `layers` (see that field's own doc
     /// comment) since the view itself is a property of the *window*, the
     /// same way Photoshop remembers a document's own zoom/scroll
     /// independent of its pixel content.
@@ -1346,12 +1489,34 @@ struct App {
     /// own right (see that type's own doc comment), not something that
     /// needs a live `LayerTree` alongside it to exist.
     selection: aurora_doc::SelectionSet,
+    /// The live document's own layer structure — built once in
+    /// [`App::new`] (from [`demo_document`] or a recovered autosave) and
+    /// kept alive from then on, unlike `history` (used once to populate
+    /// the History panel and write the autosave, then dropped — nothing
+    /// yet needs it kept alive the way painting needs `layers`). This is
+    /// what [`Self::active_layer`]/[`LayerTree::surface_id`] read to find
+    /// somewhere for the Brush tool to actually paint.
+    layers: aurora_doc::LayerTree,
+    /// The layer the Brush tool paints into, if any — the topmost pixel
+    /// layer of `layers` at construction time
+    /// ([`topmost_pixel_layer`]). `None` for a document with no pixel
+    /// layer at all. There is no click-to-select UI yet to *change*
+    /// this (the same gap `aurora_ui::tool`'s own doc comment names for
+    /// the Move tool), so it never changes after construction today.
+    active_layer: Option<aurora_doc::LayerId>,
+    /// This document's own shared tile store (ADR 0010) — `None` if it
+    /// failed to open (e.g. an unwritable scratch directory), logged as
+    /// a warning rather than treated as fatal, the same "must never stop
+    /// the application starting" shape [`write_session_marker`] already
+    /// uses for its own I/O. Painting is silently disabled for the
+    /// session when this is `None`.
+    tile_store: Option<aurora_tile::TileStore>,
     /// The pointer's last known position, in the *window's* own logical
     /// space (already DPI-adjusted — see [`logical_point`]) — `None`
     /// before the first `CursorMoved`, or after `CursorLeft`.
     pointer_position: Option<(f32, f32)>,
-    /// An in-progress pointer drag (Pan or Marquee Select), if any —
-    /// `None` is "not dragging," the same "no separate flag" shape
+    /// An in-progress pointer drag (Pan, Marquee Select, or Brush), if
+    /// any — `None` is "not dragging," the same "no separate flag" shape
     /// `command_palette`/`crash_recovery_dialog` above already use.
     drag: Option<Drag>,
     /// The native menu bar — macOS only, see this crate's own "native
@@ -1408,6 +1573,8 @@ impl App {
         // document, and is what the *next* run should recover to if this
         // one doesn't shut down cleanly.
         write_autosave(autosave_path, &history);
+        let active_layer = topmost_pixel_layer(&layers);
+        let tile_store = open_tile_store();
 
         let mut focus = FocusManager::default();
         let mut crash_recovery_dialog = None;
@@ -1441,6 +1608,9 @@ impl App {
             tool: aurora_ui::Tool::default(),
             canvas_view: aurora_ui::CanvasView::default(),
             selection: aurora_doc::SelectionSet::new(),
+            layers,
+            active_layer,
+            tile_store,
             pointer_position: None,
             drag: None,
             #[cfg(target_os = "macos")]
@@ -1519,7 +1689,8 @@ impl App {
 
     /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
     /// position and, if a drag is in progress, advances it
-    /// ([`continue_drag`]).
+    /// ([`continue_drag`]), painting any dab positions it returns
+    /// ([`Self::paint_dab`]) — empty for every drag but `Brush`.
     fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
@@ -1527,19 +1698,24 @@ impl App {
             return;
         };
         if let Some(drag) = self.drag.as_mut() {
-            continue_drag(
+            let dabs = continue_drag(
                 drag,
                 canvas_point,
                 &mut self.canvas_view,
                 &mut self.selection,
             );
+            for doc_point in dabs {
+                self.paint_dab(doc_point);
+            }
         }
     }
 
     /// A real `WindowEvent::MouseInput { state: Pressed, .. }`: either
     /// performs the active Zoom tool's click-to-zoom
     /// ([`handle_zoom_tool_click`]), or starts a drag ([`begin_drag`]) —
-    /// never both for the same press.
+    /// never both for the same press. A fresh `Brush` drag paints its
+    /// own starting point immediately ([`Self::paint_dab`]), so a plain
+    /// click (no drag at all) still paints something.
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
         let Some(button) = translate_pointer_button(button) else {
             return;
@@ -1556,6 +1732,42 @@ impl App {
             return;
         }
         self.drag = begin_drag(self.tool, button, canvas_point, &self.canvas_view);
+        if let Some(Drag::Brush { last_doc, .. }) = self.drag {
+            self.paint_dab(last_doc);
+        }
+    }
+
+    /// Stamps one brush dab at `doc_point` (document space) into the
+    /// active layer's own surface in the live tile store —
+    /// [`aurora_brush::stamp_dab`], via [`layer_local_point`] for the
+    /// document-space -> layer-local conversion `aurora_tile::TileStore`
+    /// needs. A silent no-op if there's no live store
+    /// ([`Self::tile_store`] failed to open), no active layer
+    /// ([`Self::active_layer`] is `None`), or that layer isn't (or is no
+    /// longer) a pixel layer — the same "detect a real signal, do
+    /// nothing more" honesty `pending_open_path` already uses for an
+    /// unbuilt pipeline. A real, logged failure ([`aurora_tile::TileError`],
+    /// e.g. the scratch disk failing mid-session) is worth a warning,
+    /// though, unlike those absent-precondition cases.
+    fn paint_dab(&mut self, doc_point: (f32, f32)) {
+        let Some(layer_id) = self.active_layer else {
+            return;
+        };
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
+        else {
+            return;
+        };
+        let Some(surface) = self.layers.surface_id(layer_id) else {
+            return;
+        };
+        let Some(store) = self.tile_store.as_mut() else {
+            return;
+        };
+        let local = layer_local_point(bounds, doc_point);
+        if let Err(err) = aurora_brush::stamp_dab(store, surface, local, BRUSH_RADIUS, BRUSH_COLOUR)
+        {
+            tracing::warn!(?err, "failed to stamp a brush dab");
+        }
     }
 
     /// A real `WindowEvent::MouseInput { state: Released, .. }`: ends
@@ -1927,9 +2139,10 @@ mod tests {
         autosave_path, begin_drag, clear_session_marker, close_command_palette,
         close_crash_recovery_dialog, continue_drag, crash_recovery_dialog_message,
         default_shortcuts, demo_document, handle_dialog_key, handle_key, handle_palette_key,
-        handle_zoom_tool_click, load_background_color, load_scales, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, pointer_in_canvas,
-        previous_session_left_a_marker, recover_document, run_command, toggle_command_palette,
+        handle_zoom_tool_click, layer_local_point, load_background_color, load_scales,
+        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog,
+        open_tile_store, pointer_in_canvas, previous_session_left_a_marker, recover_document,
+        run_command, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
         translate_key, translate_modifiers, translate_pointer_button, write_autosave,
         write_session_marker, zoom_steps_for_scroll,
     };
@@ -2043,6 +2256,46 @@ mod tests {
         {
             assert_eq!(layers.opacity(color_balance), Some(0.8));
         }
+    }
+
+    #[test]
+    fn topmost_pixel_layer_of_the_demo_document_is_the_topmost_root() {
+        let (layers, _history) = demo_document();
+        let Some(&expected) = layers.roots().first() else {
+            unreachable!("demo_document always has at least one root");
+        };
+        assert_eq!(topmost_pixel_layer(&layers), Some(expected));
+    }
+
+    #[test]
+    fn topmost_pixel_layer_is_none_for_an_empty_tree() {
+        let layers = aurora_doc::LayerTree::new();
+        assert_eq!(topmost_pixel_layer(&layers), None);
+    }
+
+    #[test]
+    fn topmost_pixel_layer_skips_a_topmost_group_and_finds_the_pixel_layer_beneath() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let pixel = match layers.add_pixel_layer(
+            "background",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Added after the pixel layer, so it's the new topmost root --
+        // `topmost_pixel_layer` must skip it and still find the pixel
+        // layer underneath, not just check `roots()[0]`.
+        if let Err(err) = layers.add_group("a group on top", None) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(topmost_pixel_layer(&layers), Some(pixel));
     }
 
     /// `demo_document`'s whole point (unlike a plain `LayerTree` built
@@ -2854,6 +3107,47 @@ mod tests {
     }
 
     #[test]
+    fn tile_store_scratch_dir_is_distinct_from_the_marker_and_autosave_paths() {
+        let scratch = tile_store_scratch_dir();
+        assert_ne!(scratch, super::marker_path());
+        assert_ne!(scratch, autosave_path());
+    }
+
+    #[test]
+    fn open_tile_store_succeeds_against_the_real_scratch_directory() {
+        // A real, if unremarkable, assertion: this crate's own scratch
+        // directory is always writable in a real environment (the same
+        // assumption `write_session_marker`'s own `std::env::temp_dir()`
+        // use already makes) -- confirms `open_tile_store` doesn't
+        // always return `None` in ordinary conditions, not this
+        // function's own I/O error path (real disk-failure injection is
+        // not something this sandbox can do).
+        assert!(open_tile_store().is_some());
+    }
+
+    #[test]
+    fn layer_local_point_subtracts_the_layers_own_origin() {
+        let bounds = aurora_core::Rect {
+            x: 100,
+            y: 50,
+            width: 10,
+            height: 10,
+        };
+        assert_eq!(layer_local_point(bounds, (110.0, 60.0)), (10.0, 10.0));
+    }
+
+    #[test]
+    fn layer_local_point_is_identity_for_an_origin_at_zero() {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        assert_eq!(layer_local_point(bounds, (5.0, 7.0)), (5.0, 7.0));
+    }
+
+    #[test]
     fn recovering_a_missing_autosave_returns_none() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -3183,6 +3477,18 @@ mod tests {
     }
 
     #[test]
+    fn begin_drag_with_brush_tool_and_primary_button_starts_a_brush_drag_at_zero_carry() {
+        let view = CanvasView::new();
+        assert_eq!(
+            begin_drag(Tool::Brush, PointerButton::Primary, (10.0, 20.0), &view),
+            Some(Drag::Brush {
+                last_doc: (10.0, 20.0),
+                carry: 0.0
+            })
+        );
+    }
+
+    #[test]
     fn begin_drag_with_zoom_tool_and_secondary_button_does_nothing() {
         let view = CanvasView::new();
         assert_eq!(
@@ -3198,7 +3504,7 @@ mod tests {
         let mut drag = Drag::Pan {
             last_screen: (10.0, 10.0),
         };
-        continue_drag(&mut drag, (15.0, 8.0), &mut view, &mut selection);
+        let dabs = continue_drag(&mut drag, (15.0, 8.0), &mut view, &mut selection);
         assert_eq!(view.pan(), (5.0, -2.0));
         assert_eq!(
             drag,
@@ -3207,6 +3513,7 @@ mod tests {
             },
             "must advance its own last-known point for the next event"
         );
+        assert_eq!(dabs, Vec::new(), "Pan must never produce dabs to paint");
     }
 
     #[test]
@@ -3216,7 +3523,7 @@ mod tests {
         let mut drag = Drag::Marquee {
             start_doc: (10.0, 10.0),
         };
-        continue_drag(&mut drag, (30.0, 25.0), &mut view, &mut selection);
+        let dabs = continue_drag(&mut drag, (30.0, 25.0), &mut view, &mut selection);
         let Some(active) = selection.active() else {
             unreachable!("must select something");
         };
@@ -3224,14 +3531,69 @@ mod tests {
         assert_eq!(active.bounds.y, 10);
         assert_eq!(active.bounds.width, 20);
         assert_eq!(active.bounds.height, 15);
+        assert_eq!(dabs, Vec::new(), "Marquee must never produce dabs to paint");
 
         // A second move further extends the same drag -- the selection
         // must track the *current* rect, not just the first one.
-        continue_drag(&mut drag, (50.0, 5.0), &mut view, &mut selection);
+        let _ = continue_drag(&mut drag, (50.0, 5.0), &mut view, &mut selection);
         let Some(active) = selection.active() else {
             unreachable!("must still be selected");
         };
         assert_eq!(active.bounds.width, 40);
+    }
+
+    #[test]
+    fn continue_drag_brush_returns_the_new_segments_dabs() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: (0.0, 0.0),
+            carry: 0.0,
+        };
+        // radius 24, DEFAULT_SPACING 0.25 -> step 6; a 12-unit segment
+        // lands dabs at 6 and 12 (the segment's own start, 0, is not
+        // re-emitted -- it was already painted by whatever started the
+        // drag or the previous event).
+        let dabs = continue_drag(&mut drag, (12.0, 0.0), &mut view, &mut selection);
+        assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
+        assert_eq!(
+            drag,
+            Drag::Brush {
+                last_doc: (12.0, 0.0),
+                carry: 0.0
+            },
+            "must advance its own last-known point and carry for the next event"
+        );
+    }
+
+    #[test]
+    fn continue_drag_brush_carries_spacing_across_multiple_short_move_events() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: (0.0, 0.0),
+            carry: 0.0,
+        };
+        let first = continue_drag(&mut drag, (3.0, 0.0), &mut view, &mut selection);
+        // Segment shorter than one step (6): no new dab yet, but the 3
+        // units already travelled must carry forward, not reset to 0 --
+        // the exact bug a fresh `dabs_along_path` call each event would
+        // have (see `continue_drag`'s own doc comment).
+        assert_eq!(first, Vec::new());
+        assert_eq!(
+            drag,
+            Drag::Brush {
+                last_doc: (3.0, 0.0),
+                carry: 3.0
+            }
+        );
+
+        // Second event: 4 more units. 3 (carried) + 4 = 7 >= step (6),
+        // so exactly one dab lands (at the 6-unit mark, i.e. 3 units
+        // into *this* segment) -- proving the carry from the first,
+        // sub-step event was not lost.
+        let second = continue_drag(&mut drag, (7.0, 0.0), &mut view, &mut selection);
+        assert_eq!(second, vec![(6.0, 0.0)]);
     }
 
     #[test]

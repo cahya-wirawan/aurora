@@ -25,20 +25,71 @@
 /// own proven default (a dab every quarter-radius travelled).
 pub const DEFAULT_SPACING: f32 = 0.25;
 
+/// The distance between dabs — `radius * spacing`, floored at `0.5` so a
+/// degenerate `spacing` of `0.0` can't demand a dab at every
+/// float-epsilon step. Shared by [`dabs_along_path`] and
+/// [`advance_segment`] so both use the exact same formula.
+#[must_use]
+pub fn dab_step(radius: f32, spacing: f32) -> f32 {
+    (radius * spacing).max(0.5)
+}
+
+/// Advances dab spacing across one segment from `prev` to `point`, given
+/// `carry` (how far the path had already travelled past the last placed
+/// dab, before this segment started) and `step` ([`dab_step`]). Returns
+/// the dabs this segment placed (possibly none, for a segment shorter
+/// than what's left before the next one) and the updated carry to feed
+/// into the *next* segment's own call.
+///
+/// This is [`dabs_along_path`]'s own per-segment engine, exposed so a
+/// caller driving a live pointer drag one move-event at a time (not a
+/// fully-known path up front) can carry spacing correctly across many
+/// small events — calling [`dabs_along_path`] fresh on each two-point
+/// event would restart `carry` at `0.0` every time, which silently loses
+/// spacing across events shorter than one `step` (a slow drag could
+/// place no dabs at all past the first, despite covering real distance
+/// over several events).
+///
+/// A zero-length segment (`prev == point`, e.g. two pointer-move events
+/// with no actual movement) places nothing and returns `carry`
+/// unchanged.
+#[must_use]
+pub fn advance_segment(
+    prev: (f32, f32),
+    point: (f32, f32),
+    carry: f32,
+    step: f32,
+) -> (Vec<(f32, f32)>, f32) {
+    let (dx, dy) = (point.0 - prev.0, point.1 - prev.1);
+    let segment_len = dx.hypot(dy);
+    if segment_len <= f32::EPSILON {
+        return (Vec::new(), carry);
+    }
+    let (ux, uy) = (dx / segment_len, dy / segment_len);
+    let mut dabs = Vec::new();
+    let mut travelled = 0.0_f32;
+    let mut carry = carry;
+    while carry + (segment_len - travelled) >= step {
+        let needed = step - carry;
+        travelled += needed;
+        dabs.push((prev.0 + ux * travelled, prev.1 + uy * travelled));
+        carry = 0.0;
+    }
+    carry += segment_len - travelled;
+    (dabs, carry)
+}
+
 /// Generates evenly spaced dab centers along the polyline through
-/// `points`, `radius * spacing` apart (floored at `0.5`, so a degenerate
-/// `spacing` of `0.0` can't produce a dab at every float-epsilon step).
+/// `points`, [`dab_step`] apart.
 ///
 /// Always includes `points`'s own first point (a stroke's very first dab
 /// lands exactly where the pointer went down, not one `step` later).
-/// Consecutive duplicate points (a zero-length segment — e.g. two
-/// pointer-move events with no actual movement) are skipped rather than
-/// treated as a stroke direction, since a zero-length segment has none.
 ///
-/// Spacing carries across segment boundaries: splitting one straight
-/// path into many short segments (any way the points get chopped up, as
-/// long as they still lie on it) produces the exact same dab positions
-/// as one long segment — see this function's own tests.
+/// Spacing carries across segment boundaries ([`advance_segment`]):
+/// splitting one straight path into many short segments (any way the
+/// points get chopped up, as long as they still lie on it) produces the
+/// exact same dab positions as one long segment — see this function's
+/// own tests.
 #[must_use]
 pub fn dabs_along_path(points: &[(f32, f32)], radius: f32, spacing: f32) -> Vec<(f32, f32)> {
     let mut dabs = Vec::new();
@@ -48,29 +99,14 @@ pub fn dabs_along_path(points: &[(f32, f32)], radius: f32, spacing: f32) -> Vec<
     };
     dabs.push(first);
 
-    let step = (radius * spacing).max(0.5);
+    let step = dab_step(radius, spacing);
     let mut prev = first;
-    // How far the path has travelled since the last dab was placed --
-    // persists across segments so spacing is continuous along the whole
-    // path, not reset to zero at every point.
-    let mut distance_since_last_dab = 0.0_f32;
+    let mut carry = 0.0_f32;
 
     for point in iter {
-        let (dx, dy) = (point.0 - prev.0, point.1 - prev.1);
-        let segment_len = dx.hypot(dy);
-        if segment_len <= f32::EPSILON {
-            prev = point;
-            continue;
-        }
-        let (ux, uy) = (dx / segment_len, dy / segment_len);
-        let mut travelled = 0.0_f32;
-        while distance_since_last_dab + (segment_len - travelled) >= step {
-            let needed = step - distance_since_last_dab;
-            travelled += needed;
-            dabs.push((prev.0 + ux * travelled, prev.1 + uy * travelled));
-            distance_since_last_dab = 0.0;
-        }
-        distance_since_last_dab += segment_len - travelled;
+        let (segment_dabs, new_carry) = advance_segment(prev, point, carry, step);
+        dabs.extend(segment_dabs);
+        carry = new_carry;
         prev = point;
     }
     dabs
@@ -78,7 +114,7 @@ pub fn dabs_along_path(points: &[(f32, f32)], radius: f32, spacing: f32) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SPACING, dabs_along_path};
+    use super::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
 
     #[test]
     fn empty_path_produces_no_dabs() {
@@ -154,5 +190,77 @@ mod tests {
         };
         assert!((midpoint.0 - 1.5).abs() < 1e-4, "{midpoint:?}");
         assert!((midpoint.1 - 2.0).abs() < 1e-4, "{midpoint:?}");
+    }
+
+    #[test]
+    // `dab_step` is one multiplication (or the fixed `0.5` floor), never
+    // accumulated -- exact equality is correct here.
+    #[allow(clippy::float_cmp)]
+    fn dab_step_matches_the_documented_formula() {
+        assert_eq!(dab_step(10.0, 0.25), 2.5);
+        assert_eq!(dab_step(1.0, 0.0), 0.5, "must floor at 0.5");
+    }
+
+    #[test]
+    // `carry` here is `0.0` because the loop's own exact arithmetic
+    // lands exactly on the segment's end (4 * 2.5 == 10.0), not because
+    // of accumulated rounding -- exact equality is correct.
+    #[allow(clippy::float_cmp)]
+    fn advance_segment_with_zero_carry_matches_dabs_along_path() {
+        let step = dab_step(10.0, DEFAULT_SPACING);
+        let (dabs, carry) = advance_segment((0.0, 0.0), (10.0, 0.0), 0.0, step);
+        assert_eq!(dabs, vec![(2.5, 0.0), (5.0, 0.0), (7.5, 0.0), (10.0, 0.0)]);
+        assert_eq!(
+            carry, 0.0,
+            "landing exactly on the segment's end leaves nothing to carry"
+        );
+    }
+
+    #[test]
+    // `carry` is exactly the 1-unit segment length itself (no dab
+    // placed, so no further arithmetic touched it) -- exact equality is
+    // correct.
+    #[allow(clippy::float_cmp)]
+    fn advance_segment_carries_a_short_segment_forward() {
+        let step = dab_step(10.0, DEFAULT_SPACING);
+        // A 1-unit segment is shorter than the 2.5-unit step -- no dab
+        // yet, but the 1 unit already travelled must carry forward.
+        let (dabs, carry) = advance_segment((0.0, 0.0), (1.0, 0.0), 0.0, step);
+        assert_eq!(dabs, Vec::new());
+        assert_eq!(carry, 1.0);
+    }
+
+    #[test]
+    fn advance_segment_called_event_by_event_matches_one_whole_call() {
+        // The same 10-unit path, once as a single `advance_segment` call
+        // and once as several small ones each carrying `carry` forward --
+        // must produce the same dabs in total, proving this function
+        // (not just `dabs_along_path`'s own internal use of it) carries
+        // spacing correctly across many small steps, the exact scenario
+        // a live pointer drag's many move events puts it in.
+        let step = dab_step(10.0, DEFAULT_SPACING);
+        let (whole, _) = advance_segment((0.0, 0.0), (10.0, 0.0), 0.0, step);
+
+        let mut piecewise = Vec::new();
+        let mut carry = 0.0;
+        let mut prev = (0.0, 0.0);
+        for next in [(1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (10.0, 0.0)] {
+            let (dabs, new_carry) = advance_segment(prev, next, carry, step);
+            piecewise.extend(dabs);
+            carry = new_carry;
+            prev = next;
+        }
+        assert_eq!(whole, piecewise);
+    }
+
+    #[test]
+    // `carry` is returned completely untouched for a zero-length
+    // segment (an early return, no arithmetic at all) -- exact equality
+    // is correct.
+    #[allow(clippy::float_cmp)]
+    fn advance_segment_of_a_zero_length_segment_carries_unchanged() {
+        let (dabs, carry) = advance_segment((5.0, 5.0), (5.0, 5.0), 1.5, 2.5);
+        assert_eq!(dabs, Vec::new());
+        assert_eq!(carry, 1.5);
     }
 }

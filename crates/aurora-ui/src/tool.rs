@@ -1,6 +1,8 @@
 //! Which interactive canvas tool is active, and the pure geometry each
 //! one needs. PLAN.md M1.9's "basic tools" bullet: Move, Marquee Select,
-//! Zoom, Pan, Eyedropper.
+//! Zoom, Pan, Eyedropper — plus `Brush` (M1.9's separate "basic brush
+//! and eraser" bullet), included here since it's a canvas tool like any
+//! other.
 //!
 //! **Scope, stated honestly.** This module is deliberately just the tool
 //! identity and the coordinate math a caller (`aurora-app`, which owns
@@ -10,16 +12,19 @@
 //! already draw. Zoom and Pan are pure view-transform operations
 //! ([`crate::CanvasView`] itself) and need nothing from this module
 //! beyond the enum variant. Marquee Select needs [`marquee_rect`], real
-//! and tested here. **Move and Eyedropper are not wired to anything
-//! yet**: Move needs a notion of "the active layer," which needs
-//! click-to-select routing in the Layers panel (`aurora_ui::layers_panel`
-//! has no pointer-click handling at all yet — this crate has never
-//! routed a pointer event to any panel); Eyedropper needs to sample a
-//! real pixel, and no layer owns real pixel storage yet (the same open
-//! question `aurora_doc::LayerKind::Pixel`'s own `bounds` field has
-//! flagged since M1.4). Both are real, selectable tool variants — so a
-//! user (or test) can switch to them — but their pointer handling is
-//! deliberately a no-op today, not a faked partial behaviour.
+//! and tested here. `Brush` is real too, but its actual stamping logic
+//! (`aurora_brush::stamp_dab`) needs a live `aurora_tile::TileStore` this
+//! crate has no reason to own — that lives in `aurora-app`, the one
+//! place a live document and a live store both exist. **Move and
+//! Eyedropper are not wired to anything yet**: Move needs a notion of
+//! "the active layer" a user can *change*, which needs click-to-select
+//! routing in the Layers panel (`aurora_ui::layers_panel` has no
+//! pointer-click handling at all yet — this crate has never routed a
+//! pointer event to any panel); Eyedropper needs to sample a real pixel,
+//! which is real now (`aurora_tile::TileStore`, ADR 0010) but has no
+//! sampling function built yet. Both are real, selectable tool variants
+//! — so a user (or test) can switch to them — but their pointer handling
+//! is deliberately a no-op today, not a faked partial behaviour.
 
 use aurora_core::Rect;
 
@@ -49,20 +54,27 @@ pub enum Tool {
     /// [`crate::CanvasView::pan_by`].
     Pan,
     /// Samples a pixel's colour. **Not wired yet** — see this module's
-    /// own doc comment (no layer owns real pixel storage yet).
+    /// own doc comment (no sampling function built on top of
+    /// `aurora_tile::TileStore` yet).
     Eyedropper,
+    /// Paints — real, via `aurora_brush::stamp_dab`/`stamp_stroke`
+    /// against `aurora-app`'s own live `aurora_tile::TileStore` and
+    /// active layer. See this module's own doc comment for why the
+    /// actual stamping logic lives there, not here.
+    Brush,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
-    /// offered to the user (matches PLAN.md's own bullet: Move, Marquee
-    /// Select, Zoom, Pan, Eyedropper).
-    pub const ALL: [Self; 5] = [
+    /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
+    /// Select, Zoom, Pan, Eyedropper, then Brush).
+    pub const ALL: [Self; 6] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::Zoom,
         Self::Pan,
         Self::Eyedropper,
+        Self::Brush,
     ];
 
     /// A short, human-readable label — for a future tool palette/status
@@ -75,6 +87,7 @@ impl Tool {
             Self::Zoom => "Zoom",
             Self::Pan => "Pan",
             Self::Eyedropper => "Eyedropper",
+            Self::Brush => "Brush",
         }
     }
 }
@@ -115,11 +128,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 5);
+        assert_eq!(Tool::ALL.len(), 6);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 5, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 6, "ALL must not repeat a variant");
     }
 
     #[test]
