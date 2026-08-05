@@ -465,6 +465,8 @@ dependencies = [
  "aurora-core",
  "aurora-gpu",
  "aurora-tile",
+ "half",
+ "tempfile",
  "thiserror 2.0.19",
  "tracing",
 ]

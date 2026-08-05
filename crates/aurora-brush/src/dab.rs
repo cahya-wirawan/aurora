@@ -15,19 +15,11 @@
 //! must not double up dabs at every point the way naively restarting the
 //! spacing countdown at each segment would.
 //!
-//! **What this deliberately does not do: write a single pixel.**
-//! Invariant §7.3.5 sends brush input into a scratch layer, and there is
-//! no scratch layer to write to yet — `aurora_doc::LayerKind::Pixel`
-//! doesn't own any real pixel storage. That question is now *decided*
-//! ([ADR 0010](../../../docs/adr/0010-layer-pixel-storage.md): one
-//! shared `aurora_tile::TileStore` per document for real layers, plus a
-//! separate small store for the active stroke this module's own dabs
-//! would stamp into), but not yet *implemented* — `aurora-tile` doesn't
-//! have a `SurfaceId` type or the compound-key store API yet. This
-//! module stops exactly at that boundary; wiring `dabs_along_path`'s
-//! output into real dab-stamping is real, separate follow-on work, the
-//! same place `aurora_ui::tool`'s Move/Eyedropper gap stops at "no
-//! active layer to move/sample."
+//! This module is pure geometry — no pixel storage involved at all.
+//! [`crate::stamp`] is where a dab position actually becomes pixels
+//! (`aurora_tile::TileStore`, addressed by `SurfaceId` per [ADR
+//! 0010](../../../docs/adr/0010-layer-pixel-storage.md)); this module
+//! only produces the positions `stamp::stamp_stroke` consumes.
 
 /// Dab spacing as a fraction of brush radius — `spike/vertical-slice`'s
 /// own proven default (a dab every quarter-radius travelled).
