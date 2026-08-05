@@ -39,15 +39,16 @@
 //! `rfd`/`arboard`, PRD §8.3's own pre-decided choices, plus `winit`'s
 //! own native `WindowEvent::DroppedFile` (no extra dependency needed).
 //! The command palette's `Ctrl+C`/`Ctrl+V` read and write the real
-//! system clipboard, and its "Open File…" entry shows a real, native
-//! `rfd::FileDialog`; a real drag-and-dropped file is recorded the same
-//! way. Both `arboard`/`rfd` are real platform calls with no meaningful
-//! headless behaviour, so `handle_palette_key` takes them as
+//! system clipboard, and its "Open File…"/"Save As…" entries show a
+//! real, native `rfd::FileDialog`; a real drag-and-dropped file is
+//! opened the same way "Open File…" is. Both `arboard`/`rfd` are real
+//! platform calls with no meaningful headless behaviour, so
+//! `handle_palette_key` takes them as
 //! `&mut dyn ClipboardAccess`/`&mut dyn FileDialogAccess` rather than
 //! calling them directly — the same "keep the pure dispatch logic
 //! testable, isolate the untestable platform call" seam `translate_key`/
 //! `translate_modifiers` already use for keyboard input. **A file
-//! chosen via "Open File…" *or* dropped onto the window is now really
+//! chosen via "Open File…" *or* dropped onto the window is really
 //! opened** (`App::open_file` — the same method either route calls,
 //! since both are the same "the user wants to open this" signal):
 //! `aurora_io::decode_by_extension` decodes it (PNG/JPEG/TIFF), and the
@@ -55,7 +56,18 @@
 //! the image, its own pixels written into the live tile store via
 //! `aurora_io::write_into_store` so the canvas actually shows it. A bad
 //! file (unreadable, undecodable, unrecognised extension) is logged and
-//! leaves the current document untouched.
+//! leaves the current document untouched. **"Save As…" is the reverse**
+//! (`App::save_file`): the active layer's own pixels are read back out
+//! of the tile store (`aurora_io::read_from_store`), encoded by the
+//! chosen path's own extension (`aurora_io::encode_by_extension`), and
+//! written to disk via `write_verified` — a sibling temp file, verified
+//! by reading it back and decoding it, then renamed over the real
+//! destination, so a failed export never corrupts or overwrites
+//! whatever was already there. Exports the active layer's own pixels
+//! only, not a composited whole document — this crate has no
+//! compositor wired in yet, and the canvas itself only ever shows the
+//! active layer's own surface today (see `App::redraw`'s own doc
+//! comment).
 //!
 //! **DPI/scale-factor aware layout**: `logical_size` divides a real
 //! physical window size by `Window::scale_factor` before it reaches
@@ -348,6 +360,64 @@ fn open_image(path: &Path) -> Option<aurora_io::Image> {
             None
         }
     }
+}
+
+/// Writes `bytes` to `path` without ever leaving a corrupt or partial
+/// file in `path`'s own place if something goes wrong partway through:
+/// writes to a sibling `.tmp` file first, verifies it actually reads
+/// and decodes back as a real image of exactly `width`x`height`
+/// (`aurora_io::decode_by_extension` against the file re-read from
+/// disk, not just the in-memory `bytes` — catching a truncated write,
+/// e.g. a full disk mid-write, not only a wrong encoder output), then
+/// atomically renames it over `path`. CLAUDE.md's own PSD/PSB
+/// round-trip rule applies here too, even though PNG/JPEG/TIFF aren't
+/// the round-trip-critical case that rule names: "never overwrite a
+/// user's file in place... write to temp, verify by reopening, then
+/// swap" — a half-written export silently destroying whatever used to
+/// be at `path` is exactly as bad regardless of format.
+///
+/// **Known gap, not built here**: CLAUDE.md's other half of that same
+/// rule — "warn with an itemized list before any lossy save" — has no
+/// UI to attach to yet (no warning-dialog widget exists, and this
+/// function has no way to know *why* a save might be lossy, e.g. a
+/// JPEG export silently dropping an alpha channel). Real, separate
+/// follow-on work.
+///
+/// Returns `false` (logged) on any failure — writing the temp file,
+/// reading/decoding it back, a size mismatch, or the final rename —
+/// leaving `path` itself untouched in every one of those cases; the
+/// temp file is cleaned up rather than left behind.
+#[must_use]
+fn write_verified(path: &Path, bytes: &[u8], width: u32, height: u32) -> bool {
+    let Some(file_name) = path.file_name() else {
+        tracing::warn!(path = %path.display(), "save path has no file name");
+        return false;
+    };
+    let mut temp_name = file_name.to_os_string();
+    temp_name.push(".tmp");
+    let temp_path = path.with_file_name(temp_name);
+
+    if let Err(err) = std::fs::write(&temp_path, bytes) {
+        tracing::warn!(path = %temp_path.display(), %err, "failed to write the temp export file");
+        return false;
+    }
+
+    let verified = std::fs::read(&temp_path)
+        .ok()
+        .and_then(|reread| aurora_io::decode_by_extension(path, &reread).ok())
+        .is_some_and(|image| image.width() == width && image.height() == height);
+    if !verified {
+        tracing::warn!(path = %temp_path.display(), "exported file failed to verify by reading it back");
+        let _ = std::fs::remove_file(&temp_path);
+        return false;
+    }
+
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        tracing::warn!(path = %path.display(), %err, "failed to replace the destination with the verified export");
+        let _ = std::fs::remove_file(&temp_path);
+        return false;
+    }
+    true
 }
 
 /// Clears and repopulates `workspace`'s Layers/History panels for a
@@ -759,10 +829,11 @@ impl ClipboardAccess for SystemClipboard {
     }
 }
 
-/// Whatever the caller uses to show a native "open file" dialog —
-/// [`SystemFileDialog`] in real use, a fake in tests.
+/// Whatever the caller uses to show a native "open file"/"save file"
+/// dialog — [`SystemFileDialog`] in real use, a fake in tests.
 trait FileDialogAccess {
     fn pick_file(&mut self) -> Option<PathBuf>;
+    fn save_file(&mut self) -> Option<PathBuf>;
 }
 
 /// The real native file picker, via `rfd`. Synchronous — the call
@@ -775,6 +846,25 @@ impl FileDialogAccess for SystemFileDialog {
     fn pick_file(&mut self) -> Option<PathBuf> {
         rfd::FileDialog::new().pick_file()
     }
+
+    fn save_file(&mut self) -> Option<PathBuf> {
+        rfd::FileDialog::new().save_file()
+    }
+}
+
+/// One real, resolvable outcome of activating a command-palette entry
+/// (or, on macOS, a native menu item) that this crate can't finish
+/// dispatching on its own: [`COMMAND_FILE_OPEN`]'s picked path
+/// ([`App::open_file`] still needs to read/decode/replace the document
+/// with it) or [`COMMAND_FILE_SAVE`]'s picked path ([`App::save_file`]
+/// still needs to encode/write to it). Both are "a real native file
+/// dialog just returned a real path" signals — the same reason
+/// [`activate_command`] previously returned a bare `Option<PathBuf>`
+/// before there were two different actions that path could mean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChosenFile {
+    Open(PathBuf),
+    Save(PathBuf),
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -785,22 +875,26 @@ const COMMAND_FOCUS_LAYERS: &str = "view.focus_layers";
 const COMMAND_FOCUS_PROPERTIES: &str = "view.focus_properties";
 const COMMAND_FOCUS_HISTORY: &str = "view.focus_history";
 const COMMAND_FILE_OPEN: &str = "file.open";
+const COMMAND_FILE_SAVE: &str = "file.save";
 
 /// The command palette's own, real content: one command per docked
-/// panel, focusing it, plus a real native "Open File…" picker. Genuine,
-/// not placeholder — each focus command moves real keyboard focus to a
-/// real, already-focusable panel region (see `aurora-ui`'s
-/// `insert_panel`), verifiable the same way any other focus change is
-/// (`push_accessibility`); `COMMAND_FILE_OPEN` shows a real, native
-/// `rfd::FileDialog` and the chosen path is really opened
-/// (`App::open_file`). A richer command set (undo, save, tool switches)
-/// waits on those real actions existing.
+/// panel, focusing it, plus real native "Open File…"/"Save As…"
+/// pickers. Genuine, not placeholder — each focus command moves real
+/// keyboard focus to a real, already-focusable panel region (see
+/// `aurora-ui`'s `insert_panel`), verifiable the same way any other
+/// focus change is (`push_accessibility`); `COMMAND_FILE_OPEN`/
+/// `COMMAND_FILE_SAVE` show a real, native `rfd::FileDialog` and the
+/// chosen path is really opened/saved (`App::open_file`/`save_file`).
+/// "Save As…", not "Save" — this crate tracks no "current document
+/// path" to reuse yet, so every save shows a picker. A richer command
+/// set (undo, tool switches) waits on those real actions existing.
 fn palette_commands() -> Vec<CommandEntry> {
     vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
         CommandEntry::new(COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
         CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
         CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
+        CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
     ]
 }
 
@@ -823,14 +917,15 @@ fn command_target(workspace: &aurora_ui::Workspace, id: &str) -> Option<WidgetId
 /// from two different UI surfaces, rather than two parallel
 /// implementations of "what does this command do." Moves focus for a
 /// panel-focus command ([`command_target`]); shows the native file
-/// dialog and returns the picked path for [`COMMAND_FILE_OPEN`]; logs
-/// and returns `None` for any other id.
+/// dialog and returns the picked path, tagged by which one it was
+/// ([`ChosenFile`]), for [`COMMAND_FILE_OPEN`]/[`COMMAND_FILE_SAVE`];
+/// logs and returns `None` for any other id.
 fn activate_command(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     id: &str,
     file_dialog: &mut dyn FileDialogAccess,
-) -> Option<PathBuf> {
+) -> Option<ChosenFile> {
     if let Some(target) = command_target(workspace, id) {
         if let Err(err) = focus.focus(&mut workspace.tree, target) {
             tracing::warn!(?err, "activated command's target isn't focusable");
@@ -838,7 +933,10 @@ fn activate_command(
         return None;
     }
     if id == COMMAND_FILE_OPEN {
-        return file_dialog.pick_file();
+        return file_dialog.pick_file().map(ChosenFile::Open);
+    }
+    if id == COMMAND_FILE_SAVE {
+        return file_dialog.save_file().map(ChosenFile::Save);
     }
     tracing::warn!(command = id, "unknown command activated");
     None
@@ -862,7 +960,7 @@ fn activate_command(
 // every platform.
 
 /// Builds the native menu's own cross-platform structure: File > Open
-/// File…, View > Focus Layers/Properties/History Panel — reusing the
+/// File…/Save As…, View > Focus Layers/Properties/History Panel — reusing the
 /// exact same `COMMAND_*` ids the command palette already uses (via
 /// `MenuItem::with_id`), so [`activate_command`] drives both UI
 /// surfaces identically; nothing here invents a second command
@@ -877,15 +975,13 @@ fn build_menu() -> muda::Menu {
     let file_menu = match muda::Submenu::with_items(
         "File",
         true,
-        &[&muda::MenuItem::with_id(
-            COMMAND_FILE_OPEN,
-            "Open File…",
-            true,
-            None,
-        )],
+        &[
+            &muda::MenuItem::with_id(COMMAND_FILE_OPEN, "Open File…", true, None),
+            &muda::MenuItem::with_id(COMMAND_FILE_SAVE, "Save As…", true, None),
+        ],
     ) {
         Ok(submenu) => submenu,
-        Err(err) => unreachable!("a single, freshly built item cannot fail to append: {err:?}"),
+        Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
     };
 
     let view_menu = match muda::Submenu::with_items(
@@ -996,11 +1092,11 @@ fn run_command(
 /// `palette` is `None` (defensive; [`handle_key`] only calls this when
 /// it's `Some`).
 /// Routes one key press while the command palette is open. Returns
-/// `Some(path)` only when `Enter` just activated [`COMMAND_FILE_OPEN`]
-/// and the user picked a real file — the one case this function can't
-/// fully resolve itself (there's no import pipeline for it to hand the
-/// path to yet; see [`palette_commands`]'s own doc comment), so it
-/// hands the path back up to [`handle_key`]/`App` instead. Every other
+/// `Some(ChosenFile)` only when `Enter` just activated
+/// [`COMMAND_FILE_OPEN`]/[`COMMAND_FILE_SAVE`] and the user picked a
+/// real path — the one case this function can't fully resolve itself
+/// (opening/saving needs `App`'s own live document state), so it hands
+/// the tagged path back up to [`handle_key`]/`App` instead. Every other
 /// case returns `None`.
 #[allow(clippy::too_many_arguments)]
 fn handle_palette_key(
@@ -1011,7 +1107,7 @@ fn handle_palette_key(
     text: Option<&str>,
     clipboard: &mut dyn ClipboardAccess,
     file_dialog: &mut dyn FileDialogAccess,
-) -> Option<PathBuf> {
+) -> Option<ChosenFile> {
     let root = (*palette)?;
     match chord.key {
         Key::Named(NamedKey::Escape) => close_command_palette(workspace, focus, palette),
@@ -1093,9 +1189,9 @@ fn handle_palette_key(
 /// silently ignored — there's no text field to fall back to routing
 /// into yet.
 ///
-/// Returns `Some(path)` only in the one case no pure `WidgetTree`
-/// mutation can finish on its own: the palette's `Open File…` command
-/// was just activated and the user picked a real file via
+/// Returns `Some(ChosenFile)` only in the one case no pure `WidgetTree`
+/// mutation can finish on its own: the palette's `Open File…`/`Save
+/// As…` command was just activated and the user picked a real path via
 /// `file_dialog` — see [`handle_palette_key`]'s own doc comment. The
 /// caller (`App::handle_key_event`) is what actually has somewhere to
 /// put it.
@@ -1112,7 +1208,7 @@ fn handle_key(
     text: Option<&str>,
     clipboard: &mut dyn ClipboardAccess,
     file_dialog: &mut dyn FileDialogAccess,
-) -> Option<PathBuf> {
+) -> Option<ChosenFile> {
     let chord = KeyChord::new(modifiers, key);
     if dialog.is_some() {
         handle_dialog_key(workspace, focus, dialog, chord);
@@ -2002,8 +2098,10 @@ impl App {
             &mut self.clipboard,
             &mut self.file_dialog,
         );
-        if let Some(path) = picked {
-            self.open_file(&path);
+        match picked {
+            Some(ChosenFile::Open(path)) => self.open_file(&path),
+            Some(ChosenFile::Save(path)) => self.save_file(&path),
+            None => {}
         }
         self.push_accessibility();
     }
@@ -2075,6 +2173,59 @@ impl App {
         self.selection = aurora_doc::SelectionSet::new();
         self.drag = None;
         self.push_accessibility();
+    }
+
+    /// Saves the active layer's own pixels to `path`: reads them back
+    /// out of the live tile store (`aurora_io::read_from_store`),
+    /// encodes via whichever format `path`'s own extension names
+    /// (`aurora_io::encode_by_extension`), and writes the result to disk
+    /// with [`write_verified`]'s own "never leave a corrupt file in
+    /// place" discipline.
+    ///
+    /// **Scope, stated honestly**: exports the *active layer's* own
+    /// pixels, not a composited whole document — this crate has no
+    /// document compositor wired in yet (`aurora_render::TileCompositor`
+    /// exists, but nothing in `aurora-app` calls it), and the canvas
+    /// itself only ever shows the active layer's own surface today (see
+    /// [`Self::redraw`]'s own doc comment) — so a save round-trips
+    /// exactly what the canvas already shows, no more.
+    ///
+    /// A silent no-op if there's no live tile store, no active layer,
+    /// or that layer isn't a pixel layer — the same absent-precondition
+    /// honesty [`Self::paint_dab`] already uses. A real, logged failure
+    /// (reading the pixels, encoding, or writing the file) is worth a
+    /// warning, though.
+    fn save_file(&mut self, path: &Path) {
+        let Some(layer_id) = self.active_layer else {
+            return;
+        };
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
+        else {
+            return;
+        };
+        let Some(surface) = self.layers.surface_id(layer_id) else {
+            return;
+        };
+        let Some(store) = self.tile_store.as_mut() else {
+            return;
+        };
+        let image = match aurora_io::read_from_store(store, surface, bounds.width, bounds.height) {
+            Ok(image) => image,
+            Err(err) => {
+                tracing::warn!(?err, "failed to read the active layer's pixels for export");
+                return;
+            }
+        };
+        let bytes = match aurora_io::encode_by_extension(path, &image) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), ?err, "failed to encode the exported image");
+                return;
+            }
+        };
+        if write_verified(path, &bytes, image.width(), image.height()) {
+            tracing::info!(path = %path.display(), "exported the active layer");
+        }
     }
 
     /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
@@ -2247,8 +2398,10 @@ impl App {
             event.id().as_ref(),
             &mut self.file_dialog,
         );
-        if let Some(path) = picked {
-            self.open_file(&path);
+        match picked {
+            Some(ChosenFile::Open(path)) => self.open_file(&path),
+            Some(ChosenFile::Save(path)) => self.save_file(&path),
+            None => {}
         }
         self.push_accessibility();
     }
@@ -2629,19 +2782,20 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppCommand, COMMAND_FILE_OPEN, COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS,
-        COMMAND_FOCUS_PROPERTIES, CRASH_RECOVERY_CONTINUE, ClipboardAccess, Drag, FileDialogAccess,
-        Key, KeyChord, Modifiers, NamedKey, PointerButton, activate_command, apply_scroll_zoom,
-        autosave_path, begin_drag, canvas_area_physical_rect, canvas_area_physical_size,
-        clear_session_marker, close_command_palette, close_crash_recovery_dialog, continue_drag,
-        crash_recovery_dialog_message, default_shortcuts, demo_document, document_from_image,
-        handle_dialog_key, handle_key, handle_palette_key, handle_zoom_tool_click,
-        layer_local_point, load_background_color, load_scales, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        pointer_in_canvas, previous_session_left_a_marker, recover_document, replace_document,
-        run_command, select_layer, tile_origin_for_view, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, write_autosave, write_session_marker, zoom_steps_for_scroll,
+        AppCommand, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
+        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, CRASH_RECOVERY_CONTINUE, ChosenFile,
+        ClipboardAccess, Drag, FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PointerButton,
+        activate_command, apply_scroll_zoom, autosave_path, begin_drag, canvas_area_physical_rect,
+        canvas_area_physical_size, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, continue_drag, crash_recovery_dialog_message,
+        default_shortcuts, demo_document, document_from_image, handle_dialog_key, handle_key,
+        handle_palette_key, handle_zoom_tool_click, layer_local_point, load_background_color,
+        load_scales, logical_point, logical_size, open_command_palette, open_crash_recovery_dialog,
+        open_image, open_tile_store, pointer_in_canvas, previous_session_left_a_marker,
+        recover_document, replace_document, run_command, select_layer, tile_origin_for_view,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, write_autosave, write_session_marker,
+        write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -2668,15 +2822,22 @@ mod tests {
 
     /// [`FileDialogAccess`]'s test double — returns a canned path (or
     /// none, simulating a cancelled dialog) instead of showing a real
-    /// native picker.
+    /// native picker. `next_pick`/`next_save` are separate slots since a
+    /// real "Open File…"/"Save As…" activation would show two different
+    /// dialogs, never the same one.
     #[derive(Debug, Default)]
     struct FakeFileDialog {
         next_pick: Option<PathBuf>,
+        next_save: Option<PathBuf>,
     }
 
     impl FileDialogAccess for FakeFileDialog {
         fn pick_file(&mut self) -> Option<PathBuf> {
             self.next_pick.take()
+        }
+
+        fn save_file(&mut self) -> Option<PathBuf> {
+            self.next_save.take()
         }
     }
 
@@ -3033,6 +3194,100 @@ mod tests {
         assert_eq!(new_layers.roots(), &[layer_id]);
         assert_eq!(layer_rows.len(), 1);
         assert_eq!(layer_rows.values().copied().next(), Some(layer_id));
+    }
+
+    #[test]
+    fn write_verified_writes_a_real_verifiable_file() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let image = fake_image(4, 4);
+        let bytes = match aurora_io::png::encode(&image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("export.png");
+
+        assert!(write_verified(&path, &bytes, 4, 4));
+        assert!(path.exists());
+        assert!(
+            !path.with_file_name("export.png.tmp").exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+        let written = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let decoded = match aurora_io::decode_by_extension(&path, &written) {
+            Ok(image) => image,
+            Err(err) => {
+                unreachable!("the written file must itself be a real, decodable PNG: {err:?}")
+            }
+        };
+        assert_eq!(decoded.width(), 4);
+        assert_eq!(decoded.height(), 4);
+    }
+
+    #[test]
+    fn write_verified_rejects_corrupt_bytes_and_creates_no_destination_file() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("export.png");
+
+        assert!(!write_verified(&path, b"not a real png", 4, 4));
+        assert!(
+            !path.exists(),
+            "a failed verify must not create the destination"
+        );
+        assert!(
+            !path.with_file_name("export.png.tmp").exists(),
+            "the failed temp file must be cleaned up, not left behind"
+        );
+    }
+
+    #[test]
+    fn write_verified_never_touches_an_existing_destination_on_failure() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("export.png");
+        if let Err(err) = std::fs::write(&path, b"pre-existing content") {
+            unreachable!("{err:?}");
+        }
+
+        assert!(!write_verified(&path, b"not a real png", 4, 4));
+        let survived = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            survived, b"pre-existing content",
+            "a failed export must never overwrite what was already at the destination"
+        );
+    }
+
+    #[test]
+    fn write_verified_rejects_a_size_mismatch() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let image = fake_image(4, 4);
+        let bytes = match aurora_io::png::encode(&image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("export.png");
+
+        // Claims the export is 8x8, but the real PNG bytes decode back
+        // as 4x4 -- must be treated as a verify failure, not silently
+        // accepted.
+        assert!(!write_verified(&path, &bytes, 8, 8));
+        assert!(!path.exists());
     }
 
     // -- keyboard shortcuts and the command palette --
@@ -3596,6 +3851,7 @@ mod tests {
         let mut clipboard = FakeClipboard::default();
         let mut file_dialog = FakeFileDialog {
             next_pick: Some(PathBuf::from("/tmp/example.psd")),
+            ..FakeFileDialog::default()
         };
 
         for ch in "open file".chars() {
@@ -3632,7 +3888,10 @@ mod tests {
             &mut file_dialog,
         );
 
-        assert_eq!(picked, Some(PathBuf::from("/tmp/example.psd")));
+        assert_eq!(
+            picked,
+            Some(ChosenFile::Open(PathBuf::from("/tmp/example.psd")))
+        );
         assert_eq!(palette, None, "activating a command must close the palette");
     }
 
@@ -3701,6 +3960,7 @@ mod tests {
         let mut focus = FocusManager::default();
         let mut file_dialog = FakeFileDialog {
             next_pick: Some(PathBuf::from("/tmp/example.psd")),
+            ..FakeFileDialog::default()
         };
 
         let picked = activate_command(
@@ -3710,12 +3970,60 @@ mod tests {
             &mut file_dialog,
         );
 
-        assert_eq!(picked, Some(PathBuf::from("/tmp/example.psd")));
+        assert_eq!(
+            picked,
+            Some(ChosenFile::Open(PathBuf::from("/tmp/example.psd")))
+        );
         assert_eq!(
             focus.focused(),
             None,
             "COMMAND_FILE_OPEN has no focus target of its own"
         );
+    }
+
+    #[test]
+    fn activate_command_returns_the_picked_path_for_file_save() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut file_dialog = FakeFileDialog {
+            next_save: Some(PathBuf::from("/tmp/example.png")),
+            ..FakeFileDialog::default()
+        };
+
+        let picked = activate_command(
+            &mut workspace,
+            &mut focus,
+            COMMAND_FILE_SAVE,
+            &mut file_dialog,
+        );
+
+        assert_eq!(
+            picked,
+            Some(ChosenFile::Save(PathBuf::from("/tmp/example.png")))
+        );
+        assert_eq!(
+            focus.focused(),
+            None,
+            "COMMAND_FILE_SAVE has no focus target of its own"
+        );
+    }
+
+    #[test]
+    fn activate_command_returns_none_for_a_cancelled_save_dialog() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        // `next_save: None` -- simulates the user cancelling the native
+        // dialog rather than picking a destination.
+        let mut file_dialog = FakeFileDialog::default();
+
+        let picked = activate_command(
+            &mut workspace,
+            &mut focus,
+            COMMAND_FILE_SAVE,
+            &mut file_dialog,
+        );
+
+        assert_eq!(picked, None);
     }
 
     #[test]
