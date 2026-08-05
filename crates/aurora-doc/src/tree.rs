@@ -492,6 +492,38 @@ impl LayerTree {
         Ok(())
     }
 
+    /// A pixel layer's own `bounds`, in document space — `None` for an
+    /// unknown `id` or one that names a group (a group has no `bounds`
+    /// of its own; see [`LayerKind::Group`]).
+    #[must_use]
+    pub fn bounds(&self, id: LayerId) -> Option<Rect> {
+        match self.kind(id)? {
+            LayerKind::Pixel { bounds } => Some(*bounds),
+            LayerKind::Group { .. } => None,
+        }
+    }
+
+    /// Repositions/resizes a pixel layer: sets `id`'s own [`LayerKind::Pixel`]
+    /// `bounds` to `bounds` — the Move tool's own document-model support.
+    /// Until now a pixel layer's `bounds` could only ever be set once, at
+    /// [`Self::add_pixel_layer`] time; nothing could move a layer
+    /// afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist, or
+    /// [`DocError::NotAPixelLayer`] if it names a group.
+    pub fn set_bounds(&mut self, id: LayerId, bounds: Rect) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        match &mut entry.kind {
+            LayerKind::Pixel { bounds: current } => {
+                *current = bounds;
+                Ok(())
+            }
+            LayerKind::Group { .. } => Err(DocError::NotAPixelLayer(id)),
+        }
+    }
+
     /// This layer's *own* visibility flag — not whether it actually shows
     /// up in the final composite, which also depends on every ancestor
     /// group's own visibility. Computing that combined answer needs a
@@ -1185,6 +1217,59 @@ mod tests {
         match tree.set_blend_mode(bogus, BlendMode::Screen) {
             Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
             other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounds_reads_a_pixel_layers_own_bounds_and_none_for_a_group() {
+        let mut tree = LayerTree::new();
+        let pixel = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.bounds(pixel), Some(bounds()));
+        assert_eq!(tree.bounds(group), None);
+    }
+
+    #[test]
+    fn set_bounds_updates_and_rejects_unknown_id() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let moved = Rect {
+            x: 100,
+            y: 200,
+            width: 30,
+            height: 40,
+        };
+        if let Err(err) = tree.set_bounds(id, moved) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.kind(id), Some(&LayerKind::Pixel { bounds: moved }));
+
+        let bogus: super::LayerId = Id::from_raw(999);
+        match tree.set_bounds(bogus, moved) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_bounds_rejects_a_group() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match tree.set_bounds(group, bounds()) {
+            Err(DocError::NotAPixelLayer(got)) => assert_eq!(got, group),
+            other => unreachable!("expected NotAPixelLayer, got {other:?}"),
         }
     }
 

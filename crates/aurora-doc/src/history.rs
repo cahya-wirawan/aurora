@@ -101,6 +101,16 @@ enum LayerOp {
         id: LayerId,
         value: bool,
     },
+    /// Appended last, not alongside the other `Set*` variants above —
+    /// `LayerOp` is `postcard`-serialized (ADR 0009, the crash-recovery
+    /// journal/autosave), and postcard encodes an enum variant by its
+    /// ordinal position; inserting a new variant in the *middle* would
+    /// silently reinterpret every later variant in an old, already-
+    /// written journal as the wrong op. Appending is always safe.
+    SetBounds {
+        id: LayerId,
+        value: Rect,
+    },
 }
 
 /// The document-space region a step touched, when it's knowable from
@@ -149,6 +159,11 @@ fn current_index(tree: &LayerTree, id: LayerId, parent: Option<LayerId>) -> Opti
 /// this call just did) plus the region it dirtied, if known. The one
 /// place every undo *and* redo step actually happens — `History::undo`/
 /// `redo` differ only in which stack they pop from and push to.
+// One match arm per `LayerOp` variant, each following the exact same
+// "read the old value, apply, return the inverse" shape -- splitting
+// this up would just relocate the same lines into several
+// same-length-total functions, not reduce real complexity.
+#[allow(clippy::too_many_lines)]
 fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), DocError> {
     match op {
         LayerOp::RemoveById(id) => {
@@ -245,6 +260,19 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
                 layer_dirty_rect(tree, id),
             ))
         }
+        LayerOp::SetBounds { id, value } => {
+            let old = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
+            tree.set_bounds(id, value)?;
+            // The dirty region must cover *both* the old and new bounds
+            // -- undoing/redoing a move needs whatever the layer used to
+            // cover repainted too, not just where it ends up, or the
+            // canvas would show a stale copy left behind at the old
+            // position.
+            Ok((
+                LayerOp::SetBounds { id, value: old },
+                Some(old.union(&value)),
+            ))
+        }
     }
 }
 
@@ -300,6 +328,17 @@ fn describe(op: &LayerOp) -> String {
         LayerOp::SetMaskInverted { id, value } => {
             let verb = if *value { "Inverted" } else { "Un-inverted" };
             format!("{verb} mask on layer #{}", id.to_raw())
+        }
+        // "Repositioned," not "Moved" -- `Reparent` already claims that
+        // verb for changing a layer's place in the tree/z-order, a
+        // different operation from changing its own on-canvas bounds.
+        LayerOp::SetBounds { id, value } => {
+            format!(
+                "Repositioned layer #{} to ({}, {})",
+                id.to_raw(),
+                value.x,
+                value.y
+            )
         }
     }
 }
@@ -636,6 +675,25 @@ impl History {
         self.journal.push(LayerOp::SetBlendMode { id, value });
         self.push(LayerOp::SetBlendMode { id, value: old });
         Ok(layer_dirty_rect(tree, id))
+    }
+
+    /// Same as [`LayerTree::set_bounds`], recorded for undo — the Move
+    /// tool's own document-model support.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_bounds`].
+    pub fn set_bounds(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: Rect,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
+        tree.set_bounds(id, value)?;
+        self.journal.push(LayerOp::SetBounds { id, value });
+        self.push(LayerOp::SetBounds { id, value: old });
+        Ok(Some(old.union(&value)))
     }
 
     /// Same as [`LayerTree::set_visible`], recorded for undo.
@@ -1356,6 +1414,95 @@ mod tests {
             dirty, None,
             "a group has no bounds of its own to report as dirtied"
         );
+    }
+
+    #[test]
+    fn set_bounds_undo_redo_round_trips_and_dirties_the_union_of_old_and_new() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let moved = Rect {
+            x: 100,
+            y: 100,
+            width: 10,
+            height: 10,
+        };
+
+        let dirty = match history.set_bounds(&mut tree, id, moved) {
+            Ok(dirty) => dirty,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            dirty,
+            Some(bounds().union(&moved)),
+            "must dirty both where the layer used to be and where it ends up"
+        );
+        assert_eq!(tree.bounds(id), Some(moved));
+
+        let dirty = match history.undo(&mut tree) {
+            Ok(dirty) => dirty,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(dirty, Some(bounds().union(&moved)));
+        assert_eq!(tree.bounds(id), Some(bounds()));
+
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.bounds(id), Some(moved));
+    }
+
+    #[test]
+    fn set_bounds_rejects_a_group() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // `UnknownLayer`, not `NotAPixelLayer` -- this method reads the
+        // *old* bounds first (`tree.bounds(id)`, `None` for a group) and
+        // rejects there, before ever reaching `LayerTree::set_bounds`'s
+        // own `NotAPixelLayer` check (already covered directly by
+        // `tree::tests::set_bounds_rejects_a_group`).
+        match history.set_bounds(&mut tree, id, bounds()) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, id),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn journal_describes_set_bounds_distinctly_from_reparent() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_bounds(
+            &mut tree,
+            id,
+            Rect {
+                x: 5,
+                y: 7,
+                width: 10,
+                height: 10,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let descriptions = history.journal_descriptions();
+        let Some(last) = descriptions.last() else {
+            unreachable!("just recorded one action");
+        };
+        assert!(
+            last.starts_with("Repositioned"),
+            "must use a verb distinct from Reparent's own \"Moved\": {last:?}"
+        );
+        assert!(last.contains("(5, 7)"), "{last:?}");
     }
 
     #[test]

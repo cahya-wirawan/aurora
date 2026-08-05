@@ -20,6 +20,11 @@ pub enum DocError {
     /// names a pixel layer instead.
     #[error("layer {0:?} is not a group and cannot contain other layers")]
     NotAGroup(LayerId),
+    /// [`crate::LayerTree::set_bounds`] was called on a layer that names
+    /// a group — a group has no `bounds` of its own to move (see
+    /// [`crate::LayerKind::Group`]).
+    #[error("layer {0:?} is a group and has no bounds of its own to move")]
+    NotAPixelLayer(LayerId),
     /// Reparenting `id` under `new_parent` would make `id` its own
     /// ancestor — `new_parent` is `id` itself, or one of `id`'s
     /// descendants.
