@@ -29,6 +29,11 @@ allow = [
     # `clipboard-win`/`error-code` (arboard's Windows clipboard backend,
     # PRD §7's "clipboard is our work" / M1.8).
     "BSL-1.0",
+    # The Independent JPEG Group's own licence -- permissive (attribution
+    # only, same spirit as BSD/MIT), used by libjpeg itself. Pulled in by
+    # `jpeg-encoder`'s IJG-derived DCT code (PRD §8.2's pure-Rust image-
+    # codec pair, M1.9's JPEG export).
+    "IJG",
 ]
 confidence-threshold = 0.9
 # The allow list is deliberately forward-looking: most entries are not hit yet

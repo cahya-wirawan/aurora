@@ -7,14 +7,17 @@
 //!
 //! [`png`] is this crate's first real format (PLAN.md M1.9): the
 //! simplest one, and the one invariant §7.3.1b's own "8-bit only at
-//! import/export" wording directly names. [`Image`] is this crate's
-//! own, self-contained pixel representation for it — see that type's
-//! own doc comment for why it's deliberately not wired into
-//! `aurora_doc::LayerTree`/`aurora_tile::TileStore` yet. PSD/PSB, JPEG,
-//! TIFF, and the real document-pixel-storage wiring all remain open.
+//! import/export" wording directly names. [`jpeg`] is the second, via
+//! `zune-jpeg`/`jpeg-encoder` (PRD §8.2's own pure-Rust image-codec
+//! pair). [`Image`] is this crate's own, self-contained pixel
+//! representation for both — see that type's own doc comment for why
+//! it's deliberately not wired into `aurora_doc::LayerTree`/
+//! `aurora_tile::TileStore` yet. PSD/PSB, TIFF, and the real
+//! document-pixel-storage wiring all remain open.
 
 mod error;
 mod image;
+pub mod jpeg;
 pub mod png;
 
 pub use error::IoError;

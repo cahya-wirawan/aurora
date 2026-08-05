@@ -2,8 +2,8 @@
 
 use thiserror::Error;
 
-/// `#[non_exhaustive]`: more variants land as this crate grows past PNG
-/// into other formats.
+/// `#[non_exhaustive]`: more variants land as this crate grows past
+/// PNG/JPEG into other formats.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IoError {
@@ -19,6 +19,22 @@ pub enum IoError {
     /// scramble colour channels, not just fail loudly.
     #[error("decoded PNG has an unexpected colour layout: {0:?}")]
     UnexpectedColorType(png::ColorType),
+    #[error("failed to decode JPEG: {0}")]
+    JpegDecode(#[from] zune_jpeg::errors::DecodeErrors),
+    #[error("failed to encode JPEG: {0}")]
+    JpegEncode(#[from] jpeg_encoder::EncodingError),
+    /// Requesting RGBA output from the JPEG decoder (see `jpeg` module
+    /// doc comment) produced something else — the decoder's own docs
+    /// warn it "does not guarantee... can convert to all colorspaces,"
+    /// so this is a real, checked condition, not an assumption.
+    #[error("decoded JPEG has an unexpected colour layout: {0:?}")]
+    UnexpectedJpegColorSpace(zune_jpeg::zune_core::colorspace::ColorSpace),
+    /// [`crate::jpeg::encode`] was given an [`crate::Image`] wider or
+    /// taller than JPEG's own SOF marker can represent — a real,
+    /// permanent format limit (16-bit dimension fields), not a library
+    /// shortcoming.
+    #[error("image is {width}x{height}, which exceeds JPEG's own 65535x65535 dimension limit")]
+    JpegDimensionsTooLarge { width: u32, height: u32 },
     /// [`crate::Image::new`] was given a sample buffer whose length
     /// doesn't match `width * height * 4`.
     #[error("image is {width}x{height} (expects {expected} samples) but got {actual} samples")]

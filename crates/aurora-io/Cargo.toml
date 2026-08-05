@@ -21,3 +21,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 half = { workspace = true }
 png = { workspace = true }
+zune-jpeg = { workspace = true }
+jpeg-encoder = { workspace = true }

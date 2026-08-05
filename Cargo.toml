@@ -120,6 +120,15 @@ arboard = { version = "3", default-features = false }
 # separate `unsafe`-code decision -- both left open. Default features
 # off: `gtk`/`libxdo` are Linux-only optional deps, moot on macOS.
 muda = { version = "0.19", default-features = false }
+# PRD §8.2's pre-decided pair for image codecs ("`image`, `zune-image` |
+# Mature, pure Rust") -- `zune-jpeg` is the focused, decode-only member
+# of that same `zune-image` family, matching this crate's existing
+# "lean, single-purpose codec crate, not the aggregate `image` crate"
+# pattern (see the `png` entry above).
+zune-jpeg = "0.5"
+# `zune-jpeg` is decode-only; encoding needs a separate pure-Rust crate.
+# `jpeg-encoder` matches the same "focused, single-purpose" shape.
+jpeg-encoder = "0.7"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
