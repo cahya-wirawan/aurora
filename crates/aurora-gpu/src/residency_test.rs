@@ -8,7 +8,7 @@
 
 use crate::TileResidency;
 use crate::test_support::{real_context, real_tile_store};
-use aurora_tile::{TILE, TileId};
+use aurora_tile::{SurfaceId, TILE, TileId};
 use half::f16;
 
 #[test]
@@ -30,9 +30,10 @@ fn upload_lands_in_the_correct_slot() {
     let viewport = (256, 256);
     let mut residency = TileResidency::new(device, queue, viewport);
 
+    let surface = SurfaceId::from_raw(0);
     let target_tile = TileId { x: 1, y: 0 };
     {
-        let tile = match store.get_mut(target_tile) {
+        let tile = match store.get_mut(surface, target_tile) {
             Ok(tile) => tile,
             Err(err) => unreachable!("test-local scratch store must accept this: {err}"),
         };
@@ -54,7 +55,7 @@ fn upload_lands_in_the_correct_slot() {
         });
     }
 
-    let stats = residency.sync(queue, &mut store, false, usize::MAX);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
     assert_eq!(
         stats.uploaded, 4,
         "first sync uploads the whole visible grid"

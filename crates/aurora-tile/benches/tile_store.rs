@@ -1,7 +1,7 @@
 //! The M1.1 "bench: paging throughput, eviction cost, compression ratio"
 //! deliverable. `cargo bench -p aurora-tile`.
 
-use aurora_tile::{SAMPLES, TileId, TileStore};
+use aurora_tile::{SAMPLES, SurfaceId, TileId, TileStore};
 use criterion::{Criterion, criterion_group, criterion_main};
 use half::f16;
 use std::num::NonZeroUsize;
@@ -61,6 +61,7 @@ fn new_tempdir() -> tempfile::TempDir {
 fn paging_throughput(c: &mut Criterion) {
     let dir = new_tempdir();
     let mut store = new_store(&dir, 16);
+    let surface = SurfaceId::from_raw(0);
     let mut next_x = 0u32;
 
     c.bench_function("paging_throughput", |b| {
@@ -72,7 +73,7 @@ fn paging_throughput(c: &mut Criterion) {
             for _ in 0..32 {
                 let id = TileId { x: next_x, y: 0 };
                 next_x = next_x.wrapping_add(1);
-                if let Ok(tile) = store.get_mut(id)
+                if let Ok(tile) = store.get_mut(surface, id)
                     && let Some(first) = tile.texels_mut().first_mut()
                 {
                     *first = f16::from_f32(1.0);
@@ -86,8 +87,9 @@ fn paging_throughput(c: &mut Criterion) {
 fn eviction_cost(c: &mut Criterion) {
     let dir = new_tempdir();
     let mut store = new_store(&dir, 8);
+    let surface = SurfaceId::from_raw(0);
     for x in 0..8 {
-        let _ = store.get_mut(TileId { x, y: 0 });
+        let _ = store.get_mut(surface, TileId { x, y: 0 });
     }
     let mut next_x = 8u32;
 
@@ -97,7 +99,7 @@ fn eviction_cost(c: &mut Criterion) {
             // exactly one eviction.
             let id = TileId { x: next_x, y: 0 };
             next_x = next_x.wrapping_add(1);
-            let _ = store.get_mut(id);
+            let _ = store.get_mut(surface, id);
         });
     });
 }

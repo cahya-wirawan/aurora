@@ -12,9 +12,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
-use crate::tile::TileId;
+use crate::tile::{SurfaceId, TileId};
 
 pub(crate) struct WriteJob {
+    pub(crate) surface: SurfaceId,
     pub(crate) id: TileId,
     pub(crate) path: PathBuf,
     pub(crate) bytes: Vec<u8>,
@@ -23,6 +24,7 @@ pub(crate) struct WriteJob {
 /// Result of a background write, reported back so [`crate::store::TileStore`]
 /// can track failures without blocking on them.
 pub(crate) struct WriteResult {
+    pub(crate) surface: SurfaceId,
     pub(crate) id: TileId,
     pub(crate) outcome: std::io::Result<()>,
 }
@@ -48,6 +50,7 @@ impl BackgroundWriter {
                 // mid-write) -- a dropped results receiver is not this
                 // thread's problem to report anywhere.
                 let _ = results_tx.send(WriteResult {
+                    surface: job.surface,
                     id: job.id,
                     outcome,
                 });
@@ -104,7 +107,7 @@ impl std::fmt::Debug for BackgroundWriter {
 #[cfg(test)]
 mod tests {
     use super::{BackgroundWriter, WriteJob};
-    use crate::tile::TileId;
+    use crate::tile::{SurfaceId, TileId};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -116,6 +119,7 @@ mod tests {
         let path = dir.path().join("0_0.tile");
         let mut writer = BackgroundWriter::spawn();
         writer.submit(WriteJob {
+            surface: SurfaceId::from_raw(0),
             id: TileId { x: 0, y: 0 },
             path: path.clone(),
             bytes: vec![1, 2, 3, 4],
@@ -140,6 +144,7 @@ mod tests {
         let start = Instant::now();
         for i in 0..100 {
             writer.submit(WriteJob {
+                surface: SurfaceId::from_raw(0),
                 id: TileId { x: i, y: 0 },
                 path: dir.path().join(format!("{i}_0.tile")),
                 bytes: vec![0; 1024],

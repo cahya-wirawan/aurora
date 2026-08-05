@@ -1,7 +1,27 @@
 //! Tile identity and resident tile storage.
 
-use aurora_core::Rect;
+use aurora_core::{Id, Rect};
 use half::f16;
+
+/// Marker type for [`SurfaceId`] — never constructed, just named. See
+/// `aurora_core::Id`'s own doc comment and tests, which already name
+/// this exact "one crate's own opaque identifier" use case.
+#[derive(Debug)]
+pub struct Surface;
+
+/// Identifies one independently addressed sequence of tiles within a
+/// [`crate::TileStore`] — [ADR 0010](../../../docs/adr/0010-layer-pixel-storage.md)'s
+/// "one shared store, addressed by surface" decision. `aurora-tile`
+/// itself has no idea what a surface *represents* (a document's pixel
+/// layer, a brush's own scratch layer, or anything else a future caller
+/// invents) — it is exactly as opaque to this crate as `TileId` itself
+/// is meaningful only as a grid position. A real `LayerId` in
+/// `aurora-doc` becomes a `SurfaceId` via `SurfaceId::from_raw(layer_id.to_raw())`,
+/// not a second, independently generated identifier — `aurora-tile`
+/// can't depend on `aurora-doc`'s own `LayerId` type (layering runs the
+/// other way), so this crate only ever sees the raw value, never
+/// allocates one itself.
+pub type SurfaceId = Id<Surface>;
 
 /// Tile dimension in pixels (ADR 0005: 256×256, matching what
 /// `spike/vertical-slice` actually measured — the only real data point

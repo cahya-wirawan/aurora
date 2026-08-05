@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use aurora_tile::{CHANNELS, SAMPLES, TILE, TileId, TileStore};
+use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 
 use crate::error::GpuError;
@@ -192,10 +192,18 @@ impl TileResidency {
     /// itself is separate, still-open M1.2 work — the parameter exists
     /// now because retrofitting it later is exactly what this bullet is
     /// about avoiding).
+    ///
+    /// `surface`: which of `store`'s surfaces this atlas is showing
+    /// (ADR 0010 — `store` may hold many). This crate has no document
+    /// assembly yet to say *which* surface that should be (a single
+    /// layer's own preview vs. a whole document's composited result) —
+    /// real, separate follow-on work; today's only callers (this
+    /// crate's own tests) just pick one.
     pub fn sync(
         &mut self,
         queue: &wgpu::Queue,
         store: &mut TileStore,
+        surface: SurfaceId,
         force: bool,
         byte_budget: usize,
     ) -> SyncStats {
@@ -209,7 +217,7 @@ impl TileResidency {
                 };
                 let slot = (id.x % self.grid.0, id.y % self.grid.1);
                 let resident = self.slots.get(&slot) == Some(&id);
-                let dirty = store.take_dirty(id).is_some();
+                let dirty = store.take_dirty(surface, id).is_some();
                 if !force && resident && !dirty {
                     continue;
                 }
@@ -217,7 +225,7 @@ impl TileResidency {
                     stats.remaining += 1;
                     continue;
                 }
-                let tile = match store.get(id) {
+                let tile = match store.get(surface, id) {
                     Ok(tile) => tile,
                     Err(err) => {
                         // One bad tile shouldn't abort uploading the
@@ -369,13 +377,21 @@ impl std::fmt::Debug for TileResidency {
 mod tests {
     use super::{TILE_BYTES, TileResidency};
     use crate::test_support::{real_context, real_tile_store};
-    use aurora_tile::TileId;
+    use aurora_tile::{SurfaceId, TileId};
     use half::f16;
+
+    /// The one surface every test in this module addresses — nothing
+    /// here exercises multi-surface behaviour (that's `aurora-tile`'s
+    /// own job); this crate just needs *a* valid `SurfaceId` to call the
+    /// store's API with.
+    fn surface() -> SurfaceId {
+        SurfaceId::from_raw(0)
+    }
 
     /// Paints tile `id` a known solid colour and marks it dirty, exactly
     /// as a real edit would.
     fn paint(store: &mut aurora_tile::TileStore, id: TileId, rgba: [f32; 4]) {
-        let tile = match store.get_mut(id) {
+        let tile = match store.get_mut(surface(), id) {
             Ok(tile) => tile,
             Err(err) => unreachable!("test-local scratch store must accept this: {err}"),
         };
@@ -413,7 +429,7 @@ mod tests {
         }
 
         // Nothing resident yet: every visible slot must upload.
-        let first = residency.sync(context.queue(), &mut store, false, usize::MAX);
+        let first = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
         assert_eq!(
             first.uploaded, 4,
             "first sync must upload the whole visible grid"
@@ -424,7 +440,7 @@ mod tests {
         );
 
         // Unchanged: nothing should re-upload.
-        let second = residency.sync(context.queue(), &mut store, false, usize::MAX);
+        let second = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
         assert_eq!(
             second.uploaded, 0,
             "unchanged, resident, clean tiles must not re-upload"
@@ -435,7 +451,7 @@ mod tests {
         paint(&mut store, TileId { x: 2, y: 0 }, [0.0, 1.0, 0.0, 1.0]);
         paint(&mut store, TileId { x: 2, y: 1 }, [0.0, 1.0, 0.0, 1.0]);
         residency.set_origin(context.queue(), TileId { x: 1, y: 0 }, viewport);
-        let third = residency.sync(context.queue(), &mut store, false, usize::MAX);
+        let third = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
         assert_eq!(
             third.uploaded, 2,
             "panning by one tile must invalidate exactly one column, not the whole grid"
@@ -461,7 +477,7 @@ mod tests {
         // Budget for exactly 2 tiles' worth of bytes.
         let budget = TILE_BYTES * 2;
 
-        let first = residency.sync(context.queue(), &mut store, false, budget);
+        let first = residency.sync(context.queue(), &mut store, surface(), false, budget);
         assert_eq!(first.uploaded, 2, "budget must cap uploads to what fits");
         assert_eq!(
             first.remaining, 2,
@@ -472,7 +488,7 @@ mod tests {
 
         // Same small budget again, nothing else changed: must pick up
         // exactly the two left over, not re-touch the first two.
-        let second = residency.sync(context.queue(), &mut store, false, budget);
+        let second = residency.sync(context.queue(), &mut store, surface(), false, budget);
         assert_eq!(
             second.uploaded, 2,
             "second call must finish the backlog, not restart it"
@@ -483,7 +499,7 @@ mod tests {
         );
 
         // Steady state: nothing left to do, even with the same tight budget.
-        let third = residency.sync(context.queue(), &mut store, false, budget);
+        let third = residency.sync(context.queue(), &mut store, surface(), false, budget);
         assert_eq!(third.uploaded, 0);
         assert_eq!(third.remaining, 0);
     }

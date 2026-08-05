@@ -1,6 +1,6 @@
 //! Error types for `aurora-tile`.
 
-use crate::tile::TileId;
+use crate::tile::{SurfaceId, TileId};
 use std::path::PathBuf;
 
 /// Errors from the tile store.
@@ -20,9 +20,13 @@ pub enum TileError {
         #[source]
         source: std::io::Error,
     },
-    /// Scratch-disk I/O failed while paging a tile in or out.
-    #[error("scratch-disk I/O failed for tile {id:?}: {source}")]
+    /// Scratch-disk I/O failed while paging a tile in or out. Names both
+    /// `surface` and `id` — a shared, multi-surface store (ADR 0010) can
+    /// have the same `TileId` resident for many different surfaces at
+    /// once, so `id` alone would be ambiguous.
+    #[error("scratch-disk I/O failed for surface {surface:?} tile {id:?}: {source}")]
     Io {
+        surface: SurfaceId,
         id: TileId,
         #[source]
         source: std::io::Error,

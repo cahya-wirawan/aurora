@@ -42,7 +42,7 @@
 use std::time::{Duration, Instant};
 
 use aurora_gpu::TileResidency;
-use aurora_tile::{TILE, TileId, TileStore};
+use aurora_tile::{SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 
 use crate::TileCompositor;
@@ -82,6 +82,7 @@ fn upload_and_composite_one_dirtied_tile_stays_within_a_generous_ci_budget() {
     let device = context.device();
     let queue = context.queue();
     let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
     let id = TileId { x: 0, y: 0 };
 
     // A one-tile viewport -> a 2x2 slot grid (`TileResidency::new`'s own
@@ -112,7 +113,7 @@ fn upload_and_composite_one_dirtied_tile_stays_within_a_generous_ci_budget() {
     let mut samples = Vec::with_capacity(ITERATIONS);
     for i in 0..ITERATIONS {
         {
-            let Ok(tile) = store.get_mut(id) else {
+            let Ok(tile) = store.get_mut(surface, id) else {
                 unreachable!("test-local scratch store must accept this");
             };
             let value = f16::from_f32(f32::from(u8::from(i % 2 == 0)));
@@ -128,7 +129,7 @@ fn upload_and_composite_one_dirtied_tile_stays_within_a_generous_ci_budget() {
         }
 
         let start = Instant::now();
-        let _stats = residency.sync(queue, &mut store, false, usize::MAX);
+        let _stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
         let src_view = residency.view();
         compositor.composite_over(&context, &dst_view, src_view);
         samples.push(start.elapsed());

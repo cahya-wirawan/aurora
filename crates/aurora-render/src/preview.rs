@@ -12,7 +12,7 @@
 //! work.
 
 use aurora_gpu::{GpuError, TileResidency};
-use aurora_tile::{TileError, TileId, TileStore};
+use aurora_tile::{SurfaceId, TileError, TileId, TileStore};
 
 use crate::mip::{MipLevel, downsample};
 
@@ -47,13 +47,14 @@ pub fn upload_preview(
     residency: &TileResidency,
     queue: &wgpu::Queue,
     store: &mut TileStore,
+    surface: SurfaceId,
     id: TileId,
     level: MipLevel,
 ) -> Result<(), PreviewError> {
     if level == MipLevel::Full {
         return Err(PreviewError::FullResolutionNotSupported);
     }
-    let tile = store.get(id)?;
+    let tile = store.get(surface, id)?;
     let downsampled = downsample(tile.texels(), level);
     residency.upload_mip(queue, id, level.index(), &downsampled)?;
     Ok(())
@@ -64,7 +65,7 @@ mod tests {
     use super::{PreviewError, upload_preview};
     use crate::mip::MipLevel;
     use crate::test_support::real_context;
-    use aurora_tile::{TileId, TileStore};
+    use aurora_tile::{SurfaceId, TileId, TileStore};
     use half::f16;
     use std::num::NonZeroUsize;
 
@@ -84,6 +85,11 @@ mod tests {
     }
 
     #[test]
+    // One linear setup-render-readback flow for a single real GPU test --
+    // splitting it into helper functions would just relocate the same
+    // lines without reducing the actual complexity, the same call
+    // already made for `aurora-gpu`'s own `residency_test.rs`.
+    #[allow(clippy::too_many_lines)]
     fn upload_preview_lands_a_downsampled_tile_in_the_atlas() {
         let Some(context) = real_context() else {
             return;
@@ -93,9 +99,10 @@ mod tests {
         let (_dir, mut store) = tile_store();
 
         // 256x256 viewport -> grid (2, 2): tile (1, 0) maps to slot (1, 0).
+        let surface = SurfaceId::from_raw(0);
         let id = TileId { x: 1, y: 0 };
         {
-            let tile = match store.get_mut(id) {
+            let tile = match store.get_mut(surface, id) {
                 Ok(tile) => tile,
                 Err(err) => unreachable!("test-local scratch store must accept this: {err}"),
             };
@@ -110,7 +117,14 @@ mod tests {
         }
 
         let residency = aurora_gpu::TileResidency::new(device, queue, (256, 256));
-        if let Err(err) = upload_preview(&residency, queue, &mut store, id, MipLevel::Quarter) {
+        if let Err(err) = upload_preview(
+            &residency,
+            queue,
+            &mut store,
+            surface,
+            id,
+            MipLevel::Quarter,
+        ) {
             unreachable!("a real tile and a non-Full level must upload: {err}");
         }
 
@@ -205,6 +219,7 @@ mod tests {
             &residency,
             queue,
             &mut store,
+            SurfaceId::from_raw(0),
             TileId { x: 0, y: 0 },
             MipLevel::Full,
         ) {
