@@ -21,6 +21,7 @@ Each ADR records one decision that is expensive to reverse: what was decided, wh
 | [0006](0006-accessibility-conformance-target.md) | Accessibility conformance target: WCAG 2.1 AA | Accepted |
 | [0007](0007-raw-library-libraw.md) | RAW decode library: LibRaw via FFI | Accepted |
 | [0008](0008-icc-library-lcms2.md) | ICC transform library: lcms2 via FFI | Accepted |
+| [0009](0009-aur-document-format.md) | `.aur` document format: ZIP container, `postcard` metadata, embedded tile codec | Accepted |
 
 ## Writing a new one
 

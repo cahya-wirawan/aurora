@@ -1410,6 +1410,8 @@ These block or reshape implementation and need owners and answers, most before P
 5. **Photoshop version target for PSD round-trip** — which Photoshop versions must reopen Aurora-written files? Determines the format features and the composition of the 1,000-file test corpus.
 6. **PSD features with no Aurora equivalent** — on import, are they dropped with a warning, or preserved opaquely and written back untouched on save? The latter is far friendlier to mixed Photoshop/Aurora teams and far harder to build.
 7. **`.aur` format** — must it be forward-compatible across versions from v1.0? Decide before the first byte is written.
+
+    **Resolved 2026-08-06: yes, backward-compatible unconditionally (every past `.aur` file must always keep opening) and forward-tolerant best-effort (an unrecognised chunk from a newer version is skipped, not fatal).** See [ADR 0009](docs/adr/0009-aur-document-format.md) for the full reasoning: a ZIP container (real, ubiquitous tooling, proven precedent in `.kra`/`.ora`) holding a `postcard`-serialized manifest/history plus `aurora_tile::codec`'s own already-proven tile encoding embedded verbatim, chosen in part *because* ZIP's central directory makes "skip what you don't recognise" and lazy/streaming access natural rather than something to build by hand.
 8. **AI models** — first-party, bundled third-party, or bring-your-own? Licensing and download size follow from this.
 9. **Minimum GPU baseline** — what hardware must Aurora run on? Sets the `wgpu` feature floor.
 10. **Which Photoshop workflows are the 95%?** The success metric in §10 is currently unmeasurable without this list.
