@@ -1,13 +1,14 @@
 //! Bridges a decoded [`Image`] into a document's own real pixel storage
 //! (`aurora_tile::TileStore`, [ADR
-//! 0010](../../../docs/adr/0010-layer-pixel-storage.md)) — the missing
-//! piece between `png`/`jpeg`/`tiff::decode` and a document layer
-//! actually showing anything, which `Image`'s own doc comment named as
-//! real, separate, still-open work.
+//! 0010](../../../docs/adr/0010-layer-pixel-storage.md)) and back — the
+//! missing piece between `png`/`jpeg`/`tiff::decode`/`encode` and a
+//! document layer actually showing anything, which `Image`'s own doc
+//! comment named as real, separate, still-open work.
 //!
-//! [`decode_by_extension`] is the single entry point a real "Open File"
-//! flow needs instead of picking `png`/`jpeg`/`tiff::decode` itself —
-//! this crate's first, first-party format dispatcher.
+//! [`decode_by_extension`]/[`encode_by_extension`] are the single entry
+//! points a real "Open File"/"Save/Export" flow needs instead of
+//! picking `png`/`jpeg`/`tiff::decode`/`encode` itself — this crate's
+//! first, first-party format dispatcher.
 
 use std::path::Path;
 
@@ -95,11 +96,7 @@ pub fn write_into_store(
 /// extension at all), or whatever the underlying decoder itself
 /// returns.
 pub fn decode_by_extension(path: &Path, bytes: &[u8]) -> Result<Image, IoError> {
-    let extension = path
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let extension = extension_of(path);
     match extension.as_str() {
         "png" => crate::png::decode(bytes),
         "jpg" | "jpeg" => crate::jpeg::decode(bytes),
@@ -108,9 +105,96 @@ pub fn decode_by_extension(path: &Path, bytes: &[u8]) -> Result<Image, IoError> 
     }
 }
 
+/// Encodes `image` using whichever format `path`'s own extension names
+/// (case-insensitive) — [`decode_by_extension`]'s own encode-side
+/// counterpart, for a real "Save/Export" flow.
+///
+/// # Errors
+///
+/// Returns [`IoError::UnsupportedExtension`] for anything else (or no
+/// extension at all), or whatever the underlying encoder itself
+/// returns.
+pub fn encode_by_extension(path: &Path, image: &Image) -> Result<Vec<u8>, IoError> {
+    let extension = extension_of(path);
+    match extension.as_str() {
+        "png" => crate::png::encode(image),
+        "jpg" | "jpeg" => crate::jpeg::encode(image),
+        "tif" | "tiff" => crate::tiff::encode(image),
+        _ => Err(IoError::UnsupportedExtension(extension)),
+    }
+}
+
+/// `path`'s own extension, lower-cased, or an empty string if it has
+/// none — shared by [`decode_by_extension`]/[`encode_by_extension`] so
+/// both dispatch on exactly the same normalization.
+fn extension_of(path: &Path) -> String {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// Reads `width`x`height` samples back out of `store`'s `surface`,
+/// starting at surface-local `(0, 0)` — [`write_into_store`]'s own
+/// inverse, needed for a real "Save/Export" flow to turn a document
+/// layer's live pixels back into an encodable [`Image`]. Tile by tile,
+/// the same row-major layout on both sides as `write_into_store`, so
+/// each overlapping row is a plain slice copy. The resulting `Image` is
+/// always tagged `IccProfile::srgb()` — the same default every decoder
+/// in this crate already assumes (none of them read an embedded ICC
+/// profile yet either), not a new gap this function introduces.
+///
+/// A tile the store has never touched (fully outside whatever's been
+/// painted) reads back as all-zero (transparent black) — a freshly
+/// allocated [`aurora_tile::Tile`]'s own documented default — not an
+/// error.
+///
+/// # Errors
+///
+/// Returns [`IoError::Tile`] if paging a touched tile in from the
+/// scratch disk fails.
+pub fn read_from_store(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    width: u32,
+    height: u32,
+) -> Result<Image, IoError> {
+    let mut samples = vec![half::f16::from_f32(0.0); width as usize * height as usize * CHANNELS];
+    if width > 0 && height > 0 {
+        let tiles_x = width.div_ceil(TILE);
+        let tiles_y = height.div_ceil(TILE);
+
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let origin_x = tx * TILE;
+                let origin_y = ty * TILE;
+                let w = (width - origin_x).min(TILE);
+                let h = (height - origin_y).min(TILE);
+                let tile = store.get(surface, TileId { x: tx, y: ty })?;
+                let texels = tile.texels();
+
+                for ly in 0..h {
+                    let dst_start =
+                        ((origin_y + ly) as usize * width as usize + origin_x as usize) * CHANNELS;
+                    let dst_end = dst_start + (w as usize) * CHANNELS;
+                    let src_start = (ly * TILE) as usize * CHANNELS;
+                    let src_end = src_start + (w as usize) * CHANNELS;
+                    if let (Some(dst), Some(src)) = (
+                        samples.get_mut(dst_start..dst_end),
+                        texels.get(src_start..src_end),
+                    ) {
+                        dst.copy_from_slice(src);
+                    }
+                }
+            }
+        }
+    }
+    Image::new(width, height, aurora_color::IccProfile::srgb(), samples)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decode_by_extension, write_into_store};
+    use super::{decode_by_extension, encode_by_extension, read_from_store, write_into_store};
     use crate::Image;
     use aurora_color::IccProfile;
     use aurora_tile::{SurfaceId, TILE, TileId, TileStore};
@@ -272,5 +356,78 @@ mod tests {
             Err(super::IoError::UnsupportedExtension(ext)) => assert_eq!(ext, ""),
             other => unreachable!("expected UnsupportedExtension, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn encode_by_extension_round_trips_a_real_jpeg() {
+        let image = solid_image(4, 4, [1.0, 0.0, 0.0, 1.0]);
+        let bytes = match encode_by_extension(Path::new("photo.jpg"), &image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let decoded = match crate::jpeg::decode(&bytes) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(decoded.width(), 4);
+        assert_eq!(decoded.height(), 4);
+    }
+
+    #[test]
+    fn encode_by_extension_rejects_an_unsupported_extension() {
+        let image = solid_image(1, 1, [0.0, 0.0, 0.0, 1.0]);
+        match encode_by_extension(Path::new("document.psd"), &image) {
+            Err(super::IoError::UnsupportedExtension(ext)) => assert_eq!(ext, "psd"),
+            other => unreachable!("expected UnsupportedExtension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // A freshly allocated tile's own exact `0.0` default, never computed
+    // -- exact equality is correct here, same reasoning as the
+    // `write_into_store` tests above.
+    #[allow(clippy::float_cmp)]
+    fn read_from_store_of_an_untouched_surface_is_all_zero() {
+        let (_dir, mut store) = store();
+        let image = match read_from_store(&mut store, surface(), 4, 4) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(image.width(), 4);
+        assert_eq!(image.height(), 4);
+        assert!(image.samples().iter().all(|s| s.to_f32() == 0.0));
+    }
+
+    #[test]
+    fn read_from_store_round_trips_write_into_store_within_one_tile() {
+        let (_dir, mut store) = store();
+        let written = solid_image(10, 10, [0.0, 1.0, 0.0, 1.0]);
+        if let Err(err) = write_into_store(&written, &mut store, surface()) {
+            unreachable!("{err:?}");
+        }
+        let read_back = match read_from_store(&mut store, surface(), 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(read_back.width(), 10);
+        assert_eq!(read_back.height(), 10);
+        assert_eq!(read_back.samples(), written.samples());
+    }
+
+    #[test]
+    fn read_from_store_round_trips_write_into_store_across_multiple_tiles() {
+        let (_dir, mut store) = store();
+        // TILE is 256; 300x300 spans a 2x2 tile grid, exercising the
+        // same partial-edge-tile logic `write_into_store`'s own
+        // multi-tile test does.
+        let written = solid_image(300, 300, [1.0, 0.0, 1.0, 1.0]);
+        if let Err(err) = write_into_store(&written, &mut store, surface()) {
+            unreachable!("{err:?}");
+        }
+        let read_back = match read_from_store(&mut store, surface(), 300, 300) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(read_back.samples(), written.samples());
     }
 }

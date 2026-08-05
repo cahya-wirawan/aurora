@@ -16,12 +16,13 @@
 //! for all three. `channels` (private) holds the
 //! grayscale/grayscale-with-alpha/RGB → RGBA expansion helpers `png`
 //! and `tiff` both need. [`import`] is the real document-pixel-storage
-//! wiring `Image`'s own doc comment used to name as open:
-//! [`import::write_into_store`] writes a decoded `Image` into a
-//! document layer's own `aurora_tile::TileStore` surface (ADR 0010),
-//! and [`import::decode_by_extension`] picks `png`/`jpeg`/`tiff::decode`
-//! by a file's own extension — the dispatcher a real "Open File" flow
-//! needs. PSD/PSB remains open.
+//! wiring `Image`'s own doc comment used to name as open, both
+//! directions: [`import::write_into_store`]/[`import::read_from_store`]
+//! write/read a document layer's own `aurora_tile::TileStore` surface
+//! (ADR 0010), and [`import::decode_by_extension`]/
+//! [`import::encode_by_extension`] pick `png`/`jpeg`/`tiff` by a file's
+//! own extension — the dispatchers a real "Open File"/"Save/Export"
+//! flow needs. PSD/PSB remains open.
 
 mod channels;
 mod error;
@@ -33,4 +34,4 @@ pub mod tiff;
 
 pub use error::IoError;
 pub use image::Image;
-pub use import::{decode_by_extension, write_into_store};
+pub use import::{decode_by_extension, encode_by_extension, read_from_store, write_into_store};
