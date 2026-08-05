@@ -118,6 +118,24 @@
 //! follow-on work. See `aurora_ui::tool`'s own doc comment and this
 //! module's "brush painting" section for the full reasoning.
 //!
+//! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
+//! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
+//! `aurora_gpu::CanvasPipeline` sized to the canvas dock area; `redraw`
+//! syncs the atlas from `tile_store` (whatever `active_layer` actually
+//! holds, painted or not) and draws it within that area's own viewport,
+//! in the same pass that already clears the background — a Brush stroke
+//! is now actually visible, not just written into an otherwise-invisible
+//! store. **Scope, stated honestly**: only `CanvasView`'s pan is
+//! reflected (`tile_origin_for_view` deliberately ignores zoom —
+//! `TileResidency` has no scale support); the atlas is sized once at
+//! startup and does not resize with the window
+//! (`TileResidency`'s own documented limitation); rotation, rulers,
+//! guides, grid, and snap remain this bullet's own still-open remainder.
+//! Not yet real-hardware-verified (this sandbox has no display server;
+//! real GPU tests pass here, but nothing has shown this crate's own
+//! window on an actual screen since M1.8's original human-verification
+//! pass, which predates this work).
+//!
 //! **Human-verified on macOS, 2026-08-03** (real hardware, real desktop
 //! session): the window opens, resizes without crashing, and `VoiceOver`
 //! announces it — the create-hidden → attach-adapter → show ordering
@@ -1417,6 +1435,101 @@ fn layer_local_point(bounds: aurora_core::Rect, doc_point: (f32, f32)) -> (f32, 
 const BRUSH_RADIUS: f32 = 24.0;
 const BRUSH_COLOUR: [f32; 3] = [0.0, 0.0, 0.0];
 
+// -- Canvas rendering: drawing the live document to the screen --
+//
+// PLAN.md M1.8's still-open "Canvas" bullet, the piece that finally
+// gives the brush painting above (and anything else touching
+// `tile_store`) somewhere visible to show up: `aurora_gpu::TileResidency`
+// (the GPU atlas) and `aurora_gpu::CanvasPipeline` (the shader that
+// draws it) already existed, real and tested, but nothing had ever
+// created or drawn either outside that crate's own tests. `App::resumed`
+// creates both, sized to the canvas dock area; `App::redraw` syncs the
+// atlas from the live store and draws it within that area's own
+// viewport, inside the same pass that already clears the background.
+//
+// Scope, stated honestly: only pan is reflected (`CanvasView`'s own
+// `zoom`, and rotation/rulers/guides/grid/snap, are not -- this bullet's
+// own still-open remainder); the atlas is sized once at startup and
+// does not resize with the window (`TileResidency`'s own documented
+// limitation); and infinite zoom, rotation, rulers, guides, grid, and
+// snap are all still separately open, exactly as the bullet's own name
+// says.
+
+/// The canvas dock area's own on-screen rectangle, in physical pixels
+/// (`bounds`'s logical units scaled by `scale_factor`) — `(x, y, width,
+/// height)`. `None` only for a genuinely unknown widget id, which
+/// `workspace.canvas_area` never actually is — **not** `None` before any
+/// layout has run: `WidgetTree::bounds` returns a widget's *current*
+/// bounds unconditionally once it exists, a zero rect by default before
+/// the first `compute_layout`, not `None` (confirmed by this function's
+/// own tests — a real finding, not assumed from `bounds`'s own doc
+/// comment). Used both to size the atlas ([`canvas_area_physical_size`])
+/// and to restrict the canvas draw call to this rect via
+/// `RenderPass::set_viewport`, so it never draws over the
+/// Layers/Properties/History dock.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn canvas_area_physical_rect(
+    workspace: &aurora_ui::Workspace,
+    scale_factor: f64,
+) -> Option<(f32, f32, f32, f32)> {
+    let bounds = workspace.tree.bounds(workspace.canvas_area)?;
+    let scale = scale_factor as f32;
+    Some((
+        bounds.x as f32 * scale,
+        bounds.y as f32 * scale,
+        bounds.width as f32 * scale,
+        bounds.height as f32 * scale,
+    ))
+}
+
+/// [`canvas_area_physical_rect`]'s own width/height, rounded to whole
+/// physical pixels (floored at `1` each — `aurora_gpu::TileResidency::new`
+/// has no defined behaviour for a zero-sized viewport, and a
+/// not-yet-laid-out or momentarily zero-sized dock area is a real
+/// transient state, not one worth propagating into a GPU texture size).
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn canvas_area_physical_size(
+    workspace: &aurora_ui::Workspace,
+    scale_factor: f64,
+) -> Option<(u32, u32)> {
+    let (_, _, width, height) = canvas_area_physical_rect(workspace, scale_factor)?;
+    Some((
+        width.round().max(1.0) as u32,
+        height.round().max(1.0) as u32,
+    ))
+}
+
+/// The document-space point currently at the canvas area's own top-left
+/// corner, given `view`'s own pan — the [`aurora_tile::TileId`] this
+/// maps to is where [`aurora_gpu::TileResidency::set_origin`] should
+/// point the atlas.
+///
+/// **Zoom is deliberately not reflected here** — `TileResidency` has no
+/// scale support (it samples its atlas 1:1 into the viewport), so this
+/// assumes `view.zoom() == 1.0` regardless of its real value; real
+/// zoom-aware rendering needs either shader-side scaling or mip-level
+/// selection tied to zoom, separate follow-on work this bullet's own
+/// "infinite zoom" remainder still names. Negative document coordinates
+/// (panning above/left of the document's own origin) clamp to `0` —
+/// `TileId`'s own fields are unsigned, so there is no tile to point to
+/// there; a real fix needs either signed tile coordinates or a
+/// document-relative origin convention, not invented here.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn tile_origin_for_view(view: &aurora_ui::CanvasView) -> aurora_tile::TileId {
+    let (pan_x, pan_y) = view.pan();
+    #[allow(clippy::cast_precision_loss)]
+    let tile_size = aurora_tile::TILE as f32;
+    let x = (-pan_x / tile_size).floor().max(0.0);
+    let y = (-pan_y / tile_size).floor().max(0.0);
+    aurora_tile::TileId {
+        x: x as u32,
+        y: y as u32,
+    }
+}
+
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
@@ -1511,6 +1624,19 @@ struct App {
     /// uses for its own I/O. Painting is silently disabled for the
     /// session when this is `None`.
     tile_store: Option<aurora_tile::TileStore>,
+    /// The GPU-resident atlas over `tile_store`'s active-layer surface —
+    /// `None` until `resumed` has a real device and a computed canvas
+    /// area to size it to (real GPU resources can't exist before then).
+    /// Sized once, at construction — `aurora_gpu::TileResidency` itself
+    /// doesn't support resizing (PLAN.md M1.2's own still-open scope), so
+    /// a window resize after startup leaves this showing a fixed-size
+    /// sub-window rather than growing/shrinking with the canvas area; a
+    /// real, separate follow-on fix, not new scope this field invents.
+    residency: Option<aurora_gpu::TileResidency>,
+    /// The render pipeline that draws `residency`'s own atlas to the
+    /// screen (`aurora_gpu::CanvasPipeline`) — built alongside
+    /// `residency`, `None` under the same conditions.
+    canvas_pipeline: Option<aurora_gpu::CanvasPipeline>,
     /// The pointer's last known position, in the *window's* own logical
     /// space (already DPI-adjusted — see [`logical_point`]) — `None`
     /// before the first `CursorMoved`, or after `CursorLeft`.
@@ -1611,6 +1737,8 @@ impl App {
             layers,
             active_layer,
             tile_store,
+            residency: None,
+            canvas_pipeline: None,
             pointer_position: None,
             drag: None,
             #[cfg(target_os = "macos")]
@@ -1849,11 +1977,13 @@ impl App {
         surface.resize(gpu.device(), physical_size);
     }
 
-    /// Clears the surface to the real theme background colour and
-    /// presents — real widget/panel/canvas content is separate,
-    /// still-open M1.8 work; this is still just "the window paints a
-    /// frame at all," now with a real token behind it instead of a
-    /// hardcoded literal.
+    /// Clears the surface to the real theme background colour, then —
+    /// if a live document, tile store, and GPU atlas all exist — syncs
+    /// the atlas from whatever's actually in the store
+    /// ([`Self::active_layer`]'s own surface) and draws it within the
+    /// canvas dock area's own viewport, in the same pass as the clear.
+    /// Real widget/panel content beyond that is still separate,
+    /// still-open M1.8 work.
     fn redraw(&mut self) {
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
@@ -1869,9 +1999,30 @@ impl App {
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("aurora-app-frame"),
                         });
+
+                // Sync before drawing, so this frame shows the latest
+                // painted pixels rather than lagging one frame behind.
+                if let Some(residency) = self.residency.as_mut() {
+                    if let Some(canvas_size) =
+                        canvas_area_physical_size(&self.workspace, self.scale_factor)
+                    {
+                        residency.set_origin(
+                            gpu.queue(),
+                            tile_origin_for_view(&self.canvas_view),
+                            canvas_size,
+                        );
+                    }
+                    if let (Some(layer_id), Some(store)) =
+                        (self.active_layer, self.tile_store.as_mut())
+                        && let Some(surface_id) = self.layers.surface_id(layer_id)
+                    {
+                        let _ = residency.sync(gpu.queue(), store, surface_id, false, usize::MAX);
+                    }
+                }
+
                 {
-                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("aurora-app-clear"),
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("aurora-app-frame"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &view,
                             depth_slice: None,
@@ -1886,6 +2037,20 @@ impl App {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
+
+                    let viewport = canvas_area_physical_rect(&self.workspace, self.scale_factor);
+                    if let (Some(residency), Some(canvas_pipeline), Some((x, y, w, h))) = (
+                        self.residency.as_ref(),
+                        self.canvas_pipeline.as_mut(),
+                        viewport,
+                    ) {
+                        let bind_group = canvas_pipeline.bind_group(gpu.device(), residency);
+                        let pipeline = canvas_pipeline.pipeline(gpu.device(), surface.format());
+                        pass.set_viewport(x, y, w, h, 0.0, 1.0);
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
                 }
                 gpu.queue().submit(std::iter::once(encoder.finish()));
                 gpu.queue().present(texture);
@@ -1957,6 +2122,22 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         self.scale_factor = window.scale_factor();
         let (width, height) = logical_size((size.width, size.height), self.scale_factor);
         self.workspace.tree.compute_layout(width, height);
+
+        // Sized once, here, to the canvas area's own physical size --
+        // see `residency`/`canvas_pipeline`'s own doc comments for why a
+        // later window resize isn't reflected.
+        if let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor) {
+            self.residency = Some(aurora_gpu::TileResidency::new(
+                gpu.device(),
+                gpu.queue(),
+                canvas_size,
+            ));
+            self.canvas_pipeline = Some(aurora_gpu::CanvasPipeline::new(gpu.device()));
+        } else {
+            tracing::warn!(
+                "canvas area has no computed layout yet; canvas rendering disabled this session"
+            );
+        }
 
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -2136,15 +2317,16 @@ mod tests {
         AppCommand, COMMAND_FILE_OPEN, COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS,
         COMMAND_FOCUS_PROPERTIES, CRASH_RECOVERY_CONTINUE, ClipboardAccess, Drag, FileDialogAccess,
         Key, KeyChord, Modifiers, NamedKey, PointerButton, activate_command, apply_scroll_zoom,
-        autosave_path, begin_drag, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, continue_drag, crash_recovery_dialog_message,
-        default_shortcuts, demo_document, handle_dialog_key, handle_key, handle_palette_key,
-        handle_zoom_tool_click, layer_local_point, load_background_color, load_scales,
-        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog,
-        open_tile_store, pointer_in_canvas, previous_session_left_a_marker, recover_document,
-        run_command, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, write_autosave,
-        write_session_marker, zoom_steps_for_scroll,
+        autosave_path, begin_drag, canvas_area_physical_rect, canvas_area_physical_size,
+        clear_session_marker, close_command_palette, close_crash_recovery_dialog, continue_drag,
+        crash_recovery_dialog_message, default_shortcuts, demo_document, handle_dialog_key,
+        handle_key, handle_palette_key, handle_zoom_tool_click, layer_local_point,
+        load_background_color, load_scales, logical_point, logical_size, open_command_palette,
+        open_crash_recovery_dialog, open_tile_store, pointer_in_canvas,
+        previous_session_left_a_marker, recover_document, run_command, tile_origin_for_view,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, write_autosave, write_session_marker,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -3408,6 +3590,75 @@ mod tests {
     fn pointer_in_canvas_returns_none_before_any_layout_has_run() {
         let workspace = aurora_ui::build_workspace();
         assert_eq!(pointer_in_canvas(&workspace, (10.0, 10.0)), None);
+    }
+
+    #[test]
+    fn canvas_area_physical_rect_scales_by_the_dpi_factor() {
+        let workspace = laid_out_workspace();
+        // Logical canvas area is (0, 0, 750, 800) (see
+        // `pointer_in_canvas_reports_a_canvas_relative_point_when_inside`'s
+        // own comment); at a 2x scale factor, physical is double that.
+        assert_eq!(
+            canvas_area_physical_rect(&workspace, 2.0),
+            Some((0.0, 0.0, 1500.0, 1600.0))
+        );
+    }
+
+    #[test]
+    fn canvas_area_physical_rect_is_zero_sized_before_any_layout_has_run() {
+        // A real finding, not assumed: `WidgetTree::bounds` returns a
+        // widget's current (zero, by default) bounds unconditionally
+        // once it exists, not `None`, before the first `compute_layout`
+        // -- `canvas_area_physical_rect`'s own `Option` only covers a
+        // genuinely unknown widget id, which `canvas_area` never is.
+        let workspace = aurora_ui::build_workspace();
+        assert_eq!(
+            canvas_area_physical_rect(&workspace, 1.0),
+            Some((0.0, 0.0, 0.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn canvas_area_physical_size_rounds_to_whole_pixels() {
+        let workspace = laid_out_workspace();
+        assert_eq!(canvas_area_physical_size(&workspace, 1.0), Some((750, 800)));
+    }
+
+    #[test]
+    fn tile_origin_for_view_is_zero_zero_with_no_pan() {
+        let view = CanvasView::new();
+        assert_eq!(
+            tile_origin_for_view(&view),
+            aurora_tile::TileId { x: 0, y: 0 }
+        );
+    }
+
+    #[test]
+    fn tile_origin_for_view_follows_a_positive_pan() {
+        // Panning the view so document (0, 0) renders 300 logical px to
+        // the right/down of the canvas area's own top-left corner means
+        // the tile now at that corner is one tile up and to the left of
+        // the document's own origin tile... but since tile coordinates
+        // are unsigned, this must clamp to (0, 0), not go negative.
+        let mut view = CanvasView::new();
+        view.pan_by((300.0, 300.0));
+        assert_eq!(
+            tile_origin_for_view(&view),
+            aurora_tile::TileId { x: 0, y: 0 }
+        );
+    }
+
+    #[test]
+    fn tile_origin_for_view_follows_a_negative_pan() {
+        // Panning left/up by more than one tile's worth (256px) means
+        // the canvas area's own top-left corner now shows document
+        // pixels *past* one whole tile -- origin must advance to (1, 1).
+        let mut view = CanvasView::new();
+        view.pan_by((-300.0, -300.0));
+        assert_eq!(
+            tile_origin_for_view(&view),
+            aurora_tile::TileId { x: 1, y: 1 }
+        );
     }
 
     #[test]
