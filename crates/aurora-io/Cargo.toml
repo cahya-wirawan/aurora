@@ -19,3 +19,5 @@ aurora-doc = { workspace = true }
 aurora-color = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+half = { workspace = true }
+png = { workspace = true }

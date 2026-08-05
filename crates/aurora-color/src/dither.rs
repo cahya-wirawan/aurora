@@ -11,6 +11,16 @@ pub fn promote_u8(sample: u8) -> f32 {
     f32::from(sample) / 255.0
 }
 
+/// Promotes one 16-bit sample to the normalized `[0.0, 1.0]` range —
+/// the same import-boundary role [`promote_u8`] fills for 8-bit
+/// samples, for formats (e.g. 16-bit-per-channel PNG) that carry real
+/// precision beyond 8 bits worth preserving rather than truncating away
+/// before it ever reaches this pipeline.
+#[must_use]
+pub fn promote_u16(sample: u16) -> f32 {
+    f32::from(sample) / 65535.0
+}
+
 /// Quantizes one float sample to 8 bits *without* dithering — plain
 /// rounding. Exposed for callers that genuinely want that (e.g. a
 /// preview thumbnail, where banding is an acceptable, temporary
@@ -93,7 +103,7 @@ fn bayer_value(x: u32, y: u32, n: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{bayer_value, dither_quantize, promote_u8, quantize_u8};
+    use super::{bayer_value, dither_quantize, promote_u8, promote_u16, quantize_u8};
 
     #[test]
     // 0/255 and 255/255 are exact, bit-representable results, not
@@ -104,6 +114,15 @@ mod tests {
         assert_eq!(promote_u8(0), 0.0);
         assert_eq!(promote_u8(255), 1.0);
         assert!((promote_u8(128) - 0.501_960_8).abs() < 1e-6);
+    }
+
+    #[test]
+    // Same reasoning as the u8 case above: 0 and 65535 are exact.
+    #[allow(clippy::float_cmp)]
+    fn promote_u16_maps_the_full_range_onto_zero_to_one() {
+        assert_eq!(promote_u16(0), 0.0);
+        assert_eq!(promote_u16(65535), 1.0);
+        assert!((promote_u16(32768) - 0.500_007_6).abs() < 1e-6);
     }
 
     #[test]

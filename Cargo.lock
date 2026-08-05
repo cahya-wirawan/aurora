@@ -565,6 +565,8 @@ dependencies = [
  "aurora-core",
  "aurora-doc",
  "aurora-tile",
+ "half",
+ "png 0.17.16",
  "thiserror 2.0.19",
  "tracing",
 ]
