@@ -110,6 +110,16 @@ rfd = "0.17"
 # pixels) -- text only, the same "declare only what's used" discipline
 # `aurora-widgets`' own headless-mode work already established.
 arboard = { version = "3", default-features = false }
+# Native menu bar -- macOS only (`aurora-app`'s own Cargo.toml adds this
+# as a target-specific dependency, `cfg(target_os = "macos")`). PRD
+# §8.3/§14 only name macOS for the native menu bar; on inspection,
+# muda's only Linux backend needs a real `gtk::Window` (which a plain
+# `winit`-created X11/Wayland window structurally never is, and doesn't
+# even compile on Linux without the heavy `gtk` feature for a backend
+# that couldn't attach to anything anyway), and Windows needs its own,
+# separate `unsafe`-code decision -- both left open. Default features
+# off: `gtk`/`libxdo` are Linux-only optional deps, moot on macOS.
+muda = { version = "0.19", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -15,9 +15,21 @@
 //! from a small, clearly-fake demo document; the window's background is
 //! a real theme token (`design/themes/dark.toml`'s `surface.app`, the
 //! only built-in theme that exists as a real design yet). Still nothing
-//! renders visually beyond the background clear — the canvas itself,
-//! tools, IME, and native menus are this milestone's other, separate,
-//! still-open bullets.
+//! renders visually beyond the background clear — the canvas itself and
+//! IME are this milestone's other, separate, still-open bullets.
+//!
+//! **Native menu bar, macOS only**: `muda`, scoped to macOS because PRD
+//! §8.3/§14 only name macOS for the native menu bar, and because neither
+//! Windows nor Linux is actually a good fit right now — see the "native
+//! menu bar" section further down for the full reasoning (Windows needs
+//! its own real `unsafe`-code decision; Linux's only muda backend needs
+//! a real `gtk::Window`, which a plain `winit` window structurally never
+//! is). `build_menu`/`activate_command` are cross-platform, real, tested
+//! logic; only the attachment (`Menu::init_for_nsapp` in `resumed`) and
+//! event polling (`about_to_wait`) are behind `#[cfg(target_os =
+//! "macos")]`. The menu reuses the exact same `COMMAND_*` ids the
+//! command palette does, through the same `activate_command` — one
+//! underlying action, two UI surfaces.
 //!
 //! **System clipboard, native file dialogs, and drag & drop**:
 //! `rfd`/`arboard`, PRD §8.3's own pre-decided choices, plus `winit`'s
@@ -82,8 +94,11 @@
 //! and the accessibility tree both reach a real screen reader. Windows
 //! and Linux remain unverified on real hardware — see PLAN.md M1.8. The
 //! keyboard-shortcut/command-palette/crash-recovery/DPI-scaling/
-//! clipboard/file-dialog/drag-and-drop work above has not yet had its
-//! own real-hardware pass.
+//! clipboard/file-dialog/drag-and-drop/native-menu work above has not
+//! yet had its own real-hardware pass — the native menu bar in
+//! particular has never been compiled at all outside CI (this
+//! development sandbox is Linux, where the dependency isn't even
+//! present).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -545,6 +560,101 @@ fn command_target(workspace: &aurora_ui::Workspace, id: &str) -> Option<WidgetId
     }
 }
 
+/// Activates a command by its own opaque id — shared by the command
+/// palette's `Enter` key and, on macOS, the native menu bar
+/// (`App::handle_menu_event`): the same underlying action, reachable
+/// from two different UI surfaces, rather than two parallel
+/// implementations of "what does this command do." Moves focus for a
+/// panel-focus command ([`command_target`]); shows the native file
+/// dialog and returns the picked path for [`COMMAND_FILE_OPEN`]; logs
+/// and returns `None` for any other id.
+fn activate_command(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    id: &str,
+    file_dialog: &mut dyn FileDialogAccess,
+) -> Option<PathBuf> {
+    if let Some(target) = command_target(workspace, id) {
+        if let Err(err) = focus.focus(&mut workspace.tree, target) {
+            tracing::warn!(?err, "activated command's target isn't focusable");
+        }
+        return None;
+    }
+    if id == COMMAND_FILE_OPEN {
+        return file_dialog.pick_file();
+    }
+    tracing::warn!(command = id, "unknown command activated");
+    None
+}
+
+// -- Native menu bar (macOS only) --
+//
+// PLAN.md M1.8's "native menus" bullet, scoped to macOS per PRD §8.3/
+// §14's own wording ("Native menu bar (macOS)..." — Windows/Linux
+// aren't named there for the menu bar specifically). On inspection
+// neither of the other two is a good fit for `muda` right now: Windows
+// would need a separate, real `unsafe`-code decision (a raw `HWND` via
+// `muda::Menu::init_for_hwnd`); Linux's only muda backend needs a real
+// `gtk::Window`, which this project's plain `winit`-created X11/Wayland
+// window structurally never is (and muda doesn't even compile on Linux
+// without the heavy `gtk` feature, for a backend that couldn't attach
+// to anything anyway). Both left for whenever Aurora draws its own
+// in-window menu (`aurora-vector`, still an empty skeleton) — the more
+// natural cross-platform answer this project's own "we own our UI"
+// architecture already points toward, not a native OS integration on
+// every platform.
+
+/// Builds the native menu's own cross-platform structure: File > Open
+/// File…, View > Focus Layers/Properties/History Panel — reusing the
+/// exact same `COMMAND_*` ids the command palette already uses (via
+/// `MenuItem::with_id`), so [`activate_command`] drives both UI
+/// surfaces identically; nothing here invents a second command
+/// vocabulary. Building the model (as opposed to attaching it to a
+/// window) is the same on every platform muda supports, which is why
+/// this function itself needs no further `#[cfg]` beyond the module
+/// section's own macOS gate.
+#[cfg(target_os = "macos")]
+fn build_menu() -> muda::Menu {
+    let menu = muda::Menu::new();
+
+    let file_menu = match muda::Submenu::with_items(
+        "File",
+        true,
+        &[&muda::MenuItem::with_id(
+            COMMAND_FILE_OPEN,
+            "Open File…",
+            true,
+            None,
+        )],
+    ) {
+        Ok(submenu) => submenu,
+        Err(err) => unreachable!("a single, freshly built item cannot fail to append: {err:?}"),
+    };
+
+    let view_menu = match muda::Submenu::with_items(
+        "View",
+        true,
+        &[
+            &muda::MenuItem::with_id(COMMAND_FOCUS_LAYERS, "Focus Layers Panel", true, None),
+            &muda::MenuItem::with_id(
+                COMMAND_FOCUS_PROPERTIES,
+                "Focus Properties Panel",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(COMMAND_FOCUS_HISTORY, "Focus History Panel", true, None),
+        ],
+    ) {
+        Ok(submenu) => submenu,
+        Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
+    };
+
+    if let Err(err) = menu.append_items(&[&file_menu, &view_menu]) {
+        tracing::warn!(?err, "failed to build the native menu bar structure");
+    }
+    menu
+}
+
 /// Opens the command palette (a no-op if one is already open): inserts
 /// it into `workspace.tree` under `workspace.root` with
 /// [`palette_commands`]'s own list, then moves keyboard focus to it.
@@ -663,16 +773,7 @@ fn handle_palette_key(
                 .map(|entry| entry.id.clone());
             close_command_palette(workspace, focus, palette);
             let id = selected?;
-            if let Some(target) = command_target(workspace, &id) {
-                if let Err(err) = focus.focus(&mut workspace.tree, target) {
-                    tracing::warn!(?err, "activated command's target isn't focusable");
-                }
-                return None;
-            }
-            if id == COMMAND_FILE_OPEN {
-                return file_dialog.pick_file();
-            }
-            tracing::warn!(command = id, "unknown command activated");
+            return activate_command(workspace, focus, &id, file_dialog);
         }
         Key::Named(NamedKey::Backspace) => {
             if let Ok(state) = command_palette_state(&workspace.tree, root) {
@@ -915,6 +1016,12 @@ struct App {
     /// [`palette_commands`]'s own doc comment), so this is only ever
     /// recorded and logged, ready for whenever that pipeline exists.
     pending_open_path: Option<PathBuf>,
+    /// The native menu bar — macOS only, see this crate's own "native
+    /// menu bar" section for why Windows/Linux aren't included. Built
+    /// in [`App::new`] (no window needed); attached to the real
+    /// application menu bar in `resumed` (`Menu::init_for_nsapp`).
+    #[cfg(target_os = "macos")]
+    menu: muda::Menu,
     /// The window's background clear colour, resolved from
     /// `design/themes/dark.toml`'s `surface.app` token
     /// (`load_background_color`) — invariant §7.3.10 (no hardcoded
@@ -977,6 +1084,8 @@ impl App {
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
             pending_open_path: None,
+            #[cfg(target_os = "macos")]
+            menu: build_menu(),
             background,
             failed: false,
         }
@@ -1046,6 +1155,24 @@ impl App {
     fn handle_dropped_file(&mut self, path: PathBuf) {
         tracing::info!(path = %path.display(), "file dropped (no import pipeline yet)");
         self.pending_open_path = Some(path);
+    }
+
+    /// Routes one native menu activation to [`activate_command`] — the
+    /// same dispatch the command palette's `Enter` key already uses,
+    /// just reached from the menu bar instead.
+    #[cfg(target_os = "macos")]
+    fn handle_menu_event(&mut self, event: &muda::MenuEvent) {
+        let picked = activate_command(
+            &mut self.workspace,
+            &mut self.focus,
+            event.id().as_ref(),
+            &mut self.file_dialog,
+        );
+        if let Some(path) = picked {
+            tracing::info!(path = %path.display(), "file chosen via native menu (no import pipeline yet)");
+            self.pending_open_path = Some(path);
+        }
+        self.push_accessibility();
     }
 
     /// Logs `message`, marks this run as failed, and asks the event loop
@@ -1184,6 +1311,13 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             accesskit_winit::Adapter::with_event_loop_proxy(el, &window, self.proxy.clone());
         window.set_visible(true);
 
+        // The native application menu bar -- macOS only, see this
+        // crate's own "native menu bar" section. No ordering constraint
+        // like the accessibility adapter's own create-hidden dance;
+        // this can happen any time before the app is fully active.
+        #[cfg(target_os = "macos")]
+        self.menu.init_for_nsapp();
+
         self.scale_factor = window.scale_factor();
         let (width, height) = logical_size((size.width, size.height), self.scale_factor);
         self.workspace.tree.compute_layout(width, height);
@@ -1264,6 +1398,17 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
     }
 
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+        // muda's own events arrive on a plain channel, not through this
+        // crate's `accesskit_winit::Event` user-event type (the two
+        // don't share one enum -- restructuring the accessibility
+        // integration around a combined event type is a bigger, separate
+        // change) -- polled here since `about_to_wait` already runs on
+        // every loop iteration.
+        #[cfg(target_os = "macos")]
+        while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+            self.handle_menu_event(&event);
+        }
+
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
@@ -1328,14 +1473,15 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::{
         AppCommand, COMMAND_FILE_OPEN, COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS,
-        CRASH_RECOVERY_CONTINUE, ClipboardAccess, FileDialogAccess, Key, KeyChord, Modifiers,
-        NamedKey, clear_session_marker, close_command_palette, close_crash_recovery_dialog,
-        default_shortcuts, demo_document, handle_dialog_key, handle_key, handle_palette_key,
-        load_background_color, load_scales, logical_size, open_command_palette,
-        open_crash_recovery_dialog, previous_session_left_a_marker, run_command,
-        toggle_command_palette, translate_key, translate_modifiers, write_session_marker,
+        COMMAND_FOCUS_PROPERTIES, CRASH_RECOVERY_CONTINUE, ClipboardAccess, FileDialogAccess, Key,
+        KeyChord, Modifiers, NamedKey, activate_command, clear_session_marker,
+        close_command_palette, close_crash_recovery_dialog, default_shortcuts, demo_document,
+        handle_dialog_key, handle_key, handle_palette_key, load_background_color, load_scales,
+        logical_size, open_command_palette, open_crash_recovery_dialog,
+        previous_session_left_a_marker, run_command, toggle_command_palette, translate_key,
+        translate_modifiers, write_session_marker,
     };
-    use aurora_widgets::FocusManager;
+    use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
 
     /// [`ClipboardAccess`]'s test double — a plain in-memory slot, no
@@ -2048,6 +2194,106 @@ mod tests {
 
         assert_eq!(picked, None);
         assert_eq!(palette, None, "must still close, even on a cancelled pick");
+    }
+
+    // -- shared command activation (palette + native menu) --
+
+    #[test]
+    fn activate_command_focuses_the_matching_panel_for_every_known_id() {
+        fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> WidgetId) {
+            let mut workspace = aurora_ui::build_workspace();
+            let mut focus = FocusManager::default();
+            let mut file_dialog = FakeFileDialog::default();
+            let expected = expected(&workspace);
+
+            let picked = activate_command(&mut workspace, &mut focus, id, &mut file_dialog);
+
+            assert_eq!(picked, None);
+            assert_eq!(focus.focused(), Some(expected));
+        }
+
+        check(COMMAND_FOCUS_LAYERS, |workspace| workspace.layers.root);
+        check(COMMAND_FOCUS_PROPERTIES, |workspace| {
+            workspace.properties.root
+        });
+        check(COMMAND_FOCUS_HISTORY, |workspace| workspace.history.root);
+    }
+
+    #[test]
+    fn activate_command_returns_the_picked_path_for_file_open() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut file_dialog = FakeFileDialog {
+            next_pick: Some(PathBuf::from("/tmp/example.psd")),
+        };
+
+        let picked = activate_command(
+            &mut workspace,
+            &mut focus,
+            COMMAND_FILE_OPEN,
+            &mut file_dialog,
+        );
+
+        assert_eq!(picked, Some(PathBuf::from("/tmp/example.psd")));
+        assert_eq!(
+            focus.focused(),
+            None,
+            "COMMAND_FILE_OPEN has no focus target of its own"
+        );
+    }
+
+    #[test]
+    fn activate_command_returns_none_and_focuses_nothing_for_an_unknown_id() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut file_dialog = FakeFileDialog::default();
+
+        let picked = activate_command(
+            &mut workspace,
+            &mut focus,
+            "bogus.command",
+            &mut file_dialog,
+        );
+
+        assert_eq!(picked, None);
+        assert_eq!(focus.focused(), None);
+    }
+
+    // -- native menu bar (macOS only) --
+    //
+    // `build_menu` itself needs no window/display -- it only builds
+    // muda's own in-memory menu model, the same "constructing the
+    // model is real, cross-platform, testable logic; attaching it to a
+    // window is the untestable platform call" split this crate already
+    // draws for the command palette's clipboard/file-dialog access. Not
+    // runnable in this sandbox (Linux) either way -- `#[cfg(target_os =
+    // "macos")]`, verified on macOS CI instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_menu_uses_the_same_command_ids_the_palette_uses() {
+        use muda::MenuItemKind;
+
+        let menu = super::build_menu();
+        let mut ids: Vec<String> = Vec::new();
+        for item in menu.items() {
+            if let MenuItemKind::Submenu(submenu) = item {
+                for sub_item in submenu.items() {
+                    ids.push(sub_item.id().0.clone());
+                }
+            }
+        }
+
+        for expected in [
+            COMMAND_FILE_OPEN,
+            COMMAND_FOCUS_LAYERS,
+            COMMAND_FOCUS_PROPERTIES,
+            COMMAND_FOCUS_HISTORY,
+        ] {
+            assert!(
+                ids.iter().any(|id| id == expected),
+                "expected {expected:?} among the menu's own item ids, got {ids:?}"
+            );
+        }
     }
 
     // -- crash recovery --

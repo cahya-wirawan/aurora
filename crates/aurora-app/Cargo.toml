@@ -39,6 +39,11 @@ wgpu = { workspace = true }
 rfd = { workspace = true }
 arboard = { workspace = true }
 
+# macOS only -- see the workspace `Cargo.toml`'s own comment on `muda`
+# for why Windows/Linux aren't included here.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { workspace = true }
+
 [dev-dependencies]
 accesskit = { workspace = true }
 tempfile = { workspace = true }
