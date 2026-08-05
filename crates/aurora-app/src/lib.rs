@@ -1050,6 +1050,212 @@ fn logical_size(physical: (u32, u32), scale_factor: f64) -> (f32, f32) {
     )
 }
 
+// -- Basic tools: pointer input, canvas view, tool dispatch --
+//
+// PLAN.md M1.9's "basic tools" bullet (Move, Marquee Select, Zoom, Pan,
+// Eyedropper). This crate's first pointer input at all — until now only
+// `KeyboardInput` was wired (see the "command dispatch" section above).
+// Every function below is pure, free, and platform-free (real `winit`
+// event *types* like `MouseButton`/`MouseScrollDelta` are plain,
+// window-less data, the same reason `translate_key` can take a real
+// `winit::keyboard::Key` and still be unit-tested), so the actual
+// dispatch logic is headlessly testable in this sandbox (no display
+// server) — the same shape this crate's keyboard input already uses.
+//
+// Move and Eyedropper are real, selectable `aurora_ui::Tool` variants
+// (see that enum's own doc comment) but have no pointer handling here
+// either — the blockers are the same ones named there, not a gap
+// introduced by this section.
+
+/// One user-visible pointer button, decoupled from `winit::event::
+/// MouseButton` — the same "pure dispatch logic, isolate the real
+/// platform type" seam `translate_key`/`translate_modifiers` already use
+/// for keyboard input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerButton {
+    Primary,
+    Secondary,
+    Middle,
+}
+
+/// Converts a real `winit::event::MouseButton` — `None` for anything
+/// this crate doesn't give a meaning to yet (`Back`/`Forward`/an
+/// arbitrary numbered button).
+#[must_use]
+fn translate_pointer_button(button: winit::event::MouseButton) -> Option<PointerButton> {
+    match button {
+        winit::event::MouseButton::Left => Some(PointerButton::Primary),
+        winit::event::MouseButton::Right => Some(PointerButton::Secondary),
+        winit::event::MouseButton::Middle => Some(PointerButton::Middle),
+        _ => None,
+    }
+}
+
+/// Converts a physical point (e.g. `WindowEvent::CursorMoved`'s own
+/// position) into the window's logical space — the single-point twin of
+/// [`logical_size`]; see that function's own doc comment for the
+/// scale-factor fallback reasoning, which applies identically here.
+#[must_use]
+fn logical_point(physical: (f64, f64), scale_factor: f64) -> (f32, f32) {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    (
+        (physical.0 / scale_factor) as f32,
+        (physical.1 / scale_factor) as f32,
+    )
+}
+
+/// Converts a pointer position in the *window's* own logical space into
+/// a canvas-area-relative logical position, if the pointer is actually
+/// over the canvas area — `None` if it's over a dock panel, outside the
+/// window, or before the first layout has run (`workspace.tree.bounds`
+/// returns `None` either way, so this doesn't need to tell those cases
+/// apart).
+#[must_use]
+fn pointer_in_canvas(
+    workspace: &aurora_ui::Workspace,
+    window_position: (f32, f32),
+) -> Option<(f32, f32)> {
+    let bounds = workspace.tree.bounds(workspace.canvas_area)?;
+    #[allow(clippy::cast_precision_loss)]
+    let (bx, by, bw, bh) = (
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+    );
+    let (x, y) = window_position;
+    if x < bx || y < by || x >= bx + bw || y >= by + bh {
+        return None;
+    }
+    Some((x - bx, y - by))
+}
+
+/// One in-progress pointer drag. `Pan` tracks the last *screen*-space
+/// position (panning moves the view itself, so re-deriving a document
+/// point from a moving view on every event would be circular); `Marquee`
+/// tracks the fixed document-space point the drag started at, since a
+/// selection rectangle is defined in document space regardless of how
+/// the view is panned/zoomed mid-drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Drag {
+    Pan { last_screen: (f32, f32) },
+    Marquee { start_doc: (f32, f32) },
+}
+
+/// Starts a drag for `tool`/`button` at `canvas_point` (already
+/// canvas-area-relative — see [`pointer_in_canvas`]), or `None` if this
+/// tool/button combination doesn't start one. The middle button always
+/// pans, regardless of the active tool — the usual "hand tool"
+/// convention professional raster editors already use as a universal
+/// pan gesture.
+#[must_use]
+fn begin_drag(
+    tool: aurora_ui::Tool,
+    button: PointerButton,
+    canvas_point: (f32, f32),
+    view: &aurora_ui::CanvasView,
+) -> Option<Drag> {
+    match (tool, button) {
+        (_, PointerButton::Middle) | (aurora_ui::Tool::Pan, PointerButton::Primary) => {
+            Some(Drag::Pan {
+                last_screen: canvas_point,
+            })
+        }
+        (aurora_ui::Tool::MarqueeSelect, PointerButton::Primary) => Some(Drag::Marquee {
+            start_doc: view.to_document(canvas_point),
+        }),
+        _ => None,
+    }
+}
+
+/// Advances an in-progress `drag` to `canvas_point`: pans the view by
+/// the screen-space delta since the last event, or updates the active
+/// selection to the marquee rectangle spanned so far
+/// (`aurora_ui::tool::marquee_rect`) — live, so the selection visibly
+/// grows/shrinks as the user drags, not just once on release.
+fn continue_drag(
+    drag: &mut Drag,
+    canvas_point: (f32, f32),
+    view: &mut aurora_ui::CanvasView,
+    selection: &mut aurora_doc::SelectionSet,
+) {
+    match drag {
+        Drag::Pan { last_screen } => {
+            let delta = (
+                canvas_point.0 - last_screen.0,
+                canvas_point.1 - last_screen.1,
+            );
+            view.pan_by(delta);
+            *last_screen = canvas_point;
+        }
+        Drag::Marquee { start_doc } => {
+            let current_doc = view.to_document(canvas_point);
+            let rect = aurora_ui::tool::marquee_rect(*start_doc, current_doc);
+            selection.select(aurora_doc::Selection::new(rect));
+        }
+    }
+}
+
+/// Base of the exponential zoom-per-scroll-unit curve `apply_scroll_zoom`
+/// uses — `1.1^steps` rather than a linear `1.0 + steps * k`, so it's
+/// always positive (never yields a zero/negative zoom, whatever `steps`
+/// is) and composes smoothly across many small scroll events, matching
+/// how trackpad-driven zoom feels in practice.
+const ZOOM_WHEEL_BASE: f32 = 1.1;
+
+/// How many "steps" of zoom one scroll event represents — a wheel
+/// `LineDelta` step is one unit per notch; a trackpad `PixelDelta` is
+/// scaled down since it reports much finer-grained deltas.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn zoom_steps_for_scroll(delta: winit::event::MouseScrollDelta) -> f32 {
+    match delta {
+        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+        winit::event::MouseScrollDelta::PixelDelta(position) => (position.y / 20.0) as f32,
+    }
+}
+
+/// Zooms `view` in/out around `anchor` (already canvas-area-relative) in
+/// response to one `WindowEvent::MouseWheel` — the "scroll to zoom"
+/// gesture that works regardless of which tool is active, matching
+/// every professional raster editor's own convention.
+fn apply_scroll_zoom(
+    view: &mut aurora_ui::CanvasView,
+    anchor: (f32, f32),
+    delta: winit::event::MouseScrollDelta,
+) {
+    let steps = zoom_steps_for_scroll(delta);
+    let factor = ZOOM_WHEEL_BASE.powf(steps);
+    view.zoom_at(anchor, view.zoom() * factor);
+}
+
+/// How much one Zoom-tool click zooms in (or, with `Alt` held, out) —
+/// [`handle_zoom_tool_click`]'s own factor.
+const ZOOM_CLICK_FACTOR: f32 = 2.0;
+
+/// Handles a Zoom-tool primary click at `canvas_point`: zooms in by
+/// [`ZOOM_CLICK_FACTOR`], or out (the reciprocal) if `modifiers.alt` is
+/// held — Photoshop's own Zoom-tool convention (`Alt`+click to zoom
+/// out), distinct from [`apply_scroll_zoom`], which works with any tool
+/// active.
+fn handle_zoom_tool_click(
+    view: &mut aurora_ui::CanvasView,
+    canvas_point: (f32, f32),
+    modifiers: Modifiers,
+) {
+    let factor = if modifiers.alt {
+        1.0 / ZOOM_CLICK_FACTOR
+    } else {
+        ZOOM_CLICK_FACTOR
+    };
+    view.zoom_at(canvas_point, view.zoom() * factor);
+}
+
 /// Owns the window, GPU device/surface, and accessibility adapter for
 /// one application window. Not part of this crate's public API — [`run`]
 /// is the only sanctioned entry point.
@@ -1106,6 +1312,30 @@ struct App {
     /// [`palette_commands`]'s own doc comment), so this is only ever
     /// recorded and logged, ready for whenever that pipeline exists.
     pending_open_path: Option<PathBuf>,
+    /// PLAN.md M1.9's "basic tools" bullet — see `aurora_ui::tool`'s own
+    /// doc comment for exactly which of the five named tools (Move,
+    /// Marquee Select, Zoom, Pan, Eyedropper) actually do anything yet.
+    tool: aurora_ui::Tool,
+    /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]) —
+    /// deliberately not tied to any particular document (there is no
+    /// live document held here at all; see [`demo_document`]'s own doc
+    /// comment) since the view itself is a property of the *window*, the
+    /// same way Photoshop remembers a document's own zoom/scroll
+    /// independent of its pixel content.
+    canvas_view: aurora_ui::CanvasView,
+    /// The document-level selection ([`aurora_doc::SelectionSet`]) the
+    /// Marquee Select tool drags out — a document-level concept in its
+    /// own right (see that type's own doc comment), not something that
+    /// needs a live `LayerTree` alongside it to exist.
+    selection: aurora_doc::SelectionSet,
+    /// The pointer's last known position, in the *window's* own logical
+    /// space (already DPI-adjusted — see [`logical_point`]) — `None`
+    /// before the first `CursorMoved`, or after `CursorLeft`.
+    pointer_position: Option<(f32, f32)>,
+    /// An in-progress pointer drag (Pan or Marquee Select), if any —
+    /// `None` is "not dragging," the same "no separate flag" shape
+    /// `command_palette`/`crash_recovery_dialog` above already use.
+    drag: Option<Drag>,
     /// The native menu bar — macOS only, see this crate's own "native
     /// menu bar" section for why Windows/Linux aren't included. Built
     /// in [`App::new`] (no window needed); attached to the real
@@ -1190,6 +1420,11 @@ impl App {
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
             pending_open_path: None,
+            tool: aurora_ui::Tool::default(),
+            canvas_view: aurora_ui::CanvasView::default(),
+            selection: aurora_doc::SelectionSet::new(),
+            pointer_position: None,
+            drag: None,
             #[cfg(target_os = "macos")]
             menu: build_menu(),
             background,
@@ -1261,6 +1496,70 @@ impl App {
     fn handle_dropped_file(&mut self, path: PathBuf) {
         tracing::info!(path = %path.display(), "file dropped (no import pipeline yet)");
         self.pending_open_path = Some(path);
+    }
+
+    /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
+    /// position and, if a drag is in progress, advances it
+    /// ([`continue_drag`]).
+    fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
+        let position = logical_point(physical_position, self.scale_factor);
+        self.pointer_position = Some(position);
+        let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
+            return;
+        };
+        if let Some(drag) = self.drag.as_mut() {
+            continue_drag(
+                drag,
+                canvas_point,
+                &mut self.canvas_view,
+                &mut self.selection,
+            );
+        }
+    }
+
+    /// A real `WindowEvent::MouseInput { state: Pressed, .. }`: either
+    /// performs the active Zoom tool's click-to-zoom
+    /// ([`handle_zoom_tool_click`]), or starts a drag ([`begin_drag`]) —
+    /// never both for the same press.
+    fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
+        let Some(button) = translate_pointer_button(button) else {
+            return;
+        };
+        let Some(position) = self.pointer_position else {
+            return;
+        };
+        let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
+            return;
+        };
+
+        if self.tool == aurora_ui::Tool::Zoom && button == PointerButton::Primary {
+            handle_zoom_tool_click(&mut self.canvas_view, canvas_point, self.modifiers);
+            return;
+        }
+        self.drag = begin_drag(self.tool, button, canvas_point, &self.canvas_view);
+    }
+
+    /// A real `WindowEvent::MouseInput { state: Released, .. }`: ends
+    /// whatever drag is in progress. Any button release ends it — this
+    /// crate has no multi-touch/multi-pointer support to disambiguate
+    /// which button a drag actually started with, and a single active
+    /// window only ever has one drag in progress at a time.
+    fn handle_pointer_released(&mut self) {
+        self.drag = None;
+    }
+
+    /// A real `WindowEvent::MouseWheel`: zooms around the pointer's last
+    /// known position ([`apply_scroll_zoom`]) if it's over the canvas
+    /// area — a no-op otherwise (e.g. scrolling while the pointer is
+    /// over a dock panel must not zoom the canvas).
+    fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
+        let Some(position) = self.pointer_position else {
+            return;
+        };
+        let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
+            return;
+        };
+        apply_scroll_zoom(&mut self.canvas_view, canvas_point, delta);
     }
 
     /// Routes one native menu activation to [`activate_command`] — the
@@ -1499,6 +1798,23 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             WindowEvent::HoveredFileCancelled => {
                 tracing::debug!("file drag cancelled");
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.handle_pointer_moved((position.x, position.y));
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => self.handle_pointer_pressed(button),
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                ..
+            } => self.handle_pointer_released(),
+            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer_position = None;
+                self.drag = None;
+            }
             _ => {}
         }
     }
@@ -1587,15 +1903,19 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::{
         AppCommand, COMMAND_FILE_OPEN, COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS,
-        COMMAND_FOCUS_PROPERTIES, CRASH_RECOVERY_CONTINUE, ClipboardAccess, FileDialogAccess, Key,
-        KeyChord, Modifiers, NamedKey, activate_command, autosave_path, clear_session_marker,
-        close_command_palette, close_crash_recovery_dialog, crash_recovery_dialog_message,
+        COMMAND_FOCUS_PROPERTIES, CRASH_RECOVERY_CONTINUE, ClipboardAccess, Drag, FileDialogAccess,
+        Key, KeyChord, Modifiers, NamedKey, PointerButton, activate_command, apply_scroll_zoom,
+        autosave_path, begin_drag, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, continue_drag, crash_recovery_dialog_message,
         default_shortcuts, demo_document, handle_dialog_key, handle_key, handle_palette_key,
-        load_background_color, load_scales, logical_size, open_command_palette,
-        open_crash_recovery_dialog, previous_session_left_a_marker, recover_document, run_command,
-        toggle_command_palette, translate_key, translate_modifiers, write_autosave,
-        write_session_marker,
+        handle_zoom_tool_click, load_background_color, load_scales, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, pointer_in_canvas,
+        previous_session_left_a_marker, recover_document, run_command, toggle_command_palette,
+        translate_key, translate_modifiers, translate_pointer_button, write_autosave,
+        write_session_marker, zoom_steps_for_scroll,
     };
+    use aurora_doc::SelectionSet;
+    use aurora_ui::{CanvasView, Tool};
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
 
@@ -2651,5 +2971,237 @@ mod tests {
             palette.is_some(),
             "the palette must be untouched while the dialog was still open"
         );
+    }
+
+    // -- Basic tools: pointer input, canvas view, tool dispatch --
+
+    #[test]
+    fn translate_pointer_button_maps_the_three_known_buttons() {
+        assert_eq!(
+            translate_pointer_button(winit::event::MouseButton::Left),
+            Some(PointerButton::Primary)
+        );
+        assert_eq!(
+            translate_pointer_button(winit::event::MouseButton::Right),
+            Some(PointerButton::Secondary)
+        );
+        assert_eq!(
+            translate_pointer_button(winit::event::MouseButton::Middle),
+            Some(PointerButton::Middle)
+        );
+    }
+
+    #[test]
+    fn translate_pointer_button_returns_none_for_an_unmapped_button() {
+        assert_eq!(
+            translate_pointer_button(winit::event::MouseButton::Back),
+            None
+        );
+    }
+
+    #[test]
+    fn logical_point_divides_out_a_scale_factor() {
+        assert_eq!(logical_point((200.0, 100.0), 2.0), (100.0, 50.0));
+    }
+
+    #[test]
+    fn logical_point_falls_back_to_one_for_a_non_positive_scale_factor() {
+        assert_eq!(logical_point((50.0, 25.0), 0.0), (50.0, 25.0));
+        assert_eq!(logical_point((50.0, 25.0), -1.0), (50.0, 25.0));
+    }
+
+    fn laid_out_workspace() -> aurora_ui::Workspace {
+        let mut workspace = aurora_ui::build_workspace();
+        workspace.tree.compute_layout(1000.0, 800.0);
+        workspace
+    }
+
+    #[test]
+    fn pointer_in_canvas_reports_a_canvas_relative_point_when_inside() {
+        let workspace = laid_out_workspace();
+        // A 1000x800 viewport, 3:1 canvas:rail flex ratio -- canvas area
+        // is the 750x800 rect at the window's own origin (see
+        // `aurora_ui::workspace`'s own layout test).
+        assert_eq!(
+            pointer_in_canvas(&workspace, (100.0, 50.0)),
+            Some((100.0, 50.0))
+        );
+    }
+
+    #[test]
+    fn pointer_in_canvas_returns_none_over_the_rail() {
+        let workspace = laid_out_workspace();
+        assert_eq!(pointer_in_canvas(&workspace, (900.0, 50.0)), None);
+    }
+
+    #[test]
+    fn pointer_in_canvas_returns_none_before_any_layout_has_run() {
+        let workspace = aurora_ui::build_workspace();
+        assert_eq!(pointer_in_canvas(&workspace, (10.0, 10.0)), None);
+    }
+
+    #[test]
+    // A `LineDelta`'s own `y` is returned unchanged, not computed --
+    // exact equality is correct here.
+    #[allow(clippy::float_cmp)]
+    fn zoom_steps_for_scroll_reads_the_y_axis_of_a_line_delta() {
+        assert_eq!(
+            zoom_steps_for_scroll(winit::event::MouseScrollDelta::LineDelta(0.0, 2.0)),
+            2.0
+        );
+    }
+
+    #[test]
+    fn begin_drag_with_the_middle_button_always_pans_regardless_of_tool() {
+        let view = CanvasView::new();
+        for tool in Tool::ALL {
+            assert_eq!(
+                begin_drag(tool, PointerButton::Middle, (10.0, 20.0), &view),
+                Some(Drag::Pan {
+                    last_screen: (10.0, 20.0)
+                }),
+                "tool {tool:?} must still pan on a middle-button drag"
+            );
+        }
+    }
+
+    #[test]
+    fn begin_drag_with_pan_tool_and_primary_button_pans() {
+        let view = CanvasView::new();
+        assert_eq!(
+            begin_drag(Tool::Pan, PointerButton::Primary, (5.0, 5.0), &view),
+            Some(Drag::Pan {
+                last_screen: (5.0, 5.0)
+            })
+        );
+    }
+
+    #[test]
+    fn begin_drag_with_marquee_tool_and_primary_button_starts_a_marquee_in_document_space() {
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 2.0);
+        assert_eq!(
+            begin_drag(
+                Tool::MarqueeSelect,
+                PointerButton::Primary,
+                (20.0, 40.0),
+                &view
+            ),
+            Some(Drag::Marquee {
+                start_doc: (10.0, 20.0)
+            })
+        );
+    }
+
+    #[test]
+    fn begin_drag_with_move_or_eyedropper_tool_and_primary_button_does_nothing() {
+        let view = CanvasView::new();
+        assert_eq!(
+            begin_drag(Tool::Move, PointerButton::Primary, (1.0, 1.0), &view),
+            None
+        );
+        assert_eq!(
+            begin_drag(Tool::Eyedropper, PointerButton::Primary, (1.0, 1.0), &view),
+            None
+        );
+    }
+
+    #[test]
+    fn begin_drag_with_zoom_tool_and_secondary_button_does_nothing() {
+        let view = CanvasView::new();
+        assert_eq!(
+            begin_drag(Tool::Zoom, PointerButton::Secondary, (1.0, 1.0), &view),
+            None
+        );
+    }
+
+    #[test]
+    fn continue_drag_pan_moves_the_view_by_the_delta_since_the_last_point() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Pan {
+            last_screen: (10.0, 10.0),
+        };
+        continue_drag(&mut drag, (15.0, 8.0), &mut view, &mut selection);
+        assert_eq!(view.pan(), (5.0, -2.0));
+        assert_eq!(
+            drag,
+            Drag::Pan {
+                last_screen: (15.0, 8.0)
+            },
+            "must advance its own last-known point for the next event"
+        );
+    }
+
+    #[test]
+    fn continue_drag_marquee_updates_the_active_selection_live() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Marquee {
+            start_doc: (10.0, 10.0),
+        };
+        continue_drag(&mut drag, (30.0, 25.0), &mut view, &mut selection);
+        let Some(active) = selection.active() else {
+            unreachable!("must select something");
+        };
+        assert_eq!(active.bounds.x, 10);
+        assert_eq!(active.bounds.y, 10);
+        assert_eq!(active.bounds.width, 20);
+        assert_eq!(active.bounds.height, 15);
+
+        // A second move further extends the same drag -- the selection
+        // must track the *current* rect, not just the first one.
+        continue_drag(&mut drag, (50.0, 5.0), &mut view, &mut selection);
+        let Some(active) = selection.active() else {
+            unreachable!("must still be selected");
+        };
+        assert_eq!(active.bounds.width, 40);
+    }
+
+    #[test]
+    fn apply_scroll_zoom_zooms_in_on_a_positive_scroll() {
+        let mut view = CanvasView::new();
+        apply_scroll_zoom(
+            &mut view,
+            (100.0, 100.0),
+            winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+        );
+        assert!(view.zoom() > 1.0, "zoom was {}", view.zoom());
+    }
+
+    #[test]
+    fn apply_scroll_zoom_zooms_out_on_a_negative_scroll() {
+        let mut view = CanvasView::new();
+        apply_scroll_zoom(
+            &mut view,
+            (100.0, 100.0),
+            winit::event::MouseScrollDelta::LineDelta(0.0, -1.0),
+        );
+        assert!(view.zoom() < 1.0, "zoom was {}", view.zoom());
+    }
+
+    #[test]
+    // `zoom()` here is `1.0 * ZOOM_CLICK_FACTOR` from a fresh view,
+    // computed via one exact multiplication, not accumulated float
+    // error -- exact equality is correct.
+    #[allow(clippy::float_cmp)]
+    fn handle_zoom_tool_click_zooms_in_without_alt() {
+        let mut view = CanvasView::new();
+        handle_zoom_tool_click(&mut view, (50.0, 50.0), Modifiers::none());
+        assert_eq!(view.zoom(), 2.0);
+    }
+
+    #[test]
+    // Same reasoning as `handle_zoom_tool_click_zooms_in_without_alt`
+    // above.
+    #[allow(clippy::float_cmp)]
+    fn handle_zoom_tool_click_zooms_out_with_alt_held() {
+        let mut view = CanvasView::new();
+        let alt_held = Modifiers {
+            alt: true,
+            ..Modifiers::none()
+        };
+        handle_zoom_tool_click(&mut view, (50.0, 50.0), alt_held);
+        assert_eq!(view.zoom(), 0.5);
     }
 }
