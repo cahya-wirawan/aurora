@@ -1,14 +1,27 @@
-//! Real content for the Layers panel: one accessible row per layer in
-//! an `aurora_doc::LayerTree`, nested to match group structure.
-//! PLAN.md M1.8's "Layers, history, tool-options panels" bullet, first
-//! slice — Layers only; History and tool-options panels are separate,
-//! still-open work.
+//! Real content for the Layers panel: one accessible, real-sized,
+//! clickable row per layer in an `aurora_doc::LayerTree`, nested to
+//! match group structure. PLAN.md M1.8's "Layers, history, tool-options
+//! panels" bullet, first slice — Layers only; History and tool-options
+//! panels are separate, still-open work.
 //!
 //! **No pixel rendering** — same boundary every widget in this crate
 //! keeps: a row gets a real, correct accessible name and description
 //! (the layer's own name; its kind, blend mode, opacity, and visibility),
 //! no thumbnail/swatch, no drawn pixels — `aurora-vector`/text rendering
 //! don't exist yet.
+//!
+//! **Real, clickable size** (PLAN.md M1.9's "active-layer selection"):
+//! each row's own style resolves padding from `scales.spacing`
+//! (`md`/`sm`, the same tokens `aurora_widgets::widgets::button` already
+//! uses — there is no dedicated "row height" token, and inventing one
+//! is a design decision to raise, not fill locally, CLAUDE.md), so
+//! `WidgetTree::compute_layout` gives each row a real, non-zero screen
+//! rect a pointer can actually land on
+//! (`aurora_widgets::WidgetTree::hit_test`), and carries `Action::Focus`/
+//! `Action::Click` for the same reason — a screen reader needs a real
+//! target too, not just a mouse. [`populate_layers_panel`] returns the
+//! `WidgetId -> LayerId` map a caller (`aurora-app`) needs to turn a hit
+//! or an `ActionRequest` back into "which layer".
 //!
 //! **One-shot, not reactive**: [`populate_layers_panel`] builds rows
 //! once from whatever `LayerTree` state it's given. It does not diff
@@ -18,19 +31,54 @@
 //! yet (real, separate work for whenever a document can actually be
 //! edited live in `aurora-app`, which doesn't have one open yet either).
 
-use accesskit::{Node, Role};
+use std::collections::HashMap;
+
+use accesskit::{Action, Node, Role};
 use aurora_doc::{LayerId, LayerKind, LayerTree};
+use aurora_theme::Scales;
 use aurora_widgets::widgets::WidgetKind;
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
-use taffy::Style;
+use taffy::style_helpers::length;
+use taffy::{Rect as LayoutRect, Style};
 
 use crate::panel::PanelHandle;
+
+/// A row's own layout style — padding only (`scales.spacing.md`
+/// horizontal, `.sm` vertical), matching
+/// `aurora_widgets::widgets::button`'s own style exactly (no dedicated
+/// "row height" token exists to reach for instead — see this module's
+/// own doc comment).
+fn row_style(scales: &Scales) -> Style {
+    Style {
+        padding: LayoutRect {
+            left: length(spacing(scales.spacing.md)),
+            right: length(spacing(scales.spacing.md)),
+            top: length(spacing(scales.spacing.sm)),
+            bottom: length(spacing(scales.spacing.sm)),
+        },
+        ..Default::default()
+    }
+}
+
+/// `scales.spacing.<name>` as a plain `f32` pixel value — every concrete
+/// widget's own layout style goes through this rather than a literal,
+/// per invariant §7.3.10. A small, local duplicate of
+/// `aurora_widgets::widgets`'s own private helper of the same name and
+/// body — that one is `pub(crate)` to its own crate, and one line of
+/// arithmetic isn't worth a new public cross-crate API for.
+#[allow(clippy::cast_precision_loss)]
+fn spacing(value: u32) -> f32 {
+    value as f32
+}
 
 /// Replaces `panel`'s body accessibility with a real `Role::List`, then
 /// inserts one `Role::ListItem` row per layer in `layers` as that
 /// body's children — root layers first, top-to-bottom, matching
 /// `LayerTree`'s own ordering convention, nested to mirror group
-/// structure (a group's own layers become its row's children).
+/// structure (a group's own layers become its row's children). Returns
+/// every inserted row's own id mapped to the `LayerId` it represents,
+/// so a caller can turn a real pointer hit or accessibility action back
+/// into "which layer".
 ///
 /// # Errors
 ///
@@ -38,33 +86,40 @@ use crate::panel::PanelHandle;
 pub fn populate_layers_panel(
     tree: &mut WidgetTree<WidgetKind>,
     panel: PanelHandle,
+    scales: &Scales,
     layers: &LayerTree,
-) -> Result<(), WidgetError> {
+) -> Result<HashMap<WidgetId, LayerId>, WidgetError> {
     let mut list_node = Node::new(Role::List);
     list_node.set_label("Layers");
     tree.set_accessibility(panel.body, list_node)?;
 
+    let mut rows = HashMap::new();
     for &id in layers.roots() {
-        insert_layer_row(tree, panel.body, layers, id)?;
+        insert_layer_row(tree, panel.body, scales, layers, id, &mut rows)?;
     }
-    Ok(())
+    Ok(rows)
 }
 
 fn insert_layer_row(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
+    scales: &Scales,
     layers: &LayerTree,
     id: LayerId,
+    rows: &mut HashMap<WidgetId, LayerId>,
 ) -> Result<WidgetId, WidgetError> {
     let name = layers.name(id).unwrap_or("Untitled Layer");
     let mut node = Node::new(Role::ListItem);
     node.set_label(name);
     node.set_description(describe_layer(layers, id));
-    let row = tree.insert(parent, Style::default(), node, WidgetKind::Container)?;
+    node.add_action(Action::Focus);
+    node.add_action(Action::Click);
+    let row = tree.insert(parent, row_style(scales), node, WidgetKind::Container)?;
+    rows.insert(row, id);
 
     if let Some(children) = layers.children(id) {
         for &child in children {
-            insert_layer_row(tree, row, layers, child)?;
+            insert_layer_row(tree, row, scales, layers, child, rows)?;
         }
     }
     Ok(row)
@@ -99,6 +154,7 @@ mod tests {
     use crate::panel::insert_panel;
     use aurora_core::Rect;
     use aurora_doc::LayerTree;
+    use aurora_theme::Scales;
     use aurora_widgets::widgets::{self};
     use taffy::Style;
 
@@ -108,6 +164,17 @@ mod tests {
             y: 0,
             width: 100,
             height: 100,
+        }
+    }
+
+    // The real, committed, owner-approved scales -- the same file
+    // `aurora-theme`'s own tests parse, so this exercises real token
+    // values, not a synthetic fixture.
+    fn test_scales() -> Scales {
+        const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
+        match Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
         }
     }
 
@@ -137,9 +204,11 @@ mod tests {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = populate_layers_panel(&mut tree, panel, &layers) {
-            unreachable!("{err:?}");
-        }
+        let scales = test_scales();
+        let rows = match populate_layers_panel(&mut tree, panel, &scales, &layers) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
 
         let Some(body_accessibility) = tree.accessibility(panel.body) else {
             unreachable!("just populated");
@@ -149,14 +218,14 @@ mod tests {
         // `add_pixel_layer` inserts each new layer as the topmost root,
         // so `retouch` (added second) must come before `background` in
         // `roots()` -- and so in row order too.
-        let Some(rows) = tree.children(panel.body) else {
+        let Some(row_ids) = tree.children(panel.body) else {
             unreachable!("just populated");
         };
-        assert_eq!(rows.len(), 2);
-        let Some(first_row) = rows.first() else {
+        assert_eq!(row_ids.len(), 2);
+        let Some(first_row) = row_ids.first() else {
             unreachable!("just asserted len() == 2");
         };
-        let Some(second_row) = rows.get(1) else {
+        let Some(second_row) = row_ids.get(1) else {
             unreachable!("just asserted len() == 2");
         };
 
@@ -165,12 +234,55 @@ mod tests {
         };
         assert_eq!(first.label(), Some("Retouch"));
         assert_eq!(first.description(), Some("Multiply, 80%"));
+        assert!(first.supports_action(accesskit::Action::Focus));
+        assert!(first.supports_action(accesskit::Action::Click));
 
         let Some(second) = tree.accessibility(*second_row) else {
             unreachable!("just inserted");
         };
         assert_eq!(second.label(), Some("Background"));
         assert_eq!(second.description(), Some("Normal, 100%, hidden"));
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "the returned map must have one entry per row"
+        );
+        assert_eq!(rows.get(first_row), Some(&retouch));
+        assert_eq!(rows.get(second_row), Some(&background));
+    }
+
+    #[test]
+    fn populate_layers_panel_gives_rows_a_real_nonzero_computed_size() {
+        let mut layers = LayerTree::new();
+        if let Err(err) = layers.add_pixel_layer("Background", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Layers") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = test_scales();
+        if let Err(err) = populate_layers_panel(&mut tree, panel, &scales, &layers) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(1000.0, 800.0);
+
+        let Some(row_ids) = tree.children(panel.body) else {
+            unreachable!("just populated");
+        };
+        let Some(&row) = row_ids.first() else {
+            unreachable!("just added one layer");
+        };
+        let Some(row_bounds) = tree.bounds(row) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            row_bounds.width > 0 && row_bounds.height > 0,
+            "a row must have a real, clickable size after layout: {row_bounds:?}"
+        );
     }
 
     #[test]
@@ -180,24 +292,27 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = layers.add_pixel_layer("Glow", bounds(), Some(group)) {
-            unreachable!("{err:?}");
-        }
+        let glow = match layers.add_pixel_layer("Glow", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
 
         let (mut tree, root) = widgets::new_tree(Style::default());
         let panel = match insert_panel(&mut tree, root, "Layers") {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = populate_layers_panel(&mut tree, panel, &layers) {
-            unreachable!("{err:?}");
-        }
+        let scales = test_scales();
+        let rows = match populate_layers_panel(&mut tree, panel, &scales, &layers) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
 
-        let Some(rows) = tree.children(panel.body) else {
+        let Some(row_ids) = tree.children(panel.body) else {
             unreachable!("just populated");
         };
-        assert_eq!(rows.len(), 1, "one top-level row for the group");
-        let Some(&group_row) = rows.first() else {
+        assert_eq!(row_ids.len(), 1, "one top-level row for the group");
+        let Some(&group_row) = row_ids.first() else {
             unreachable!("just asserted len() == 1");
         };
         let Some(group_accessibility) = tree.accessibility(group_row) else {
@@ -217,6 +332,9 @@ mod tests {
             unreachable!("just inserted");
         };
         assert_eq!(child_accessibility.label(), Some("Glow"));
+
+        assert_eq!(rows.get(&group_row), Some(&group));
+        assert_eq!(rows.get(&child_row), Some(&glow));
     }
 
     #[test]
@@ -230,7 +348,8 @@ mod tests {
         if let Err(err) = tree.remove(panel.body) {
             unreachable!("{err:?}");
         }
-        match populate_layers_panel(&mut tree, panel, &layers) {
+        let scales = test_scales();
+        match populate_layers_panel(&mut tree, panel, &scales, &layers) {
             Err(aurora_widgets::WidgetError::UnknownWidget(id)) => assert_eq!(id, panel.body),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }

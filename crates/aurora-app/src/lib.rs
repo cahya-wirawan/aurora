@@ -112,11 +112,17 @@
 //! and a Brush drag calls `aurora_brush::stamp_dab`/`advance_segment`
 //! against the topmost pixel layer's own surface — a real mouse drag
 //! really paints real pixels into a real, live document for the first
-//! time in this project. Move and Eyedropper remain real, selectable,
-//! inert tools (no active-layer-selection UI, no colour-sampling
-//! function); eraser and undo-as-you-drag are separate, still-open
-//! follow-on work. See `aurora_ui::tool`'s own doc comment and this
-//! module's "brush painting" section for the full reasoning.
+//! time in this project. **Active-layer selection followed the same
+//! milestone**: `aurora_ui::layers_panel`'s own rows are now real,
+//! non-zero-sized, clickable widgets (`aurora_widgets::WidgetTree::hit_test`,
+//! new for this), so clicking one calls `select_layer` — updates
+//! `active_layer` (what Brush paints into) and marks the row accessibly
+//! selected, both instead of always targeting the topmost pixel layer
+//! with no way to change it. Eyedropper remains a real, selectable,
+//! inert tool (no colour-sampling function built on `tile_store` yet);
+//! eraser and undo-as-you-drag are separate, still-open follow-on work.
+//! See `aurora_ui::tool`'s own doc comment and this module's "brush
+//! painting"/"layer selection" sections for the full reasoning.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
@@ -148,6 +154,7 @@
 //! development sandbox is Linux, where the dependency isn't even
 //! present).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1356,17 +1363,21 @@ fn handle_zoom_tool_click(
     view.zoom_at(canvas_point, view.zoom() * factor);
 }
 
-// -- Brush painting: a live document and a live tile store --
+// -- Brush painting and layer selection: a live document, a live tile
+// -- store, and a way to pick which layer is active --
 //
 // PLAN.md M1.9's "basic brush and eraser" bullet, picking up exactly
 // where `aurora_brush::stamp_dab`/`stamp_stroke` (ADR 0010) left off:
 // this crate's first *live* document (`App::layers`, kept alive instead
 // of being discarded after populating the panels, as it was through
-// M1.8/M1.9 until now) and first real `aurora_tile::TileStore`. Eraser,
-// undo-as-you-drag, and a way to *change* which layer is active (the
-// same click-to-select gap the Move tool has) all remain separate,
-// still-open follow-on work -- this section closes exactly the "no live
-// document to paint into" gap ADR 0010's own doc named, nothing more.
+// M1.8/M1.9 until now) and first real `aurora_tile::TileStore`.
+// `select_layer` closes the other half: `active_layer` no longer just
+// defaults to the topmost pixel layer and stays there forever -- a real
+// click on a real, clickable Layers-panel row (`aurora_ui::layers_panel`,
+// `aurora_widgets::WidgetTree::hit_test`) changes it, live. Eraser and
+// undo-as-you-drag remain separate, still-open follow-on work; so does
+// Move's own drag-to-reposition logic, even though its *blocker*
+// (no active-layer selection) is what this section just resolved.
 
 /// The topmost pixel layer in `layers` — [`App::active_layer`]'s own
 /// initial value. `layers.roots()` is already ordered top-to-bottom
@@ -1380,6 +1391,35 @@ fn topmost_pixel_layer(layers: &aurora_doc::LayerTree) -> Option<aurora_doc::Lay
         .iter()
         .copied()
         .find(|&id| matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. })))
+}
+
+/// Selects `layer_id` as the active layer: sets `*active_layer` and
+/// marks its own Layers-panel row (`layer_rows` —
+/// `aurora_ui::populate_layers_panel`'s own return value) as accessibly
+/// selected (`accesskit::Node::set_selected`), clearing that state from
+/// every other row. Pushing the updated accessibility tree to the
+/// platform is the caller's job (`App::push_accessibility`) — this
+/// function only touches `workspace`/`active_layer`, the same "pure
+/// dispatch, caller owns the one real platform side-effect" split every
+/// other function in this crate already uses
+/// (`open_crash_recovery_dialog`, `begin_drag`, ...).
+fn select_layer(
+    workspace: &mut aurora_ui::Workspace,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &mut Option<aurora_doc::LayerId>,
+    layer_id: aurora_doc::LayerId,
+) {
+    *active_layer = Some(layer_id);
+    for (&row, &id) in layer_rows {
+        let Some(node) = workspace.tree.accessibility(row) else {
+            continue;
+        };
+        let mut node = node.clone();
+        node.set_selected(id == layer_id);
+        if let Err(err) = workspace.tree.set_accessibility(row, node) {
+            tracing::warn!(?err, "failed to update a layer row's selection state");
+        }
+    }
 }
 
 /// Where this session's shared tile store keeps its scratch files —
@@ -1612,11 +1652,23 @@ struct App {
     layers: aurora_doc::LayerTree,
     /// The layer the Brush tool paints into, if any — the topmost pixel
     /// layer of `layers` at construction time
-    /// ([`topmost_pixel_layer`]). `None` for a document with no pixel
-    /// layer at all. There is no click-to-select UI yet to *change*
-    /// this (the same gap `aurora_ui::tool`'s own doc comment names for
-    /// the Move tool), so it never changes after construction today.
+    /// ([`topmost_pixel_layer`]), real-time-changeable now by clicking a
+    /// row in the Layers panel ([`Self::layer_rows`],
+    /// [`Self::handle_pointer_pressed`]) — the same click-to-select gap
+    /// `aurora_ui::tool`'s own doc comment used to name for the Move
+    /// tool, now closed for layer selection (Move's own blocker is
+    /// unrelated and remains open). `None` for a document with no pixel
+    /// layer at all, or once one is clicked that turns out to be a
+    /// group (groups are never inserted into `layer_rows` at all, so
+    /// this can't actually happen via a click — only via never having a
+    /// pixel layer to begin with).
     active_layer: Option<aurora_doc::LayerId>,
+    /// Every Layers-panel row's own `WidgetId`, mapped to the `LayerId`
+    /// it represents (`aurora_ui::populate_layers_panel`'s own return
+    /// value) — what [`Self::handle_pointer_pressed`] looks a
+    /// `WidgetTree::hit_test` result up in to turn a click into "select
+    /// this layer."
+    layer_rows: HashMap<WidgetId, aurora_doc::LayerId>,
     /// This document's own shared tile store (ADR 0010) — `None` if it
     /// failed to open (e.g. an unwritable scratch directory), logged as
     /// a warning rather than treated as fatal, the same "must never stop
@@ -1684,11 +1736,17 @@ impl App {
             .flatten();
         let was_recovered = recovered.is_some();
         let (layers, history) = recovered.unwrap_or_else(demo_document);
-        if let Err(err) =
-            aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, &layers)
-        {
-            unreachable!("workspace.layers was just built by build_workspace above: {err:?}");
-        }
+        let layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                unreachable!("workspace.layers was just built by build_workspace above: {err:?}")
+            }
+        };
         if let Err(err) =
             aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &history)
         {
@@ -1736,6 +1794,7 @@ impl App {
             selection: aurora_doc::SelectionSet::new(),
             layers,
             active_layer,
+            layer_rows,
             tile_store,
             residency: None,
             canvas_pipeline: None,
@@ -1851,6 +1910,25 @@ impl App {
         let Some(position) = self.pointer_position else {
             return;
         };
+
+        // Layer selection takes priority over — and is independent of —
+        // whichever canvas tool is active: clicking a Layers panel row
+        // selects a layer no matter what the Brush/Zoom/Pan/... tool is
+        // doing, the same way it would in any real image editor.
+        if button == PointerButton::Primary
+            && let Some(hit) = self.workspace.tree.hit_test(position)
+            && let Some(&layer_id) = self.layer_rows.get(&hit)
+        {
+            select_layer(
+                &mut self.workspace,
+                &self.layer_rows,
+                &mut self.active_layer,
+                layer_id,
+            );
+            self.push_accessibility();
+            return;
+        }
+
         let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
             return;
         };
@@ -2323,10 +2401,10 @@ mod tests {
         handle_key, handle_palette_key, handle_zoom_tool_click, layer_local_point,
         load_background_color, load_scales, logical_point, logical_size, open_command_palette,
         open_crash_recovery_dialog, open_tile_store, pointer_in_canvas,
-        previous_session_left_a_marker, recover_document, run_command, tile_origin_for_view,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, write_autosave, write_session_marker,
-        zoom_steps_for_scroll,
+        previous_session_left_a_marker, recover_document, run_command, select_layer,
+        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
+        translate_key, translate_modifiers, translate_pointer_button, write_autosave,
+        write_session_marker, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -2478,6 +2556,73 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert_eq!(topmost_pixel_layer(&layers), Some(pixel));
+    }
+
+    fn layer_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        }
+    }
+
+    #[test]
+    fn select_layer_sets_active_layer_and_marks_only_its_own_row_selected() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut layers = aurora_doc::LayerTree::new();
+        let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match layers.add_pixel_layer("b", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some((&row_a, _)) = layer_rows.iter().find(|&(_, &id)| id == a) else {
+            unreachable!("a must have a row");
+        };
+        let Some((&row_b, _)) = layer_rows.iter().find(|&(_, &id)| id == b) else {
+            unreachable!("b must have a row");
+        };
+        let mut active_layer = None;
+
+        select_layer(&mut workspace, &layer_rows, &mut active_layer, a);
+        assert_eq!(active_layer, Some(a));
+        let Some(node_a) = workspace.tree.accessibility(row_a) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(node_a.is_selected(), Some(true));
+        let Some(node_b) = workspace.tree.accessibility(row_b) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(node_b.is_selected(), Some(false));
+
+        // Selecting the other layer must flip both rows, not just add
+        // to whatever was already selected.
+        select_layer(&mut workspace, &layer_rows, &mut active_layer, b);
+        assert_eq!(active_layer, Some(b));
+        let Some(node_a) = workspace.tree.accessibility(row_a) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(node_a.is_selected(), Some(false));
+        let Some(node_b) = workspace.tree.accessibility(row_b) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(node_b.is_selected(), Some(true));
     }
 
     /// `demo_document`'s whole point (unlike a plain `LayerTree` built

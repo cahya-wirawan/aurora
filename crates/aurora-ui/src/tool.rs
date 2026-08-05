@@ -17,10 +17,12 @@
 //! crate has no reason to own — that lives in `aurora-app`, the one
 //! place a live document and a live store both exist. **Move and
 //! Eyedropper are not wired to anything yet**: Move needs a notion of
-//! "the active layer" a user can *change*, which needs click-to-select
-//! routing in the Layers panel (`aurora_ui::layers_panel` has no
-//! pointer-click handling at all yet — this crate has never routed a
-//! pointer event to any panel); Eyedropper needs to sample a real pixel,
+//! "the active layer" a user can *change* — click-to-select routing now
+//! exists (`aurora_ui::layers_panel`'s own rows are real, clickable
+//! widgets, and `aurora_widgets::WidgetTree::hit_test` plus
+//! `aurora-app`'s own `select_layer` turn a click into "this is now the
+//! active layer") — but Move's own drag-to-reposition-bounds logic still
+//! isn't built on top of it; Eyedropper needs to sample a real pixel,
 //! which is real now (`aurora_tile::TileStore`, ADR 0010) but has no
 //! sampling function built yet. Both are real, selectable tool variants
 //! — so a user (or test) can switch to them — but their pointer handling
@@ -32,8 +34,8 @@ use aurora_core::Rect;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tool {
     /// Repositions a layer's bounds. **Not wired yet** — see this
-    /// module's own doc comment (needs an active-layer selection this
-    /// crate doesn't have).
+    /// module's own doc comment (active-layer selection now exists;
+    /// Move's own drag-to-reposition logic on top of it doesn't).
     Move,
     /// Drags out a rectangular selection ([`aurora_doc::SelectionSet`]).
     /// The only tool with real, working pointer logic so far —
