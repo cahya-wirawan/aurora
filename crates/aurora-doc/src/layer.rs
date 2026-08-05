@@ -24,7 +24,7 @@ pub type LayerId = Id<Layer>;
 /// `aurora-core`/`aurora-tile`/`aurora-graph` (PRD §7.2), not
 /// `aurora-text`, `aurora-vector`, `aurora-filters`, or `aurora-ai`. This
 /// is the honest current scope, not a deliberately narrowed one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LayerKind {
     /// Raw pixel content, positioned at `bounds` in document space.
     /// Deliberately does not yet own an `aurora_tile::TileStore` —
@@ -56,7 +56,7 @@ impl LayerKind {
 /// interprets this value the same way `TileCompositor`'s caller will
 /// eventually supply an opacity/blend-mode parameter it doesn't have yet
 /// (see `aurora-render`'s M1.3 notes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
     #[default]
     Normal,
@@ -96,7 +96,7 @@ pub enum BlendMode {
 /// move tool exists to refuse), the same "data now, enforcement once a
 /// concrete consumer exists" shape `LayerKind::Pixel`'s `bounds` already
 /// has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct LayerLock {
     pub transparency: bool,
     pub pixels: bool,
@@ -147,7 +147,7 @@ impl LayerLock {
 /// yet (`spike/psd-write/FINDINGS.md`: masks are still unspiked). `enabled`
 /// and `inverted` are the two toggles the modern UI actually exposes
 /// (shift-click a mask thumbnail to disable; Ctrl/Cmd+I to invert).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LayerMask {
     pub bounds: Rect,
     pub enabled: bool,
@@ -158,7 +158,7 @@ pub struct LayerMask {
 ///
 /// `Clone`: needed by [`crate::tree::RemovedSubtree`]'s own `Clone` impl,
 /// in turn needed by [`crate::History`]'s in-memory journal.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LayerEntry {
     pub(crate) name: String,
     pub(crate) parent: Option<LayerId>,

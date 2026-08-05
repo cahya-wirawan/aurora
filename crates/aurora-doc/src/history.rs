@@ -52,7 +52,7 @@ use crate::tree::{LayerTree, RemovedSubtree};
 ///
 /// `Clone`: the journal needs its own independent copy of each op (the
 /// stacks' copies get consumed by [`apply`]).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum LayerOp {
     /// Remove `LayerId` (capturing it fresh at apply time, which becomes
     /// the paired [`LayerOp::Restore`] pushed onto the other stack). The
@@ -401,6 +401,61 @@ impl History {
             apply(&mut tree, op)?;
         }
         Ok(tree)
+    }
+
+    /// Serializes this history's own journal — via `postcard`, ADR
+    /// 0009's own decision for `.aur`'s manifest/history encoding — the
+    /// on-disk encoding this crate's own doc comment named as the
+    /// missing piece of crash-recovery persistence. Deliberately just
+    /// the journal, not the undo/redo stacks: [`Self::replay`]'s own
+    /// doc comment already proves the journal alone is a sufficient,
+    /// order-correct record of *current* state, and a crash doesn't
+    /// need to preserve exactly how many times the user pressed undo
+    /// along the way.
+    ///
+    /// **Scope, stated honestly**: this returns plain `postcard` bytes,
+    /// not a full `.aur` file — ADR 0009's real ZIP container (with a
+    /// `mimetype` sentinel, a manifest, and per-tile entries) has
+    /// nothing else to hold yet (no layer owns real pixel storage, and
+    /// there is no document-level manifest beyond what the journal
+    /// itself already encodes), so wrapping one entry in a container
+    /// with no siblings would be premature scaffolding. Building the
+    /// real container is separate, follow-on work for whenever a
+    /// manifest/tile data exist to go alongside this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::JournalSerialization`] if `postcard` itself
+    /// fails — not expected for this crate's own, entirely
+    /// serializable `LayerOp` shape, but a real, checked possibility
+    /// rather than an assumption.
+    pub fn save_journal(&self) -> Result<Vec<u8>, DocError> {
+        postcard::to_allocvec(&self.journal)
+            .map_err(|source| DocError::JournalSerialization(source.to_string()))
+    }
+
+    /// Reconstructs a `History` from a journal previously produced by
+    /// [`Self::save_journal`]. The undo/redo stacks start empty — the
+    /// same "can't undo past the recovery point" behaviour real
+    /// applications already have after crash recovery — with the
+    /// recovered journal itself intact for [`Self::replay`]/
+    /// [`Self::journal_descriptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::JournalDeserialization`] if `bytes` isn't a
+    /// valid, `postcard`-encoded journal (e.g. corrupted, truncated, or
+    /// from an incompatible future version — see ADR 0009's own
+    /// forward-compatibility policy for the container format this will
+    /// eventually be embedded in).
+    pub fn load_journal(bytes: &[u8]) -> Result<Self, DocError> {
+        let journal: Vec<LayerOp> = postcard::from_bytes(bytes)
+            .map_err(|source| DocError::JournalDeserialization(source.to_string()))?;
+        Ok(Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            journal,
+        })
     }
 
     fn push(&mut self, op: LayerOp) {
@@ -1543,5 +1598,121 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert!(tree.contains(b));
+    }
+
+    // -- save_journal / load_journal (ADR 0009) --
+
+    #[test]
+    fn save_then_load_journal_round_trips_journal_len_and_descriptions() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_blend_mode(&mut tree, id, BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+
+        let bytes = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let recovered = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        assert_eq!(recovered.journal_len(), history.journal_len());
+        assert_eq!(
+            recovered.journal_descriptions(),
+            history.journal_descriptions()
+        );
+    }
+
+    #[test]
+    fn load_journal_replays_into_the_same_tree_shape_as_the_original() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_opacity(&mut tree, id, 0.5) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.add_mask(&mut tree, id, other_bounds()) {
+            unreachable!("{err:?}");
+        }
+
+        let bytes = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let recovered = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let replayed = match recovered.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        assert!(replayed.contains(id));
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(replayed.opacity(id), Some(0.5));
+        }
+        let Some(mask) = replayed.mask(id) else {
+            unreachable!("mask must survive save_journal/load_journal/replay");
+        };
+        assert_eq!(mask.bounds, other_bounds());
+    }
+
+    #[test]
+    fn load_journal_starts_with_empty_undo_redo_stacks() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        if let Err(err) = history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        assert!(history.can_undo(), "sanity check: the original can undo");
+
+        let bytes = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let recovered = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        assert!(
+            !recovered.can_undo(),
+            "recovery cannot undo past the point it recovered from"
+        );
+        assert!(!recovered.can_redo());
+    }
+
+    #[test]
+    fn load_journal_rejects_garbage() {
+        match History::load_journal(b"not a real journal") {
+            Err(DocError::JournalDeserialization(_)) => {}
+            other => unreachable!("expected JournalDeserialization, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_journal_of_an_empty_history_round_trips_to_an_empty_journal() {
+        let history = History::new();
+        let bytes = match history.save_journal() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let recovered = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(recovered.journal_len(), 0);
     }
 }

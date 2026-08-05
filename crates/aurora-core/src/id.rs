@@ -70,6 +70,28 @@ impl<T> fmt::Debug for Id<T> {
     }
 }
 
+/// Hand-implemented, not derived, for the same reason as the traits
+/// above: `#[derive(Serialize)]` on a type generic over `T` would add a
+/// `T: Serialize` bound even though `T` is never actually serialized
+/// (only named via `PhantomData`) — wrongly forcing every marker type to
+/// implement a trait it has no reason to. Serializes as the plain `u64`
+/// it is underneath; the type tag exists only at compile time, so there
+/// is nothing else to carry across a serialization boundary. First real
+/// consumer: `aurora_doc::History::save_journal` (ADR 0009).
+impl<T> serde::Serialize for Id<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(self.value)
+    }
+}
+
+/// Hand-written for the same reason `Serialize` above is.
+impl<'de, T> serde::Deserialize<'de> for Id<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u64::deserialize(deserializer)?;
+        Ok(Self::from_raw(value))
+    }
+}
+
 /// Generates process-local, monotonically increasing [`Id`]s for one
 /// marker type `T`.
 ///

@@ -32,7 +32,7 @@ use crate::layer::{BlendMode, Layer, LayerEntry, LayerId, LayerKind, LayerLock, 
 /// for [`crate::History::replay`]'s later use) — see that type's own doc
 /// comment for why replaying it back into a *disk file* is a separate,
 /// not-yet-built piece.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RemovedSubtree {
     pub(crate) root: LayerId,
     pub(crate) parent: Option<LayerId>,

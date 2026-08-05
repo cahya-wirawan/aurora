@@ -81,15 +81,24 @@
 //! `translate_modifiers` touch real `winit::keyboard` types, and those
 //! are plain data, constructible with no window either.
 //!
-//! **Crash recovery, narrowly scoped and honest about it**: `run` writes
-//! a small marker file (`std::env::temp_dir()`) at startup and clears it
-//! on a clean `WindowEvent::CloseRequested` shutdown; if a *previous*
-//! run's marker is still there, this run shows a real, modal
+//! **Crash recovery and autosave** (PLAN.md M1.9): `run` writes a small
+//! marker file (`std::env::temp_dir()`) at startup and clears it on a
+//! clean `WindowEvent::CloseRequested` shutdown; if a *previous* run's
+//! marker is still there, this run shows a real, modal
 //! `Role::AlertDialog` (`aurora_widgets::widgets::dialog`) saying so.
-//! What it deliberately does **not** do is restore any document state —
-//! `aurora-doc`'s own crash-recovery journal has no on-disk encoding
-//! decided yet (see that crate's M1.4 notes), so the dialog's one action
-//! is "Continue," not "Recover Document." See this module's own "crash
+//! Document recovery is now real, not just detected: `aurora-doc`'s
+//! `History::save_journal`/`load_journal` (ADR 0009) give this crate an
+//! on-disk journal encoding to write and read, so `App::new` writes the
+//! current document's journal to a second small file
+//! (`std::env::temp_dir()` again) every startup, and — if a previous
+//! run's marker is there *and* that autosave file parses and replays —
+//! opens with the recovered document instead of the fake demo one.
+//! **Scope, stated honestly**: still just one dialog action ("Continue"
+//! — its message changes depending on whether recovery actually
+//! happened), because recovery itself is unconditional and automatic
+//! rather than a user choice, and autosave is written once at startup,
+//! not on a repeating timer or after edits, since there is no live
+//! editing loop yet to re-trigger it from. See this module's own "crash
 //! recovery" section for the full reasoning.
 //!
 //! **Human-verified on macOS, 2026-08-03** (real hardware, real desktop
@@ -225,26 +234,33 @@ fn demo_document() -> (aurora_doc::LayerTree, aurora_doc::History) {
     (layers, history)
 }
 
-// -- Crash recovery: an unclosed-session marker on disk --
+// -- Crash recovery: an unclosed-session marker, plus a real autosave --
 //
-// PLAN.md M1.8's "crash recovery UI" bullet. Deliberately narrow: this
-// detects whether the *previous* run reached its own clean-shutdown
-// step — a real, useful signal on its own — but does **not** restore
-// any actual document state. `aurora-doc`'s crash-recovery journal only
-// has its in-memory half built so far (`History::replay`); durable
-// on-disk persistence is deliberately deferred there because no on-disk
-// encoding for `LayerOp`'s recursive shape has been decided yet (see
-// that crate's own M1.4 notes) — inventing one here, as a side effect of
-// this bullet, would be exactly the kind of forced-without-evidence
-// format decision `spike/raw-icc/FINDINGS.md` already warned against
-// once. So the dialog below is honest about what it can and can't do:
-// its one action is "Continue," not "Recover Document."
+// PLAN.md M1.8's "crash recovery UI" bullet detected whether the
+// *previous* run reached its own clean-shutdown step, but couldn't
+// restore any actual document state: `aurora-doc`'s crash-recovery
+// journal only had its in-memory half built (`History::replay`) — no
+// on-disk encoding for `LayerOp`'s recursive shape had been decided yet.
+// PLAN.md M1.9's "autosave and recovery" bullet closes that gap: ADR
+// 0009 picked `postcard` for `.aur`'s manifest/history encoding, and
+// `History::save_journal`/`load_journal` now use it. So this section now
+// does two things: writes the current document's journal to a small
+// autosave file every startup ([`write_autosave`]), and — if a previous
+// run's marker is present — tries to read that file back and replay it
+// ([`recover_document`]), falling back to the fake demo document if
+// there's nothing to recover or it doesn't parse.
 //
-// The marker itself lives in `std::env::temp_dir()` under a fixed name
-// — deliberately not a proper per-platform app-support directory (no
-// `directories`-style crate is a dependency yet), since a boolean marker
-// doesn't need one; a real location decision belongs together with the
-// actual journal's, once that exists.
+// Still deliberately narrow: recovery is unconditional (there is no
+// "Recover Document" vs. "Discard" choice — the dialog just reports
+// what already happened), and autosave is written once at startup, not
+// on a repeating timer or after edits, since there is no live editing
+// loop yet to re-trigger it. A real `.aur` file (ADR 0009's ZIP
+// container, with a manifest and tile data) is separate follow-on work
+// — there's still nothing but the journal to put in one.
+//
+// Both the marker and the autosave file live in `std::env::temp_dir()`
+// under fixed names — deliberately not a proper per-platform app-support
+// directory (no `directories`-style crate is a dependency yet).
 
 /// Where this run's own "I'm still running" marker lives.
 fn marker_path() -> PathBuf {
@@ -282,12 +298,82 @@ fn clear_session_marker(path: &Path) {
     }
 }
 
+/// Where this run's own autosave journal lives — analogous to
+/// [`marker_path`], and for the same reason not a proper per-platform
+/// app-support directory yet.
+fn autosave_path() -> PathBuf {
+    std::env::temp_dir().join("aurora-autosave.postcard")
+}
+
+/// Writes `history`'s journal to `path` — call once, early, the same
+/// "errors are logged, not fatal" shape [`write_session_marker`] already
+/// uses: failing to autosave must never stop the application starting.
+fn write_autosave(path: &Path, history: &aurora_doc::History) {
+    match history.save_journal() {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(path, bytes) {
+                tracing::warn!(?err, path = %path.display(), "failed to write the autosave journal");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(?err, "failed to serialize the autosave journal");
+        }
+    }
+}
+
+/// Reads and replays the autosave journal at `path`, if one is present
+/// and usable. Returns `None` — not an error — for anything that keeps
+/// this from producing a usable document (no file, unreadable bytes, a
+/// journal `postcard` can't parse, or a journal that fails to replay):
+/// a missing or corrupt autosave means falling back to
+/// [`demo_document`], not failing to start.
+fn recover_document(path: &Path) -> Option<(aurora_doc::LayerTree, aurora_doc::History)> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(?err, path = %path.display(), "failed to read the autosave journal");
+            }
+            return None;
+        }
+    };
+    let history = match aurora_doc::History::load_journal(&bytes) {
+        Ok(history) => history,
+        Err(err) => {
+            tracing::warn!(?err, "failed to deserialize the autosave journal");
+            return None;
+        }
+    };
+    let layers = match history.replay() {
+        Ok(layers) => layers,
+        Err(err) => {
+            tracing::warn!(?err, "failed to replay the recovered autosave journal");
+            return None;
+        }
+    };
+    Some((layers, history))
+}
+
 const CRASH_RECOVERY_CONTINUE: &str = "recovery.continue";
 
-/// The crash-recovery dialog's own, honest content — see this section's
-/// own doc comment for why "Continue" and not "Recover Document."
+/// The crash-recovery dialog's own, honest content — a single "Continue"
+/// action either way (see this section's own doc comment for why there
+/// is no separate "Recover Document" choice); only the message differs.
 fn crash_recovery_dialog_actions() -> Vec<DialogAction> {
     vec![DialogAction::new(CRASH_RECOVERY_CONTINUE, "Continue")]
+}
+
+/// The crash-recovery dialog's message — reports whether [`recover_document`]
+/// actually found and replayed a usable autosave, since that's the one
+/// thing that changed since the previous (M1.8) version of this dialog.
+fn crash_recovery_dialog_message(recovered: bool) -> &'static str {
+    if recovered {
+        "The previous session didn't shut down cleanly. Its autosaved \
+         document was recovered and is now open."
+    } else {
+        "The previous session didn't shut down cleanly, and no autosaved \
+         document could be recovered. This is a fresh document."
+    }
 }
 
 /// Opens the crash-recovery dialog (a no-op if one is already open):
@@ -298,6 +384,7 @@ fn open_crash_recovery_dialog(
     focus: &mut FocusManager,
     dialog: &mut Option<DialogHandle>,
     scales: &Scales,
+    recovered: bool,
 ) {
     if dialog.is_some() {
         return;
@@ -307,8 +394,7 @@ fn open_crash_recovery_dialog(
         workspace.root,
         scales,
         "Aurora Didn't Close Properly",
-        "The previous session didn't shut down cleanly. Document recovery \
-         isn't available yet, but this is recorded so it can be added later.",
+        crash_recovery_dialog_message(recovered),
         crash_recovery_dialog_actions(),
     ) {
         Ok(handle) => handle,
@@ -1046,9 +1132,19 @@ impl App {
         scales: &Scales,
         marker_path: PathBuf,
         had_previous_marker: bool,
+        autosave_path: &Path,
     ) -> Self {
         let mut workspace = aurora_ui::build_workspace();
-        let (layers, history) = demo_document();
+        // Only even try reading an autosave if the previous run left a
+        // marker behind -- a clean shutdown never needs its own autosave
+        // read back, and skipping the attempt means an autosave file left
+        // over from a much older, already-recovered-from crash can't
+        // resurface later.
+        let recovered = had_previous_marker
+            .then(|| recover_document(autosave_path))
+            .flatten();
+        let was_recovered = recovered.is_some();
+        let (layers, history) = recovered.unwrap_or_else(demo_document);
         if let Err(err) =
             aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, &layers)
         {
@@ -1059,6 +1155,11 @@ impl App {
         {
             unreachable!("workspace.history was just built by build_workspace above: {err:?}");
         }
+        // Written unconditionally, whether this session opened the demo
+        // document or a recovered one -- either way, it's the current
+        // document, and is what the *next* run should recover to if this
+        // one doesn't shut down cleanly.
+        write_autosave(autosave_path, &history);
 
         let mut focus = FocusManager::default();
         let mut crash_recovery_dialog = None;
@@ -1068,6 +1169,7 @@ impl App {
                 &mut focus,
                 &mut crash_recovery_dialog,
                 scales,
+                was_recovered,
             );
         }
 
@@ -1454,6 +1556,7 @@ pub fn run() -> anyhow::Result<()> {
     // *previous* run crashed.
     let had_previous_marker = previous_session_left_a_marker(&marker_path);
     write_session_marker(&marker_path);
+    let autosave_path = autosave_path();
 
     let event_loop = EventLoop::<accesskit_winit::Event>::with_user_event()
         .build()
@@ -1461,7 +1564,14 @@ pub fn run() -> anyhow::Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    let mut app = App::new(proxy, background, &scales, marker_path, had_previous_marker);
+    let mut app = App::new(
+        proxy,
+        background,
+        &scales,
+        marker_path,
+        had_previous_marker,
+        &autosave_path,
+    );
     event_loop
         .run_app(&mut app)
         .map_err(|err| anyhow::anyhow!("event loop run failed: {err}"))?;
@@ -1478,12 +1588,13 @@ mod tests {
     use super::{
         AppCommand, COMMAND_FILE_OPEN, COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS,
         COMMAND_FOCUS_PROPERTIES, CRASH_RECOVERY_CONTINUE, ClipboardAccess, FileDialogAccess, Key,
-        KeyChord, Modifiers, NamedKey, activate_command, clear_session_marker,
-        close_command_palette, close_crash_recovery_dialog, default_shortcuts, demo_document,
-        handle_dialog_key, handle_key, handle_palette_key, load_background_color, load_scales,
-        logical_size, open_command_palette, open_crash_recovery_dialog,
-        previous_session_left_a_marker, run_command, toggle_command_palette, translate_key,
-        translate_modifiers, write_session_marker,
+        KeyChord, Modifiers, NamedKey, activate_command, autosave_path, clear_session_marker,
+        close_command_palette, close_crash_recovery_dialog, crash_recovery_dialog_message,
+        default_shortcuts, demo_document, handle_dialog_key, handle_key, handle_palette_key,
+        load_background_color, load_scales, logical_size, open_command_palette,
+        open_crash_recovery_dialog, previous_session_left_a_marker, recover_document, run_command,
+        toggle_command_palette, translate_key, translate_modifiers, write_autosave,
+        write_session_marker,
     };
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
@@ -2342,6 +2453,64 @@ mod tests {
     }
 
     #[test]
+    fn autosave_path_and_marker_path_are_distinct() {
+        // Both live under `std::env::temp_dir()` -- must not collide with
+        // each other or overwrite the wrong file.
+        assert_ne!(autosave_path(), super::marker_path());
+    }
+
+    #[test]
+    fn recovering_a_missing_autosave_returns_none() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.postcard");
+        assert!(recover_document(&path).is_none());
+    }
+
+    #[test]
+    fn recovering_garbage_bytes_returns_none() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.postcard");
+        if let Err(err) = std::fs::write(&path, b"not a postcard journal") {
+            unreachable!("{err}");
+        }
+        assert!(recover_document(&path).is_none());
+    }
+
+    #[test]
+    fn writing_then_recovering_an_autosave_round_trips_the_same_journal_descriptions() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.postcard");
+        let (_layers, history) = demo_document();
+        let original_descriptions = history.journal_descriptions();
+
+        write_autosave(&path, &history);
+        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
+            unreachable!("just wrote a real autosave");
+        };
+        assert_eq!(
+            recovered_history.journal_descriptions(),
+            original_descriptions
+        );
+    }
+
+    #[test]
+    fn crash_recovery_dialog_message_differs_by_whether_recovery_happened() {
+        assert_ne!(
+            crash_recovery_dialog_message(true),
+            crash_recovery_dialog_message(false)
+        );
+    }
+
+    #[test]
     fn open_crash_recovery_dialog_focuses_its_only_action() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
@@ -2350,7 +2519,7 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err}"),
         };
-        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
 
         let Some(handle) = dialog else {
             unreachable!("must open");
@@ -2379,9 +2548,9 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err}"),
         };
-        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
         let first = dialog.clone();
-        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
         assert_eq!(dialog, first, "already open must not reopen or replace it");
     }
 
@@ -2394,7 +2563,7 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err}"),
         };
-        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
         let Some(handle) = dialog.clone() else {
             unreachable!("just opened");
         };
@@ -2420,7 +2589,7 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err}"),
         };
-        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
 
         handle_dialog_key(
             &mut workspace,
@@ -2458,7 +2627,7 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err}"),
         };
-        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales);
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
         handle_key(

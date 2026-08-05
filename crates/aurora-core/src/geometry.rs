@@ -65,7 +65,11 @@ impl Size {
 /// `x`/`y` are signed: a layer's bounds can sit partially or fully outside
 /// the canvas (moved off-edge, mid-transform) — unlike a document's own
 /// extent ([`Size`]), which always starts at the origin.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize`: a layer's own `bounds` (`LayerKind::Pixel`)
+/// and mask bounds travel through `aurora_doc::History::save_journal`
+/// (ADR 0009's `.aur` journal encoding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: i64,
     pub y: i64,

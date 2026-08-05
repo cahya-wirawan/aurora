@@ -53,4 +53,15 @@ pub enum DocError {
     /// never saved (or was already deleted).
     #[error("no selection saved under {0:?}")]
     UnknownSavedSelection(String),
+    /// [`crate::History::save_journal`] failed. `postcard`'s own error
+    /// type carries no useful structure for a caller to match on, so
+    /// this holds its rendered message (via `to_string`) rather than
+    /// the error value itself, avoiding a `postcard` dependency leaking
+    /// into every downstream crate's own error-handling `match`.
+    #[error("failed to serialize the crash-recovery journal: {0}")]
+    JournalSerialization(String),
+    /// [`crate::History::load_journal`] failed — the bytes weren't a
+    /// valid, `postcard`-encoded journal.
+    #[error("failed to deserialize the crash-recovery journal: {0}")]
+    JournalDeserialization(String),
 }
