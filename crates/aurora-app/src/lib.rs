@@ -476,18 +476,20 @@ fn handle_dialog_key(
 /// One command this crate's own keyboard shortcuts and command-palette
 /// entries can name. Deliberately small: `FocusNext`/`FocusPrevious` are
 /// the first time `aurora_widgets::FocusManager` (built in M1.7, never
-/// wired to a real key event until now) actually reaches a keyboard, and
+/// wired to a real key event until now) actually reaches a keyboard,
 /// `ToggleCommandPalette` is the one entry point into the palette
-/// itself. More commands (undo/redo, save, tool switches) are real,
-/// separate follow-on work once this crate has real actions for them to
-/// invoke — inventing placeholder commands with nothing behind them
-/// would be exactly the kind of half-finished feature CLAUDE.md warns
-/// against.
+/// itself, and `SelectTool` switches `App`'s own active
+/// `aurora_ui::Tool` (PLAN.md M1.9's "basic tools" bullet). More
+/// commands (undo/redo, save) are real, separate follow-on work once
+/// this crate has real actions for them to invoke — inventing
+/// placeholder commands with nothing behind them would be exactly the
+/// kind of half-finished feature CLAUDE.md warns against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppCommand {
     FocusNext,
     FocusPrevious,
     ToggleCommandPalette,
+    SelectTool(aurora_ui::Tool),
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -500,6 +502,18 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         ("Tab", AppCommand::FocusNext),
         ("Shift+Tab", AppCommand::FocusPrevious),
         ("Ctrl+Shift+P", AppCommand::ToggleCommandPalette),
+        // Tool-switch letters match Photoshop's own single-key bindings
+        // (no modifier) -- the same convention this project's target
+        // users already carry in muscle memory. Bound even for Move/
+        // Eyedropper, which don't do anything yet once selected (see
+        // `aurora_ui::tool`'s own doc comment) -- switching *to* one is
+        // still real, honest behaviour; only its own pointer handling is
+        // the still-open part.
+        ("v", AppCommand::SelectTool(aurora_ui::Tool::Move)),
+        ("m", AppCommand::SelectTool(aurora_ui::Tool::MarqueeSelect)),
+        ("z", AppCommand::SelectTool(aurora_ui::Tool::Zoom)),
+        ("h", AppCommand::SelectTool(aurora_ui::Tool::Pan)),
+        ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
     ];
     let mut registry = ShortcutRegistry::new();
     for (source, command) in bindings {
@@ -807,6 +821,7 @@ fn run_command(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     palette: &mut Option<WidgetId>,
+    tool: &mut aurora_ui::Tool,
     command: AppCommand,
 ) {
     match command {
@@ -817,6 +832,7 @@ fn run_command(
             focus.focus_previous(&mut workspace.tree);
         }
         AppCommand::ToggleCommandPalette => toggle_command_palette(workspace, focus, palette),
+        AppCommand::SelectTool(selected) => *tool = selected,
     }
 }
 
@@ -919,9 +935,10 @@ fn handle_palette_key(
 /// alert blocks everything else, including the palette; otherwise the
 /// command palette owns it while open ([`handle_palette_key`]);
 /// otherwise a chord that resolves in `shortcuts` runs its command
-/// ([`run_command`]). Anything else (an unbound chord, with nothing
-/// modal open) is silently ignored — there's no text field or canvas
-/// tool to fall back to routing into yet.
+/// ([`run_command`], which is also where a tool-switch shortcut updates
+/// `tool`). Anything else (an unbound chord, with nothing modal open) is
+/// silently ignored — there's no text field to fall back to routing
+/// into yet.
 ///
 /// Returns `Some(path)` only in the one case no pure `WidgetTree`
 /// mutation can finish on its own: the palette's `Open File…` command
@@ -935,6 +952,7 @@ fn handle_key(
     focus: &mut FocusManager,
     dialog: &mut Option<DialogHandle>,
     palette: &mut Option<WidgetId>,
+    tool: &mut aurora_ui::Tool,
     shortcuts: &ShortcutRegistry<AppCommand>,
     modifiers: Modifiers,
     key: Key,
@@ -959,7 +977,7 @@ fn handle_key(
         );
     }
     if let Some(&command) = shortcuts.resolve(chord) {
-        run_command(workspace, focus, palette, command);
+        run_command(workspace, focus, palette, tool, command);
     }
     None
 }
@@ -1471,6 +1489,7 @@ impl App {
             &mut self.focus,
             &mut self.crash_recovery_dialog,
             &mut self.command_palette,
+            &mut self.tool,
             &self.shortcuts,
             self.modifiers,
             key,
@@ -2170,11 +2189,13 @@ mod tests {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut palette = None;
+        let mut tool = Tool::default();
 
         run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
+            &mut tool,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.layers.root));
@@ -2182,6 +2203,7 @@ mod tests {
             &mut workspace,
             &mut focus,
             &mut palette,
+            &mut tool,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.properties.root));
@@ -2189,6 +2211,7 @@ mod tests {
             &mut workspace,
             &mut focus,
             &mut palette,
+            &mut tool,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.history.root));
@@ -2197,6 +2220,7 @@ mod tests {
             &mut workspace,
             &mut focus,
             &mut palette,
+            &mut tool,
             AppCommand::FocusPrevious,
         );
         assert_eq!(
@@ -2204,6 +2228,23 @@ mod tests {
             Some(workspace.properties.root),
             "Shift+Tab must step backward through the same order"
         );
+    }
+
+    #[test]
+    fn run_command_select_tool_switches_the_active_tool() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            AppCommand::SelectTool(Tool::Pan),
+        );
+        assert_eq!(tool, Tool::Pan);
     }
 
     #[test]
@@ -2349,12 +2390,14 @@ mod tests {
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
+        let mut tool = Tool::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
             &mut focus,
             &mut dialog,
             &mut palette,
+            &mut tool,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Tab),
@@ -2366,26 +2409,55 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_ignores_an_unbound_chord() {
+    fn handle_key_routes_a_tool_letter_to_select_tool_when_the_palette_is_closed() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
+        let mut tool = Tool::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
             &mut focus,
             &mut dialog,
             &mut palette,
+            &mut tool,
             &shortcuts,
             Modifiers::none(),
-            Key::Character('z'),
-            Some("z"),
+            Key::Character('h'),
+            Some("h"),
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
+        );
+        assert_eq!(tool, Tool::Pan);
+    }
+
+    #[test]
+    fn handle_key_ignores_an_unbound_chord() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let shortcuts = default_shortcuts();
+        // 'q' is deliberately not one of `default_shortcuts`' own
+        // tool-switch letters (v/m/z/h/i) or anything else bound.
+        handle_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &mut palette,
+            &mut tool,
+            &shortcuts,
+            Modifiers::none(),
+            Key::Character('q'),
+            Some("q"),
             &mut FakeClipboard::default(),
             &mut FakeFileDialog::default(),
         );
         assert_eq!(focus.focused(), None);
         assert_eq!(palette, None);
+        assert_eq!(tool, Tool::default(), "must not have switched tools");
     }
 
     #[test]
@@ -2394,6 +2466,7 @@ mod tests {
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
+        let mut tool = Tool::default();
         let shortcuts = default_shortcuts();
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
@@ -2405,6 +2478,7 @@ mod tests {
             &mut focus,
             &mut dialog,
             &mut palette,
+            &mut tool,
             &shortcuts,
             Modifiers::none(),
             Key::Character('p'),
@@ -2942,6 +3016,7 @@ mod tests {
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
+        let mut tool = Tool::default();
         let shortcuts = default_shortcuts();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -2955,6 +3030,7 @@ mod tests {
             &mut focus,
             &mut dialog,
             &mut palette,
+            &mut tool,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Escape),
