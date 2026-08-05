@@ -46,14 +46,16 @@
 //! `&mut dyn ClipboardAccess`/`&mut dyn FileDialogAccess` rather than
 //! calling them directly — the same "keep the pure dispatch logic
 //! testable, isolate the untestable platform call" seam `translate_key`/
-//! `translate_modifiers` already use for keyboard input. **Honest about
-//! its own limit**: a file chosen via "Open File…" *or* dropped onto the
-//! window is only recorded (`App::pending_open_path` — the same slot
-//! either route writes to, since both are the same "the user wants to
-//! open this" signal), not imported — `aurora-io` remains an empty
-//! skeleton (separate M1.9 work), the same "detect a real signal, defer
-//! the action" pattern this crate's own crash-recovery marker already
-//! uses.
+//! `translate_modifiers` already use for keyboard input. **A file
+//! chosen via "Open File…" *or* dropped onto the window is now really
+//! opened** (`App::open_file` — the same method either route calls,
+//! since both are the same "the user wants to open this" signal):
+//! `aurora_io::decode_by_extension` decodes it (PNG/JPEG/TIFF), and the
+//! current document is replaced by a fresh, single-layer one sized to
+//! the image, its own pixels written into the live tile store via
+//! `aurora_io::write_into_store` so the canvas actually shows it. A bad
+//! file (unreadable, undecodable, unrecognised extension) is logged and
+//! leaves the current document untouched.
 //!
 //! **DPI/scale-factor aware layout**: `logical_size` divides a real
 //! physical window size by `Window::scale_factor` before it reaches
@@ -288,6 +290,103 @@ fn demo_document() -> (aurora_doc::LayerTree, aurora_doc::History) {
     }
 
     (layers, history)
+}
+
+/// Builds a fresh, single-layer document from a decoded
+/// `aurora_io::Image` — the real "open a file" document construction
+/// [`Self::open_file`] needs, mirroring [`demo_document`]'s own shape
+/// (built through `History`, not `LayerTree` directly, so the journal
+/// stays a meaningful record for the History panel and autosave) but
+/// with exactly the one real layer the opened file actually has, sized
+/// to `image`'s own `width`/`height` at document-space `(0, 0)`.
+/// Returns the new layer's own id alongside the built tree/history —
+/// the caller needs it both to write `image`'s own pixels into the
+/// right tile-store surface and to set it as the new active layer.
+#[must_use]
+fn document_from_image(
+    name: impl Into<String>,
+    image: &aurora_io::Image,
+) -> (
+    aurora_doc::LayerTree,
+    aurora_doc::History,
+    aurora_doc::LayerId,
+) {
+    let bounds = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: image.width(),
+        height: image.height(),
+    };
+    let mut layers = aurora_doc::LayerTree::new();
+    let mut history = aurora_doc::History::new();
+    let id = match history.add_pixel_layer(&mut layers, name, bounds, None) {
+        Ok(id) => id,
+        Err(err) => unreachable!("a fresh tree with parent: None cannot fail: {err:?}"),
+    };
+    (layers, history, id)
+}
+
+/// Reads `path` from disk and decodes it via
+/// `aurora_io::decode_by_extension` — the real "open a file" read+decode
+/// step. `None` on any real failure (I/O, decode, unrecognised
+/// extension), logged as a warning rather than propagated: a bad chosen
+/// file must never crash or leave `App` in a half-updated state, the
+/// same honesty [`recover_document`] already applies to a bad autosave.
+#[must_use]
+fn open_image(path: &Path) -> Option<aurora_io::Image> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "failed to read the chosen file");
+            return None;
+        }
+    };
+    match aurora_io::decode_by_extension(path, &bytes) {
+        Ok(image) => Some(image),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "failed to decode the chosen file");
+            None
+        }
+    }
+}
+
+/// Clears and repopulates `workspace`'s Layers/History panels for a
+/// freshly opened, single-layer document built from `image` (named
+/// `name`, via [`document_from_image`]) — the real "replace the current
+/// document" step [`App::open_file`] needs. Returns the new
+/// `LayerTree`/`History`, the new layer's own id (the caller's new
+/// active layer), and the new `WidgetId -> LayerId` map
+/// (`aurora_ui::populate_layers_panel`'s own return value) — everything
+/// the caller assigns onto its own fields.
+///
+/// # Errors
+///
+/// Propagates [`aurora_widgets::WidgetError`] if clearing or
+/// repopulating either panel fails — structurally unreachable in
+/// practice (`workspace` is always a real `aurora_ui::build_workspace`
+/// with real panel bodies), but this function doesn't itself know that,
+/// so it reports rather than assumes.
+fn replace_document(
+    workspace: &mut aurora_ui::Workspace,
+    scales: &Scales,
+    name: &str,
+    image: &aurora_io::Image,
+) -> Result<
+    (
+        aurora_doc::LayerTree,
+        aurora_doc::History,
+        aurora_doc::LayerId,
+        HashMap<WidgetId, aurora_doc::LayerId>,
+    ),
+    aurora_widgets::WidgetError,
+> {
+    let (layers, history, layer_id) = document_from_image(name, image);
+    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.layers.body)?;
+    let layer_rows =
+        aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, &layers)?;
+    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body)?;
+    aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &history)?;
+    Ok((layers, history, layer_id, layer_rows))
 }
 
 // -- Crash recovery: an unclosed-session marker, plus a real autosave --
@@ -693,13 +792,9 @@ const COMMAND_FILE_OPEN: &str = "file.open";
 /// real, already-focusable panel region (see `aurora-ui`'s
 /// `insert_panel`), verifiable the same way any other focus change is
 /// (`push_accessibility`); `COMMAND_FILE_OPEN` shows a real, native
-/// `rfd::FileDialog`. **Honest about its own limit**: there is still no
-/// document-import pipeline (`aurora-io` remains an empty skeleton,
-/// separate M1.9 work), so a chosen path is only recorded
-/// (`App::pending_open_path`), the same "detect a real signal, defer
-/// the action" pattern this crate's own crash-recovery marker already
-/// uses. A richer command set (undo, save, tool switches) waits on
-/// those real actions existing.
+/// `rfd::FileDialog` and the chosen path is really opened
+/// (`App::open_file`). A richer command set (undo, save, tool switches)
+/// waits on those real actions existing.
 fn palette_commands() -> Vec<CommandEntry> {
     vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
@@ -1679,11 +1774,6 @@ struct App {
     /// The real native file picker — [`FileDialogAccess`]'s real
     /// implementation, used by [`COMMAND_FILE_OPEN`].
     file_dialog: SystemFileDialog,
-    /// The most recent path chosen via [`COMMAND_FILE_OPEN`], if any —
-    /// there is no document-import pipeline yet to hand it to (see
-    /// [`palette_commands`]'s own doc comment), so this is only ever
-    /// recorded and logged, ready for whenever that pipeline exists.
-    pending_open_path: Option<PathBuf>,
     /// PLAN.md M1.9's "basic tools" bullet — see `aurora_ui::tool`'s own
     /// doc comment for exactly which of the seven named tools (Move,
     /// Marquee Select, Zoom, Pan, Eyedropper, Brush, Eraser) actually do
@@ -1847,7 +1937,6 @@ impl App {
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
-            pending_open_path: None,
             tool: aurora_ui::Tool::default(),
             canvas_view: aurora_ui::CanvasView::default(),
             selection: aurora_doc::SelectionSet::new(),
@@ -1914,23 +2003,78 @@ impl App {
             &mut self.file_dialog,
         );
         if let Some(path) = picked {
-            tracing::info!(path = %path.display(), "file chosen (no import pipeline yet)");
-            self.pending_open_path = Some(path);
+            self.open_file(&path);
         }
         self.push_accessibility();
     }
 
-    /// Records a real, native `WindowEvent::DroppedFile` — the same
-    /// "detect a real signal, defer the action" honesty
-    /// [`COMMAND_FILE_OPEN`] already applies: there is no import
-    /// pipeline yet for a dropped path to feed into, so this only
-    /// records it (reusing the exact same [`Self::pending_open_path`]
-    /// slot the palette's "Open File…" command already writes to — a
-    /// dropped file and a chosen one are the same kind of "the user
-    /// wants to open this" signal, whichever route it arrived by).
-    fn handle_dropped_file(&mut self, path: PathBuf) {
-        tracing::info!(path = %path.display(), "file dropped (no import pipeline yet)");
-        self.pending_open_path = Some(path);
+    /// Opens a real, native `WindowEvent::DroppedFile` — the same
+    /// [`Self::open_file`] the palette's "Open File…" command uses, since
+    /// a dropped file and a chosen one are the same kind of "the user
+    /// wants to open this" signal, whichever route it arrived by.
+    fn handle_dropped_file(&mut self, path: &Path) {
+        self.open_file(path);
+    }
+
+    /// Opens `path` as a real document: reads and decodes it
+    /// ([`open_image`]) and, on success, replaces the current document
+    /// with a fresh, single-layer one sized to the image
+    /// ([`replace_document`]), writing the image's own pixels into the
+    /// live tile store (`aurora_io::write_into_store`) so the canvas
+    /// actually shows it. A read/decode failure (bad file, unrecognised
+    /// extension) is logged and leaves the current document completely
+    /// untouched — the same honesty [`recover_document`] already applies
+    /// to a bad autosave, extended here to a bad chosen file.
+    ///
+    /// Resets `canvas_view`/`selection`/`drag` to their own fresh-
+    /// session defaults — a newly opened document has no relationship
+    /// to whatever pan/zoom/selection/in-progress-drag the *previous*
+    /// one had.
+    fn open_file(&mut self, path: &Path) {
+        let Some(image) = open_image(path) else {
+            return;
+        };
+        let name = path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("Image");
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a document");
+                return;
+            }
+        };
+        let (layers, history, layer_id, layer_rows) =
+            match replace_document(&mut self.workspace, &scales, name, &image) {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        "failed to rebuild the workspace panels for the opened document"
+                    );
+                    return;
+                }
+            };
+
+        if let Some(store) = self.tile_store.as_mut()
+            && let Some(surface) = layers.surface_id(layer_id)
+            && let Err(err) = aurora_io::write_into_store(&image, store, surface)
+        {
+            tracing::warn!(
+                ?err,
+                "failed to write the opened image's pixels into the tile store"
+            );
+        }
+        write_autosave(&autosave_path(), &history);
+
+        self.layers = layers;
+        self.active_layer = Some(layer_id);
+        self.layer_rows = layer_rows;
+        self.canvas_view = aurora_ui::CanvasView::default();
+        self.selection = aurora_doc::SelectionSet::new();
+        self.drag = None;
+        self.push_accessibility();
     }
 
     /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
@@ -2019,9 +2163,8 @@ impl App {
     /// needs. A silent no-op if there's no live store
     /// ([`Self::tile_store`] failed to open), no active layer
     /// ([`Self::active_layer`] is `None`), or that layer isn't (or is no
-    /// longer) a pixel layer — the same "detect a real signal, do
-    /// nothing more" honesty `pending_open_path` already uses for an
-    /// unbuilt pipeline. A real, logged failure ([`aurora_tile::TileError`],
+    /// longer) a pixel layer — a real, absent precondition, not an
+    /// error worth logging on its own. A real, logged failure ([`aurora_tile::TileError`],
     /// e.g. the scratch disk failing mid-session) is worth a warning,
     /// though, unlike those absent-precondition cases.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
@@ -2105,8 +2248,7 @@ impl App {
             &mut self.file_dialog,
         );
         if let Some(path) = picked {
-            tracing::info!(path = %path.display(), "file chosen via native menu (no import pipeline yet)");
-            self.pending_open_path = Some(path);
+            self.open_file(&path);
         }
         self.push_accessibility();
     }
@@ -2372,7 +2514,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                     self.apply_resize((size.width, size.height));
                 }
             }
-            WindowEvent::DroppedFile(path) => self.handle_dropped_file(path),
+            WindowEvent::DroppedFile(path) => self.handle_dropped_file(&path),
             // No drop-target visual affordance exists yet (nothing
             // renders a pixel in this crate regardless of drag state),
             // so a hover just gets a debug-level trace -- there's
@@ -2492,14 +2634,14 @@ mod tests {
         Key, KeyChord, Modifiers, NamedKey, PointerButton, activate_command, apply_scroll_zoom,
         autosave_path, begin_drag, canvas_area_physical_rect, canvas_area_physical_size,
         clear_session_marker, close_command_palette, close_crash_recovery_dialog, continue_drag,
-        crash_recovery_dialog_message, default_shortcuts, demo_document, handle_dialog_key,
-        handle_key, handle_palette_key, handle_zoom_tool_click, layer_local_point,
-        load_background_color, load_scales, logical_point, logical_size, open_command_palette,
-        open_crash_recovery_dialog, open_tile_store, pointer_in_canvas,
-        previous_session_left_a_marker, recover_document, run_command, select_layer,
-        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, write_autosave,
-        write_session_marker, zoom_steps_for_scroll,
+        crash_recovery_dialog_message, default_shortcuts, demo_document, document_from_image,
+        handle_dialog_key, handle_key, handle_palette_key, handle_zoom_tool_click,
+        layer_local_point, load_background_color, load_scales, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        pointer_in_canvas, previous_session_left_a_marker, recover_document, replace_document,
+        run_command, select_layer, tile_origin_for_view, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, write_autosave, write_session_marker, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -2741,6 +2883,156 @@ mod tests {
                 "Added layer \"Retouch — skin\"".to_owned(),
             ]
         );
+    }
+
+    // -- opening a real file --
+    //
+    // PLAN.md M1.9's "no document-import pipeline" gap: `document_from_image`,
+    // `open_image`, and `replace_document` are the pure/near-pure pieces
+    // `App::open_file` composes -- each independently testable with no
+    // window/GPU/event-loop, the same seam every other dispatch function
+    // in this crate already uses.
+
+    /// A small, solid-colour `aurora_io::Image` -- a real, valid
+    /// decoded image these tests treat as if `png::decode` had just
+    /// produced it, without needing a real file on disk for tests that
+    /// don't care about the read/decode step itself.
+    fn fake_image(width: u32, height: u32) -> aurora_io::Image {
+        let samples: Vec<half::f16> = (0..width as usize * height as usize)
+            .flat_map(|_| [0.0, 1.0, 0.0, 1.0].map(half::f16::from_f32))
+            .collect();
+        match aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn document_from_image_sizes_the_new_layer_to_the_images_own_dimensions() {
+        let image = fake_image(640, 480);
+        let (layers, history, id) = document_from_image("photo", &image);
+
+        assert_eq!(layers.roots(), &[id]);
+        match layers.kind(id) {
+            Some(aurora_doc::LayerKind::Pixel { bounds }) => {
+                assert_eq!(
+                    *bounds,
+                    aurora_core::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 640,
+                        height: 480
+                    }
+                );
+            }
+            other => unreachable!("expected a pixel layer, got {other:?}"),
+        }
+        assert_eq!(
+            history.journal_descriptions(),
+            vec!["Added layer \"photo\"".to_owned()]
+        );
+    }
+
+    #[test]
+    fn open_image_reads_and_decodes_a_real_png_file() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let image = fake_image(4, 4);
+        let bytes = match aurora_io::png::encode(&image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("photo.png");
+        if let Err(err) = std::fs::write(&path, bytes) {
+            unreachable!("{err:?}");
+        }
+
+        let Some(decoded) = open_image(&path) else {
+            unreachable!("a real, freshly written PNG must decode");
+        };
+        assert_eq!(decoded.width(), 4);
+        assert_eq!(decoded.height(), 4);
+    }
+
+    #[test]
+    fn open_image_returns_none_for_a_path_that_does_not_exist() {
+        assert!(open_image(std::path::Path::new("/no/such/file.png")).is_none());
+    }
+
+    #[test]
+    fn open_image_returns_none_for_an_unsupported_extension() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let path = dir.path().join("document.psd");
+        if let Err(err) = std::fs::write(&path, b"whatever") {
+            unreachable!("{err:?}");
+        }
+        assert!(open_image(&path).is_none());
+    }
+
+    #[test]
+    fn replace_document_clears_the_old_rows_and_populates_exactly_the_new_layer() {
+        let mut workspace = aurora_ui::build_workspace();
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (old_layers, old_history) = demo_document();
+        if aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &old_layers,
+        )
+        .is_err()
+        {
+            unreachable!("a freshly built workspace's own panel body must accept this");
+        }
+        if aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &old_history)
+            .is_err()
+        {
+            unreachable!("a freshly built workspace's own panel body must accept this");
+        }
+        assert!(
+            workspace
+                .tree
+                .children(workspace.layers.body)
+                .unwrap_or(&[])
+                .len()
+                > 1,
+            "the demo document must have seeded more than one row"
+        );
+
+        let image = fake_image(8, 8);
+        let (new_layers, _history, layer_id, layer_rows) =
+            match replace_document(&mut workspace, &scales, "photo", &image) {
+                Ok(result) => result,
+                Err(err) => unreachable!("{err:?}"),
+            };
+
+        assert_eq!(
+            workspace
+                .tree
+                .children(workspace.layers.body)
+                .map(<[_]>::len),
+            Some(1),
+            "old demo rows must be gone, replaced by exactly the new layer's own row"
+        );
+        assert_eq!(
+            workspace
+                .tree
+                .children(workspace.history.body)
+                .map(<[_]>::len),
+            Some(1),
+            "old demo history rows must be gone too"
+        );
+        assert_eq!(new_layers.roots(), &[layer_id]);
+        assert_eq!(layer_rows.len(), 1);
+        assert_eq!(layer_rows.values().copied().next(), Some(layer_id));
     }
 
     // -- keyboard shortcuts and the command palette --
