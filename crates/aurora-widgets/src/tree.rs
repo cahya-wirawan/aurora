@@ -232,6 +232,39 @@ impl<W> WidgetTree<W> {
         self.nodes.get(&id).map(|node| node.bounds)
     }
 
+    /// The topmost widget whose current bounds contain `point`
+    /// (screen-space, same units [`Self::bounds`] reports), or `None` if
+    /// none does — the "what did the user actually click" query real
+    /// pointer input needs, this crate's first (this type has offered
+    /// `bounds` since M1.7, but nothing has needed the reverse direction
+    /// until now).
+    ///
+    /// Descends into `children` (paint order [`Self::children`] already
+    /// documents: first inserted to last) before considering a node's
+    /// own bounds a hit, and checks them in *reverse* order — the
+    /// last-painted child is topmost, the one a real click should prefer
+    /// when widgets overlap. A parent whose own bounds don't contain
+    /// `point` is not descended into at all, on the assumption
+    /// (already true of every widget this crate builds via flex layout)
+    /// that a child never paints outside its parent's own bounds.
+    #[must_use]
+    pub fn hit_test(&self, point: (f32, f32)) -> Option<WidgetId> {
+        self.hit_test_from(self.root, point)
+    }
+
+    fn hit_test_from(&self, id: WidgetId, point: (f32, f32)) -> Option<WidgetId> {
+        let node = self.nodes.get(&id)?;
+        if !bounds_contain(node.bounds, point) {
+            return None;
+        }
+        for &child in node.children.iter().rev() {
+            if let Some(hit) = self.hit_test_from(child, point) {
+                return Some(hit);
+            }
+        }
+        Some(id)
+    }
+
     /// # Errors
     ///
     /// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist.
@@ -503,6 +536,22 @@ impl<W> WidgetTree<W> {
             focus,
         }
     }
+}
+
+/// Half-open containment — `point` is inside `rect` if `rect.x <=
+/// point.x < rect.right()` (and the same for `y`) — matching
+/// `aurora_core::Rect::intersects`'s own convention (two rects only
+/// touching at a shared edge don't overlap).
+#[allow(clippy::cast_precision_loss)]
+fn bounds_contain(rect: Rect, point: (f32, f32)) -> bool {
+    let (x, y) = point;
+    let (left, top, right, bottom) = (
+        rect.x as f32,
+        rect.y as f32,
+        rect.right() as f32,
+        rect.bottom() as f32,
+    );
+    x >= left && y >= top && x < right && y < bottom
 }
 
 impl<W> std::fmt::Debug for WidgetTree<W> {
@@ -905,5 +954,91 @@ mod tests {
             Some(bounds(0, 0, 100, 100).union(&bounds(0, 0, 200, 200))),
             "resizing the root must dirty both the old and new region"
         );
+    }
+
+    #[test]
+    fn hit_test_finds_the_deepest_widget_containing_the_point() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        if let Err(err) = tree.set_bounds(root, bounds(0, 0, 100, 100)) {
+            unreachable!("{err:?}");
+        }
+        let child = match tree.insert(root, Style::default(), label("child"), "child") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(child, bounds(10, 10, 20, 20)) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.hit_test((15.0, 15.0)), Some(child));
+    }
+
+    #[test]
+    fn hit_test_falls_back_to_the_parent_when_no_child_matches() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        if let Err(err) = tree.set_bounds(root, bounds(0, 0, 100, 100)) {
+            unreachable!("{err:?}");
+        }
+        let child = match tree.insert(root, Style::default(), label("child"), "child") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(child, bounds(10, 10, 20, 20)) {
+            unreachable!("{err:?}");
+        }
+        // Inside root, outside child.
+        assert_eq!(tree.hit_test((50.0, 50.0)), Some(root));
+    }
+
+    #[test]
+    fn hit_test_returns_none_outside_every_widget() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        if let Err(err) = tree.set_bounds(root, bounds(0, 0, 100, 100)) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.hit_test((200.0, 200.0)), None);
+    }
+
+    #[test]
+    fn hit_test_prefers_the_last_painted_of_two_overlapping_children() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        if let Err(err) = tree.set_bounds(root, bounds(0, 0, 100, 100)) {
+            unreachable!("{err:?}");
+        }
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(a, bounds(0, 0, 50, 50)) {
+            unreachable!("{err:?}");
+        }
+        // Inserted after `a`, so later in paint order -- must win the
+        // same overlapping region.
+        let b = match tree.insert(root, Style::default(), label("b"), "b") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(b, bounds(0, 0, 50, 50)) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.hit_test((25.0, 25.0)), Some(b));
+    }
+
+    #[test]
+    fn hit_test_is_half_open_a_point_on_the_right_or_bottom_edge_is_outside() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        if let Err(err) = tree.set_bounds(root, bounds(0, 0, 10, 10)) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.hit_test((10.0, 5.0)),
+            None,
+            "exactly on the right edge"
+        );
+        assert_eq!(
+            tree.hit_test((5.0, 10.0)),
+            None,
+            "exactly on the bottom edge"
+        );
+        assert_eq!(tree.hit_test((9.999, 9.999)), Some(root), "just inside");
     }
 }
