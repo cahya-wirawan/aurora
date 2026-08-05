@@ -18,15 +18,16 @@
 //! **What this deliberately does not do: write a single pixel.**
 //! Invariant §7.3.5 sends brush input into a scratch layer, and there is
 //! no scratch layer to write to yet — `aurora_doc::LayerKind::Pixel`
-//! doesn't own a `TileStore` (one store per layer, or one shared store
-//! addressed some other way, is a real open resource-management
-//! question that crate's own doc comment has flagged, unresolved since
-//! M1.4). Deciding that is a real architecture decision (CLAUDE.md: "a
-//! design decision to raise, not a gap to fill locally"), not something
-//! to invent silently as a side effect of a basic-tools pass — so this
-//! module stops exactly at the boundary where that decision would be
-//! needed, the same place `aurora_ui::tool`'s Move/Eyedropper gap stops
-//! at "no active layer to move/sample."
+//! doesn't own any real pixel storage. That question is now *decided*
+//! ([ADR 0010](../../../docs/adr/0010-layer-pixel-storage.md): one
+//! shared `aurora_tile::TileStore` per document for real layers, plus a
+//! separate small store for the active stroke this module's own dabs
+//! would stamp into), but not yet *implemented* — `aurora-tile` doesn't
+//! have a `SurfaceId` type or the compound-key store API yet. This
+//! module stops exactly at that boundary; wiring `dabs_along_path`'s
+//! output into real dab-stamping is real, separate follow-on work, the
+//! same place `aurora_ui::tool`'s Move/Eyedropper gap stops at "no
+//! active layer to move/sample."
 
 /// Dab spacing as a fraction of brush radius — `spike/vertical-slice`'s
 /// own proven default (a dab every quarter-radius travelled).

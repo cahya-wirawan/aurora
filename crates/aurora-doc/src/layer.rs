@@ -27,13 +27,14 @@ pub type LayerId = Id<Layer>;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LayerKind {
     /// Raw pixel content, positioned at `bounds` in document space.
-    /// Deliberately does not yet own an `aurora_tile::TileStore` —
-    /// whether pixel storage is one store per layer (simple, but an
-    /// unlimited-layers document would mean an unlimited number of
-    /// background-writer threads, since `TileStore::new` spawns one) or
-    /// one shared store addressed some other way is a real resource-
-    /// management question this pass deliberately leaves open rather
-    /// than picking silently.
+    /// Deliberately does not yet own any real pixel storage — **decided**
+    /// (one shared `aurora_tile::TileStore` per document, addressed by a
+    /// `SurfaceId` reused from this layer's own `LayerId` — [ADR
+    /// 0010](../../../docs/adr/0010-layer-pixel-storage.md)), but not yet
+    /// *implemented*: this variant doesn't hold a `SurfaceId` field yet,
+    /// and neither `aurora-tile`'s `SurfaceId` type nor the shared
+    /// store's own compound-key API exist yet either. Real, separate
+    /// follow-on work, same as ADR 0010's own doc says.
     Pixel { bounds: Rect },
     /// A group containing other layers, top-to-bottom (index 0 is
     /// topmost — see [`crate::LayerTree`]'s own doc comment for the

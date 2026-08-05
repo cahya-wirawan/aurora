@@ -22,6 +22,7 @@ Each ADR records one decision that is expensive to reverse: what was decided, wh
 | [0007](0007-raw-library-libraw.md) | RAW decode library: LibRaw via FFI | Accepted |
 | [0008](0008-icc-library-lcms2.md) | ICC transform library: lcms2 via FFI | Accepted |
 | [0009](0009-aur-document-format.md) | `.aur` document format: ZIP container, `postcard` metadata, embedded tile codec | Accepted |
+| [0010](0010-layer-pixel-storage.md) | Layer pixel storage: one shared `TileStore` per document, addressed by surface | Accepted |
 
 ## Writing a new one
 
