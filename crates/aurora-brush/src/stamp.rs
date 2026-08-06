@@ -703,4 +703,69 @@ mod tests {
             "erasing surface_a must not have touched surface_b's own opaque pixel: {a:?}"
         );
     }
+
+    #[test]
+    fn stamp_dab_latency_stays_within_a_generous_ci_safe_budget() {
+        // spike/FINDINGS.md's own "Recommended follow-ups" #5: p99 stroke
+        // latency measured at 9.1 ms against a real 10 ms product budget
+        // on real hardware -- under 1 ms of margin -- with an explicit
+        // call to "add a latency regression test in CI ... do not assume
+        // this holds as the brush engine grows." This is that test.
+        //
+        // What it measures, and what it deliberately doesn't: only
+        // `stamp_dab`'s own CPU cost against an already-resident tile --
+        // the same "CPU compositing/stamping, not disk I/O" hot path the
+        // spike named as the real bottleneck -- isolated from GPU frame
+        // submission (no GPU exists at this layer) and from first-touch
+        // page-in cost (warmed up below; `aurora-tile`'s own benches
+        // already cover paging). The 10 ms *product* budget the spike
+        // measured covers the whole input-to-frame-submitted path across
+        // `aurora-gpu`/`aurora-app` too, not just this one call, so the
+        // threshold here is deliberately far more generous than 10 ms --
+        // wide enough to absorb a slow, shared CI runner (the real
+        // environment this test actually runs in, across
+        // `.github/workflows/ci.yml`'s own three-OS matrix) while still
+        // catching a genuine algorithmic regression, not a strict
+        // recreation of the spike's own end-to-end figure.
+        const SAMPLES: usize = 200;
+        // 20 ms: roughly 2x the real 10 ms *product* budget, and nowhere
+        // near the low-microsecond costs this call actually measures on
+        // real hardware (a 24 px dab touches ~2,300 texels in one tile)
+        // -- generous enough to absorb CI noise while still catching a
+        // real regression.
+        const BUDGET_MICROS: u128 = 20_000;
+
+        let (_dir, mut store) = store();
+        let center = (128.0, 128.0);
+        let radius = 24.0; // aurora-app's own BRUSH_RADIUS/ERASER_RADIUS.
+        let colour = [1.0, 0.0, 0.0];
+
+        // Warm-up: settle the one touched tile as resident before any
+        // timed iteration, so page-in cost (a separate, already-covered
+        // concern) doesn't leak into this measurement.
+        for _ in 0..8 {
+            if let Err(err) = stamp_dab(&mut store, surface(), center, radius, colour) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        let mut micros = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let start = std::time::Instant::now();
+            if let Err(err) = stamp_dab(&mut store, surface(), center, radius, colour) {
+                unreachable!("{err:?}");
+            }
+            micros.push(start.elapsed().as_micros());
+        }
+        micros.sort_unstable();
+        let Some(&p99) = micros.get(SAMPLES * 99 / 100) else {
+            unreachable!("SAMPLES * 99 / 100 is always in bounds for a SAMPLES-length vec");
+        };
+
+        assert!(
+            p99 <= BUDGET_MICROS,
+            "stamp_dab p99 latency regressed: {p99} \u{b5}s against a {BUDGET_MICROS} \u{b5}s \
+             budget (spike/FINDINGS.md's own real 10 ms product budget had under 1 ms of margin)"
+        );
+    }
 }
