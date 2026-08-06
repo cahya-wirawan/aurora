@@ -20,11 +20,19 @@
 //!   permanent format limit (65,535×65,535 px), not a library
 //!   shortcoming. [`encode`] checks this explicitly rather than
 //!   silently truncating a too-large [`Image`].
-//! - Colour space is always tagged sRGB, the same honest gap `png`'s
-//!   own module already documents: real JPEGs can carry ICC profiles
-//!   or an Adobe APP14 marker naming CMYK/YCCK; neither is read here.
-//! - Quality is a fixed constant for this first slice — a user-facing
-//!   quality control is real, separate follow-on work.
+//! - Colour space is always tagged sRGB — real JPEGs can carry ICC
+//!   profiles (a segmented `APP2` marker, unlike PNG/TIFF's own
+//!   single-chunk embedding) or an Adobe `APP14` marker naming
+//!   CMYK/YCCK; neither is read or written here — a bigger, separate,
+//!   per-format undertaking than the single-chunk case `png`/`tiff`
+//!   just closed, not attempted yet.
+//! - Quality is real, as of 2026-08-06 ([`encode_with_quality`]) — the
+//!   underlying `jpeg_encoder::Encoder` already takes it as a required
+//!   constructor parameter, so this needed no new capability, just a
+//!   real caller for one that already existed. [`encode`] still calls
+//!   it with a fixed `DEFAULT_QUALITY`: this crate has no user-facing
+//!   quality control (an export dialog with a slider) to drive
+//!   [`encode_with_quality`] with anything else yet.
 
 use aurora_color::{IccProfile, dither_quantize, promote_u8};
 use half::f16;
@@ -37,9 +45,9 @@ use zune_jpeg::zune_core::options::DecoderOptions;
 use crate::error::IoError;
 use crate::image::Image;
 
-/// A fixed, "visually near-lossless" default quality (0–100) — no
-/// user-facing quality control exists yet (real, separate follow-on
-/// work).
+/// [`encode`]'s own fixed, "visually near-lossless" quality (0–100) —
+/// see this module's own doc comment for why it's still a constant
+/// rather than something a caller chooses.
 const DEFAULT_QUALITY: u8 = 90;
 
 /// Decodes `bytes` (a whole JPEG file's own contents) into a real
@@ -80,18 +88,30 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
     )
 }
 
-/// Encodes `image` as a JPEG at `DEFAULT_QUALITY` — the export half
-/// of invariant §7.3.1b's 8-bit boundary, using [`dither_quantize`]
+/// Encodes `image` as a JPEG at `DEFAULT_QUALITY` — see
+/// [`encode_with_quality`] for the real, quality-parameterized version
+/// this delegates to.
+///
+/// # Errors
+///
+/// See [`encode_with_quality`].
+pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
+    encode_with_quality(image, DEFAULT_QUALITY)
+}
+
+/// Encodes `image` as a JPEG at `quality` (1–100, `jpeg_encoder`'s own
+/// documented range — 100 is the highest image quality) — the export
+/// half of invariant §7.3.1b's 8-bit boundary, using [`dither_quantize`]
 /// rather than plain rounding so a smooth gradient doesn't band on the
-/// way out. `image`'s own alpha channel is discarded (see this
-/// module's own doc comment — JPEG has none to encode it into).
+/// way out. `image`'s own alpha channel is discarded (see this module's
+/// own doc comment — JPEG has none to encode it into).
 ///
 /// # Errors
 ///
 /// Returns [`IoError::JpegDimensionsTooLarge`] if `image` is wider or
 /// taller than JPEG's own 16-bit dimension fields can represent, or
 /// [`IoError::JpegEncode`] if the encoder itself fails.
-pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
+pub fn encode_with_quality(image: &Image, quality: u8) -> Result<Vec<u8>, IoError> {
     let (width, height) = (image.width(), image.height());
     let (Ok(width16), Ok(height16)) = (u16::try_from(width), u16::try_from(height)) else {
         return Err(IoError::JpegDimensionsTooLarge { width, height });
@@ -107,7 +127,7 @@ pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
     }
 
     let mut bytes = Vec::new();
-    let encoder = Encoder::new(&mut bytes, DEFAULT_QUALITY);
+    let encoder = Encoder::new(&mut bytes, quality);
     encoder.encode(&rgba8, width16, height16, ColorType::Rgba)?;
     Ok(bytes)
 }
@@ -240,5 +260,64 @@ mod tests {
             Err(_) => {}
             Ok(_) => unreachable!("garbage bytes must not decode as a valid JPEG"),
         }
+    }
+
+    #[test]
+    fn a_lower_quality_produces_a_smaller_file_for_the_same_image() {
+        // A real gradient, not a flat colour -- same reasoning the
+        // lossy-round-trip test above already documents (a flat colour
+        // barely changes size across quality levels).
+        let width = 32;
+        let height = 32;
+        let samples: Vec<f16> = (0..width * height * 4)
+            .map(|i| f16::from_f32((i % 256) as f32 / 255.0))
+            .collect();
+        let image = match Image::new(width, height, IccProfile::srgb(), samples) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let low = match super::encode_with_quality(&image, 10) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let high = match super::encode_with_quality(&image, 95) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            low.len() < high.len(),
+            "a lower quality setting must produce a smaller file for the \
+             same image: {} vs {} bytes",
+            low.len(),
+            high.len()
+        );
+    }
+
+    #[test]
+    fn encode_delegates_to_encode_with_quality_at_the_default() {
+        let image = match Image::new(
+            1,
+            1,
+            IccProfile::srgb(),
+            vec![
+                f16::from_f32(0.5),
+                f16::from_f32(0.5),
+                f16::from_f32(0.5),
+                f16::from_f32(1.0),
+            ],
+        ) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let via_encode = match encode(&image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let via_default_quality = match super::encode_with_quality(&image, super::DEFAULT_QUALITY) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(via_encode, via_default_quality);
     }
 }
