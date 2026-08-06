@@ -275,6 +275,26 @@
 //! records nothing — `finish_move` checks the layer's current bounds
 //! against `start_bounds` first.
 //!
+//! **Per-layer-origin-aware compositing, also 2026-08-06** — closes the
+//! "same-origin assumption" gap Multi-layer compositing named the same
+//! day it landed: `recomposite_visible_tiles` used to read the *same*
+//! `TileId` from every visible layer's own surface, correct only when
+//! every layer shared the active layer's own document-space origin
+//! (true of every document this crate's UI could build before Move-drag
+//! coalescing above, since nothing had actually moved a second layer
+//! away from another's origin yet). A new `read_layer_window` is the
+//! real fix: given a document-space tile position and a specific
+//! layer's own origin, it converts back into that layer's own local
+//! space and, when the two origins aren't a whole number of tiles
+//! apart, blends together whichever of that layer's own tiles overlap
+//! the result — up to four, the same "one dab can span four tiles"
+//! shape `aurora_brush::stamp::touched_tiles` already has for a much
+//! smaller window. A layer that *does* share the active layer's own
+//! origin still takes the cheap direct-read path — the common case
+//! costs nothing extra. Any part of the window before a layer's own
+//! local `(0, 0)` reads as transparent, the same as a pixel that layer
+//! genuinely never painted.
+//!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
 //! `aurora_gpu::CanvasPipeline` sized to the canvas dock area; `redraw`
@@ -2293,18 +2313,16 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 /// that one tile, the same "one bad tile shouldn't abort the rest"
 /// discipline `TileResidency::sync` itself already uses.
 ///
-/// **Same-origin assumption, stated honestly**: every layer's own
-/// `TileId` space is read as if it shared the atlas's own current view
-/// origin — true of every document this crate's own UI can actually
-/// build today (image import always creates one layer at document
-/// `(0, 0)`; `demo_document`'s three layers all share that same origin
-/// too; only a hand-crafted `.aur` file could actually diverge two
-/// layers' origins, since Move is the only thing that ever changes one).
-/// A real per-layer-origin-aware compositor — reading each layer's own
-/// `bounds` and converting a document-space tile into that specific
-/// layer's own local tile, possibly spanning a sub-tile boundary when
-/// origins aren't tile-aligned — is separate, still-open follow-on
-/// work.
+/// **Per-layer origins, handled for real**: the atlas's own visible
+/// grid is anchored to `active_layer`'s own document-space origin
+/// (`tile_origin_for_view`'s own doc comment) — for a layer that
+/// shares that exact origin, its own `TileId` space already lines up,
+/// so its tile is read directly; for one that doesn't (a document with
+/// two layers at different `bounds`, e.g. after a Move), a document-
+/// space tile is converted into that specific layer's own local
+/// window via [`read_layer_window`], which may need blending up to
+/// four of that layer's own tiles together when origins aren't
+/// tile-aligned.
 ///
 /// **Performance, stated honestly**: recomposites the *entire* visible
 /// grid unconditionally on every call, not just tiles some constituent
@@ -2324,14 +2342,23 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 fn recomposite_visible_tiles(
     residency: &aurora_gpu::TileResidency,
     layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
     store: &mut aurora_tile::TileStore,
 ) {
     let mut paint_layers = Vec::new();
     for id in layers.paint_order() {
         if let (Some(surface), Some(opacity)) = (layers.surface_id(id), layers.opacity(id)) {
-            paint_layers.push((surface, opacity));
+            let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+            paint_layers.push((surface, opacity, origin));
         }
     }
+    // The tile grid `residency.visible_tiles()` walks is anchored to the
+    // *active* layer's own origin (`tile_origin_for_view`'s own doc
+    // comment) — every other layer's own document-space tile boundaries
+    // only line up with it by coincidence, so this is the one origin
+    // every `tile_id` below needs converting back out of.
+    let reference_origin =
+        active_pixel_layer(layers, active_layer).map_or((0, 0), |(_, b)| (b.x, b.y));
 
     let full_tile = aurora_core::Rect {
         x: 0,
@@ -2339,15 +2366,26 @@ fn recomposite_visible_tiles(
         width: aurora_tile::TILE,
         height: aurora_tile::TILE,
     };
+    let tile_size = i64::from(aurora_tile::TILE);
     for tile_id in residency.visible_tiles() {
+        let doc_origin = (
+            reference_origin.0 + i64::from(tile_id.x) * tile_size,
+            reference_origin.1 + i64::from(tile_id.y) * tile_size,
+        );
         let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::with_capacity(paint_layers.len());
-        for &(surface, opacity) in &paint_layers {
-            match store.get(surface, tile_id) {
-                Ok(tile) => layer_texels.push((tile.texels().to_vec(), opacity)),
-                Err(err) => {
-                    tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
+        for &(surface, opacity, origin) in &paint_layers {
+            let texels = if origin == reference_origin {
+                match store.get(surface, tile_id) {
+                    Ok(tile) => tile.texels().to_vec(),
+                    Err(err) => {
+                        tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
+                        continue;
+                    }
                 }
-            }
+            } else {
+                read_layer_window(store, surface, origin, doc_origin)
+            };
+            layer_texels.push((texels, opacity));
         }
         let refs: Vec<(&[half::f16], f32)> = layer_texels
             .iter()
@@ -2360,6 +2398,101 @@ fn recomposite_visible_tiles(
         dest.texels_mut().copy_from_slice(&composited);
         dest.mark_dirty(full_tile);
     }
+}
+
+/// Assembles one `aurora_tile::TILE`-sized window of `surface`'s own
+/// texels, positioned at document-space `doc_origin`, given that
+/// `surface`'s own pixels are addressed from `layer_origin` (that
+/// layer's own document-space `(bounds.x, bounds.y)`) rather than
+/// `doc_origin`'s own reference frame — the general case
+/// [`recomposite_visible_tiles`] needs once two composited layers no
+/// longer share an origin. Unless `layer_origin` happens to be a whole
+/// number of tiles away from `doc_origin`'s own frame, the window
+/// doesn't land on a single one of `surface`'s own tiles: up to four
+/// can overlap it (the same "one dab can span four tiles" shape
+/// `aurora_brush::stamp::touched_tiles` already has for one small dab,
+/// generalized here to a whole tile-sized window), each contributing
+/// whatever rectangular sub-block of itself actually falls inside the
+/// window.
+///
+/// A part of the window that falls before `surface`'s own local
+/// `(0, 0)` — negative local coordinates, where `aurora_tile::TileId`'s
+/// own unsigned fields mean there is no tile to read — is left fully
+/// transparent, the same as any pixel `surface` has genuinely never
+/// been painted at.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn read_layer_window(
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    layer_origin: (i64, i64),
+    doc_origin: (i64, i64),
+) -> Vec<half::f16> {
+    let tile_size = i64::from(aurora_tile::TILE);
+    let window_x = doc_origin.0 - layer_origin.0;
+    let window_y = doc_origin.1 - layer_origin.1;
+    let mut out =
+        vec![
+            half::f16::from_f32(0.0);
+            aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
+        ];
+
+    for tile_y in [
+        window_y.div_euclid(tile_size),
+        window_y.div_euclid(tile_size) + 1,
+    ] {
+        let Ok(tile_row) = u32::try_from(tile_y) else {
+            continue;
+        };
+        let row_lo = (tile_y * tile_size).max(window_y);
+        let row_hi = ((tile_y + 1) * tile_size).min(window_y + tile_size);
+        if row_lo >= row_hi {
+            continue;
+        }
+        for tile_x in [
+            window_x.div_euclid(tile_size),
+            window_x.div_euclid(tile_size) + 1,
+        ] {
+            let Ok(tile_col) = u32::try_from(tile_x) else {
+                continue;
+            };
+            let col_lo = (tile_x * tile_size).max(window_x);
+            let col_hi = ((tile_x + 1) * tile_size).min(window_x + tile_size);
+            if col_lo >= col_hi {
+                continue;
+            }
+            let Ok(src) = store.get(
+                surface,
+                aurora_tile::TileId {
+                    x: tile_col,
+                    y: tile_row,
+                },
+            ) else {
+                continue;
+            };
+            let texels = src.texels().to_vec();
+            for src_row in row_lo..row_hi {
+                let dst_row = (src_row - window_y) as usize;
+                let in_tile_row = (src_row - tile_y * tile_size) as usize;
+                for src_col in col_lo..col_hi {
+                    let dst_col = (src_col - window_x) as usize;
+                    let in_tile_col = (src_col - tile_x * tile_size) as usize;
+                    let src_index = (in_tile_row * aurora_tile::TILE as usize + in_tile_col)
+                        * aurora_tile::CHANNELS;
+                    let dst_index =
+                        (dst_row * aurora_tile::TILE as usize + dst_col) * aurora_tile::CHANNELS;
+                    for channel in 0..aurora_tile::CHANNELS {
+                        if let (Some(&s), Some(d)) = (
+                            texels.get(src_index + channel),
+                            out.get_mut(dst_index + channel),
+                        ) {
+                            *d = s;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Selects `layer_id` as the active layer: sets `*active_layer` and
@@ -3730,7 +3863,12 @@ impl App {
                         );
                     }
                     if let Some(store) = self.tile_store.as_mut() {
-                        recomposite_visible_tiles(residency, &self.layers, store);
+                        recomposite_visible_tiles(
+                            residency,
+                            &self.layers,
+                            self.active_layer,
+                            store,
+                        );
                         let _ = residency.sync(
                             gpu.queue(),
                             store,
@@ -6165,7 +6303,7 @@ mod tests {
 
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
-        recomposite_visible_tiles(&residency, &layers, &mut store);
+        recomposite_visible_tiles(&residency, &layers, None, &mut store);
 
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
         assert_eq!(
@@ -6173,6 +6311,94 @@ mod tests {
             (0.5, 0.0, 0.5, 1.0),
             "opaque red bottom, opaque blue top at 50% opacity, hidden green never contributes"
         );
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_blends_a_layer_at_a_different_origin_than_the_active_layer() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let origin_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        // Offset by less than one tile on each axis, so the composite
+        // tile at (0, 0) straddles up to four of `shifted`'s own tiles
+        // -- exactly the case `read_layer_window` exists for.
+        let shifted_bounds = aurora_core::Rect {
+            x: 40,
+            y: 40,
+            ..origin_bounds
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", origin_bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let shifted = match layers.add_pixel_layer("shifted", shifted_bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let Some(bottom_surface) = layers.surface_id(bottom) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            bottom_surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        let Some(shifted_surface) = layers.surface_id(shifted) else {
+            unreachable!("just created as a pixel layer");
+        };
+        // `shifted`'s own bounds start at document (40, 40); painting a
+        // solid tile at its own local (0, 0) covers document
+        // [40, 40 + TILE) on each axis -- squarely inside the active
+        // layer's own composite tile at (0, 0) (document [0, TILE)),
+        // since TILE (256) is far bigger than the 40px offset.
+        fill_solid(
+            &mut store,
+            shifted_surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        // `bottom` is the active layer, so the composite tile grid is
+        // anchored to its own origin (0, 0) -- `shifted` is the one that
+        // needs `read_layer_window`'s own re-tiling.
+        recomposite_visible_tiles(&residency, &layers, Some(bottom), &mut store);
+
+        let composite_surface = composite_surface_id();
+        let at_shifted_origin =
+            sample_pixel(&mut store, composite_surface, (40.0, 40.0)).unwrap_or([-1.0; 4]);
+        let outside_shifted =
+            sample_pixel(&mut store, composite_surface, (5.0, 5.0)).unwrap_or([-1.0; 4]);
+        // Exact-literal comparison, not accumulated computation noise --
+        // both `fill_solid` calls write exact 0.0/1.0 literals, and a
+        // single fully-opaque layer over a transparent background
+        // multiplies/adds only by 0.0 and 1.0 through `composite_tile_cpu`,
+        // same reasoning this crate's other float_cmp allows already
+        // document.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                at_shifted_origin,
+                [0.0, 0.0, 1.0, 1.0],
+                "shifted's own opaque blue must land at its real document position, not (0, 0)"
+            );
+            assert_eq!(
+                outside_shifted,
+                [1.0, 0.0, 0.0, 1.0],
+                "outside shifted's own bounds, only bottom's opaque red should show"
+            );
+        }
     }
 
     #[test]
@@ -6184,7 +6410,7 @@ mod tests {
         let layers = aurora_doc::LayerTree::new();
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
-        recomposite_visible_tiles(&residency, &layers, &mut store);
+        recomposite_visible_tiles(&residency, &layers, None, &mut store);
 
         let tile_id = aurora_tile::TileId { x: 0, y: 0 };
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
