@@ -190,10 +190,10 @@
 //! Move is really undoable — one undo step per pointer-move event
 //! during the drag, not one per whole drag gesture (coalescing a drag
 //! into a single undo step is separate, still-open follow-on work).
-//! **Scope, stated honestly**: `Undo`/`Redo` are shortcut-only, matching
-//! how the existing tool-switch letters work — neither is in the
-//! command palette or (macOS) native menu yet, real follow-on work once
-//! this crate has an Edit menu at all.
+//! **Scope, stated honestly (at the time)**: `Undo`/`Redo` were
+//! shortcut-only when this bullet first landed — see the "command
+//! palette/native menu Undo/Redo" paragraph further down for how that
+//! closed the same week.
 //!
 //! **Pixel-edit undo, 2026-08-06** — the gap the paragraph above named
 //! (`App::paint_dab`/`Self::erase_dab` bypassing `History` entirely,
@@ -216,6 +216,26 @@
 //! undoes the stroke, not the more-recent Move. See `run_command`'s own
 //! doc comment for the full policy and why unifying the two for real is
 //! separate, still-open follow-on work.
+//!
+//! **Command palette and native menu Undo/Redo, also 2026-08-06**:
+//! `Ctrl+Z`/`Ctrl+Shift+Z` were the only way to reach either command
+//! until now — a real, named accessibility/discoverability gap (a
+//! screen-reader user driving this crate through the palette had no
+//! way to trigger either one). `ChosenFile` (the enum
+//! `activate_command` returns for whatever it can't finish itself)
+//! is renamed `ActivatedCommand` and gained `Undo`/`Redo` variants
+//! alongside its existing `OpenFile`/`SaveFile`; `activate_command`
+//! itself stays free of `layers`/`history`/`pixel_history`/the tile
+//! store (resolving `COMMAND_UNDO`/`COMMAND_REDO` to their own bare
+//! variant, nothing more), so `App::handle_key_event`/
+//! `App::handle_menu_event` run the real command via a new
+//! `App::run_undo_redo` — the same `run_command` path `Ctrl+Z`/
+//! `Ctrl+Shift+Z` themselves already use, so there's exactly one place
+//! either command's own logic lives. The native menu (macOS only)
+//! gained an Edit submenu; deliberately no accelerator hint on its own
+//! Undo/Redo items, since this crate's shortcuts bind literal `Ctrl+Z`
+//! even on macOS and showing a `⌘Z` hint the app doesn't actually
+//! respond to would be misleading.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
@@ -1071,19 +1091,23 @@ impl FileDialogAccess for SystemFileDialog {
     }
 }
 
-/// One real, resolvable outcome of activating a command-palette entry
-/// (or, on macOS, a native menu item) that this crate can't finish
-/// dispatching on its own: [`COMMAND_FILE_OPEN`]'s picked path
-/// ([`App::open_file`] still needs to read/decode/replace the document
-/// with it) or [`COMMAND_FILE_SAVE`]'s picked path ([`App::save_file`]
-/// still needs to encode/write to it). Both are "a real native file
-/// dialog just returned a real path" signals — the same reason
-/// [`activate_command`] previously returned a bare `Option<PathBuf>`
-/// before there were two different actions that path could mean.
+/// One real outcome of activating a command-palette entry (or, on
+/// macOS, a native menu item) that [`activate_command`] itself can't
+/// finish — either because it needs a real platform call this crate
+/// keeps behind a testable seam (`Open`/`Save`, a real native
+/// `rfd::FileDialog`'s own picked path — [`App::open_file`]/
+/// [`App::save_file`] still need to read/decode or encode/write it),
+/// or because it needs live document state `activate_command` is
+/// deliberately kept free of (`Undo`/`Redo` — [`App::handle_key_event`]/
+/// [`App::handle_menu_event`] run them via the same [`run_command`]
+/// path `Ctrl+Z`/`Ctrl+Shift+Z` already use, so there is exactly one
+/// place either command's own logic lives, not a second copy here).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ChosenFile {
-    Open(PathBuf),
-    Save(PathBuf),
+enum ActivatedCommand {
+    OpenFile(PathBuf),
+    SaveFile(PathBuf),
+    Undo,
+    Redo,
 }
 
 /// Command ids [`palette_commands`] emits — `aurora_widgets::widgets::
@@ -1095,18 +1119,25 @@ const COMMAND_FOCUS_PROPERTIES: &str = "view.focus_properties";
 const COMMAND_FOCUS_HISTORY: &str = "view.focus_history";
 const COMMAND_FILE_OPEN: &str = "file.open";
 const COMMAND_FILE_SAVE: &str = "file.save";
+const COMMAND_UNDO: &str = "edit.undo";
+const COMMAND_REDO: &str = "edit.redo";
 
 /// The command palette's own, real content: one command per docked
-/// panel, focusing it, plus real native "Open File…"/"Save As…"
-/// pickers. Genuine, not placeholder — each focus command moves real
+/// panel, focusing it; real native "Open File…"/"Save As…" pickers; and
+/// `Undo`/`Redo`, the same commands `Ctrl+Z`/`Ctrl+Shift+Z` already run
+/// — previously shortcut-only, a real, named gap (a screen-reader user
+/// driving this crate through the palette had no way to reach either
+/// one). Genuine, not placeholder — each focus command moves real
 /// keyboard focus to a real, already-focusable panel region (see
 /// `aurora-ui`'s `insert_panel`), verifiable the same way any other
 /// focus change is (`push_accessibility`); `COMMAND_FILE_OPEN`/
 /// `COMMAND_FILE_SAVE` show a real, native `rfd::FileDialog` and the
-/// chosen path is really opened/saved (`App::open_file`/`save_file`).
-/// "Save As…", not "Save" — this crate tracks no "current document
-/// path" to reuse yet, so every save shows a picker. A richer command
-/// set (undo, tool switches) waits on those real actions existing.
+/// chosen path is really opened/saved (`App::open_file`/`save_file`);
+/// `COMMAND_UNDO`/`COMMAND_REDO` really undo/redo (see
+/// [`ActivatedCommand`]'s own doc comment for why `activate_command`
+/// itself doesn't run them directly). "Save As…", not "Save" — this
+/// crate tracks no "current document path" to reuse yet, so every save
+/// shows a picker.
 fn palette_commands() -> Vec<CommandEntry> {
     vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
@@ -1114,13 +1145,16 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
         CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
         CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
+        CommandEntry::new(COMMAND_UNDO, "Undo"),
+        CommandEntry::new(COMMAND_REDO, "Redo"),
     ]
 }
 
 /// Resolves an activated command-palette entry's own `id` (one of the
 /// `COMMAND_*` constants above) to the widget it should focus. `None`
-/// for an id this build doesn't recognise — defensive; every id
-/// [`palette_commands`] itself emits is handled here.
+/// for an id this build doesn't recognise, including `COMMAND_FILE_OPEN`/
+/// `COMMAND_FILE_SAVE`/`COMMAND_UNDO`/`COMMAND_REDO` — none of those
+/// focus anything, they're handled directly in [`activate_command`].
 fn command_target(workspace: &aurora_ui::Workspace, id: &str) -> Option<WidgetId> {
     match id {
         COMMAND_FOCUS_LAYERS => Some(workspace.layers.root),
@@ -1137,14 +1171,22 @@ fn command_target(workspace: &aurora_ui::Workspace, id: &str) -> Option<WidgetId
 /// implementations of "what does this command do." Moves focus for a
 /// panel-focus command ([`command_target`]); shows the native file
 /// dialog and returns the picked path, tagged by which one it was
-/// ([`ChosenFile`]), for [`COMMAND_FILE_OPEN`]/[`COMMAND_FILE_SAVE`];
-/// logs and returns `None` for any other id.
+/// ([`ActivatedCommand`]), for [`COMMAND_FILE_OPEN`]/[`COMMAND_FILE_SAVE`];
+/// resolves `COMMAND_UNDO`/`COMMAND_REDO` to their own
+/// [`ActivatedCommand`] variant without running them here — this
+/// function is deliberately kept free of `layers`/`history`/
+/// `pixel_history`/`aurora_tile::TileStore`, so it stays exactly as
+/// pure and unit-testable as it already was; the caller
+/// ([`App::handle_key_event`]/[`App::handle_menu_event`], both of
+/// which already own that state) runs the real undo/redo via
+/// [`run_command`], the same path `Ctrl+Z`/`Ctrl+Shift+Z` themselves
+/// use. Logs and returns `None` for any other id.
 fn activate_command(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     id: &str,
     file_dialog: &mut dyn FileDialogAccess,
-) -> Option<ChosenFile> {
+) -> Option<ActivatedCommand> {
     if let Some(target) = command_target(workspace, id) {
         if let Err(err) = focus.focus(&mut workspace.tree, target) {
             tracing::warn!(?err, "activated command's target isn't focusable");
@@ -1152,10 +1194,16 @@ fn activate_command(
         return None;
     }
     if id == COMMAND_FILE_OPEN {
-        return file_dialog.pick_file().map(ChosenFile::Open);
+        return file_dialog.pick_file().map(ActivatedCommand::OpenFile);
     }
     if id == COMMAND_FILE_SAVE {
-        return file_dialog.save_file().map(ChosenFile::Save);
+        return file_dialog.save_file().map(ActivatedCommand::SaveFile);
+    }
+    if id == COMMAND_UNDO {
+        return Some(ActivatedCommand::Undo);
+    }
+    if id == COMMAND_REDO {
+        return Some(ActivatedCommand::Redo);
     }
     tracing::warn!(command = id, "unknown command activated");
     None
@@ -1179,14 +1227,19 @@ fn activate_command(
 // every platform.
 
 /// Builds the native menu's own cross-platform structure: File > Open
-/// File…/Save As…, View > Focus Layers/Properties/History Panel — reusing the
-/// exact same `COMMAND_*` ids the command palette already uses (via
-/// `MenuItem::with_id`), so [`activate_command`] drives both UI
-/// surfaces identically; nothing here invents a second command
-/// vocabulary. Building the model (as opposed to attaching it to a
-/// window) is the same on every platform muda supports, which is why
-/// this function itself needs no further `#[cfg]` beyond the module
-/// section's own macOS gate.
+/// File…/Save As…, Edit > Undo/Redo, View > Focus Layers/Properties/
+/// History Panel — reusing the exact same `COMMAND_*` ids the command
+/// palette already uses (via `MenuItem::with_id`), so
+/// [`activate_command`] drives both UI surfaces identically; nothing
+/// here invents a second command vocabulary. No accelerator hint on
+/// Undo/Redo (the trailing `None`) — this crate's own keyboard
+/// shortcuts bind literal `Ctrl+Z`/`Ctrl+Shift+Z` even on macOS (no
+/// per-platform rebinding exists yet, `default_shortcuts`'s own doc
+/// comment), and showing a `⌘Z` hint the app doesn't actually respond
+/// to would be actively misleading. Building the model (as opposed to
+/// attaching it to a window) is the same on every platform muda
+/// supports, which is why this function itself needs no further
+/// `#[cfg]` beyond the module section's own macOS gate.
 #[cfg(target_os = "macos")]
 fn build_menu() -> muda::Menu {
     let menu = muda::Menu::new();
@@ -1197,6 +1250,18 @@ fn build_menu() -> muda::Menu {
         &[
             &muda::MenuItem::with_id(COMMAND_FILE_OPEN, "Open File…", true, None),
             &muda::MenuItem::with_id(COMMAND_FILE_SAVE, "Save As…", true, None),
+        ],
+    ) {
+        Ok(submenu) => submenu,
+        Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
+    };
+
+    let edit_menu = match muda::Submenu::with_items(
+        "Edit",
+        true,
+        &[
+            &muda::MenuItem::with_id(COMMAND_UNDO, "Undo", true, None),
+            &muda::MenuItem::with_id(COMMAND_REDO, "Redo", true, None),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -1221,7 +1286,7 @@ fn build_menu() -> muda::Menu {
         Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
     };
 
-    if let Err(err) = menu.append_items(&[&file_menu, &view_menu]) {
+    if let Err(err) = menu.append_items(&[&file_menu, &edit_menu, &view_menu]) {
         tracing::warn!(?err, "failed to build the native menu bar structure");
     }
     menu
@@ -1420,12 +1485,13 @@ fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_
 /// `palette` is `None` (defensive; [`handle_key`] only calls this when
 /// it's `Some`).
 /// Routes one key press while the command palette is open. Returns
-/// `Some(ChosenFile)` only when `Enter` just activated
-/// [`COMMAND_FILE_OPEN`]/[`COMMAND_FILE_SAVE`] and the user picked a
-/// real path — the one case this function can't fully resolve itself
-/// (opening/saving needs `App`'s own live document state), so it hands
-/// the tagged path back up to [`handle_key`]/`App` instead. Every other
-/// case returns `None`.
+/// `Some(ActivatedCommand)` when `Enter` just activated a command
+/// [`activate_command`] itself couldn't fully resolve — a real file
+/// path picked for [`COMMAND_FILE_OPEN`]/[`COMMAND_FILE_SAVE`], or
+/// `COMMAND_UNDO`/`COMMAND_REDO` — hands it back up to
+/// [`handle_key`]/`App` instead, which has the live document state (or,
+/// for a file, the read/decode step) `activate_command` deliberately
+/// doesn't. Every other case returns `None`.
 #[allow(clippy::too_many_arguments)]
 fn handle_palette_key(
     workspace: &mut aurora_ui::Workspace,
@@ -1435,7 +1501,7 @@ fn handle_palette_key(
     text: Option<&str>,
     clipboard: &mut dyn ClipboardAccess,
     file_dialog: &mut dyn FileDialogAccess,
-) -> Option<ChosenFile> {
+) -> Option<ActivatedCommand> {
     let root = (*palette)?;
     match chord.key {
         Key::Named(NamedKey::Escape) => close_command_palette(workspace, focus, palette),
@@ -1518,12 +1584,12 @@ fn handle_palette_key(
 /// silently ignored — there's no text field to fall back to routing
 /// into yet.
 ///
-/// Returns `Some(ChosenFile)` only in the one case no pure `WidgetTree`
-/// mutation can finish on its own: the palette's `Open File…`/`Save
-/// As…` command was just activated and the user picked a real path via
-/// `file_dialog` — see [`handle_palette_key`]'s own doc comment. The
-/// caller (`App::handle_key_event`) is what actually has somewhere to
-/// put it.
+/// Returns `Some(ActivatedCommand)` only in the one case no pure
+/// `WidgetTree` mutation can finish on its own — see
+/// [`handle_palette_key`]'s own doc comment for exactly which commands
+/// that covers. The caller (`App::handle_key_event`) is what actually
+/// has somewhere to put it (real document state for `Undo`/`Redo`, a
+/// read/decode or encode/write step for an opened/saved file).
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     workspace: &mut aurora_ui::Workspace,
@@ -1541,7 +1607,7 @@ fn handle_key(
     text: Option<&str>,
     clipboard: &mut dyn ClipboardAccess,
     file_dialog: &mut dyn FileDialogAccess,
-) -> Option<ChosenFile> {
+) -> Option<ActivatedCommand> {
     let chord = KeyChord::new(modifiers, key);
     if dialog.is_some() {
         handle_dialog_key(workspace, focus, dialog, chord);
@@ -2793,11 +2859,35 @@ impl App {
             &mut self.file_dialog,
         );
         match picked {
-            Some(ChosenFile::Open(path)) => self.open_file(&path),
-            Some(ChosenFile::Save(path)) => self.save_file(&path),
+            Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
+            Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
+            Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
+            Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             None => {}
         }
         self.push_accessibility();
+    }
+
+    /// Runs `command` (`AppCommand::Undo` or `::Redo`) via
+    /// [`run_command`] against this app's own live state — what the
+    /// command palette's and (macOS) native menu's own Undo/Redo
+    /// entries fall back to once `activate_command` hands the bare
+    /// command back up (deliberately kept free of `layers`/`history`/
+    /// `pixel_history`/the tile store — see [`ActivatedCommand`]'s own
+    /// doc comment for why), the same path `Ctrl+Z`/`Ctrl+Shift+Z`
+    /// themselves already run through.
+    fn run_undo_redo(&mut self, command: AppCommand) {
+        run_command(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            &mut self.tool,
+            &mut self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            self.tile_store.as_mut(),
+            command,
+        );
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -3398,8 +3488,10 @@ impl App {
             &mut self.file_dialog,
         );
         match picked {
-            Some(ChosenFile::Open(path)) => self.open_file(&path),
-            Some(ChosenFile::Save(path)) => self.save_file(&path),
+            Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
+            Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
+            Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
+            Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             None => {}
         }
         self.push_accessibility();
@@ -3834,21 +3926,21 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppCommand, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
-        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, CRASH_RECOVERY_CONTINUE, ChosenFile,
-        ClipboardAccess, Drag, FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PointerButton,
-        activate_command, apply_scroll_zoom, autosave_path, begin_drag, canvas_area_physical_rect,
-        canvas_area_physical_size, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, composite_surface_id, continue_drag,
+        ActivatedCommand, AppCommand, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
+        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_UNDO,
+        CRASH_RECOVERY_CONTINUE, ClipboardAccess, Drag, FileDialogAccess, Key, KeyChord, Modifiers,
+        NamedKey, PointerButton, activate_command, apply_scroll_zoom, autosave_path, begin_drag,
+        canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
+        close_command_palette, close_crash_recovery_dialog, composite_surface_id, continue_drag,
         crash_recovery_dialog_message, default_shortcuts, demo_document, document_canvas_size,
         document_from_image, handle_dialog_key, handle_dialog_pointer, handle_key,
         handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point,
         load_background_color, load_scales, logical_point, logical_size, open_command_palette,
-        open_crash_recovery_dialog, open_image, open_tile_store, pointer_in_canvas,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, run_command, sample_pixel, select_layer, tile_origin_for_view,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
+        open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
+        pointer_in_canvas, previous_session_left_a_marker, recomposite_visible_tiles,
+        recover_document, replace_document, run_command, sample_pixel, select_layer,
+        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
+        translate_key, translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
         write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
@@ -5345,7 +5437,9 @@ mod tests {
 
         assert_eq!(
             picked,
-            Some(ChosenFile::Open(PathBuf::from("/tmp/example.psd")))
+            Some(ActivatedCommand::OpenFile(PathBuf::from(
+                "/tmp/example.psd"
+            )))
         );
         assert_eq!(palette, None, "activating a command must close the palette");
     }
@@ -5427,7 +5521,9 @@ mod tests {
 
         assert_eq!(
             picked,
-            Some(ChosenFile::Open(PathBuf::from("/tmp/example.psd")))
+            Some(ActivatedCommand::OpenFile(PathBuf::from(
+                "/tmp/example.psd"
+            )))
         );
         assert_eq!(
             focus.focused(),
@@ -5454,13 +5550,42 @@ mod tests {
 
         assert_eq!(
             picked,
-            Some(ChosenFile::Save(PathBuf::from("/tmp/example.png")))
+            Some(ActivatedCommand::SaveFile(PathBuf::from(
+                "/tmp/example.png"
+            )))
         );
         assert_eq!(
             focus.focused(),
             None,
             "COMMAND_FILE_SAVE has no focus target of its own"
         );
+    }
+
+    #[test]
+    fn activate_command_resolves_undo_and_redo_without_focusing_anything() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut file_dialog = FakeFileDialog::default();
+
+        let undo = activate_command(&mut workspace, &mut focus, COMMAND_UNDO, &mut file_dialog);
+        assert_eq!(undo, Some(ActivatedCommand::Undo));
+
+        let redo = activate_command(&mut workspace, &mut focus, COMMAND_REDO, &mut file_dialog);
+        assert_eq!(redo, Some(ActivatedCommand::Redo));
+
+        assert_eq!(
+            focus.focused(),
+            None,
+            "neither command has a focus target of its own"
+        );
+    }
+
+    #[test]
+    fn palette_commands_includes_undo_and_redo() {
+        let commands = palette_commands();
+        let ids: Vec<&str> = commands.iter().map(|entry| entry.id.as_str()).collect();
+        assert!(ids.contains(&COMMAND_UNDO), "{ids:?}");
+        assert!(ids.contains(&COMMAND_REDO), "{ids:?}");
     }
 
     #[test]
