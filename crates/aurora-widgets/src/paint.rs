@@ -3,43 +3,50 @@
 //! need to actually draw it — the "wiring a widget's own paint through
 //! this pipeline" step `render`'s own doc comment names as still open.
 //!
-//! **Scope, stated honestly.** [`paint_widget`] covers `Button` only —
-//! a solid, rounded-rect background, the simplest of the widgets this
-//! crate has (`widgets`' own doc comment). Every other [`WidgetKind`]
-//! returns `Ok(None)` (a real, deliberate "nothing to paint yet"), not
-//! an error — `Checkbox`/`Slider`/`TextField`/`CommandPalette` all need
-//! their own shapes (a check glyph, a track + thumb, a caret/selection,
-//! a list) designed and built the same way, one at a time, matching
-//! this project's own "no half-finished implementations" practice
-//! rather than a fill-everything-with-a-rectangle placeholder.
+//! **Scope, stated honestly.** [`paint_widget`] covers `Button` and
+//! `Checkbox` — each a single solid, rounded-rect background, the
+//! simplest of the widgets this crate has (`widgets`' own doc
+//! comment). `Checkbox`'s own box has no check/dash *glyph* drawn
+//! inside it yet (this crate draws no glyphs at all — solid fills
+//! only, `render`'s own doc comment); `Toggled::True` and
+//! `Toggled::Mixed` currently render identically (both
+//! `accent.primary`) since nothing yet exists to tell them apart
+//! visually. Every other [`WidgetKind`] returns `Ok(None)` (a real,
+//! deliberate "nothing to paint yet"), not an error —
+//! `Slider`/`TextField`/`CommandPalette` all need their own shapes (a
+//! track + thumb, a caret/selection, a list) designed and built the
+//! same way, one at a time, matching this project's own "no
+//! half-finished implementations" practice rather than a
+//! fill-everything-with-a-rectangle placeholder.
 //!
 //! Colour always comes from a real, resolved [`Theme`] token
-//! (`accent.primary`/`accent.primary_active`, `state.disabled_opacity`)
-//! — invariant §7.3.10, never a literal. The returned `[f32; 4]` is
-//! straight (unpremultiplied) sRGB-gamma-encoded RGBA, [`Color::
-//! to_srgb_f32`]'s own convention — matching what [`crate::render::
-//! PathPipeline::bind_group`]'s own doc comment expects, but *not* yet
-//! linearized for an sRGB-aware render target the way `aurora-app`'s
-//! own `load_background_color` linearizes `surface.app` before using it
-//! as a clear colour. Whether the real render target this eventually
-//! draws into is sRGB-aware is an `aurora-app` integration decision
-//! that doesn't exist yet; this function's job stops at "the token's
-//! own colour, resolved," the same seam `load_background_color` itself
-//! sits on the other side of.
+//! (`accent.primary`/`accent.primary_active`, `surface.sunken`,
+//! `state.disabled_opacity`) — invariant §7.3.10, never a literal. The
+//! returned `[f32; 4]` is straight (unpremultiplied) sRGB-gamma-encoded
+//! RGBA, [`Color::to_srgb_f32`]'s own convention — matching what
+//! [`crate::render::PathPipeline::bind_group`]'s own doc comment
+//! expects. This function itself never linearizes for an sRGB-aware
+//! render target; that's a real caller's own job once it actually owns
+//! one (`aurora-app::linearize_paint_color` does it for the real
+//! swapchain, the headless gallery harness's own `render_gallery`
+//! deliberately doesn't need to for its non-sRGB offscreen target) —
+//! this function's job stops at "the token's own colour, resolved."
 //!
-//! No button corner-radius token exists in `design/tokens/vocabulary.md`
-//! yet (only the bare `radius.*` scale does) — `scales.radius.sm` is
-//! this function's own reasonable choice, not a design decision made by
-//! Cahya (PRD FR-027 *Ownership*); revisit if/when a real per-widget
-//! radius token is added.
+//! No per-widget corner-radius token exists in
+//! `design/tokens/vocabulary.md` yet (only the bare `radius.*` scale
+//! does) — `scales.radius.sm` is this function's own reasonable
+//! choice for both `Button` and `Checkbox`, not a design decision made
+//! by Cahya (PRD FR-027 *Ownership*); revisit if/when a real
+//! per-widget radius token is added.
 
+use accesskit::Toggled;
 use aurora_core::Rect;
 use aurora_theme::{Scales, Theme};
 use aurora_vector::{DEFAULT_TOLERANCE, Mesh, fill, rounded_rect};
 
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
-use crate::widgets::{ButtonState, WidgetKind};
+use crate::widgets::{ButtonState, CheckboxState, WidgetKind};
 
 /// A widget's own paint: tessellated fill geometry plus the straight,
 /// unpremultiplied RGBA colour to draw it with — exactly the pair
@@ -68,8 +75,8 @@ pub fn paint_widget(
     let kind = tree.payload(id).ok_or(WidgetError::UnknownWidget(id))?;
     match kind {
         WidgetKind::Button(state) => paint_button(state, bounds, theme, scales).map(Some),
+        WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales).map(Some),
         WidgetKind::Container
-        | WidgetKind::Checkbox(_)
         | WidgetKind::Slider(_)
         | WidgetKind::TextField(_)
         | WidgetKind::CommandPalette(_) => Ok(None),
@@ -109,10 +116,45 @@ fn paint_button(
     Ok((mesh, [r, g, b, alpha]))
 }
 
+fn paint_checkbox(
+    state: &CheckboxState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+) -> Result<Paint, WidgetError> {
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+
+    // `Toggled::True`/`Toggled::Mixed` share a colour -- see this
+    // module's own doc comment for why (no check/dash glyph exists yet
+    // to actually tell them apart).
+    let base = match state.checked {
+        Toggled::True | Toggled::Mixed => theme.accent.primary,
+        Toggled::False => theme.surface.sunken,
+    };
+    let [r, g, b] = base.to_srgb_f32();
+    let alpha = if state.disabled {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    Ok((mesh, [r, g, b, alpha]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::paint_widget;
-    use crate::widgets::{insert_button, new_tree, set_button_disabled, set_button_pressed};
+    use crate::widgets::{
+        insert_button, insert_checkbox, new_tree, set_button_disabled, set_button_pressed,
+        set_checkbox_disabled, toggle_checkbox,
+    };
+    use accesskit::Toggled;
     use aurora_core::Rect;
     use aurora_theme::{Palette, Scales, ThemeSet};
 
@@ -222,6 +264,115 @@ mod tests {
         let theme = dark_theme();
 
         let (_, color) = match paint_widget(&tree, button, &theme, &scales) {
+            Ok(Some(paint)) => paint,
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(color[3], theme.state.disabled_opacity);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_unchecked_checkbox_paints_surface_sunken() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let checkbox = match insert_checkbox(&mut tree, root, &scales, "x") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            checkbox,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 20,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let paint = match paint_widget(&tree, checkbox, &theme, &scales) {
+            Ok(Some(paint)) => paint,
+            other => unreachable!("a laid-out checkbox must paint something: {other:?}"),
+        };
+        let (mesh, color) = paint;
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a 20x20 checkbox must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.surface.sunken.to_srgb_f32();
+        assert_eq!(
+            color,
+            [r, g, b, 1.0],
+            "an unchecked, enabled checkbox must use surface.sunken at full opacity"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_checked_checkbox_paints_accent_primary() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let checkbox = match insert_checkbox(&mut tree, root, &scales, "x") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = toggle_checkbox(&mut tree, checkbox) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (_, color) = match paint_widget(&tree, checkbox, &theme, &scales) {
+            Ok(Some(paint)) => paint,
+            other => unreachable!("{other:?}"),
+        };
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert_eq!(color, [r, g, b, 1.0]);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_mixed_checkbox_paints_the_same_as_checked() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let checkbox = match insert_checkbox(&mut tree, root, &scales, "x") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(crate::widgets::WidgetKind::Checkbox(state)) = tree.payload_mut(checkbox) else {
+            unreachable!("just inserted");
+        };
+        state.checked = Toggled::Mixed;
+        let theme = dark_theme();
+
+        let (_, color) = match paint_widget(&tree, checkbox, &theme, &scales) {
+            Ok(Some(paint)) => paint,
+            other => unreachable!("{other:?}"),
+        };
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert_eq!(
+            color,
+            [r, g, b, 1.0],
+            "Mixed currently renders identically to True -- see this module's own doc comment"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_checkbox_applies_the_theme_disabled_opacity() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let checkbox = match insert_checkbox(&mut tree, root, &scales, "x") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_checkbox_disabled(&mut tree, checkbox, true) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (_, color) = match paint_widget(&tree, checkbox, &theme, &scales) {
             Ok(Some(paint)) => paint,
             other => unreachable!("{other:?}"),
         };
