@@ -10,8 +10,10 @@
 //! than PNG or JPEG (arbitrary bit depth, photometric interpretation,
 //! compression, and multiple pages/IFDs per file), so this is
 //! deliberately a first slice, not full coverage:
-//! - Only the **first image (IFD)** in a TIFF file is read — real
-//!   multi-page TIFF support is separate, still-open follow-on work.
+//! - [`decode`] still only reads the **first image (IFD)** in a TIFF
+//!   file — [`decode_all`] (added 2026-08-06) is the real multi-page
+//!   counterpart, reading every IFD in order (`Decoder::more_images`/
+//!   `next_image`) rather than just the first.
 //! - Only `Gray`/`GrayA`/`RGB`/`RGBA` photometric layouts are decoded,
 //!   normalized to this crate's own canonical RGBA via the same
 //!   `crate::channels` helpers `png` uses. `Palette`/`CMYK`/`CMYKA`
@@ -31,11 +33,13 @@
 //!   assumed from the variant's name). 64-bit floats and every signed-
 //!   integer sample format remain a real, checked error, not silently
 //!   misinterpreted.
-//! - Encode is always 8-bit RGBA, uncompressed — matching invariant
-//!   §7.3.1b's own 8-bit export boundary via [`dither_quantize`], the
-//!   same as `png`/`jpeg`. Compressed TIFF export (LZW/deflate, both of
-//!   which the `tiff` crate itself already supports for *decode*) is
-//!   real, separate follow-on work.
+//! - Encode is always 8-bit RGBA — matching invariant §7.3.1b's own
+//!   8-bit export boundary via [`dither_quantize`], the same as
+//!   `png`/`jpeg` — uncompressed ([`encode`]) or LZW-compressed
+//!   ([`encode_compressed`], added 2026-08-06). Deflate/`PackBits` (the
+//!   `tiff` crate's other two compression options) remain unwritten —
+//!   LZW alone covers the "smaller file, still universally readable"
+//!   case this exists for.
 //! - Colour space round-trips for real now (added 2026-08-06):
 //!   [`decode`] reads the standard `ICCProfile` tag (34675) if present
 //!   (`aurora_color::IccProfile::from_bytes`), falling back to
@@ -71,19 +75,50 @@ use crate::image::Image;
 const ICC_PROFILE_TAG: u16 = 34675;
 
 /// Decodes `bytes` (a whole TIFF file's own contents) into a real
-/// [`Image`] — only the first image (IFD) in the file, see this
-/// module's own doc comment.
+/// [`Image`] — only the first image (IFD) in the file; see
+/// [`decode_all`] for every one.
 ///
 /// # Errors
 ///
-/// Returns [`IoError::TiffDecode`] if `bytes` isn't a valid TIFF,
-/// [`IoError::UnsupportedTiffColorType`] for a photometric layout this
-/// crate doesn't handle yet, [`IoError::UnsupportedTiffSampleFormat`]
-/// for a sample type other than 8-/16-bit unsigned integers or 32-bit
-/// float, or [`IoError::Color`] if an embedded `ICCProfile` tag's own
-/// bytes fail to parse.
+/// See `decode_current_image`.
 pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
     let mut decoder = Decoder::new(Cursor::new(bytes))?;
+    decode_current_image(&mut decoder)
+}
+
+/// Decodes `bytes` into one real [`Image`] per IFD, in file order —
+/// the real multi-page counterpart [`decode`] itself doesn't attempt.
+///
+/// # Errors
+///
+/// See `decode_current_image` — the first page to fail any of its own
+/// checks aborts the whole call, rather than returning however many
+/// pages decoded before it (a partial `Vec<Image>` with no way to tell
+/// the caller it's incomplete would be a worse failure mode than a
+/// clean, whole-file error).
+pub fn decode_all(bytes: &[u8]) -> Result<Vec<Image>, IoError> {
+    let mut decoder = Decoder::new(Cursor::new(bytes))?;
+    let mut images = vec![decode_current_image(&mut decoder)?];
+    while decoder.more_images() {
+        decoder.next_image()?;
+        images.push(decode_current_image(&mut decoder)?);
+    }
+    Ok(images)
+}
+
+/// [`decode`]/[`decode_all`]'s own shared per-IFD logic: `decoder`'s
+/// *current* image (whichever `Decoder::new`/`Decoder::next_image` most
+/// recently selected) into a real [`Image`].
+///
+/// # Errors
+///
+/// Returns [`IoError::UnsupportedTiffColorType`] for a photometric
+/// layout this crate doesn't handle yet, [`IoError::UnsupportedTiffSampleFormat`]
+/// for a sample type other than 8-/16-bit unsigned integers or
+/// 16-/32-bit float, [`IoError::Color`] if an embedded `ICCProfile`
+/// tag's own bytes fail to parse, or [`IoError::TiffDecode`] for any
+/// other real decode failure.
+fn decode_current_image(decoder: &mut Decoder<Cursor<&[u8]>>) -> Result<Image, IoError> {
     let (width, height) = decoder.dimensions()?;
     let color_type = decoder.colortype()?;
     let color_space = match decoder.find_tag(Tag::Unknown(ICC_PROFILE_TAG))? {
@@ -162,17 +197,12 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
     Image::new(width, height, color_space, samples)
 }
 
-/// Encodes `image` as an uncompressed, 8-bit RGBA TIFF — the export
-/// half of invariant §7.3.1b's 8-bit boundary, using [`dither_quantize`]
-/// rather than plain rounding so a smooth gradient doesn't band on the
-/// way out. Embeds `image.color_space()`'s own real bytes as the
-/// standard `ICCProfile` tag — see this module's own doc comment.
-///
-/// # Errors
-///
-/// Returns [`IoError::Color`] if `image.color_space()` fails to
-/// serialize, or [`IoError::TiffEncode`] if the encoder itself fails.
-pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
+/// `image`'s own samples, dither-quantized to 8-bit RGBA — the shared
+/// pixel-preparation step [`encode`]/[`encode_compressed`] both need,
+/// using [`dither_quantize`] rather than plain rounding so a smooth
+/// gradient doesn't band on the way out (invariant §7.3.1b's own 8-bit
+/// export boundary).
+fn quantize_rgba8(image: &Image) -> Vec<u8> {
     let width = image.width();
     let mut rgba8 = Vec::with_capacity(image.samples().len());
     for (index, &sample) in image.samples().iter().enumerate() {
@@ -182,13 +212,63 @@ pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
         let y = pixel_index / width.max(1);
         rgba8.push(dither_quantize(sample.to_f32(), x, y));
     }
+    rgba8
+}
+
+/// Encodes `image` as an uncompressed, 8-bit RGBA TIFF. Embeds
+/// `image.color_space()`'s own real bytes as the standard `ICCProfile`
+/// tag — see this module's own doc comment. See [`encode_compressed`]
+/// for the real, LZW-compressed counterpart.
+///
+/// # Errors
+///
+/// Returns [`IoError::Color`] if `image.color_space()` fails to
+/// serialize, or [`IoError::TiffEncode`] if the encoder itself fails.
+pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
+    let rgba8 = quantize_rgba8(image);
     let profile_bytes = image.color_space().to_bytes()?;
 
     let mut bytes = Cursor::new(Vec::new());
     {
         let mut encoder = TiffEncoder::new(&mut bytes).map_err(IoError::TiffEncode)?;
         let mut image_encoder = encoder
-            .new_image::<RGBA8>(width, image.height())
+            .new_image::<RGBA8>(image.width(), image.height())
+            .map_err(IoError::TiffEncode)?;
+        image_encoder
+            .encoder()
+            .write_tag(Tag::Unknown(ICC_PROFILE_TAG), profile_bytes.as_slice())
+            .map_err(IoError::TiffEncode)?;
+        image_encoder
+            .write_data(&rgba8)
+            .map_err(IoError::TiffEncode)?;
+    }
+    Ok(bytes.into_inner())
+}
+
+/// Encodes `image` as an LZW-compressed, 8-bit RGBA TIFF — real,
+/// separate follow-on work [`encode`]'s own doc comment used to name as
+/// still open. LZW specifically (not Deflate/`PackBits`, the `tiff`
+/// crate's other two options): lossless, and the one every mainstream
+/// TIFF reader (this crate's own [`decode`] included — the `tiff` crate
+/// already supports LZW *decode*) is guaranteed to understand, unlike
+/// Deflate-compressed TIFF, which is real but less universally
+/// supported.
+///
+/// # Errors
+///
+/// Returns [`IoError::Color`] if `image.color_space()` fails to
+/// serialize, or [`IoError::TiffEncode`] if the encoder itself fails.
+pub fn encode_compressed(image: &Image) -> Result<Vec<u8>, IoError> {
+    let rgba8 = quantize_rgba8(image);
+    let profile_bytes = image.color_space().to_bytes()?;
+
+    let mut bytes = Cursor::new(Vec::new());
+    {
+        let mut encoder = TiffEncoder::new(&mut bytes)
+            .map_err(IoError::TiffEncode)?
+            .with_compression(tiff::encoder::Compression::Lzw);
+        let mut image_encoder = encoder
+            .new_image::<RGBA8>(image.width(), image.height())
             .map_err(IoError::TiffEncode)?;
         image_encoder
             .encoder()
@@ -203,7 +283,7 @@ pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode};
+    use super::{decode, decode_all, encode, encode_compressed};
     use crate::Image;
     use aurora_color::{IccProfile, promote_u8, quantize_u8};
     use half::f16;
@@ -459,5 +539,128 @@ mod tests {
             Err(crate::IoError::UnsupportedTiffSampleFormat("64-bit float")) => {}
             other => unreachable!("expected UnsupportedTiffSampleFormat, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_all_reads_every_ifd_in_a_real_multi_page_tiff() {
+        // Built independently of this module's own `encode` -- three
+        // real pages, each a single distinctly-valued pixel, written to
+        // the *same* `TiffEncoder` (which chains each `write_image`
+        // call into the next IFD automatically) so `decode_all` has
+        // real, order-dependent content to prove it reads all three in
+        // file order, not just however many happen to decode.
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let mut tiff_encoder = match tiff::encoder::TiffEncoder::new(&mut bytes) {
+                Ok(encoder) => encoder,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            for value in [10u8, 20, 30] {
+                if let Err(err) =
+                    tiff_encoder.write_image::<tiff::encoder::colortype::Gray8>(1, 1, &[value])
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+
+        let images = match decode_all(bytes.get_ref()) {
+            Ok(images) => images,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            images.len(),
+            3,
+            "must read all three pages, not just the first"
+        );
+
+        let expected = [promote_u8(10), promote_u8(20), promote_u8(30)];
+        for (image, &want) in images.iter().zip(expected.iter()) {
+            let Some(&red) = image.samples().first() else {
+                unreachable!("a 1x1 image always has at least one sample");
+            };
+            assert!(
+                (red.to_f32() - want).abs() < 1e-3,
+                "page order must match file order: expected ~{want}, got {}",
+                red.to_f32()
+            );
+        }
+    }
+
+    #[test]
+    fn decode_reads_the_first_page_of_a_multi_page_tiff_the_same_as_decode_all() {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            let mut tiff_encoder = match tiff::encoder::TiffEncoder::new(&mut bytes) {
+                Ok(encoder) => encoder,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            for value in [42u8, 99] {
+                if let Err(err) =
+                    tiff_encoder.write_image::<tiff::encoder::colortype::Gray8>(1, 1, &[value])
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+
+        let single = match decode(bytes.get_ref()) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let all = match decode_all(bytes.get_ref()) {
+            Ok(images) => images,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(first_of_all) = all.first() else {
+            unreachable!("just wrote two real pages");
+        };
+        assert_eq!(single.samples(), first_of_all.samples());
+    }
+
+    #[test]
+    fn encode_compressed_round_trips_the_same_pixels_as_encode() {
+        // A large, solid-colour image -- real content LZW actually
+        // compresses well, so a size-comparison assertion below means
+        // something rather than being lucky noise on a 1x1 test image.
+        let width = 64;
+        let height = 64;
+        let samples: Vec<f16> = (0..width * height * 4)
+            .map(|i| f16::from_f32(promote_u8(if i % 4 == 3 { 255 } else { 80 })))
+            .collect();
+        let image = match Image::new(width, height, IccProfile::srgb(), samples) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let plain = match encode(&image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let compressed = match encode_compressed(&image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            compressed.len() < plain.len(),
+            "LZW must actually shrink a real, compressible image: \
+             {} plain vs {} compressed bytes",
+            plain.len(),
+            compressed.len()
+        );
+
+        let decoded_plain = match decode(&plain) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let decoded_compressed = match decode(&compressed) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            decoded_plain.samples(),
+            decoded_compressed.samples(),
+            "LZW is lossless -- both encodings must decode to identical pixels"
+        );
     }
 }
