@@ -17,6 +17,12 @@
 //! `compressed` exists because `lz4` can *expand* incompressible data
 //! (rare, but real for dense noise) — falling back to a raw payload
 //! rather than storing an expanded blob is the defensive choice.
+//!
+//! Public (not `pub(crate)`) since [ADR 0009](../../../docs/adr/0009-aur-document-format.md)
+//! names this exact format as what a `.aur` file's own per-tile ZIP
+//! entries hold verbatim — `aurora_io::aur` calls [`encode`]/[`decode`]
+//! directly rather than this crate inventing a second on-disk tile
+//! encoding at the document level.
 
 use crate::error::TileError;
 use half::f16;

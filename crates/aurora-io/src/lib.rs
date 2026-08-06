@@ -22,8 +22,14 @@
 //! (ADR 0010), and [`import::decode_by_extension`]/
 //! [`import::encode_by_extension`] pick `png`/`jpeg`/`tiff` by a file's
 //! own extension — the dispatchers a real "Open File"/"Save/Export"
-//! flow needs. PSD/PSB remains open.
+//! flow needs. [`aur`] is the real document format ([ADR
+//! 0009](../../../docs/adr/0009-aur-document-format.md)): a full
+//! `aurora_doc::LayerTree`/`History` plus every pixel layer's own
+//! tiles, round-tripped through a `.aur` file — the answer to what
+//! `png`/`jpeg`/`tiff` structurally can't do (more than one flat
+//! image). PSD/PSB remains open.
 
+pub mod aur;
 mod channels;
 mod error;
 mod image;
@@ -32,6 +38,7 @@ pub mod jpeg;
 pub mod png;
 pub mod tiff;
 
+pub use aur::{read as read_aur, write as write_aur};
 pub use error::IoError;
 pub use image::Image;
 pub use import::{decode_by_extension, encode_by_extension, read_from_store, write_into_store};

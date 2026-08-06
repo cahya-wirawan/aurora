@@ -69,4 +69,31 @@ pub enum IoError {
     /// that exists.
     #[error("unsupported file extension: {0:?}")]
     UnsupportedExtension(String),
+    /// A `.aur` file's own ZIP container ([`crate::aur`], ADR 0009)
+    /// failed to read or write.
+    #[error("failed to read/write the .aur container: {0}")]
+    Zip(#[from] zip::result::ZipError),
+    /// Raw I/O within a `.aur` container entry (as opposed to
+    /// [`IoError::Zip`], which is the ZIP format itself) — e.g. reading
+    /// a tile entry's own bytes.
+    #[error("I/O error reading/writing a .aur entry: {0}")]
+    Io(#[from] std::io::Error),
+    /// A `.aur` file's `LayerTree` mutation ([`crate::aur::read`]
+    /// rebuilding an active layer's own bounds, or similar) failed.
+    #[error("failed to rebuild the document from a .aur file: {0}")]
+    Doc(#[from] aurora_doc::DocError),
+    /// [`crate::aur::write`] failed to serialize the manifest entry.
+    #[error("failed to serialize the .aur manifest: {0}")]
+    ManifestSerialization(String),
+    /// [`crate::aur::read`] failed to deserialize the manifest entry —
+    /// corrupted, truncated, or from an incompatible future schema
+    /// version (see [`crate::aur`]'s own doc comment for the
+    /// forward-compatibility policy ADR 0009 sets).
+    #[error("failed to deserialize the .aur manifest: {0}")]
+    ManifestDeserialization(String),
+    /// [`crate::aur::read`] found a required entry (the manifest or the
+    /// history) missing from the ZIP container — not a valid `.aur`
+    /// file, or one truncated/corrupted past recovery.
+    #[error(".aur file is missing its own required {0:?} entry")]
+    MissingEntry(&'static str),
 }

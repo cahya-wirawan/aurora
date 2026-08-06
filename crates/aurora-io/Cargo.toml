@@ -24,6 +24,9 @@ png = { workspace = true }
 zune-jpeg = { workspace = true }
 jpeg-encoder = { workspace = true }
 tiff = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

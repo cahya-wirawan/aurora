@@ -12,7 +12,7 @@
 //! `aurora-graph`/`aurora-brush`) — this crate owns storage, paging,
 //! compression, and dirty-rectangle *carrying* only.
 
-mod codec;
+pub mod codec;
 mod error;
 mod store;
 mod tile;
