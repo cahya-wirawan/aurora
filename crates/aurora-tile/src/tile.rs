@@ -41,7 +41,13 @@ pub const SAMPLES: usize = TEXELS * CHANNELS;
 
 /// Identifies one tile by its grid position in document space (not a
 /// pixel coordinate — tile `(1, 0)` covers pixels `256..512` in x).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+///
+/// `Serialize`/`Deserialize`: a `.aur` file (ADR 0009) names each tile's
+/// own ZIP entry by its `(SurfaceId, TileId)` pair — this is the half of
+/// that pair `aurora-tile` itself owns.
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct TileId {
     pub x: u32,
     pub y: u32,
@@ -115,8 +121,22 @@ impl Tile {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHANNELS, SAMPLES, TEXELS, TILE, Tile};
+    use super::{CHANNELS, SAMPLES, TEXELS, TILE, Tile, TileId};
     use aurora_core::Rect;
+
+    #[test]
+    fn tile_id_round_trips_through_real_postcard_bytes() {
+        let id = TileId { x: 3, y: 7 };
+        let bytes = match postcard::to_allocvec(&id) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let restored: TileId = match postcard::from_bytes(&bytes) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(restored, id);
+    }
 
     #[test]
     fn tile_dimensions_match_adr_0005() {

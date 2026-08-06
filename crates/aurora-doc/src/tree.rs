@@ -59,6 +59,13 @@ pub(crate) struct RemovedSubtree {
 /// interpret them. Any layer, pixel or group, may also carry one
 /// [`LayerMask`] (see [`Self::add_mask`] and neighbours) — likewise
 /// stored state only, no real mask pixels yet.
+///
+/// `Serialize`/`Deserialize`: a `.aur` file's own manifest entry (ADR
+/// 0009) is the whole tree, `postcard`-encoded — every field here
+/// (including `ids`, via `IdGenerator`'s own hand-written impl) needs to
+/// round-trip so a reloaded document keeps allocating fresh, non-
+/// colliding `LayerId`s rather than restarting the counter from `0`.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct LayerTree {
     ids: IdGenerator<Layer>,
     layers: HashMap<LayerId, LayerEntry>,
@@ -697,6 +704,65 @@ mod tests {
             width: 10,
             height: 10,
         }
+    }
+
+    #[test]
+    // Exact-literal round-trip through real postcard bytes, no
+    // arithmetic -- same reasoning this crate's other float_cmp allows
+    // already document.
+    #[allow(clippy::float_cmp)]
+    fn layer_tree_round_trips_through_real_postcard_bytes() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match tree.add_pixel_layer("child", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_opacity(child, 0.5) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_blend_mode(child, BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.add_mask(child, bounds()) {
+            unreachable!("{err:?}");
+        }
+
+        let bytes = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut restored: LayerTree = match postcard::from_bytes(&bytes) {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        assert_eq!(restored.roots(), &[group]);
+        assert_eq!(restored.children(group), Some([child].as_slice()));
+        assert_eq!(restored.opacity(child), Some(0.5));
+        assert_eq!(restored.blend_mode(child), Some(BlendMode::Multiply));
+        assert_eq!(
+            restored.mask(child),
+            Some(&LayerMask {
+                bounds: bounds(),
+                enabled: true,
+                inverted: false,
+            })
+        );
+
+        // The restored tree's own id generator must keep counting from
+        // where the saved one left off -- not restart from 0 and
+        // eventually hand out an id (`group`'s or `child`'s) that
+        // already exists.
+        let fresh = match restored.add_pixel_layer("new", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_ne!(fresh, group);
+        assert_ne!(fresh, child);
     }
 
     #[test]

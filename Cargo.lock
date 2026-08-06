@@ -650,6 +650,8 @@ dependencies = [
  "half",
  "lru",
  "lz4_flex",
+ "postcard",
+ "serde",
  "tempfile",
  "thiserror 2.0.19",
  "tracing",

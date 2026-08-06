@@ -19,10 +19,12 @@ tracing = { workspace = true }
 half = { workspace = true }
 lru = { workspace = true }
 lz4_flex = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+postcard = { workspace = true }
 
 [[bench]]
 name = "tile_store"
