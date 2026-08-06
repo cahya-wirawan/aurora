@@ -209,13 +209,10 @@
 //! result into the active `Drag::Brush`/`Drag::Eraser`'s own `stroke`
 //! field; `Self::handle_pointer_released` pushes the completed stroke
 //! onto `Self::pixel_history` once the drag ends. `Ctrl+Z`/
-//! `Ctrl+Shift+Z` (`run_command`) check `pixel_history` first and fall
-//! back to `history` — a real, useful default (a stroke is usually the
-//! most recent thing to undo), but **not a unified chronological
-//! stack**: undoing right after a Move that itself followed a stroke
-//! undoes the stroke, not the more-recent Move. See `run_command`'s own
-//! doc comment for the full policy and why unifying the two for real is
-//! separate, still-open follow-on work.
+//! `Ctrl+Shift+Z` (`run_command`) checked `pixel_history` first and
+//! fell back to `history` at the time — a real, useful default, but not
+//! the actual chronological order; see the "unified undo/redo"
+//! paragraph below for how that was later replaced with the real thing.
 //!
 //! **Command palette and native menu Undo/Redo, also 2026-08-06**:
 //! `Ctrl+Z`/`Ctrl+Shift+Z` were the only way to reach either command
@@ -236,6 +233,29 @@
 //! Undo/Redo items, since this crate's shortcuts bind literal `Ctrl+Z`
 //! even on macOS and showing a `⌘Z` hint the app doesn't actually
 //! respond to would be misleading.
+//!
+//! **Unified undo/redo, also 2026-08-06** — closes the gap the
+//! Pixel-edit undo paragraph above named: `Ctrl+Z`/`Ctrl+Shift+Z` now
+//! walk `history`'s structural entries and `pixel_history`'s stroke
+//! entries as one true chronological sequence, not "pixel first, then
+//! fall back." `UndoOrder`, a new small type, is the mechanism — it
+//! doesn't hold either kind of edit itself (`aurora_doc::LayerOp` stays
+//! private to that crate; a `StrokeSnapshot` stays owned by
+//! `pixel_history`), only a `Vec<UndoKind>` tagging *which* backing
+//! store's own top entry is actually next, in the order edits were
+//! really committed. `Self::apply_move`/`Self::handle_pointer_released`
+//! record into it (via `UndoOrder::record`, which also clears both
+//! backing stores' own redo stacks — `history.clear_redo`/
+//! `pixel_history.clear_redo`, both new — so a pixel edit correctly
+//! invalidates a pending structural redo and vice versa, something two
+//! fully independent stacks couldn't do for each other before);
+//! `run_command`'s `Undo`/`Redo` arms consult `UndoOrder` first to find
+//! out which store to actually call. Opening a new document
+//! (`Self::open_file`/`Self::open_aur_file`) now resets
+//! `pixel_history`/`undo_order` alongside `history` — a real, related
+//! bug fixed as a side effect: previously `pixel_history` outlived a
+//! document switch untouched, so `Ctrl+Z` could reach into a stroke
+//! from a document that was no longer open.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
@@ -1348,32 +1368,77 @@ fn toggle_command_palette(
     }
 }
 
+/// Which backing stack a completed edit actually lives in — the tag
+/// [`UndoOrder`] itself is built from. See that type's own doc comment
+/// for why this indirection exists at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndoKind {
+    Structural,
+    Pixel,
+}
+
+/// The one true chronological order `Ctrl+Z`/`Ctrl+Shift+Z` walk across
+/// `aurora_doc::History`'s own structural entries (so far, just Move)
+/// and `aurora_brush::PixelHistory`'s own stroke entries — what makes
+/// two otherwise fully independent stacks undo/redo as a single
+/// sequence. Neither backing type knows about the other (PRD §7.2's own
+/// layering: `aurora-brush` and `aurora-doc` are sibling crates,
+/// neither depending on the other), so `aurora-app`, which depends on
+/// both, is where the interleaving has to live. This records only
+/// *which* stack a completed edit belongs to, in the order it actually
+/// happened — the edit's own content (the `LayerOp`, the
+/// `StrokeSnapshot`) stays exactly where it already lived, in that
+/// backing store's own stack; undoing/redoing here means popping a tag
+/// from `self` and asking the matching backing store to actually do it.
+#[derive(Debug, Default)]
+struct UndoOrder {
+    undo: Vec<UndoKind>,
+    redo: Vec<UndoKind>,
+}
+
+impl UndoOrder {
+    /// Records that an edit of `kind` was just committed to its own
+    /// backing store: pushes it onto the unified undo order and
+    /// invalidates every pending redo — in this order's own
+    /// bookkeeping *and* in both backing stores' own internal redo
+    /// stacks (`history.clear_redo`/`pixel_history.clear_redo`), so
+    /// neither can report a redo the unified order itself has already
+    /// discarded. The backing store `kind` itself just recorded through
+    /// already cleared its own redo stack as a side effect of being
+    /// recorded through (`History`'s/`PixelHistory`'s own `push`-style
+    /// methods) — clearing it again here is a harmless no-op; the
+    /// *other* store's clear is the one that actually matters.
+    fn record(
+        &mut self,
+        kind: UndoKind,
+        history: &mut aurora_doc::History,
+        pixel_history: &mut aurora_brush::PixelHistory,
+    ) {
+        self.undo.push(kind);
+        self.redo.clear();
+        history.clear_redo();
+        pixel_history.clear_redo();
+    }
+}
+
 /// Runs a global shortcut's own command — [`handle_key`]'s dispatch
 /// target once a [`KeyChord`] resolves via [`ShortcutRegistry::resolve`].
 ///
-/// **`Undo`/`Redo`'s own policy, stated honestly**: `aurora-brush`'s
-/// `pixel_history` (a completed Brush/Eraser stroke) and
-/// `aurora-doc`'s `history` (a structural edit — so far, just Move) are
-/// two genuinely separate stacks, not one unified chronological journal
-/// — `aurora-brush` doesn't depend on `aurora-doc` (PRD §7.2's own
-/// layering), so there is no shared "most recent action, whatever kind"
-/// order to interleave them into from either side. This picks
-/// `pixel_history` first whenever it has something to undo/redo,
-/// falling back to `history` otherwise — a real, useful default (a
-/// stroke is usually the most recent thing a user reaches to undo), but
-/// not always the *chronologically* correct one: pressing `Ctrl+Z`
-/// right after a Move that itself followed a stroke undoes the stroke,
-/// not the more-recent Move. Unifying the two into one real
-/// chronological stack is separate, still-open follow-on work. Both
-/// paths can fail (mixing a direct `LayerTree`/`TileStore` call with
-/// recorded ones — see `History`'s and `PixelHistory`'s own doc
-/// comments); logged rather than propagated, the same "a bad input
-/// mustn't crash the event loop" shape every other handler in this
-/// section already follows. A structural undo/redo refreshes the
-/// History panel afterward ([`refresh_history_panel`]) since undoing/
-/// redoing is itself a journaled step; a pixel undo/redo has no such
-/// panel to refresh — the canvas alone shows the result, on the next
-/// redraw.
+/// `Undo`/`Redo` consult [`UndoOrder`] first to find out *which*
+/// backing store's own top entry is actually next, then delegate to
+/// that store (`history.undo`/`pixel_history.undo`, or the `redo`
+/// equivalents) to do the real work — see `UndoOrder`'s own doc comment
+/// for why this indirection exists. A pixel undo/redo with no live
+/// `TileStore` is logged and left exactly as it was (the popped-but-
+/// not-yet-removed order entry is never removed, so nothing desyncs);
+/// either path failing for its own reason (an unknown layer id mixed in
+/// from outside `History`; a real `TileError` restoring a captured
+/// tile) is logged too, the same "a bad input mustn't crash the event
+/// loop" shape every other handler in this section already follows. A
+/// structural undo/redo refreshes the History panel afterward
+/// ([`refresh_history_panel`]) since undoing/redoing is itself a
+/// journaled step; a pixel undo/redo has no such panel to refresh — the
+/// canvas alone shows the result, on the next redraw.
 #[allow(clippy::too_many_arguments)]
 fn run_command(
     workspace: &mut aurora_ui::Workspace,
@@ -1384,6 +1449,7 @@ fn run_command(
     history: &mut aurora_doc::History,
     pixel_history: &mut aurora_brush::PixelHistory,
     store: Option<&mut aurora_tile::TileStore>,
+    undo_order: &mut UndoOrder,
     command: AppCommand,
 ) {
     match command {
@@ -1395,66 +1461,60 @@ fn run_command(
         }
         AppCommand::ToggleCommandPalette => toggle_command_palette(workspace, focus, palette),
         AppCommand::SelectTool(selected) => *tool = selected,
-        AppCommand::Undo => {
-            if pixel_history.can_undo() {
-                run_pixel_undo(
-                    pixel_history,
-                    store,
-                    aurora_brush::PixelHistory::undo,
-                    "undo",
-                );
-            } else {
-                match history.undo(layers) {
-                    Ok(_) => refresh_history_panel(workspace, history),
-                    Err(err) => tracing::warn!(?err, "undo failed"),
+        AppCommand::Undo => match undo_order.undo.last().copied() {
+            Some(UndoKind::Structural) => match history.undo(layers) {
+                Ok(_) => {
+                    undo_order.undo.pop();
+                    undo_order.redo.push(UndoKind::Structural);
+                    refresh_history_panel(workspace, history);
+                }
+                Err(err) => tracing::warn!(?err, "undo failed"),
+            },
+            Some(UndoKind::Pixel) => {
+                if let Some(store) = store {
+                    match pixel_history.undo(store) {
+                        Ok(true) => {
+                            undo_order.undo.pop();
+                            undo_order.redo.push(UndoKind::Pixel);
+                        }
+                        Ok(false) => {
+                            tracing::warn!("pixel history had nothing to undo, unexpectedly");
+                        }
+                        Err(err) => tracing::warn!(?err, "pixel undo failed"),
+                    }
+                } else {
+                    tracing::warn!("no live tile store; cannot undo a pixel edit");
                 }
             }
-        }
-        AppCommand::Redo => {
-            if pixel_history.can_redo() {
-                run_pixel_undo(
-                    pixel_history,
-                    store,
-                    aurora_brush::PixelHistory::redo,
-                    "redo",
-                );
-            } else {
-                match history.redo(layers) {
-                    Ok(_) => refresh_history_panel(workspace, history),
-                    Err(err) => tracing::warn!(?err, "redo failed"),
+            None => {}
+        },
+        AppCommand::Redo => match undo_order.redo.last().copied() {
+            Some(UndoKind::Structural) => match history.redo(layers) {
+                Ok(_) => {
+                    undo_order.redo.pop();
+                    undo_order.undo.push(UndoKind::Structural);
+                    refresh_history_panel(workspace, history);
+                }
+                Err(err) => tracing::warn!(?err, "redo failed"),
+            },
+            Some(UndoKind::Pixel) => {
+                if let Some(store) = store {
+                    match pixel_history.redo(store) {
+                        Ok(true) => {
+                            undo_order.redo.pop();
+                            undo_order.undo.push(UndoKind::Pixel);
+                        }
+                        Ok(false) => {
+                            tracing::warn!("pixel history had nothing to redo, unexpectedly");
+                        }
+                        Err(err) => tracing::warn!(?err, "pixel redo failed"),
+                    }
+                } else {
+                    tracing::warn!("no live tile store; cannot redo a pixel edit");
                 }
             }
-        }
-    }
-}
-
-/// [`aurora_brush::PixelHistory::undo`]/`::redo`'s own shared shape —
-/// what [`run_pixel_undo`]'s own `op` parameter names.
-type PixelHistoryOp = fn(
-    &mut aurora_brush::PixelHistory,
-    &mut aurora_tile::TileStore,
-) -> Result<bool, aurora_tile::TileError>;
-
-/// Runs `op` (`PixelHistory::undo` or `::redo`) against `pixel_history`
-/// and `store`, logging under `verb` (`"undo"`/`"redo"`, for the log
-/// message alone) on either kind of failure — no live `TileStore` to
-/// restore into (painting is already silently disabled for the session
-/// in that case, same as everywhere else in this crate) or a real
-/// `TileError` restoring a captured tile. Factored out since
-/// [`run_command`]'s own `Undo`/`Redo` arms are otherwise identical but
-/// for which `PixelHistory` method to call.
-fn run_pixel_undo(
-    pixel_history: &mut aurora_brush::PixelHistory,
-    store: Option<&mut aurora_tile::TileStore>,
-    op: PixelHistoryOp,
-    verb: &str,
-) {
-    let Some(store) = store else {
-        tracing::warn!(verb, "no live tile store; cannot undo/redo a pixel edit");
-        return;
-    };
-    if let Err(err) = op(pixel_history, store) {
-        tracing::warn!(?err, verb, "pixel undo/redo failed");
+            None => {}
+        },
     }
 }
 
@@ -1580,7 +1640,8 @@ fn handle_palette_key(
 /// otherwise a chord that resolves in `shortcuts` runs its command
 /// ([`run_command`], which is also where a tool-switch shortcut updates
 /// `tool` and `Ctrl+Z`/`Ctrl+Shift+Z` undo/redo against `layers`/
-/// `history`). Anything else (an unbound chord, with nothing modal open) is
+/// `history`/`pixel_history`, in `undo_order`'s own unified sequence).
+/// Anything else (an unbound chord, with nothing modal open) is
 /// silently ignored — there's no text field to fall back to routing
 /// into yet.
 ///
@@ -1601,6 +1662,7 @@ fn handle_key(
     history: &mut aurora_doc::History,
     pixel_history: &mut aurora_brush::PixelHistory,
     store: Option<&mut aurora_tile::TileStore>,
+    undo_order: &mut UndoOrder,
     shortcuts: &ShortcutRegistry<AppCommand>,
     modifiers: Modifiers,
     key: Key,
@@ -1634,6 +1696,7 @@ fn handle_key(
             history,
             pixel_history,
             store,
+            undo_order,
             command,
         );
     }
@@ -2626,13 +2689,23 @@ struct App {
     /// Undo/redo for completed Brush/Eraser strokes
     /// (`aurora_brush::PixelHistory`) — the pixel-edit half `history`
     /// structurally can't cover (a stroke is raw pixel data, not a
-    /// `LayerOp`). A genuinely separate stack, not unified with
-    /// `history` into one chronological journal — see [`run_command`]'s
-    /// own doc comment for the policy `Ctrl+Z`/`Ctrl+Shift+Z` use when
-    /// both have something to offer, and why. Populated by
-    /// `Self::handle_pointer_released` once a `Drag::Brush`/
-    /// `Drag::Eraser`'s own accumulated `StrokeSnapshot` completes.
+    /// `LayerOp`). Still a separate stack internally (neither type knows
+    /// about the other), but `Ctrl+Z`/`Ctrl+Shift+Z` walk it and
+    /// `history` as one true chronological sequence via
+    /// [`Self::undo_order`]. Populated by `Self::handle_pointer_released`
+    /// once a `Drag::Brush`/`Drag::Eraser`'s own accumulated
+    /// `StrokeSnapshot` completes.
     pixel_history: aurora_brush::PixelHistory,
+    /// The real interleaving order `Ctrl+Z`/`Ctrl+Shift+Z` walk across
+    /// `history`'s own structural entries and `pixel_history`'s own
+    /// stroke entries — see [`UndoOrder`]'s own doc comment for why this
+    /// exists at all (`aurora-brush` and `aurora-doc` are sibling
+    /// crates, neither depending on the other, so neither can know about
+    /// the other's own activity). `Self::apply_move`/
+    /// `Self::handle_pointer_released` record into it; `run_command`
+    /// consults it to decide which backing store `Ctrl+Z`/
+    /// `Ctrl+Shift+Z` should actually reach into next.
+    undo_order: UndoOrder,
     /// The layer the Brush/Eraser tools paint/erase into and the Move
     /// tool repositions, if any — the topmost pixel layer of `layers`
     /// at construction time ([`topmost_pixel_layer`]), real-time-
@@ -2791,6 +2864,7 @@ impl App {
             layers,
             history,
             pixel_history: aurora_brush::PixelHistory::new(),
+            undo_order: UndoOrder::default(),
             active_layer,
             current_colour: DEFAULT_COLOUR,
             layer_rows,
@@ -2851,6 +2925,7 @@ impl App {
             &mut self.history,
             &mut self.pixel_history,
             self.tile_store.as_mut(),
+            &mut self.undo_order,
             &self.shortcuts,
             self.modifiers,
             key,
@@ -2886,6 +2961,7 @@ impl App {
             &mut self.history,
             &mut self.pixel_history,
             self.tile_store.as_mut(),
+            &mut self.undo_order,
             command,
         );
     }
@@ -2958,6 +3034,15 @@ impl App {
 
         self.layers = layers;
         self.history = history;
+        // A freshly opened document has no relationship to the previous
+        // one's own undo state either -- `self.history` above is a
+        // brand-new, empty `History` (not merged with the old one), so
+        // keeping the old `pixel_history`/`undo_order` around would let
+        // Ctrl+Z reach into a document that's no longer open, and
+        // `undo_order` would already be desynced from `history`'s own
+        // (now-empty) stacks regardless.
+        self.pixel_history = aurora_brush::PixelHistory::new();
+        self.undo_order = UndoOrder::default();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
@@ -3017,6 +3102,9 @@ impl App {
 
         self.layers = layers;
         self.history = history;
+        // See the same reset in `Self::open_file`'s own flat-image path.
+        self.pixel_history = aurora_brush::PixelHistory::new();
+        self.undo_order = UndoOrder::default();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
@@ -3382,20 +3470,29 @@ impl App {
     /// ([`Self::handle_pointer_moved`]). Recorded through `self.history`
     /// (unlike [`Self::paint_dab`]/[`Self::erase_dab`], which still
     /// bypass it — see `Self::history`'s own doc comment for why pixel
-    /// edits are a separate case), so a completed Move is a real,
-    /// `Ctrl+Z`-undoable step — one entry per pointer-move event, not one
-    /// per drag (every intermediate position along the drag becomes its
-    /// own undo step; undoing several times during a slow drag steps
-    /// back through the intermediate positions rather than jumping
-    /// straight to where the drag began). A real, logged failure (an
-    /// unknown or non-pixel `layer_id`) shouldn't happen in practice —
-    /// `layer_id` always comes from `Drag::Move` itself, set from a real
-    /// active pixel layer when the drag began — but this reports rather
-    /// than assumes it, the same discipline every other fallible call in
-    /// this crate already applies.
+    /// edits are a separate case) and, on success, into
+    /// [`Self::undo_order`] too, so a completed Move is a real,
+    /// `Ctrl+Z`-undoable step in the *unified* order, not just
+    /// `history`'s own — one entry per pointer-move event, not one per
+    /// drag (every intermediate position along the drag becomes its own
+    /// undo step; undoing several times during a slow drag steps back
+    /// through the intermediate positions rather than jumping straight
+    /// to where the drag began). A real, logged failure (an unknown or
+    /// non-pixel `layer_id`) shouldn't happen in practice — `layer_id`
+    /// always comes from `Drag::Move` itself, set from a real active
+    /// pixel layer when the drag began — but this reports rather than
+    /// assumes it, the same discipline every other fallible call in this
+    /// crate already applies.
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
-        if let Err(err) = self.history.set_bounds(&mut self.layers, layer_id, bounds) {
-            tracing::warn!(?err, "failed to reposition the active layer");
+        match self.history.set_bounds(&mut self.layers, layer_id, bounds) {
+            Ok(_) => {
+                self.undo_order.record(
+                    UndoKind::Structural,
+                    &mut self.history,
+                    &mut self.pixel_history,
+                );
+            }
+            Err(err) => tracing::warn!(?err, "failed to reposition the active layer"),
         }
     }
 
@@ -3441,11 +3538,14 @@ impl App {
     /// window only ever has one drag in progress at a time.
     ///
     /// If the ending drag was a `Drag::Brush`/`Drag::Eraser` with a real
-    /// `stroke`, pushes it onto [`Self::pixel_history`]
-    /// (`aurora_brush::PixelHistory::push`'s own no-op-for-an-empty-
-    /// stroke behaviour handles a click/drag that never actually
-    /// touched a tile — e.g. a zero-radius brush, or no active layer at
-    /// all — without this needing to check that itself).
+    /// `stroke`, pushes it onto [`Self::pixel_history`] and, if that
+    /// actually recorded something, into [`Self::undo_order`] too — a
+    /// completed stroke becomes a real, `Ctrl+Z`-undoable step in the
+    /// unified order. `PixelHistory::push`'s own `bool` return (`false`
+    /// for an empty snapshot) is exactly what lets this tell "a real
+    /// stroke happened" apart from "a click/drag that never actually
+    /// touched a tile" (e.g. a zero-radius brush, or no active layer at
+    /// all) without checking `stroke.is_empty()` itself.
     fn handle_pointer_released(&mut self) {
         if let Some(
             Drag::Brush {
@@ -3457,8 +3557,10 @@ impl App {
                 ..
             },
         ) = self.drag.take()
+            && self.pixel_history.push(stroke)
         {
-            self.pixel_history.push(stroke);
+            self.undo_order
+                .record(UndoKind::Pixel, &mut self.history, &mut self.pixel_history);
         }
     }
 
@@ -3929,19 +4031,19 @@ mod tests {
         ActivatedCommand, AppCommand, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_UNDO,
         CRASH_RECOVERY_CONTINUE, ClipboardAccess, Drag, FileDialogAccess, Key, KeyChord, Modifiers,
-        NamedKey, PointerButton, activate_command, apply_scroll_zoom, autosave_path, begin_drag,
-        canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
-        close_command_palette, close_crash_recovery_dialog, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, default_shortcuts, demo_document, document_canvas_size,
-        document_from_image, handle_dialog_key, handle_dialog_pointer, handle_key,
-        handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point,
-        load_background_color, load_scales, logical_point, logical_size, open_command_palette,
-        open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
-        pointer_in_canvas, previous_session_left_a_marker, recomposite_visible_tiles,
-        recover_document, replace_document, run_command, sample_pixel, select_layer,
-        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        NamedKey, PointerButton, UndoKind, UndoOrder, activate_command, apply_scroll_zoom,
+        autosave_path, begin_drag, canvas_area_physical_rect, canvas_area_physical_size,
+        clear_session_marker, close_command_palette, close_crash_recovery_dialog,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message, default_shortcuts,
+        demo_document, document_canvas_size, document_from_image, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path,
+        layer_local_point, load_background_color, load_scales, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        palette_commands, pointer_in_canvas, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, run_command, sample_pixel,
+        select_layer, tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -4632,6 +4734,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
 
         run_command(
             &mut workspace,
@@ -4642,6 +4745,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.layers.root));
@@ -4654,6 +4758,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.properties.root));
@@ -4666,6 +4771,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.history.root));
@@ -4679,6 +4785,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::FocusPrevious,
         );
         assert_eq!(
@@ -4697,6 +4804,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
 
         run_command(
             &mut workspace,
@@ -4707,6 +4815,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::SelectTool(Tool::Pan),
         );
         assert_eq!(tool, Tool::Pan);
@@ -4740,6 +4849,11 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert_eq!(layers.bounds(id), Some(moved));
+        // Simulates what `App::apply_move` itself does after a
+        // successful `history.set_bounds` call, since this test drives
+        // `history` directly rather than through `App`.
+        let mut undo_order = UndoOrder::default();
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
 
         run_command(
             &mut workspace,
@@ -4750,6 +4864,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::Undo,
         );
         assert_eq!(layers.bounds(id), Some(bounds), "undo must revert the move");
@@ -4771,6 +4886,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::Redo,
         );
         assert_eq!(layers.bounds(id), Some(moved), "redo must reapply the move");
@@ -4785,6 +4901,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
 
         run_command(
             &mut workspace,
@@ -4795,6 +4912,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::Undo,
         );
         assert!(layers.is_empty());
@@ -4804,9 +4922,13 @@ mod tests {
     #[test]
     // Exact-literal round-trip through f16 storage, no arithmetic --
     // same reasoning `aurora-doc`'s own tests already document for
-    // their float_cmp allows.
-    #[allow(clippy::float_cmp)]
-    fn run_command_undo_prefers_a_pending_pixel_stroke_over_structural_history() {
+    // their float_cmp allows. Long because it walks a real four-step
+    // undo/redo sequence end to end -- splitting it into several
+    // same-length-total helper functions would just relocate the same
+    // lines, not reduce real complexity, the same reasoning
+    // `aurora_doc::history::apply` already documents for its own allow.
+    #[allow(clippy::float_cmp, clippy::too_many_lines)]
+    fn run_command_undo_redo_walk_structural_and_pixel_edits_in_true_chronological_order() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut palette = None;
@@ -4814,6 +4936,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
         let (_dir, mut store) = real_tile_store();
 
         let bounds = aurora_core::Rect {
@@ -4826,12 +4949,15 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        // A structural edit also sits on history's own undo stack --
-        // pixel_history must still be the one Ctrl+Z reaches for.
+        let original_opacity = layers.opacity(id);
+
+        // 1) A structural edit first...
         if let Err(err) = history.set_opacity(&mut layers, id, 0.5) {
             unreachable!("{err:?}");
         }
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
 
+        // 2) ...then a pixel stroke, on the very same layer's surface.
         let surface = aurora_tile::SurfaceId::from_raw(id.to_raw());
         let tile = aurora_tile::TileId { x: 0, y: 0 };
         let mut stroke = aurora_brush::StrokeSnapshot::new(surface);
@@ -4844,8 +4970,11 @@ mod tests {
         for sample in painted.texels_mut() {
             *sample = half::f16::from_f32(0.75);
         }
-        pixel_history.push(stroke);
+        assert!(pixel_history.push(stroke));
+        undo_order.record(UndoKind::Pixel, &mut history, &mut pixel_history);
 
+        // The pixel stroke was the more recent edit -- Ctrl+Z must
+        // reach it first, leaving the structural change untouched.
         run_command(
             &mut workspace,
             &mut focus,
@@ -4855,30 +4984,60 @@ mod tests {
             &mut history,
             &mut pixel_history,
             Some(&mut store),
+            &mut undo_order,
             AppCommand::Undo,
         );
-
-        let Ok(restored) = store.get(surface, tile) else {
+        let Ok(after_first_undo) = store.get(surface, tile) else {
             unreachable!("just written");
         };
-        let Some(&sample) = restored.texels().first() else {
+        let Some(&sample) = after_first_undo.texels().first() else {
             unreachable!("a real tile always has at least one sample");
         };
+        assert_eq!(sample.to_f32(), 0.0, "the pixel stroke must undo first");
         assert_eq!(
-            sample.to_f32(),
-            0.0,
-            "the pixel stroke must have been undone"
+            layers.opacity(id),
+            Some(0.5),
+            "the structural opacity change must still be untouched"
+        );
+
+        // A second Ctrl+Z must now reach the structural edit.
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            AppCommand::Undo,
+        );
+        assert_eq!(
+            layers.opacity(id),
+            original_opacity,
+            "the second undo must reach the structural edit"
+        );
+
+        // Redo walks the exact same order back: structural first, then
+        // pixel.
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            AppCommand::Redo,
         );
         assert_eq!(
             layers.opacity(id),
             Some(0.5),
-            "the structural opacity change must be untouched"
+            "the first redo must reapply the structural edit"
         );
-        assert!(
-            history.can_undo(),
-            "structural history must still have its own entry, since pixel_history was chosen instead"
-        );
-        assert!(pixel_history.can_redo());
 
         run_command(
             &mut workspace,
@@ -4889,19 +5048,24 @@ mod tests {
             &mut history,
             &mut pixel_history,
             Some(&mut store),
+            &mut undo_order,
             AppCommand::Redo,
         );
-        let Ok(redone) = store.get(surface, tile) else {
+        let Ok(after_second_redo) = store.get(surface, tile) else {
             unreachable!("just written");
         };
-        let Some(&sample) = redone.texels().first() else {
+        let Some(&sample) = after_second_redo.texels().first() else {
             unreachable!("a real tile always has at least one sample");
         };
-        assert_eq!(sample.to_f32(), 0.75, "redo must reapply the stroke");
+        assert_eq!(
+            sample.to_f32(),
+            0.75,
+            "the second redo must reapply the pixel stroke"
+        );
     }
 
     #[test]
-    fn run_command_pixel_undo_with_no_live_store_is_a_safe_no_op() {
+    fn run_command_pixel_undo_with_no_live_store_leaves_the_unified_order_untouched() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut palette = None;
@@ -4917,7 +5081,9 @@ mod tests {
         if let Err(err) = stroke.record_touch(&mut store, tile) {
             unreachable!("{err:?}");
         }
-        pixel_history.push(stroke);
+        assert!(pixel_history.push(stroke));
+        let mut undo_order = UndoOrder::default();
+        undo_order.record(UndoKind::Pixel, &mut history, &mut pixel_history);
         assert!(pixel_history.can_undo());
 
         run_command(
@@ -4929,11 +5095,17 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             AppCommand::Undo,
         );
         assert!(
             pixel_history.can_undo(),
             "with no live store to restore into, the pending stroke must be left exactly as it was"
+        );
+        assert_eq!(
+            undo_order.undo,
+            [UndoKind::Pixel],
+            "a failed attempt must not desync the unified order from the backing store"
         );
     }
 
@@ -5084,6 +5256,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -5095,6 +5268,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Tab),
@@ -5115,6 +5289,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -5126,6 +5301,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             &shortcuts,
             Modifiers::none(),
             Key::Character('h'),
@@ -5160,6 +5336,11 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        // Simulates what a real App-level recording call (like
+        // `App::apply_move`) would have done when `add_pixel_layer` was
+        // called above.
+        let mut undo_order = UndoOrder::default();
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -5171,6 +5352,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             &shortcuts,
             Modifiers {
                 control: true,
@@ -5197,6 +5379,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
         let shortcuts = default_shortcuts();
         // 'q' is deliberately not one of `default_shortcuts`' own
         // tool-switch letters (v/m/z/h/i) or anything else bound.
@@ -5210,6 +5393,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             &shortcuts,
             Modifiers::none(),
             Key::Character('q'),
@@ -5232,6 +5416,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
         let shortcuts = default_shortcuts();
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
@@ -5248,6 +5433,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             &shortcuts,
             Modifiers::none(),
             Key::Character('p'),
@@ -6289,6 +6475,7 @@ mod tests {
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
         let shortcuts = default_shortcuts();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -6307,6 +6494,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             None,
+            &mut undo_order,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Escape),
