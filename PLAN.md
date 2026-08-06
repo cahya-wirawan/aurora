@@ -2512,14 +2512,24 @@ check licenses` clean with the new `toml` dependency.
   **Still `[~]`, not `[x]`**: no real-hardware verification yet (does a
   screen reader actually announce a *modal* alert the way `Role::
   AlertDialog` intends — a real, separate question from "does the tree
-  structure exist," per this milestone's own repeated lesson); no
-  click routing for the dialog's own button (this crate has no pointer
-  input handling for *any* widget yet, so `Enter` on the focused action
-  is what's wired, matching the keyboard-only interaction model
-  everything else in this crate uses so far); and, most importantly,
-  no real document recovery — that's real, separate follow-on work
-  gated on `aurora-doc` choosing and implementing an on-disk journal
-  encoding first.
+  structure exist," per this milestone's own repeated lesson).
+
+  Both of this bullet's other two original gaps have since closed, on
+  later days, once the blockers they were waiting on existed: **click
+  routing** followed once `aurora-app` gained real pointer input at all
+  (M1.9's "basic tools" bullet) — a new `handle_dialog_pointer`
+  (`aurora-app`) hit-tests a `Primary`-button click against the open
+  dialog's own action buttons (`DialogHandle::action_id`, the same
+  lookup `Enter`'s own handling already used) and runs the same
+  close-and-log behaviour, factored into a shared `run_dialog_action`;
+  any other click while the dialog is open — a different button, or
+  anywhere else — is swallowed, not passed through, matching a real
+  modal alert's usual behaviour (`aurora_widgets::widgets::dialog`'s
+  own doc comment updated to match: the "no click routing" paragraph
+  it used to carry is gone). 3 new `aurora-app` tests. **Real document
+  recovery** followed once `aurora-doc` decided and implemented a real
+  on-disk journal encoding — see the "Autosave and recovery" bullet in
+  M1.9, below.
 
 ### M1.9 — Basic tools and I/O
 
