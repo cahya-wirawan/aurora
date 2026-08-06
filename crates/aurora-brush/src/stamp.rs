@@ -33,6 +33,53 @@ const fn texel_index(x: u32, y: u32) -> usize {
     (y * TILE + x) as usize * CHANNELS
 }
 
+/// The inclusive tile range a dab centered at `center` with `radius`
+/// overlaps — shared by [`stamp_dab`]/[`erase_dab`]/[`touched_tiles`] so
+/// the bounding-box math exists in exactly one place. Callers with
+/// `radius <= 0.0` should check that themselves first; this doesn't
+/// special-case it (`min > max` would otherwise fall out, and every
+/// caller here already guards it before reaching this function).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn tile_range(center: (f32, f32), radius: f32) -> (TileId, TileId) {
+    let (cx, cy) = center;
+    let min_x = (cx - radius).floor().max(0.0) as u32;
+    let min_y = (cy - radius).floor().max(0.0) as u32;
+    let max_x = (cx + radius).ceil().max(0.0) as u32;
+    let max_y = (cy + radius).ceil().max(0.0) as u32;
+    (
+        TileId {
+            x: min_x / TILE,
+            y: min_y / TILE,
+        },
+        TileId {
+            x: max_x / TILE,
+            y: max_y / TILE,
+        },
+    )
+}
+
+/// Every tile a dab centered at `center` with `radius` would touch, in
+/// the same row-major order [`stamp_dab`]/[`erase_dab`] themselves
+/// iterate — `radius <= 0.0` yields nothing, matching both. Public
+/// specifically so a caller needing to know *which* tiles a dab is
+/// about to change — capturing an undo snapshot beforehand
+/// (`aurora_brush::undo::StrokeSnapshot::record_touch`) is the first
+/// real one — doesn't have to duplicate this math.
+#[must_use]
+pub fn touched_tiles(center: (f32, f32), radius: f32) -> Vec<TileId> {
+    if radius <= 0.0 {
+        return Vec::new();
+    }
+    let (t0, t1) = tile_range(center, radius);
+    let mut tiles = Vec::with_capacity(((t1.x - t0.x + 1) * (t1.y - t0.y + 1)) as usize);
+    for ty in t0.y..=t1.y {
+        for tx in t0.x..=t1.x {
+            tiles.push(TileId { x: tx, y: ty });
+        }
+    }
+    tiles
+}
+
 /// Stamps one dab centered at `center` (surface-pixel coordinates, i.e.
 /// document space — the same space [`crate::dabs_along_path`] produces)
 /// with `radius` and straight-RGB `colour` into `store`'s `surface`.
@@ -66,15 +113,7 @@ pub fn stamp_dab(
     let min_y = (cy - radius).floor().max(0.0) as u32;
     let max_x = (cx + radius).ceil().max(0.0) as u32;
     let max_y = (cy + radius).ceil().max(0.0) as u32;
-
-    let t0 = TileId {
-        x: min_x / TILE,
-        y: min_y / TILE,
-    };
-    let t1 = TileId {
-        x: max_x / TILE,
-        y: max_y / TILE,
-    };
+    let (t0, t1) = tile_range(center, radius);
     let mut touched = 0;
 
     for ty in t0.y..=t1.y {
@@ -181,15 +220,7 @@ pub fn erase_dab(
     let min_y = (cy - radius).floor().max(0.0) as u32;
     let max_x = (cx + radius).ceil().max(0.0) as u32;
     let max_y = (cy + radius).ceil().max(0.0) as u32;
-
-    let t0 = TileId {
-        x: min_x / TILE,
-        y: min_y / TILE,
-    };
-    let t1 = TileId {
-        x: max_x / TILE,
-        y: max_y / TILE,
-    };
+    let (t0, t1) = tile_range(center, radius);
     let mut touched = 0;
 
     for ty in t0.y..=t1.y {
@@ -298,7 +329,7 @@ pub fn erase_stroke(
 
 #[cfg(test)]
 mod tests {
-    use super::{erase_dab, erase_stroke, stamp_dab, stamp_stroke};
+    use super::{erase_dab, erase_stroke, stamp_dab, stamp_stroke, touched_tiles};
     use aurora_tile::{SurfaceId, TileId, TileStore};
     use std::num::NonZeroUsize;
 
@@ -354,6 +385,37 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(touched, 4);
+    }
+
+    #[test]
+    fn touched_tiles_of_a_zero_radius_dab_is_empty() {
+        assert_eq!(touched_tiles((10.0, 10.0), 0.0), []);
+    }
+
+    #[test]
+    fn touched_tiles_matches_stamp_dabs_own_tile_count_away_from_a_boundary() {
+        assert_eq!(touched_tiles((128.0, 128.0), 20.0), [TileId { x: 0, y: 0 }]);
+    }
+
+    #[test]
+    fn touched_tiles_matches_stamp_dabs_own_tile_count_at_a_corner() {
+        let tiles = touched_tiles((256.0, 256.0), 20.0);
+        assert_eq!(
+            tiles.len(),
+            4,
+            "must agree with stamp_dab's own corner test"
+        );
+        for expected in [
+            TileId { x: 0, y: 0 },
+            TileId { x: 1, y: 0 },
+            TileId { x: 0, y: 1 },
+            TileId { x: 1, y: 1 },
+        ] {
+            assert!(
+                tiles.contains(&expected),
+                "missing {expected:?} in {tiles:?}"
+            );
+        }
     }
 
     #[test]
