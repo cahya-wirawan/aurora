@@ -138,6 +138,13 @@ jpeg-encoder = "0.7"
 # ("PNG/JPG/TIFF/WebP/GIF/BMP | `image`, `zune-image`"). One crate here
 # covers both decode and encode, unlike JPEG's two-crate split.
 tiff = "0.11"
+# ADR 0009's own container format for `.aur`: default features off, only
+# `deflate` enabled -- the format uses exactly two compression methods
+# (STORE for the mimetype sniff-entry and already-`lz4_flex`-compressed
+# tile payloads; DEFLATE for the postcard-encoded manifest/history,
+# which aren't pre-compressed) -- no encryption, no bzip2/lzma/zstd/ppmd,
+# none of which `.aur` needs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

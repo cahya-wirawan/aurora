@@ -508,6 +508,7 @@ dependencies = [
 name = "aurora-core"
 version = "0.0.0"
 dependencies = [
+ "postcard",
  "serde",
  "thiserror 2.0.19",
  "tracing",

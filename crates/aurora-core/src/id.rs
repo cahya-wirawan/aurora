@@ -138,6 +138,30 @@ impl<T> fmt::Debug for IdGenerator<T> {
     }
 }
 
+/// Hand-implemented for the same `PhantomData<fn() -> T>` reason [`Id`]'s
+/// own impl is: `#[derive(Serialize)]` would wrongly add a `T: Serialize`
+/// bound. Serializes as the plain `next: u64` counter — a document
+/// format that saves a whole `aurora_doc::LayerTree` (ADR 0009's `.aur`
+/// manifest) needs this so a reloaded tree keeps allocating fresh,
+/// non-colliding `LayerId`s rather than restarting from `0` and
+/// eventually reusing an id already on disk.
+impl<T> serde::Serialize for IdGenerator<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(self.next)
+    }
+}
+
+/// Hand-written for the same reason `Serialize` above is.
+impl<'de, T> serde::Deserialize<'de> for IdGenerator<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let next = u64::deserialize(deserializer)?;
+        Ok(Self {
+            next,
+            marker: PhantomData,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Id, IdGenerator};
@@ -171,5 +195,27 @@ mod tests {
         assert_eq!(b.to_raw(), u64::MAX);
         let c = generator.next_id();
         assert_eq!(c.to_raw(), u64::MAX, "must saturate, not wrap to 0");
+    }
+
+    #[test]
+    fn generator_round_trips_through_real_postcard_bytes() {
+        let mut generator: IdGenerator<Layer> = IdGenerator::new();
+        let _ = generator.next_id();
+        let _ = generator.next_id();
+        // generator.next is now 2 -- the next id it would hand out.
+        let bytes = match postcard::to_allocvec(&generator) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut restored: IdGenerator<Layer> = match postcard::from_bytes(&bytes) {
+            Ok(generator) => generator,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            restored.next_id().to_raw(),
+            2,
+            "a restored generator must keep counting from where the saved one left off, \
+             not restart from 0 and risk colliding with an id already on disk"
+        );
     }
 }
