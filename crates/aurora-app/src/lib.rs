@@ -79,10 +79,11 @@
 //! saves every real pixel layer's own tiles (`document_canvas_size`
 //! stands in for a real document-level canvas size, which nothing
 //! tracks separately yet), unlike the flat-image path's active-layer-
-//! only limit — but `history` written is always a fresh, empty
-//! `aurora_doc::History`, since there is no live `History` kept on
-//! `App` to save through yet (the same reason `Move`/`Brush`/`Eraser`
-//! all bypass it too).
+//! only limit — and, since Undo/Redo (below) gave `App` a real, kept-
+//! alive `history` field, `history` written is that real journal, not
+//! the fresh empty one this path used to write; it's still partial,
+//! since `Brush`/`Eraser` don't record through it (see the Undo/Redo
+//! paragraph below).
 //!
 //! **DPI/scale-factor aware layout**: `logical_size` divides a real
 //! physical window size by `Window::scale_factor` before it reaches
@@ -172,11 +173,33 @@
 //! constant — as long as the sampled texel is actually painted (alpha
 //! `> 0.0`; a fully transparent one, painted-then-erased or never
 //! touched, has nothing meaningful to pick). Every M1.9 "basic tools"
-//! variant is real now. Undo-as-you-drag is separate, still-open
-//! follow-on work (Move/Eyedropper, like Brush/Eraser, bypass `History`
-//! entirely — there is no live `History` on `App` to record through
-//! yet). See `aurora_ui::tool`'s own doc comment and this module's
-//! "brush painting"/"layer selection" sections for the full reasoning.
+//! variant is real now. See `aurora_ui::tool`'s own doc comment and this
+//! module's "brush painting"/"layer selection" sections for the full
+//! reasoning.
+//!
+//! **Undo/Redo** (PLAN.md's Undo/Redo bullet): `App` now keeps a live
+//! `history: aurora_doc::History` alongside `layers` (previously built
+//! once in `App::new`, used only to populate the History panel and
+//! write the autosave, then dropped) — `Ctrl+Z`/`Ctrl+Shift+Z`
+//! (`AppCommand::Undo`/`Redo`, `run_command`) call `History::undo`/
+//! `redo` against it directly and refresh the History panel
+//! (`refresh_history_panel`) to show the result, since `History`'s own
+//! doc comment already establishes that undoing/redoing is itself a
+//! journaled step. `App::apply_move` now records through `history`
+//! instead of calling `LayerTree::set_bounds` directly, so a completed
+//! Move is really undoable — one undo step per pointer-move event
+//! during the drag, not one per whole drag gesture (coalescing a drag
+//! into a single undo step is separate, still-open follow-on work).
+//! **Scope, stated honestly**: `App::paint_dab`/`Self::erase_dab` still
+//! bypass `History` entirely — a brush/eraser edit is raw pixel data
+//! with no `LayerOp` equivalent to record (`History`'s own doc comment:
+//! ops are tree-level changes, never pixel snapshots), so undoing a
+//! stroke needs a real, separate design (a pixel-level op storing
+//! dirtied tiles, per invariant §7.3.3), not invented here. `Undo`/
+//! `Redo` are shortcut-only, matching how the existing tool-switch
+//! letters work — neither is in the command palette or (macOS) native
+//! menu yet, real follow-on work once this crate has an Edit menu at
+//! all.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
@@ -807,18 +830,21 @@ fn handle_dialog_key(
 /// the first time `aurora_widgets::FocusManager` (built in M1.7, never
 /// wired to a real key event until now) actually reaches a keyboard,
 /// `ToggleCommandPalette` is the one entry point into the palette
-/// itself, and `SelectTool` switches `App`'s own active
-/// `aurora_ui::Tool` (PLAN.md M1.9's "basic tools" bullet). More
-/// commands (undo/redo, save) are real, separate follow-on work once
-/// this crate has real actions for them to invoke — inventing
-/// placeholder commands with nothing behind them would be exactly the
-/// kind of half-finished feature CLAUDE.md warns against.
+/// itself, `SelectTool` switches `App`'s own active `aurora_ui::Tool`
+/// (PLAN.md M1.9's "basic tools" bullet), and `Undo`/`Redo` drive
+/// `App`'s own live `aurora_doc::History` (PLAN.md's Undo/Redo bullet).
+/// Save is still real, separate follow-on work once this crate has a
+/// keyboard-triggerable action for it to invoke — inventing a
+/// placeholder command with nothing behind it would be exactly the kind
+/// of half-finished feature CLAUDE.md warns against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppCommand {
     FocusNext,
     FocusPrevious,
     ToggleCommandPalette,
     SelectTool(aurora_ui::Tool),
+    Undo,
+    Redo,
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -831,6 +857,14 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         ("Tab", AppCommand::FocusNext),
         ("Shift+Tab", AppCommand::FocusPrevious),
         ("Ctrl+Shift+P", AppCommand::ToggleCommandPalette),
+        // Matches Photoshop's/every mainstream editor's own convention
+        // (`Ctrl+Z`/`Ctrl+Shift+Z`, not a separate `Ctrl+Y` for redo).
+        // Literally `Ctrl`, even on macOS -- this registry has no
+        // per-platform rebinding yet, so a macOS user's own muscle-memory
+        // `Cmd+Z` doesn't resolve; a real, named gap, not silently
+        // missing.
+        ("Ctrl+Z", AppCommand::Undo),
+        ("Ctrl+Shift+Z", AppCommand::Redo),
         // Tool-switch letters match Photoshop's own single-key bindings
         // (no modifier) -- the same convention this project's target
         // users already carry in muscle memory. Every tool here does
@@ -1167,11 +1201,23 @@ fn toggle_command_palette(
 
 /// Runs a global shortcut's own command — [`handle_key`]'s dispatch
 /// target once a [`KeyChord`] resolves via [`ShortcutRegistry::resolve`].
+/// `Undo`/`Redo` are the one case that can fail (mixing a direct
+/// `LayerTree` call with `History`-recorded ones — see `History`'s own
+/// doc comment); logged rather than propagated, the same "a bad input
+/// mustn't crash the event loop" shape every other handler in this
+/// section already follows. Both refresh the History panel afterward
+/// ([`refresh_history_panel`]) since undo/redo themselves grow the
+/// journal (`History`'s own doc comment: undoing/redoing is itself a
+/// journaled step) — the one case in this crate so far where the
+/// History panel's own "one-shot, not reactive" scope no longer holds.
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     palette: &mut Option<WidgetId>,
     tool: &mut aurora_ui::Tool,
+    layers: &mut aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
     command: AppCommand,
 ) {
     match command {
@@ -1183,6 +1229,34 @@ fn run_command(
         }
         AppCommand::ToggleCommandPalette => toggle_command_palette(workspace, focus, palette),
         AppCommand::SelectTool(selected) => *tool = selected,
+        AppCommand::Undo => match history.undo(layers) {
+            Ok(_) => refresh_history_panel(workspace, history),
+            Err(err) => tracing::warn!(?err, "undo failed"),
+        },
+        AppCommand::Redo => match history.redo(layers) {
+            Ok(_) => refresh_history_panel(workspace, history),
+            Err(err) => tracing::warn!(?err, "redo failed"),
+        },
+    }
+}
+
+/// Clears and repopulates the History panel from `history`'s own
+/// current journal — [`AppCommand::Undo`]/[`AppCommand::Redo`]'s own
+/// shared refresh step, the same `clear_panel_body` + `populate_*`
+/// pattern [`replace_document`] already uses for a freshly opened
+/// document, just for one panel instead of two.
+fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_doc::History) {
+    if let Err(err) = aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body) {
+        tracing::warn!(
+            ?err,
+            "failed to clear the History panel before refreshing it"
+        );
+        return;
+    }
+    if let Err(err) =
+        aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, history)
+    {
+        tracing::warn!(?err, "failed to repopulate the History panel");
     }
 }
 
@@ -1286,7 +1360,8 @@ fn handle_palette_key(
 /// command palette owns it while open ([`handle_palette_key`]);
 /// otherwise a chord that resolves in `shortcuts` runs its command
 /// ([`run_command`], which is also where a tool-switch shortcut updates
-/// `tool`). Anything else (an unbound chord, with nothing modal open) is
+/// `tool` and `Ctrl+Z`/`Ctrl+Shift+Z` undo/redo against `layers`/
+/// `history`). Anything else (an unbound chord, with nothing modal open) is
 /// silently ignored — there's no text field to fall back to routing
 /// into yet.
 ///
@@ -1303,6 +1378,8 @@ fn handle_key(
     dialog: &mut Option<DialogHandle>,
     palette: &mut Option<WidgetId>,
     tool: &mut aurora_ui::Tool,
+    layers: &mut aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
     shortcuts: &ShortcutRegistry<AppCommand>,
     modifiers: Modifiers,
     key: Key,
@@ -1327,7 +1404,7 @@ fn handle_key(
         );
     }
     if let Some(&command) = shortcuts.resolve(chord) {
-        run_command(workspace, focus, palette, tool, command);
+        run_command(workspace, focus, palette, tool, layers, history, command);
     }
     None
 }
@@ -2180,12 +2257,21 @@ struct App {
     selection: aurora_doc::SelectionSet,
     /// The live document's own layer structure — built once in
     /// [`App::new`] (from [`demo_document`] or a recovered autosave) and
-    /// kept alive from then on, unlike `history` (used once to populate
-    /// the History panel and write the autosave, then dropped — nothing
-    /// yet needs it kept alive the way painting needs `layers`). This is
-    /// what [`Self::active_layer`]/[`LayerTree::surface_id`] read to find
-    /// somewhere for the Brush tool to actually paint.
+    /// kept alive from then on. This is what [`Self::active_layer`]/
+    /// [`LayerTree::surface_id`] read to find somewhere for the Brush
+    /// tool to actually paint.
     layers: aurora_doc::LayerTree,
+    /// `layers`' own undo/redo history — built alongside it (same
+    /// source: [`demo_document`] or a recovered autosave) and, since
+    /// Undo/Redo (`Ctrl+Z`/`Ctrl+Shift+Z`, [`run_command`]), also kept
+    /// alive alongside it, not dropped after startup the way it used to
+    /// be. `Self::apply_move` is the one live-editing path that records
+    /// through this today — `Self::paint_dab`/`Self::erase_dab` still
+    /// bypass it entirely, since raw pixel edits have no `LayerOp`
+    /// equivalent to record (`History`'s own doc comment: ops are
+    /// tree-level changes, never pixel data) — undoing a brush stroke is
+    /// separate, still-open follow-on work, not silently missing.
+    history: aurora_doc::History,
     /// The layer the Brush/Eraser tools paint/erase into and the Move
     /// tool repositions, if any — the topmost pixel layer of `layers`
     /// at construction time ([`topmost_pixel_layer`]), real-time-
@@ -2331,6 +2417,7 @@ impl App {
             canvas_view: aurora_ui::CanvasView::default(),
             selection: aurora_doc::SelectionSet::new(),
             layers,
+            history,
             active_layer,
             current_colour: DEFAULT_COLOUR,
             layer_rows,
@@ -2386,6 +2473,8 @@ impl App {
             &mut self.crash_recovery_dialog,
             &mut self.command_palette,
             &mut self.tool,
+            &mut self.layers,
+            &mut self.history,
             &self.shortcuts,
             self.modifiers,
             key,
@@ -2468,6 +2557,7 @@ impl App {
         write_autosave(&autosave_path(), &history);
 
         self.layers = layers;
+        self.history = history;
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
@@ -2526,6 +2616,7 @@ impl App {
         write_autosave(&autosave_path(), &history);
 
         self.layers = layers;
+        self.history = history;
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
@@ -2609,23 +2700,23 @@ impl App {
     /// single "does this decode to the right width/height" check the way a flat image
     /// does).
     ///
-    /// **Scope, stated honestly**: `history` is always a fresh, empty
-    /// `aurora_doc::History` — there is no live `History` kept on `App`
-    /// to save through yet (the same reason `Self::apply_move`/
-    /// `Self::paint_dab`/`Self::erase_dab` all bypass it too), so an
-    /// `.aur` file this session writes has no real undo journal, only
-    /// the real, current `LayerTree` state. `canvas_size` is the
-    /// topmost pixel layer's own bounds ([`document_canvas_size`]) —
-    /// the best this crate can offer today, since nothing tracks a
-    /// real, separate document-level canvas size yet (every document
-    /// built so far is exactly one layer). A silent no-op if there's no
-    /// live tile store.
+    /// **Scope, stated honestly**: `canvas_size` is the topmost pixel
+    /// layer's own bounds ([`document_canvas_size`]) — the best this
+    /// crate can offer today, since nothing tracks a real, separate
+    /// document-level canvas size yet (every document built so far is
+    /// exactly one layer). `history` is now `self.history`, the real
+    /// live journal — Move (`Self::apply_move`) records through it, so a
+    /// `.aur` file this session writes carries a real, if partial, undo
+    /// journal; `Self::paint_dab`/`Self::erase_dab` still bypass it
+    /// entirely (see `Self::history`'s own doc comment), so a document
+    /// with brush/eraser edits still saves a journal that omits them —
+    /// a real, named gap, not the previous "always completely empty"
+    /// one. A silent no-op if there's no live tile store.
     fn save_aur_file(&mut self, path: &Path) {
         let Some(store) = self.tile_store.as_mut() else {
             return;
         };
         let canvas_size = document_canvas_size(&self.layers);
-        let history = aurora_doc::History::new();
 
         let Some(file_name) = path.file_name() else {
             tracing::warn!(path = %path.display(), "save path has no file name");
@@ -2637,7 +2728,7 @@ impl App {
 
         let write_result: Result<(), aurora_io::IoError> = (|| {
             let file = std::fs::File::create(&temp_path)?;
-            aurora_io::write_aur(file, &self.layers, &history, canvas_size, store)
+            aurora_io::write_aur(file, &self.layers, &self.history, canvas_size, store)
         })();
         if let Err(err) = write_result {
             tracing::warn!(path = %temp_path.display(), ?err, "failed to write the temp .aur export file");
@@ -2831,18 +2922,22 @@ impl App {
     /// (`aurora_doc::LayerTree::set_bounds`) — the one real mutation a
     /// `Drag::Move` needs, called every pointer-move event while one is
     /// active with that drag's own live `current_bounds`
-    /// ([`Self::handle_pointer_moved`]). Bypasses `History` entirely,
-    /// the same as [`Self::paint_dab`]/[`Self::erase_dab`] already do
-    /// for pixel edits — there is no live `History` on `App` to record
-    /// through yet, so a Move, like a brush stroke, isn't undoable
-    /// today. A real, logged failure (an unknown or non-pixel
-    /// `layer_id`) shouldn't happen in practice — `layer_id` always
-    /// comes from `Drag::Move` itself, set from a real active pixel
-    /// layer when the drag began — but this reports rather than assumes
-    /// it, the same discipline every other fallible call in this crate
-    /// already applies.
+    /// ([`Self::handle_pointer_moved`]). Recorded through `self.history`
+    /// (unlike [`Self::paint_dab`]/[`Self::erase_dab`], which still
+    /// bypass it — see `Self::history`'s own doc comment for why pixel
+    /// edits are a separate case), so a completed Move is a real,
+    /// `Ctrl+Z`-undoable step — one entry per pointer-move event, not one
+    /// per drag (every intermediate position along the drag becomes its
+    /// own undo step; undoing several times during a slow drag steps
+    /// back through the intermediate positions rather than jumping
+    /// straight to where the drag began). A real, logged failure (an
+    /// unknown or non-pixel `layer_id`) shouldn't happen in practice —
+    /// `layer_id` always comes from `Drag::Move` itself, set from a real
+    /// active pixel layer when the drag began — but this reports rather
+    /// than assumes it, the same discipline every other fallible call in
+    /// this crate already applies.
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
-        if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
+        if let Err(err) = self.history.set_bounds(&mut self.layers, layer_id, bounds) {
             tracing::warn!(?err, "failed to reposition the active layer");
         }
     }
@@ -3903,6 +3998,21 @@ mod tests {
     }
 
     #[test]
+    fn default_shortcuts_binds_ctrl_z_and_ctrl_shift_z_to_undo_and_redo() {
+        let shortcuts = default_shortcuts();
+        let undo = match KeyChord::parse("Ctrl+Z") {
+            Ok(chord) => chord,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let redo = match KeyChord::parse("Ctrl+Shift+Z") {
+            Ok(chord) => chord,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(shortcuts.resolve(undo), Some(&AppCommand::Undo));
+        assert_eq!(shortcuts.resolve(redo), Some(&AppCommand::Redo));
+    }
+
+    #[test]
     fn translate_key_lowercases_a_character_and_maps_named_keys() {
         assert_eq!(
             translate_key(&winit::keyboard::Key::Character("P".into())),
@@ -3990,12 +4100,16 @@ mod tests {
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
 
         run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.layers.root));
@@ -4004,6 +4118,8 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.properties.root));
@@ -4012,6 +4128,8 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.history.root));
@@ -4021,6 +4139,8 @@ mod tests {
             &mut focus,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             AppCommand::FocusPrevious,
         );
         assert_eq!(
@@ -4036,15 +4156,100 @@ mod tests {
         let mut focus = FocusManager::default();
         let mut palette = None;
         let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
 
         run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             AppCommand::SelectTool(Tool::Pan),
         );
         assert_eq!(tool, Tool::Pan);
+    }
+
+    #[test]
+    fn run_command_undo_reverts_a_bounds_change_and_refreshes_the_history_panel() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let moved = aurora_core::Rect {
+            x: 5,
+            y: 5,
+            ..bounds
+        };
+        if let Err(err) = history.set_bounds(&mut layers, id, moved) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(layers.bounds(id), Some(moved));
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            AppCommand::Undo,
+        );
+        assert_eq!(layers.bounds(id), Some(bounds), "undo must revert the move");
+        let Some(rows) = workspace.tree.children(workspace.history.body) else {
+            unreachable!("populate_history_panel always inserts a body");
+        };
+        assert_eq!(
+            rows.len(),
+            history.journal_len(),
+            "the History panel must reflect the undo's own journal entry"
+        );
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            AppCommand::Redo,
+        );
+        assert_eq!(layers.bounds(id), Some(moved), "redo must reapply the move");
+    }
+
+    #[test]
+    fn run_command_undo_with_nothing_to_undo_is_a_safe_no_op() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            AppCommand::Undo,
+        );
+        assert!(layers.is_empty());
+        assert_eq!(history.journal_len(), 0);
     }
 
     #[test]
@@ -4191,6 +4396,8 @@ mod tests {
         let mut dialog = None;
         let mut palette = None;
         let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -4198,6 +4405,8 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Tab),
@@ -4215,6 +4424,8 @@ mod tests {
         let mut dialog = None;
         let mut palette = None;
         let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -4222,6 +4433,8 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             &shortcuts,
             Modifiers::none(),
             Key::Character('h'),
@@ -4233,12 +4446,62 @@ mod tests {
     }
 
     #[test]
+    fn handle_key_routes_ctrl_z_to_undo_when_the_palette_is_closed() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let id = match history.add_pixel_layer(
+            &mut layers,
+            "a",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let shortcuts = default_shortcuts();
+        handle_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &shortcuts,
+            Modifiers {
+                control: true,
+                ..Modifiers::none()
+            },
+            Key::Character('z'),
+            None,
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
+        );
+        assert!(
+            !layers.contains(id),
+            "Ctrl+Z must undo the just-added layer"
+        );
+    }
+
+    #[test]
     fn handle_key_ignores_an_unbound_chord() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let mut palette = None;
         let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
         let shortcuts = default_shortcuts();
         // 'q' is deliberately not one of `default_shortcuts`' own
         // tool-switch letters (v/m/z/h/i) or anything else bound.
@@ -4248,6 +4511,8 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             &shortcuts,
             Modifiers::none(),
             Key::Character('q'),
@@ -4267,6 +4532,8 @@ mod tests {
         let mut dialog = None;
         let mut palette = None;
         let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
         let shortcuts = default_shortcuts();
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
@@ -4279,6 +4546,8 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             &shortcuts,
             Modifiers::none(),
             Key::Character('p'),
@@ -4964,6 +5233,8 @@ mod tests {
         let mut dialog = None;
         let mut palette = None;
         let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
         let shortcuts = default_shortcuts();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -4978,6 +5249,8 @@ mod tests {
             &mut dialog,
             &mut palette,
             &mut tool,
+            &mut layers,
+            &mut history,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Escape),
