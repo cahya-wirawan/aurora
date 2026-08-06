@@ -12,39 +12,34 @@
 //! already draw. Zoom and Pan are pure view-transform operations
 //! ([`crate::CanvasView`] itself) and need nothing from this module
 //! beyond the enum variant. Marquee Select needs [`marquee_rect`], real
-//! and tested here. `Brush`/`Eraser` are real too, but their actual
-//! pixel math (`aurora_brush::stamp_dab`/`erase_dab`) needs a live
-//! `aurora_tile::TileStore` this crate has no reason to own — that lives
-//! in `aurora-app`, the one place a live document and a live store both
-//! exist. **Move and Eyedropper are not wired to anything yet**: Move
-//! needs a notion of "the active layer" a user can *change* —
-//! click-to-select routing now exists (`aurora_ui::layers_panel`'s own
-//! rows are real, clickable widgets, and
-//! `aurora_widgets::WidgetTree::hit_test` plus `aurora-app`'s own
-//! `select_layer` turn a click into "this is now the active layer") —
-//! but Move's own drag-to-reposition-bounds logic still isn't built on
-//! top of it; Eyedropper needs to sample a real pixel, which is real now
+//! and tested here. `Brush`/`Eraser`/`Move` are real too, but their
+//! actual work (`aurora_brush::stamp_dab`/`erase_dab`,
+//! `aurora_doc::LayerTree::set_bounds`) needs a live
+//! `aurora_tile::TileStore`/`LayerTree` this crate has no reason to own
+//! — that lives in `aurora-app`, the one place a live document and a
+//! live store both exist. **Eyedropper is not wired to anything yet**:
+//! it needs to sample a real pixel, which is real now
 //! (`aurora_tile::TileStore`, ADR 0010) but has no sampling function
-//! built yet. Both are real, selectable tool variants — so a user (or
-//! test) can switch to them — but their pointer handling is deliberately
-//! a no-op today, not a faked partial behaviour.
+//! built yet. It's a real, selectable tool variant — so a user (or
+//! test) can switch to it — but its pointer handling is deliberately a
+//! no-op today, not a faked partial behaviour.
 
 use aurora_core::Rect;
 
 /// Which canvas tool is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tool {
-    /// Repositions a layer's bounds. **Not wired yet** — see this
-    /// module's own doc comment (active-layer selection now exists;
-    /// Move's own drag-to-reposition logic on top of it doesn't).
+    /// Repositions a layer's bounds — real, via
+    /// `aurora_doc::LayerTree::set_bounds`, against `aurora-app`'s own
+    /// live document and active layer. See this module's own doc
+    /// comment for why the actual mutation lives there, not here.
     Move,
     /// Drags out a rectangular selection ([`aurora_doc::SelectionSet`]).
-    /// The only tool with real, working pointer logic so far —
-    /// [`marquee_rect`]. The `#[default]` variant: a real image editor's
-    /// usual default is `Move`, but `Move` doesn't do anything yet (see
-    /// this module's own doc comment), and defaulting to a tool that
-    /// silently does nothing would be worse than defaulting to one that
-    /// actually works.
+    /// The `#[default]` variant: a real image editor's usual default is
+    /// `Move`, but defaulting to a tool that repositions the active
+    /// layer on a plain click-drag felt like a worse first-run surprise
+    /// than defaulting to a selection tool, which never mutates
+    /// anything just by dragging.
     #[default]
     MarqueeSelect,
     /// Zooms [`crate::CanvasView`] — real, via

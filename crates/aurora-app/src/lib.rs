@@ -138,11 +138,24 @@
 //! this), so clicking one calls `select_layer` — updates `active_layer`
 //! (what Brush/Eraser paint/erase into) and marks the row accessibly
 //! selected, both instead of always targeting the topmost pixel layer
-//! with no way to change it. Eyedropper remains a real, selectable,
+//! with no way to change it. **Move followed later the same week**,
+//! once `aurora_doc::LayerTree::set_bounds` gave the document model
+//! somewhere to actually put a reposition: a new `Drag::Move` tracks
+//! the active layer's own bounds at drag-start and shifts them by the
+//! pointer's own travelled delta each move event, applied via
+//! `App::apply_move`. Making a moved layer actually *render* in its new
+//! place needed one more real fix: `tile_origin_for_view` used to
+//! assume the active layer always sat at document `(0, 0)` (true of
+//! every layer built until Move existed) — it now subtracts the active
+//! layer's own bounds offset before converting a document-space point
+//! into a surface-local tile, the same conversion `layer_local_point`
+//! already does for painting. Eyedropper remains a real, selectable,
 //! inert tool (no colour-sampling function built on `tile_store` yet);
-//! undo-as-you-drag is separate, still-open follow-on work. See
-//! `aurora_ui::tool`'s own doc comment and this module's "brush
-//! painting"/"layer selection" sections for the full reasoning.
+//! undo-as-you-drag is separate, still-open follow-on work (Move, like
+//! Brush/Eraser, bypasses `History` entirely — there is no live
+//! `History` on `App` to record through yet). See `aurora_ui::tool`'s
+//! own doc comment and this module's "brush painting"/"layer
+//! selection" sections for the full reasoning.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
@@ -729,9 +742,9 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         ("Ctrl+Shift+P", AppCommand::ToggleCommandPalette),
         // Tool-switch letters match Photoshop's own single-key bindings
         // (no modifier) -- the same convention this project's target
-        // users already carry in muscle memory. Bound even for Move/
-        // Eyedropper, which don't do anything yet once selected (see
-        // `aurora_ui::tool`'s own doc comment) -- switching *to* one is
+        // users already carry in muscle memory. Bound even for
+        // Eyedropper, which doesn't do anything yet once selected (see
+        // `aurora_ui::tool`'s own doc comment) -- switching *to* it is
         // still real, honest behaviour; only its own pointer handling is
         // the still-open part.
         ("v", AppCommand::SelectTool(aurora_ui::Tool::Move)),
@@ -1329,10 +1342,12 @@ fn logical_size(physical: (u32, u32), scale_factor: f64) -> (f32, f32) {
 // dispatch logic is headlessly testable in this sandbox (no display
 // server) — the same shape this crate's keyboard input already uses.
 //
-// Move and Eyedropper are real, selectable `aurora_ui::Tool` variants
-// (see that enum's own doc comment) but have no pointer handling here
-// either — the blockers are the same ones named there, not a gap
-// introduced by this section.
+// Move gained real pointer handling later the same week (`Drag::Move`,
+// below) once `aurora_doc::LayerTree::set_bounds` gave the document
+// model somewhere for a reposition to actually land. Eyedropper is
+// still a real, selectable `aurora_ui::Tool` variant with no pointer
+// handling — the same blocker its own enum doc comment names, not a
+// gap introduced by this section.
 
 /// One user-visible pointer button, decoupled from `winit::event::
 /// MouseButton` — the same "pure dispatch logic, isolate the real
@@ -1419,12 +1434,39 @@ fn pointer_in_canvas(
 /// [`App::erase_dab`]) — so it gets its own variant rather than reusing
 /// `Brush`'s, keeping "which pixel operation to perform" a property of
 /// the active `Drag`, not a runtime flag alongside it.
+///
+/// `Move` tracks `layer_id` (which layer is being repositioned),
+/// `start_doc`/`start_bounds` (the drag's own fixed starting point and
+/// that layer's own bounds at that moment), and `current_bounds` — the
+/// live result of shifting `start_bounds` by however far the pointer
+/// has travelled since `start_doc` ([`continue_drag`] updates this
+/// field in place, mirroring `Pan`'s own `last_screen`); the caller
+/// (`App::handle_pointer_moved`) reads it back out afterward and
+/// applies it to the document (`App::apply_move`) — the same
+/// "`continue_drag` stays pure, `App` does the one real mutation" split
+/// `Brush`/`Eraser` already use for painting.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Drag {
-    Pan { last_screen: (f32, f32) },
-    Marquee { start_doc: (f32, f32) },
-    Brush { last_doc: (f32, f32), carry: f32 },
-    Eraser { last_doc: (f32, f32), carry: f32 },
+    Pan {
+        last_screen: (f32, f32),
+    },
+    Marquee {
+        start_doc: (f32, f32),
+    },
+    Brush {
+        last_doc: (f32, f32),
+        carry: f32,
+    },
+    Eraser {
+        last_doc: (f32, f32),
+        carry: f32,
+    },
+    Move {
+        layer_id: aurora_doc::LayerId,
+        start_doc: (f32, f32),
+        start_bounds: aurora_core::Rect,
+        current_bounds: aurora_core::Rect,
+    },
 }
 
 /// Starts a drag for `tool`/`button` at `canvas_point` (already
@@ -1438,13 +1480,20 @@ enum Drag {
 /// of whether there's actually anywhere to paint/erase (a live store, an
 /// active layer) — that check happens where the real pixel work does
 /// (`App::paint_dab`/`App::erase_dab`), keeping this function pure and
-/// not needing to know about either.
+/// not needing to know about either. `Move` is the one drag that *does*
+/// need to know up front — repositioning needs a real pixel layer to
+/// reposition, and `start_bounds` has to be that layer's bounds at this
+/// exact moment, not looked up later — so it takes `active_pixel_layer`
+/// (`None` for no active layer, an active layer that's a group, or no
+/// active layer at all: [`active_pixel_layer`]) and starts nothing if
+/// that's `None`.
 #[must_use]
 fn begin_drag(
     tool: aurora_ui::Tool,
     button: PointerButton,
     canvas_point: (f32, f32),
     view: &aurora_ui::CanvasView,
+    active_pixel_layer: Option<(aurora_doc::LayerId, aurora_core::Rect)>,
 ) -> Option<Drag> {
     match (tool, button) {
         (_, PointerButton::Middle) | (aurora_ui::Tool::Pan, PointerButton::Primary) => {
@@ -1463,6 +1512,15 @@ fn begin_drag(
             last_doc: view.to_document(canvas_point),
             carry: 0.0,
         }),
+        (aurora_ui::Tool::Move, PointerButton::Primary) => {
+            let (layer_id, bounds) = active_pixel_layer?;
+            Some(Drag::Move {
+                layer_id,
+                start_doc: view.to_document(canvas_point),
+                start_bounds: bounds,
+                current_bounds: bounds,
+            })
+        }
         _ => None,
     }
 }
@@ -1490,6 +1548,13 @@ fn begin_drag(
 /// pure and testable as `Pan`/`Marquee` already are — the caller
 /// (`App::handle_pointer_moved`) does the actual pixel work, and which
 /// of `paint_dab`/`erase_dab` to call for each returned position.
+/// `Move` follows the same split: this function only updates
+/// `Drag::Move`'s own `current_bounds` field (via [`shift_bounds`]) and
+/// always returns an empty `Vec` (there are no dabs to paint) — the
+/// caller reads `current_bounds` back out of `drag` afterward and
+/// applies it to the document (`App::apply_move`), the same "update a
+/// field in place, caller does the one real mutation" shape `Pan`'s own
+/// `last_screen` already uses.
 #[must_use]
 fn continue_drag(
     drag: &mut Drag,
@@ -1531,6 +1596,32 @@ fn continue_drag(
             *carry = new_carry;
             dabs
         }
+        Drag::Move {
+            start_doc,
+            start_bounds,
+            current_bounds,
+            ..
+        } => {
+            let current_doc = view.to_document(canvas_point);
+            let delta = (current_doc.0 - start_doc.0, current_doc.1 - start_doc.1);
+            *current_bounds = shift_bounds(*start_bounds, delta);
+            Vec::new()
+        }
+    }
+}
+
+/// `bounds` shifted by `delta` document-space pixels, rounding to the
+/// nearest whole pixel — [`Drag::Move`]'s own per-event position
+/// update, kept as its own function so `continue_drag`'s own `Move` arm
+/// stays a one-liner.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn shift_bounds(bounds: aurora_core::Rect, delta: (f32, f32)) -> aurora_core::Rect {
+    aurora_core::Rect {
+        x: bounds.x + delta.0.round() as i64,
+        y: bounds.y + delta.1.round() as i64,
+        width: bounds.width,
+        height: bounds.height,
     }
 }
 
@@ -1604,10 +1695,12 @@ fn handle_zoom_tool_click(
 // no longer just defaults to the topmost pixel layer and stays there
 // forever -- a real click on a real, clickable Layers-panel row
 // (`aurora_ui::layers_panel`, `aurora_widgets::WidgetTree::hit_test`)
-// changes it, live. Undo-as-you-drag remains separate, still-open
-// follow-on work; so does Move's own drag-to-reposition logic, even
-// though its *blocker* (no active-layer selection) is what this section
-// already resolved.
+// changes it, live. Move's own drag-to-reposition logic (`Drag::Move`,
+// `App::apply_move`) followed once `aurora_doc::LayerTree::set_bounds`
+// gave it somewhere real to land, and `tile_origin_for_view` learned to
+// read the active layer's own bounds offset so a moved layer actually
+// renders in its new place, not just in the document model. Undo-as-
+// you-drag remains separate, still-open follow-on work.
 
 /// The topmost pixel layer in `layers` — [`App::active_layer`]'s own
 /// initial value. `layers.roots()` is already ordered top-to-bottom
@@ -1621,6 +1714,39 @@ fn topmost_pixel_layer(layers: &aurora_doc::LayerTree) -> Option<aurora_doc::Lay
         .iter()
         .copied()
         .find(|&id| matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. })))
+}
+
+/// `active_layer`, together with its own bounds, if it names a real
+/// pixel layer in `layers` — `None` for no active layer, an unknown id,
+/// or one that names a group (a group has no `bounds` of its own to
+/// move). What [`begin_drag`]'s own `Move` arm needs to start a drag,
+/// via [`aurora_doc::LayerTree::bounds`].
+#[must_use]
+fn active_pixel_layer(
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+) -> Option<(aurora_doc::LayerId, aurora_core::Rect)> {
+    let id = active_layer?;
+    let bounds = layers.bounds(id)?;
+    Some((id, bounds))
+}
+
+/// The active layer's own document-space origin (`bounds.x`/`bounds.y`,
+/// as `f32`), or `(0.0, 0.0)` if there's no active layer or it isn't a
+/// pixel layer — the same absent-precondition honesty
+/// [`active_pixel_layer`] already uses. What [`tile_origin_for_view`]
+/// needs to convert a document-space point into the active layer's own
+/// surface-local space, now that a layer can actually sit somewhere
+/// other than the document's own origin (`aurora_doc::LayerTree::set_bounds`,
+/// the Move tool's own document-model support).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn active_layer_origin(
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+) -> (f32, f32) {
+    active_pixel_layer(layers, active_layer)
+        .map_or((0.0, 0.0), |(_, bounds)| (bounds.x as f32, bounds.y as f32))
 }
 
 /// Selects `layer_id` as the active layer: sets `*active_layer` and
@@ -1784,10 +1910,12 @@ fn canvas_area_physical_size(
     ))
 }
 
-/// The document-space point currently at the canvas area's own top-left
-/// corner, given `view`'s own pan *and zoom* — the [`aurora_tile::TileId`]
-/// this maps to is where [`aurora_gpu::TileResidency::set_origin`]
-/// should point the atlas.
+/// The active pixel layer's own *surface-local* tile currently at the
+/// canvas area's own top-left corner, given `view`'s own pan *and
+/// zoom*, and `layer_origin` ([`active_layer_origin`] — the active
+/// layer's own document-space `(bounds.x, bounds.y)`, `(0.0, 0.0)` if
+/// there isn't one) — the [`aurora_tile::TileId`] this maps to is where
+/// [`aurora_gpu::TileResidency::set_origin`] should point the atlas.
 ///
 /// Goes through [`aurora_ui::CanvasView::to_document`] rather than
 /// dividing `view.pan()` by [`aurora_tile::TILE`] directly, so a
@@ -1795,24 +1923,40 @@ fn canvas_area_physical_size(
 /// `view.zoom()`) — real zoom-aware panning, not the "assumes
 /// `view.zoom() == 1.0`" approximation this function used before
 /// [`aurora_gpu::TileResidency::set_origin`] gained real scale support.
+/// Subtracting `layer_origin` from that document-space point before
+/// dividing into tiles is what makes a *moved* layer
+/// (`aurora_doc::LayerTree::set_bounds`) actually render in its new
+/// place, not just update the document model: `aurora_tile::TileStore`
+/// addresses a surface from its own local `(0, 0)`, not the document's
+/// (the same conversion `layer_local_point` already does for
+/// painting), and every layer built before the Move tool existed
+/// happened to sit at document `(0, 0)`, so this function never needed
+/// to make the distinction until now.
+///
 /// Still only tile-*granular*, though: the atlas's own uv offset always
 /// starts at a whole tile's own top-left corner, so any sub-tile
 /// fractional scroll within that tile isn't reflected — a real fix
 /// needs a fractional uv offset alongside `TileResidency`'s existing
 /// zoom-scaled `uv_scale`, separate follow-on work this bullet's own
-/// "infinite zoom" remainder still names. Negative document coordinates
-/// (panning above/left of the document's own origin) clamp to `0` —
-/// `TileId`'s own fields are unsigned, so there is no tile to point to
-/// there; a real fix needs either signed tile coordinates or a
-/// document-relative origin convention, not invented here.
+/// "infinite zoom" remainder still names. Negative surface-local
+/// coordinates (panning above/left of the layer's own origin, or a
+/// layer moved so its origin is right of/below the canvas area's own
+/// top-left corner) clamp to `0` — `TileId`'s own fields are unsigned,
+/// so there is no tile to point to there; a real fix needs either
+/// signed tile coordinates or a document-relative origin convention,
+/// not invented here.
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn tile_origin_for_view(view: &aurora_ui::CanvasView) -> aurora_tile::TileId {
+fn tile_origin_for_view(
+    view: &aurora_ui::CanvasView,
+    layer_origin: (f32, f32),
+) -> aurora_tile::TileId {
     let (doc_x, doc_y) = view.to_document((0.0, 0.0));
+    let (local_x, local_y) = (doc_x - layer_origin.0, doc_y - layer_origin.1);
     #[allow(clippy::cast_precision_loss)]
     let tile_size = aurora_tile::TILE as f32;
-    let x = (doc_x / tile_size).floor().max(0.0);
-    let y = (doc_y / tile_size).floor().max(0.0);
+    let x = (local_x / tile_size).floor().max(0.0);
+    let y = (local_y / tile_size).floor().max(0.0);
     aurora_tile::TileId {
         x: x as u32,
         y: y as u32,
@@ -1894,18 +2038,15 @@ struct App {
     /// what [`Self::active_layer`]/[`LayerTree::surface_id`] read to find
     /// somewhere for the Brush tool to actually paint.
     layers: aurora_doc::LayerTree,
-    /// The layer the Brush/Eraser tools paint/erase into, if any — the topmost pixel
-    /// layer of `layers` at construction time
-    /// ([`topmost_pixel_layer`]), real-time-changeable now by clicking a
-    /// row in the Layers panel ([`Self::layer_rows`],
-    /// [`Self::handle_pointer_pressed`]) — the same click-to-select gap
-    /// `aurora_ui::tool`'s own doc comment used to name for the Move
-    /// tool, now closed for layer selection (Move's own blocker is
-    /// unrelated and remains open). `None` for a document with no pixel
-    /// layer at all, or once one is clicked that turns out to be a
-    /// group (groups are never inserted into `layer_rows` at all, so
-    /// this can't actually happen via a click — only via never having a
-    /// pixel layer to begin with).
+    /// The layer the Brush/Eraser tools paint/erase into and the Move
+    /// tool repositions, if any — the topmost pixel layer of `layers`
+    /// at construction time ([`topmost_pixel_layer`]), real-time-
+    /// changeable now by clicking a row in the Layers panel
+    /// ([`Self::layer_rows`], [`Self::handle_pointer_pressed`]). `None`
+    /// for a document with no pixel layer at all, or once one is
+    /// clicked that turns out to be a group (groups are never inserted
+    /// into `layer_rows` at all, so this can't actually happen via a
+    /// click — only via never having a pixel layer to begin with).
     active_layer: Option<aurora_doc::LayerId>,
     /// Every Layers-panel row's own `WidgetId`, mapped to the `LayerId`
     /// it represents (`aurora_ui::populate_layers_panel`'s own return
@@ -2233,7 +2374,11 @@ impl App {
     /// ([`continue_drag`]), painting or erasing any dab positions it
     /// returns ([`Self::paint_dab`]/[`Self::erase_dab`], chosen by which
     /// `Drag` variant is active) — empty for every drag but
-    /// `Brush`/`Eraser`.
+    /// `Brush`/`Eraser`. For `Drag::Move`, applies its own live,
+    /// just-updated `current_bounds` to the document
+    /// ([`Self::apply_move`]) instead — the "read the field
+    /// `continue_drag` just updated, then do the one real mutation"
+    /// half of the split that function's own doc comment describes.
     fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
@@ -2255,6 +2400,14 @@ impl App {
                     self.paint_dab(doc_point);
                 }
             }
+        }
+        if let Some(Drag::Move {
+            layer_id,
+            current_bounds,
+            ..
+        }) = self.drag
+        {
+            self.apply_move(layer_id, current_bounds);
         }
     }
 
@@ -2299,7 +2452,13 @@ impl App {
             handle_zoom_tool_click(&mut self.canvas_view, canvas_point, self.modifiers);
             return;
         }
-        self.drag = begin_drag(self.tool, button, canvas_point, &self.canvas_view);
+        self.drag = begin_drag(
+            self.tool,
+            button,
+            canvas_point,
+            &self.canvas_view,
+            active_pixel_layer(&self.layers, self.active_layer),
+        );
         match self.drag {
             Some(Drag::Brush { last_doc, .. }) => self.paint_dab(last_doc),
             Some(Drag::Eraser { last_doc, .. }) => self.erase_dab(last_doc),
@@ -2361,6 +2520,26 @@ impl App {
         let local = layer_local_point(bounds, doc_point);
         if let Err(err) = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS) {
             tracing::warn!(?err, "failed to erase a dab");
+        }
+    }
+
+    /// Applies `bounds` to `layer_id` in the live document
+    /// (`aurora_doc::LayerTree::set_bounds`) — the one real mutation a
+    /// `Drag::Move` needs, called every pointer-move event while one is
+    /// active with that drag's own live `current_bounds`
+    /// ([`Self::handle_pointer_moved`]). Bypasses `History` entirely,
+    /// the same as [`Self::paint_dab`]/[`Self::erase_dab`] already do
+    /// for pixel edits — there is no live `History` on `App` to record
+    /// through yet, so a Move, like a brush stroke, isn't undoable
+    /// today. A real, logged failure (an unknown or non-pixel
+    /// `layer_id`) shouldn't happen in practice — `layer_id` always
+    /// comes from `Drag::Move` itself, set from a real active pixel
+    /// layer when the drag began — but this reports rather than assumes
+    /// it, the same discipline every other fallible call in this crate
+    /// already applies.
+    fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
+        if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
+            tracing::warn!(?err, "failed to reposition the active layer");
         }
     }
 
@@ -2475,7 +2654,10 @@ impl App {
                     {
                         residency.set_origin(
                             gpu.queue(),
-                            tile_origin_for_view(&self.canvas_view),
+                            tile_origin_for_view(
+                                &self.canvas_view,
+                                active_layer_origin(&self.layers, self.active_layer),
+                            ),
                             canvas_size,
                             self.canvas_view.zoom(),
                         );
@@ -4468,7 +4650,7 @@ mod tests {
     fn tile_origin_for_view_is_zero_zero_with_no_pan() {
         let view = CanvasView::new();
         assert_eq!(
-            tile_origin_for_view(&view),
+            tile_origin_for_view(&view, (0.0, 0.0)),
             aurora_tile::TileId { x: 0, y: 0 }
         );
     }
@@ -4483,7 +4665,7 @@ mod tests {
         let mut view = CanvasView::new();
         view.pan_by((300.0, 300.0));
         assert_eq!(
-            tile_origin_for_view(&view),
+            tile_origin_for_view(&view, (0.0, 0.0)),
             aurora_tile::TileId { x: 0, y: 0 }
         );
     }
@@ -4496,7 +4678,7 @@ mod tests {
         let mut view = CanvasView::new();
         view.pan_by((-300.0, -300.0));
         assert_eq!(
-            tile_origin_for_view(&view),
+            tile_origin_for_view(&view, (0.0, 0.0)),
             aurora_tile::TileId { x: 1, y: 1 }
         );
     }
@@ -4512,7 +4694,33 @@ mod tests {
         view.zoom_at((0.0, 0.0), 2.0);
         view.pan_by((-600.0, -600.0));
         assert_eq!(
-            tile_origin_for_view(&view),
+            tile_origin_for_view(&view, (0.0, 0.0)),
+            aurora_tile::TileId { x: 1, y: 1 }
+        );
+    }
+
+    #[test]
+    fn tile_origin_for_view_accounts_for_a_moved_layers_own_origin() {
+        // No pan/zoom at all, but the active layer itself sits at
+        // document (300, 300) -- the canvas area's own top-left corner
+        // (document (0, 0)) is now *before* the layer even starts, in
+        // surface-local space (-300, -300), which clamps to tile (0, 0)
+        // the same way a pan past the document's own edge already does.
+        let view = CanvasView::new();
+        assert_eq!(
+            tile_origin_for_view(&view, (300.0, 300.0)),
+            aurora_tile::TileId { x: 0, y: 0 }
+        );
+
+        // A layer at (300, 300), *plus* enough pan to put document
+        // (600, 600) at the canvas area's own top-left corner: surface-
+        // local (600 - 300, 600 - 300) = (300, 300), landing in tile
+        // (1, 1) -- proving the layer's own origin and the view's own
+        // pan combine, neither alone.
+        let mut panned = CanvasView::new();
+        panned.pan_by((-600.0, -600.0));
+        assert_eq!(
+            tile_origin_for_view(&panned, (300.0, 300.0)),
             aurora_tile::TileId { x: 1, y: 1 }
         );
     }
@@ -4533,7 +4741,7 @@ mod tests {
         let view = CanvasView::new();
         for tool in Tool::ALL {
             assert_eq!(
-                begin_drag(tool, PointerButton::Middle, (10.0, 20.0), &view),
+                begin_drag(tool, PointerButton::Middle, (10.0, 20.0), &view, None),
                 Some(Drag::Pan {
                     last_screen: (10.0, 20.0)
                 }),
@@ -4546,7 +4754,7 @@ mod tests {
     fn begin_drag_with_pan_tool_and_primary_button_pans() {
         let view = CanvasView::new();
         assert_eq!(
-            begin_drag(Tool::Pan, PointerButton::Primary, (5.0, 5.0), &view),
+            begin_drag(Tool::Pan, PointerButton::Primary, (5.0, 5.0), &view, None),
             Some(Drag::Pan {
                 last_screen: (5.0, 5.0)
             })
@@ -4562,7 +4770,8 @@ mod tests {
                 Tool::MarqueeSelect,
                 PointerButton::Primary,
                 (20.0, 40.0),
-                &view
+                &view,
+                None
             ),
             Some(Drag::Marquee {
                 start_doc: (10.0, 20.0)
@@ -4571,14 +4780,16 @@ mod tests {
     }
 
     #[test]
-    fn begin_drag_with_move_or_eyedropper_tool_and_primary_button_does_nothing() {
+    fn begin_drag_with_eyedropper_tool_and_primary_button_does_nothing() {
         let view = CanvasView::new();
         assert_eq!(
-            begin_drag(Tool::Move, PointerButton::Primary, (1.0, 1.0), &view),
-            None
-        );
-        assert_eq!(
-            begin_drag(Tool::Eyedropper, PointerButton::Primary, (1.0, 1.0), &view),
+            begin_drag(
+                Tool::Eyedropper,
+                PointerButton::Primary,
+                (1.0, 1.0),
+                &view,
+                None
+            ),
             None
         );
     }
@@ -4587,7 +4798,13 @@ mod tests {
     fn begin_drag_with_brush_tool_and_primary_button_starts_a_brush_drag_at_zero_carry() {
         let view = CanvasView::new();
         assert_eq!(
-            begin_drag(Tool::Brush, PointerButton::Primary, (10.0, 20.0), &view),
+            begin_drag(
+                Tool::Brush,
+                PointerButton::Primary,
+                (10.0, 20.0),
+                &view,
+                None
+            ),
             Some(Drag::Brush {
                 last_doc: (10.0, 20.0),
                 carry: 0.0
@@ -4599,7 +4816,13 @@ mod tests {
     fn begin_drag_with_eraser_tool_and_primary_button_starts_an_eraser_drag_at_zero_carry() {
         let view = CanvasView::new();
         assert_eq!(
-            begin_drag(Tool::Eraser, PointerButton::Primary, (10.0, 20.0), &view),
+            begin_drag(
+                Tool::Eraser,
+                PointerButton::Primary,
+                (10.0, 20.0),
+                &view,
+                None
+            ),
             Some(Drag::Eraser {
                 last_doc: (10.0, 20.0),
                 carry: 0.0
@@ -4611,8 +4834,54 @@ mod tests {
     fn begin_drag_with_zoom_tool_and_secondary_button_does_nothing() {
         let view = CanvasView::new();
         assert_eq!(
-            begin_drag(Tool::Zoom, PointerButton::Secondary, (1.0, 1.0), &view),
+            begin_drag(
+                Tool::Zoom,
+                PointerButton::Secondary,
+                (1.0, 1.0),
+                &view,
+                None
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn begin_drag_with_move_tool_and_no_active_pixel_layer_does_nothing() {
+        let view = CanvasView::new();
+        assert_eq!(
+            begin_drag(Tool::Move, PointerButton::Primary, (1.0, 1.0), &view, None),
+            None
+        );
+    }
+
+    #[test]
+    fn begin_drag_with_move_tool_and_an_active_pixel_layer_starts_a_move_drag() {
+        let view = CanvasView::new();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            begin_drag(
+                Tool::Move,
+                PointerButton::Primary,
+                (5.0, 5.0),
+                &view,
+                Some((id, bounds))
+            ),
+            Some(Drag::Move {
+                layer_id: id,
+                start_doc: (5.0, 5.0),
+                start_bounds: bounds,
+                current_bounds: bounds,
+            })
         );
     }
 
@@ -4735,6 +5004,39 @@ mod tests {
                 carry: 0.0
             },
             "must advance its own last-known point and carry for the next event"
+        );
+    }
+
+    #[test]
+    fn continue_drag_move_shifts_current_bounds_by_the_pointer_delta_and_returns_no_dabs() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let start_bounds = aurora_core::Rect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 50,
+        };
+        let mut drag = Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: (0.0, 0.0),
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+        let dabs = continue_drag(&mut drag, (15.0, -8.0), &mut view, &mut selection);
+        assert_eq!(dabs, Vec::new(), "Move must never produce dabs to paint");
+        let Drag::Move { current_bounds, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert_eq!(
+            current_bounds,
+            aurora_core::Rect {
+                x: 25,
+                y: 12,
+                width: 100,
+                height: 50,
+            },
+            "must shift start_bounds by the same delta the pointer travelled"
         );
     }
 
