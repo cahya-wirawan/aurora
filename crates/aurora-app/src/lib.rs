@@ -190,16 +190,32 @@
 //! Move is really undoable — one undo step per pointer-move event
 //! during the drag, not one per whole drag gesture (coalescing a drag
 //! into a single undo step is separate, still-open follow-on work).
-//! **Scope, stated honestly**: `App::paint_dab`/`Self::erase_dab` still
-//! bypass `History` entirely — a brush/eraser edit is raw pixel data
-//! with no `LayerOp` equivalent to record (`History`'s own doc comment:
-//! ops are tree-level changes, never pixel snapshots), so undoing a
-//! stroke needs a real, separate design (a pixel-level op storing
-//! dirtied tiles, per invariant §7.3.3), not invented here. `Undo`/
-//! `Redo` are shortcut-only, matching how the existing tool-switch
-//! letters work — neither is in the command palette or (macOS) native
-//! menu yet, real follow-on work once this crate has an Edit menu at
-//! all.
+//! **Scope, stated honestly**: `Undo`/`Redo` are shortcut-only, matching
+//! how the existing tool-switch letters work — neither is in the
+//! command palette or (macOS) native menu yet, real follow-on work once
+//! this crate has an Edit menu at all.
+//!
+//! **Pixel-edit undo, 2026-08-06** — the gap the paragraph above named
+//! (`App::paint_dab`/`Self::erase_dab` bypassing `History` entirely,
+//! since a stroke has no `LayerOp` equivalent to record) is closed, via
+//! `aurora_brush::StrokeSnapshot`/`PixelHistory` rather than extending
+//! `History` itself: a stroke's pixel diff (the tiles it touched, their
+//! before/after content — invariant §7.3.3's own "dirtied tiles"
+//! wording, applied to raw pixel data instead of a layer's own scalar
+//! properties) has no home in `aurora_doc::LayerOp`, and `aurora-brush`
+//! can't depend on `aurora-doc` to add one anyway (PRD §7.2's own
+//! layering). `Self::paint_dab`/`Self::erase_dab` now call
+//! `aurora_brush::touched_tiles` before each real write and record the
+//! result into the active `Drag::Brush`/`Drag::Eraser`'s own `stroke`
+//! field; `Self::handle_pointer_released` pushes the completed stroke
+//! onto `Self::pixel_history` once the drag ends. `Ctrl+Z`/
+//! `Ctrl+Shift+Z` (`run_command`) check `pixel_history` first and fall
+//! back to `history` — a real, useful default (a stroke is usually the
+//! most recent thing to undo), but **not a unified chronological
+//! stack**: undoing right after a Move that itself followed a stroke
+//! undoes the stroke, not the more-recent Move. See `run_command`'s own
+//! doc comment for the full policy and why unifying the two for real is
+//! separate, still-open follow-on work.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
@@ -1269,15 +1285,30 @@ fn toggle_command_palette(
 
 /// Runs a global shortcut's own command — [`handle_key`]'s dispatch
 /// target once a [`KeyChord`] resolves via [`ShortcutRegistry::resolve`].
-/// `Undo`/`Redo` are the one case that can fail (mixing a direct
-/// `LayerTree` call with `History`-recorded ones — see `History`'s own
-/// doc comment); logged rather than propagated, the same "a bad input
+///
+/// **`Undo`/`Redo`'s own policy, stated honestly**: `aurora-brush`'s
+/// `pixel_history` (a completed Brush/Eraser stroke) and
+/// `aurora-doc`'s `history` (a structural edit — so far, just Move) are
+/// two genuinely separate stacks, not one unified chronological journal
+/// — `aurora-brush` doesn't depend on `aurora-doc` (PRD §7.2's own
+/// layering), so there is no shared "most recent action, whatever kind"
+/// order to interleave them into from either side. This picks
+/// `pixel_history` first whenever it has something to undo/redo,
+/// falling back to `history` otherwise — a real, useful default (a
+/// stroke is usually the most recent thing a user reaches to undo), but
+/// not always the *chronologically* correct one: pressing `Ctrl+Z`
+/// right after a Move that itself followed a stroke undoes the stroke,
+/// not the more-recent Move. Unifying the two into one real
+/// chronological stack is separate, still-open follow-on work. Both
+/// paths can fail (mixing a direct `LayerTree`/`TileStore` call with
+/// recorded ones — see `History`'s and `PixelHistory`'s own doc
+/// comments); logged rather than propagated, the same "a bad input
 /// mustn't crash the event loop" shape every other handler in this
-/// section already follows. Both refresh the History panel afterward
-/// ([`refresh_history_panel`]) since undo/redo themselves grow the
-/// journal (`History`'s own doc comment: undoing/redoing is itself a
-/// journaled step) — the one case in this crate so far where the
-/// History panel's own "one-shot, not reactive" scope no longer holds.
+/// section already follows. A structural undo/redo refreshes the
+/// History panel afterward ([`refresh_history_panel`]) since undoing/
+/// redoing is itself a journaled step; a pixel undo/redo has no such
+/// panel to refresh — the canvas alone shows the result, on the next
+/// redraw.
 #[allow(clippy::too_many_arguments)]
 fn run_command(
     workspace: &mut aurora_ui::Workspace,
@@ -1286,6 +1317,8 @@ fn run_command(
     tool: &mut aurora_ui::Tool,
     layers: &mut aurora_doc::LayerTree,
     history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    store: Option<&mut aurora_tile::TileStore>,
     command: AppCommand,
 ) {
     match command {
@@ -1297,14 +1330,66 @@ fn run_command(
         }
         AppCommand::ToggleCommandPalette => toggle_command_palette(workspace, focus, palette),
         AppCommand::SelectTool(selected) => *tool = selected,
-        AppCommand::Undo => match history.undo(layers) {
-            Ok(_) => refresh_history_panel(workspace, history),
-            Err(err) => tracing::warn!(?err, "undo failed"),
-        },
-        AppCommand::Redo => match history.redo(layers) {
-            Ok(_) => refresh_history_panel(workspace, history),
-            Err(err) => tracing::warn!(?err, "redo failed"),
-        },
+        AppCommand::Undo => {
+            if pixel_history.can_undo() {
+                run_pixel_undo(
+                    pixel_history,
+                    store,
+                    aurora_brush::PixelHistory::undo,
+                    "undo",
+                );
+            } else {
+                match history.undo(layers) {
+                    Ok(_) => refresh_history_panel(workspace, history),
+                    Err(err) => tracing::warn!(?err, "undo failed"),
+                }
+            }
+        }
+        AppCommand::Redo => {
+            if pixel_history.can_redo() {
+                run_pixel_undo(
+                    pixel_history,
+                    store,
+                    aurora_brush::PixelHistory::redo,
+                    "redo",
+                );
+            } else {
+                match history.redo(layers) {
+                    Ok(_) => refresh_history_panel(workspace, history),
+                    Err(err) => tracing::warn!(?err, "redo failed"),
+                }
+            }
+        }
+    }
+}
+
+/// [`aurora_brush::PixelHistory::undo`]/`::redo`'s own shared shape —
+/// what [`run_pixel_undo`]'s own `op` parameter names.
+type PixelHistoryOp = fn(
+    &mut aurora_brush::PixelHistory,
+    &mut aurora_tile::TileStore,
+) -> Result<bool, aurora_tile::TileError>;
+
+/// Runs `op` (`PixelHistory::undo` or `::redo`) against `pixel_history`
+/// and `store`, logging under `verb` (`"undo"`/`"redo"`, for the log
+/// message alone) on either kind of failure — no live `TileStore` to
+/// restore into (painting is already silently disabled for the session
+/// in that case, same as everywhere else in this crate) or a real
+/// `TileError` restoring a captured tile. Factored out since
+/// [`run_command`]'s own `Undo`/`Redo` arms are otherwise identical but
+/// for which `PixelHistory` method to call.
+fn run_pixel_undo(
+    pixel_history: &mut aurora_brush::PixelHistory,
+    store: Option<&mut aurora_tile::TileStore>,
+    op: PixelHistoryOp,
+    verb: &str,
+) {
+    let Some(store) = store else {
+        tracing::warn!(verb, "no live tile store; cannot undo/redo a pixel edit");
+        return;
+    };
+    if let Err(err) = op(pixel_history, store) {
+        tracing::warn!(?err, verb, "pixel undo/redo failed");
     }
 }
 
@@ -1448,6 +1533,8 @@ fn handle_key(
     tool: &mut aurora_ui::Tool,
     layers: &mut aurora_doc::LayerTree,
     history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    store: Option<&mut aurora_tile::TileStore>,
     shortcuts: &ShortcutRegistry<AppCommand>,
     modifiers: Modifiers,
     key: Key,
@@ -1472,7 +1559,17 @@ fn handle_key(
         );
     }
     if let Some(&command) = shortcuts.resolve(chord) {
-        run_command(workspace, focus, palette, tool, layers, history, command);
+        run_command(
+            workspace,
+            focus,
+            palette,
+            tool,
+            layers,
+            history,
+            pixel_history,
+            store,
+            command,
+        );
     }
     None
 }
@@ -1683,7 +1780,7 @@ fn pointer_in_canvas(
 /// sampling a pixel needs no state carried between events (no carry, no
 /// start point, nothing) — each event just samples wherever the
 /// pointer currently is, independent of the last one.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug)]
 enum Drag {
     Pan {
         last_screen: (f32, f32),
@@ -1694,10 +1791,20 @@ enum Drag {
     Brush {
         last_doc: (f32, f32),
         carry: f32,
+        /// This stroke's own accumulated undo snapshot — `None` when the
+        /// drag began with no real active pixel layer to paint into
+        /// (`begin_drag`'s own doc comment: Brush/Eraser start
+        /// unconditionally, whether or not there's actually anywhere to
+        /// paint), matching [`App::paint_dab`]'s own absent-precondition
+        /// honesty rather than picking an arbitrary placeholder
+        /// `SurfaceId`.
+        stroke: Option<aurora_brush::StrokeSnapshot>,
     },
     Eraser {
         last_doc: (f32, f32),
         carry: f32,
+        /// Same as `Drag::Brush`'s own `stroke` field, above.
+        stroke: Option<aurora_brush::StrokeSnapshot>,
     },
     Move {
         layer_id: aurora_doc::LayerId,
@@ -1747,10 +1854,14 @@ fn begin_drag(
         (aurora_ui::Tool::Brush, PointerButton::Primary) => Some(Drag::Brush {
             last_doc: view.to_document(canvas_point),
             carry: 0.0,
+            stroke: active_pixel_layer
+                .map(|(id, _)| aurora_brush::StrokeSnapshot::new(surface_id_for(id))),
         }),
         (aurora_ui::Tool::Eraser, PointerButton::Primary) => Some(Drag::Eraser {
             last_doc: view.to_document(canvas_point),
             carry: 0.0,
+            stroke: active_pixel_layer
+                .map(|(id, _)| aurora_brush::StrokeSnapshot::new(surface_id_for(id))),
         }),
         (aurora_ui::Tool::Move, PointerButton::Primary) => {
             let (layer_id, bounds) = active_pixel_layer?;
@@ -1822,7 +1933,9 @@ fn continue_drag(
             selection.select(aurora_doc::Selection::new(rect));
             Vec::new()
         }
-        Drag::Brush { last_doc, carry } => {
+        Drag::Brush {
+            last_doc, carry, ..
+        } => {
             let current_doc = view.to_document(canvas_point);
             let step = aurora_brush::dab_step(BRUSH_RADIUS, aurora_brush::DEFAULT_SPACING);
             let (dabs, new_carry) =
@@ -1831,7 +1944,9 @@ fn continue_drag(
             *carry = new_carry;
             dabs
         }
-        Drag::Eraser { last_doc, carry } => {
+        Drag::Eraser {
+            last_doc, carry, ..
+        } => {
             let current_doc = view.to_document(canvas_point);
             let step = aurora_brush::dab_step(ERASER_RADIUS, aurora_brush::DEFAULT_SPACING);
             let (dabs, new_carry) =
@@ -2006,6 +2121,18 @@ fn active_layer_origin(
 #[must_use]
 fn composite_surface_id() -> aurora_tile::SurfaceId {
     aurora_tile::SurfaceId::from_raw(u64::MAX)
+}
+
+/// `id`'s own `SurfaceId`, computed directly rather than through
+/// `LayerTree::surface_id` — a pure conversion of `id`'s own raw value
+/// (`aurora_tile::SurfaceId::from_raw(id.to_raw())`, exactly what that
+/// method does for a pixel layer), usable from a context like
+/// [`begin_drag`] that already knows `id` names a real pixel layer
+/// (`active_pixel_layer`'s own contract) without needing a `&LayerTree`
+/// reference just to re-derive what the id itself already encodes.
+#[must_use]
+fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
+    aurora_tile::SurfaceId::from_raw(id.to_raw())
 }
 
 /// Recomposites every tile in `residency`'s own currently-visible grid
@@ -2425,12 +2552,21 @@ struct App {
     /// Undo/Redo (`Ctrl+Z`/`Ctrl+Shift+Z`, [`run_command`]), also kept
     /// alive alongside it, not dropped after startup the way it used to
     /// be. `Self::apply_move` is the one live-editing path that records
-    /// through this today — `Self::paint_dab`/`Self::erase_dab` still
-    /// bypass it entirely, since raw pixel edits have no `LayerOp`
-    /// equivalent to record (`History`'s own doc comment: ops are
-    /// tree-level changes, never pixel data) — undoing a brush stroke is
-    /// separate, still-open follow-on work, not silently missing.
+    /// through this — raw pixel edits (`Self::paint_dab`/
+    /// `Self::erase_dab`) still bypass it entirely, since they have no
+    /// `aurora_doc::LayerOp` equivalent to record; see
+    /// [`Self::pixel_history`] for their own, separate undo instead.
     history: aurora_doc::History,
+    /// Undo/redo for completed Brush/Eraser strokes
+    /// (`aurora_brush::PixelHistory`) — the pixel-edit half `history`
+    /// structurally can't cover (a stroke is raw pixel data, not a
+    /// `LayerOp`). A genuinely separate stack, not unified with
+    /// `history` into one chronological journal — see [`run_command`]'s
+    /// own doc comment for the policy `Ctrl+Z`/`Ctrl+Shift+Z` use when
+    /// both have something to offer, and why. Populated by
+    /// `Self::handle_pointer_released` once a `Drag::Brush`/
+    /// `Drag::Eraser`'s own accumulated `StrokeSnapshot` completes.
+    pixel_history: aurora_brush::PixelHistory,
     /// The layer the Brush/Eraser tools paint/erase into and the Move
     /// tool repositions, if any — the topmost pixel layer of `layers`
     /// at construction time ([`topmost_pixel_layer`]), real-time-
@@ -2588,6 +2724,7 @@ impl App {
             selection: aurora_doc::SelectionSet::new(),
             layers,
             history,
+            pixel_history: aurora_brush::PixelHistory::new(),
             active_layer,
             current_colour: DEFAULT_COLOUR,
             layer_rows,
@@ -2646,6 +2783,8 @@ impl App {
             &mut self.tool,
             &mut self.layers,
             &mut self.history,
+            &mut self.pixel_history,
+            self.tile_store.as_mut(),
             &self.shortcuts,
             self.modifiers,
             key,
@@ -2957,12 +3096,15 @@ impl App {
                 }
             }
         }
-        match self.drag {
+        match self.drag.as_ref() {
             Some(Drag::Move {
                 layer_id,
                 current_bounds,
                 ..
-            }) => self.apply_move(layer_id, current_bounds),
+            }) => {
+                let (layer_id, current_bounds) = (*layer_id, *current_bounds);
+                self.apply_move(layer_id, current_bounds);
+            }
             Some(Drag::Eyedropper) => {
                 let doc_point = self.canvas_view.to_document(canvas_point);
                 self.sample_eyedropper(doc_point);
@@ -3035,9 +3177,15 @@ impl App {
             &self.canvas_view,
             active_pixel_layer(&self.layers, self.active_layer),
         );
-        match self.drag {
-            Some(Drag::Brush { last_doc, .. }) => self.paint_dab(last_doc),
-            Some(Drag::Eraser { last_doc, .. }) => self.erase_dab(last_doc),
+        match self.drag.as_ref() {
+            Some(Drag::Brush { last_doc, .. }) => {
+                let last_doc = *last_doc;
+                self.paint_dab(last_doc);
+            }
+            Some(Drag::Eraser { last_doc, .. }) => {
+                let last_doc = *last_doc;
+                self.erase_dab(last_doc);
+            }
             Some(Drag::Eyedropper) => {
                 let doc_point = self.canvas_view.to_document(canvas_point);
                 self.sample_eyedropper(doc_point);
@@ -3057,6 +3205,17 @@ impl App {
     /// error worth logging on its own. A real, logged failure ([`aurora_tile::TileError`],
     /// e.g. the scratch disk failing mid-session) is worth a warning,
     /// though, unlike those absent-precondition cases.
+    ///
+    /// Before the real write, captures every tile this dab is about to
+    /// touch ([`aurora_brush::touched_tiles`]) into the active
+    /// `Drag::Brush`'s own `stroke` snapshot
+    /// ([`aurora_brush::StrokeSnapshot::record_touch`]), if there is
+    /// one — the pixel-edit half of `Self::history`'s own Undo/Redo,
+    /// closed by [`Self::handle_pointer_released`] once the stroke
+    /// completes. A no-op for that half specifically (still paints)
+    /// when `self.drag` isn't actually a `Drag::Brush` with a real
+    /// `stroke` — shouldn't happen given how this is always called, but
+    /// this doesn't assume it.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
         let Some(layer_id) = self.active_layer else {
             return;
@@ -3072,6 +3231,17 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
+        if let Some(Drag::Brush {
+            stroke: Some(stroke),
+            ..
+        }) = self.drag.as_mut()
+        {
+            for tile in aurora_brush::touched_tiles(local, BRUSH_RADIUS) {
+                if let Err(err) = stroke.record_touch(store, tile) {
+                    tracing::warn!(?err, ?tile, "failed to capture a pixel-undo snapshot");
+                }
+            }
+        }
         if let Err(err) =
             aurora_brush::stamp_dab(store, surface, local, BRUSH_RADIUS, self.current_colour)
         {
@@ -3082,8 +3252,8 @@ impl App {
     /// Erases one dab at `doc_point` (document space) from the active
     /// layer's own surface in the live tile store — `aurora_brush::erase_dab`,
     /// [`Self::paint_dab`]'s subtractive counterpart, sharing every one
-    /// of its preconditions and silent-no-op cases (no live store, no
-    /// active layer, or that layer isn't a pixel layer).
+    /// of its preconditions, silent-no-op cases, and undo-snapshot
+    /// capture (against `Drag::Eraser`'s own `stroke` field instead).
     fn erase_dab(&mut self, doc_point: (f32, f32)) {
         let Some(layer_id) = self.active_layer else {
             return;
@@ -3099,6 +3269,17 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
+        if let Some(Drag::Eraser {
+            stroke: Some(stroke),
+            ..
+        }) = self.drag.as_mut()
+        {
+            for tile in aurora_brush::touched_tiles(local, ERASER_RADIUS) {
+                if let Err(err) = stroke.record_touch(store, tile) {
+                    tracing::warn!(?err, ?tile, "failed to capture a pixel-undo snapshot");
+                }
+            }
+        }
         if let Err(err) = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS) {
             tracing::warn!(?err, "failed to erase a dab");
         }
@@ -3168,8 +3349,27 @@ impl App {
     /// crate has no multi-touch/multi-pointer support to disambiguate
     /// which button a drag actually started with, and a single active
     /// window only ever has one drag in progress at a time.
+    ///
+    /// If the ending drag was a `Drag::Brush`/`Drag::Eraser` with a real
+    /// `stroke`, pushes it onto [`Self::pixel_history`]
+    /// (`aurora_brush::PixelHistory::push`'s own no-op-for-an-empty-
+    /// stroke behaviour handles a click/drag that never actually
+    /// touched a tile — e.g. a zero-radius brush, or no active layer at
+    /// all — without this needing to check that itself).
     fn handle_pointer_released(&mut self) {
-        self.drag = None;
+        if let Some(
+            Drag::Brush {
+                stroke: Some(stroke),
+                ..
+            }
+            | Drag::Eraser {
+                stroke: Some(stroke),
+                ..
+            },
+        ) = self.drag.take()
+        {
+            self.pixel_history.push(stroke);
+        }
     }
 
     /// A real `WindowEvent::MouseWheel`: zooms around the pointer's last
@@ -4339,6 +4539,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
 
         run_command(
             &mut workspace,
@@ -4347,6 +4548,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.layers.root));
@@ -4357,6 +4560,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.properties.root));
@@ -4367,6 +4572,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.history.root));
@@ -4378,6 +4585,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             AppCommand::FocusPrevious,
         );
         assert_eq!(
@@ -4395,6 +4604,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
 
         run_command(
             &mut workspace,
@@ -4403,6 +4613,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             AppCommand::SelectTool(Tool::Pan),
         );
         assert_eq!(tool, Tool::Pan);
@@ -4416,6 +4628,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
         let bounds = aurora_core::Rect {
             x: 0,
             y: 0,
@@ -4443,6 +4656,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             AppCommand::Undo,
         );
         assert_eq!(layers.bounds(id), Some(bounds), "undo must revert the move");
@@ -4462,6 +4677,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             AppCommand::Redo,
         );
         assert_eq!(layers.bounds(id), Some(moved), "redo must reapply the move");
@@ -4475,6 +4692,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
 
         run_command(
             &mut workspace,
@@ -4483,10 +4701,148 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             AppCommand::Undo,
         );
         assert!(layers.is_empty());
         assert_eq!(history.journal_len(), 0);
+    }
+
+    #[test]
+    // Exact-literal round-trip through f16 storage, no arithmetic --
+    // same reasoning `aurora-doc`'s own tests already document for
+    // their float_cmp allows.
+    #[allow(clippy::float_cmp)]
+    fn run_command_undo_prefers_a_pending_pixel_stroke_over_structural_history() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // A structural edit also sits on history's own undo stack --
+        // pixel_history must still be the one Ctrl+Z reaches for.
+        if let Err(err) = history.set_opacity(&mut layers, id, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let surface = aurora_tile::SurfaceId::from_raw(id.to_raw());
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let mut stroke = aurora_brush::StrokeSnapshot::new(surface);
+        if let Err(err) = stroke.record_touch(&mut store, tile) {
+            unreachable!("{err:?}");
+        }
+        let Ok(painted) = store.get_mut(surface, tile) else {
+            unreachable!("a real store must accept this write");
+        };
+        for sample in painted.texels_mut() {
+            *sample = half::f16::from_f32(0.75);
+        }
+        pixel_history.push(stroke);
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            AppCommand::Undo,
+        );
+
+        let Ok(restored) = store.get(surface, tile) else {
+            unreachable!("just written");
+        };
+        let Some(&sample) = restored.texels().first() else {
+            unreachable!("a real tile always has at least one sample");
+        };
+        assert_eq!(
+            sample.to_f32(),
+            0.0,
+            "the pixel stroke must have been undone"
+        );
+        assert_eq!(
+            layers.opacity(id),
+            Some(0.5),
+            "the structural opacity change must be untouched"
+        );
+        assert!(
+            history.can_undo(),
+            "structural history must still have its own entry, since pixel_history was chosen instead"
+        );
+        assert!(pixel_history.can_redo());
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            AppCommand::Redo,
+        );
+        let Ok(redone) = store.get(surface, tile) else {
+            unreachable!("just written");
+        };
+        let Some(&sample) = redone.texels().first() else {
+            unreachable!("a real tile always has at least one sample");
+        };
+        assert_eq!(sample.to_f32(), 0.75, "redo must reapply the stroke");
+    }
+
+    #[test]
+    fn run_command_pixel_undo_with_no_live_store_is_a_safe_no_op() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let mut stroke = aurora_brush::StrokeSnapshot::new(surface);
+        if let Err(err) = stroke.record_touch(&mut store, tile) {
+            unreachable!("{err:?}");
+        }
+        pixel_history.push(stroke);
+        assert!(pixel_history.can_undo());
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            AppCommand::Undo,
+        );
+        assert!(
+            pixel_history.can_undo(),
+            "with no live store to restore into, the pending stroke must be left exactly as it was"
+        );
     }
 
     #[test]
@@ -4635,6 +4991,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -4644,6 +5001,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Tab),
@@ -4663,6 +5022,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -4672,6 +5032,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             &shortcuts,
             Modifiers::none(),
             Key::Character('h'),
@@ -4705,6 +5067,7 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
+        let mut pixel_history = aurora_brush::PixelHistory::new();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -4714,6 +5077,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             &shortcuts,
             Modifiers {
                 control: true,
@@ -4739,6 +5104,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
         let shortcuts = default_shortcuts();
         // 'q' is deliberately not one of `default_shortcuts`' own
         // tool-switch letters (v/m/z/h/i) or anything else bound.
@@ -4750,6 +5116,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             &shortcuts,
             Modifiers::none(),
             Key::Character('q'),
@@ -4771,6 +5139,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
         let shortcuts = default_shortcuts();
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
@@ -4785,6 +5154,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             &shortcuts,
             Modifiers::none(),
             Key::Character('p'),
@@ -5792,6 +6163,7 @@ mod tests {
         let mut tool = Tool::default();
         let mut layers = aurora_doc::LayerTree::new();
         let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
         let shortcuts = default_shortcuts();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -5808,6 +6180,8 @@ mod tests {
             &mut tool,
             &mut layers,
             &mut history,
+            &mut pixel_history,
+            None,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Escape),
@@ -6019,118 +6393,126 @@ mod tests {
     fn begin_drag_with_the_middle_button_always_pans_regardless_of_tool() {
         let view = CanvasView::new();
         for tool in Tool::ALL {
-            assert_eq!(
-                begin_drag(tool, PointerButton::Middle, (10.0, 20.0), &view, None),
-                Some(Drag::Pan {
-                    last_screen: (10.0, 20.0)
-                }),
-                "tool {tool:?} must still pan on a middle-button drag"
-            );
+            match begin_drag(tool, PointerButton::Middle, (10.0, 20.0), &view, None) {
+                Some(Drag::Pan { last_screen }) => assert_eq!(last_screen, (10.0, 20.0)),
+                other => {
+                    unreachable!("tool {tool:?} must still pan on a middle-button drag: {other:?}")
+                }
+            }
         }
     }
 
     #[test]
     fn begin_drag_with_pan_tool_and_primary_button_pans() {
         let view = CanvasView::new();
-        assert_eq!(
-            begin_drag(Tool::Pan, PointerButton::Primary, (5.0, 5.0), &view, None),
-            Some(Drag::Pan {
-                last_screen: (5.0, 5.0)
-            })
-        );
+        match begin_drag(Tool::Pan, PointerButton::Primary, (5.0, 5.0), &view, None) {
+            Some(Drag::Pan { last_screen }) => assert_eq!(last_screen, (5.0, 5.0)),
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[test]
     fn begin_drag_with_marquee_tool_and_primary_button_starts_a_marquee_in_document_space() {
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 2.0);
-        assert_eq!(
-            begin_drag(
-                Tool::MarqueeSelect,
-                PointerButton::Primary,
-                (20.0, 40.0),
-                &view,
-                None
-            ),
-            Some(Drag::Marquee {
-                start_doc: (10.0, 20.0)
-            })
-        );
+        match begin_drag(
+            Tool::MarqueeSelect,
+            PointerButton::Primary,
+            (20.0, 40.0),
+            &view,
+            None,
+        ) {
+            Some(Drag::Marquee { start_doc }) => assert_eq!(start_doc, (10.0, 20.0)),
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[test]
     fn begin_drag_with_eyedropper_tool_and_primary_button_starts_an_eyedropper_drag() {
         let view = CanvasView::new();
-        assert_eq!(
-            begin_drag(
-                Tool::Eyedropper,
-                PointerButton::Primary,
-                (1.0, 1.0),
-                &view,
-                None
-            ),
-            Some(Drag::Eyedropper)
+        let drag = begin_drag(
+            Tool::Eyedropper,
+            PointerButton::Primary,
+            (1.0, 1.0),
+            &view,
+            None,
         );
+        assert!(matches!(drag, Some(Drag::Eyedropper)), "{drag:?}");
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn begin_drag_with_brush_tool_and_primary_button_starts_a_brush_drag_at_zero_carry() {
         let view = CanvasView::new();
-        assert_eq!(
-            begin_drag(
-                Tool::Brush,
-                PointerButton::Primary,
-                (10.0, 20.0),
-                &view,
-                None
-            ),
+        match begin_drag(
+            Tool::Brush,
+            PointerButton::Primary,
+            (10.0, 20.0),
+            &view,
+            None,
+        ) {
             Some(Drag::Brush {
-                last_doc: (10.0, 20.0),
-                carry: 0.0
-            })
-        );
+                last_doc,
+                carry,
+                stroke,
+            }) => {
+                assert_eq!(last_doc, (10.0, 20.0));
+                assert_eq!(carry, 0.0);
+                assert!(
+                    stroke.is_none(),
+                    "no active pixel layer means nothing to snapshot"
+                );
+            }
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn begin_drag_with_eraser_tool_and_primary_button_starts_an_eraser_drag_at_zero_carry() {
         let view = CanvasView::new();
-        assert_eq!(
-            begin_drag(
-                Tool::Eraser,
-                PointerButton::Primary,
-                (10.0, 20.0),
-                &view,
-                None
-            ),
+        match begin_drag(
+            Tool::Eraser,
+            PointerButton::Primary,
+            (10.0, 20.0),
+            &view,
+            None,
+        ) {
             Some(Drag::Eraser {
-                last_doc: (10.0, 20.0),
-                carry: 0.0
-            })
-        );
+                last_doc,
+                carry,
+                stroke,
+            }) => {
+                assert_eq!(last_doc, (10.0, 20.0));
+                assert_eq!(carry, 0.0);
+                assert!(
+                    stroke.is_none(),
+                    "no active pixel layer means nothing to snapshot"
+                );
+            }
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[test]
     fn begin_drag_with_zoom_tool_and_secondary_button_does_nothing() {
         let view = CanvasView::new();
-        assert_eq!(
+        assert!(
             begin_drag(
                 Tool::Zoom,
                 PointerButton::Secondary,
                 (1.0, 1.0),
                 &view,
                 None
-            ),
-            None
+            )
+            .is_none()
         );
     }
 
     #[test]
     fn begin_drag_with_move_tool_and_no_active_pixel_layer_does_nothing() {
         let view = CanvasView::new();
-        assert_eq!(
-            begin_drag(Tool::Move, PointerButton::Primary, (1.0, 1.0), &view, None),
-            None
-        );
+        assert!(begin_drag(Tool::Move, PointerButton::Primary, (1.0, 1.0), &view, None).is_none());
     }
 
     #[test]
@@ -6147,21 +6529,26 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        assert_eq!(
-            begin_drag(
-                Tool::Move,
-                PointerButton::Primary,
-                (5.0, 5.0),
-                &view,
-                Some((id, bounds))
-            ),
+        match begin_drag(
+            Tool::Move,
+            PointerButton::Primary,
+            (5.0, 5.0),
+            &view,
+            Some((id, bounds)),
+        ) {
             Some(Drag::Move {
-                layer_id: id,
-                start_doc: (5.0, 5.0),
-                start_bounds: bounds,
-                current_bounds: bounds,
-            })
-        );
+                layer_id,
+                start_doc,
+                start_bounds,
+                current_bounds,
+            }) => {
+                assert_eq!(layer_id, id);
+                assert_eq!(start_doc, (5.0, 5.0));
+                assert_eq!(start_bounds, bounds);
+                assert_eq!(current_bounds, bounds);
+            }
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[test]
@@ -6173,13 +6560,14 @@ mod tests {
         };
         let dabs = continue_drag(&mut drag, (15.0, 8.0), &mut view, &mut selection);
         assert_eq!(view.pan(), (5.0, -2.0));
-        assert_eq!(
-            drag,
-            Drag::Pan {
-                last_screen: (15.0, 8.0)
-            },
-            "must advance its own last-known point for the next event"
-        );
+        match drag {
+            Drag::Pan { last_screen } => assert_eq!(
+                last_screen,
+                (15.0, 8.0),
+                "must advance its own last-known point for the next event"
+            ),
+            other => unreachable!("{other:?}"),
+        }
         assert_eq!(dabs, Vec::new(), "Pan must never produce dabs to paint");
     }
 
@@ -6216,6 +6604,7 @@ mod tests {
         let mut drag = Drag::Brush {
             last_doc: (0.0, 0.0),
             carry: 0.0,
+            stroke: None,
         };
         // radius 24, DEFAULT_SPACING 0.25 -> step 6; a 12-unit segment
         // lands dabs at 6 and 12 (the segment's own start, 0, is not
@@ -6223,14 +6612,18 @@ mod tests {
         // drag or the previous event).
         let dabs = continue_drag(&mut drag, (12.0, 0.0), &mut view, &mut selection);
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
-        assert_eq!(
-            drag,
+        match drag {
             Drag::Brush {
-                last_doc: (12.0, 0.0),
-                carry: 0.0
-            },
-            "must advance its own last-known point and carry for the next event"
-        );
+                last_doc, carry, ..
+            } => {
+                assert_eq!(
+                    (last_doc, carry),
+                    ((12.0, 0.0), 0.0),
+                    "must advance its own last-known point and carry for the next event"
+                );
+            }
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[test]
@@ -6240,6 +6633,7 @@ mod tests {
         let mut drag = Drag::Brush {
             last_doc: (0.0, 0.0),
             carry: 0.0,
+            stroke: None,
         };
         let first = continue_drag(&mut drag, (3.0, 0.0), &mut view, &mut selection);
         // Segment shorter than one step (6): no new dab yet, but the 3
@@ -6247,13 +6641,12 @@ mod tests {
         // the exact bug a fresh `dabs_along_path` call each event would
         // have (see `continue_drag`'s own doc comment).
         assert_eq!(first, Vec::new());
-        assert_eq!(
-            drag,
+        match drag {
             Drag::Brush {
-                last_doc: (3.0, 0.0),
-                carry: 3.0
-            }
-        );
+                last_doc, carry, ..
+            } => assert_eq!((last_doc, carry), ((3.0, 0.0), 3.0)),
+            other => unreachable!("{other:?}"),
+        }
 
         // Second event: 4 more units. 3 (carried) + 4 = 7 >= step (6),
         // so exactly one dab lands (at the 6-unit mark, i.e. 3 units
@@ -6270,20 +6663,25 @@ mod tests {
         let mut drag = Drag::Eraser {
             last_doc: (0.0, 0.0),
             carry: 0.0,
+            stroke: None,
         };
         // Same radius/spacing as Brush (ERASER_RADIUS == BRUSH_RADIUS ==
         // 24, DEFAULT_SPACING 0.25 -> step 6), so the same dab positions
         // land for the same segment.
         let dabs = continue_drag(&mut drag, (12.0, 0.0), &mut view, &mut selection);
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
-        assert_eq!(
-            drag,
+        match drag {
             Drag::Eraser {
-                last_doc: (12.0, 0.0),
-                carry: 0.0
-            },
-            "must advance its own last-known point and carry for the next event"
-        );
+                last_doc, carry, ..
+            } => {
+                assert_eq!(
+                    (last_doc, carry),
+                    ((12.0, 0.0), 0.0),
+                    "must advance its own last-known point and carry for the next event"
+                );
+            }
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[test]
@@ -6330,7 +6728,10 @@ mod tests {
             Vec::new(),
             "Eyedropper must never produce dabs to paint"
         );
-        assert_eq!(drag, Drag::Eyedropper, "carries no state to update");
+        assert!(
+            matches!(drag, Drag::Eyedropper),
+            "carries no state to update"
+        );
     }
 
     #[test]
