@@ -711,6 +711,36 @@ impl History {
         Ok(Some(old.union(&value)))
     }
 
+    /// Records a bounds change for `id` from `old` to whatever `tree`
+    /// currently shows, as a single undo step — unlike [`Self::set_bounds`],
+    /// this never touches `tree` itself. For a caller that already
+    /// applied the real change directly (`aurora-app`'s own Move drag:
+    /// live visual feedback on every pointer-move event, without
+    /// recording an undo step for each one) and wants exactly one undo
+    /// entry for the whole gesture, retroactively, once it completes.
+    /// Journals `SetBounds { value: tree.bounds(id) }` — the tree's own
+    /// current, real state, matching every other journal entry's own
+    /// "what was actually applied" meaning — and pushes its inverse,
+    /// `SetBounds { value: old }`, onto the undo stack, so undoing
+    /// restores `old` in one step regardless of how many intermediate
+    /// positions the live gesture actually passed through.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't currently name
+    /// a real layer in `tree`.
+    pub fn record_bounds_change(
+        &mut self,
+        tree: &LayerTree,
+        id: LayerId,
+        old: Rect,
+    ) -> Result<(), DocError> {
+        let current = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
+        self.journal.push(LayerOp::SetBounds { id, value: current });
+        self.push(LayerOp::SetBounds { id, value: old });
+        Ok(())
+    }
+
     /// Same as [`LayerTree::set_visible`], recorded for undo.
     ///
     /// # Errors
@@ -1512,6 +1542,64 @@ mod tests {
         // `tree::tests::set_bounds_rejects_a_group`).
         match history.set_bounds(&mut tree, id, bounds()) {
             Err(DocError::UnknownLayer(got)) => assert_eq!(got, id),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_bounds_change_records_one_undo_step_covering_a_change_already_applied() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let moved = Rect {
+            x: 100,
+            y: 100,
+            width: 10,
+            height: 10,
+        };
+        // Applied directly, bypassing History entirely -- the same
+        // "live drag feedback" shape `aurora-app` uses.
+        if let Err(err) = tree.set_bounds(id, moved) {
+            unreachable!("{err:?}");
+        }
+        let journal_len_before = history.journal_len();
+
+        if let Err(err) = history.record_bounds_change(&tree, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            history.journal_len(),
+            journal_len_before + 1,
+            "exactly one journal entry for the whole gesture, not one per intermediate position"
+        );
+        assert!(history.can_undo());
+        assert!(!history.can_redo());
+
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.bounds(id),
+            Some(bounds()),
+            "undo must restore the pre-gesture bounds in one step"
+        );
+
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.bounds(id), Some(moved), "redo must reapply the move");
+    }
+
+    #[test]
+    fn record_bounds_change_rejects_an_unknown_id() {
+        let tree = LayerTree::new();
+        let mut history = History::new();
+        let bogus: super::LayerId = Id::from_raw(999);
+        match history.record_bounds_change(&tree, bogus, bounds()) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
             other => unreachable!("expected UnknownLayer, got {other:?}"),
         }
     }
