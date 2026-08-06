@@ -320,6 +320,35 @@
 //! and so does GPU-side compositing (`aurora_render::TileCompositor`
 //! already exists for it, just not wired in here yet).
 //!
+//! **Document-level canvas size and real ICC round-trip, also
+//! 2026-08-06**: two gaps the `.aur` bullet had named since it landed.
+//! `App::canvas_size` is a new, real, independent field — until now,
+//! `.aur` saves re-derived canvas size from the topmost pixel layer's
+//! own bounds on *every* save (`document_canvas_size`), which is wrong
+//! for a real editor: opening a `.aur` file whose stored canvas size
+//! differed from its topmost layer, then saving again with no edits,
+//! silently shrank or grew the canvas to match that layer instead of
+//! preserving it. `canvas_size` is now seeded once (from
+//! `document_canvas_size` for `demo_document`/a recovered autosave,
+//! from a decoded image's own real dimensions for `Self::open_file`, or
+//! restored directly from a `.aur` file's own manifest for
+//! `Self::open_aur_file`) and stays live from then on, read (not
+//! re-derived) by `Self::save_aur_file`. `document_canvas_size` itself
+//! is unchanged — it's the fallback `canvas_size` is seeded *from* when
+//! nothing else names a real one, not replaced.
+//!
+//! `aurora_io::aur`'s own `write`/`read` gained a real
+//! `Option<&aurora_color::IccProfile>`/`Option<IccProfile>` parameter
+//! (`aurora_color::IccProfile::to_bytes`, new the same day, wraps
+//! `lcms2`'s own `Profile::icc`) — a `.aur` file can now embed and
+//! restore a genuine ICC profile, not just a bare `Srgb` tag, tested
+//! against a real non-sRGB profile from `corpora/icc/`.
+//! `Self::save_aur_file`/`Self::open_aur_file` both still only ever
+//! pass/discard `None` — this crate has no colour-management UI yet to
+//! have set a non-sRGB profile with in the first place — stated
+//! honestly rather than inventing an `App`-level field nothing could
+//! ever set to something else yet.
+//!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
 //! `aurora_gpu::CanvasPipeline` sized to the canvas dock area; `redraw`
@@ -621,12 +650,14 @@ fn is_aur_path(path: &Path) -> bool {
 }
 
 /// `layers`' own topmost pixel layer's `bounds` (`(width, height)`), or
-/// `(0, 0)` if there isn't one — the best "canvas size" a `.aur` export
-/// ([`App::save_aur_file`]) can offer today, since nothing tracks a
-/// real, separate document-level canvas size yet: every document this
-/// crate builds is exactly one layer, sized to whatever was opened or
-/// painted. A real, separate follow-on once a document can hold more
-/// than one meaningfully, differently sized layer.
+/// `(0, 0)` if there isn't one — the *fallback* [`App::canvas_size`] is
+/// seeded from when nothing else names a real, independent canvas size
+/// for a document (a freshly built [`demo_document`], or one recovered
+/// from an autosave, whose journal has no canvas-size concept of its
+/// own). Once a document is live, `App::canvas_size` is the real source
+/// of truth — this is deliberately *not* called again on every save;
+/// see that field's own doc comment for the bug re-deriving it used to
+/// cause.
 #[must_use]
 fn document_canvas_size(layers: &aurora_doc::LayerTree) -> (u32, u32) {
     topmost_pixel_layer(layers)
@@ -2923,6 +2954,25 @@ struct App {
     /// [`LayerTree::surface_id`] read to find somewhere for the Brush
     /// tool to actually paint.
     layers: aurora_doc::LayerTree,
+    /// The document's own real, independent canvas size — `(width,
+    /// height)`, in document-space pixels. **Not** derived from any
+    /// one layer's own `bounds` on every read ([`document_canvas_size`]
+    /// used to be the only source, silently following whichever layer
+    /// happened to be on top or shrinking to nothing if that layer was
+    /// deleted or resized) — a real editor's canvas can be larger,
+    /// smaller, or offset from any single layer it contains. Set once
+    /// from [`document_canvas_size`] for a document built without a
+    /// real, independent canvas size of its own ([`demo_document`], a
+    /// recovered autosave — the crash-recovery journal doesn't persist
+    /// one either, a real, honest, separate limitation from the `.aur`
+    /// case below), from a decoded image's own real dimensions
+    /// ([`Self::open_file`]), or from a `.aur` file's own manifest
+    /// (`aurora_io::read_aur`'s own third return value,
+    /// [`Self::open_aur_file`]) — the one case this was actually wrong
+    /// before: re-saving a `.aur` file whose real canvas size differed
+    /// from its topmost layer's own bounds used to silently shrink (or
+    /// grow) the canvas to match that layer instead of preserving it.
+    canvas_size: (u32, u32),
     /// `layers`' own undo/redo history — built alongside it (same
     /// source: [`demo_document`] or a recovered autosave) and, since
     /// Undo/Redo (`Ctrl+Z`/`Ctrl+Shift+Z`, [`run_command`]), also kept
@@ -3080,6 +3130,12 @@ impl App {
         // one doesn't shut down cleanly.
         write_autosave(autosave_path, &history);
         let active_layer = topmost_pixel_layer(&layers);
+        // Neither `demo_document` nor a recovered autosave carries a
+        // real, independent canvas size (the crash-recovery journal is
+        // just a `LayerOp` sequence, see `Self::canvas_size`'s own doc
+        // comment) -- derived from the topmost layer here, the same
+        // fallback `document_canvas_size` has always been.
+        let canvas_size = document_canvas_size(&layers);
         let tile_store = open_tile_store();
 
         let mut focus = FocusManager::default();
@@ -3114,6 +3170,7 @@ impl App {
             canvas_view: aurora_ui::CanvasView::default(),
             selection: aurora_doc::SelectionSet::new(),
             layers,
+            canvas_size,
             history,
             pixel_history: aurora_brush::PixelHistory::new(),
             undo_order: UndoOrder::default(),
@@ -3292,6 +3349,10 @@ impl App {
         write_autosave(&autosave_path(), &history);
 
         self.layers = layers;
+        // The image's own real, decoded dimensions -- known exactly
+        // here, rather than derived back out of the one layer just
+        // built from it (`document_canvas_size`'s own fallback role).
+        self.canvas_size = (image.width(), image.height());
         self.history = history;
         // A freshly opened document has no relationship to the previous
         // one's own undo state either -- `self.history` above is a
@@ -3333,7 +3394,14 @@ impl App {
                 return;
             }
         };
-        let (layers, history, _canvas_size) = match aurora_io::read_aur(file, store) {
+        // The profile (4th element) is a real, checked value now
+        // (`aurora_io::aur`'s own ICC round-trip), but nothing in this
+        // crate yet tracks a "current document profile" to restore it
+        // into -- no colour-management UI exists to have set one in the
+        // first place, so every `.aur` file this app has ever written
+        // only ever carries `None` in practice. Discarded here rather
+        // than invented a field to hold, honestly, until that UI exists.
+        let (layers, history, canvas_size, _profile) = match aurora_io::read_aur(file, store) {
             Ok(result) => result,
             Err(err) => {
                 tracing::warn!(path = %path.display(), ?err, "failed to read the chosen .aur file");
@@ -3361,6 +3429,11 @@ impl App {
         write_autosave(&autosave_path(), &history);
 
         self.layers = layers;
+        // The file's own real, saved canvas size -- restored directly,
+        // not re-derived from whichever layer it contains (the bug this
+        // field exists to fix; see `Self::canvas_size`'s own doc
+        // comment).
+        self.canvas_size = canvas_size;
         self.history = history;
         // See the same reset in `Self::open_file`'s own flat-image path.
         self.pixel_history = aurora_brush::PixelHistory::new();
@@ -3449,23 +3522,26 @@ impl App {
     /// single "does this decode to the right width/height" check the way a flat image
     /// does).
     ///
-    /// **Scope, stated honestly**: `canvas_size` is the topmost pixel
-    /// layer's own bounds ([`document_canvas_size`]) — the best this
-    /// crate can offer today, since nothing tracks a real, separate
-    /// document-level canvas size yet (every document built so far is
-    /// exactly one layer). `history` is now `self.history`, the real
-    /// live journal — Move (`Self::apply_move`) records through it, so a
-    /// `.aur` file this session writes carries a real, if partial, undo
-    /// journal; `Self::paint_dab`/`Self::erase_dab` still bypass it
-    /// entirely (see `Self::history`'s own doc comment), so a document
-    /// with brush/eraser edits still saves a journal that omits them —
-    /// a real, named gap, not the previous "always completely empty"
-    /// one. A silent no-op if there's no live tile store.
+    /// **Scope, stated honestly**: `canvas_size` is `self.canvas_size`,
+    /// the document's own real, independent canvas size — no longer
+    /// re-derived from the topmost pixel layer's own bounds on every
+    /// save (see [`Self::canvas_size`]'s own doc comment for the bug
+    /// that used to cause). No colour profile is passed
+    /// (`aurora_io::write_aur`'s own `profile: None`) — this crate has
+    /// no colour-management UI yet to have set a non-sRGB one with, even
+    /// though the format itself round-trips a real one now (`aurora-io`).
+    /// `history` is `self.history`, the real live journal — Move
+    /// (`Self::apply_move`) records through it, so a `.aur` file this
+    /// session writes carries a real, if partial, undo journal;
+    /// `Self::paint_dab`/`Self::erase_dab` still bypass it entirely (see
+    /// `Self::history`'s own doc comment), so a document with
+    /// brush/eraser edits still saves a journal that omits them — a
+    /// real, named gap, not the previous "always completely empty" one.
+    /// A silent no-op if there's no live tile store.
     fn save_aur_file(&mut self, path: &Path) {
         let Some(store) = self.tile_store.as_mut() else {
             return;
         };
-        let canvas_size = document_canvas_size(&self.layers);
 
         let Some(file_name) = path.file_name() else {
             tracing::warn!(path = %path.display(), "save path has no file name");
@@ -3477,7 +3553,14 @@ impl App {
 
         let write_result: Result<(), aurora_io::IoError> = (|| {
             let file = std::fs::File::create(&temp_path)?;
-            aurora_io::write_aur(file, &self.layers, &self.history, canvas_size, store)
+            aurora_io::write_aur(
+                file,
+                &self.layers,
+                &self.history,
+                self.canvas_size,
+                None,
+                store,
+            )
         })();
         if let Err(err) = write_result {
             tracing::warn!(path = %temp_path.display(), ?err, "failed to write the temp .aur export file");
@@ -4796,7 +4879,7 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), &mut store) {
+        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), None, &mut store) {
             unreachable!("{err:?}");
         }
         assert!(
