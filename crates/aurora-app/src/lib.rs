@@ -1982,6 +1982,97 @@ fn active_layer_origin(
         .map_or((0.0, 0.0), |(_, bounds)| (bounds.x as f32, bounds.y as f32))
 }
 
+/// The reserved `aurora_tile::SurfaceId` this crate uses for its own
+/// live, composited multi-layer preview — never a real layer's own
+/// surface. Every real one reuses a `LayerId`'s own raw value
+/// (`LayerTree::surface_id`), sequentially allocated from near zero by
+/// `aurora_core::IdGenerator`; `u64::MAX` is guaranteed never to
+/// collide with one in any document this process could ever build.
+#[must_use]
+fn composite_surface_id() -> aurora_tile::SurfaceId {
+    aurora_tile::SurfaceId::from_raw(u64::MAX)
+}
+
+/// Recomposites every tile in `residency`'s own currently-visible grid
+/// from `layers.paint_order()`'s own bottom-to-top, visible pixel
+/// layers into `store`'s reserved composite surface
+/// ([`composite_surface_id`]), via `aurora_render::composite_tile_cpu`'s
+/// per-texel math — what [`App::redraw`] calls before syncing the
+/// atlas, so the canvas shows every visible pixel layer's real content
+/// composited together, not just whichever one happens to be active for
+/// editing. A layer whose tile fails to load is logged and skipped for
+/// that one tile, the same "one bad tile shouldn't abort the rest"
+/// discipline `TileResidency::sync` itself already uses.
+///
+/// **Same-origin assumption, stated honestly**: every layer's own
+/// `TileId` space is read as if it shared the atlas's own current view
+/// origin — true of every document this crate's own UI can actually
+/// build today (image import always creates one layer at document
+/// `(0, 0)`; `demo_document`'s three layers all share that same origin
+/// too; only a hand-crafted `.aur` file could actually diverge two
+/// layers' origins, since Move is the only thing that ever changes one).
+/// A real per-layer-origin-aware compositor — reading each layer's own
+/// `bounds` and converting a document-space tile into that specific
+/// layer's own local tile, possibly spanning a sub-tile boundary when
+/// origins aren't tile-aligned — is separate, still-open follow-on
+/// work.
+///
+/// **Performance, stated honestly**: recomposites the *entire* visible
+/// grid unconditionally on every call, not just tiles some constituent
+/// layer actually changed since the last one. Per `spike/FINDINGS.md`'s
+/// own ~20ms "merging whole tiles" measurement — the exact CPU
+/// compositing cost that finding named as the reason GPU tile
+/// compositing (`aurora_render::TileCompositor`) exists at all — this
+/// will not hold the 60 FPS budget once a real multi-layer document is
+/// actually being interacted with. A real, incremental, per-tile-dirty-
+/// aware (or GPU-side) multi-layer compositor is separate, still-open
+/// follow-on work; this first slice is scoped to correctness, not
+/// performance, the same tradeoff `aurora-brush`'s own "real engine is
+/// Phase 2" bullet already made. A document with zero or one visible
+/// pixel layer (the common case so far) is unaffected in practice:
+/// `aurora_render::composite_tile_cpu` reproduces a single full-opacity
+/// layer's own texels exactly.
+fn recomposite_visible_tiles(
+    residency: &aurora_gpu::TileResidency,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+) {
+    let mut paint_layers = Vec::new();
+    for id in layers.paint_order() {
+        if let (Some(surface), Some(opacity)) = (layers.surface_id(id), layers.opacity(id)) {
+            paint_layers.push((surface, opacity));
+        }
+    }
+
+    let full_tile = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: aurora_tile::TILE,
+        height: aurora_tile::TILE,
+    };
+    for tile_id in residency.visible_tiles() {
+        let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::with_capacity(paint_layers.len());
+        for &(surface, opacity) in &paint_layers {
+            match store.get(surface, tile_id) {
+                Ok(tile) => layer_texels.push((tile.texels().to_vec(), opacity)),
+                Err(err) => {
+                    tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
+                }
+            }
+        }
+        let refs: Vec<(&[half::f16], f32)> = layer_texels
+            .iter()
+            .map(|(texels, opacity)| (texels.as_slice(), *opacity))
+            .collect();
+        let composited = aurora_render::composite_tile_cpu(&refs);
+        let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
+            continue;
+        };
+        dest.texels_mut().copy_from_slice(&composited);
+        dest.mark_dirty(full_tile);
+    }
+}
+
 /// Selects `layer_id` as the active layer: sets `*active_layer` and
 /// marks its own Layers-panel row (`layer_rows` —
 /// `aurora_ui::populate_layers_panel`'s own return value) as accessibly
@@ -3126,12 +3217,12 @@ impl App {
     }
 
     /// Clears the surface to the real theme background colour, then —
-    /// if a live document, tile store, and GPU atlas all exist — syncs
-    /// the atlas from whatever's actually in the store
-    /// ([`Self::active_layer`]'s own surface) and draws it within the
-    /// canvas dock area's own viewport, in the same pass as the clear.
-    /// Real widget/panel content beyond that is still separate,
-    /// still-open M1.8 work.
+    /// if a live document, tile store, and GPU atlas all exist —
+    /// recomposites every visible pixel layer
+    /// ([`recomposite_visible_tiles`]) and syncs the atlas from the
+    /// result and draws it within the canvas dock area's own viewport,
+    /// in the same pass as the clear. Real widget/panel content beyond
+    /// that is still separate, still-open M1.8 work.
     fn redraw(&mut self) {
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
@@ -3164,11 +3255,15 @@ impl App {
                             self.canvas_view.zoom(),
                         );
                     }
-                    if let (Some(layer_id), Some(store)) =
-                        (self.active_layer, self.tile_store.as_mut())
-                        && let Some(surface_id) = self.layers.surface_id(layer_id)
-                    {
-                        let _ = residency.sync(gpu.queue(), store, surface_id, false, usize::MAX);
+                    if let Some(store) = self.tile_store.as_mut() {
+                        recomposite_visible_tiles(residency, &self.layers, store);
+                        let _ = residency.sync(
+                            gpu.queue(),
+                            store,
+                            composite_surface_id(),
+                            false,
+                            usize::MAX,
+                        );
                     }
                 }
 
@@ -3471,12 +3566,13 @@ mod tests {
         ClipboardAccess, Drag, FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PointerButton,
         activate_command, apply_scroll_zoom, autosave_path, begin_drag, canvas_area_physical_rect,
         canvas_area_physical_size, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, continue_drag, crash_recovery_dialog_message,
-        default_shortcuts, demo_document, document_canvas_size, document_from_image,
-        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
-        handle_zoom_tool_click, is_aur_path, layer_local_point, load_background_color, load_scales,
-        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
-        open_tile_store, pointer_in_canvas, previous_session_left_a_marker, recover_document,
+        close_crash_recovery_dialog, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, default_shortcuts, demo_document, document_canvas_size,
+        document_from_image, handle_dialog_key, handle_dialog_pointer, handle_key,
+        handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point,
+        load_background_color, load_scales, logical_point, logical_size, open_command_palette,
+        open_crash_recovery_dialog, open_image, open_tile_store, pointer_in_canvas,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
         replace_document, run_command, sample_pixel, select_layer, tile_origin_for_view,
         tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
         translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
@@ -5084,6 +5180,53 @@ mod tests {
         assert_eq!(layer_local_point(bounds, (5.0, 7.0)), (5.0, 7.0));
     }
 
+    /// Serializes every real-GPU test in this module — mirrors
+    /// `aurora-gpu`'s own `test_support::GPU_TEST_LOCK`, which found
+    /// this necessary (concurrent real-device creation reproducibly
+    /// deadlocked under plain `cargo test`); this crate's own tests are
+    /// a separate binary from that crate's, so its lock doesn't cover
+    /// this process too.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct GpuTestContext {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        context: aurora_gpu::GpuContext,
+    }
+
+    impl std::ops::Deref for GpuTestContext {
+        type Target = aurora_gpu::GpuContext;
+        fn deref(&self) -> &aurora_gpu::GpuContext {
+            &self.context
+        }
+    }
+
+    /// `NoSuitableAdapter` is an inconclusive skip (this sandbox/CI
+    /// runner may genuinely have no usable GPU); any other error means
+    /// an adapter *was* found but device/queue creation failed, a real
+    /// bug worth a hard test failure — same distinction
+    /// `aurora-gpu::test_support::real_context` already draws.
+    fn real_gpu_context() -> Option<GpuTestContext> {
+        let guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match aurora_gpu::GpuContext::new() {
+            Ok(context) => Some(GpuTestContext {
+                _guard: guard,
+                context,
+            }),
+            Err(aurora_gpu::GpuError::NoSuitableAdapter) => {
+                eprintln!("SKIPPED: no GPU adapter available on this machine/CI runner");
+                None
+            }
+            Err(err) => {
+                #[allow(clippy::panic)]
+                {
+                    panic!("device request failed with a real adapter present: {err}");
+                }
+            }
+        }
+    }
+
     fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -5099,6 +5242,145 @@ mod tests {
             }
         };
         (dir, store)
+    }
+
+    #[test]
+    fn composite_surface_id_never_collides_with_a_real_layers_surface() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let id = match layers.add_pixel_layer(
+            "a",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_ne!(layers.surface_id(id), Some(composite_surface_id()));
+    }
+
+    /// Writes `rgba` into every texel of `tile` on `surface`, marking it
+    /// dirty — the same shape `aurora-gpu`'s own `residency::tests::paint`
+    /// helper already uses.
+    fn fill_solid(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        tile: aurora_tile::TileId,
+        rgba: [f32; 4],
+    ) {
+        let Ok(t) = store.get_mut(surface, tile) else {
+            unreachable!("a real store must accept this write");
+        };
+        for (i, sample) in t.texels_mut().iter_mut().enumerate() {
+            let Some(&channel) = rgba.get(i % 4) else {
+                unreachable!("i % 4 is always in range 0..4");
+            };
+            *sample = half::f16::from_f32(channel);
+        }
+        t.mark_dirty(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_tile::TILE,
+            height: aurora_tile::TILE,
+        });
+    }
+
+    /// Reads back `tile`'s own first texel as `(r, g, b, a)` floats.
+    // The clearest names for one pixel's own RGBA sample, the same
+    // justification `sample_pixel` already uses for the same lint.
+    #[allow(clippy::many_single_char_names)]
+    fn read_first_texel(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        tile: aurora_tile::TileId,
+    ) -> (f32, f32, f32, f32) {
+        let Ok(t) = store.get(surface, tile) else {
+            unreachable!("just written");
+        };
+        let texels = t.texels();
+        let (Some(r), Some(g), Some(b), Some(a)) =
+            (texels.first(), texels.get(1), texels.get(2), texels.get(3))
+        else {
+            unreachable!("a real tile always has at least one full texel");
+        };
+        (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32())
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_blends_visible_layers_bottom_to_top_and_skips_hidden_ones() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let hidden = match layers.add_pixel_layer("hidden", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_visible(hidden, false) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (bottom, [1.0, 0.0, 0.0, 1.0]),
+            (hidden, [0.0, 1.0, 0.0, 1.0]),
+            (top, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        recomposite_visible_tiles(&residency, &layers, &mut store);
+
+        let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+        assert_eq!(
+            result,
+            (0.5, 0.0, 0.5, 1.0),
+            "opaque red bottom, opaque blue top at 50% opacity, hidden green never contributes"
+        );
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_of_an_empty_document_is_fully_transparent() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        recomposite_visible_tiles(&residency, &layers, &mut store);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+        assert_eq!(result, (0.0, 0.0, 0.0, 0.0));
     }
 
     #[test]

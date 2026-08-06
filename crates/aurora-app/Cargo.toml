@@ -38,6 +38,7 @@ winit = { workspace = true }
 wgpu = { workspace = true }
 rfd = { workspace = true }
 arboard = { workspace = true }
+half = { workspace = true }
 
 # macOS only -- see the workspace `Cargo.toml`'s own comment on `muda`
 # for why Windows/Linux aren't included here.
@@ -46,7 +47,6 @@ muda = { workspace = true }
 
 [dev-dependencies]
 accesskit = { workspace = true }
-half = { workspace = true }
 tempfile = { workspace = true }
 
 [[bin]]
