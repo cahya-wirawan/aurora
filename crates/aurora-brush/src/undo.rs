@@ -155,12 +155,29 @@ impl PixelHistory {
     /// `aurora_doc::History`'s own recording methods already apply
     /// structurally). A no-op for an empty snapshot
     /// ([`StrokeSnapshot::is_empty`]) — nothing was actually touched, so
-    /// there is nothing a later undo could meaningfully reverse.
-    pub fn push(&mut self, stroke: StrokeSnapshot) {
+    /// there is nothing a later undo could meaningfully reverse. Returns
+    /// whether the stroke was actually recorded, so a caller keeping its
+    /// own parallel record of *when* each push happened (`aurora-app`'s
+    /// own unified undo ordering across this type and
+    /// `aurora_doc::History`) knows whether to record this one too.
+    #[must_use]
+    pub fn push(&mut self, stroke: StrokeSnapshot) -> bool {
         if stroke.is_empty() {
-            return;
+            return false;
         }
         self.undo.push(stroke);
+        self.redo.clear();
+        true
+    }
+
+    /// Discards every redo entry without touching the undo stack — the
+    /// same clearing [`Self::push`] already does internally when a new
+    /// stroke completes, exposed here for a caller that needs to
+    /// invalidate this type's own redo stack in response to activity
+    /// recorded somewhere else entirely (a structural edit through
+    /// `aurora_doc::History`, from the same unified-ordering need
+    /// `aurora_doc::History::clear_redo` itself already documents).
+    pub fn clear_redo(&mut self) {
         self.redo.clear();
     }
 
@@ -291,7 +308,7 @@ mod tests {
     #[test]
     fn pixel_history_push_of_an_empty_stroke_is_a_no_op() {
         let mut history = PixelHistory::new();
-        history.push(StrokeSnapshot::new(surface()));
+        assert!(!history.push(StrokeSnapshot::new(surface())));
         assert!(!history.can_undo());
     }
 
@@ -309,7 +326,7 @@ mod tests {
         fill(&mut store, tile, 0.75);
 
         let mut history = PixelHistory::new();
-        history.push(stroke);
+        assert!(history.push(stroke));
         assert!(history.can_undo());
         assert!(!history.can_redo());
 
@@ -351,7 +368,7 @@ mod tests {
         fill(&mut store, tile, 0.5);
 
         let mut history = PixelHistory::new();
-        history.push(first);
+        assert!(history.push(first));
         match history.undo(&mut store) {
             Ok(true) => {}
             other => unreachable!("expected Ok(true), got {other:?}"),
@@ -362,10 +379,61 @@ mod tests {
         if let Err(err) = second.record_touch(&mut store, tile) {
             unreachable!("{err:?}");
         }
-        history.push(second);
+        assert!(history.push(second));
         assert!(
             !history.can_redo(),
             "new activity must invalidate the old redo entry"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn clear_redo_discards_a_pending_redo_without_touching_undo() {
+        let (_dir, mut store) = real_tile_store();
+        let tile = TileId { x: 0, y: 0 };
+
+        // Two strokes on the same tile, so undoing the second one still
+        // leaves a real, distinguishable first stroke behind on the
+        // undo stack.
+        fill(&mut store, tile, 0.25);
+        let mut first = StrokeSnapshot::new(surface());
+        if let Err(err) = first.record_touch(&mut store, tile) {
+            unreachable!("{err:?}");
+        }
+        fill(&mut store, tile, 0.5);
+
+        let mut history = PixelHistory::new();
+        assert!(history.push(first));
+
+        let mut second = StrokeSnapshot::new(surface());
+        if let Err(err) = second.record_touch(&mut store, tile) {
+            unreachable!("{err:?}");
+        }
+        fill(&mut store, tile, 0.75);
+        assert!(history.push(second));
+
+        match history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(history.can_redo());
+        assert!(history.can_undo(), "the first stroke is still undoable");
+
+        history.clear_redo();
+
+        assert!(!history.can_redo(), "the pending redo must be discarded");
+        assert!(
+            history.can_undo(),
+            "clear_redo must not touch the undo stack"
+        );
+        match history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert_eq!(
+            first_sample(&mut store, tile),
+            0.25,
+            "the untouched undo entry must still restore correctly"
         );
     }
 
