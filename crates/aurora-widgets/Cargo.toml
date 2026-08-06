@@ -13,21 +13,30 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-# aurora-gpu/aurora-vector/aurora-text are allowed here (see
-# scripts/layering.json) for the still-open "vector-first rendering"
-# M1.7 bullet, but nothing in this crate uses them yet -- add them back
-# exactly when that work starts. Keeping them out until then makes
-# "headlessly testable" a checkable fact about this crate's own
-# dependency graph (`cargo tree -p aurora-widgets -i wgpu` finds
-# nothing), not just an inferred property of what happens not to be
-# called at runtime.
+# aurora-text is allowed here (see scripts/layering.json) for the
+# still-open "vector-first rendering" M1.7 bullet, but nothing in this
+# crate uses it yet -- add it back exactly when that work starts.
+#
+# aurora-gpu/aurora-vector, and the `wgpu` this pulls in transitively,
+# are real now (2026-08-06) -- the GPU path renderer (`render` module).
+# The core widget toolkit (layout/input/accessibility) stays exactly as
+# headlessly testable as before: its own tests still run with no
+# window, no GPU, and no platform accessibility backend, unchanged.
+# Only `render`'s own tests need a real adapter, and skip (not fail)
+# when this sandbox/CI runner doesn't have one -- the same "headless CI
+# still runs everything, real hardware exercises the rest" shape every
+# other `wgpu`-touching crate in this workspace already uses, not an
+# exception carved out for this one.
 aurora-core = { workspace = true }
+aurora-gpu = { workspace = true }
 aurora-theme = { workspace = true }
+aurora-vector = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 accesskit = { workspace = true }
 taffy = { workspace = true }
 unicode-segmentation = { workspace = true }
+wgpu = { workspace = true }
 
 [dev-dependencies]
 accesskit_consumer = { workspace = true }

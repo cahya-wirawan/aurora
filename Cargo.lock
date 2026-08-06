@@ -712,11 +712,14 @@ dependencies = [
  "accesskit",
  "accesskit_consumer",
  "aurora-core",
+ "aurora-gpu",
  "aurora-theme",
+ "aurora-vector",
  "taffy",
  "thiserror 2.0.19",
  "tracing",
  "unicode-segmentation",
+ "wgpu",
 ]
 
 [[package]]

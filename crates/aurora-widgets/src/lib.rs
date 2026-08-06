@@ -26,30 +26,43 @@
 //! `winit` types" seam as `FocusManager`/`hit_test`.
 //!
 //! This crate knows nothing about documents or layers (`aurora-doc` is a
-//! layer above it) and must stay headlessly testable — every test in
-//! this crate runs with no window, no GPU, and no platform accessibility
-//! backend, and this crate's own `Cargo.toml` has no `wgpu`/`winit`
-//! anywhere in its dependency graph (`aurora-gpu`/`aurora-vector`/
-//! `aurora-text` are allowed by `scripts/layering.json` for when
-//! vector-first rendering starts, but aren't depended on until then) —
-//! a fact `cargo tree -p aurora-widgets -i wgpu` can check directly, not
-//! just an inference from what the code happens not to call.
-//! `tests/headless.rs` is the permanent, end-to-end proof: it builds a
-//! small multi-widget form, lays it out, routes focus and pointer input,
-//! mutates every widget (including an IME composition), and inspects a
-//! full `accesskit::TreeUpdate` — all through this crate's public API,
-//! with nothing platform-specific anywhere in the call graph. This is
-//! what "headless mode for automated UI tests" (M1.7's own bullet) was
-//! asking this crate to already be, made explicit and checked rather
-//! than left as a hopeful property.
+//! layer above it). Its *core* — layout, input routing, damage
+//! tracking, accessibility ([`WidgetTree`]/[`FocusManager`]/
+//! [`widgets`]) — must stay headlessly testable, and does: every test
+//! for those pieces still runs with no window, no GPU, and no platform
+//! accessibility backend, `tests/headless.rs` is still the permanent,
+//! end-to-end proof (a small multi-widget form, laid out, focus/pointer-
+//! routed, every widget mutated including an IME composition, a full
+//! `accesskit::TreeUpdate` inspected — all through this crate's public
+//! API, nothing platform-specific anywhere in that call graph).
+//!
+//! [`render`] (added 2026-08-06) is the one real exception, by design:
+//! the GPU path renderer PRD §8 names ("vector rasterization: `lyon`
+//! (tessellation) + custom GPU path renderer"), the still-open
+//! "vector-first rendering" M1.7 bullet's own next real step. This
+//! crate is where it has to live — the one crate depending on both
+//! `aurora-vector` and `aurora-gpu` (`scripts/layering.json`) —
+//! and `wgpu` is now a real, direct part of this crate's own dependency
+//! graph because of it, not just an allowance nothing used yet. Its own
+//! tests skip (not fail) with no real GPU adapter present, the same
+//! "headless CI still runs everything, real hardware exercises the
+//! rest" shape every other `wgpu`-touching crate in this workspace
+//! already uses — not a new exception, the same rule applied here for
+//! the first time. No real widget produces a `Mesh` to hand `render`
+//! yet; see that module's own doc comment for exactly what's still open.
 
 mod error;
 mod input;
+pub mod render;
+#[cfg(test)]
+mod render_test;
 pub mod shortcut;
+mod test_support;
 mod tree;
 pub mod widgets;
 
 pub use error::WidgetError;
 pub use input::{FocusManager, hit_test};
+pub use render::{GpuMesh, PathPipeline};
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
 pub use tree::{WidgetId, WidgetTree};
