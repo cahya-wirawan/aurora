@@ -19,6 +19,14 @@ pub enum ColorError {
     /// otherwise-valid profiles.
     #[error("failed to build a colour transform")]
     TransformCreationFailed(#[source] lcms2::Error),
+    /// [`crate::IccProfile::to_bytes`] failed to re-serialize a loaded
+    /// profile back to raw ICC bytes — not expected in practice (`lcms2`
+    /// can always re-encode a profile it successfully parsed or built),
+    /// but a real, checked possibility rather than an assumption, the
+    /// same discipline every other `lcms2` call in this crate already
+    /// applies.
+    #[error("failed to serialize ICC profile data")]
+    SerializeFailed(#[source] lcms2::Error),
     /// [`crate::Transform::new`] was asked for a channel layout this
     /// crate doesn't wire up to `lcms2` yet — see [`Channels`]'s own
     /// variants against [`crate::Transform`]'s doc comment for exactly

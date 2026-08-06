@@ -30,6 +30,23 @@ impl IccProfile {
             inner: lcms2::Profile::new_srgb(),
         }
     }
+
+    /// Re-serializes this profile back to raw ICC bytes — [`Self::from_bytes`]'s
+    /// own inverse, what a caller needs to embed a real profile into a
+    /// file (a `.aur` document's own manifest, or eventually a PNG/TIFF
+    /// chunk) instead of just tagging pixels with it in memory. Works
+    /// for a profile built via [`Self::srgb`] too, not just one loaded
+    /// from real file bytes — `lcms2` can always re-encode a profile it
+    /// holds, built-in or parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ColorError::SerializeFailed`] if `lcms2` fails to
+    /// re-encode the profile — not expected in practice, but checked
+    /// rather than assumed.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ColorError> {
+        self.inner.icc().map_err(ColorError::SerializeFailed)
+    }
 }
 
 #[cfg(test)]
@@ -64,5 +81,38 @@ mod tests {
         // Not much to assert on the profile alone -- real coverage is
         // `transform::tests` actually transforming through it.
         let _ = IccProfile::srgb();
+    }
+
+    #[test]
+    fn to_bytes_round_trips_a_real_loaded_profile() {
+        let profile = match IccProfile::from_bytes(ECI_RGBV2_ICC) {
+            Ok(profile) => profile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bytes = match profile.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(!bytes.is_empty());
+        // Re-parsing lcms2's own re-encoding must succeed -- the actual
+        // round trip a `.aur` save/reopen cycle depends on. Not asserted
+        // byte-for-byte against the original file: lcms2 is free to
+        // re-encode with a different profile ID/timestamp than whatever
+        // the original file happened to carry.
+        if let Err(err) = IccProfile::from_bytes(&bytes) {
+            unreachable!("re-parsing a just-serialized profile must succeed: {err:?}");
+        }
+    }
+
+    #[test]
+    fn to_bytes_also_works_for_the_built_in_srgb_profile() {
+        let bytes = match IccProfile::srgb().to_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(!bytes.is_empty());
+        if let Err(err) = IccProfile::from_bytes(&bytes) {
+            unreachable!("{err:?}");
+        }
     }
 }

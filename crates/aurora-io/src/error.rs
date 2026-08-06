@@ -82,6 +82,11 @@ pub enum IoError {
     /// rebuilding an active layer's own bounds, or similar) failed.
     #[error("failed to rebuild the document from a .aur file: {0}")]
     Doc(#[from] aurora_doc::DocError),
+    /// [`crate::aur::write`] failed to serialize an embedded ICC
+    /// profile's own bytes, or [`crate::aur::read`] failed to parse one
+    /// back out of the manifest.
+    #[error("failed to read/write a .aur file's embedded ICC profile: {0}")]
+    Color(#[from] aurora_color::ColorError),
     /// [`crate::aur::write`] failed to serialize the manifest entry.
     #[error("failed to serialize the .aur manifest: {0}")]
     ManifestSerialization(String),

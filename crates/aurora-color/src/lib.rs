@@ -4,7 +4,11 @@
 //! `docs/adr/` for the decisions that shape it.
 //!
 //! [`IccProfile`]/[`Transform`] are M1.5's first piece: ICC transforms via
-//! ADR 0008's `lcms2` decision. Colour-space *descriptors*
+//! ADR 0008's `lcms2` decision. [`IccProfile::to_bytes`] (added
+//! 2026-08-06) is the inverse of [`IccProfile::from_bytes`] — real
+//! profile *bytes* out, not just a value usable in memory — what
+//! `.aur`'s own manifest (ADR 0009) needs to embed a real profile
+//! instead of a bare colour-space tag. Colour-space *descriptors*
 //! ([`aurora_core::ColorSpace`]/[`aurora_core::PixelFormat`]) already
 //! exist from M1.1 — this crate is what actually interprets an ICC
 //! profile and moves pixel data between colour spaces.

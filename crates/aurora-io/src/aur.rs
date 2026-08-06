@@ -33,12 +33,24 @@
 //! of a freshly created layer's own tile range is never actually
 //! painted, and writing every one of those out would be real, avoidable
 //! file bloat; a missing tile entry on read simply leaves that tile at
-//! the store's own default (blank), not an error. Colour space is a
-//! single document-level tag (`ColorSpaceTag`), not a real embedded
-//! ICC profile — every image this crate decodes or creates is already
-//! always tagged `aurora_color::IccProfile::srgb()` (no decoder here
-//! reads an embedded profile yet either), so a richer per-profile
-//! encoding has no real caller to serve today.
+//! the store's own default (blank), not an error.
+//!
+//! **Colour space, real as of 2026-08-06**: [`write()`]/[`read`] carry a
+//! real `Option<&aurora_color::IccProfile>`/`Option<IccProfile>` now,
+//! not just a bare tag — `None` (the compact, common case, matching
+//! every past `.aur` file this crate has ever written) keeps writing
+//! `ColorSpaceTag::Srgb`; `Some(profile)` embeds the profile's own real
+//! bytes (`IccProfile::to_bytes`, ADR 0008's `lcms2`) as a new
+//! `ColorSpaceTag::Icc(Vec<u8>)` variant, restored via
+//! `IccProfile::from_bytes` on read. `Srgb` stays index `0` — an old
+//! file only ever contains that variant, so it keeps opening unchanged
+//! (ADR 0009's own backward-compatibility policy); `Icc` is purely
+//! additive. `aurora-app` doesn't have a live "current document
+//! profile" to pass yet (no colour-management UI exists), so every
+//! real caller today still passes `None` in practice — the mechanism is
+//! real and tested against a real non-sRGB profile
+//! (`corpora/icc/ECI-RGBv2.icc`), even though nothing yet drives it to
+//! something other than `None` end to end.
 
 use std::io::{Read, Seek, Write};
 
@@ -93,10 +105,18 @@ struct ManifestRead {
 }
 
 /// The manifest's own "colour space" field — see this module's own doc
-/// comment for why it's a single tag, not a real ICC profile, today.
+/// comment for the real-vs-compact tradeoff behind having two variants.
+/// `Srgb` must stay variant `0` (declared first): `postcard`'s wire
+/// format encodes an enum variant positionally, and every `.aur` file
+/// written before `Icc` existed only ever contains this one, so its own
+/// index can never change without breaking ADR 0009's backward-
+/// compatibility policy.
 #[derive(serde::Serialize, serde::Deserialize)]
 enum ColorSpaceTag {
     Srgb,
+    /// A real embedded ICC profile's own raw bytes
+    /// (`aurora_color::IccProfile::to_bytes`).
+    Icc(Vec<u8>),
 }
 
 /// Writes a complete `.aur` document to `writer`: `layers`/`history`'s
@@ -110,19 +130,25 @@ enum ColorSpaceTag {
 /// swap" discipline (CLAUDE.md's PSD/PSB round-trip rule) composes with
 /// this rather than being duplicated inside it.
 ///
+/// `profile`: `None` writes the compact `ColorSpaceTag::Srgb` (every
+/// past caller's own behaviour, unchanged); `Some` embeds that
+/// profile's own real bytes — see this module's own doc comment.
+///
 /// # Errors
 ///
 /// Returns [`IoError::Zip`]/[`IoError::Io`] for a real container/I/O
 /// failure, [`IoError::ManifestSerialization`] if the manifest itself
 /// somehow fails to `postcard`-encode (a plain, already-checked struct —
 /// not expected in practice), [`IoError::Doc`] if `history.save_journal`
-/// fails, or [`IoError::Tile`] if paging a touched tile in from the
-/// scratch disk fails.
+/// fails, [`IoError::Color`] if `profile.to_bytes()` fails, or
+/// [`IoError::Tile`] if paging a touched tile in from the scratch disk
+/// fails.
 pub fn write<W: Write + Seek>(
     writer: W,
     layers: &LayerTree,
     history: &History,
     canvas_size: (u32, u32),
+    profile: Option<&aurora_color::IccProfile>,
     store: &mut TileStore,
 ) -> Result<(), IoError> {
     let mut zip = ZipWriter::new(writer);
@@ -132,11 +158,15 @@ pub fn write<W: Write + Seek>(
     zip.start_file(MIME_ENTRY, stored)?;
     zip.write_all(MIME_TYPE.as_bytes())?;
 
+    let color_space = match profile {
+        None => ColorSpaceTag::Srgb,
+        Some(profile) => ColorSpaceTag::Icc(profile.to_bytes()?),
+    };
     let manifest = ManifestWrite {
         version: MANIFEST_VERSION,
         canvas_width: canvas_size.0,
         canvas_height: canvas_size.1,
-        color_space: ColorSpaceTag::Srgb,
+        color_space,
         layers,
     };
     let manifest_bytes = postcard::to_allocvec(&manifest)
@@ -175,13 +205,27 @@ pub fn write<W: Write + Seek>(
     Ok(())
 }
 
+/// [`read`]'s own return shape: the reconstructed `LayerTree`/`History`,
+/// the manifest's own `(canvas_width, canvas_height)`, and its own
+/// colour profile (`None`/`Some` — see [`read`]'s own doc comment).
+type AurDocument = (
+    LayerTree,
+    History,
+    (u32, u32),
+    Option<aurora_color::IccProfile>,
+);
+
 /// Reads a complete `.aur` document from `reader`, writing every
 /// persisted tile it finds directly into `store` (mirroring
 /// `crate::import::write_into_store`'s own "the caller already has a
 /// live store; write into it" shape rather than returning some
 /// intermediate pixel buffer). Returns the reconstructed
-/// `LayerTree`/`History` and the manifest's own `(canvas_width,
-/// canvas_height)`.
+/// `LayerTree`/`History`, the manifest's own `(canvas_width,
+/// canvas_height)`, and its own colour profile — `None` for a file
+/// that only ever carried the bare `ColorSpaceTag::Srgb` (every `.aur`
+/// file written before [`write()`]'s own `profile` parameter existed, and
+/// every one written with `profile: None` since), `Some` for one that
+/// embedded a real ICC profile.
 ///
 /// # Errors
 ///
@@ -189,12 +233,10 @@ pub fn write<W: Write + Seek>(
 /// failure, [`IoError::MissingEntry`] if the manifest or history entry
 /// is absent (not a valid `.aur` file, or one truncated past recovery),
 /// [`IoError::ManifestDeserialization`]/[`IoError::Doc`] if either
-/// fails to decode, or [`IoError::Tile`] if a tile entry fails to
+/// fails to decode, [`IoError::Color`] if an embedded ICC profile's own
+/// bytes fail to parse, or [`IoError::Tile`] if a tile entry fails to
 /// decode or doesn't decode to the expected sample count.
-pub fn read<R: Read + Seek>(
-    reader: R,
-    store: &mut TileStore,
-) -> Result<(LayerTree, History, (u32, u32)), IoError> {
+pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocument, IoError> {
     let mut zip = ZipArchive::new(reader)?;
 
     let manifest_bytes = read_entry(&mut zip, MANIFEST_ENTRY)?;
@@ -206,13 +248,12 @@ pub fn read<R: Read + Seek>(
             manifest.version
         )));
     }
-    // Exhaustive on purpose: `ColorSpaceTag` gaining a real second
-    // variant (a step toward this module's own still-open "real ICC
-    // profile, not just a tag" gap) must force a deliberate decision
-    // here, not silently fall through unread.
-    match manifest.color_space {
-        ColorSpaceTag::Srgb => {}
-    }
+    // Exhaustive on purpose: a further `ColorSpaceTag` variant would
+    // need a deliberate decision here, not a silent fall-through.
+    let profile = match manifest.color_space {
+        ColorSpaceTag::Srgb => None,
+        ColorSpaceTag::Icc(bytes) => Some(aurora_color::IccProfile::from_bytes(&bytes)?),
+    };
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
@@ -266,6 +307,7 @@ pub fn read<R: Read + Seek>(
         manifest.layers,
         history,
         (manifest.canvas_width, manifest.canvas_height),
+        profile,
     ))
 }
 
@@ -385,18 +427,27 @@ mod tests {
         }
 
         let mut bytes = Cursor::new(Vec::new());
-        if let Err(err) = write(&mut bytes, &layers, &history, (10, 10), &mut store) {
+        // A canvas size that deliberately doesn't match the layer's own
+        // 10x10 bounds -- proving canvas size round-trips as its own,
+        // independent document-level value, not something derived from
+        // whichever layer happens to be on top.
+        if let Err(err) = write(&mut bytes, &layers, &history, (20, 15), None, &mut store) {
             unreachable!("{err:?}");
         }
 
         let (_dir2, mut fresh_store) = real_tile_store();
         bytes.set_position(0);
-        let (restored_layers, restored_history, canvas_size) = match read(bytes, &mut fresh_store) {
-            Ok(result) => result,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let (restored_layers, restored_history, canvas_size, profile) =
+            match read(bytes, &mut fresh_store) {
+                Ok(result) => result,
+                Err(err) => unreachable!("{err:?}"),
+            };
 
-        assert_eq!(canvas_size, (10, 10));
+        assert_eq!(canvas_size, (20, 15));
+        assert!(
+            profile.is_none(),
+            "writing with profile: None must read back as no embedded profile"
+        );
         assert_eq!(restored_layers.roots(), &[id]);
         assert_eq!(restored_layers.name(id), Some("Background"));
         assert_eq!(restored_layers.blend_mode(id), Some(BlendMode::Multiply));
@@ -430,6 +481,54 @@ mod tests {
         );
     }
 
+    // CC0-licensed, from the colord-data Debian package -- see
+    // corpora/icc/README.md for full provenance. The same real,
+    // deliberately non-sRGB profile `aurora-color`'s own tests already
+    // use, so a passing test here proves a real round trip through
+    // `.aur`, not just a profile this module invented to be convenient.
+    const ECI_RGBV2_ICC: &[u8] = include_bytes!("../../../corpora/icc/ECI-RGBv2.icc");
+
+    #[test]
+    fn round_trips_a_real_non_srgb_icc_profile() {
+        let (_dir, mut store) = real_tile_store();
+        let layers = LayerTree::new();
+        let history = History::new();
+        let profile = match aurora_color::IccProfile::from_bytes(ECI_RGBV2_ICC) {
+            Ok(profile) => profile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1, 1),
+            Some(&profile),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+
+        let (_dir2, mut fresh_store) = real_tile_store();
+        bytes.set_position(0);
+        let (_, _, _, restored_profile) = match read(bytes, &mut fresh_store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let Some(restored_profile) = restored_profile else {
+            unreachable!("writing with Some(profile) must read back as a real embedded profile");
+        };
+        // Re-serializing the restored profile must itself succeed --
+        // real, checked evidence it's a genuinely usable `lcms2`
+        // profile, not just bytes that happened to survive the ZIP trip
+        // unexamined.
+        if let Err(err) = restored_profile.to_bytes() {
+            unreachable!("the restored profile must itself be a real, usable profile: {err:?}");
+        }
+    }
+
     #[test]
     fn write_skips_a_fully_blank_layer_and_read_leaves_it_blank() {
         let (_dir, mut store) = real_tile_store();
@@ -447,7 +546,7 @@ mod tests {
         };
 
         let mut bytes = Cursor::new(Vec::new());
-        if let Err(err) = write(&mut bytes, &layers, &history, (10, 10), &mut store) {
+        if let Err(err) = write(&mut bytes, &layers, &history, (10, 10), None, &mut store) {
             unreachable!("{err:?}");
         }
 
