@@ -2848,9 +2848,10 @@ check licenses` clean with the new `toml` dependency.
   for precondition, calling `aurora_brush::erase_dab` in place of
   `stamp_dab`. `handle_pointer_pressed`/`handle_pointer_moved` dispatch
   to `paint_dab` or `erase_dab` by which `Drag` variant is active. 6 new
-  `aurora-app` tests (87 total). **Still open**: undo-as-you-drag; the
+  `aurora-app` tests (87 total). **Still open at the time**: undo-as-you-
+  drag (closed the next day — see the Pixel-edit undo bullet below); the
   real brush/eraser engine itself (size/hardness/colour options, Phase
-  2 per this bullet's own name).
+  2 per this bullet's own name) remains genuinely open.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
@@ -2976,16 +2977,17 @@ check licenses` clean with the new `toml` dependency.
   Committed in two steps: the `aurora-io` reader/writer itself
   (`ade24bc`), then the `aurora-app` wiring (`857fd00`).
 
-  **Still `[~]`, not `[x]`**: `.aur` save always writes a fresh, empty
-  `History` — `App` keeps no live `History` field to save through yet
-  (Move/Brush/Eraser all already bypass `History` the same way for
-  their own edits, a pre-existing gap, not a new one); `canvas_size` is
-  read from the topmost pixel layer's own bounds only, since nothing
-  tracks a real, separate document-level canvas size yet and every
-  document built so far is exactly one layer; `ColorSpaceTag` is a
-  single sRGB tag, not a real ICC profile round-trip. None of this has
-  been exercised on real multi-layer documents or real hardware yet —
-  everything so far is unit-level, in-process round-trips.
+  **Still `[~]`, not `[x]`**: `canvas_size` is read from the topmost
+  pixel layer's own bounds only, since nothing tracks a real, separate
+  document-level canvas size yet; `ColorSpaceTag` is a single sRGB tag,
+  not a real ICC profile round-trip. Neither has been exercised on real
+  hardware yet — everything so far is unit-level, in-process round-trips
+  (multi-layer documents now exist, per the Multi-layer compositing
+  bullet below, but a `.aur` round-trip of one hasn't had its own
+  real-hardware pass either). **`.aur` save always writing a fresh,
+  empty `History` was also named here — closed the same day, once
+  `App` kept a live `history` field to save through; see the Undo/Redo
+  bullet below.**
 - [~] **Import/export PNG, JPEG, TIFF** — all three done 2026-08-06,
   first slices each. `aurora-io`'s first real code (was a placeholder). Asked
   Cahya which M1.9 bullet to start on first, since several are big,
@@ -3145,12 +3147,15 @@ check licenses` clean with the new `toml` dependency.
   `tiff`'s own default feature set raised a licence or dependency-
   weight concern worth trimming for).
 
-  **Still `[~]`, not `[x]`**: no wiring into a real document (no layer
-  owns pixel storage yet, see above); no ICC-profile-aware import/
-  export for any of the three formats (always sRGB); no 16-bit export
-  for PNG; no user-facing JPEG quality control; TIFF multi-page,
-  Palette/CMYK, 32-bit-float, and compressed-export support are all
-  real, named, still-open gaps, not silent ones.
+  **Still `[~]`, not `[x]`**: no ICC-profile-aware import/export for
+  any of the three formats (always sRGB); no 16-bit export for PNG; no
+  user-facing JPEG quality control; TIFF multi-page, Palette/CMYK,
+  32-bit-float, and compressed-export support are all real, named,
+  still-open gaps, not silent ones. **No wiring into a real document
+  was also named here** (no layer owned pixel storage yet at the time)
+  — closed the same day, once ADR 0010 decided pixel storage and
+  `App::open_file` started writing an opened image's pixels into the
+  live tile store; see the Pixel storage/live-document bullets below.
 - [x] **Autosave and recovery** — done 2026-08-06, the same day as the
   `.aur` decision and PNG/JPEG/TIFF, closing the exact gap both of
   those left open: `aurora-doc`'s `History::save_journal`/
@@ -3210,7 +3215,7 @@ check licenses` clean with the new `toml` dependency.
   `.aur` reader/writer was built the same week (see the `.aur` bullet
   above) but autosave itself hasn't been switched over to it; that
   remains separate, still-open follow-on work.
-- [~] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
+- [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
   mutator with an undo-recording version and kept its own undo/redo
   stacks — the gap was entirely in `aurora-app`: `App` built a
@@ -3255,13 +3260,14 @@ check licenses` clean with the new `toml` dependency.
   (`python3` still absent from this sandbox); no new `aurora-*`
   dependency edges (`aurora-app` already depended on `aurora-doc`).
 
-  **Still `[~]`, not `[x]`**: a completed Move's own undo granularity
-  is one step per pointer-move event during the drag, not one step per
-  whole drag gesture — `apply_move` runs, and records, once per
-  `CursorMoved` while dragging, so undoing several times during what
-  felt like one drag steps back through its own intermediate positions
-  rather than jumping straight to where it began; coalescing a drag
-  into a single undo step is separate, still-open follow-on work.
+  **Every gap originally named here has since closed** — kept as a
+  record of what they were, not because any is still open. A completed
+  Move's own undo granularity was one step per pointer-move event
+  during the drag, not one step per whole drag gesture (`apply_move`
+  ran, and recorded, once per `CursorMoved` while dragging, so undoing
+  several times during what felt like one drag stepped back through
+  its own intermediate positions rather than jumping straight to where
+  it began) — closed by the Move-drag coalescing bullet below.
   `App::paint_dab`/`App::erase_dab` bypassing `History` entirely was
   also named here — closed the same week; see the Pixel-edit undo
   bullet below. `Undo`/`Redo` being shortcut-only, with no command-
@@ -3345,19 +3351,20 @@ check licenses` clean with the new `toml` dependency.
   layers all shared that origin too; only a hand-crafted `.aur` file
   could actually diverge two layers' origins, since Move was the only
   thing that ever changed one). **Closed the same week — see the
-  Per-layer-origin-aware compositing bullet below.** Performance is
-  the limitation that remains: `recomposite_visible_tiles` recomposites
-  the *entire* visible grid
-  unconditionally on every redraw, not just tiles some constituent layer
-  actually changed — per `spike/FINDINGS.md`'s own ~20ms "merging whole
-  tiles" measurement (the exact cost that finding named as the reason
-  GPU tile compositing exists at all), this will not hold the 60 FPS
-  budget once a real multi-layer document is actually being interacted
-  with; a real, incremental, per-tile-dirty-aware (or GPU-side)
-  multi-layer compositor is separate, still-open follow-on work. A
-  document with zero or one visible pixel layer — every document this
-  app's own UI can produce without opening a hand-crafted `.aur` file —
-  is unaffected in practice: compositing a single full-opacity layer
+  Per-layer-origin-aware compositing bullet below.** The other named
+  limitation, performance — `recomposite_visible_tiles` recomposited
+  the *entire* visible grid unconditionally on every redraw, not just
+  tiles some constituent layer actually changed — per
+  `spike/FINDINGS.md`'s own ~20ms "merging whole tiles" measurement
+  (the exact cost that finding named as the reason GPU tile compositing
+  exists at all) — was **partially closed the same week too**: see the
+  Incremental compositing bullet below for a coarse, whole-cache-
+  invalidation-based fix that helps idle redraws and pan-revisit but
+  not active painting. True per-tile-dirty-aware and GPU-side
+  compositing remain separate, still-open follow-on work. A document
+  with zero or one visible pixel layer — every document this app's own
+  UI can produce without opening a hand-crafted `.aur` file — is
+  unaffected either way: compositing a single full-opacity layer
   reproduces it exactly, proven by a dedicated test.
 - [~] **Pixel-edit undo (Brush/Eraser)** — done 2026-08-06, in two
   committed steps, closing the gap the Undo/Redo bullet above named
@@ -3416,13 +3423,14 @@ check licenses` clean with the new `toml` dependency.
   `aurora-*` dependency edges (`aurora-app` already depended on
   `aurora-brush`).
 
-  **Still `[~]`, not `[x]`**: a completed stroke's own undo granularity
-  is the whole stroke as one step (unlike Move's own per-event
-  granularity) — correct and arguably the more expected behaviour, but
-  worth noting as a real difference between the two pixel-editing paths
-  this crate now has. The "pixel-first, not unified" undo priority
-  named above was closed the same week — see the Unified undo/redo
-  bullet below.
+  **Still `[~]`, not `[x]`, at the time**: a completed stroke's own
+  undo granularity was the whole stroke as one step, unlike Move's own
+  per-pointer-move-event granularity then — a real, named difference
+  between the two pixel-editing paths this crate had. Move's own
+  granularity later changed to match (Move-drag coalescing, below), so
+  this is no longer a real difference, just a fact about how it used to
+  be. The "pixel-first, not unified" undo priority named above was
+  closed the same week — see the Unified undo/redo bullet below.
 - [x] **Undo/Redo in the command palette and native menu** — done
   2026-08-06, closing the gap named on the Undo/Redo bullet above from
   the day it landed: `Ctrl+Z`/`Ctrl+Shift+Z` were the only way to reach
@@ -3569,9 +3577,10 @@ check licenses` clean with the new `toml` dependency.
   step) are now the same shape, but the two paths still don't share
   code — a real, minor duplication, not worth unifying on its own.
   Multi-layer compositing's own two named limitations (single shared
-  origin assumed; whole-grid recompute every redraw) remain separate,
-  still-open follow-on work. The first was closed the same day — see
-  the next bullet.
+  origin assumed; whole-grid recompute every redraw) were, at the time,
+  both still fully open. The first was closed the same day — see the
+  next bullet; the second was partially closed the same day too — see
+  the Incremental compositing bullet further below.
 - [x] **Per-layer-origin-aware compositing** — done 2026-08-06, closing
   the "same-origin assumption" limitation the Multi-layer compositing
   bullet above named the same day it landed: `recomposite_visible_tiles`
