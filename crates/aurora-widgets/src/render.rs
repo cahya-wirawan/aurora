@@ -277,6 +277,9 @@ impl PathPipeline {
     /// indexed draw call itself, the one part specific to which `Mesh`
     /// is being drawn.
     pub fn draw<'pass>(&self, pass: &mut wgpu::RenderPass<'pass>, mesh: &'pass GpuMesh) {
+        if mesh.index_count == 0 {
+            return;
+        }
         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
         pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
