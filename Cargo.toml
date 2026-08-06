@@ -79,6 +79,16 @@ accesskit_winit = "0.33"
 accesskit_consumer = "0.38"
 # PLAN.md M1.7's own suggestion ("flexbox-style; taffy if it fits").
 taffy = "0.12"
+# PRD §8's own pre-decided pair ("Vector rasterization | lyon
+# (tessellation) + custom GPU path renderer") -- aurora-vector's own
+# job is the tessellation half; the GPU renderer is separate, still-
+# open follow-on work in whichever crate actually draws it (aurora-
+# widgets depends on both aurora-vector and aurora-gpu; aurora-vector
+# itself only depends on aurora-core per scripts/layering.json, so it
+# stays GPU-agnostic). Default features only (path building +
+# tessellation) -- `extra`/`debugger`/`profiling`/`serialization` are
+# all off already, nothing here opts into them.
+lyon = "1"
 # Correct Unicode word-boundary motion for the text field widget, not a
 # hand-rolled whitespace heuristic.
 unicode-segmentation = "1"

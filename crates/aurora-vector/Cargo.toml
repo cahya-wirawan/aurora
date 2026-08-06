@@ -14,5 +14,6 @@ workspace = true
 
 [dependencies]
 aurora-core = { workspace = true }
+lyon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
