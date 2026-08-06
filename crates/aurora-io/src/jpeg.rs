@@ -20,12 +20,18 @@
 //!   permanent format limit (65,535×65,535 px), not a library
 //!   shortcoming. [`encode`] checks this explicitly rather than
 //!   silently truncating a too-large [`Image`].
-//! - Colour space is always tagged sRGB — real JPEGs can carry ICC
-//!   profiles (a segmented `APP2` marker, unlike PNG/TIFF's own
-//!   single-chunk embedding) or an Adobe `APP14` marker naming
-//!   CMYK/YCCK; neither is read or written here — a bigger, separate,
-//!   per-format undertaking than the single-chunk case `png`/`tiff`
-//!   just closed, not attempted yet.
+//! - Colour space round-trips for real now too (added 2026-08-06):
+//!   real JPEGs carry ICC profiles across one or more segmented `APP2`
+//!   markers, unlike PNG/TIFF's own single-chunk embedding — but both
+//!   codec crates already do that reassembly/splitting internally
+//!   (`zune_jpeg::JpegDecoder::icc_profile`/
+//!   `jpeg_encoder::Encoder::add_icc_profile`), so this needed no
+//!   hand-rolled segment handling, just a real caller for machinery
+//!   that already existed — the same shape quality control turned out
+//!   to have. An Adobe `APP14` marker naming CMYK/YCCK is still not
+//!   read — this crate's own RGBA-only decode path
+//!   ([`IoError::UnexpectedJpegColorSpace`]) already rejects a CMYK
+//!   source before colour space would even matter.
 //! - Quality is real, as of 2026-08-06 ([`encode_with_quality`]) — the
 //!   underlying `jpeg_encoder::Encoder` already takes it as a required
 //!   constructor parameter, so this needed no new capability, just a
@@ -55,10 +61,12 @@ const DEFAULT_QUALITY: u8 = 90;
 ///
 /// # Errors
 ///
-/// Returns [`IoError::JpegDecode`] if `bytes` isn't a valid JPEG, or
+/// Returns [`IoError::JpegDecode`] if `bytes` isn't a valid JPEG,
 /// [`IoError::UnexpectedJpegColorSpace`] if decoding produced something
 /// other than RGBA (see this module's own doc comment for why that's a
-/// real, checked possibility, not just theoretical).
+/// real, checked possibility, not just theoretical), or
+/// [`IoError::Color`] if an embedded ICC profile's own bytes fail to
+/// parse.
 pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
@@ -75,6 +83,15 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
         unreachable!("decode() succeeding means decode_headers() already ran internally");
     };
 
+    // `icc_profile()` already reassembles however many segmented `APP2`
+    // markers the source carried (or `None` for a genuinely untagged
+    // one, or a corrupt/incomplete ICC marker sequence -- see its own
+    // doc comment) -- this module doesn't need to know either detail.
+    let color_space = match decoder.icc_profile() {
+        Some(bytes) => IccProfile::from_bytes(&bytes)?,
+        None => IccProfile::srgb(),
+    };
+
     let samples: Vec<f16> = pixels
         .iter()
         .map(|&sample| f16::from_f32(promote_u8(sample)))
@@ -83,7 +100,7 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
     Image::new(
         u32::from(info.width),
         u32::from(info.height),
-        IccProfile::srgb(),
+        color_space,
         samples,
     )
 }
@@ -109,7 +126,8 @@ pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
 /// # Errors
 ///
 /// Returns [`IoError::JpegDimensionsTooLarge`] if `image` is wider or
-/// taller than JPEG's own 16-bit dimension fields can represent, or
+/// taller than JPEG's own 16-bit dimension fields can represent,
+/// [`IoError::Color`] if `image.color_space()` fails to serialize, or
 /// [`IoError::JpegEncode`] if the encoder itself fails.
 pub fn encode_with_quality(image: &Image, quality: u8) -> Result<Vec<u8>, IoError> {
     let (width, height) = (image.width(), image.height());
@@ -127,7 +145,8 @@ pub fn encode_with_quality(image: &Image, quality: u8) -> Result<Vec<u8>, IoErro
     }
 
     let mut bytes = Vec::new();
-    let encoder = Encoder::new(&mut bytes, quality);
+    let mut encoder = Encoder::new(&mut bytes, quality);
+    encoder.add_icc_profile(&image.color_space().to_bytes()?)?;
     encoder.encode(&rgba8, width16, height16, ColorType::Rgba)?;
     Ok(bytes)
 }
@@ -319,5 +338,73 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(via_encode, via_default_quality);
+    }
+
+    // CC0-licensed, from the colord-data Debian package -- see
+    // corpora/icc/README.md for full provenance. The same real,
+    // deliberately non-sRGB profile `aurora-color`'s own tests already
+    // use -- large enough (a few KB) to matter for confirming the
+    // segmented `APP2` embedding actually round-trips, not just a
+    // profile too small to ever need splitting.
+    const ECI_RGBV2_ICC: &[u8] = include_bytes!("../../../corpora/icc/ECI-RGBv2.icc");
+
+    #[test]
+    fn round_trips_a_real_non_srgb_icc_profile() {
+        let profile = match IccProfile::from_bytes(ECI_RGBV2_ICC) {
+            Ok(profile) => profile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let image = match Image::new(
+            1,
+            1,
+            profile,
+            vec![
+                f16::from_f32(0.0),
+                f16::from_f32(0.0),
+                f16::from_f32(0.0),
+                f16::from_f32(1.0),
+            ],
+        ) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let bytes = match encode(&image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let decoded = match decode(&bytes) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Re-serializing the round-tripped profile must itself succeed
+        // -- real, checked evidence `decode` actually reassembled and
+        // parsed the segmented `APP2` markers into a genuinely usable
+        // profile, not just stashed some bytes unexamined.
+        if let Err(err) = decoded.color_space().to_bytes() {
+            unreachable!("the round-tripped profile must itself be real and usable: {err}");
+        }
+    }
+
+    #[test]
+    fn decode_falls_back_to_srgb_when_no_icc_profile_is_embedded() {
+        // `encode` always embeds a real profile now (see this module's
+        // own doc comment), so a genuinely untagged source has to be
+        // built independently -- the real `jpeg_encoder::Encoder`, with
+        // no `add_icc_profile` call at all.
+        let mut bytes = Vec::new();
+        let encoder = jpeg_encoder::Encoder::new(&mut bytes, super::DEFAULT_QUALITY);
+        if let Err(err) = encoder.encode(&[128, 128, 128, 255], 1, 1, jpeg_encoder::ColorType::Rgba)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let decoded = match decode(&bytes) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = decoded.color_space().to_bytes() {
+            unreachable!("the sRGB fallback must itself be a real, usable profile: {err}");
+        }
     }
 }
