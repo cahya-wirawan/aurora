@@ -188,8 +188,8 @@
 //! journaled step. `App::apply_move` now records through `history`
 //! instead of calling `LayerTree::set_bounds` directly, so a completed
 //! Move is really undoable — one undo step per pointer-move event
-//! during the drag, not one per whole drag gesture (coalescing a drag
-//! into a single undo step is separate, still-open follow-on work).
+//! during the drag, not one per whole drag gesture at the time (see the
+//! "Move-drag coalescing" paragraph further down for how that changed).
 //! **Scope, stated honestly (at the time)**: `Undo`/`Redo` were
 //! shortcut-only when this bullet first landed — see the "command
 //! palette/native menu Undo/Redo" paragraph further down for how that
@@ -256,6 +256,24 @@
 //! bug fixed as a side effect: previously `pixel_history` outlived a
 //! document switch untouched, so `Ctrl+Z` could reach into a stroke
 //! from a document that was no longer open.
+//!
+//! **Move-drag coalescing, also 2026-08-06** — closes the other gap the
+//! Pixel-edit undo paragraph above named: dragging a layer used to
+//! record one `history` entry per pointer-move event, so `Ctrl+Z` after
+//! a single drag undid it one tiny step at a time instead of returning
+//! the layer to where the drag started. `Self::apply_move` now bypasses
+//! `history`/`undo_order` entirely and calls `LayerTree::set_bounds`
+//! directly, purely for live visual feedback while the pointer is still
+//! down; the actual undo entry is recorded once, retroactively, by a new
+//! `Self::finish_move`, called from `Self::handle_pointer_released` when
+//! the drag ends, via `aurora_doc::History::record_bounds_change` (the
+//! start bounds captured when the drag began, the tree's own current
+//! bounds as the end point) and `UndoOrder::record`, the same coalescing
+//! shape `Self::handle_pointer_released` already used for a completed
+//! Brush/Eraser stroke. A drag that ends back where it started (a click
+//! with no real movement, or a pointer-up right after pointer-down)
+//! records nothing — `finish_move` checks the layer's current bounds
+//! against `start_bounds` first.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
@@ -3463,36 +3481,56 @@ impl App {
         }
     }
 
-    /// Applies `bounds` to `layer_id` in the live document
+    /// Applies `bounds` to `layer_id` directly in the live document
     /// (`aurora_doc::LayerTree::set_bounds`) — the one real mutation a
     /// `Drag::Move` needs, called every pointer-move event while one is
     /// active with that drag's own live `current_bounds`
-    /// ([`Self::handle_pointer_moved`]). Recorded through `self.history`
-    /// (unlike [`Self::paint_dab`]/[`Self::erase_dab`], which still
-    /// bypass it — see `Self::history`'s own doc comment for why pixel
-    /// edits are a separate case) and, on success, into
-    /// [`Self::undo_order`] too, so a completed Move is a real,
-    /// `Ctrl+Z`-undoable step in the *unified* order, not just
-    /// `history`'s own — one entry per pointer-move event, not one per
-    /// drag (every intermediate position along the drag becomes its own
-    /// undo step; undoing several times during a slow drag steps back
-    /// through the intermediate positions rather than jumping straight
-    /// to where the drag began). A real, logged failure (an unknown or
-    /// non-pixel `layer_id`) shouldn't happen in practice — `layer_id`
-    /// always comes from `Drag::Move` itself, set from a real active
-    /// pixel layer when the drag began — but this reports rather than
-    /// assumes it, the same discipline every other fallible call in this
-    /// crate already applies.
+    /// ([`Self::handle_pointer_moved`]), for live visual feedback only.
+    /// Deliberately bypasses `self.history`/`self.undo_order` — the
+    /// whole point of coalescing a drag into one undo step
+    /// ([`Self::finish_move`]) is *not* recording an entry for every
+    /// intermediate position a fast drag passes through. A real, logged
+    /// failure (an unknown or non-pixel `layer_id`) shouldn't happen in
+    /// practice — `layer_id` always comes from `Drag::Move` itself, set
+    /// from a real active pixel layer when the drag began — but this
+    /// reports rather than assumes it, the same discipline every other
+    /// fallible call in this crate already applies.
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
-        match self.history.set_bounds(&mut self.layers, layer_id, bounds) {
-            Ok(_) => {
+        if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
+            tracing::warn!(?err, "failed to reposition the active layer");
+        }
+    }
+
+    /// Records a completed `Drag::Move` as a single undo step, from
+    /// `start_bounds` to wherever `layer_id` actually ended up — already
+    /// applied, live, by every [`Self::apply_move`] call during the drag
+    /// — via `aurora_doc::History::record_bounds_change`, which journals
+    /// the move without re-applying it (the tree already reflects it).
+    /// Called once, from [`Self::handle_pointer_released`], when the
+    /// drag that just ended was a `Drag::Move`.
+    ///
+    /// A no-op if the layer never actually ended up anywhere different
+    /// (`start_bounds` still matches its current bounds — e.g. a click
+    /// that started and ended a drag with no real pointer movement, or
+    /// `layer_id` no longer exists at all): nothing for a later undo to
+    /// meaningfully reverse. A real, logged failure otherwise is worth a
+    /// warning, the same discipline [`Self::apply_move`] already uses.
+    fn finish_move(&mut self, layer_id: aurora_doc::LayerId, start_bounds: aurora_core::Rect) {
+        if self.layers.bounds(layer_id) == Some(start_bounds) {
+            return;
+        }
+        match self
+            .history
+            .record_bounds_change(&self.layers, layer_id, start_bounds)
+        {
+            Ok(()) => {
                 self.undo_order.record(
                     UndoKind::Structural,
                     &mut self.history,
                     &mut self.pixel_history,
                 );
             }
-            Err(err) => tracing::warn!(?err, "failed to reposition the active layer"),
+            Err(err) => tracing::warn!(?err, "failed to record the completed move"),
         }
     }
 
@@ -3545,22 +3583,37 @@ impl App {
     /// for an empty snapshot) is exactly what lets this tell "a real
     /// stroke happened" apart from "a click/drag that never actually
     /// touched a tile" (e.g. a zero-radius brush, or no active layer at
-    /// all) without checking `stroke.is_empty()` itself.
+    /// all) without checking `stroke.is_empty()` itself. If the ending
+    /// drag was a `Drag::Move`, [`Self::finish_move`] records the whole
+    /// gesture as one coalesced undo step, from wherever it started.
     fn handle_pointer_released(&mut self) {
-        if let Some(
-            Drag::Brush {
-                stroke: Some(stroke),
-                ..
+        match self.drag.take() {
+            Some(
+                Drag::Brush {
+                    stroke: Some(stroke),
+                    ..
+                }
+                | Drag::Eraser {
+                    stroke: Some(stroke),
+                    ..
+                },
+            ) => {
+                if self.pixel_history.push(stroke) {
+                    self.undo_order.record(
+                        UndoKind::Pixel,
+                        &mut self.history,
+                        &mut self.pixel_history,
+                    );
+                }
             }
-            | Drag::Eraser {
-                stroke: Some(stroke),
+            Some(Drag::Move {
+                layer_id,
+                start_bounds,
                 ..
-            },
-        ) = self.drag.take()
-            && self.pixel_history.push(stroke)
-        {
-            self.undo_order
-                .record(UndoKind::Pixel, &mut self.history, &mut self.pixel_history);
+            }) => {
+                self.finish_move(layer_id, start_bounds);
+            }
+            _ => {}
         }
     }
 
@@ -4849,9 +4902,9 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert_eq!(layers.bounds(id), Some(moved));
-        // Simulates what `App::apply_move` itself does after a
-        // successful `history.set_bounds` call, since this test drives
-        // `history` directly rather than through `App`.
+        // Simulates what `App::finish_move` itself does after a
+        // successful `history.record_bounds_change` call, since this
+        // test drives `history` directly rather than through `App`.
         let mut undo_order = UndoOrder::default();
         undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
 
