@@ -40,3 +40,4 @@ wgpu = { workspace = true }
 
 [dev-dependencies]
 accesskit_consumer = { workspace = true }
+aurora-testkit = { workspace = true }

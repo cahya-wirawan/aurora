@@ -714,6 +714,7 @@ dependencies = [
  "accesskit_consumer",
  "aurora-core",
  "aurora-gpu",
+ "aurora-testkit",
  "aurora-theme",
  "aurora-vector",
  "taffy",

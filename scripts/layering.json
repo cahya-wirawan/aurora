@@ -69,7 +69,8 @@
     "aurora-gpu",
     "aurora-vector",
     "aurora-text",
-    "aurora-theme"
+    "aurora-theme",
+    "aurora-testkit"
   ],
   "aurora-ui": [
     "aurora-core",
