@@ -67,7 +67,22 @@
 //! only, not a composited whole document — this crate has no
 //! compositor wired in yet, and the canvas itself only ever shows the
 //! active layer's own surface today (see `App::redraw`'s own doc
-//! comment).
+//! comment). **A `.aur` path (ADR 0009) takes a different, real route
+//! through both**: `App::open_aur_file`/`App::save_aur_file` call
+//! `aurora_io::read_aur`/`write_aur` directly — a real, possibly
+//! multi-layer document, not a single flat image, verified on save the
+//! same `write_verified`-style way (`verify_aur`, reading the temp file
+//! back with a throwaway `aurora_tile::TileStore`) since `.aur` has no
+//! single "does this decode to the right width/height" check the way a
+//! flat image does. `App::open_file`/`save_file` dispatch to the `.aur`
+//! path or the flat-image path by extension (`is_aur_path`). `.aur`
+//! saves every real pixel layer's own tiles (`document_canvas_size`
+//! stands in for a real document-level canvas size, which nothing
+//! tracks separately yet), unlike the flat-image path's active-layer-
+//! only limit — but `history` written is always a fresh, empty
+//! `aurora_doc::History`, since there is no live `History` kept on
+//! `App` to save through yet (the same reason `Move`/`Brush`/`Eraser`
+//! all bypass it too).
 //!
 //! **DPI/scale-factor aware layout**: `logical_size` divides a real
 //! physical window size by `Window::scale_factor` before it reaches
@@ -439,14 +454,87 @@ fn write_verified(path: &Path, bytes: &[u8], width: u32, height: u32) -> bool {
     true
 }
 
+/// Whether `path`'s own extension names a real `.aur` document (ADR
+/// 0009), case-insensitively — [`App::open_file`]/[`App::save_file`]'s
+/// own dispatch between a whole-document `.aur` and a flat image.
+#[must_use]
+fn is_aur_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("aur"))
+}
+
+/// `layers`' own topmost pixel layer's `bounds` (`(width, height)`), or
+/// `(0, 0)` if there isn't one — the best "canvas size" a `.aur` export
+/// ([`App::save_aur_file`]) can offer today, since nothing tracks a
+/// real, separate document-level canvas size yet: every document this
+/// crate builds is exactly one layer, sized to whatever was opened or
+/// painted. A real, separate follow-on once a document can hold more
+/// than one meaningfully, differently sized layer.
+#[must_use]
+fn document_canvas_size(layers: &aurora_doc::LayerTree) -> (u32, u32) {
+    topmost_pixel_layer(layers)
+        .and_then(|id| layers.bounds(id))
+        .map_or((0, 0), |bounds| (bounds.width, bounds.height))
+}
+
+/// Where a `.aur` export's own "verify by reading it back"
+/// ([`verify_aur`]) keeps its throwaway `aurora_tile::TileStore`
+/// scratch files — deliberately separate from [`tile_store_scratch_dir`]
+/// (the live document's own store): verifying a fresh export must never
+/// touch the live document's real tiles. Not a proper per-platform
+/// app-support directory yet, the same scope this crate's other
+/// `std::env::temp_dir()`-based paths already accept.
+fn aur_verify_scratch_dir() -> PathBuf {
+    std::env::temp_dir().join("aurora-aur-verify")
+}
+
+/// Reads `path` back as a `.aur` file, against a fresh, throwaway
+/// `aurora_tile::TileStore` ([`aur_verify_scratch_dir`]) — [`App::save_aur_file`]'s
+/// own "never leave a corrupt file in place" check, the `.aur`
+/// counterpart to [`write_verified`]'s own "decodes to the right
+/// width/height" check for a flat image (`.aur` has no single such
+/// number to compare; successfully parsing the whole container,
+/// manifest, history, and every tile entry it names is itself the
+/// check). `false` (logged) if the scratch store fails to open or
+/// `aurora_io::read_aur` itself fails for any reason.
+#[must_use]
+fn verify_aur(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        tracing::warn!(path = %path.display(), "failed to reopen the exported .aur file to verify it");
+        return false;
+    };
+    let Some(budget) = std::num::NonZeroUsize::new(16) else {
+        unreachable!("16 is non-zero");
+    };
+    let mut store = match aurora_tile::TileStore::new(aur_verify_scratch_dir(), budget) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(?err, "failed to open the .aur verification scratch store");
+            return false;
+        }
+    };
+    match aurora_io::read_aur(file, &mut store) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), ?err, "exported .aur file failed to read back");
+            false
+        }
+    }
+}
+
 /// Clears and repopulates `workspace`'s Layers/History panels for a
-/// freshly opened, single-layer document built from `image` (named
-/// `name`, via [`document_from_image`]) — the real "replace the current
-/// document" step [`App::open_file`] needs. Returns the new
-/// `LayerTree`/`History`, the new layer's own id (the caller's new
-/// active layer), and the new `WidgetId -> LayerId` map
-/// (`aurora_ui::populate_layers_panel`'s own return value) — everything
-/// the caller assigns onto its own fields.
+/// freshly opened `layers`/`history` — the real "replace the current
+/// document" step [`App::open_file`] needs, shared by both routes that
+/// reach it: a single-image import ([`document_from_image`], always
+/// exactly one new pixel layer) and a real, possibly multi-layer `.aur`
+/// open (`aurora_io::read_aur`). Returns the new `WidgetId -> LayerId`
+/// map (`aurora_ui::populate_layers_panel`'s own return value) and
+/// which layer should become the new active one — `layers`' own
+/// topmost pixel layer ([`topmost_pixel_layer`]; for a freshly
+/// imported single-layer document this is trivially the layer that was
+/// just created) — for the caller to assign onto its own fields
+/// alongside `layers`/`history` themselves (kept by the caller, not
+/// threaded through here, since this function only needs to read them).
 ///
 /// # Errors
 ///
@@ -458,24 +546,21 @@ fn write_verified(path: &Path, bytes: &[u8], width: u32, height: u32) -> bool {
 fn replace_document(
     workspace: &mut aurora_ui::Workspace,
     scales: &Scales,
-    name: &str,
-    image: &aurora_io::Image,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
 ) -> Result<
     (
-        aurora_doc::LayerTree,
-        aurora_doc::History,
-        aurora_doc::LayerId,
         HashMap<WidgetId, aurora_doc::LayerId>,
+        Option<aurora_doc::LayerId>,
     ),
     aurora_widgets::WidgetError,
 > {
-    let (layers, history, layer_id) = document_from_image(name, image);
     aurora_ui::clear_panel_body(&mut workspace.tree, workspace.layers.body)?;
     let layer_rows =
-        aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, &layers)?;
+        aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
     aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body)?;
-    aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &history)?;
-    Ok((layers, history, layer_id, layer_rows))
+    aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, history)?;
+    Ok((layer_rows, topmost_pixel_layer(layers)))
 }
 
 // -- Crash recovery: an unclosed-session marker, plus a real autosave --
@@ -2324,21 +2409,26 @@ impl App {
         self.open_file(path);
     }
 
-    /// Opens `path` as a real document: reads and decodes it
-    /// ([`open_image`]) and, on success, replaces the current document
-    /// with a fresh, single-layer one sized to the image
-    /// ([`replace_document`]), writing the image's own pixels into the
-    /// live tile store (`aurora_io::write_into_store`) so the canvas
-    /// actually shows it. A read/decode failure (bad file, unrecognised
-    /// extension) is logged and leaves the current document completely
-    /// untouched — the same honesty [`recover_document`] already applies
-    /// to a bad autosave, extended here to a bad chosen file.
+    /// Opens `path` as a real document — a real, multi-layer `.aur` file
+    /// ([`Self::open_aur_file`]) if the extension names one, otherwise a
+    /// flat image ([`open_image`]) replacing the current document with a
+    /// fresh, single-layer one sized to it ([`replace_document`]),
+    /// writing the image's own pixels into the live tile store
+    /// (`aurora_io::write_into_store`) so the canvas actually shows it.
+    /// A read/decode failure (bad file, unrecognised extension) is
+    /// logged and leaves the current document completely untouched —
+    /// the same honesty [`recover_document`] already applies to a bad
+    /// autosave, extended here to a bad chosen file.
     ///
     /// Resets `canvas_view`/`selection`/`drag` to their own fresh-
     /// session defaults — a newly opened document has no relationship
     /// to whatever pan/zoom/selection/in-progress-drag the *previous*
     /// one had.
     fn open_file(&mut self, path: &Path) {
+        if is_aur_path(path) {
+            self.open_aur_file(path);
+            return;
+        }
         let Some(image) = open_image(path) else {
             return;
         };
@@ -2346,6 +2436,7 @@ impl App {
             .file_stem()
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("Image");
+        let (layers, history, layer_id) = document_from_image(name, &image);
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
@@ -2353,8 +2444,8 @@ impl App {
                 return;
             }
         };
-        let (layers, history, layer_id, layer_rows) =
-            match replace_document(&mut self.workspace, &scales, name, &image) {
+        let (layer_rows, active_layer) =
+            match replace_document(&mut self.workspace, &scales, &layers, &history) {
                 Ok(result) => result,
                 Err(err) => {
                     tracing::error!(
@@ -2377,7 +2468,7 @@ impl App {
         write_autosave(&autosave_path(), &history);
 
         self.layers = layers;
-        self.active_layer = Some(layer_id);
+        self.active_layer = active_layer;
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
         self.selection = aurora_doc::SelectionSet::new();
@@ -2385,20 +2476,84 @@ impl App {
         self.push_accessibility();
     }
 
-    /// Saves the active layer's own pixels to `path`: reads them back
+    /// Opens a real `.aur` file (ADR 0009): `aurora_io::read_aur` gives
+    /// back a real, possibly multi-layer `LayerTree`/`History`, its own
+    /// tiles written directly into the live tile store — the same
+    /// document-replacement shape [`Self::open_file`]'s own flat-image
+    /// path uses ([`replace_document`], resetting
+    /// `canvas_view`/`selection`/`drag`), just fed by a real document
+    /// reader instead of a single decoded image. A silent no-op
+    /// (logged) if there's no live tile store, the file fails to open,
+    /// or `read_aur` itself fails (corrupt file, missing manifest/
+    /// history entry, or an unsupported future schema version).
+    fn open_aur_file(&mut self, path: &Path) {
+        let Some(store) = self.tile_store.as_mut() else {
+            tracing::warn!(path = %path.display(), "no live tile store; cannot open a .aur file");
+            return;
+        };
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "failed to open the chosen .aur file");
+                return;
+            }
+        };
+        let (layers, history, _canvas_size) = match aurora_io::read_aur(file, store) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), ?err, "failed to read the chosen .aur file");
+                return;
+            }
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a document");
+                return;
+            }
+        };
+        let (layer_rows, active_layer) =
+            match replace_document(&mut self.workspace, &scales, &layers, &history) {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        "failed to rebuild the workspace panels for the opened document"
+                    );
+                    return;
+                }
+            };
+        write_autosave(&autosave_path(), &history);
+
+        self.layers = layers;
+        self.active_layer = active_layer;
+        self.layer_rows = layer_rows;
+        self.canvas_view = aurora_ui::CanvasView::default();
+        self.selection = aurora_doc::SelectionSet::new();
+        self.drag = None;
+        self.push_accessibility();
+    }
+
+    /// Saves to `path` — the whole document, real and multi-layer
+    /// ([`Self::save_aur_file`]), if the extension names `.aur`;
+    /// otherwise the active layer's own pixels alone, reading them back
     /// out of the live tile store (`aurora_io::read_from_store`),
-    /// encodes via whichever format `path`'s own extension names
-    /// (`aurora_io::encode_by_extension`), and writes the result to disk
-    /// with [`write_verified`]'s own "never leave a corrupt file in
-    /// place" discipline.
+    /// encoding via whichever format `path`'s own extension names
+    /// (`aurora_io::encode_by_extension`), and writing the result to
+    /// disk with [`write_verified`]'s own "never leave a corrupt file
+    /// in place" discipline.
     ///
-    /// **Scope, stated honestly**: exports the *active layer's* own
-    /// pixels, not a composited whole document — this crate has no
-    /// document compositor wired in yet (`aurora_render::TileCompositor`
-    /// exists, but nothing in `aurora-app` calls it), and the canvas
-    /// itself only ever shows the active layer's own surface today (see
-    /// [`Self::redraw`]'s own doc comment) — so a save round-trips
-    /// exactly what the canvas already shows, no more.
+    /// **Scope, stated honestly**: the non-`.aur` path exports the
+    /// *active layer's* own pixels, not a composited whole document —
+    /// this crate has no document compositor wired in yet
+    /// (`aurora_render::TileCompositor` exists, but nothing in
+    /// `aurora-app` calls it), and the canvas itself only ever shows
+    /// the active layer's own surface today (see [`Self::redraw`]'s own
+    /// doc comment) — so a flat-format save round-trips exactly what
+    /// the canvas already shows, no more. `.aur`, by contrast, saves
+    /// every layer's own real tiles regardless of which one is active
+    /// — see [`Self::save_aur_file`]'s own doc comment for that path's
+    /// own scope.
     ///
     /// A silent no-op if there's no live tile store, no active layer,
     /// or that layer isn't a pixel layer — the same absent-precondition
@@ -2406,6 +2561,10 @@ impl App {
     /// (reading the pixels, encoding, or writing the file) is worth a
     /// warning, though.
     fn save_file(&mut self, path: &Path) {
+        if is_aur_path(path) {
+            self.save_aur_file(path);
+            return;
+        }
         let Some(layer_id) = self.active_layer else {
             return;
         };
@@ -2436,6 +2595,68 @@ impl App {
         if write_verified(path, &bytes, image.width(), image.height()) {
             tracing::info!(path = %path.display(), "exported the active layer");
         }
+    }
+
+    /// Saves the whole live document to `path` as a real `.aur` file
+    /// (ADR 0009, `aurora_io::write_aur`): every pixel layer's own
+    /// tiles, not just the active one — the real answer to the
+    /// non-`.aur` export path's own "active layer only" limit. Writes
+    /// to a sibling `.tmp` file first, verifies it by reading it back
+    /// with a throwaway `aurora_tile::TileStore` ([`verify_aur`]), then
+    /// atomically renames it over `path` — the same
+    /// [`write_verified`]-style discipline the flat-format export path
+    /// uses, just against a different verification step (`.aur` has no
+    /// single "does this decode to the right width/height" check the way a flat image
+    /// does).
+    ///
+    /// **Scope, stated honestly**: `history` is always a fresh, empty
+    /// `aurora_doc::History` — there is no live `History` kept on `App`
+    /// to save through yet (the same reason `Self::apply_move`/
+    /// `Self::paint_dab`/`Self::erase_dab` all bypass it too), so an
+    /// `.aur` file this session writes has no real undo journal, only
+    /// the real, current `LayerTree` state. `canvas_size` is the
+    /// topmost pixel layer's own bounds ([`document_canvas_size`]) —
+    /// the best this crate can offer today, since nothing tracks a
+    /// real, separate document-level canvas size yet (every document
+    /// built so far is exactly one layer). A silent no-op if there's no
+    /// live tile store.
+    fn save_aur_file(&mut self, path: &Path) {
+        let Some(store) = self.tile_store.as_mut() else {
+            return;
+        };
+        let canvas_size = document_canvas_size(&self.layers);
+        let history = aurora_doc::History::new();
+
+        let Some(file_name) = path.file_name() else {
+            tracing::warn!(path = %path.display(), "save path has no file name");
+            return;
+        };
+        let mut temp_name = file_name.to_os_string();
+        temp_name.push(".tmp");
+        let temp_path = path.with_file_name(temp_name);
+
+        let write_result: Result<(), aurora_io::IoError> = (|| {
+            let file = std::fs::File::create(&temp_path)?;
+            aurora_io::write_aur(file, &self.layers, &history, canvas_size, store)
+        })();
+        if let Err(err) = write_result {
+            tracing::warn!(path = %temp_path.display(), ?err, "failed to write the temp .aur export file");
+            let _ = std::fs::remove_file(&temp_path);
+            return;
+        }
+
+        if !verify_aur(&temp_path) {
+            tracing::warn!(path = %temp_path.display(), "exported .aur file failed to verify by reading it back");
+            let _ = std::fs::remove_file(&temp_path);
+            return;
+        }
+
+        if let Err(err) = std::fs::rename(&temp_path, path) {
+            tracing::warn!(path = %path.display(), %err, "failed to replace the destination with the verified export");
+            let _ = std::fs::remove_file(&temp_path);
+            return;
+        }
+        tracing::info!(path = %path.display(), "exported the document as .aur");
     }
 
     /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
@@ -3088,14 +3309,15 @@ mod tests {
         activate_command, apply_scroll_zoom, autosave_path, begin_drag, canvas_area_physical_rect,
         canvas_area_physical_size, clear_session_marker, close_command_palette,
         close_crash_recovery_dialog, continue_drag, crash_recovery_dialog_message,
-        default_shortcuts, demo_document, document_from_image, handle_dialog_key, handle_key,
-        handle_palette_key, handle_zoom_tool_click, layer_local_point, load_background_color,
-        load_scales, logical_point, logical_size, open_command_palette, open_crash_recovery_dialog,
-        open_image, open_tile_store, pointer_in_canvas, previous_session_left_a_marker,
-        recover_document, replace_document, run_command, sample_pixel, select_layer,
-        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        default_shortcuts, demo_document, document_canvas_size, document_from_image,
+        handle_dialog_key, handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path,
+        layer_local_point, load_background_color, load_scales, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        pointer_in_canvas, previous_session_left_a_marker, recover_document, replace_document,
+        run_command, sample_pixel, select_layer, tile_origin_for_view, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -3469,8 +3691,9 @@ mod tests {
         );
 
         let image = fake_image(8, 8);
-        let (new_layers, _history, layer_id, layer_rows) =
-            match replace_document(&mut workspace, &scales, "photo", &image) {
+        let (new_layers, new_history, new_layer_id) = document_from_image("photo", &image);
+        let (layer_rows, active_layer) =
+            match replace_document(&mut workspace, &scales, &new_layers, &new_history) {
                 Ok(result) => result,
                 Err(err) => unreachable!("{err:?}"),
             };
@@ -3491,9 +3714,64 @@ mod tests {
             Some(1),
             "old demo history rows must be gone too"
         );
-        assert_eq!(new_layers.roots(), &[layer_id]);
+        assert_eq!(new_layers.roots(), &[new_layer_id]);
+        assert_eq!(active_layer, Some(new_layer_id));
         assert_eq!(layer_rows.len(), 1);
-        assert_eq!(layer_rows.values().copied().next(), Some(layer_id));
+        assert_eq!(layer_rows.values().copied().next(), Some(new_layer_id));
+    }
+
+    #[test]
+    fn is_aur_path_matches_case_insensitively_and_rejects_other_extensions() {
+        assert!(is_aur_path(std::path::Path::new("photo.aur")));
+        assert!(is_aur_path(std::path::Path::new("photo.AUR")));
+        assert!(!is_aur_path(std::path::Path::new("photo.png")));
+        assert!(!is_aur_path(std::path::Path::new("photo")));
+    }
+
+    #[test]
+    fn document_canvas_size_reads_the_topmost_pixel_layers_bounds() {
+        let image = fake_image(12, 34);
+        let (layers, _history, _id) = document_from_image("photo", &image);
+        assert_eq!(document_canvas_size(&layers), (12, 34));
+    }
+
+    #[test]
+    fn document_canvas_size_is_zero_zero_for_an_empty_tree() {
+        let layers = aurora_doc::LayerTree::new();
+        assert_eq!(document_canvas_size(&layers), (0, 0));
+    }
+
+    #[test]
+    fn verify_aur_accepts_a_real_written_file_and_rejects_garbage() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_store_dir, mut store) = real_tile_store();
+        let image = fake_image(4, 4);
+        let (layers, history, _id) = document_from_image("photo", &image);
+
+        let good_path = dir.path().join("real.aur");
+        let file = match std::fs::File::create(&good_path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), &mut store) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            verify_aur(&good_path),
+            "a real, just-written .aur file must verify"
+        );
+
+        let garbage_path = dir.path().join("garbage.aur");
+        if let Err(err) = std::fs::write(&garbage_path, b"not a real .aur file") {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            !verify_aur(&garbage_path),
+            "garbage bytes must not verify as a real .aur file"
+        );
     }
 
     #[test]
