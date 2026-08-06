@@ -802,13 +802,66 @@ fn handle_dialog_key(
                 .focused()
                 .and_then(|id| handle.action_id(id))
                 .map(str::to_owned);
-            close_crash_recovery_dialog(workspace, focus, dialog);
-            if let Some(action) = action {
-                tracing::info!(action, "crash recovery dialog action chosen");
-            }
+            run_dialog_action(workspace, focus, dialog, action);
         }
         _ => {}
     }
+}
+
+/// Closes the crash-recovery dialog and, if `action` names one of its
+/// own action ids, logs it as chosen — the shared "resolve, then close"
+/// step [`handle_dialog_key`]'s own `Enter` case and
+/// [`handle_dialog_pointer`]'s own button-click case both need, factored
+/// out so there's exactly one place this dialog's actions actually run.
+fn run_dialog_action(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+    action: Option<String>,
+) {
+    close_crash_recovery_dialog(workspace, focus, dialog);
+    if let Some(action) = action {
+        tracing::info!(action, "crash recovery dialog action chosen");
+    }
+}
+
+/// Routes a real pointer press while the crash-recovery dialog is open
+/// — the same modal precedence [`handle_dialog_key`] already gives the
+/// keyboard, extended to the pointer now that this crate has real
+/// pointer input (PLAN.md M1.9) — previously this dialog's own named,
+/// still-open gap (`aurora_widgets::widgets::dialog`'s own doc comment:
+/// "no click routing"). A `Primary`-button click on one of the
+/// dialog's own action buttons runs it, the same as `Enter` on the
+/// focused one; any other click — a different button, or anywhere
+/// else, including past the dialog's own edge — is swallowed, not
+/// passed through to whatever's underneath, matching a real modal
+/// alert's usual behaviour (unlike a popover, it doesn't dismiss on an
+/// outside click). Returns whether a dialog was actually open to route
+/// to, so [`App::handle_pointer_pressed`] knows whether to fall through
+/// to its own, non-modal hit-testing.
+fn handle_dialog_pointer(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+    button: PointerButton,
+    position: (f32, f32),
+) -> bool {
+    if dialog.is_none() {
+        return false;
+    }
+    if button == PointerButton::Primary {
+        let action = dialog.as_ref().and_then(|handle| {
+            workspace
+                .tree
+                .hit_test(position)
+                .and_then(|hit| handle.action_id(hit))
+        });
+        let action = action.map(str::to_owned);
+        if action.is_some() {
+            run_dialog_action(workspace, focus, dialog, action);
+        }
+    }
+    true
 }
 
 // -- Command dispatch: keyboard shortcuts and the command palette --
@@ -2816,6 +2869,21 @@ impl App {
             return;
         };
 
+        // The crash-recovery dialog, if open, owns every pointer press
+        // the same way it already owns the keyboard (`handle_key`'s own
+        // routing order) — a modal alert blocks everything else,
+        // including layer selection and canvas tools.
+        if handle_dialog_pointer(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.crash_recovery_dialog,
+            button,
+            position,
+        ) {
+            self.push_accessibility();
+            return;
+        }
+
         // Layer selection takes priority over — and is independent of —
         // whichever canvas tool is active: clicking a Layers panel row
         // selects a layer no matter what the Brush/Zoom/Pan/... tool is
@@ -3405,14 +3473,14 @@ mod tests {
         canvas_area_physical_size, clear_session_marker, close_command_palette,
         close_crash_recovery_dialog, continue_drag, crash_recovery_dialog_message,
         default_shortcuts, demo_document, document_canvas_size, document_from_image,
-        handle_dialog_key, handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path,
-        layer_local_point, load_background_color, load_scales, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        pointer_in_canvas, previous_session_left_a_marker, recover_document, replace_document,
-        run_command, sample_pixel, select_layer, tile_origin_for_view, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
+        handle_zoom_tool_click, is_aur_path, layer_local_point, load_background_color, load_scales,
+        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
+        open_tile_store, pointer_in_canvas, previous_session_left_a_marker, recover_document,
+        replace_document, run_command, sample_pixel, select_layer, tile_origin_for_view,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -5209,6 +5277,140 @@ mod tests {
         );
 
         assert_eq!(dialog, None);
+    }
+
+    #[test]
+    fn clicking_the_dialogs_action_button_closes_it() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+        let Some(button) = handle.first_action() else {
+            unreachable!("the crash recovery dialog always has one action");
+        };
+        // `hit_test` requires every ancestor along the path, not just
+        // the button itself, to actually contain the point -- no real
+        // `compute_layout` has run in this test, so every node defaults
+        // to zero-size bounds; set all three explicitly, the same
+        // isolated-geometry shape `hit_test`'s own unit tests in
+        // `aurora-widgets` already use.
+        let big = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 1000,
+        };
+        for id in [workspace.root, handle.root, button] {
+            if let Err(err) = workspace.tree.set_bounds(id, big) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        let opened = handle_dialog_pointer(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            PointerButton::Primary,
+            (10.0, 10.0),
+        );
+
+        assert!(opened, "a dialog was open to route the click to");
+        assert_eq!(dialog, None, "clicking the action button must close it");
+        assert!(!workspace.tree.contains(handle.root));
+    }
+
+    #[test]
+    fn clicking_elsewhere_while_the_dialog_is_open_swallows_the_click_without_closing_it() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+        let Some(button) = handle.first_action() else {
+            unreachable!("the crash recovery dialog always has one action");
+        };
+        // Root and the dialog's own root are real and hit-testable
+        // (same reasoning as `clicking_the_dialogs_action_button_closes_it`),
+        // but the button itself sits in just one corner -- so a click
+        // inside the dialog, but outside the button, hits the dialog's
+        // own root instead, which has no `action_id` of its own.
+        if let Err(err) = workspace.tree.set_bounds(
+            workspace.root,
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 1000,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = workspace.tree.set_bounds(
+            handle.root,
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 1000,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = workspace.tree.set_bounds(
+            button,
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 20,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+
+        // Inside the dialog's own root, but past the button's own
+        // bottom-right corner.
+        let opened = handle_dialog_pointer(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            PointerButton::Primary,
+            (500.0, 500.0),
+        );
+
+        assert!(opened, "a dialog was open, so the click must be swallowed");
+        assert_eq!(
+            dialog,
+            Some(handle),
+            "clicking outside the dialog's own buttons must not close it"
+        );
+    }
+
+    #[test]
+    fn handle_dialog_pointer_returns_false_when_no_dialog_is_open() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        assert!(!handle_dialog_pointer(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            PointerButton::Primary,
+            (0.0, 0.0),
+        ));
     }
 
     #[test]

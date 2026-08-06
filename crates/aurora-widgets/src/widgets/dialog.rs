@@ -21,13 +21,15 @@
 //! [`super::command_palette`] already draws between its own tree
 //! structure and `aurora-app`'s own command matching.
 //!
-//! **No click routing**: like every widget in this crate, a dialog's
-//! action buttons are real `Button`s with `Action::Click` declared, but
-//! nothing in this workspace routes a pointer click to them yet
-//! (`aurora-app` doesn't handle pointer input at all so far, only
-//! keyboard) — a caller drives activation through
-//! [`DialogHandle::action_id`] against whatever *is* wired (currently:
-//! `Enter` on a focused action button).
+//! **Click routing is the caller's job, same as keyboard**: a dialog's
+//! action buttons are real `Button`s with `Action::Click` declared, and
+//! this module builds them and returns their ids via
+//! [`DialogHandle::action_id`] — deciding what a click (or `Enter` on a
+//! focused button) actually *does* stays outside this module, the same
+//! split this doc comment's own "action handling" paragraph already
+//! draws for the keyboard. `aurora-app`'s `handle_dialog_pointer`
+//! (added once that crate had real pointer input at all, PLAN.md M1.9)
+//! is the first caller to actually do this.
 
 use accesskit::{Node, Role};
 use aurora_theme::Scales;
