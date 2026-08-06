@@ -148,6 +148,28 @@ impl TileResidency {
         self.origin
     }
 
+    /// Every [`TileId`] currently within this atlas's own visible grid,
+    /// document-space, in the same fixed row-major order [`Self::sync`]
+    /// itself iterates — what a caller computing its own per-tile
+    /// content (rather than reading a single [`TileStore`] surface
+    /// [`Self::sync`] can already do directly) needs to know what to
+    /// actually produce. `aurora-render`'s multi-layer CPU compositing
+    /// (`composite_tile_cpu`) is the first real consumer: its own
+    /// orchestration (in `aurora-app`, which depends on both this crate
+    /// and `aurora-doc`) must run *before* the next [`Self::sync`] call
+    /// each frame, so the surface `sync` then reads has fresh,
+    /// already-composited content.
+    pub fn visible_tiles(&self) -> impl Iterator<Item = TileId> + '_ {
+        let origin = self.origin;
+        let grid = self.grid;
+        (0..grid.1).flat_map(move |gy| {
+            (0..grid.0).map(move |gx| TileId {
+                x: origin.x + gx,
+                y: origin.y + gy,
+            })
+        })
+    }
+
     /// Call when the visible top-left tile changes (panning) or `zoom`
     /// itself changes. Updates the UV uniform immediately; the texture
     /// itself is only touched by the next [`Self::sync`].
@@ -429,6 +451,47 @@ mod tests {
             width: aurora_tile::TILE,
             height: aurora_tile::TILE,
         });
+    }
+
+    #[test]
+    fn visible_tiles_covers_exactly_the_grid_from_the_current_origin() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        // A 256x256 viewport -> grid = (2, 2), same math
+        // `toroidal_addressing_uploads_only_the_newly_exposed_column`
+        // below already establishes.
+        let residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        let tiles: Vec<TileId> = residency.visible_tiles().collect();
+        assert_eq!(
+            tiles,
+            vec![
+                TileId { x: 0, y: 0 },
+                TileId { x: 1, y: 0 },
+                TileId { x: 0, y: 1 },
+                TileId { x: 1, y: 1 },
+            ],
+            "row-major from the origin, matching sync's own iteration order"
+        );
+    }
+
+    #[test]
+    fn visible_tiles_shifts_with_the_origin() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        residency.set_origin(context.queue(), TileId { x: 5, y: 3 }, (256, 256), 1.0);
+        let tiles: Vec<TileId> = residency.visible_tiles().collect();
+        assert_eq!(
+            tiles,
+            vec![
+                TileId { x: 5, y: 3 },
+                TileId { x: 6, y: 3 },
+                TileId { x: 5, y: 4 },
+                TileId { x: 6, y: 4 },
+            ]
+        );
     }
 
     #[test]
