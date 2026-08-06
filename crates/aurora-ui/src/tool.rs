@@ -12,17 +12,12 @@
 //! already draw. Zoom and Pan are pure view-transform operations
 //! ([`crate::CanvasView`] itself) and need nothing from this module
 //! beyond the enum variant. Marquee Select needs [`marquee_rect`], real
-//! and tested here. `Brush`/`Eraser`/`Move` are real too, but their
-//! actual work (`aurora_brush::stamp_dab`/`erase_dab`,
-//! `aurora_doc::LayerTree::set_bounds`) needs a live
-//! `aurora_tile::TileStore`/`LayerTree` this crate has no reason to own
-//! — that lives in `aurora-app`, the one place a live document and a
-//! live store both exist. **Eyedropper is not wired to anything yet**:
-//! it needs to sample a real pixel, which is real now
-//! (`aurora_tile::TileStore`, ADR 0010) but has no sampling function
-//! built yet. It's a real, selectable tool variant — so a user (or
-//! test) can switch to it — but its pointer handling is deliberately a
-//! no-op today, not a faked partial behaviour.
+//! and tested here. Every other variant is real too, but its actual
+//! work (`aurora_brush::stamp_dab`/`erase_dab`,
+//! `aurora_doc::LayerTree::set_bounds`, sampling a pixel for Eyedropper)
+//! needs a live `aurora_tile::TileStore`/`LayerTree` this crate has no
+//! reason to own — that lives in `aurora-app`, the one place a live
+//! document and a live store both exist.
 
 use aurora_core::Rect;
 
@@ -51,9 +46,11 @@ pub enum Tool {
     /// Pans [`crate::CanvasView`] by a drag — real, via
     /// [`crate::CanvasView::pan_by`].
     Pan,
-    /// Samples a pixel's colour. **Not wired yet** — see this module's
-    /// own doc comment (no sampling function built on top of
-    /// `aurora_tile::TileStore` yet).
+    /// Samples a pixel's colour — real, via `aurora-app`'s own
+    /// `sample_pixel` against the active layer's live
+    /// `aurora_tile::TileStore` surface, setting it as the new colour
+    /// `Brush` paints with. See this module's own doc comment for why
+    /// the actual sampling lives there, not here.
     Eyedropper,
     /// Paints — real, via `aurora_brush::stamp_dab`/`stamp_stroke`
     /// against `aurora-app`'s own live `aurora_tile::TileStore` and

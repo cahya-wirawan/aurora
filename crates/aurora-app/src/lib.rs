@@ -149,13 +149,19 @@
 //! every layer built until Move existed) — it now subtracts the active
 //! layer's own bounds offset before converting a document-space point
 //! into a surface-local tile, the same conversion `layer_local_point`
-//! already does for painting. Eyedropper remains a real, selectable,
-//! inert tool (no colour-sampling function built on `tile_store` yet);
-//! undo-as-you-drag is separate, still-open follow-on work (Move, like
-//! Brush/Eraser, bypasses `History` entirely — there is no live
-//! `History` on `App` to record through yet). See `aurora_ui::tool`'s
-//! own doc comment and this module's "brush painting"/"layer
-//! selection" sections for the full reasoning.
+//! already does for painting. **Eyedropper finished the same week**:
+//! `sample_pixel` reads one texel straight out of the active layer's
+//! own tile store surface (`TileStore::get`, no interpolation), and
+//! `App::sample_eyedropper` sets it as `current_colour` — what `Brush`
+//! now actually paints with, replacing what used to be a fixed
+//! constant — as long as the sampled texel is actually painted (alpha
+//! `> 0.0`; a fully transparent one, painted-then-erased or never
+//! touched, has nothing meaningful to pick). Every M1.9 "basic tools"
+//! variant is real now. Undo-as-you-drag is separate, still-open
+//! follow-on work (Move/Eyedropper, like Brush/Eraser, bypass `History`
+//! entirely — there is no live `History` on `App` to record through
+//! yet). See `aurora_ui::tool`'s own doc comment and this module's
+//! "brush painting"/"layer selection" sections for the full reasoning.
 //!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
@@ -742,11 +748,8 @@ fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
         ("Ctrl+Shift+P", AppCommand::ToggleCommandPalette),
         // Tool-switch letters match Photoshop's own single-key bindings
         // (no modifier) -- the same convention this project's target
-        // users already carry in muscle memory. Bound even for
-        // Eyedropper, which doesn't do anything yet once selected (see
-        // `aurora_ui::tool`'s own doc comment) -- switching *to* it is
-        // still real, honest behaviour; only its own pointer handling is
-        // the still-open part.
+        // users already carry in muscle memory. Every tool here does
+        // something real once selected now.
         ("v", AppCommand::SelectTool(aurora_ui::Tool::Move)),
         ("m", AppCommand::SelectTool(aurora_ui::Tool::MarqueeSelect)),
         ("z", AppCommand::SelectTool(aurora_ui::Tool::Zoom)),
@@ -1344,10 +1347,10 @@ fn logical_size(physical: (u32, u32), scale_factor: f64) -> (f32, f32) {
 //
 // Move gained real pointer handling later the same week (`Drag::Move`,
 // below) once `aurora_doc::LayerTree::set_bounds` gave the document
-// model somewhere for a reposition to actually land. Eyedropper is
-// still a real, selectable `aurora_ui::Tool` variant with no pointer
-// handling — the same blocker its own enum doc comment names, not a
-// gap introduced by this section.
+// model somewhere for a reposition to actually land. Eyedropper
+// followed the same week (`Drag::Eyedropper`, `sample_pixel`,
+// `App::sample_eyedropper`) — every tool this bullet named now has real
+// pointer handling.
 
 /// One user-visible pointer button, decoupled from `winit::event::
 /// MouseButton` — the same "pure dispatch logic, isolate the real
@@ -1445,6 +1448,11 @@ fn pointer_in_canvas(
 /// applies it to the document (`App::apply_move`) — the same
 /// "`continue_drag` stays pure, `App` does the one real mutation" split
 /// `Brush`/`Eraser` already use for painting.
+///
+/// `Eyedropper` carries no fields at all: unlike every other drag here,
+/// sampling a pixel needs no state carried between events (no carry, no
+/// start point, nothing) — each event just samples wherever the
+/// pointer currently is, independent of the last one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Drag {
     Pan {
@@ -1467,6 +1475,7 @@ enum Drag {
         start_bounds: aurora_core::Rect,
         current_bounds: aurora_core::Rect,
     },
+    Eyedropper,
 }
 
 /// Starts a drag for `tool`/`button` at `canvas_point` (already
@@ -1476,17 +1485,18 @@ enum Drag {
 /// convention professional raster editors already use as a universal
 /// pan gesture.
 ///
-/// `Brush`/`Eraser` start unconditionally on a primary click, regardless
-/// of whether there's actually anywhere to paint/erase (a live store, an
-/// active layer) — that check happens where the real pixel work does
-/// (`App::paint_dab`/`App::erase_dab`), keeping this function pure and
-/// not needing to know about either. `Move` is the one drag that *does*
-/// need to know up front — repositioning needs a real pixel layer to
-/// reposition, and `start_bounds` has to be that layer's bounds at this
-/// exact moment, not looked up later — so it takes `active_pixel_layer`
-/// (`None` for no active layer, an active layer that's a group, or no
-/// active layer at all: [`active_pixel_layer`]) and starts nothing if
-/// that's `None`.
+/// `Brush`/`Eraser`/`Eyedropper` start unconditionally on a primary
+/// click, regardless of whether there's actually anywhere to
+/// paint/erase/sample (a live store, an active layer) — that check
+/// happens where the real pixel work does
+/// (`App::paint_dab`/`App::erase_dab`/`App::sample_eyedropper`),
+/// keeping this function pure and not needing to know about either.
+/// `Move` is the one drag that *does* need to know up front —
+/// repositioning needs a real pixel layer to reposition, and
+/// `start_bounds` has to be that layer's bounds at this exact moment,
+/// not looked up later — so it takes `active_pixel_layer` (`None` for
+/// no active layer, an active layer that's a group, or no active layer
+/// at all: [`active_pixel_layer`]) and starts nothing if that's `None`.
 #[must_use]
 fn begin_drag(
     tool: aurora_ui::Tool,
@@ -1521,6 +1531,7 @@ fn begin_drag(
                 current_bounds: bounds,
             })
         }
+        (aurora_ui::Tool::Eyedropper, PointerButton::Primary) => Some(Drag::Eyedropper),
         _ => None,
     }
 }
@@ -1554,7 +1565,10 @@ fn begin_drag(
 /// caller reads `current_bounds` back out of `drag` afterward and
 /// applies it to the document (`App::apply_move`), the same "update a
 /// field in place, caller does the one real mutation" shape `Pan`'s own
-/// `last_screen` already uses.
+/// `last_screen` already uses. `Eyedropper` has nothing at all to
+/// update (it carries no state — see [`Drag`]'s own doc comment) and
+/// always returns an empty `Vec` too; the caller samples directly at
+/// `canvas_point` itself (`App::sample_eyedropper`).
 #[must_use]
 fn continue_drag(
     drag: &mut Drag,
@@ -1607,6 +1621,10 @@ fn continue_drag(
             *current_bounds = shift_bounds(*start_bounds, delta);
             Vec::new()
         }
+        // Nothing to update in place (see `Drag::Eyedropper`'s own doc
+        // comment) -- the caller (`App::handle_pointer_moved`) samples
+        // directly at `canvas_point` itself once this returns.
+        Drag::Eyedropper => Vec::new(),
     }
 }
 
@@ -1824,12 +1842,57 @@ fn layer_local_point(bounds: aurora_core::Rect, doc_point: (f32, f32)) -> (f32, 
     (doc_point.0 - bounds.x as f32, doc_point.1 - bounds.y as f32)
 }
 
-/// The Brush tool's fixed radius and colour — real defaults, not a
-/// placeholder, but not a considered one either: there is no brush
-/// options UI yet (size/colour picker, real engine, Phase 2 per
-/// PLAN.md's own "(real engine is Phase 2)" framing on this bullet).
+/// Reads the straight RGBA sample at `local_point` (surface-local space
+/// — the same space [`layer_local_point`] produces) from `store`'s
+/// `surface`, one texel, no interpolation — what the Eyedropper tool
+/// needs to pick a real, already-painted colour. `None` for a negative
+/// coordinate (`TileId`'s own fields are unsigned, so there is no tile
+/// there — the same "outside the surface" case
+/// [`tile_origin_for_view`]'s own doc comment names) or if paging the
+/// touched tile in fails.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// x/y/r/g/b/a are the clearest names for "one pixel coordinate, one
+// RGBA sample" -- spelling any of them out would be noise, not clarity.
+#[allow(clippy::many_single_char_names)]
+fn sample_pixel(
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    local_point: (f32, f32),
+) -> Option<[f32; 4]> {
+    let (x, y) = local_point;
+    if x < 0.0 || y < 0.0 {
+        return None;
+    }
+    let (px, py) = (x as u32, y as u32);
+    let tile_id = aurora_tile::TileId {
+        x: px / aurora_tile::TILE,
+        y: py / aurora_tile::TILE,
+    };
+    let tile = store.get(surface, tile_id).ok()?;
+    let (lx, ly) = (px % aurora_tile::TILE, py % aurora_tile::TILE);
+    let index = (ly * aurora_tile::TILE + lx) as usize * aurora_tile::CHANNELS;
+    let texels = tile.texels();
+    let r = texels.get(index)?.to_f32();
+    let g = texels.get(index + 1)?.to_f32();
+    let b = texels.get(index + 2)?.to_f32();
+    let a = texels.get(index + 3)?.to_f32();
+    Some([r, g, b, a])
+}
+
+/// The Brush tool's fixed radius — a real default, not a placeholder,
+/// but not a considered one either: there is no brush options UI yet
+/// (size picker, real engine, Phase 2 per PLAN.md's own "(real engine
+/// is Phase 2)" framing on this bullet).
 const BRUSH_RADIUS: f32 = 24.0;
-const BRUSH_COLOUR: [f32; 3] = [0.0, 0.0, 0.0];
+
+/// [`App::current_colour`]'s own starting value — black, since there is
+/// no colour-picker UI yet to set it any other way at startup. Real
+/// after that: the Eyedropper tool changes it to whatever's actually
+/// sampled, and every `Brush` dab paints with whatever it currently is,
+/// not this constant directly (unlike [`BRUSH_RADIUS`]/[`ERASER_RADIUS`],
+/// which stay fixed).
+const DEFAULT_COLOUR: [f32; 3] = [0.0, 0.0, 0.0];
 
 /// The Eraser tool's fixed radius — same reasoning and same value as
 /// [`BRUSH_RADIUS`] (no options UI yet), kept as its own named constant
@@ -2014,10 +2077,10 @@ struct App {
     /// The real native file picker — [`FileDialogAccess`]'s real
     /// implementation, used by [`COMMAND_FILE_OPEN`].
     file_dialog: SystemFileDialog,
-    /// PLAN.md M1.9's "basic tools" bullet — see `aurora_ui::tool`'s own
-    /// doc comment for exactly which of the seven named tools (Move,
-    /// Marquee Select, Zoom, Pan, Eyedropper, Brush, Eraser) actually do
-    /// anything yet.
+    /// PLAN.md M1.9's "basic tools" bullet — all seven variants (Move,
+    /// Marquee Select, Zoom, Pan, Eyedropper, Brush, Eraser) do
+    /// something real once selected; see `aurora_ui::tool`'s own doc
+    /// comment for the detail.
     tool: aurora_ui::Tool,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]) —
     /// deliberately not tied to `layers` (see that field's own doc
@@ -2048,6 +2111,11 @@ struct App {
     /// into `layer_rows` at all, so this can't actually happen via a
     /// click — only via never having a pixel layer to begin with).
     active_layer: Option<aurora_doc::LayerId>,
+    /// The colour `Brush` paints with — [`DEFAULT_COLOUR`] until the
+    /// Eyedropper tool samples a real pixel and changes it
+    /// ([`Self::sample_eyedropper`]). No colour-picker UI exists yet to
+    /// set it any other way.
+    current_colour: [f32; 3],
     /// Every Layers-panel row's own `WidgetId`, mapped to the `LayerId`
     /// it represents (`aurora_ui::populate_layers_panel`'s own return
     /// value) — what [`Self::handle_pointer_pressed`] looks a
@@ -2179,6 +2247,7 @@ impl App {
             selection: aurora_doc::SelectionSet::new(),
             layers,
             active_layer,
+            current_colour: DEFAULT_COLOUR,
             layer_rows,
             tile_store,
             residency: None,
@@ -2378,7 +2447,11 @@ impl App {
     /// just-updated `current_bounds` to the document
     /// ([`Self::apply_move`]) instead — the "read the field
     /// `continue_drag` just updated, then do the one real mutation"
-    /// half of the split that function's own doc comment describes.
+    /// half of the split that function's own doc comment describes. For
+    /// `Drag::Eyedropper`, samples directly at the current point
+    /// ([`Self::sample_eyedropper`]) every event, so dragging with the
+    /// Eyedropper tool held down updates `current_colour` live, the
+    /// same as a real image editor's own eyedropper.
     fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
@@ -2401,23 +2474,28 @@ impl App {
                 }
             }
         }
-        if let Some(Drag::Move {
-            layer_id,
-            current_bounds,
-            ..
-        }) = self.drag
-        {
-            self.apply_move(layer_id, current_bounds);
+        match self.drag {
+            Some(Drag::Move {
+                layer_id,
+                current_bounds,
+                ..
+            }) => self.apply_move(layer_id, current_bounds),
+            Some(Drag::Eyedropper) => {
+                let doc_point = self.canvas_view.to_document(canvas_point);
+                self.sample_eyedropper(doc_point);
+            }
+            _ => {}
         }
     }
 
     /// A real `WindowEvent::MouseInput { state: Pressed, .. }`: either
     /// performs the active Zoom tool's click-to-zoom
     /// ([`handle_zoom_tool_click`]), or starts a drag ([`begin_drag`]) —
-    /// never both for the same press. A fresh `Brush`/`Eraser` drag
-    /// paints/erases its own starting point immediately
-    /// ([`Self::paint_dab`]/[`Self::erase_dab`]), so a plain click (no
-    /// drag at all) still does something.
+    /// never both for the same press. A fresh `Brush`/`Eraser`/
+    /// `Eyedropper` drag paints/erases/samples its own starting point
+    /// immediately
+    /// ([`Self::paint_dab`]/[`Self::erase_dab`]/[`Self::sample_eyedropper`]),
+    /// so a plain click (no drag at all) still does something.
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
         let Some(button) = translate_pointer_button(button) else {
             return;
@@ -2462,6 +2540,10 @@ impl App {
         match self.drag {
             Some(Drag::Brush { last_doc, .. }) => self.paint_dab(last_doc),
             Some(Drag::Eraser { last_doc, .. }) => self.erase_dab(last_doc),
+            Some(Drag::Eyedropper) => {
+                let doc_point = self.canvas_view.to_document(canvas_point);
+                self.sample_eyedropper(doc_point);
+            }
             _ => {}
         }
     }
@@ -2492,7 +2574,8 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
-        if let Err(err) = aurora_brush::stamp_dab(store, surface, local, BRUSH_RADIUS, BRUSH_COLOUR)
+        if let Err(err) =
+            aurora_brush::stamp_dab(store, surface, local, BRUSH_RADIUS, self.current_colour)
         {
             tracing::warn!(?err, "failed to stamp a brush dab");
         }
@@ -2540,6 +2623,41 @@ impl App {
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
         if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
             tracing::warn!(?err, "failed to reposition the active layer");
+        }
+    }
+
+    /// Samples the active layer's own pixel at `doc_point` (document
+    /// space) and, if it's actually painted (alpha `> 0.0`), sets it as
+    /// the new [`Self::current_colour`] — what the Eyedropper tool does
+    /// on a click or while dragging. A fully transparent texel (never
+    /// painted, or painted then erased down to nothing — `Self::erase_dab`
+    /// leaves RGB untouched even at zero alpha) is treated as "nothing
+    /// to pick," not a valid sample, the same way a real image editor's
+    /// eyedropper has nothing meaningful to pick from empty canvas. A
+    /// silent no-op if there's no live store, no active layer, that
+    /// layer isn't a pixel layer, or `doc_point` falls outside the
+    /// surface entirely — the same absent-precondition honesty
+    /// [`Self::paint_dab`] already uses.
+    fn sample_eyedropper(&mut self, doc_point: (f32, f32)) {
+        let Some(layer_id) = self.active_layer else {
+            return;
+        };
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
+        else {
+            return;
+        };
+        let Some(surface) = self.layers.surface_id(layer_id) else {
+            return;
+        };
+        let Some(store) = self.tile_store.as_mut() else {
+            return;
+        };
+        let local = layer_local_point(bounds, doc_point);
+        let Some([r, g, b, a]) = sample_pixel(store, surface, local) else {
+            return;
+        };
+        if a > 0.0 {
+            self.current_colour = [r, g, b];
         }
     }
 
@@ -2974,10 +3092,10 @@ mod tests {
         handle_palette_key, handle_zoom_tool_click, layer_local_point, load_background_color,
         load_scales, logical_point, logical_size, open_command_palette, open_crash_recovery_dialog,
         open_image, open_tile_store, pointer_in_canvas, previous_session_left_a_marker,
-        recover_document, replace_document, run_command, select_layer, tile_origin_for_view,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, write_autosave, write_session_marker,
-        write_verified, zoom_steps_for_scroll,
+        recover_document, replace_document, run_command, sample_pixel, select_layer,
+        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
+        translate_key, translate_modifiers, translate_pointer_button, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -4351,6 +4469,59 @@ mod tests {
         assert_eq!(layer_local_point(bounds, (5.0, 7.0)), (5.0, 7.0));
     }
 
+    fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(16) else {
+            unreachable!("16 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+        (dir, store)
+    }
+
+    #[test]
+    fn sample_pixel_reads_back_a_real_stamped_dab() {
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        if let Err(err) =
+            aurora_brush::stamp_dab(&mut store, surface, (10.5, 10.5), 20.0, [1.0, 0.0, 0.0])
+        {
+            unreachable!("{err:?}");
+        }
+        let Some([r, g, b, a]) = sample_pixel(&mut store, surface, (10.5, 10.5)) else {
+            unreachable!("a dab was just stamped exactly here");
+        };
+        assert!(r > 0.9, "red channel should be near-opaque red: {r}");
+        assert!(g < 0.1, "{g}");
+        assert!(b < 0.1, "{b}");
+        assert!(a > 0.9, "{a}");
+    }
+
+    #[test]
+    fn sample_pixel_of_an_untouched_surface_reads_transparent() {
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        assert_eq!(
+            sample_pixel(&mut store, surface, (5.0, 5.0)),
+            Some([0.0, 0.0, 0.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn sample_pixel_returns_none_for_negative_coordinates() {
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        assert_eq!(sample_pixel(&mut store, surface, (-1.0, 5.0)), None);
+        assert_eq!(sample_pixel(&mut store, surface, (5.0, -1.0)), None);
+    }
+
     #[test]
     fn recovering_a_missing_autosave_returns_none() {
         let dir = match tempfile::tempdir() {
@@ -4780,7 +4951,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_drag_with_eyedropper_tool_and_primary_button_does_nothing() {
+    fn begin_drag_with_eyedropper_tool_and_primary_button_starts_an_eyedropper_drag() {
         let view = CanvasView::new();
         assert_eq!(
             begin_drag(
@@ -4790,7 +4961,7 @@ mod tests {
                 &view,
                 None
             ),
-            None
+            Some(Drag::Eyedropper)
         );
     }
 
@@ -5038,6 +5209,20 @@ mod tests {
             },
             "must shift start_bounds by the same delta the pointer travelled"
         );
+    }
+
+    #[test]
+    fn continue_drag_eyedropper_returns_no_dabs_and_updates_nothing() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Eyedropper;
+        let dabs = continue_drag(&mut drag, (15.0, -8.0), &mut view, &mut selection);
+        assert_eq!(
+            dabs,
+            Vec::new(),
+            "Eyedropper must never produce dabs to paint"
+        );
+        assert_eq!(drag, Drag::Eyedropper, "carries no state to update");
     }
 
     #[test]
