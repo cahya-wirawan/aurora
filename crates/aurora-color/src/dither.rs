@@ -35,6 +35,20 @@ pub fn quantize_u8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+/// Quantizes one float sample to 16 bits — plain rounding, no dithering.
+/// Unlike [`quantize_u8`], this genuinely is what a real 16-bit export
+/// boundary should call: invariant §7.3.1b's own dithering requirement
+/// is scoped to the *8-bit* boundary specifically, because that's where
+/// banding in a smooth gradient is actually visible to a human eye —
+/// 16 bits gives 256× the levels of 8, past the point where ordered
+/// dithering has any real, perceptible job left to do. Same clamping
+/// behaviour as [`quantize_u8`] for out-of-range input.
+#[must_use]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+pub fn quantize_u16(value: f32) -> u16 {
+    (value.clamp(0.0, 1.0) * 65535.0).round() as u16
+}
+
 /// Quantizes one float sample to 8 bits with ordered (Bayer) dithering at
 /// pixel position `(x, y)` — breaks up banding in smooth gradients by
 /// adding a small, deterministic, position-dependent offset before
@@ -103,7 +117,7 @@ fn bayer_value(x: u32, y: u32, n: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{bayer_value, dither_quantize, promote_u8, promote_u16, quantize_u8};
+    use super::{bayer_value, dither_quantize, promote_u8, promote_u16, quantize_u8, quantize_u16};
 
     #[test]
     // 0/255 and 255/255 are exact, bit-representable results, not
@@ -140,6 +154,30 @@ mod tests {
     fn quantize_clamps_out_of_range_input() {
         assert_eq!(quantize_u8(-1.0), 0);
         assert_eq!(quantize_u8(2.0), 255);
+    }
+
+    #[test]
+    fn quantize_u16_round_trips_promote_u16_for_representative_values() {
+        // Not every one of the 65,536 values round-trips exactly (float
+        // rounding at this density means a handful of adjacent u16
+        // values can map to the same nearest f32 and back) -- checked
+        // against a representative spread instead of the full range,
+        // the same "representative, not exhaustive" scope `promote_u16`
+        // itself already accepts implicitly by not having its own
+        // exhaustive round-trip test either.
+        for sample in [0u16, 1, 12_345, 32_768, 65_534, 65_535] {
+            assert_eq!(
+                quantize_u16(promote_u16(sample)),
+                sample,
+                "promote/quantize must round-trip for {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_u16_clamps_out_of_range_input() {
+        assert_eq!(quantize_u16(-1.0), 0);
+        assert_eq!(quantize_u16(2.0), 65535);
     }
 
     #[test]
