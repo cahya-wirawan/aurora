@@ -35,4 +35,10 @@ pub enum WidgetError {
     /// toggle, drag) a widget whose own state marks it disabled.
     #[error("widget {0:?} is disabled")]
     WidgetDisabled(WidgetId),
+    /// [`crate::paint_widget`] failed to tessellate a widget's own paint
+    /// geometry into a `Mesh`. In practice unreachable from this crate's
+    /// own callers today: `rounded_rect`'s own cubic-Bézier output never
+    /// triggers a `lyon` tessellation failure in this module's tests.
+    #[error("failed to tessellate a widget's own paint geometry: {0}")]
+    Paint(#[source] aurora_vector::VectorError),
 }

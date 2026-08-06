@@ -38,12 +38,14 @@
 //! already produces a real `Mesh` this pipeline can draw exactly the
 //! same way a fill's `Mesh` is drawn — nothing here is fill-specific —
 //! but that combination isn't exercised by this module's own tests
-//! yet. No real widget actually produces a `Mesh` to draw yet — every
-//! widget still emits layout + accessibility content only
-//! (`aurora_widgets`' own crate-level doc comment) — wiring a widget's
-//! own paint (a rounded-rect background, say) through this pipeline,
-//! and the golden-image component gallery testing that unblocks, are
-//! both separate, still-open follow-on work.
+//! yet. [`crate::paint_widget`] (added 2026-08-06) is the first real
+//! widget-to-`Mesh` path — `Button`'s own solid rounded-rect background
+//! — but it stops at producing a `(Mesh, [f32; 4])`; nothing in this
+//! crate yet drives a real per-frame render pass that calls
+//! `paint_widget` for every widget in a tree and feeds the results
+//! through this pipeline (an `aurora-app` integration piece), and the
+//! golden-image component gallery testing that unblocks is still
+//! separate, still-open follow-on work.
 
 use aurora_gpu::{Blend, PipelineCache, PipelineKey};
 use aurora_vector::Mesh;

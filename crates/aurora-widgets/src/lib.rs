@@ -48,11 +48,20 @@
 //! "headless CI still runs everything, real hardware exercises the
 //! rest" shape every other `wgpu`-touching crate in this workspace
 //! already uses — not a new exception, the same rule applied here for
-//! the first time. No real widget produces a `Mesh` to hand `render`
-//! yet; see that module's own doc comment for exactly what's still open.
+//! the first time.
+//!
+//! [`paint_widget`] (added 2026-08-06) is the piece `render`'s own doc
+//! comment named as still open: the first real widget-to-`Mesh` path,
+//! covering `Button`'s own solid rounded-rect background, coloured from
+//! a real, resolved `aurora_theme::Theme` (invariant §7.3.10) rather
+//! than a literal. Every other widget still paints nothing — see
+//! [`paint_widget`]'s own doc comment for exactly which and why. The
+//! golden-image component gallery this unblocks is still separate,
+//! still-open follow-on work.
 
 mod error;
 mod input;
+mod paint;
 pub mod render;
 #[cfg(test)]
 mod render_test;
@@ -63,6 +72,7 @@ pub mod widgets;
 
 pub use error::WidgetError;
 pub use input::{FocusManager, hit_test};
+pub use paint::{Paint, paint_widget};
 pub use render::{GpuMesh, PathPipeline};
 pub use shortcut::{KeyChord, Modifiers as ShortcutModifiers, ShortcutRegistry};
 pub use tree::{WidgetId, WidgetTree};
