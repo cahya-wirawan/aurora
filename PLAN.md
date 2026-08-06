@@ -3717,7 +3717,50 @@ check licenses` clean with the new `toml` dependency.
   2.4.3/4.1.2) — not just "a screen reader announces something."
 - [ ] IME audit passes on all three platforms
 - [ ] 60 FPS at the Phase 0 document size
-- [ ] Brush latency regression test green in CI
+- [x] **Brush latency regression test green in CI** — this checklist
+  line itself was stale, not the underlying work: §0.2 already tracks
+  a real, CI-gated pair of latency regression tests, done 2026-08-02
+  (`aurora-tile`'s `paint_and_dirty_round_trip_stays_within_a_tight_cpu_budget`
+  for the CPU tile-write half, `aurora-render`'s
+  `upload_and_composite_one_dirtied_tile_stays_within_a_generous_ci_budget`
+  for the GPU upload+composite half) — this M1.10 line just never got
+  checked off or cross-referenced to that entry. Found this only after
+  writing a third test below under the mistaken impression the gap was
+  still fully open; caught before the misleading PLAN.md framing shipped,
+  worth naming directly rather than quietly editing around it.
+
+  What the two existing tests measure is real, but neither calls
+  `aurora_brush::stamp_dab` itself: `aurora-tile`'s writes a synthetic
+  48×48 square region, not the real circular-falloff dab shape
+  (`dab.rs`'s alpha computation, `stamp.rs`'s max-alpha-accumulation
+  blend) — a distinct hot path that could regress independently (e.g.
+  a more expensive per-pixel falloff) without either existing test
+  noticing. New `stamp_dab_latency_stays_within_a_generous_ci_safe_budget`
+  (`aurora-brush`) closes that specific, real gap: 200 timed
+  `stamp_dab` calls at a 24 px radius (`aurora-app`'s own
+  `BRUSH_RADIUS`/`ERASER_RADIUS`) against an already-resident tile
+  (warmed up first, so page-in cost doesn't leak in), p99 asserted
+  under a 20 ms budget — generous by the same reasoning the two
+  existing tests already established (nowhere near the low-microsecond
+  reality, wide enough to absorb a slow, shared, three-OS-matrix CI
+  runner without flaking, still a real trip-wire for an algorithmic
+  regression). 1 new test (38 `aurora-brush` tests, was 37).
+
+  Verified: `cargo fmt --all --check`, `cargo clippy -p aurora-brush
+  --all-targets --all-features -- -D warnings`, `cargo clippy
+  --workspace --all-targets --all-features -- -D warnings`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc -p aurora-brush --no-deps
+  --all-features`, `cargo test --workspace` (0 failures across every
+  crate), `cargo deny check all` — all clean. No new dependencies.
+
+  **Stated honestly**: all three tests together are still a CPU-hot-path
+  proxy plus a GPU-submission proxy, not a recreation of the spike's own
+  "input → frame submitted" figure — a true end-to-end regression test
+  needs a real frame/present loop in `aurora-app` (gated behind a real
+  adapter the way its own `real_gpu_context()` tests already are) and is
+  separate, still-open
+  follow-on work if the margin ever needs re-checking against real
+  frame submission again, not just the CPU stamp itself.
 - [ ] Component gallery complete, contrast checks green
 
 ---
