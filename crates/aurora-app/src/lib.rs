@@ -222,6 +222,21 @@
 //! while zoomed out or panning (`spike/FINDINGS.md`'s own progressive-
 //! rendering finding), rotation, rulers, guides, grid, and snap all
 //! remain this bullet's own still-open remainder.
+//!
+//! **A real bug fixed, 2026-08-06**: real hardware (macOS) reported
+//! ~100% CPU at idle. `about_to_wait` was requesting a redraw
+//! unconditionally on *every* event-loop iteration, including the
+//! iteration its own previous request had just woken — a self-
+//! sustaining loop that defeated `ControlFlow::Wait` entirely, and got
+//! measurably worse the same day multi-layer compositing gave every
+//! redraw real per-tile CPU work to do. Fixed with a `needs_redraw`
+//! flag, set on real `WindowEvent`s and cleared once a redraw is
+//! actually requested for them — see that field's own doc comment.
+//! macOS still needs *some* periodic wakeup (muda's own menu-event
+//! channel has no event-loop integration to interrupt a true `Wait`),
+//! now scoped to a short `ControlFlow::WaitUntil` poll instead of a
+//! permanent busy loop; non-macOS stays on plain, fully blocking
+//! `Wait`.
 //! Not yet real-hardware-verified (this sandbox has no display server;
 //! real GPU tests pass here, but nothing has shown this crate's own
 //! window on an actual screen since M1.8's original human-verification
@@ -2482,6 +2497,17 @@ struct App {
     /// it from the ordinary, successful case of the user closing the
     /// window.
     failed: bool,
+    /// Whether the next [`Self::about_to_wait`] should actually request a
+    /// redraw — set on every real `WindowEvent` other than
+    /// `RedrawRequested` itself, cleared once a redraw has been
+    /// requested for it. Without this, `about_to_wait` requesting a
+    /// redraw unconditionally on *every* loop iteration (including the
+    /// iteration its own previous request just woke) turns
+    /// `ControlFlow::Wait` into a permanent busy loop — real, measured
+    /// 100% CPU on real hardware, not `ControlFlow::Wait`'s intended
+    /// "block until something changes." Starts `true` so the window's
+    /// very first frame actually paints.
+    needs_redraw: bool,
 }
 
 impl App {
@@ -2574,6 +2600,7 @@ impl App {
             menu: build_menu(),
             background,
             failed: false,
+            needs_redraw: true,
         }
     }
 
@@ -3316,6 +3343,14 @@ impl App {
     }
 }
 
+/// How often [`App::about_to_wait`] re-checks muda's own menu-event
+/// channel on macOS — see that method's own doc comment. Short enough
+/// that a menu click feels instant to a human (who just consciously
+/// clicked something), long enough to spend negligible CPU polling an
+/// empty channel the rest of the time.
+#[cfg(target_os = "macos")]
+const MUDA_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl ApplicationHandler<accesskit_winit::Event> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -3418,6 +3453,18 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             adapter.process_event(window, &event);
         }
 
+        // Every real event other than `RedrawRequested` itself might
+        // change what the next frame should show (a moved cursor, a
+        // resize, a keystroke, ...) — coarse (any event, not just ones
+        // that actually touched pixels) but correct and cheap, and
+        // exactly what keeps `about_to_wait` from ever needing to guess.
+        // `RedrawRequested` is excluded so handling one doesn't
+        // immediately ask for another — see `needs_redraw`'s own doc
+        // comment for why that distinction is the whole fix.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            self.needs_redraw = true;
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 // A clean shutdown -- clear this run's own marker so the
@@ -3478,20 +3525,46 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+    // `el` is only used to re-arm the poll timer on macOS (below) --
+    // unused on every other platform, which stays on the plain `Wait`
+    // set once in `run`.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         // muda's own events arrive on a plain channel, not through this
         // crate's `accesskit_winit::Event` user-event type (the two
         // don't share one enum -- restructuring the accessibility
         // integration around a combined event type is a bigger, separate
         // change) -- polled here since `about_to_wait` already runs on
-        // every loop iteration.
+        // every loop iteration. Real `winit` `WindowEvent`s never arrive
+        // for a native menu action, so `needs_redraw` alone can't catch
+        // one -- set explicitly here instead, for the same reason
+        // `window_event` sets it for every other real input.
         #[cfg(target_os = "macos")]
-        while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
-            self.handle_menu_event(&event);
+        {
+            while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+                self.handle_menu_event(&event);
+                self.needs_redraw = true;
+            }
+            // `ControlFlow::Wait` (set once in `run`) would otherwise
+            // block indefinitely, and muda's channel has no event-loop
+            // wakeup of its own to interrupt that wait -- so macOS
+            // alone re-polls on a short timer instead, the cost of
+            // catching a menu click promptly without the unconditional
+            // per-frame `request_redraw` this whole mechanism used to
+            // rely on (and which pegged a full CPU core doing it, since
+            // it never let the loop go idle at all -- see
+            // `needs_redraw`'s own doc comment). Non-macOS has no
+            // channel to poll and stays on plain, fully blocking `Wait`.
+            el.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + MUDA_POLL_INTERVAL,
+            ));
         }
 
-        if let Some(window) = self.window.as_ref() {
+        if self.needs_redraw
+            && let Some(window) = self.window.as_ref()
+        {
             window.request_redraw();
+            self.needs_redraw = false;
         }
     }
 }
