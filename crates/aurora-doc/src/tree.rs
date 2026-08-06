@@ -673,6 +673,35 @@ impl LayerTree {
             LayerKind::Pixel { .. } => None,
         }
     }
+
+    /// The root-level pixel layers a compositor should actually draw,
+    /// bottom-to-top (paint order — later entries draw over earlier
+    /// ones): [`Self::roots`] reversed (it's top-to-bottom, matching how
+    /// `add_pixel_layer`/`add_group` always insert as the new topmost
+    /// root), filtered to [`LayerKind::Pixel`] entries whose own
+    /// `visible` flag is `true`. A hidden or non-pixel root is skipped
+    /// entirely, not composited at reduced strength — visibility is
+    /// binary, matching `set_visible`'s own semantics.
+    ///
+    /// **Scope, stated honestly**: groups are never recursed into — a
+    /// layer nested inside one, visible or not, simply never appears
+    /// here, the same real, named gap this crate's own private
+    /// `layer_dirty_rect` helper (`history.rs`) already has for groups
+    /// (no subtree-bounds/effective-visibility aggregation exists yet).
+    /// This makes the method's own name honest about groups today: it
+    /// names *root* paint order, not the whole tree's.
+    #[must_use]
+    pub fn paint_order(&self) -> Vec<LayerId> {
+        self.roots
+            .iter()
+            .rev()
+            .copied()
+            .filter(|&id| {
+                matches!(self.kind(id), Some(LayerKind::Pixel { .. }))
+                    && self.visible(id) == Some(true)
+            })
+            .collect()
+    }
 }
 
 impl Default for LayerTree {
@@ -844,6 +873,79 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_ne!(tree.surface_id(a), tree.surface_id(b));
+    }
+
+    #[test]
+    fn paint_order_is_bottom_to_top_the_reverse_of_roots() {
+        let mut tree = LayerTree::new();
+        let a = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match tree.add_pixel_layer("b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // roots() is top-to-bottom, newest on top: [b, a].
+        assert_eq!(tree.roots(), [b, a]);
+        assert_eq!(
+            tree.paint_order(),
+            [a, b],
+            "paint order is bottom-to-top: a first, b drawn over it"
+        );
+    }
+
+    #[test]
+    fn paint_order_skips_a_hidden_root() {
+        let mut tree = LayerTree::new();
+        let a = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match tree.add_pixel_layer("b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_visible(a, false) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.paint_order(), [b]);
+    }
+
+    #[test]
+    fn paint_order_skips_a_root_level_group() {
+        let mut tree = LayerTree::new();
+        let a = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.add_group("g", None) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.paint_order(), [a]);
+    }
+
+    #[test]
+    fn paint_order_never_includes_a_layer_nested_inside_a_group() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.add_pixel_layer("child", bounds(), Some(group)) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.paint_order(),
+            [],
+            "groups are never recursed into, per this method's own scope"
+        );
+    }
+
+    #[test]
+    fn paint_order_is_empty_for_a_fresh_tree() {
+        let tree = LayerTree::new();
+        assert_eq!(tree.paint_order(), []);
     }
 
     #[test]
