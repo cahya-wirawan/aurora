@@ -8,7 +8,15 @@
 //! [`TileCompositor`] executes the GPU half of that work: blending one
 //! tile over another via the GPU's fixed-function alpha blend unit,
 //! replacing the CPU per-pixel merge `spike/FINDINGS.md` finding #1 named
-//! as the real compositing bottleneck. Progressive rendering (finding
+//! as the real compositing bottleneck. [`composite_tile_cpu`] is its
+//! CPU-side sibling for *multi*-layer compositing: the same straight-alpha
+//! "source over" math, opacity-aware, run entirely on the CPU because the
+//! orchestration crate (`aurora-app`) needs to walk a real
+//! `aurora_doc::LayerTree` — a sibling crate this one can't depend on —
+//! per visible tile, every frame a layer changes; a real GPU-accelerated
+//! version is separate, still-open follow-on work (PLAN.md M1.9).
+//!
+//! Progressive rendering (finding
 //! #3's "render a lower-resolution mip while panning fast, refining when
 //! motion stops") has two pieces: [`mip::downsample`] box-filters a tile
 //! down to a [`mip::MipLevel`], and [`preview::upload_preview`] lands the
@@ -28,7 +36,7 @@ mod schedule;
 #[cfg(test)]
 mod test_support;
 
-pub use composite::TileCompositor;
+pub use composite::{TileCompositor, composite_tile_cpu};
 pub use executor::{Executor, TaskId};
 pub use mip::{MipLevel, downsample};
 pub use preview::{PreviewError, upload_preview};

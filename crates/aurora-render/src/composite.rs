@@ -5,9 +5,79 @@
 //! the same spike found fast). PLAN.md M1.3.
 
 use aurora_gpu::{Blend, GpuContext, PipelineCache, PipelineKey};
+use aurora_tile::{CHANNELS, SAMPLES};
+use half::f16;
 
 const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
 const LABEL: &str = "composite";
+
+/// Composites `layers` (bottom-to-top; each entry is one tile's own full
+/// [`aurora_tile::SAMPLES`]-length `f16` texel buffer, plus that layer's
+/// own opacity) via straight-alpha "source over" — the CPU-side sibling
+/// of [`TileCompositor::composite_over`]'s own GPU shader math, needed
+/// because the actual orchestration this crate can't do itself (walking
+/// a real `aurora_doc::LayerTree` to decide *which* layers, in what
+/// order, at what opacity) can't live here: `aurora-render` and
+/// `aurora-doc` are sibling crates in PRD §7.2's layering (neither
+/// depends on the other), so `aurora-app`, which depends on both, is
+/// where that walk actually happens — this is the pure per-tile math it
+/// calls once it has real layer data in hand, exactly what this
+/// module's own [`TileCompositor`] doc comment already anticipated
+/// ("the primitive real layer compositing will call once that model
+/// exists").
+///
+/// Per texel: `result_rgb = src_rgb * a + dst_rgb * (1 - a)`,
+/// `result_a = a + dst_a * (1 - a)`, where `a = src_a * opacity` — the
+/// same formula [`TileCompositor::composite_over`]'s own GPU blend unit
+/// computes (proven by that function's own
+/// `composite_over_blends_source_over_destination` test), just run on
+/// the CPU and with an opacity factor the fixed-function blend unit has
+/// no way to express. `opacity` is clamped to `0.0..=1.0`.
+///
+/// A `texels` slice whose length isn't a multiple of [`CHANNELS`] has
+/// its trailing partial texel silently dropped (`chunks_exact`) rather
+/// than erroring or panicking — real callers always pass a genuine
+/// `Tile::texels()` slice, exactly [`aurora_tile::SAMPLES`] long, so
+/// this only matters for a malformed, never-real input, and dropping a
+/// few trailing samples is a safer failure than indexing past the
+/// shorter buffer.
+///
+/// Returns a fresh, [`aurora_tile::SAMPLES`]-length buffer starting from
+/// fully transparent black — an empty `layers` composites to that,
+/// exactly matching what a document with no visible pixel layers should
+/// show.
+///
+/// **Scope, stated honestly**: Normal blend mode only — every layer
+/// composites as if `BlendMode::Normal` regardless of its own
+/// `blend_mode`, the same "first slice, full mode set is Phase 2"
+/// scoping `aurora-brush`'s own real-engine bullet already uses. This
+/// is a CPU implementation specifically because the orchestration
+/// crate (`aurora-app`) needs to run it per visible tile, per layer,
+/// every time any constituent layer changes — GPU-accelerated
+/// multi-layer compositing (reusing [`TileCompositor`] properly, with a
+/// real opacity/blend-mode-aware shader) is separate, still-open
+/// follow-on work.
+#[must_use]
+pub fn composite_tile_cpu(layers: &[(&[f16], f32)]) -> Vec<f16> {
+    let mut out = vec![f16::from_f32(0.0); SAMPLES];
+    for &(texels, opacity) in layers {
+        let opacity = opacity.clamp(0.0, 1.0);
+        for (dst, src) in out
+            .chunks_exact_mut(CHANNELS)
+            .zip(texels.chunks_exact(CHANNELS))
+        {
+            let [dr, dg, db, da] = dst else { continue };
+            let [sr, sg, sb, sa] = src else { continue };
+            let alpha = sa.to_f32() * opacity;
+            let inverse = 1.0 - alpha;
+            *dr = f16::from_f32(sr.to_f32() * alpha + dr.to_f32() * inverse);
+            *dg = f16::from_f32(sg.to_f32() * alpha + dg.to_f32() * inverse);
+            *db = f16::from_f32(sb.to_f32() * alpha + db.to_f32() * inverse);
+            *da = f16::from_f32(alpha + da.to_f32() * inverse);
+        }
+    }
+    out
+}
 
 /// Composites tile-sized `Rgba16Float` textures on the GPU. Owns its own
 /// shader module, bind group layout, sampler, and pipeline cache —
@@ -179,10 +249,103 @@ impl std::fmt::Debug for TileCompositor {
 
 #[cfg(test)]
 mod tests {
-    use super::TileCompositor;
+    use super::{TileCompositor, composite_tile_cpu};
     use crate::test_support::real_context;
-    use aurora_tile::TILE;
+    use aurora_tile::{SAMPLES, TILE};
     use half::f16;
+
+    /// A `SAMPLES`-length buffer of one solid `rgba` texel repeated —
+    /// the CPU-side sibling of the GPU tests' own `solid_tile` below,
+    /// same shape.
+    fn solid_texels(rgba: [f32; 4]) -> Vec<f16> {
+        let mut out = Vec::with_capacity(SAMPLES);
+        for _ in 0..(SAMPLES / 4) {
+            for channel in rgba {
+                out.push(f16::from_f32(channel));
+            }
+        }
+        out
+    }
+
+    /// Reads the first texel back out of a `composite_tile_cpu` result.
+    fn first_texel(texels: &[f16]) -> (f32, f32, f32, f32) {
+        let [r, g, b, a, ..] = texels else {
+            unreachable!("a SAMPLES-length buffer has at least one texel");
+        };
+        (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32())
+    }
+
+    #[test]
+    fn composite_tile_cpu_of_no_layers_is_fully_transparent_black() {
+        let out = composite_tile_cpu(&[]);
+        assert_eq!(out.len(), SAMPLES);
+        assert_eq!(first_texel(&out), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn composite_tile_cpu_matches_the_gpu_shaders_own_source_over_math() {
+        // Same case `composite_over_blends_source_over_destination`
+        // proves on the GPU: opaque blue dst, half-transparent red src
+        // -> (0.5, 0.0, 0.5, 1.0).
+        let dst = solid_texels([0.0, 0.0, 1.0, 1.0]);
+        let src = solid_texels([1.0, 0.0, 0.0, 0.5]);
+        let out = composite_tile_cpu(&[(&dst, 1.0), (&src, 1.0)]);
+        assert_eq!(first_texel(&out), (0.5, 0.0, 0.5, 1.0));
+    }
+
+    #[test]
+    // Exact-literal round-trip (0.25/0.5/0.75, powers of two -- unlike
+    // 0.2/0.4/0.6, these round-trip exactly through f16), same reasoning
+    // `aurora-doc`'s own tests already document for their float_cmp
+    // allows.
+    fn composite_tile_cpu_a_single_layer_at_full_opacity_reproduces_it_over_transparent() {
+        let src = solid_texels([0.25, 0.5, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[(&src, 1.0)]);
+        // Over fully transparent black, straight-alpha "over" at full
+        // opacity reproduces the source exactly.
+        assert_eq!(first_texel(&out), (0.25, 0.5, 0.75, 1.0));
+    }
+
+    #[test]
+    fn composite_tile_cpu_applies_layer_opacity_on_top_of_the_texels_own_alpha() {
+        // A fully opaque source at 50% layer opacity must land at 50%
+        // effective alpha, not its own texel alpha unmodified.
+        let dst = solid_texels([0.0, 0.0, 0.0, 0.0]);
+        let src = solid_texels([1.0, 1.0, 1.0, 1.0]);
+        let out = composite_tile_cpu(&[(&dst, 1.0), (&src, 0.5)]);
+        assert_eq!(first_texel(&out), (0.5, 0.5, 0.5, 0.5));
+    }
+
+    #[test]
+    fn composite_tile_cpu_clamps_an_out_of_range_opacity() {
+        let dst = solid_texels([0.0, 0.0, 0.0, 0.0]);
+        let src = solid_texels([1.0, 1.0, 1.0, 1.0]);
+        let out = composite_tile_cpu(&[(&dst, 1.0), (&src, 5.0)]);
+        assert_eq!(
+            first_texel(&out),
+            (1.0, 1.0, 1.0, 1.0),
+            "an opacity above 1.0 must clamp, not overshoot"
+        );
+    }
+
+    #[test]
+    fn composite_tile_cpu_with_a_fully_transparent_top_layer_leaves_the_bottom_unchanged() {
+        let dst = solid_texels([0.25, 0.5, 0.75, 1.0]);
+        let src = solid_texels([1.0, 1.0, 1.0, 0.0]);
+        let out = composite_tile_cpu(&[(&dst, 1.0), (&src, 1.0)]);
+        assert_eq!(first_texel(&out), (0.25, 0.5, 0.75, 1.0));
+    }
+
+    #[test]
+    fn composite_tile_cpu_three_layers_composite_in_the_given_order() {
+        // Bottom fully opaque red, middle fully opaque green at 50%
+        // layer opacity, top fully transparent (contributes nothing).
+        let bottom = solid_texels([1.0, 0.0, 0.0, 1.0]);
+        let middle = solid_texels([0.0, 1.0, 0.0, 1.0]);
+        let top = solid_texels([0.0, 0.0, 1.0, 0.0]);
+        let out = composite_tile_cpu(&[(&bottom, 1.0), (&middle, 0.5), (&top, 1.0)]);
+        assert_eq!(first_texel(&out), (0.5, 0.5, 0.0, 1.0));
+    }
 
     /// A `TILE`x`TILE` `Rgba16Float` texture, pre-filled solid `rgba` via
     /// `write_texture` (the same upload technique `aurora_gpu::TileResidency`
