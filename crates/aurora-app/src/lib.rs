@@ -295,6 +295,31 @@
 //! local `(0, 0)` reads as transparent, the same as a pixel that layer
 //! genuinely never painted.
 //!
+//! **Incremental compositing, also 2026-08-06** — the other named
+//! Multi-layer compositing gap: `recomposite_visible_tiles` recomputed
+//! the entire visible grid unconditionally on every redraw, even one
+//! with nothing to do (a pure UI interaction, an idle repaint) or one
+//! looking at territory already composited under the current document
+//! state (panning back over it). New `CompositeCache` tracks which
+//! composite `TileId`s are already known current and lets
+//! `recomposite_visible_tiles` skip recomputing them; `Self::bump`
+//! invalidates the whole cache at once, called from every place that
+//! could change what a `TileId` now composites to (`Self::paint_dab`/
+//! `Self::erase_dab`, `Self::apply_move`, selecting a different active
+//! layer, Undo/Redo, opening or replacing the document). Coarse,
+//! stated honestly: one bump invalidates every cached tile, not just
+//! the one(s) an edit actually touched, so painting still recomposites
+//! the whole visible grid each redraw the way it always did — the real
+//! win is every redraw that isn't an edit at all. `aurora_tile::TileStore`'s
+//! own per-tile dirty flags were deliberately *not* reused for finer
+//! granularity: they only track resident tiles, so a tile dirtied then
+//! evicted before a redraw ever consumes its flag would silently stop
+//! reporting dirty at all — a real correctness risk this coarser,
+//! explicitly-triggered design avoids entirely. True per-tile dirty
+//! tracking across layers remains separate, still-open follow-on work,
+//! and so does GPU-side compositing (`aurora_render::TileCompositor`
+//! already exists for it, just not wired in here yet).
+//!
 //! **Real rendering, for the first time** (PLAN.md M1.8's own "Canvas"
 //! bullet): `resumed` builds an `aurora_gpu::TileResidency` and
 //! `aurora_gpu::CanvasPipeline` sized to the canvas dock area; `redraw`
@@ -1701,6 +1726,7 @@ fn handle_key(
     pixel_history: &mut aurora_brush::PixelHistory,
     store: Option<&mut aurora_tile::TileStore>,
     undo_order: &mut UndoOrder,
+    composite_cache: &mut CompositeCache,
     shortcuts: &ShortcutRegistry<AppCommand>,
     modifiers: Modifiers,
     key: Key,
@@ -1737,6 +1763,12 @@ fn handle_key(
             undo_order,
             command,
         );
+        // Only Undo/Redo can change what a composite tile shows -- see
+        // `App::run_undo_redo`'s own matching bump for the command-
+        // palette/menu path to the same two commands.
+        if matches!(command, AppCommand::Undo | AppCommand::Redo) {
+            composite_cache.bump();
+        }
     }
     None
 }
@@ -2324,19 +2356,19 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 /// four of that layer's own tiles together when origins aren't
 /// tile-aligned.
 ///
-/// **Performance, stated honestly**: recomposites the *entire* visible
-/// grid unconditionally on every call, not just tiles some constituent
-/// layer actually changed since the last one. Per `spike/FINDINGS.md`'s
-/// own ~20ms "merging whole tiles" measurement — the exact CPU
-/// compositing cost that finding named as the reason GPU tile
-/// compositing (`aurora_render::TileCompositor`) exists at all — this
-/// will not hold the 60 FPS budget once a real multi-layer document is
-/// actually being interacted with. A real, incremental, per-tile-dirty-
-/// aware (or GPU-side) multi-layer compositor is separate, still-open
-/// follow-on work; this first slice is scoped to correctness, not
-/// performance, the same tradeoff `aurora-brush`'s own "real engine is
-/// Phase 2" bullet already made. A document with zero or one visible
-/// pixel layer (the common case so far) is unaffected in practice:
+/// **Performance, incremental but coarse**: a visible tile already
+/// current in `cache` is skipped entirely — see [`CompositeCache`]'s
+/// own doc comment for what invalidates it. Still not per-tile-dirty-
+/// aware *within* one invalidation: a single edit anywhere forces a
+/// full recompute of every visible tile on the next redraw, not just
+/// the one(s) it actually touched, so active painting still pays
+/// something close to `spike/FINDINGS.md`'s own ~20ms "merging whole
+/// tiles" cost per redraw — the exact cost that finding named as the
+/// reason GPU tile compositing (`aurora_render::TileCompositor`) exists
+/// at all. True per-tile dirty tracking across layers, and GPU-side
+/// compositing, are both separate, still-open follow-on work. A
+/// document with zero or one visible pixel layer (the common case so
+/// far) is unaffected in practice either way:
 /// `aurora_render::composite_tile_cpu` reproduces a single full-opacity
 /// layer's own texels exactly.
 fn recomposite_visible_tiles(
@@ -2344,6 +2376,7 @@ fn recomposite_visible_tiles(
     layers: &aurora_doc::LayerTree,
     active_layer: Option<aurora_doc::LayerId>,
     store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
 ) {
     let mut paint_layers = Vec::new();
     for id in layers.paint_order() {
@@ -2368,6 +2401,9 @@ fn recomposite_visible_tiles(
     };
     let tile_size = i64::from(aurora_tile::TILE);
     for tile_id in residency.visible_tiles() {
+        if cache.is_current(tile_id) {
+            continue;
+        }
         let doc_origin = (
             reference_origin.0 + i64::from(tile_id.x) * tile_size,
             reference_origin.1 + i64::from(tile_id.y) * tile_size,
@@ -2397,6 +2433,66 @@ fn recomposite_visible_tiles(
         };
         dest.texels_mut().copy_from_slice(&composited);
         dest.mark_dirty(full_tile);
+        cache.mark_current(tile_id);
+    }
+}
+
+/// Which composite `aurora_tile::TileId`s [`recomposite_visible_tiles`]
+/// has already computed since the last invalidation — the incremental
+/// half of the "recomposites the entire visible grid unconditionally on
+/// every redraw" gap Multi-layer compositing named. A `TileId`'s own
+/// meaning (which document-space window it names) depends only on the
+/// active layer's own origin (`recomposite_visible_tiles`'s own
+/// `reference_origin`), never on `CanvasView`'s pan/zoom, so panning
+/// back over already-composited, unedited territory is a real cache
+/// hit, not just an idle redraw with nothing to do.
+///
+/// [`Self::bump`] is the one invalidation primitive, called by every
+/// `aurora-app` operation that could change what a given `TileId` now
+/// composites to: a brush/eraser dab, a live Move, Undo/Redo, opening
+/// or replacing the active document, and selecting a different active
+/// layer (which changes the reference origin every `TileId` is measured
+/// from).
+///
+/// **Coarse, stated honestly**: one bump invalidates every currently
+/// cached tile at once, not just the one(s) the triggering edit actually
+/// touched — true per-tile dirty tracking across layers is separate,
+/// still-open follow-on work. `aurora_tile::TileStore`'s own per-tile
+/// dirty flags (`Tile::mark_dirty`/`TileStore::take_dirty`) are
+/// deliberately *not* reused for finer-grained invalidation here: they
+/// only track resident tiles, so a tile dirtied by an edit and then
+/// evicted before a redraw ever consumes its flag would silently stop
+/// being reported dirty at all — a real correctness risk (a stale
+/// composite shown as current) this coarser, explicitly-triggered design
+/// avoids entirely.
+///
+/// `current` only ever grows within a session between bumps — a tile
+/// computed once is never individually evicted, even once panned away
+/// from — bounded in practice by how many distinct composite tiles a
+/// session ever actually visits, and harmless even if
+/// `aurora_tile::TileStore`'s own LRU pages the real tile back out in
+/// the meantime (paging back in on next access restores the same
+/// content `TileStore` already guarantees elsewhere).
+#[derive(Debug, Default)]
+struct CompositeCache {
+    current: std::collections::HashSet<aurora_tile::TileId>,
+}
+
+impl CompositeCache {
+    /// Invalidates every cached tile.
+    fn bump(&mut self) {
+        self.current.clear();
+    }
+
+    /// Whether `id` was already computed since the last [`Self::bump`].
+    #[must_use]
+    fn is_current(&self, id: aurora_tile::TileId) -> bool {
+        self.current.contains(&id)
+    }
+
+    /// Records that `id` now holds current composited content.
+    fn mark_current(&mut self, id: aurora_tile::TileId) {
+        self.current.insert(id);
     }
 }
 
@@ -2857,6 +2953,11 @@ struct App {
     /// consults it to decide which backing store `Ctrl+Z`/
     /// `Ctrl+Shift+Z` should actually reach into next.
     undo_order: UndoOrder,
+    /// Which composite tiles [`recomposite_visible_tiles`] can skip
+    /// recomputing this redraw — see [`CompositeCache`]'s own doc
+    /// comment. Bumped by every operation that could change what a
+    /// composite tile now shows.
+    composite_cache: CompositeCache,
     /// The layer the Brush/Eraser tools paint/erase into and the Move
     /// tool repositions, if any — the topmost pixel layer of `layers`
     /// at construction time ([`topmost_pixel_layer`]), real-time-
@@ -3016,6 +3117,7 @@ impl App {
             history,
             pixel_history: aurora_brush::PixelHistory::new(),
             undo_order: UndoOrder::default(),
+            composite_cache: CompositeCache::default(),
             active_layer,
             current_colour: DEFAULT_COLOUR,
             layer_rows,
@@ -3077,6 +3179,7 @@ impl App {
             &mut self.pixel_history,
             self.tile_store.as_mut(),
             &mut self.undo_order,
+            &mut self.composite_cache,
             &self.shortcuts,
             self.modifiers,
             key,
@@ -3115,6 +3218,11 @@ impl App {
             &mut self.undo_order,
             command,
         );
+        // Either command could revert/reapply a bounds change (Move) as
+        // well as a pixel edit -- coarse but safe, matching
+        // `CompositeCache`'s own documented "any edit invalidates
+        // everything" scoping.
+        self.composite_cache.bump();
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -3194,6 +3302,7 @@ impl App {
         // (now-empty) stacks regardless.
         self.pixel_history = aurora_brush::PixelHistory::new();
         self.undo_order = UndoOrder::default();
+        self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
@@ -3256,6 +3365,7 @@ impl App {
         // See the same reset in `Self::open_file`'s own flat-image path.
         self.pixel_history = aurora_brush::PixelHistory::new();
         self.undo_order = UndoOrder::default();
+        self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
@@ -3487,6 +3597,11 @@ impl App {
                 &mut self.active_layer,
                 layer_id,
             );
+            // Changes `recomposite_visible_tiles`'s own reference origin
+            // (the newly active layer's own bounds) -- every cached
+            // `TileId` would otherwise keep meaning the *previous* active
+            // layer's own document-space window.
+            self.composite_cache.bump();
             self.push_accessibility();
             return;
         }
@@ -3576,6 +3691,7 @@ impl App {
         {
             tracing::warn!(?err, "failed to stamp a brush dab");
         }
+        self.composite_cache.bump();
     }
 
     /// Erases one dab at `doc_point` (document space) from the active
@@ -3612,6 +3728,7 @@ impl App {
         if let Err(err) = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS) {
             tracing::warn!(?err, "failed to erase a dab");
         }
+        self.composite_cache.bump();
     }
 
     /// Applies `bounds` to `layer_id` directly in the live document
@@ -3627,11 +3744,15 @@ impl App {
     /// practice — `layer_id` always comes from `Drag::Move` itself, set
     /// from a real active pixel layer when the drag began — but this
     /// reports rather than assumes it, the same discipline every other
-    /// fallible call in this crate already applies.
+    /// fallible call in this crate already applies. Bumps
+    /// `self.composite_cache` unconditionally — a moved layer's own
+    /// content lands at different composite tiles now, whether or not
+    /// `set_bounds` itself succeeded.
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
         if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
             tracing::warn!(?err, "failed to reposition the active layer");
         }
+        self.composite_cache.bump();
     }
 
     /// Records a completed `Drag::Move` as a single undo step, from
@@ -3868,6 +3989,7 @@ impl App {
                             &self.layers,
                             self.active_layer,
                             store,
+                            &mut self.composite_cache,
                         );
                         let _ = residency.sync(
                             gpu.queue(),
@@ -4221,20 +4343,21 @@ mod tests {
     use super::{
         ActivatedCommand, AppCommand, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_UNDO,
-        CRASH_RECOVERY_CONTINUE, ClipboardAccess, Drag, FileDialogAccess, Key, KeyChord, Modifiers,
-        NamedKey, PointerButton, UndoKind, UndoOrder, activate_command, apply_scroll_zoom,
-        autosave_path, begin_drag, canvas_area_physical_rect, canvas_area_physical_size,
-        clear_session_marker, close_command_palette, close_crash_recovery_dialog,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message, default_shortcuts,
-        demo_document, document_canvas_size, document_from_image, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path,
-        layer_local_point, load_background_color, load_scales, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pointer_in_canvas, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, run_command, sample_pixel,
-        select_layer, tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key,
+        KeyChord, Modifiers, NamedKey, PointerButton, UndoKind, UndoOrder, activate_command,
+        apply_scroll_zoom, autosave_path, begin_drag, canvas_area_physical_rect,
+        canvas_area_physical_size, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, default_shortcuts, demo_document, document_canvas_size,
+        document_from_image, handle_dialog_key, handle_dialog_pointer, handle_key,
+        handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point,
+        load_background_color, load_scales, logical_point, logical_size, open_command_palette,
+        open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
+        pointer_in_canvas, previous_session_left_a_marker, recomposite_visible_tiles,
+        recover_document, replace_document, run_command, sample_pixel, select_layer,
+        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
+        translate_key, translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -5448,6 +5571,7 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
+        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -5460,6 +5584,7 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
+            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Tab),
@@ -5481,6 +5606,7 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
+        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -5493,6 +5619,7 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
+            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('h'),
@@ -5532,6 +5659,7 @@ mod tests {
         // called above.
         let mut undo_order = UndoOrder::default();
         undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -5544,6 +5672,7 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
+            &mut composite_cache,
             &shortcuts,
             Modifiers {
                 control: true,
@@ -5571,6 +5700,7 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
+        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         // 'q' is deliberately not one of `default_shortcuts`' own
         // tool-switch letters (v/m/z/h/i) or anything else bound.
@@ -5585,6 +5715,7 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
+            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('q'),
@@ -5608,6 +5739,7 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
+        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
@@ -5625,6 +5757,7 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
+            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('p'),
@@ -6303,7 +6436,8 @@ mod tests {
 
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
-        recomposite_visible_tiles(&residency, &layers, None, &mut store);
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
 
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
         assert_eq!(
@@ -6373,7 +6507,8 @@ mod tests {
         // `bottom` is the active layer, so the composite tile grid is
         // anchored to its own origin (0, 0) -- `shifted` is the one that
         // needs `read_layer_window`'s own re-tiling.
-        recomposite_visible_tiles(&residency, &layers, Some(bottom), &mut store);
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, &layers, Some(bottom), &mut store, &mut cache);
 
         let composite_surface = composite_surface_id();
         let at_shifted_origin =
@@ -6410,11 +6545,107 @@ mod tests {
         let layers = aurora_doc::LayerTree::new();
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
-        recomposite_visible_tiles(&residency, &layers, None, &mut store);
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
 
         let tile_id = aurora_tile::TileId { x: 0, y: 0 };
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
         assert_eq!(result, (0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_skips_an_already_current_tile() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        fill_solid(&mut store, surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), tile_id),
+            (1.0, 0.0, 0.0, 1.0),
+            "the first real compute must reflect the layer's own content"
+        );
+
+        // Poke the composite surface directly -- content only a fresh
+        // recompute (not a skip) could ever produce, so its survival
+        // through a second call is the only way to confirm the tile was
+        // genuinely skipped rather than recomputed to the same value by
+        // coincidence.
+        fill_solid(
+            &mut store,
+            composite_surface_id(),
+            tile_id,
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), tile_id),
+            (0.0, 1.0, 0.0, 1.0),
+            "a tile already current in the cache, with no invalidation in between, must be left alone"
+        );
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_recomputes_a_tile_after_the_cache_is_bumped() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        fill_solid(&mut store, surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+
+        fill_solid(
+            &mut store,
+            composite_surface_id(),
+            tile_id,
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        cache.bump();
+        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), tile_id),
+            (1.0, 0.0, 0.0, 1.0),
+            "bump must force a real recompute, overwriting the poked value"
+        );
     }
 
     #[test]
@@ -6755,6 +6986,7 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
+        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -6774,6 +7006,7 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
+            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Escape),
