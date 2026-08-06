@@ -2854,6 +2854,52 @@ check licenses` clean with the new `toml` dependency.
   development sandbox is Linux and the dependency isn't even present
   here. Windows and Linux native menus remain unaddressed, deliberately
   — see the investigation above.
+
+  **First real-hardware look at the menu bar itself, 2026-08-06 —
+  found a real, genuine bug**: Cahya ran `cargo run -p aurora-app` on
+  real macOS hardware and saw exactly three menus — "aurora-app / Edit
+  / View" — `File` apparently missing. Diagnosis: this is a real,
+  well-documented Cocoa/AppKit behaviour, not a `muda`/`append_items`
+  failure (which would have dropped *all three*, and Edit/View plainly
+  rendered correctly) — macOS always overwrites the *first* top-level
+  menu's own displayed title with the running process's own name,
+  regardless of what string that menu was actually given. `build_menu`
+  appended `[file_menu, edit_menu, view_menu]` with nothing reserved
+  ahead of them, so `File` itself absorbed the rename — the menu wasn't
+  missing, it was wearing the wrong label. Fixed by adding a real,
+  dedicated app menu (About/Services/Hide/Hide Others/Show All/Quit,
+  via `muda::PredefinedMenuItem` — not `COMMAND_*`/`activate_command`,
+  since quitting isn't a document-level command this crate has one
+  for) as the actual first item, so Cocoa's rename lands there instead.
+  `muda::AboutMetadata { name: Some("Aurora".to_owned()), ..Default::
+  default() }` is the one piece of real content given to it.
+
+  Verified as far as this sandbox allows: the exact `muda` 0.19.3 API
+  used (`PredefinedMenuItem::about`/`services`/`hide`/`hide_others`/
+  `show_all`/`separator`/`quit`, `AboutMetadata`) was checked against
+  the crate's own vendored source directly, and the new `build_menu`
+  body was verified to actually *type-check* against real macOS
+  `x86_64-apple-darwin` types via a throwaway crate depending on
+  `muda` alone (this workspace's own `aurora-app` still can't be
+  cross-compiled to macOS from this sandbox at all — `aurora-color`'s
+  `lcms2-sys` needs a real macOS C toolchain/SDK this sandbox's `cc`
+  doesn't have, a separate, pre-existing limitation, not new). `cargo
+  fmt --all --check`/`cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`/`cargo test -p aurora-app` (129
+  tests, unchanged — `build_menu` remains untestable from this crate's
+  own suite for the same main-thread reason already documented above)
+  all clean on Linux. **Still needs real confirmation on real macOS
+  hardware**: that `File`/`Edit`/`View` now show correctly and the app
+  menu itself behaves as a real macOS user expects (About panel,
+  Hide/Quit). One real, honestly-flagged, *unverified* risk: `Quit`'s
+  interaction with this app's own graceful-shutdown path
+  (`WindowEvent::CloseRequested` clearing the crash-recovery session
+  marker) has not been confirmed on real hardware from this sandbox —
+  if native Quit terminates the process without winit ever delivering
+  `CloseRequested` for the open window, the marker file would be left
+  behind and the *next* launch would show a crash-recovery prompt for
+  a session that actually exited cleanly. Worth Cahya specifically
+  checking when verifying this fix.
 - [~] **Per-monitor DPI and fractional scaling** — first slice done
   2026-08-05, `crates/aurora-app/src/lib.rs`. Found and fixed a real,
   latent bug along the way: layout was being computed straight from

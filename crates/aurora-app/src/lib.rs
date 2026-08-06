@@ -1366,9 +1366,11 @@ fn activate_command(
 // architecture already points toward, not a native OS integration on
 // every platform.
 
-/// Builds the native menu's own cross-platform structure: File > Open
-/// File…/Save As…, Edit > Undo/Redo, View > Focus Layers/Properties/
-/// History Panel — reusing the exact same `COMMAND_*` ids the command
+/// Builds the native menu's own cross-platform structure: an app menu
+/// (About/Services/Hide/Quit — see this function's own doc comment
+/// below for why this exists at all), File > Open File…/Save As…,
+/// Edit > Undo/Redo, View > Focus Layers/Properties/History Panel —
+/// the last three reusing the exact same `COMMAND_*` ids the command
 /// palette already uses (via `MenuItem::with_id`), so
 /// [`activate_command`] drives both UI surfaces identically; nothing
 /// here invents a second command vocabulary. No accelerator hint on
@@ -1380,9 +1382,51 @@ fn activate_command(
 /// attaching it to a window) is the same on every platform muda
 /// supports, which is why this function itself needs no further
 /// `#[cfg]` beyond the module section's own macOS gate.
+///
+/// **The app menu's own real, load-bearing purpose**: on macOS, Cocoa
+/// always overwrites the *first* top-level menu's own displayed title
+/// with the running application's own process name, regardless of what
+/// string it was actually given — a real, first-hand finding (Cahya
+/// running this on real macOS hardware saw exactly three menus, "aurora-
+/// app / Edit / View," with `File` seemingly missing). Without a
+/// dedicated first item, Cocoa's own auto-rename lands on `File`
+/// itself, silently relabelling it rather than leaving it out — the
+/// menu isn't missing, it's wearing the wrong name. A real app menu
+/// here (the conventional macOS slot for About/Services/Hide/Quit, via
+/// `PredefinedMenuItem` rather than any `COMMAND_*` id this crate
+/// invented — there is no document-level "quit" command to route
+/// through `activate_command`, since quitting isn't a document
+/// operation) gives Cocoa's rename a proper target and leaves `File`
+/// alone.
 #[cfg(target_os = "macos")]
 fn build_menu() -> muda::Menu {
     let menu = muda::Menu::new();
+
+    // Title is irrelevant -- Cocoa overwrites it with the process name
+    // regardless, per this function's own doc comment above; this
+    // submenu's only job is to occupy that slot so `File` doesn't.
+    let about = muda::AboutMetadata {
+        name: Some("Aurora".to_owned()),
+        ..Default::default()
+    };
+    let app_menu = match muda::Submenu::with_items(
+        "Aurora",
+        true,
+        &[
+            &muda::PredefinedMenuItem::about(None, Some(about)),
+            &muda::PredefinedMenuItem::separator(),
+            &muda::PredefinedMenuItem::services(None),
+            &muda::PredefinedMenuItem::separator(),
+            &muda::PredefinedMenuItem::hide(None),
+            &muda::PredefinedMenuItem::hide_others(None),
+            &muda::PredefinedMenuItem::show_all(None),
+            &muda::PredefinedMenuItem::separator(),
+            &muda::PredefinedMenuItem::quit(None),
+        ],
+    ) {
+        Ok(submenu) => submenu,
+        Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
+    };
 
     let file_menu = match muda::Submenu::with_items(
         "File",
@@ -1426,7 +1470,7 @@ fn build_menu() -> muda::Menu {
         Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
     };
 
-    if let Err(err) = menu.append_items(&[&file_menu, &edit_menu, &view_menu]) {
+    if let Err(err) = menu.append_items(&[&app_menu, &file_menu, &edit_menu, &view_menu]) {
         tracing::warn!(?err, "failed to build the native menu bar structure");
     }
     menu
