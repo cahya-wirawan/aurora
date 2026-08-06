@@ -392,6 +392,21 @@ impl History {
         !self.redo_stack.is_empty()
     }
 
+    /// Discards every redo entry without touching `undo_stack` or the
+    /// journal — the same "new activity invalidates redo" clearing this
+    /// type's own private `push` helper already does internally for a
+    /// structural edit
+    /// recorded *through* this type, exposed here for a caller that
+    /// needs to invalidate this history's own redo stack in response to
+    /// activity recorded somewhere else entirely (`aurora-app`'s own
+    /// unified undo ordering across this type and
+    /// `aurora_brush::PixelHistory`, PLAN.md's Undo/Redo bullet: doing a
+    /// pixel edit must invalidate a pending structural redo too, not
+    /// just this history's own).
+    pub fn clear_redo(&mut self) {
+        self.redo_stack.clear();
+    }
+
     /// How many ops the journal has recorded so far — mostly useful for
     /// tests; see [`Self::journal_descriptions`] for reading individual
     /// entries.
@@ -1148,6 +1163,33 @@ mod tests {
             Ok(None) => {}
             other => unreachable!("expected Ok(None), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn clear_redo_discards_a_pending_redo_without_touching_undo() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(history.can_redo());
+        assert!(!tree.contains(id));
+
+        history.clear_redo();
+
+        assert!(!history.can_redo(), "the pending redo must be discarded");
+        match history.redo(&mut tree) {
+            Ok(None) => {}
+            other => unreachable!("expected Ok(None), got {other:?}"),
+        }
+        assert!(
+            !tree.contains(id),
+            "clear_redo must not have reapplied anything"
+        );
     }
 
     #[test]
