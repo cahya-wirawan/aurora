@@ -407,13 +407,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aurora_gpu::{GpuContext, GpuSurface};
-use aurora_theme::{Palette, Scales, ThemeSet};
+use aurora_theme::{Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey, ShortcutRegistry};
 use aurora_widgets::widgets::{
-    CommandEntry, DialogAction, DialogHandle, command_palette_state, insert_command_palette,
-    insert_dialog, move_command_palette_selection, set_command_palette_query,
+    CommandEntry, DialogAction, DialogHandle, WidgetKind, command_palette_state,
+    insert_command_palette, insert_dialog, move_command_palette_selection,
+    set_command_palette_query,
 };
-use aurora_widgets::{FocusManager, WidgetId};
+use aurora_widgets::{FocusManager, GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -426,27 +427,34 @@ const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 /// Loads the real, owner-approved Dark theme (`design/themes/dark.toml`
 /// — the only built-in theme that exists as a real design yet; Light/
 /// high-contrast/Colour-Critical are Cahya's own design decisions still
-/// to make, per `aurora-theme`'s own doc comment) and converts its
-/// `surface.app` token (the overall application chrome background —
-/// `surface.canvas` is reserved for the document canvas area, which
-/// doesn't exist yet) into the linear-light `wgpu::Color` a window
-/// clear needs.
+/// to make, per `aurora-theme`'s own doc comment).
 ///
 /// Theme *selection* (choosing among built-ins, a user preference) is
-/// separate, later work; this always loads Dark.
+/// separate, later work; this always loads Dark. [`App`] keeps the
+/// result alive for the whole session (`App::theme`) — real chrome
+/// (window background, a widget's own paint) reads it every frame,
+/// not just once at startup.
 ///
 /// # Errors
 ///
 /// Returns an error if the built-in palette/theme TOML fails to parse —
 /// which would mean the checked-in design files themselves are broken,
 /// not a runtime condition a user could hit.
-fn load_background_color() -> anyhow::Result<wgpu::Color> {
+fn load_theme() -> anyhow::Result<Theme> {
     let palette = Palette::from_toml_str(PALETTE_TOML)?;
     let mut themes = ThemeSet::new();
     themes.register(DARK_THEME_TOML)?;
-    let theme = themes.resolve("Dark", &palette)?;
+    Ok(themes.resolve("Dark", &palette)?)
+}
+
+/// Converts `theme`'s `surface.app` token (the overall application
+/// chrome background — `surface.canvas` is reserved for the document
+/// canvas area, which doesn't exist yet) into the linear-light
+/// `wgpu::Color` a window clear needs.
+#[must_use]
+fn background_color_from_theme(theme: &Theme) -> wgpu::Color {
     let [r, g, b] = theme.surface.app.to_srgb_f32();
-    Ok(wgpu::Color {
+    wgpu::Color {
         // The surface format is sRGB-aware (`Bgra8UnormSrgb`, per
         // `aurora-gpu`'s own `create_surface`/`examples/surface_smoke.rs`),
         // and every graphics API's clear-colour convention expects
@@ -457,21 +465,39 @@ fn load_background_color() -> anyhow::Result<wgpu::Color> {
         g: f64::from(aurora_color::srgb_to_linear(g)),
         b: f64::from(aurora_color::srgb_to_linear(b)),
         a: 1.0,
-    })
+    }
+}
+
+/// Linearizes a widget's own straight, sRGB-gamma-encoded paint colour
+/// ([`aurora_widgets::paint_widget`]'s own return convention) for the
+/// swapchain surface's sRGB-aware target format — the same "the target
+/// expects linear, using gamma-encoded values directly double-encodes
+/// and washes the colour out" reasoning [`background_color_from_theme`]
+/// already applies to the window's own clear colour. Alpha is a
+/// blend-equation coefficient, not a gamma-encoded sample, so it passes
+/// through unchanged.
+#[must_use]
+fn linearize_paint_color(color: [f32; 4]) -> [f32; 4] {
+    let [r, g, b, a] = color;
+    [
+        aurora_color::srgb_to_linear(r),
+        aurora_color::srgb_to_linear(g),
+        aurora_color::srgb_to_linear(b),
+        a,
+    ]
 }
 
 /// Loads the real, owner-approved scales (`design/tokens/scales.toml`)
 /// — needed by any widget with real chrome (buttons, the crash-recovery
 /// dialog built from them) per invariant §7.3.10, the same "resolve
-/// from tokens, never a literal" discipline `load_background_color`
-/// already applies to colour.
+/// from tokens, never a literal" discipline [`load_theme`] already
+/// applies to colour.
 ///
 /// # Errors
 ///
 /// Returns an error if the built-in scales TOML fails to parse — same
-/// caveat as [`load_background_color`]: this would mean the checked-in
-/// design file itself is broken, not a runtime condition a user could
-/// hit.
+/// caveat as [`load_theme`]: this would mean the checked-in design file
+/// itself is broken, not a runtime condition a user could hit.
 fn load_scales() -> anyhow::Result<Scales> {
     Ok(Scales::from_toml_str(SCALES_TOML)?)
 }
@@ -1035,7 +1061,7 @@ fn handle_dialog_pointer(
 // function below is deliberately free (not a method on `App`) and
 // platform-free (`aurora_widgets`/`aurora_ui` types only, no
 // `winit::event_loop`/GPU state) — the same "pure logic, headlessly
-// testable" shape `demo_document`/`load_background_color` already use,
+// testable" shape `demo_document`/`load_theme` already use,
 // so this crate's first real keyboard-input routing doesn't need a live
 // window, `EventLoopProxy`, or display server to test (this sandbox has
 // none of those — see this crate's own doc comment). `translate_key`/
@@ -3049,6 +3075,13 @@ struct App {
     /// screen (`aurora_gpu::CanvasPipeline`) — built alongside
     /// `residency`, `None` under the same conditions.
     canvas_pipeline: Option<aurora_gpu::CanvasPipeline>,
+    /// The GPU path renderer (`aurora_widgets::PathPipeline`) every
+    /// widget's own paint (`aurora_widgets::paint_widget`) draws
+    /// through — built in `resumed` alongside `canvas_pipeline` (same
+    /// "needs a real device" constraint), but unlike `residency`/
+    /// `canvas_pipeline` doesn't need a computed canvas area to size
+    /// itself to, so it's never skipped once a device exists.
+    path_pipeline: Option<PathPipeline>,
     /// The pointer's last known position, in the *window's* own logical
     /// space (already DPI-adjusted — see [`logical_point`]) — `None`
     /// before the first `CursorMoved`, or after `CursorLeft`.
@@ -3066,9 +3099,26 @@ struct App {
     menu: muda::Menu,
     /// The window's background clear colour, resolved from
     /// `design/themes/dark.toml`'s `surface.app` token
-    /// (`load_background_color`) — invariant §7.3.10 (no hardcoded
-    /// style values) applied to the one thing this crate draws so far.
+    /// (`background_color_from_theme`) — invariant §7.3.10 (no
+    /// hardcoded style values) applied to the one thing this crate drew
+    /// before real widget painting existed.
     background: wgpu::Color,
+    /// The resolved Dark theme ([`load_theme`]) — `background` above is
+    /// one, one-time derivation from it (`surface.app`); [`Self::redraw`]
+    /// re-reads it every frame for every widget's own paint
+    /// (`aurora_widgets::paint_widget`), so the resolved `Theme` itself
+    /// has to stay alive for the session, not just the one colour it
+    /// used to be reduced to.
+    theme: Theme,
+    /// The resolved scales (`load_scales`) — kept alive the same way
+    /// `theme` is, for the same reason: [`Self::redraw`] needs a real
+    /// `&Scales` every frame to resolve each widget's own paint
+    /// geometry (button corner radius, currently), and re-parsing
+    /// `design/tokens/scales.toml` every frame (the one-off convention
+    /// every other call site in this crate still uses, since they only
+    /// run on a real user action, not 60 times a second) would be real,
+    /// avoidable per-frame work.
+    scales: Scales,
     /// Set when a step that can't be retried fails (window/device/surface
     /// creation) — `run` turns this into a nonzero exit, distinguishing
     /// it from the ordinary, successful case of the user closing the
@@ -3091,8 +3141,9 @@ impl App {
     #[must_use]
     fn new(
         proxy: EventLoopProxy<accesskit_winit::Event>,
+        theme: Theme,
         background: wgpu::Color,
-        scales: &Scales,
+        scales: Scales,
         marker_path: PathBuf,
         had_previous_marker: bool,
         autosave_path: &Path,
@@ -3111,7 +3162,7 @@ impl App {
         let layer_rows = match aurora_ui::populate_layers_panel(
             &mut workspace.tree,
             workspace.layers,
-            scales,
+            &scales,
             &layers,
         ) {
             Ok(rows) => rows,
@@ -3145,7 +3196,7 @@ impl App {
                 &mut workspace,
                 &mut focus,
                 &mut crash_recovery_dialog,
-                scales,
+                &scales,
                 was_recovered,
             );
         }
@@ -3181,11 +3232,14 @@ impl App {
             tile_store,
             residency: None,
             canvas_pipeline: None,
+            path_pipeline: None,
             pointer_position: None,
             drag: None,
             #[cfg(target_os = "macos")]
             menu: build_menu(),
             background,
+            theme,
+            scales,
             failed: false,
             needs_redraw: true,
         }
@@ -4032,8 +4086,17 @@ impl App {
     /// recomposites every visible pixel layer
     /// ([`recomposite_visible_tiles`]) and syncs the atlas from the
     /// result and draws it within the canvas dock area's own viewport,
-    /// in the same pass as the clear. Real widget/panel content beyond
-    /// that is still separate, still-open M1.8 work.
+    /// then draws every widget's own paint
+    /// ([`collect_widget_paints`]/[`draw_widget_paints`]) on top —
+    /// canvas and UI in the same pass, the same frame, invariant §7.3.8
+    /// (they never become separate surfaces composited together).
+    // One linear per-frame flow (build widget paints, sync the canvas
+    // atlas, one shared render pass drawing both) -- splitting further
+    // would just relocate lines across more functions without reducing
+    // the real complexity a GPU frame has, the same call
+    // `render_test.rs::render_and_sample_pixel` already makes for an
+    // analogous reason.
+    #[allow(clippy::too_many_lines)]
     fn redraw(&mut self) {
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
@@ -4049,6 +4112,11 @@ impl App {
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("aurora-app-frame"),
                         });
+
+                // Built before the render pass below, not inside it --
+                // see `collect_widget_paints`'s own doc comment for why.
+                let widget_paints =
+                    collect_widget_paints(&self.workspace.tree, &self.theme, &self.scales, gpu);
 
                 // Sync before drawing, so this frame shows the latest
                 // painted pixels rather than lagging one frame behind.
@@ -4115,6 +4183,20 @@ impl App {
                         pass.set_bind_group(0, &bind_group, &[]);
                         pass.draw(0..3, 0..1);
                     }
+
+                    if !widget_paints.is_empty()
+                        && let Some(path_pipeline) = self.path_pipeline.as_mut()
+                    {
+                        draw_widget_paints(
+                            &mut pass,
+                            path_pipeline,
+                            gpu,
+                            surface.format(),
+                            surface.size(),
+                            self.scale_factor,
+                            &widget_paints,
+                        );
+                    }
                 }
                 gpu.queue().submit(std::iter::once(encoder.finish()));
                 gpu.queue().present(texture);
@@ -4130,6 +4212,101 @@ impl App {
                 tracing::error!("surface texture acquisition raised a validation error");
             }
         }
+    }
+}
+
+/// Resolves every widget in `tree` into a real, uploaded `GpuMesh`
+/// (`aurora_widgets::paint_widget`, in [`WidgetTree::paint_order`]'s own
+/// order — root first, each child subtree before the next sibling's
+/// own, so a later entry in the returned `Vec` draws on top of an
+/// earlier one, the same "last-painted child is topmost" convention
+/// `WidgetTree::hit_test` already assumes for the reverse (pointer-hit)
+/// direction).
+///
+/// Called *before* [`App::redraw`]'s own render pass begins, not from
+/// inside it: [`PathPipeline::draw`] needs `mesh: &'pass GpuMesh`, so
+/// every `GpuMesh` it draws must outlive the pass — one uploaded fresh
+/// inside the pass's own draw loop would be dropped at the end of that
+/// iteration, before the pass (borrowed for `'pass`) is done with it.
+/// Building the whole list first, then only borrowing from it inside
+/// the pass ([`draw_widget_paints`]), is the shape that forces.
+///
+/// A widget whose own paint fails to tessellate (`WidgetError::Paint`)
+/// is logged and skipped, not fatal to the frame — one broken widget's
+/// own geometry shouldn't blank the rest of a real user's UI. Colour is
+/// linearized ([`linearize_paint_color`]) here, once, rather than by
+/// [`draw_widget_paints`] on every draw call.
+#[must_use]
+fn collect_widget_paints(
+    tree: &WidgetTree<WidgetKind>,
+    theme: &Theme,
+    scales: &Scales,
+    gpu: &GpuContext,
+) -> Vec<(GpuMesh, [f32; 4])> {
+    let mut widget_paints = Vec::new();
+    for id in tree.paint_order() {
+        match paint_widget(tree, id, theme, scales) {
+            Ok(Some((mesh, color))) => {
+                let gpu_mesh = GpuMesh::upload(gpu.device(), gpu.queue(), &mesh);
+                widget_paints.push((gpu_mesh, linearize_paint_color(color)));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    ?id,
+                    "failed to paint a widget; skipping it this frame"
+                );
+            }
+        }
+    }
+    widget_paints
+}
+
+/// Draws `widget_paints` ([`collect_widget_paints`]) within `pass`,
+/// which must already be mid-render-pass (this only sets the pipeline,
+/// resets the viewport, and issues the draw calls — it doesn't begin or
+/// end the pass itself, the same division [`App::redraw`]'s own canvas
+/// draw block already keeps).
+///
+/// Resets the viewport to the *whole* render target first — widget
+/// chrome (the side rail, an open dialog) isn't confined to the canvas
+/// area's own restricted viewport the canvas draw sets before this
+/// runs. `viewport_size` (passed to every [`PathPipeline::bind_group`]
+/// call) is `physical_size` converted to *logical* pixels
+/// ([`logical_size`]): `PathPipeline`'s own `vs_path.wgsl` expects mesh
+/// vertex positions and `viewport_size` in the same unit, and
+/// `paint_widget`'s own mesh comes from `WidgetTree::bounds`, which
+/// `compute_layout` (`App::resumed`/the resize handler) always runs
+/// with logical, not physical, size — a fraction of the window is the
+/// same fraction regardless of which pixel unit measures it, so this is
+/// correct at any DPI scale, not just `1.0`.
+fn draw_widget_paints<'pass>(
+    pass: &mut wgpu::RenderPass<'pass>,
+    path_pipeline: &mut PathPipeline,
+    gpu: &GpuContext,
+    format: wgpu::TextureFormat,
+    physical_size: (u32, u32),
+    scale_factor: f64,
+    widget_paints: &'pass [(GpuMesh, [f32; 4])],
+) {
+    let (physical_width, physical_height) = physical_size;
+    #[allow(clippy::cast_precision_loss)]
+    pass.set_viewport(
+        0.0,
+        0.0,
+        physical_width as f32,
+        physical_height as f32,
+        0.0,
+        1.0,
+    );
+    let viewport_size = logical_size(physical_size, scale_factor);
+    let pipeline = path_pipeline.pipeline(gpu.device(), format);
+    pass.set_pipeline(pipeline);
+    for (mesh, color) in widget_paints {
+        let bind_group = path_pipeline.bind_group(gpu.device(), gpu.queue(), viewport_size, *color);
+        pass.set_bind_group(0, &bind_group, &[]);
+        path_pipeline.draw(pass, mesh);
     }
 }
 
@@ -4210,6 +4387,10 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 "canvas area has no computed layout yet; canvas rendering disabled this session"
             );
         }
+        // Unlike `residency`/`canvas_pipeline`, needs nothing but a real
+        // device -- no computed canvas area to size itself to -- so it's
+        // never skipped here.
+        self.path_pipeline = Some(PathPipeline::new(gpu.device()));
 
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -4386,7 +4567,8 @@ impl std::fmt::Debug for App {
 /// recorded an unrecoverable error during the run (e.g. window, GPU
 /// device, or surface creation failing).
 pub fn run() -> anyhow::Result<()> {
-    let background = load_background_color()?;
+    let theme = load_theme()?;
+    let background = background_color_from_theme(&theme);
     let scales = load_scales()?;
     let marker_path = marker_path();
     // Checked *before* writing this run's own marker below -- otherwise
@@ -4404,8 +4586,9 @@ pub fn run() -> anyhow::Result<()> {
 
     let mut app = App::new(
         proxy,
+        theme,
         background,
-        &scales,
+        scales,
         marker_path,
         had_previous_marker,
         &autosave_path,
@@ -4428,22 +4611,23 @@ mod tests {
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_UNDO,
         CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key,
         KeyChord, Modifiers, NamedKey, PointerButton, UndoKind, UndoOrder, activate_command,
-        apply_scroll_zoom, autosave_path, begin_drag, canvas_area_physical_rect,
-        canvas_area_physical_size, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, default_shortcuts, demo_document, document_canvas_size,
-        document_from_image, handle_dialog_key, handle_dialog_pointer, handle_key,
-        handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point,
-        load_background_color, load_scales, logical_point, logical_size, open_command_palette,
-        open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
-        pointer_in_canvas, previous_session_left_a_marker, recomposite_visible_tiles,
-        recover_document, replace_document, run_command, sample_pixel, select_layer,
-        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        apply_scroll_zoom, autosave_path, background_color_from_theme, begin_drag,
+        canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
+        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message, default_shortcuts,
+        demo_document, document_canvas_size, document_from_image, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path,
+        layer_local_point, load_scales, load_theme, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        palette_commands, pointer_in_canvas, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, run_command, sample_pixel,
+        select_layer, tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
+    use aurora_widgets::widgets::{insert_button, new_tree};
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
 
@@ -4499,14 +4683,15 @@ mod tests {
     /// linear clear colour would wash the colour out).
     #[test]
     fn load_background_color_resolves_a_real_linear_token() {
-        let color = match load_background_color() {
-            Ok(color) => color,
+        let theme = match load_theme() {
+            Ok(theme) => theme,
             Err(err) => unreachable!("the checked-in design files must parse: {err}"),
         };
+        let color = background_color_from_theme(&theme);
         // Exact-literal comparison, not accumulated computation noise --
-        // `load_background_color` sets `a: 1.0` directly, never through
-        // float math -- same reasoning `aurora-color`'s own tests
-        // already document for their float_cmp allows.
+        // `background_color_from_theme` sets `a: 1.0` directly, never
+        // through float math -- same reasoning `aurora-color`'s own
+        // tests already document for their float_cmp allows.
         #[allow(clippy::float_cmp)]
         {
             assert_eq!(color.a, 1.0, "the app background is always opaque");
@@ -6527,6 +6712,44 @@ mod tests {
             result,
             (0.5, 0.0, 0.5, 1.0),
             "opaque red bottom, opaque blue top at 50% opacity, hidden green never contributes"
+        );
+    }
+
+    #[test]
+    fn collect_widget_paints_uploads_a_mesh_for_every_paintable_widget_and_skips_the_rest() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let theme = match load_theme() {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let button = match insert_button(&mut tree, root, &scales, "OK") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            button,
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 32,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+
+        let paints = collect_widget_paints(&tree, &theme, &scales, &context);
+        assert_eq!(
+            paints.len(),
+            1,
+            "only the Button has paint defined -- the plain Container root does not"
         );
     }
 

@@ -47,6 +47,7 @@ muda = { workspace = true }
 
 [dev-dependencies]
 accesskit = { workspace = true }
+taffy = { workspace = true }
 tempfile = { workspace = true }
 
 [[bin]]

@@ -131,6 +131,30 @@ impl<W> WidgetTree<W> {
         self.nodes.is_empty()
     }
 
+    /// Every widget in this tree, in paint order: root first, then each
+    /// child subtree (in [`Self::children`]'s own first-inserted-to-last
+    /// order) before the next sibling's own — the same traversal
+    /// [`Self::hit_test`] already walks (in reverse, for "topmost wins"),
+    /// exposed as a real method rather than requiring every caller that
+    /// needs "every widget, correctly ordered" (a real per-frame paint
+    /// pass, most notably) to reimplement tree descent themselves.
+    #[must_use]
+    pub fn paint_order(&self) -> Vec<WidgetId> {
+        let mut order = Vec::with_capacity(self.nodes.len());
+        self.collect_paint_order(self.root, &mut order);
+        order
+    }
+
+    fn collect_paint_order(&self, id: WidgetId, order: &mut Vec<WidgetId>) {
+        order.push(id);
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        for &child in &node.children {
+            self.collect_paint_order(child, order);
+        }
+    }
+
     /// Adds a new widget as the last child of `parent`, laid out per
     /// `style`, described by `accessibility`. Its bounds are
     /// `UNLAID_OUT` until [`Self::compute_layout`] runs — inserting a
@@ -631,6 +655,24 @@ mod tests {
         assert_eq!(tree.children(root), Some([a, b].as_slice()));
         assert_eq!(tree.parent(a), Some(root));
         assert_eq!(tree.is_dirty(b), Some(true));
+    }
+
+    #[test]
+    fn paint_order_visits_root_then_each_child_subtree_before_the_next_sibling() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let group = match tree.insert(root, Style::default(), label("group"), "group") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let leaf = match tree.insert(group, Style::default(), label("leaf"), "leaf") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let last = match tree.insert(root, Style::default(), label("last"), "last") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.paint_order(), vec![root, group, leaf, last]);
     }
 
     #[test]

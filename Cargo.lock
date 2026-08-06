@@ -461,6 +461,7 @@ dependencies = [
  "half",
  "muda",
  "rfd",
+ "taffy",
  "tempfile",
  "tracing",
  "tracing-subscriber",
