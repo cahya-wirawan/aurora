@@ -60,6 +60,16 @@ Toolchain is pinned in `rust-toolchain.toml` (1.97, edition 2024 — `cosmic-tex
 
 The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `Cargo.toml`). This is deliberate: Aurora holds a professional's unsaved work, and a panic loses it. Return errors instead. A crate needing `unsafe` (likely `aurora-gpu` for FFI) must override `unsafe_code` in its own `[lints]` table rather than the workspace's, so the exception is visible in review.
 
+## Versioning
+
+SemVer, starting at `0.0.1`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place.
+
+- **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
+- **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.
+- Bump the version in the same commit as the work it covers, the same discipline PLAN.md's own checkbox updates already follow.
+
+A release is a `vX.Y.Z` tag (e.g. `v0.1.0`) pushed once the matching version bump is committed — pushing that tag is what actually publishes a GitHub Release, so treat it as a deliberate, user-approved action, not a routine one. `.github/workflows/release.yml` re-runs the full gate (`verify.yml`, the same jobs `ci.yml` runs on every push/PR) against the tagged commit, confirms the tag matches `Cargo.toml`'s own version, then creates the Release. Ordinary commits and PRs are still checked immediately via `ci.yml` regardless of tags — CLAUDE.md's own "cross-platform breakage is cheap to fix now" principle applies to every commit, not just tagged ones.
+
 ## What Aurora is
 
 A cross-platform, GPU-accelerated, non-destructive professional image editor (a Photoshop alternative) for Windows, macOS, and Linux. PSD/PSB compatibility and AI-assisted editing are first-class requirements, not add-ons.

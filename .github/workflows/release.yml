@@ -1,0 +1,50 @@
+name: Release
+
+# Runs only when a version tag is pushed (`v0.1.0`, not a branch push or
+# PR — see CLAUDE.md's own "Versioning" section for the tagging
+# convention). Re-runs the exact same gate `ci.yml` already ran on this
+# commit before it was tagged (`verify.yml`, reused rather than
+# duplicated — see that file's own doc comment), then creates a GitHub
+# Release. No build artifacts yet: Phase 0 has no shippable binary
+# (CLAUDE.md: "no functionality is implemented"), so there is nothing
+# real to attach.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+
+  release:
+    name: Create GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Catches the ordinary mistake of tagging before (or without)
+      # bumping `[workspace.package].version` — a release tag that
+      # doesn't match the code it points at is worse than no release at
+      # all.
+      - name: Confirm the tag matches the workspace version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml's [workspace.package] version ($cargo_version)"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes

@@ -159,6 +159,27 @@ CJK composing into a custom text field.
 - [x] Layering rule enforced mechanically — `scripts/check_layering.py`
 - [x] Lints: `unwrap`/`expect`/`panic`/`indexing_slicing` denied workspace-wide
 - [x] CI: fmt, clippy, layering, tests, rustdoc, `cargo-deny` on Linux/macOS/Windows
+- [x] **Software versioning + release workflow** — done 2026-08-07.
+  SemVer starting at `0.0.1`, `[workspace.package].version` in root
+  `Cargo.toml` the single source of truth (every crate already inherits
+  it via `version.workspace = true`) — minor bumped per PLAN.md step,
+  patch bumped per bug fix, see CLAUDE.md's own new "Versioning"
+  section for the full convention. CI restructured, not duplicated: the
+  four existing jobs (lint/test/docs/deny) moved into a new reusable
+  `.github/workflows/verify.yml` (`workflow_call`); `ci.yml` keeps its
+  exact same push/PR/`workflow_dispatch` triggers and now just calls
+  it, so ordinary commits are still checked immediately, unchanged from
+  before (asked Cahya first — restricting all CI to tag-only would have
+  contradicted this file's own "cross-platform breakage is cheap to
+  fix now" principle). New `.github/workflows/release.yml` triggers
+  only on `v[0-9]+.[0-9]+.[0-9]+` tag pushes: re-runs `verify.yml`
+  against the tagged commit, confirms the tag matches `Cargo.toml`'s
+  own version (catches tagging before bumping), then creates a GitHub
+  Release via `gh release create --generate-notes` — no build
+  artifacts yet, nothing shippable exists this early (Phase 0 skeleton,
+  this file's own top line). No `v0.0.1` tag pushed yet — that's a
+  real, visible action (publishes a GitHub Release), left for Cahya to
+  trigger deliberately rather than done automatically here.
 - [x] Toolchain pinned — 1.97 (raised from 1.88; `cosmic-text` needs ≥1.89)
 - [x] **Brush-latency regression test in CI** — done 2026-08-02, overdue
   against this bullet's own stated gate ("must exist before Phase 1

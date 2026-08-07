@@ -1,111 +1,22 @@
 name: CI
 
+# Runs the real gate (.github/workflows/verify.yml) on every push to
+# main and every PR — ordinary commits are checked immediately, not only
+# at release, per CLAUDE.md's own stated principle ("cross-platform
+# breakage is cheap to fix now and catastrophic in month 30"). Tagging a
+# release (`.github/workflows/release.yml`) runs the exact same jobs
+# again against the tagged commit before creating a GitHub Release.
+
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  RUSTFLAGS: -D warnings
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Cheap checks first, so an obvious failure does not wait on three platforms.
-  lint:
-    name: Format, lint, layering
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-
-      # winit's `wayland-csd-adwaita-crossfont` feature (see workspace Cargo.toml)
-      # needs fontconfig's pkg-config file to build `yeslogic-fontconfig-sys`.
-      - name: Install fontconfig
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      # PRD §7.2: dependencies point downward only. Enforced, not assumed.
-      - name: Crate layering
-        run: python3 scripts/check_layering.py
-
-      # PRD FR-027 acceptance criterion 3 / invariant §7.3.10: no widget
-      # hardcodes a colour or pixel size outside a real design token.
-      - name: No hardcoded style values
-        run: python3 scripts/check_no_hardcoded_style.py
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-  test:
-    name: Test (${{ matrix.os }})
-    needs: lint
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
-
-      # winit's `wayland-csd-adwaita-crossfont` feature (see workspace Cargo.toml)
-      # needs fontconfig's pkg-config file to build `yeslogic-fontconfig-sys`.
-      - name: Install fontconfig
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-
-      - name: Build
-        run: cargo build --workspace --all-targets
-
-      - name: Test
-        run: cargo nextest run --workspace
-
-      # nextest does not run doctests; they are still documentation that must compile.
-      - name: Doctests
-        run: cargo test --workspace --doc
-
-  docs:
-    name: Docs
-    needs: lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      # winit's `wayland-csd-adwaita-crossfont` feature (see workspace Cargo.toml)
-      # needs fontconfig's pkg-config file to build `yeslogic-fontconfig-sys`.
-      - name: Install fontconfig
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-
-      - name: rustdoc
-        run: cargo doc --workspace --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-  deny:
-    name: Licences and advisories
-    needs: lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Run on the normal runner rather than cargo-deny-action's musl container,
-      # which has no toolchain matching rust-toolchain.toml and errors on it.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-deny
-      # PRD §14: Aurora is MIT, and shipped binaries carry their dependencies'
-      # terms. Copyleft C libraries need a documented exception, not a silent add.
-      - run: cargo deny check all
+  verify:
+    uses: ./.github/workflows/verify.yml
