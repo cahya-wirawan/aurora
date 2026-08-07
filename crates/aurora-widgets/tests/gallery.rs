@@ -9,13 +9,16 @@
 //! `render_test.rs` only partly covers (needs GPU, but samples one
 //! pixel, not a whole image against a golden).
 //!
-//! **Scope, stated honestly.** This gallery covers `Button` only, in
-//! the three states `paint_widget` itself resolves (enabled, pressed,
-//! disabled) — `paint_widget` itself now covers `Checkbox`/`Slider`/
-//! `TextField` too, but extending *this* gallery to them is separate,
-//! still-open work: the same "add a tree, call [`render_gallery`],
-//! bless a golden" shape once each is worth its own golden-image
-//! coverage — not new harness work.
+//! **Scope, stated honestly.** `paint_widget` covers `Button`,
+//! `Checkbox`, `Slider`, `TextField`, and `CommandPalette` — this
+//! gallery now covers all five, each its own small tree, its own
+//! `render_gallery` call, its own golden PNG, the same "add a tree,
+//! call [`render_gallery`], bless a golden" shape the very first
+//! version of this file's own doc comment already predicted. Nothing
+//! here re-litigates what each widget's own `paint_widget` case
+//! already decides (colours, which states exist) — see `src/paint.rs`
+//! for that; this file only proves the render pipeline actually
+//! produces the pixels those decisions imply.
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -23,7 +26,9 @@
 
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::widgets::{
-    WidgetKind, insert_button, new_tree, set_button_disabled, set_button_pressed,
+    CommandEntry, WidgetKind, insert_button, insert_checkbox, insert_command_palette,
+    insert_slider, insert_text_field, new_tree, set_button_disabled, set_button_pressed,
+    set_checkbox_disabled, set_slider_disabled, set_text_field_disabled, toggle_checkbox,
 };
 use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
 use std::sync::{Mutex, MutexGuard};
@@ -34,20 +39,48 @@ const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
 const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
 const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 
-/// One gallery cell's own fixed size. Deliberately explicit, not the
+/// `Button`'s own gallery cell size. Deliberately explicit, not the
 /// button's own real padding-derived content size
 /// (`widgets::button`'s own internal `style` function isn't public,
 /// and this crate has no text layout wired in yet to give a label its
 /// own real content size either) — a real, deterministic pixel size is
 /// what a golden-image test needs; this gallery is testing
 /// `paint_widget`'s own background-rectangle output, not button
-/// content layout.
-const CELL: (u32, u32) = (64, 64);
+/// content layout. Every other widget's own gallery below picks its
+/// own cell size the same way, for the same reason.
+const BUTTON_CELL: (u32, u32) = (64, 64);
 /// Three states, side by side. `64 * 3 * 4 = 768 = 3 * 256`, already a
 /// multiple of `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` — see
 /// [`render_gallery`]'s own doc comment for why that matters and why
-/// this harness doesn't (yet) handle a size that isn't.
-const GALLERY_SIZE: (u32, u32) = (CELL.0 * 3, CELL.1);
+/// this harness doesn't (yet) handle a size that isn't. Every gallery
+/// cell size below is chosen as a multiple of 64 for the same reason:
+/// `64 * 4 = 256`, so *any* number of same-sized cells side by side
+/// keeps the whole row aligned, not just this particular count of 3.
+const BUTTON_GALLERY_SIZE: (u32, u32) = (BUTTON_CELL.0 * 3, BUTTON_CELL.1);
+
+const CHECKBOX_CELL: (u32, u32) = (64, 64);
+const CHECKBOX_GALLERY_SIZE: (u32, u32) = (CHECKBOX_CELL.0 * 3, CHECKBOX_CELL.1);
+
+/// Wider than tall — a slider needs real horizontal travel for its own
+/// thumb position to mean anything, unlike the other widgets' own
+/// roughly-square cells.
+const SLIDER_CELL: (u32, u32) = (128, 32);
+const SLIDER_GALLERY_SIZE: (u32, u32) = (SLIDER_CELL.0 * 3, SLIDER_CELL.1);
+/// How far into each slider cell, from its own left edge,
+/// `render_gallery_produces_distinct_pixels_for_each_slider_state`
+/// samples — well within the thumb's own 32px width when the thumb is
+/// at that cell's own left edge (the minimum-value cell), but past it
+/// once the thumb has moved away (see that test's own doc comment).
+const SLIDER_THUMB_SAMPLE_OFFSET_X: u32 = 16;
+
+const TEXT_FIELD_CELL: (u32, u32) = (192, 32);
+const TEXT_FIELD_GALLERY_SIZE: (u32, u32) = (TEXT_FIELD_CELL.0 * 2, TEXT_FIELD_CELL.1);
+
+/// `CommandPalette` has exactly one visual state today (`paint_widget`'s
+/// own doc comment: no query text, no result-row highlighting, just the
+/// outer panel) — one cell, not a row of them.
+const COMMAND_PALETTE_CELL: (u32, u32) = (192, 128);
+const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = COMMAND_PALETTE_CELL;
 
 /// Serializes this file's real-GPU tests, this integration test's own
 /// copy of the same "one `wgpu::Instance`/`Device` at a time" lock
@@ -115,18 +148,19 @@ fn scales() -> Scales {
     }
 }
 
-fn sized_style() -> Style {
+fn sized_style(size: (u32, u32)) -> Style {
     Style {
         size: Size {
-            width: length(CELL.0 as f32),
-            height: length(CELL.1 as f32),
+            width: length(size.0 as f32),
+            height: length(size.1 as f32),
         },
         ..Default::default()
     }
 }
 
 /// A real, laid-out tree with one `Button` per state — `paint_widget`'s
-/// own natural minimal fixture, side by side in `CELL`-sized cells.
+/// own natural minimal fixture, side by side in `BUTTON_CELL`-sized
+/// cells.
 fn button_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3]) {
     let (mut tree, root) = new_tree(Style {
         flex_direction: FlexDirection::Row,
@@ -152,13 +186,146 @@ fn button_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3
     }
 
     for id in [enabled, pressed, disabled] {
-        if let Err(err) = tree.set_style(id, sized_style()) {
+        if let Err(err) = tree.set_style(id, sized_style(BUTTON_CELL)) {
             unreachable!("{err:?}");
         }
     }
     #[allow(clippy::cast_precision_loss)]
-    tree.compute_layout(GALLERY_SIZE.0 as f32, GALLERY_SIZE.1 as f32);
+    tree.compute_layout(BUTTON_GALLERY_SIZE.0 as f32, BUTTON_GALLERY_SIZE.1 as f32);
     (tree, [enabled, pressed, disabled])
+}
+
+/// A real, laid-out tree with one `Checkbox` per state, mirroring
+/// exactly the three cases `src/paint.rs`'s own unit tests already
+/// cover: unchecked (enabled), checked (enabled), and unchecked
+/// disabled — not checked-and-disabled, so this exercises the
+/// `surface.sunken` + `disabled_opacity` combination specifically,
+/// distinct from the checked cell's own `accent.primary`.
+fn checkbox_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let unchecked = match insert_checkbox(&mut tree, root, scales, "Unchecked") {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let checked = match insert_checkbox(&mut tree, root, scales, "Checked") {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = toggle_checkbox(&mut tree, checked) {
+        unreachable!("{err:?}");
+    }
+    let disabled = match insert_checkbox(&mut tree, root, scales, "Disabled") {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = set_checkbox_disabled(&mut tree, disabled, true) {
+        unreachable!("{err:?}");
+    }
+
+    for id in [unchecked, checked, disabled] {
+        if let Err(err) = tree.set_style(id, sized_style(CHECKBOX_CELL)) {
+            unreachable!("{err:?}");
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        CHECKBOX_GALLERY_SIZE.0 as f32,
+        CHECKBOX_GALLERY_SIZE.1 as f32,
+    );
+    (tree, [unchecked, checked, disabled])
+}
+
+/// A real, laid-out tree with one `Slider` per state: at its own
+/// minimum value, at its own maximum value, and disabled (at a value
+/// in between, so its own thumb sits somewhere a bare min/max
+/// comparison wouldn't already cover).
+fn slider_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let at_min = match insert_slider(&mut tree, root, scales, "Min", 0.0, 0.0, 100.0) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let at_max = match insert_slider(&mut tree, root, scales, "Max", 100.0, 0.0, 100.0) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let disabled = match insert_slider(&mut tree, root, scales, "Disabled", 50.0, 0.0, 100.0) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = set_slider_disabled(&mut tree, disabled, true) {
+        unreachable!("{err:?}");
+    }
+
+    for id in [at_min, at_max, disabled] {
+        if let Err(err) = tree.set_style(id, sized_style(SLIDER_CELL)) {
+            unreachable!("{err:?}");
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(SLIDER_GALLERY_SIZE.0 as f32, SLIDER_GALLERY_SIZE.1 as f32);
+    (tree, [at_min, at_max, disabled])
+}
+
+/// A real, laid-out tree with one `TextField` per state: enabled, and
+/// disabled.
+fn text_field_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let enabled = match insert_text_field(&mut tree, root, scales, "name", "hello") {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let disabled = match insert_text_field(&mut tree, root, scales, "name", "") {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = set_text_field_disabled(&mut tree, disabled, true) {
+        unreachable!("{err:?}");
+    }
+
+    for id in [enabled, disabled] {
+        if let Err(err) = tree.set_style(id, sized_style(TEXT_FIELD_CELL)) {
+            unreachable!("{err:?}");
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        TEXT_FIELD_GALLERY_SIZE.0 as f32,
+        TEXT_FIELD_GALLERY_SIZE.1 as f32,
+    );
+    (tree, [enabled, disabled])
+}
+
+/// A real, laid-out tree with one `CommandPalette` — `paint_widget`
+/// resolves exactly one visual state for it today (see this file's own
+/// module doc comment), so there's only one cell, not a row. No
+/// `&Scales` parameter, unlike every other `*_gallery_tree` function
+/// here — `insert_command_palette` genuinely doesn't need one.
+fn command_palette_gallery_tree() -> (WidgetTree<WidgetKind>, [WidgetId; 1]) {
+    let (mut tree, root) = new_tree(Style::default());
+    let commands = vec![CommandEntry::new("edit.undo", "Undo")];
+    let palette = match insert_command_palette(&mut tree, root, commands) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = tree.set_style(palette, sized_style(COMMAND_PALETTE_CELL)) {
+        unreachable!("{err:?}");
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        COMMAND_PALETTE_GALLERY_SIZE.0 as f32,
+        COMMAND_PALETTE_GALLERY_SIZE.1 as f32,
+    );
+    (tree, [palette])
 }
 
 /// Renders every widget in `tree` (`paint_widget`, in
@@ -369,20 +536,25 @@ fn read_rgba8(
     rgba
 }
 
-/// Reads the pixel at the centre of gallery cell `cell` (0 = enabled,
-/// 1 = pressed, 2 = disabled) — enough to distinguish the three
-/// states' own fill colours without needing a golden image at all.
-fn sample_cell_centre(image: &aurora_testkit::Image, cell: u32) -> [u8; 4] {
-    let cx = cell * CELL.0 + CELL.0 / 2;
-    let cy = CELL.1 / 2;
-    let offset = (cy * image.width + cx) as usize * 4;
+/// Reads the pixel at absolute image coordinates `(x, y)`.
+fn sample_at(image: &aurora_testkit::Image, px: u32, py: u32) -> [u8; 4] {
+    let offset = (py * image.width + px) as usize * 4;
     let Some(pixel) = image.rgba.get(offset..offset + 4) else {
-        unreachable!("cell centre is always within a real gallery image");
+        unreachable!("sample point is always within a real gallery image");
     };
     match pixel {
         &[r, g, b, a] => [r, g, b, a],
         _ => unreachable!("sliced exactly 4 bytes"),
     }
+}
+
+/// Reads the pixel at the centre of gallery cell `cell` (`cell_size`
+/// wide/tall each, side by side left to right) — enough to distinguish
+/// each state's own fill colour without needing a golden image at all.
+fn sample_cell_centre(image: &aurora_testkit::Image, cell_size: (u32, u32), cell: u32) -> [u8; 4] {
+    let cx = cell * cell_size.0 + cell_size.0 / 2;
+    let cy = cell_size.1 / 2;
+    sample_at(image, cx, cy)
 }
 
 /// A real, self-contained proof the harness itself works, needing no
@@ -408,15 +580,15 @@ fn render_gallery_produces_distinct_pixels_for_each_button_state() {
         &tree,
         &theme,
         &scales,
-        GALLERY_SIZE,
+        BUTTON_GALLERY_SIZE,
         wgpu::Color::BLACK,
     );
-    assert_eq!(image.width, GALLERY_SIZE.0);
-    assert_eq!(image.height, GALLERY_SIZE.1);
+    assert_eq!(image.width, BUTTON_GALLERY_SIZE.0);
+    assert_eq!(image.height, BUTTON_GALLERY_SIZE.1);
 
-    let enabled_px = sample_cell_centre(&image, 0);
-    let pressed_px = sample_cell_centre(&image, 1);
-    let disabled_px = sample_cell_centre(&image, 2);
+    let enabled_px = sample_cell_centre(&image, BUTTON_CELL, 0);
+    let pressed_px = sample_cell_centre(&image, BUTTON_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, BUTTON_CELL, 2);
     assert_ne!(
         enabled_px, pressed_px,
         "accent.primary vs accent.primary_active must render differently"
@@ -461,11 +633,283 @@ fn button_gallery_matches_the_golden_image() {
         &tree,
         &theme,
         &scales,
-        GALLERY_SIZE,
+        BUTTON_GALLERY_SIZE,
         wgpu::Color::BLACK,
     );
     let golden_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/button_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same "distinct pixels, no golden needed" proof as `Button`'s
+/// own, for `Checkbox`: unchecked (`surface.sunken`) vs checked
+/// (`accent.primary`) must render differently outright; unchecked vs
+/// unchecked-disabled must render as the same token dimmed.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_checkbox_state() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = checkbox_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        CHECKBOX_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    assert_eq!(image.width, CHECKBOX_GALLERY_SIZE.0);
+    assert_eq!(image.height, CHECKBOX_GALLERY_SIZE.1);
+
+    let unchecked_px = sample_cell_centre(&image, CHECKBOX_CELL, 0);
+    let checked_px = sample_cell_centre(&image, CHECKBOX_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, CHECKBOX_CELL, 2);
+    assert_ne!(
+        unchecked_px, checked_px,
+        "surface.sunken vs accent.primary must render differently"
+    );
+    assert_ne!(
+        unchecked_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+    );
+}
+
+/// **`#[ignore]`, deliberately, until a human blesses a real golden**
+/// — see `button_gallery_matches_the_golden_image`'s own doc comment
+/// for the full reasoning (identical here): run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
+/// -- --ignored`, open the written `tests/golden/checkbox_gallery.png`,
+/// confirm it shows three visually distinct checkboxes in Dark theme
+/// colours, then remove this attribute and commit the PNG alongside
+/// that commit.
+#[test]
+#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/checkbox_gallery.png first"]
+fn checkbox_gallery_matches_the_golden_image() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = checkbox_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        CHECKBOX_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    let golden_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/checkbox_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// `Slider`'s own "distinct pixels" proof is shaped differently from
+/// the others: instead of comparing each cell's own centre (which
+/// would just show the track, not the thumb, for anything but a
+/// dead-centre value), this samples a fixed offset from each cell's
+/// own left edge (`x = 16`, well within the thumb's own 32px width) —
+/// at the minimum value the thumb sits right there (`accent.primary`);
+/// at the maximum value the thumb has moved to the cell's own right
+/// edge, so that same offset now shows bare track (`surface.sunken`)
+/// instead. A real, direct proof the thumb's own position actually
+/// moved, via rendered pixels rather than mesh vertices
+/// (`src/paint.rs`'s own `a_sliders_thumb_moves_right_as_its_value_
+/// increases` unit test already covers the geometry; this covers the
+/// GPU pipeline actually drawing it).
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_slider_state() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = slider_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        SLIDER_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    assert_eq!(image.width, SLIDER_GALLERY_SIZE.0);
+    assert_eq!(image.height, SLIDER_GALLERY_SIZE.1);
+
+    let near_left_edge = |cell: u32| {
+        sample_at(
+            &image,
+            cell * SLIDER_CELL.0 + SLIDER_THUMB_SAMPLE_OFFSET_X,
+            SLIDER_CELL.1 / 2,
+        )
+    };
+    let at_min = near_left_edge(0);
+    let at_max = near_left_edge(1);
+    let disabled = near_left_edge(2);
+    assert_ne!(
+        at_min, at_max,
+        "the thumb must be at a different x offset for a slider at its own minimum vs maximum value"
+    );
+    assert_ne!(
+        at_max[..3],
+        disabled[..3],
+        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+    );
+}
+
+/// See `checkbox_gallery_matches_the_golden_image`'s own doc comment
+/// for the full "never bless blind" reasoning.
+#[test]
+#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/slider_gallery.png first"]
+fn slider_gallery_matches_the_golden_image() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = slider_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        SLIDER_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    let golden_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/slider_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same "distinct pixels, no golden needed" proof as the other
+/// widgets', for `TextField`: enabled vs disabled must render as the
+/// same `surface.sunken` token dimmed, the only state `paint_text_field`
+/// resolves today.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_text_field_state() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    assert_eq!(image.width, TEXT_FIELD_GALLERY_SIZE.0);
+    assert_eq!(image.height, TEXT_FIELD_GALLERY_SIZE.1);
+
+    let enabled_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 0);
+    let disabled_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 1);
+    assert_ne!(
+        enabled_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+    );
+}
+
+/// See `checkbox_gallery_matches_the_golden_image`'s own doc comment
+/// for the full "never bless blind" reasoning.
+#[test]
+#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/text_field_gallery.png first"]
+fn text_field_gallery_matches_the_golden_image() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/text_field_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// `CommandPalette` has exactly one visual state today (`paint_widget`'s
+/// own doc comment), so there's no second state to compare against —
+/// this proves only that the panel's own centre was actually painted
+/// at all (not left showing the black clear colour underneath it),
+/// real and self-contained without needing a golden image.
+#[test]
+fn render_gallery_produces_the_command_palettes_own_panel() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    assert_eq!(image.width, COMMAND_PALETTE_GALLERY_SIZE.0);
+    assert_eq!(image.height, COMMAND_PALETTE_GALLERY_SIZE.1);
+
+    let sample = sample_cell_centre(&image, COMMAND_PALETTE_CELL, 0);
+    assert_ne!(
+        sample,
+        [0, 0, 0, 255],
+        "the panel's own centre must show surface.raised, not the black clear colour underneath it"
+    );
+}
+
+/// See `checkbox_gallery_matches_the_golden_image`'s own doc comment
+/// for the full "never bless blind" reasoning.
+#[test]
+#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/command_palette_gallery.png first"]
+fn command_palette_gallery_matches_the_golden_image() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/command_palette_gallery.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
