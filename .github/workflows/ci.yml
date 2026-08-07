@@ -39,6 +39,11 @@ jobs:
       - name: Crate layering
         run: python3 scripts/check_layering.py
 
+      # PRD FR-027 acceptance criterion 3 / invariant §7.3.10: no widget
+      # hardcodes a colour or pixel size outside a real design token.
+      - name: No hardcoded style values
+        run: python3 scripts/check_no_hardcoded_style.py
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

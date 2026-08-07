@@ -29,6 +29,7 @@ cargo fmt --all                         # format
 cargo fmt --all --check                 # CI check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 python3 scripts/check_layering.py       # crate layering rule (PRD §7.2)
+python3 scripts/check_no_hardcoded_style.py  # no literal colours/sizes in widget code (FR-027)
 cargo deny check all                    # licences + advisories
 cargo doc --workspace --no-deps --open  # docs
 
@@ -48,6 +49,7 @@ The full CI gate locally, in the order CI runs it:
 
 ```sh
 cargo fmt --all --check && python3 scripts/check_layering.py \
+  && python3 scripts/check_no_hardcoded_style.py \
   && cargo clippy --workspace --all-targets --all-features -- -D warnings \
   && cargo nextest run --workspace
 ```
