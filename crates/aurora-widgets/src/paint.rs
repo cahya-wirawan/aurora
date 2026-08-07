@@ -4,19 +4,25 @@
 //! this pipeline" step `render`'s own doc comment names as still open.
 //!
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
-//! `Checkbox`, and `Slider` — solid rounded-rect shapes, the simplest
-//! of the widgets this crate has (`widgets`' own doc comment).
-//! `Checkbox`'s own box has no check/dash *glyph* drawn inside it yet
-//! (this crate draws no glyphs at all — solid fills only, `render`'s
-//! own doc comment); `Toggled::True` and `Toggled::Mixed` currently
-//! render identically (both `accent.primary`) since nothing yet exists
-//! to tell them apart visually. Every other [`WidgetKind`] returns
-//! `Ok(vec![])` (a real, deliberate "nothing to paint yet"), not an
-//! error — `TextField`/`CommandPalette` still need their own shapes (a
-//! caret/selection, a list) designed and built the same way, one at a
-//! time, matching this project's own "no half-finished
-//! implementations" practice rather than a
-//! fill-everything-with-a-rectangle placeholder.
+//! `Checkbox`, `Slider`, and `TextField` — solid rounded-rect shapes,
+//! the simplest of the widgets this crate has (`widgets`' own doc
+//! comment). `Checkbox`'s own box has no check/dash *glyph* drawn
+//! inside it yet (this crate draws no glyphs at all — solid fills
+//! only, `render`'s own doc comment); `Toggled::True` and
+//! `Toggled::Mixed` currently render identically (both
+//! `accent.primary`) since nothing yet exists to tell them apart
+//! visually. `TextField` paints its own background only — no caret, no
+//! selection highlight, no composition underline
+//! (`composition_segments`' own byte-range *data* has no pixel
+//! position to map to without real text shaping, which doesn't exist
+//! in this crate; `content`/`cursor`/`selection_anchor`/`composition`
+//! don't affect its paint at all today, only `disabled` does). Every
+//! other [`WidgetKind`] returns `Ok(vec![])` (a real, deliberate
+//! "nothing to paint yet"), not an error — `CommandPalette` still
+//! needs its own shape (a list) designed and built the same way,
+//! matching this project's own "no half-finished implementations"
+//! practice rather than a fill-everything-with-a-rectangle
+//! placeholder.
 //!
 //! [`paint_widget`] returns a `Vec<Paint>`, not a single `Paint` —
 //! `Button`/`Checkbox` only ever needed one shape, but `Slider` is the
@@ -56,7 +62,7 @@ use aurora_vector::{DEFAULT_TOLERANCE, Mesh, fill, rounded_rect};
 
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
-use crate::widgets::{ButtonState, CheckboxState, SliderState, WidgetKind};
+use crate::widgets::{ButtonState, CheckboxState, SliderState, TextFieldState, WidgetKind};
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
 /// unpremultiplied RGBA colour to draw it with — exactly the pair
@@ -93,9 +99,10 @@ pub fn paint_widget(
             paint_checkbox(state, bounds, theme, scales).map(|p| vec![p])
         }
         WidgetKind::Slider(state) => paint_slider(state, bounds, theme, scales),
-        WidgetKind::Container | WidgetKind::TextField(_) | WidgetKind::CommandPalette(_) => {
-            Ok(vec![])
+        WidgetKind::TextField(state) => {
+            paint_text_field(state, bounds, theme, scales).map(|p| vec![p])
         }
+        WidgetKind::Container | WidgetKind::CommandPalette(_) => Ok(vec![]),
     }
 }
 
@@ -222,14 +229,42 @@ fn paint_slider(
     Ok(vec![track, thumb])
 }
 
+fn paint_text_field(
+    state: &TextFieldState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+) -> Result<Paint, WidgetError> {
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+
+    // The same "recessed input control" token an unchecked Checkbox and
+    // a Slider's own track already use -- `content`/`cursor`/
+    // `selection_anchor`/`composition` don't affect this at all, see
+    // this module's own doc comment for why.
+    let [r, g, b] = theme.surface.sunken.to_srgb_f32();
+    let alpha = if state.disabled {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    Ok((mesh, [r, g, b, alpha]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        WidgetKind, insert_button, insert_checkbox, insert_slider, new_tree, set_button_disabled,
-        set_button_pressed, set_checkbox_disabled, set_slider_disabled, set_slider_value,
-        toggle_checkbox,
+        WidgetKind, insert_button, insert_checkbox, insert_slider, insert_text_field, new_tree,
+        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_slider_disabled,
+        set_slider_value, set_text_field_disabled, toggle_checkbox,
     };
     use accesskit::Toggled;
     use aurora_core::Rect;
@@ -569,6 +604,59 @@ mod tests {
         for (_, color) in &paints {
             assert_eq!(color[3], theme.state.disabled_opacity);
         }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_text_field_paints_surface_sunken() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let field = match insert_text_field(&mut tree, root, &scales, "name", "hello") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            field,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 160,
+                height: 28,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (mesh, color) = single_paint(&tree, field, &theme, &scales);
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a 160x28 text field must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.surface.sunken.to_srgb_f32();
+        assert_eq!(
+            color,
+            [r, g, b, 1.0],
+            "an enabled text field must use surface.sunken at full opacity"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_text_field_applies_the_theme_disabled_opacity() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let field = match insert_text_field(&mut tree, root, &scales, "name", "") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_text_field_disabled(&mut tree, field, true) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (_, color) = single_paint(&tree, field, &theme, &scales);
+        assert_eq!(color[3], theme.state.disabled_opacity);
     }
 
     #[test]
