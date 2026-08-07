@@ -4,9 +4,10 @@
 //! this pipeline" step `render`'s own doc comment names as still open.
 //!
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
-//! `Checkbox`, `Slider`, `TextField`, and `CommandPalette` — solid
-//! rounded-rect shapes, the simplest of the widgets this crate has
-//! (`widgets`' own doc comment). `Checkbox`'s own box has no check/dash
+//! `Checkbox`, `Slider`, `TextField`, `CommandPalette`, and
+//! `ColorSwatch` — solid rounded-rect shapes, the simplest of the
+//! widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
+//! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
 //! solid fills only, `render`'s own doc comment); `Toggled::True` and
 //! `Toggled::Mixed` currently render identically (both
@@ -65,7 +66,9 @@ use aurora_vector::{DEFAULT_TOLERANCE, Mesh, fill, rounded_rect};
 
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
-use crate::widgets::{ButtonState, CheckboxState, SliderState, TextFieldState, WidgetKind};
+use crate::widgets::{
+    ButtonState, CheckboxState, ColorSwatchState, SliderState, TextFieldState, WidgetKind,
+};
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
 /// unpremultiplied RGBA colour to draw it with — exactly the pair
@@ -107,6 +110,9 @@ pub fn paint_widget(
         }
         WidgetKind::CommandPalette(_) => {
             paint_command_palette(bounds, theme, scales).map(|p| vec![p])
+        }
+        WidgetKind::ColorSwatch(state) => {
+            paint_color_swatch(*state, bounds, theme, scales).map(|p| vec![p])
         }
         WidgetKind::Container => Ok(vec![]),
     }
@@ -305,19 +311,52 @@ fn paint_command_palette(
     Ok((mesh, [r, g, b, 1.0]))
 }
 
+/// A colour swatch's own fill: `state.color` itself — the one widget in
+/// this module whose fill colour is *not* a `Theme` token (see this
+/// module's own doc comment and `widgets::color_swatch`'s for why: the
+/// displayed colour is arbitrary caller data, e.g. the document's
+/// current foreground colour, not UI chrome). `scales.radius.sm`, the
+/// same small-control radius `Button`/`Checkbox`/`TextField` already
+/// use — a swatch is a small control, not a floating panel like
+/// `CommandPalette`. `theme` is still needed for `state.disabled_opacity`,
+/// which *is* real chrome (how strongly a disabled swatch dims), not
+/// the colour it swatches.
+fn paint_color_swatch(
+    state: ColorSwatchState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+) -> Result<Paint, WidgetError> {
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let [r, g, b] = state.color.to_srgb_f32();
+    let alpha = if state.disabled {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    Ok((mesh, [r, g, b, alpha]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
         CommandEntry, WidgetKind, command_palette_state, insert_button, insert_checkbox,
-        insert_command_palette, insert_slider, insert_text_field, new_tree, set_button_disabled,
-        set_button_pressed, set_checkbox_disabled, set_slider_disabled, set_slider_value,
-        set_text_field_disabled, toggle_checkbox,
+        insert_color_swatch, insert_command_palette, insert_slider, insert_text_field, new_tree,
+        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
+        set_slider_disabled, set_slider_value, set_text_field_disabled, toggle_checkbox,
     };
     use accesskit::Toggled;
     use aurora_core::Rect;
-    use aurora_theme::{Palette, Scales, Theme, ThemeSet};
+    use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
 
     const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
     const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
@@ -770,6 +809,74 @@ mod tests {
             paints.is_empty(),
             "a result row is a plain Container and has no paint defined yet -- see \
              paint_command_palette's own doc comment for why"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_color_swatch_paints_its_own_arbitrary_color() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let color = Color {
+            r: 12,
+            g: 200,
+            b: 90,
+        };
+        let swatch = match insert_color_swatch(&mut tree, root, &scales, color) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            swatch,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (mesh, paint_color) = single_paint(&tree, swatch, &theme, &scales);
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a 32x32 color swatch must tessellate to real geometry"
+        );
+        let [r, g, b] = color.to_srgb_f32();
+        assert_eq!(
+            paint_color,
+            [r, g, b, 1.0],
+            "an enabled swatch must paint its own color, not a theme token, at full opacity"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_color_swatch_applies_the_theme_disabled_opacity() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let color = Color {
+            r: 12,
+            g: 200,
+            b: 90,
+        };
+        let swatch = match insert_color_swatch(&mut tree, root, &scales, color) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_color_swatch_disabled(&mut tree, swatch, true) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (_, paint_color) = single_paint(&tree, swatch, &theme, &scales);
+        let [r, g, b] = color.to_srgb_f32();
+        assert_eq!(
+            paint_color,
+            [r, g, b, theme.state.disabled_opacity],
+            "a disabled swatch still shows its own color, just dimmed"
         );
     }
 

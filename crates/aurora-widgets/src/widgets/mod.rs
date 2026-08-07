@@ -1,17 +1,19 @@
 //! The concrete widget set. PLAN.md M1.7's fourth deliverable.
 //!
-//! **Scope, stated honestly**: this is a first slice, not the full
-//! 12-widget list PLAN.md names (button, checkbox, slider, number field,
-//! dropdown, scrollbar, tree, tab bar, menu, tooltip, colour picker,
-//! curve editor). `Button` ([`ButtonState`]), `Checkbox`
-//! ([`CheckboxState`]), and `Slider` ([`SliderState`]) cover three
-//! genuinely different interaction shapes — a discrete trigger, a
-//! toggle, and a continuous drag — which is enough to validate the
-//! pattern every other widget will follow. The rest need infrastructure
-//! that doesn't exist yet (text editing for number fields/dropdowns,
-//! scrolling for scrollbars/trees, popover layering for menus/tooltips,
-//! `aurora-vector` path rendering for the colour picker/curve editor) and
-//! are deliberately left open rather than stubbed out half-built.
+//! **Scope, stated honestly**: not yet the full 12-widget list PLAN.md
+//! names (button, checkbox, slider, field, dropdown, scrollbar, tree,
+//! tab bar, menu, tooltip, colour swatch, curve editor —
+//! `design/gallery/index.html`'s own list). `Button` ([`ButtonState`]),
+//! `Checkbox` ([`CheckboxState`]), `Slider` ([`SliderState`]) covered
+//! three genuinely different interaction shapes first — a discrete
+//! trigger, a toggle, and a continuous drag — enough to validate the
+//! pattern every other widget follows; `TextField`
+//! ([`TextFieldState`]), `CommandPalette` ([`CommandPaletteState`]),
+//! and `ColorSwatch` ([`ColorSwatchState`]) followed. The rest need
+//! infrastructure that doesn't exist yet (real text shaping for
+//! dropdowns, scrolling for scrollbars/trees, popover layering for
+//! menus/tooltips, `aurora-vector` path rendering for the curve editor)
+//! and are deliberately left open rather than stubbed out half-built.
 //!
 //! **No rendering**: every widget here produces layout (a `taffy::Style`,
 //! resolved from `aurora_theme::Scales` — invariant §7.3.10, no
@@ -30,6 +32,7 @@
 
 mod button;
 mod checkbox;
+mod color_swatch;
 mod command_palette;
 mod dialog;
 mod slider;
@@ -37,6 +40,9 @@ mod text_field;
 
 pub use button::{ButtonState, insert_button, set_button_disabled, set_button_pressed};
 pub use checkbox::{CheckboxState, insert_checkbox, set_checkbox_disabled, toggle_checkbox};
+pub use color_swatch::{
+    ColorSwatchState, insert_color_swatch, set_color_swatch_color, set_color_swatch_disabled,
+};
 pub use command_palette::{
     CommandEntry, CommandPaletteState, command_palette_state, insert_command_palette,
     move_command_palette_selection, set_command_palette_query,
@@ -70,6 +76,7 @@ pub enum WidgetKind {
     Slider(SliderState),
     TextField(TextFieldState),
     CommandPalette(CommandPaletteState),
+    ColorSwatch(ColorSwatchState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

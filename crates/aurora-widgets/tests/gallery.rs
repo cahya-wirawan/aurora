@@ -10,11 +10,11 @@
 //! pixel, not a whole image against a golden).
 //!
 //! **Scope, stated honestly.** `paint_widget` covers `Button`,
-//! `Checkbox`, `Slider`, `TextField`, and `CommandPalette` — this
-//! gallery now covers all five, each its own small tree, its own
-//! `render_gallery` call, its own golden PNG, the same "add a tree,
-//! call [`render_gallery`], bless a golden" shape the very first
-//! version of this file's own doc comment already predicted. Nothing
+//! `Checkbox`, `Slider`, `TextField`, `CommandPalette`, and
+//! `ColorSwatch` — this gallery now covers all six, each its own small
+//! tree, its own `render_gallery` call, its own golden PNG, the same
+//! "add a tree, call [`render_gallery`], bless a golden" shape the very
+//! first version of this file's own doc comment already predicted. Nothing
 //! here re-litigates what each widget's own `paint_widget` case
 //! already decides (colours, which states exist) — see `src/paint.rs`
 //! for that; this file only proves the render pipeline actually
@@ -24,11 +24,12 @@
 //! as an external consumer would use it" discipline `tests/headless.rs`
 //! already established for this crate's integration tests.
 
-use aurora_theme::{Palette, Scales, Theme, ThemeSet};
+use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::widgets::{
-    CommandEntry, WidgetKind, insert_button, insert_checkbox, insert_command_palette,
-    insert_slider, insert_text_field, new_tree, set_button_disabled, set_button_pressed,
-    set_checkbox_disabled, set_slider_disabled, set_text_field_disabled, toggle_checkbox,
+    CommandEntry, WidgetKind, insert_button, insert_checkbox, insert_color_swatch,
+    insert_command_palette, insert_slider, insert_text_field, new_tree, set_button_disabled,
+    set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled, set_slider_disabled,
+    set_text_field_disabled, toggle_checkbox,
 };
 use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
 use std::sync::{Mutex, MutexGuard};
@@ -60,6 +61,9 @@ const BUTTON_GALLERY_SIZE: (u32, u32) = (BUTTON_CELL.0 * 3, BUTTON_CELL.1);
 
 const CHECKBOX_CELL: (u32, u32) = (64, 64);
 const CHECKBOX_GALLERY_SIZE: (u32, u32) = (CHECKBOX_CELL.0 * 3, CHECKBOX_CELL.1);
+
+const COLOR_SWATCH_CELL: (u32, u32) = (64, 64);
+const COLOR_SWATCH_GALLERY_SIZE: (u32, u32) = (COLOR_SWATCH_CELL.0 * 3, COLOR_SWATCH_CELL.1);
 
 /// Wider than tall — a slider needs real horizontal travel for its own
 /// thumb position to mean anything, unlike the other widgets' own
@@ -276,6 +280,59 @@ fn checkbox_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId;
         CHECKBOX_GALLERY_SIZE.1 as f32,
     );
     (tree, [unchecked, checked, disabled])
+}
+
+/// A real, laid-out tree with one `ColorSwatch` per state: a first
+/// arbitrary colour, a second, visually distinct arbitrary colour, and
+/// the first colour again but disabled — proving both that two
+/// different `state.color` values actually paint differently (unlike
+/// every other widget here, `ColorSwatch`'s own fill isn't a theme
+/// token, so this is the one gallery that can't just compare two
+/// different *states* of the same colour) and that `disabled_opacity`
+/// still dims a swatch's own arbitrary colour the same way it dims
+/// every other widget's token colour.
+fn color_swatch_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let red = Color {
+        r: 220,
+        g: 40,
+        b: 40,
+    };
+    let blue = Color {
+        r: 40,
+        g: 80,
+        b: 220,
+    };
+    let first = match insert_color_swatch(&mut tree, root, scales, red) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let second = match insert_color_swatch(&mut tree, root, scales, blue) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let disabled = match insert_color_swatch(&mut tree, root, scales, red) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    if let Err(err) = set_color_swatch_disabled(&mut tree, disabled, true) {
+        unreachable!("{err:?}");
+    }
+
+    for id in [first, second, disabled] {
+        if let Err(err) = tree.set_style(id, sized_style(COLOR_SWATCH_CELL)) {
+            unreachable!("{err:?}");
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        COLOR_SWATCH_GALLERY_SIZE.0 as f32,
+        COLOR_SWATCH_GALLERY_SIZE.1 as f32,
+    );
+    (tree, [first, second, disabled])
 }
 
 /// A real, laid-out tree with one `Slider` per state: at its own
@@ -783,6 +840,83 @@ fn checkbox_gallery_matches_the_golden_image() {
     );
     let golden_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/checkbox_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same "distinct pixels, no golden needed" proof as the other
+/// widgets', for `ColorSwatch`: two different arbitrary colours must
+/// render differently from each other (this is the one gallery where
+/// that's the fill colour itself, not a theme token two different
+/// *states* happen to resolve to), and the disabled cell (same colour
+/// as the first, enabled cell) must still render dimmer.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = color_swatch_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COLOR_SWATCH_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    assert_eq!(image.width, COLOR_SWATCH_GALLERY_SIZE.0);
+    assert_eq!(image.height, COLOR_SWATCH_GALLERY_SIZE.1);
+
+    let first_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 0);
+    let second_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 2);
+    assert_ne!(
+        first_px, second_px,
+        "two different swatch colours must render differently"
+    );
+    assert_ne!(
+        first_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full \
+         opacity, even though both cells share the same underlying color"
+    );
+}
+
+/// **`#[ignore]`, deliberately, until a human blesses a real golden**
+/// — see `button_gallery_matches_the_golden_image`'s own doc comment
+/// for the general "never bless blind" reasoning, and this file's own
+/// module doc comment / `CommandPalette`'s own three-round history for
+/// why that discipline matters in practice, not just in principle. Run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
+/// -- --ignored`, open the written
+/// `tests/golden/color_swatch_gallery.png`, confirm it shows three
+/// visually distinct squares (a red-ish one, a blue-ish one, and a
+/// dimmed red-ish one) in the right colours, then remove this
+/// attribute and commit the PNG alongside that commit.
+#[test]
+#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/color_swatch_gallery.png first"]
+fn color_swatch_gallery_matches_the_golden_image() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = color_swatch_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COLOR_SWATCH_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/color_swatch_gallery.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
