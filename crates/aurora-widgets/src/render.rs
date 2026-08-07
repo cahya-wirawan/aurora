@@ -38,14 +38,35 @@
 //! already produces a real `Mesh` this pipeline can draw exactly the
 //! same way a fill's `Mesh` is drawn — nothing here is fill-specific —
 //! but that combination isn't exercised by this module's own tests
-//! yet. [`crate::paint_widget`] (added 2026-08-06) is the first real
-//! widget-to-`Mesh` path — `Button`'s own solid rounded-rect background
-//! — but it stops at producing a `(Mesh, [f32; 4])`; nothing in this
-//! crate yet drives a real per-frame render pass that calls
-//! `paint_widget` for every widget in a tree and feeds the results
-//! through this pipeline (an `aurora-app` integration piece), and the
-//! golden-image component gallery testing that unblocks is still
-//! separate, still-open follow-on work.
+//! yet. [`crate::paint_widget`] (added 2026-08-06, `Button`'s own
+//! solid rounded-rect background only at first, `Checkbox`/`Slider`
+//! since) is the real widget-to-`Mesh` path; `aurora-app::App::redraw`
+//! is the real caller that drives it over a whole tree, every frame,
+//! feeding the results through this pipeline — both landed after this
+//! module did, see PLAN.md's own M1.7 section for the full account.
+//!
+//! **A real bug, found by real macOS CI (2026-08-07), not this
+//! sandbox** (no GPU adapter here — every test in this module skips):
+//! `PathPipeline::draw` used to bind an empty `GpuMesh`'s own
+//! zero-size vertex/index buffers unconditionally before issuing a
+//! `0..0` indexed draw call, on the assumption that a zero-size
+//! `wgpu::Buffer` is real and valid (true) and therefore safe to
+//! `Buffer::slice(..)` (false — `wgpu` 30 panics, "buffer slice can
+//! not be empty"). Fixed with an early return in `draw` itself for
+//! `index_count == 0`, before any buffer is touched — see that
+//! method's own doc comment. Not reachable through `App::redraw` in
+//! the *current* app (checked, not assumed: the only widgets
+//! `paint_widget` paints today — `Button`/`Checkbox`/`Slider` — are
+//! only ever inserted either before the first `WidgetTree::
+//! compute_layout` runs, where a subsequent full layout pass
+//! positions them, or never at all mid-session; `open_command_palette`
+//! is the one real mid-session insertion path and its own rows are
+//! `Container`/`CommandPalette`, neither painted yet), but a real,
+//! latent trap for the next widget that *is* inserted mid-session
+//! without an intervening layout pass — `WidgetTree::bounds` stays
+//! `UNLAID_OUT` (all zero) until `compute_layout` next runs, which
+//! `paint_widget` tessellates to an empty `Mesh` today with no special
+//! case of its own.
 
 use aurora_gpu::{Blend, PipelineCache, PipelineKey};
 use aurora_vector::Mesh;
@@ -78,8 +99,11 @@ impl GpuMesh {
     /// Uploads `mesh`'s own vertices/indices as real GPU buffers. An
     /// empty `mesh` (no vertices/indices — a degenerate or fully
     /// clamped-away shape) uploads a zero-length buffer rather than
-    /// erroring; [`PathPipeline::draw`] on the result is simply a
-    /// zero-triangle draw, the correct "nothing to show" outcome.
+    /// erroring; [`PathPipeline::draw`] on the result draws nothing —
+    /// see that method's own doc comment for the real mechanism (an
+    /// early return, not a zero-index draw call; `wgpu` doesn't allow
+    /// even binding a zero-size buffer, a real, only-recently-checked
+    /// finding).
     #[must_use]
     pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh) -> Self {
         let mut vertex_bytes = Vec::with_capacity(mesh.vertices.len() * 8);
@@ -276,7 +300,23 @@ impl PathPipeline {
     /// this; it only issues the vertex/index buffer binds and the
     /// indexed draw call itself, the one part specific to which `Mesh`
     /// is being drawn.
+    ///
+    /// An empty `mesh` (`index_count == 0`) returns immediately,
+    /// binding nothing — real macOS CI (2026-08-07) found that
+    /// `wgpu` 30 panics ("buffer slice can not be empty") on
+    /// `Buffer::slice(..)` for the zero-size buffers
+    /// [`GpuMesh::upload`] uploads for exactly this case, so binding
+    /// them at all, even for an indexed draw call of `0..0` that would
+    /// itself have been a real no-op, isn't safe to reach. This
+    /// sandbox has no GPU adapter, so this path had never actually run
+    /// against real `wgpu` before that CI run — [`GpuMesh::upload`]'s
+    /// own doc comment used to describe this as "drawing zero
+    /// triangles"; it's an early return instead now, same outcome
+    /// (nothing drawn), different, actually-correct mechanism.
     pub fn draw<'pass>(&self, pass: &mut wgpu::RenderPass<'pass>, mesh: &'pass GpuMesh) {
+        if mesh.index_count == 0 {
+            return;
+        }
         pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
         pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);

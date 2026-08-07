@@ -1781,6 +1781,34 @@ check licenses` clean with the new `toml` dependency.
   `Mesh` to hand this pipeline yet; wiring one (a rounded-rect
   background, say) through it is the next real step toward the
   Component gallery bullet below, still not itself unblocked by this.
+
+  **First real macOS CI run of this module, 2026-08-07 — found a real
+  bug the "not yet human-verified" note above was exactly warning
+  about**: `render_test::path_pipeline_draws_nothing_for_an_empty_mesh`
+  panicked, `thread ... panicked ... wgpu-30.0.0/src/api/buffer.rs:683:
+  36: buffer slice can not be empty`. `PathPipeline::draw` bound an
+  empty `GpuMesh`'s own zero-size vertex/index buffers unconditionally
+  before issuing a `0..0` indexed draw call, on the (never-before-
+  tested) assumption that a zero-size `wgpu::Buffer` — real and valid,
+  `GpuMesh::upload`'s own doc comment already correctly said so — is
+  therefore also safe to `Buffer::slice(..)`. It isn't; `wgpu` 30
+  panics on that specifically. Fixed with an early return in `draw`
+  itself for `index_count == 0`, before any buffer is touched at all —
+  same "nothing drawn" outcome, the actually-correct mechanism this
+  time. Checked, not assumed, whether this was reachable through the
+  real app: not currently (`App::redraw`'s only painted widgets today —
+  `Button`/`Checkbox`/`Slider` — are only ever inserted before the
+  first `WidgetTree::compute_layout` run or never mid-session; the one
+  real mid-session insertion path, `open_command_palette`, only inserts
+  `Container`/`CommandPalette` nodes, neither painted yet) — but a real,
+  latent trap for the next widget inserted mid-session without an
+  intervening layout pass (`WidgetTree::bounds` stays `UNLAID_OUT`,
+  all zero, until `compute_layout` next runs, which tessellates to an
+  empty `Mesh` `paint_widget` has no special case for). No new test
+  needed — the existing, already-failing
+  `path_pipeline_draws_nothing_for_an_empty_mesh` covers this exactly;
+  it just can't prove the fix from this sandbox (no GPU adapter, skips
+  as always) and needs a real CI re-run to confirm green.
 - [x] **Widget-to-`Mesh` painting (`aurora-widgets::paint_widget`)** —
   done 2026-08-06, the same day as the GPU path renderer above and its
   direct continuation. New `paint.rs`: `paint_widget(tree, id, theme,
