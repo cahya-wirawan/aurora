@@ -4546,6 +4546,11 @@ evidence supports is how the original 6-month Phase 1 estimate happened.
 panel and per-board export are Phase 2-shaped UI work, the PSD round-trip
 piece (layer group + `artb` tagged block) is Phase 3-shaped, matching how
 the rest of FR-001's PSD compatibility already splits across both phases.
+FR-029 (Crop & Slice, added 2026-08-07, from a toolbar reference list
+Cahya supplied) needs a home too — Crop/Perspective Crop/Slice/Slice
+Select are all Phase 2-shaped (selection- and transform-adjacent tool
+work, the same phase FR-004's own selection tools and FR-012's own
+transforms already belong to), not yet broken into its own milestone.
 
 **Phase 0–3 durations are milestone-based, not calendar-committed, as of
 2026-07-28** (PRD.md §9, following the solo-development answer to PRD §12

@@ -103,7 +103,7 @@ Every FR in §5 carries a priority. Where unmarked, assume **Should**.
 | **Won't (yet)** | Deferred past v1.0 by decision, not by oversight |
 
 Must: FR-001, FR-002, FR-003, FR-004, FR-005, FR-007, FR-010, FR-012, FR-021, FR-024, FR-025, FR-026, FR-027.
-Should: FR-006, FR-008, FR-009, FR-011, FR-013, FR-014, FR-016, FR-023, FR-028.
+Should: FR-006, FR-008, FR-009, FR-011, FR-013, FR-014, FR-016, FR-023, FR-028, FR-029.
 Could: FR-015, FR-017, FR-018.
 Won't (yet): FR-019, FR-020, FR-022.
 
@@ -121,6 +121,18 @@ first-class feature rather than plain-group round-trip only. Placed at
 **Should**, alongside the other persona/domain-specific features (FR-008,
 FR-009) rather than Must — it's one persona's need, not part of the
 universally-shared core.
+
+**FR-029 (Crop & Slice) added, 2026-08-07** — a new requirement, not a
+priority change: Cahya supplied a full toolbar reference list, and Crop/
+Perspective Crop/Slice/Slice Select had no owning FR anywhere in this
+document (the only prior "crop" mention was Smart Crop, an AI feature,
+FR-017). Given its own FR rather than folded into FR-012
+(Transformations) or FR-024 (User Interface) — cropping changes canvas
+*bounds*, not layer content, and slicing is a per-region export
+definition, both distinct enough operations to warrant a home of their
+own. Placed at **Should**, the same tier as FR-028 (Artboards) — a real,
+expected tool for the Photographer/Graphic Designer personas, but not
+core document infrastructure.
 
 ---
 
@@ -285,6 +297,12 @@ Features
 - Rulers
 - Reference Images
 
+Measurement and Annotation Tools
+
+- Ruler Tool — measures distance and angle (distinct from the passive Rulers above)
+- Note Tool
+- Count Tool
+
 ---
 
 # FR-003 Layer System
@@ -320,6 +338,10 @@ Layer Features
 - Visibility
 - Layer Comps
 
+Tools
+
+- Frame Tool — creates a Frame layer (image placeholder)
+
 ---
 
 # FR-004 Selection Engine
@@ -333,6 +355,7 @@ Selection Tools
 - Lasso
 - Polygon Lasso
 - Magnetic Lasso
+- Selection Brush — paints a selection using a brush overlay
 - Magic Wand
 - Quick Selection
 - Object Selection
@@ -413,6 +436,25 @@ Features
 - Clone
 - Healing
 
+Tools
+
+Interactive, brush-driven tools — distinct from FR-011's Blur/Sharpen
+*filters*, which apply non-interactively to a whole selection or layer
+rather than following the pointer.
+
+- Paint Bucket Tool
+- Gradient Tool — linear, radial, angular, reflected, and diamond gradients
+- Color Replacement Tool
+- Pattern Stamp Tool
+- History Brush Tool
+- Art History Brush Tool
+- Blur Tool
+- Sharpen Tool
+- Smudge Tool
+- Eraser Tool
+- Background Eraser Tool
+- Magic Eraser Tool
+
 ---
 
 # FR-007 Masks
@@ -443,7 +485,11 @@ Operations
 Tools
 
 - Pen
+- Freeform Pen
 - Curvature Pen
+- Add Anchor Point
+- Delete Anchor Point
+- Convert Point
 - Rectangle
 - Ellipse
 - Polygon
@@ -499,6 +545,10 @@ Adjustment Layers
 - Posterize
 - Threshold
 - LUT Support
+
+Tools
+
+- Adjustment Brush Tool — paints a non-destructive adjustment through a mask (see FR-007 Masks)
 
 ---
 
@@ -584,6 +634,7 @@ Tools
 - Healing Brush
 - Patch Tool
 - Remove Tool
+- Content-Aware Move Tool
 - Clone Stamp
 - Dodge
 - Burn
@@ -625,6 +676,8 @@ Features
 - ICC Profiles
 - Soft Proof
 - Color Picker
+- Eyedropper Tool
+- Color Sampler Tool
 - Swatches
 - Pantone Support
 
@@ -904,6 +957,7 @@ real tooling for it, not a group they have to remember is special.
 ## Features
 
 - Multiple named artboards in one document
+- Artboard Tool — draw and manage artboards directly on canvas
 - Boards panel: create, rename, reorder, navigate between boards
 - Per-board export
 - Device-size presets (common phone/tablet/desktop dimensions)
@@ -926,6 +980,50 @@ Interface) scope; per-board export reuses FR-021 (Export).
 
 Exact device-preset list, and whether boards can nest, are Phase 2/3
 implementation questions, not resolved here.
+
+---
+
+# FR-029 Crop & Slice
+
+**Priority: Should.** Added 2026-08-07, from a toolbar reference list
+Cahya supplied. No prior FR owned Crop or Slice — the only earlier
+"crop" mention in this document was Smart Crop, an AI-assisted feature
+(FR-017), not a manual tool. Given its own FR rather than folded into
+FR-012 (Transformations): cropping changes canvas *bounds*, which
+FR-012's own tools (Move, Scale, Rotate, Warp, ...) never do — they
+transform layer content within a fixed canvas. Slicing is a per-region
+export definition, closer to FR-021 (Export) than to any transform.
+
+## Tools
+
+- Crop Tool
+- Perspective Crop Tool
+- Slice Tool
+- Slice Select Tool
+
+## Features
+
+- Non-destructive crop (hidden pixels are preserved, not deleted, and reversible through FR-025 History — consistent with invariant §7.3.2, edits are never baked pixels)
+- Straighten while cropping
+- Content-aware fill of any canvas area revealed by a crop or straighten
+- Crop presets (common aspect ratios and print/device sizes)
+- Slices export independently, reusing FR-021's format/preset support
+
+## Relationship to other FRs
+
+Crop resizes the canvas (**FR-002**), not layer content — layers outside
+the new canvas bounds are clipped from view, not deleted, matching
+FR-012's own "edits are non-destructive" discipline. Slices are a named,
+rectangular sub-region of the canvas that FR-021 (Export) can target
+individually; a slice is metadata, not a layer or a document primitive
+of its own.
+
+## Open
+
+Whether Perspective Crop shares the mesh-warp math FR-012's own Puppet
+Warp/Mesh Warp already need, or is a separate, simpler quad-to-rect
+transform, is an implementation question for whenever this FR is
+actually scheduled — not resolved here.
 
 ---
 
