@@ -82,6 +82,28 @@ const TEXT_FIELD_GALLERY_SIZE: (u32, u32) = (TEXT_FIELD_CELL.0 * 2, TEXT_FIELD_C
 const COMMAND_PALETTE_CELL: (u32, u32) = (192, 128);
 const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = COMMAND_PALETTE_CELL;
 
+/// `render_gallery`'s own clear colour for `CommandPalette`/`TextField`
+/// specifically, not the plain `wgpu::Color::BLACK` every other
+/// gallery uses. Found by actually decoding the committed goldens'
+/// own raw pixel bytes, not by eye: `surface.raised`
+/// (`CommandPalette`'s own panel, `#28282c`) and `surface.sunken`
+/// (`TextField`'s own background, `#141414`, `#0a0a0a` once
+/// `disabled_opacity`-dimmed) are deliberately near-black by design
+/// (FR-027's own "near-neutral" principle) — correct data, confirmed
+/// pixel-for-pixel, but against a pure black backdrop there is
+/// nothing for a human reviewing the golden to visually anchor
+/// against, since neither widget ever resolves a bright `accent.*`
+/// colour the way `Button`/`Checkbox`/`Slider` each do in at least one
+/// of their own states. Those three keep the plain black backdrop —
+/// already blessed, already real reference points within each image,
+/// no reason to force a re-bless.
+const NEUTRAL_CLEAR: wgpu::Color = wgpu::Color {
+    r: 0.5,
+    g: 0.5,
+    b: 0.5,
+    a: 1.0,
+};
+
 /// Serializes this file's real-GPU tests, this integration test's own
 /// copy of the same "one `wgpu::Instance`/`Device` at a time" lock
 /// every other real-GPU test file in this workspace carries
@@ -681,16 +703,17 @@ fn render_gallery_produces_distinct_pixels_for_each_checkbox_state() {
     );
 }
 
-/// **`#[ignore]`, deliberately, until a human blesses a real golden**
-/// — see `button_gallery_matches_the_golden_image`'s own doc comment
-/// for the full reasoning (identical here): run
-/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
-/// -- --ignored`, open the written `tests/golden/checkbox_gallery.png`,
-/// confirm it shows three visually distinct checkboxes in Dark theme
-/// colours, then remove this attribute and commit the PNG alongside
-/// that commit.
+/// **Blessed and reviewed 2026-08-07**: Cahya ran the bless command on
+/// real macOS GPU hardware and committed `tests/golden/
+/// checkbox_gallery.png`. Confirmed by decoding its own raw pixel
+/// bytes (not just eyeballing a thumbnail): unchecked `[20,20,20]`
+/// (`surface.sunken`), checked `[120,172,255]` (`accent.primary`,
+/// clearly visible), disabled `[8,8,8]` (`surface.sunken` dimmed) —
+/// the checked cell's own real, bright colour gives a human reviewing
+/// this image a genuine reference point the way `TextField`'s own
+/// gallery doesn't (see `NEUTRAL_CLEAR`'s own doc comment), so plain
+/// black stayed the right backdrop here.
 #[test]
-#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/checkbox_gallery.png first"]
 fn checkbox_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
         return;
@@ -768,10 +791,14 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state() {
     );
 }
 
-/// See `checkbox_gallery_matches_the_golden_image`'s own doc comment
-/// for the full "never bless blind" reasoning.
+/// **Blessed and reviewed 2026-08-07**: Cahya ran the bless command on
+/// real macOS GPU hardware and committed `tests/golden/
+/// slider_gallery.png`, clearly showing the thumb at the left edge
+/// (minimum value), the right edge (maximum value), and a dimmed thumb
+/// at its own middle position (disabled) — visually unambiguous, no
+/// low-contrast concern the way `CommandPalette`/`TextField`'s own
+/// galleries had (see `NEUTRAL_CLEAR`'s own doc comment).
 #[test]
-#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/slider_gallery.png first"]
 fn slider_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
         return;
@@ -814,7 +841,7 @@ fn render_gallery_produces_distinct_pixels_for_each_text_field_state() {
         &theme,
         &scales,
         TEXT_FIELD_GALLERY_SIZE,
-        wgpu::Color::BLACK,
+        NEUTRAL_CLEAR,
     );
     assert_eq!(image.width, TEXT_FIELD_GALLERY_SIZE.0);
     assert_eq!(image.height, TEXT_FIELD_GALLERY_SIZE.1);
@@ -828,8 +855,19 @@ fn render_gallery_produces_distinct_pixels_for_each_text_field_state() {
     );
 }
 
-/// See `checkbox_gallery_matches_the_golden_image`'s own doc comment
-/// for the full "never bless blind" reasoning.
+/// **`#[ignore]`, deliberately, until a human blesses a real golden**
+/// — see `button_gallery_matches_the_golden_image`'s own doc comment
+/// for the full "never bless blind" reasoning. This one has a second
+/// reason to be (re-)blessed, not just the usual first one: an earlier
+/// committed golden here rendered against plain black and was
+/// genuinely correct but effectively unreviewable by eye (see
+/// `NEUTRAL_CLEAR`'s own doc comment) — that golden is gone, superseded
+/// by this now-`NEUTRAL_CLEAR`-backed version, which needs its own
+/// fresh bless. Run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets
+/// --test gallery -- --ignored`, open the written
+/// `tests/golden/text_field_gallery.png`, confirm it shows two visibly
+/// distinct text fields, then remove this attribute and commit the PNG
+/// alongside that commit.
 #[test]
 #[ignore = "needs a human on real GPU hardware to bless and review tests/golden/text_field_gallery.png first"]
 fn text_field_gallery_matches_the_golden_image() {
@@ -846,7 +884,7 @@ fn text_field_gallery_matches_the_golden_image() {
         &theme,
         &scales,
         TEXT_FIELD_GALLERY_SIZE,
-        wgpu::Color::BLACK,
+        NEUTRAL_CLEAR,
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/text_field_gallery.png");
@@ -857,9 +895,15 @@ fn text_field_gallery_matches_the_golden_image() {
 
 /// `CommandPalette` has exactly one visual state today (`paint_widget`'s
 /// own doc comment), so there's no second state to compare against —
-/// this proves only that the panel's own centre was actually painted
-/// at all (not left showing the black clear colour underneath it),
-/// real and self-contained without needing a golden image.
+/// this instead compares the panel's own centre against its own
+/// corner pixel `(0, 0)`. `scales.radius.md`'s real rounded corner
+/// (`paint_command_palette`'s own doc comment) means the very corner
+/// is *outside* the filled rounded rect regardless of what colour
+/// filled it, so this is a real, self-contained proof the panel was
+/// actually painted distinctly from its own surrounding clear colour
+/// — without hardcoding what that clear colour's own exact byte value
+/// is (see `NEUTRAL_CLEAR`'s own doc comment for why this gallery
+/// doesn't use plain black).
 #[test]
 fn render_gallery_produces_the_command_palettes_own_panel() {
     let Some(context) = real_context() else {
@@ -875,21 +919,34 @@ fn render_gallery_produces_the_command_palettes_own_panel() {
         &theme,
         &scales,
         COMMAND_PALETTE_GALLERY_SIZE,
-        wgpu::Color::BLACK,
+        NEUTRAL_CLEAR,
     );
     assert_eq!(image.width, COMMAND_PALETTE_GALLERY_SIZE.0);
     assert_eq!(image.height, COMMAND_PALETTE_GALLERY_SIZE.1);
 
-    let sample = sample_cell_centre(&image, COMMAND_PALETTE_CELL, 0);
+    let corner = sample_at(&image, 0, 0);
+    let centre = sample_cell_centre(&image, COMMAND_PALETTE_CELL, 0);
     assert_ne!(
-        sample,
-        [0, 0, 0, 255],
-        "the panel's own centre must show surface.raised, not the black clear colour underneath it"
+        corner, centre,
+        "the panel's own centre must show surface.raised, not the same clear colour its own \
+         rounded-off corner shows"
     );
 }
 
-/// See `checkbox_gallery_matches_the_golden_image`'s own doc comment
-/// for the full "never bless blind" reasoning.
+/// **`#[ignore]`, deliberately, until a human blesses a real golden**
+/// — see `text_field_gallery_matches_the_golden_image`'s own doc
+/// comment for the full reasoning, identical here: an earlier
+/// committed golden rendered against plain black, was genuinely
+/// correct (`surface.raised`, confirmed by decoding its own raw pixel
+/// bytes directly) but effectively unreviewable by eye — nearly the
+/// whole frame was one, barely-distinguishable-from-black colour, no
+/// visible boundary at all against the old backdrop. That golden is
+/// gone, superseded by this now-`NEUTRAL_CLEAR`-backed version. Run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
+/// -- --ignored`, open the written
+/// `tests/golden/command_palette_gallery.png`, confirm the panel is
+/// now visibly distinct from its own grey backdrop, then remove this
+/// attribute and commit the PNG alongside that commit.
 #[test]
 #[ignore = "needs a human on real GPU hardware to bless and review tests/golden/command_palette_gallery.png first"]
 fn command_palette_gallery_matches_the_golden_image() {
@@ -906,7 +963,7 @@ fn command_palette_gallery_matches_the_golden_image() {
         &theme,
         &scales,
         COMMAND_PALETTE_GALLERY_SIZE,
-        wgpu::Color::BLACK,
+        NEUTRAL_CLEAR,
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/command_palette_gallery.png");
