@@ -1025,32 +1025,23 @@ fn command_palette_style_positions_the_panel_with_a_real_margin() {
     );
 }
 
-/// **`#[ignore]`, deliberately, until a human blesses a real golden**
-/// — see `button_gallery_matches_the_golden_image`'s own doc comment
-/// for the general "never bless blind" reasoning. This one has been
-/// blessed twice already and rejected both times, for two different,
-/// real reasons, each found only *after* a human actually looked:
-/// first a plain-black backdrop made a correct `surface.raised` panel
-/// unreviewable by eye (fixed with `NEUTRAL_CLEAR`); then, even with
-/// that fixed, the panel still filled essentially the whole frame with
-/// no margin to contrast against at all (only `scales.radius.md`'s own
-/// tiny rounded corners ever showed the backdrop) — Cahya reported it
-/// "still looks dark" against the second attempt too. Fixed this time
-/// with a real `COMMAND_PALETTE_MARGIN` on every side
-/// (`command_palette_style`), and — since this sandbox can check
-/// layout math headlessly even without a GPU —
+/// **Blessed and reviewed 2026-08-07** (a third time — see
+/// `NEUTRAL_CLEAR`'s and `command_palette_style`'s own doc comments for
+/// the first two rejected rounds and why each failed: plain black hid
+/// a correct `surface.raised` panel, then a correct backdrop still had
+/// no margin to contrast against). This attempt added a real 32px
+/// `COMMAND_PALETTE_MARGIN` on every side via `command_palette_style`,
+/// verified headlessly first by
 /// `command_palette_style_positions_the_panel_with_a_real_margin`
-/// already proves the panel's own computed bounds sit inset exactly as
-/// intended, real confidence before asking for a third bless rather
-/// than just hoping the fix is right this time. Run
-/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
-/// -- --ignored`, open the written
-/// `tests/golden/command_palette_gallery.png`, confirm the panel now
-/// shows a real, visible grey margin on every side (not just the
-/// corners), then remove this attribute and commit the PNG alongside
-/// that commit.
+/// (proves the computed layout bounds are inset correctly, no GPU
+/// needed), then confirmed against the actual rendered PNG by decoding
+/// its raw pixel bytes directly: backdrop `[127,127,127]`
+/// (`NEUTRAL_CLEAR`) at both corners and at `x=31` (one pixel outside
+/// the panel's left edge), panel `[40,40,44]` (`surface.raised`) at its
+/// own centre and at `x=33` (one pixel inside), a real and visible
+/// margin all the way around — Cahya confirmed "looks better now"
+/// against this version.
 #[test]
-#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/command_palette_gallery.png first"]
 fn command_palette_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
         return;
