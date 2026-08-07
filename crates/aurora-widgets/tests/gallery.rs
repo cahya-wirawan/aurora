@@ -33,7 +33,7 @@ use aurora_widgets::widgets::{
 use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
 use std::sync::{Mutex, MutexGuard};
 use taffy::style_helpers::length;
-use taffy::{FlexDirection, Size, Style};
+use taffy::{FlexDirection, Rect as LayoutRect, Size, Style};
 
 const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
 const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
@@ -80,7 +80,19 @@ const TEXT_FIELD_GALLERY_SIZE: (u32, u32) = (TEXT_FIELD_CELL.0 * 2, TEXT_FIELD_C
 /// own doc comment: no query text, no result-row highlighting, just the
 /// outer panel) — one cell, not a row of them.
 const COMMAND_PALETTE_CELL: (u32, u32) = (192, 128);
-const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = COMMAND_PALETTE_CELL;
+/// A real margin around the panel on every side, not just a bigger
+/// backdrop colour — found necessary the hard way (2026-08-07):
+/// `NEUTRAL_CLEAR` alone wasn't enough, because the panel was still
+/// filling essentially the whole frame with no border to contrast
+/// against at all, `scales.radius.md`'s own small rounded corners
+/// being the only pixels that ever showed the backdrop. See
+/// `command_palette_style`'s own doc comment for how this actually
+/// gets applied.
+const COMMAND_PALETTE_MARGIN: u32 = 32;
+const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = (
+    COMMAND_PALETTE_CELL.0 + COMMAND_PALETTE_MARGIN * 2,
+    COMMAND_PALETTE_CELL.1 + COMMAND_PALETTE_MARGIN * 2,
+);
 
 /// `render_gallery`'s own clear colour for `CommandPalette`/`TextField`
 /// specifically, not the plain `wgpu::Color::BLACK` every other
@@ -96,7 +108,13 @@ const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = COMMAND_PALETTE_CELL;
 /// colour the way `Button`/`Checkbox`/`Slider` each do in at least one
 /// of their own states. Those three keep the plain black backdrop —
 /// already blessed, already real reference points within each image,
-/// no reason to force a re-bless.
+/// no reason to force a re-bless. **On its own, this alone turned out
+/// not to be enough for `CommandPalette` specifically** — it has only
+/// one visual state, so unlike `TextField` (two states, genuinely
+/// contrastable against each other even with no margin at all) its own
+/// gallery still filled essentially the whole frame with nothing to
+/// contrast the new backdrop against; `command_palette_style`'s own
+/// real margin was the second, necessary half of that particular fix.
 const NEUTRAL_CLEAR: wgpu::Color = wgpu::Color {
     r: 0.5,
     g: 0.5,
@@ -327,6 +345,39 @@ fn text_field_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetI
     (tree, [enabled, disabled])
 }
 
+/// `sized_style(COMMAND_PALETTE_CELL)` plus a real `COMMAND_PALETTE_
+/// MARGIN` on every side. Margin, not a bigger backdrop colour alone
+/// (`NEUTRAL_CLEAR`): the root this gets applied to (`new_tree`'s own
+/// default, `Style::default()`) shrink-wraps to its one child's own
+/// margin box, the standard flexbox content-sizing behaviour a
+/// single-child `Auto`-sized container already has — giving the child
+/// real margin is what makes that shrink-wrapped box, and therefore
+/// this gallery's own render target
+/// (`COMMAND_PALETTE_GALLERY_SIZE` = `COMMAND_PALETTE_CELL` padded out
+/// by `COMMAND_PALETTE_MARGIN` on every side), bigger than the panel
+/// itself in the first place. Without it, a bigger `size` passed to
+/// `render_gallery` alone would just leave extra untouched canvas the
+/// tree's own layout never actually reaches — checked directly by
+/// `command_palette_style_positions_the_panel_with_a_real_margin`
+/// below, headlessly, no GPU needed to prove the *layout* half of this
+/// is correct.
+fn command_palette_style() -> Style {
+    let margin = length(COMMAND_PALETTE_MARGIN as f32);
+    Style {
+        size: Size {
+            width: length(COMMAND_PALETTE_CELL.0 as f32),
+            height: length(COMMAND_PALETTE_CELL.1 as f32),
+        },
+        margin: LayoutRect {
+            left: margin,
+            right: margin,
+            top: margin,
+            bottom: margin,
+        },
+        ..Default::default()
+    }
+}
+
 /// A real, laid-out tree with one `CommandPalette` — `paint_widget`
 /// resolves exactly one visual state for it today (see this file's own
 /// module doc comment), so there's only one cell, not a row. No
@@ -339,7 +390,7 @@ fn command_palette_gallery_tree() -> (WidgetTree<WidgetKind>, [WidgetId; 1]) {
         Ok(id) => id,
         Err(err) => unreachable!("{err:?}"),
     };
-    if let Err(err) = tree.set_style(palette, sized_style(COMMAND_PALETTE_CELL)) {
+    if let Err(err) = tree.set_style(palette, command_palette_style()) {
         unreachable!("{err:?}");
     }
     #[allow(clippy::cast_precision_loss)]
@@ -851,25 +902,27 @@ fn render_gallery_produces_distinct_pixels_for_each_text_field_state() {
     assert_ne!(
         enabled_px[..3],
         disabled_px[..3],
-        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+        "state.disabled_opacity blended toward the clear colour must render differently from full \
+         opacity -- lighter here specifically, since NEUTRAL_CLEAR is lighter than surface.sunken, \
+         unlike the other galleries' own black backdrop"
     );
 }
 
-/// **`#[ignore]`, deliberately, until a human blesses a real golden**
-/// — see `button_gallery_matches_the_golden_image`'s own doc comment
-/// for the full "never bless blind" reasoning. This one has a second
-/// reason to be (re-)blessed, not just the usual first one: an earlier
+/// **Blessed and reviewed 2026-08-07** (a second time — the first
 /// committed golden here rendered against plain black and was
-/// genuinely correct but effectively unreviewable by eye (see
-/// `NEUTRAL_CLEAR`'s own doc comment) — that golden is gone, superseded
-/// by this now-`NEUTRAL_CLEAR`-backed version, which needs its own
-/// fresh bless. Run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets
-/// --test gallery -- --ignored`, open the written
-/// `tests/golden/text_field_gallery.png`, confirm it shows two visibly
-/// distinct text fields, then remove this attribute and commit the PNG
-/// alongside that commit.
+/// genuinely correct data but effectively unreviewable by eye, same
+/// root cause as `CommandPalette`'s own, see `NEUTRAL_CLEAR`'s own doc
+/// comment): Cahya re-ran the bless command against this
+/// `NEUTRAL_CLEAR`-backed version and committed the result. Confirmed
+/// by decoding its own raw pixel bytes directly: enabled `[20,20,20]`
+/// (`surface.sunken`, unchanged by the backdrop since full opacity
+/// never blends with anything), disabled `[85,85,85]` — genuinely,
+/// clearly distinct from the enabled cell (a human can see two real
+/// rectangles of different shades), even with no margin around either
+/// one — unlike `CommandPalette`, `TextField` has two different states
+/// to contrast *against each other*, so it never needed the margin fix
+/// `CommandPalette`'s own single-state gallery did.
 #[test]
-#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/text_field_gallery.png first"]
 fn text_field_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
         return;
@@ -924,29 +977,78 @@ fn render_gallery_produces_the_command_palettes_own_panel() {
     assert_eq!(image.width, COMMAND_PALETTE_GALLERY_SIZE.0);
     assert_eq!(image.height, COMMAND_PALETTE_GALLERY_SIZE.1);
 
+    // Not `sample_cell_centre` -- that assumes cell 0 starts at x = 0,
+    // but `command_palette_style`'s own margin pushes the panel's real
+    // centre over by `COMMAND_PALETTE_MARGIN` on both axes.
+    let panel_centre = sample_at(
+        &image,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+    );
     let corner = sample_at(&image, 0, 0);
-    let centre = sample_cell_centre(&image, COMMAND_PALETTE_CELL, 0);
     assert_ne!(
-        corner, centre,
+        corner, panel_centre,
         "the panel's own centre must show surface.raised, not the same clear colour its own \
-         rounded-off corner shows"
+         margin (and rounded-off corner) shows"
+    );
+}
+
+/// A headless (no GPU needed) proof of the *layout* half of the fix
+/// above: `command_palette_style`'s own margin actually reaches the
+/// tree's own computed bounds, not just the render target's own,
+/// larger `size`. Written specifically to build confidence *before*
+/// asking for another real-hardware bless — this sandbox can check
+/// `WidgetTree::bounds` (pure CPU layout math) but never the actual
+/// rendered pixels (no GPU adapter at all), so this is the one piece
+/// of the fix this sandbox can actually prove outright.
+#[test]
+fn command_palette_style_positions_the_panel_with_a_real_margin() {
+    let (tree, [palette]) = command_palette_gallery_tree();
+    let Some(bounds) = tree.bounds(palette) else {
+        unreachable!("just laid out");
+    };
+    let margin = i64::from(COMMAND_PALETTE_MARGIN);
+    assert_eq!(
+        bounds.x, margin,
+        "the panel must sit inset from the gallery's own left edge"
+    );
+    assert_eq!(
+        bounds.y, margin,
+        "the panel must sit inset from the gallery's own top edge"
+    );
+    assert_eq!(bounds.width, COMMAND_PALETTE_CELL.0);
+    assert_eq!(bounds.height, COMMAND_PALETTE_CELL.1);
+    assert_eq!(
+        bounds.x + i64::from(bounds.width) + margin,
+        i64::from(COMMAND_PALETTE_GALLERY_SIZE.0),
+        "the panel plus its own margin on both sides must exactly fill the gallery's own width"
     );
 }
 
 /// **`#[ignore]`, deliberately, until a human blesses a real golden**
-/// — see `text_field_gallery_matches_the_golden_image`'s own doc
-/// comment for the full reasoning, identical here: an earlier
-/// committed golden rendered against plain black, was genuinely
-/// correct (`surface.raised`, confirmed by decoding its own raw pixel
-/// bytes directly) but effectively unreviewable by eye — nearly the
-/// whole frame was one, barely-distinguishable-from-black colour, no
-/// visible boundary at all against the old backdrop. That golden is
-/// gone, superseded by this now-`NEUTRAL_CLEAR`-backed version. Run
+/// — see `button_gallery_matches_the_golden_image`'s own doc comment
+/// for the general "never bless blind" reasoning. This one has been
+/// blessed twice already and rejected both times, for two different,
+/// real reasons, each found only *after* a human actually looked:
+/// first a plain-black backdrop made a correct `surface.raised` panel
+/// unreviewable by eye (fixed with `NEUTRAL_CLEAR`); then, even with
+/// that fixed, the panel still filled essentially the whole frame with
+/// no margin to contrast against at all (only `scales.radius.md`'s own
+/// tiny rounded corners ever showed the backdrop) — Cahya reported it
+/// "still looks dark" against the second attempt too. Fixed this time
+/// with a real `COMMAND_PALETTE_MARGIN` on every side
+/// (`command_palette_style`), and — since this sandbox can check
+/// layout math headlessly even without a GPU —
+/// `command_palette_style_positions_the_panel_with_a_real_margin`
+/// already proves the panel's own computed bounds sit inset exactly as
+/// intended, real confidence before asking for a third bless rather
+/// than just hoping the fix is right this time. Run
 /// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
 /// -- --ignored`, open the written
-/// `tests/golden/command_palette_gallery.png`, confirm the panel is
-/// now visibly distinct from its own grey backdrop, then remove this
-/// attribute and commit the PNG alongside that commit.
+/// `tests/golden/command_palette_gallery.png`, confirm the panel now
+/// shows a real, visible grey margin on every side (not just the
+/// corners), then remove this attribute and commit the PNG alongside
+/// that commit.
 #[test]
 #[ignore = "needs a human on real GPU hardware to bless and review tests/golden/command_palette_gallery.png first"]
 fn command_palette_gallery_matches_the_golden_image() {
