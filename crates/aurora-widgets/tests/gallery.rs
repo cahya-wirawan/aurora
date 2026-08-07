@@ -2,20 +2,20 @@
 //! gallery: renders a real [`WidgetTree`]'s own paint
 //! (`aurora_widgets::paint_widget`) through the real GPU path renderer
 //! to an offscreen target, reads the result back as a real
-//! `aurora_testkit::Image`, and (once a human has blessed a real
-//! golden — see [`button_gallery_matches_the_golden_image`]'s own doc
-//! comment) diffs it against one via `aurora_testkit::compare_to_golden`
-//! — no window, no event loop, only a real GPU adapter. This is the
-//! headless half `tests/headless.rs` doesn't need (no GPU at all there)
-//! and `render_test.rs` only partly covers (needs GPU, but samples one
+//! `aurora_testkit::Image`, and diffs it against a checked-in golden
+//! PNG via `aurora_testkit::compare_to_golden` — no window, no event
+//! loop, only a real GPU adapter. This is the headless half
+//! `tests/headless.rs` doesn't need (no GPU at all there) and
+//! `render_test.rs` only partly covers (needs GPU, but samples one
 //! pixel, not a whole image against a golden).
 //!
-//! **Scope, stated honestly.** Covers `Button` only, in the three
-//! states `paint_widget` itself resolves (enabled, pressed, disabled) —
-//! the only widget with real paint today. Extending this to the other
-//! 8 named widgets is the same "add a tree, call [`render_gallery`],
-//! bless a golden" shape once each gains its own `paint_widget` case —
-//! not new harness work.
+//! **Scope, stated honestly.** This gallery covers `Button` only, in
+//! the three states `paint_widget` itself resolves (enabled, pressed,
+//! disabled) — `paint_widget` itself now covers `Checkbox`/`Slider`/
+//! `TextField` too, but extending *this* gallery to them is separate,
+//! still-open work: the same "add a tree, call [`render_gallery`],
+//! bless a golden" shape once each is worth its own golden-image
+//! coverage — not new harness work.
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -435,23 +435,19 @@ fn render_gallery_produces_distinct_pixels_for_each_button_state() {
 /// proves this project's own golden-image discipline for the canvas
 /// compositor.
 ///
-/// **`#[ignore]`, deliberately, until a human blesses a real golden**:
-/// this sandbox has no GPU adapter at all (every test here skips), so
-/// nobody has ever actually seen these pixels — running this without
-/// review would either fail outright (`TestkitError::GoldenMissing`,
-/// no golden committed yet) or, worse, silently accept whatever this
-/// harness happens to render as correct forever after. That is
-/// precisely the failure `aurora_testkit::compare_to_golden`'s own
-/// `AURORA_BLESS_GOLDEN` gate exists to prevent — blessing blind from
-/// an agent with no display is the same failure by another name. On a
-/// real machine: run
-/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery -- --ignored`,
-/// open the written `tests/golden/button_gallery.png`, confirm it
-/// actually shows three visually distinct buttons in Dark theme
-/// colours, then remove this attribute and commit the PNG alongside
-/// that commit.
+/// **Blessed and reviewed 2026-08-07**: Cahya ran
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
+/// -- --ignored` on real macOS GPU hardware and confirmed
+/// `tests/golden/button_gallery.png` actually shows three visually
+/// distinct buttons in Dark theme colours (enabled: bright
+/// `accent.primary`; pressed: a darker, more saturated
+/// `accent.primary_active`; disabled: a dark, desaturated navy —
+/// `accent.primary` alpha-blended at `state.disabled_opacity` over the
+/// black clear colour) before this test's own `#[ignore]` was removed
+/// — never bless blind, the same discipline
+/// `aurora_testkit::compare_to_golden`'s own `AURORA_BLESS_GOLDEN` gate
+/// exists to enforce.
 #[test]
-#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/button_gallery.png first"]
 fn button_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
         return;
