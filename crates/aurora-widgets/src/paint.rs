@@ -4,11 +4,11 @@
 //! this pipeline" step `render`'s own doc comment names as still open.
 //!
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
-//! `Checkbox`, `Slider`, and `TextField` — solid rounded-rect shapes,
-//! the simplest of the widgets this crate has (`widgets`' own doc
-//! comment). `Checkbox`'s own box has no check/dash *glyph* drawn
-//! inside it yet (this crate draws no glyphs at all — solid fills
-//! only, `render`'s own doc comment); `Toggled::True` and
+//! `Checkbox`, `Slider`, `TextField`, and `CommandPalette` — solid
+//! rounded-rect shapes, the simplest of the widgets this crate has
+//! (`widgets`' own doc comment). `Checkbox`'s own box has no check/dash
+//! *glyph* drawn inside it yet (this crate draws no glyphs at all —
+//! solid fills only, `render`'s own doc comment); `Toggled::True` and
 //! `Toggled::Mixed` currently render identically (both
 //! `accent.primary`) since nothing yet exists to tell them apart
 //! visually. `TextField` paints its own background only — no caret, no
@@ -16,24 +16,25 @@
 //! (`composition_segments`' own byte-range *data* has no pixel
 //! position to map to without real text shaping, which doesn't exist
 //! in this crate; `content`/`cursor`/`selection_anchor`/`composition`
-//! don't affect its paint at all today, only `disabled` does). Every
-//! other [`WidgetKind`] returns `Ok(vec![])` (a real, deliberate
-//! "nothing to paint yet"), not an error — `CommandPalette` still
-//! needs its own shape (a list) designed and built the same way,
-//! matching this project's own "no half-finished implementations"
-//! practice rather than a fill-everything-with-a-rectangle
-//! placeholder.
+//! don't affect its paint at all today, only `disabled` does).
+//! `CommandPalette` paints its own outer panel only — its query field's
+//! own text, and every result row (a plain `WidgetKind::Container`,
+//! indistinguishable from any other container by its own payload
+//! alone, including the one currently selected), remain entirely
+//! unpainted; see [`paint_command_palette`]'s own doc comment for why
+//! that's a real, structural gap, not an oversight. Every other
+//! [`WidgetKind`] (`Container` on its own) returns `Ok(vec![])` — a
+//! real, deliberate "nothing to paint," not an error.
 //!
 //! [`paint_widget`] returns a `Vec<Paint>`, not a single `Paint` —
 //! `Button`/`Checkbox` only ever needed one shape, but `Slider` is the
 //! first widget that genuinely needs more than one (a track *and* a
 //! thumb, different geometry, different colour, drawn in that order so
-//! the thumb lands on top), and `CommandPalette`'s own future "a list"
-//! shape will too (one row per visible command). Widening the return
-//! type now, while there are only two real call sites
+//! the thumb lands on top). Widening the return type when `Slider`
+//! needed it, while there were only two real call sites
 //! (`aurora-app::collect_widget_paints`,
-//! `tests/gallery.rs::collect_gallery_paints`) to update, is cheaper
-//! than doing it later after more of either exist.
+//! `tests/gallery.rs::collect_gallery_paints`) to update, was cheaper
+//! than doing it later after more of either existed.
 //!
 //! Colour always comes from a real, resolved [`Theme`] token
 //! (`accent.primary`/`accent.primary_active`, `surface.sunken`,
@@ -50,10 +51,12 @@
 //!
 //! No per-widget corner-radius token exists in
 //! `design/tokens/vocabulary.md` yet (only the bare `radius.*` scale
-//! does) — `scales.radius.sm`/`scales.radius.pill` are this function's
-//! own reasonable choices, not a design decision made by Cahya (PRD
-//! FR-027 *Ownership*); revisit if/when real per-widget radius tokens
-//! are added.
+//! does) — `scales.radius.sm`/`scales.radius.pill`/`scales.radius.md`
+//! (the last for `CommandPalette`'s own larger floating panel — bigger
+//! surfaces reading as more rounded is a common, but not `vocabulary.md`
+//! -mandated, convention) are this function's own reasonable choices,
+//! not a design decision made by Cahya (PRD FR-027 *Ownership*); revisit
+//! if/when real per-widget radius tokens are added.
 
 use accesskit::Toggled;
 use aurora_core::Rect;
@@ -102,7 +105,10 @@ pub fn paint_widget(
         WidgetKind::TextField(state) => {
             paint_text_field(state, bounds, theme, scales).map(|p| vec![p])
         }
-        WidgetKind::Container | WidgetKind::CommandPalette(_) => Ok(vec![]),
+        WidgetKind::CommandPalette(_) => {
+            paint_command_palette(bounds, theme, scales).map(|p| vec![p])
+        }
+        WidgetKind::Container => Ok(vec![]),
     }
 }
 
@@ -257,14 +263,57 @@ fn paint_text_field(
     Ok((mesh, [r, g, b, alpha]))
 }
 
+/// `CommandPalette`'s own outer panel, nothing else. `scales.radius.md`
+/// (a floating panel reading as more rounded than a small control is a
+/// common convention, not `scales.radius.sm` — see this module's own
+/// doc comment). `surface.raised`, not `surface.overlay`:
+/// `design/tokens/vocabulary.md` defines `surface.raised` as
+/// "Elevation 1: dropdowns, popovers, context menus" and reserves
+/// `surface.overlay` for "Elevation 2: modals, dialogs" — a command
+/// palette is the former, a floating, dismissable popover, not a
+/// blocking modal.
+///
+/// **A real, structural gap, not an oversight**: nothing here paints
+/// the query field's own text, or highlights the currently selected
+/// result row. `CommandPaletteState::selected_row` names exactly which
+/// row that is, but every row is inserted as a plain
+/// `WidgetKind::Container` (`command_palette::rebuild_rows`) —
+/// indistinguishable from *any* other container in this tree by its
+/// own payload alone (a panel body, a layout wrapper, another
+/// palette's own row). `paint_widget` dispatches purely on a widget's
+/// own local `WidgetKind`, with no notion of "is this container the
+/// selected row of some ancestor `CommandPalette`" — answering that
+/// would mean walking up the tree from every container on every frame,
+/// or giving row containers their own distinguishing `WidgetKind`
+/// variant carrying a "selected" flag. Either is a real, separate
+/// design decision (a new architecture, not a new token), not
+/// attempted here.
+fn paint_command_palette(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+) -> Result<Paint, WidgetError> {
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.md as f32,
+    );
+    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.surface.raised.to_srgb_f32();
+    Ok((mesh, [r, g, b, 1.0]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        WidgetKind, insert_button, insert_checkbox, insert_slider, insert_text_field, new_tree,
-        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_slider_disabled,
-        set_slider_value, set_text_field_disabled, toggle_checkbox,
+        CommandEntry, WidgetKind, command_palette_state, insert_button, insert_checkbox,
+        insert_command_palette, insert_slider, insert_text_field, new_tree, set_button_disabled,
+        set_button_pressed, set_checkbox_disabled, set_slider_disabled, set_slider_value,
+        set_text_field_disabled, toggle_checkbox,
     };
     use accesskit::Toggled;
     use aurora_core::Rect;
@@ -657,6 +706,71 @@ mod tests {
 
         let (_, color) = single_paint(&tree, field, &theme, &scales);
         assert_eq!(color[3], theme.state.disabled_opacity);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_command_palette_paints_surface_raised() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let commands = vec![CommandEntry::new("edit.undo", "Undo")];
+        let palette = match insert_command_palette(&mut tree, root, commands) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            palette,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 320,
+                height: 240,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (mesh, color) = single_paint(&tree, palette, &theme, &scales);
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a 320x240 command palette must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.surface.raised.to_srgb_f32();
+        assert_eq!(
+            color,
+            [r, g, b, 1.0],
+            "a command palette's own panel must use surface.raised at full opacity"
+        );
+    }
+
+    #[test]
+    fn a_command_palettes_own_result_row_has_no_paint_yet() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let commands = vec![CommandEntry::new("edit.undo", "Undo")];
+        let palette = match insert_command_palette(&mut tree, root, commands) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let selected_row = match command_palette_state(&tree, palette) {
+            Ok(state) => state.selected_row(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(row) = selected_row else {
+            unreachable!("one command was inserted, so the first result is selected");
+        };
+        let theme = dark_theme();
+
+        let paints = match paint_widget(&tree, row, &theme, &scales) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            paints.is_empty(),
+            "a result row is a plain Container and has no paint defined yet -- see \
+             paint_command_palette's own doc comment for why"
+        );
     }
 
     #[test]
