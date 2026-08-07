@@ -263,9 +263,11 @@ fn collect_gallery_paints(
 ) -> Vec<(GpuMesh, [f32; 4])> {
     let mut widget_paints = Vec::new();
     for id in tree.paint_order() {
-        if let Ok(Some((mesh, color))) = paint_widget(tree, id, theme, scales) {
-            let gpu_mesh = GpuMesh::upload(device, queue, &mesh);
-            widget_paints.push((gpu_mesh, color));
+        if let Ok(paints) = paint_widget(tree, id, theme, scales) {
+            for (mesh, color) in paints {
+                let gpu_mesh = GpuMesh::upload(device, queue, &mesh);
+                widget_paints.push((gpu_mesh, color));
+            }
         }
     }
     widget_paints

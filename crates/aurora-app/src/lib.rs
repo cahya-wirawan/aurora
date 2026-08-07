@@ -4290,11 +4290,12 @@ fn collect_widget_paints(
     let mut widget_paints = Vec::new();
     for id in tree.paint_order() {
         match paint_widget(tree, id, theme, scales) {
-            Ok(Some((mesh, color))) => {
-                let gpu_mesh = GpuMesh::upload(gpu.device(), gpu.queue(), &mesh);
-                widget_paints.push((gpu_mesh, linearize_paint_color(color)));
+            Ok(paints) => {
+                for (mesh, color) in paints {
+                    let gpu_mesh = GpuMesh::upload(gpu.device(), gpu.queue(), &mesh);
+                    widget_paints.push((gpu_mesh, linearize_paint_color(color)));
+                }
             }
-            Ok(None) => {}
             Err(err) => {
                 tracing::warn!(
                     ?err,
