@@ -4,13 +4,15 @@
 //! `docs/adr/` for the decisions that shape it.
 //!
 //! First real code: [`panel::insert_panel`] and
-//! [`workspace::build_workspace`], a static first slice of PLAN.md
-//! M1.8's "docking, panels, custom workspaces" bullet, matching the
-//! structure of the owner-approved workspace mockup
-//! (`design/mockups/workspace.html`). See both modules' own doc
-//! comments for exactly what's built and what's deliberately still
-//! open (drag-to-redock, resize, persisted layouts, the menubar/
-//! toolbar/status bar). [`layers_panel::populate_layers_panel`] and
+//! [`workspace::build_workspace`], a first slice of PLAN.md M1.8's
+//! "docking, panels, custom workspaces" bullet, matching the structure
+//! of the owner-approved workspace mockup
+//! (`design/mockups/workspace.html`). [`panel::set_panel_collapsed`],
+//! [`panel::close_panel`], and [`workspace::set_rail_width`] are the
+//! real interactivity landed so far. See each module's own doc comment
+//! for exactly what's built and what's deliberately still open
+//! (drag-to-redock, floating, persisted layouts, the menubar/toolbar/
+//! status bar). [`layers_panel::populate_layers_panel`] and
 //! [`history_panel::populate_history_panel`] are the "Layers, history,
 //! tool-options panels" bullet's own first slice — real content from a
 //! real `aurora_doc::LayerTree`/`History`; tool-options panels remain
@@ -38,4 +40,4 @@ pub use panel::{
     set_panel_collapsed,
 };
 pub use tool::Tool;
-pub use workspace::{Workspace, build_workspace};
+pub use workspace::{Workspace, build_workspace, rail_width, set_rail_width};

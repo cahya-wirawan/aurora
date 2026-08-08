@@ -2929,10 +2929,83 @@ check licenses` clean with the new `toml` dependency.
   `clippy --workspace --all-targets --all-features -- -D warnings`/
   `cargo test --workspace` (0 failures)/`cargo doc --workspace --no-deps
   --all-features -D warnings`/`cargo deny check all` all clean. Version
-  bumped per `CLAUDE.md`'s own convention (a PLAN.md step). Still open,
-  unchanged: resize, drag-to-redock, floating, persisted layouts, and
+  bumped per `CLAUDE.md`'s own convention (a PLAN.md step). Still open at
+  the time: resize, drag-to-redock, floating, persisted layouts, and
   the real `Option<PanelHandle>` version of close, left for whenever
   rendering (or real panel content volume) gives it an actual payoff.
+
+  **Rail resize landed 2026-08-08, scoped with Cahya first** (his own
+  call: "use the engineering-default clamp and proceed" once the real
+  shape was laid out — a canvas↔rail divider drag, not per-panel resize
+  within the rail; a real `Role::Splitter` widget, not proximity-only
+  hit-testing; a new interaction mechanism separate from `Drag` (canvas-
+  relative and tool-dependent, neither of which a rail resize is); and
+  min/max clamp constants with no design token to draw from, same
+  "don't invent tokens ad hoc, raise it instead" reasoning as the old
+  canvas:rail flex ratio itself).
+
+  `aurora-ui::workspace` changed the canvas:rail split from flex
+  *ratios* (3:1) to a real fixed rail width (`rail_style`, shared by
+  `build_workspace`'s own initial construction and the new
+  `set_rail_width`, so the two can't drift apart) — the canvas is now
+  the one growing element (`flex_grow: 1.0`), absorbing whatever the
+  rail doesn't claim, at the exact same starting split (750/250 at
+  1000px) the old ratio produced, so every existing layout test's own
+  numbers needed zero changes. New `Workspace::divider`: a real
+  `Role::Splitter` node inserted between `canvas_area` and `rail` —
+  zero layout width today (no pixel rendering exists yet to draw a grab
+  handle, same gap every widget here already has), `Node::
+  set_numeric_value`/`set_min_numeric_value`/`set_max_numeric_value`
+  kept current by `set_rail_width`, the same "layout and accessibility
+  change together" discipline `set_panel_collapsed` already follows.
+  `RAIL_MIN_WIDTH`/`RAIL_MAX_WIDTH` (150/600px) are engineering
+  defaults, not tokens, documented as such.
+
+  **A real regression caught by this crate's own tests, not shipped**:
+  the divider's node initially carried `Action::Focus` too (a
+  keyboard-accessible splitter felt like the obviously-more-accessible
+  choice) — broke two existing `FocusNext` tests, because `Tab` now
+  landed on the divider *before* reaching the Layers panel, and nothing
+  handles a keyboard event there (no arrow-key-driven resize exists,
+  only `aurora-app`'s own pointer-driven `RailResize`). A focusable
+  control with no working handler is a worse experience than one that
+  isn't reachable yet — removed `Action::Focus`, left a doc comment
+  naming exactly when to add it back (once keyboard resize is real),
+  and added a test asserting its absence so a future regression here is
+  caught the same way this one was.
+
+  `aurora-app` gained the real pointer-driven half:
+  `pointer_on_rail_divider` (a hit-test with its own tolerance constant,
+  `RAIL_DIVIDER_HIT_TOLERANCE` — an interaction heuristic in the app
+  shell, not a widget's own chrome value, so invariant §7.3.10 doesn't
+  govern it, distinct from the divider's own zero-width layout style
+  which does), a new `RailResize` struct deliberately *not* a `Drag`
+  variant (checked ahead of `pointer_in_canvas`'s own gate in
+  `handle_pointer_pressed`/`handle_pointer_moved`, since the divider
+  sits outside the canvas area entirely and a resize isn't tool-
+  dependent), and pure `resized_rail_width` (the delta arithmetic,
+  extracted so it's testable without a real window — the same "pure
+  function `App` just calls" shape `continue_drag` already uses).
+  `compute_layout` needs to re-run after every resize step for the new
+  width to actually reach `WidgetTree::bounds` (`set_rail_width` only
+  changes what layout resolves *from*) — reused `App::apply_resize`
+  against the current window's own real size rather than duplicating
+  that logic.
+
+  13 new tests (`aurora-ui::workspace`: 5, now 44 crate-wide; `aurora-
+  app`: 8, now 138), plus one existing `aurora-ui` test extended with a
+  new assertion and one stale comment fixed (the old "3:1 flex ratio"
+  reasoning, since a fixed-width rail has no ratio to speak of anymore).
+  `cargo fmt --all --check`/`clippy --workspace --all-targets
+  --all-features -- -D warnings`/`cargo test --workspace` (0
+  failures)/`cargo doc --workspace --no-deps --all-features -D
+  warnings`/`cargo deny check all` all clean. Version bumped per
+  `CLAUDE.md`'s own convention. Still open: drag-to-redock, floating,
+  persisted layouts (including the resized rail width itself, which
+  resets to `RAIL_WIDTH_DEFAULT` every fresh `build_workspace` — no
+  session persistence exists anywhere in this crate yet), and real
+  pixel rendering for the divider's own grab handle (blocked on
+  `aurora-vector`, same as everything else in this workspace).
 - [~] **Canvas: infinite zoom, rotation, pan, rulers, guides, grid,
   snap** — real rendering landed 2026-08-06, in two commits, picking up
   directly from M1.9's "wire a live document" step (which gave the

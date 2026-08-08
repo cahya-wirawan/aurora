@@ -2181,6 +2181,71 @@ fn pointer_in_canvas(
     Some((x - bx, y - by))
 }
 
+/// How close (logical px) a pointer needs to land to
+/// `Workspace::divider`'s own `x` to count as "grabbing" it —
+/// `aurora_ui::Workspace::divider` is a real `Role::Splitter` widget
+/// (invariant §7.3.9: every widget carries an accesskit node), but it
+/// has zero layout width today (no pixel rendering exists yet to draw a
+/// visible grab handle — same "real node, no pixels yet" gap every
+/// widget in this workspace already has), so hit-testing against its
+/// own bare bounds alone would need pixel-perfect precision. This is a
+/// plain interaction-tolerance heuristic living in the app shell, not a
+/// widget's own chrome value — invariant §7.3.10 (resolve style from
+/// tokens) governs what a widget draws, not how forgiving this crate's
+/// own hit-testing is, the same distinction `paint.rs`'s own doc
+/// comments already draw elsewhere in this workspace between chrome and
+/// non-chrome numbers.
+const RAIL_DIVIDER_HIT_TOLERANCE: f32 = 4.0;
+
+/// Whether `window_position` (window-logical space) is close enough to
+/// [`aurora_ui::Workspace::divider`] to start a resize —
+/// [`App::handle_pointer_pressed`]'s own gate before falling through to
+/// canvas-tool dragging, checked ahead of [`pointer_in_canvas`] since
+/// the divider sits *outside* the canvas area entirely.
+#[must_use]
+fn pointer_on_rail_divider(workspace: &aurora_ui::Workspace, window_position: (f32, f32)) -> bool {
+    let Some(bounds) = workspace.tree.bounds(workspace.divider) else {
+        return false;
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let (dx, dy, dh) = (bounds.x as f32, bounds.y as f32, bounds.height as f32);
+    let (x, y) = window_position;
+    (x - dx).abs() <= RAIL_DIVIDER_HIT_TOLERANCE && y >= dy && y < dy + dh
+}
+
+/// An in-progress dock-rail resize — started by a primary-button press
+/// on [`aurora_ui::Workspace::divider`] ([`pointer_on_rail_divider`]),
+/// advanced on every subsequent `CursorMoved` by
+/// [`App::handle_pointer_moved`] via `aurora_ui::set_rail_width`, ended
+/// on release. Deliberately not a [`Drag`] variant: resizing the rail
+/// is neither canvas-relative (it's a window-logical `x` position, not
+/// a document/canvas one) nor tool-dependent (it starts regardless of
+/// the active `aurora_ui::Tool`), unlike everything `Drag` itself
+/// models.
+#[derive(Debug, Clone, Copy)]
+struct RailResize {
+    /// The pointer's own window-logical `x` when the drag began.
+    start_pointer_x: f32,
+    /// The rail's own width (`aurora_ui::rail_width`) when the drag
+    /// began.
+    start_width: f32,
+}
+
+/// The rail's own candidate new width once the pointer has moved to
+/// `pointer_x` — pure arithmetic, [`App::handle_pointer_moved`]'s own
+/// delta computation extracted so it's testable without a real window
+/// or `App` (the same "pure function `App` just calls" shape
+/// [`continue_drag`] already uses). The rail sits to the *right* of the
+/// divider (`design/mockups/workspace.html`'s own canvas-then-rail
+/// ordering), so moving the pointer right shrinks it by exactly that
+/// rightward travel, and moving left grows it by exactly that leftward
+/// travel — clamping to a sane range happens downstream, in
+/// `aurora_ui::set_rail_width` itself, not here.
+#[must_use]
+fn resized_rail_width(resize: RailResize, pointer_x: f32) -> f32 {
+    resize.start_width - (pointer_x - resize.start_pointer_x)
+}
+
 /// One in-progress pointer drag. `Pan` tracks the last *screen*-space
 /// position (panning moves the view itself, so re-deriving a document
 /// point from a moving view on every event would be circular); `Marquee`
@@ -3269,6 +3334,11 @@ struct App {
     /// flag" shape `command_palette`/`crash_recovery_dialog` above
     /// already use.
     drag: Option<Drag>,
+    /// An in-progress dock-rail resize, if any — deliberately separate
+    /// from `drag`: resizing the rail is neither canvas-relative nor
+    /// tool-dependent, unlike everything `Drag` itself models (see
+    /// [`RailResize`]'s own doc comment).
+    rail_resize: Option<RailResize>,
     /// The native menu bar — macOS only, see this crate's own "native
     /// menu bar" section for why Windows/Linux aren't included. Built
     /// in [`App::new`] (no window needed); attached to the real
@@ -3413,6 +3483,7 @@ impl App {
             path_pipeline: None,
             pointer_position: None,
             drag: None,
+            rail_resize: None,
             #[cfg(target_os = "macos")]
             menu: build_menu(),
             background,
@@ -3815,7 +3886,13 @@ impl App {
     }
 
     /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
-    /// position and, if a drag is in progress, advances it
+    /// position and, if a rail resize is in progress
+    /// ([`RailResize`]), applies the new width
+    /// (`aurora_ui::set_rail_width`) and re-runs layout — checked first
+    /// and returns early, since a resize is neither canvas-relative nor
+    /// tool-dependent, the same reason [`Self::handle_pointer_pressed`]
+    /// checks [`pointer_on_rail_divider`] before its own canvas gate.
+    /// Otherwise, if a canvas drag is in progress, advances it
     /// ([`continue_drag`]), painting or erasing any dab positions it
     /// returns ([`Self::paint_dab`]/[`Self::erase_dab`], chosen by which
     /// `Drag` variant is active) — empty for every drag but
@@ -3831,6 +3908,24 @@ impl App {
     fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
+
+        if let Some(resize) = self.rail_resize {
+            let new_width = resized_rail_width(resize, position.0);
+            if let Err(err) = aurora_ui::set_rail_width(
+                &mut self.workspace.tree,
+                self.workspace.rail,
+                self.workspace.divider,
+                new_width,
+            ) {
+                tracing::warn!(?err, "failed to resize the dock rail");
+            }
+            let window_size = self.window.as_ref().map(|window| window.inner_size());
+            if let Some(size) = window_size {
+                self.apply_resize((size.width, size.height));
+            }
+            return;
+        }
+
         let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
             return;
         };
@@ -3867,12 +3962,13 @@ impl App {
         }
     }
 
-    /// A real `WindowEvent::MouseInput { state: Pressed, .. }`: either
-    /// performs the active Zoom tool's click-to-zoom
-    /// ([`handle_zoom_tool_click`]), or starts a drag ([`begin_drag`]) —
-    /// never both for the same press. A fresh `Brush`/`Eraser`/
-    /// `Eyedropper` drag paints/erases/samples its own starting point
-    /// immediately
+    /// A real `WindowEvent::MouseInput { state: Pressed, .. }`: starts a
+    /// dock-rail resize ([`RailResize`]) on the divider
+    /// ([`pointer_on_rail_divider`]), performs the active Zoom tool's
+    /// click-to-zoom ([`handle_zoom_tool_click`]), or starts a canvas
+    /// drag ([`begin_drag`]) — never more than one of these for the
+    /// same press. A fresh `Brush`/`Eraser`/`Eyedropper` drag paints/
+    /// erases/samples its own starting point immediately
     /// ([`Self::paint_dab`]/[`Self::erase_dab`]/[`Self::sample_eyedropper`]),
     /// so a plain click (no drag at all) still does something.
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
@@ -3918,6 +4014,22 @@ impl App {
             // layer's own document-space window.
             self.composite_cache.bump();
             self.push_accessibility();
+            return;
+        }
+
+        // Grabbing the dock-rail divider takes priority over canvas
+        // tools too, and is checked ahead of the `pointer_in_canvas`
+        // gate below since the divider sits *outside* the canvas area
+        // entirely.
+        if button == PointerButton::Primary
+            && pointer_on_rail_divider(&self.workspace, position)
+            && let Some(start_width) =
+                aurora_ui::rail_width(&self.workspace.tree, self.workspace.rail)
+        {
+            self.rail_resize = Some(RailResize {
+                start_pointer_x: position.0,
+                start_width,
+            });
             return;
         }
 
@@ -4155,7 +4267,12 @@ impl App {
     /// all) without checking `stroke.is_empty()` itself. If the ending
     /// drag was a `Drag::Move`, [`Self::finish_move`] records the whole
     /// gesture as one coalesced undo step, from wherever it started.
+    /// Also ends any in-progress rail resize ([`RailResize`]) — nothing
+    /// further to record for that one; `aurora_ui::set_rail_width` has
+    /// already applied every intermediate width live, on each move
+    /// event, not just the final one.
     fn handle_pointer_released(&mut self) {
+        self.rail_resize = None;
         match self.drag.take() {
             Some(
                 Drag::Brush {
@@ -4791,19 +4908,20 @@ mod tests {
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key, KeyChord, Modifiers,
-        NamedKey, PointerButton, UndoKind, UndoOrder, activate_command, apply_scroll_zoom,
-        autosave_path, background_color_from_theme, begin_drag, canvas_area_physical_rect,
-        canvas_area_physical_size, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, collect_widget_paints, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, default_shortcuts, demo_document, document_canvas_size,
-        document_from_image, handle_dialog_key, handle_dialog_pointer, handle_key,
-        handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point, load_scales,
-        load_theme, logical_point, logical_size, open_command_palette, open_crash_recovery_dialog,
-        open_image, open_tile_store, palette_commands, pointer_in_canvas,
+        NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind, UndoOrder,
+        activate_command, apply_scroll_zoom, autosave_path, background_color_from_theme,
+        begin_drag, canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
+        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message, default_shortcuts,
+        demo_document, document_canvas_size, document_from_image, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path,
+        layer_local_point, load_scales, load_theme, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
         previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, run_command, sample_pixel, select_layer, tile_origin_for_view,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
+        replace_document, resized_rail_width, run_command, sample_pixel, select_layer,
+        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
+        translate_key, translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
         write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
@@ -7646,8 +7764,8 @@ mod tests {
     #[test]
     fn pointer_in_canvas_reports_a_canvas_relative_point_when_inside() {
         let workspace = laid_out_workspace();
-        // A 1000x800 viewport, 3:1 canvas:rail flex ratio -- canvas area
-        // is the 750x800 rect at the window's own origin (see
+        // A 1000x800 viewport, a 250px-wide rail -- canvas area is the
+        // 750x800 rect at the window's own origin (see
         // `aurora_ui::workspace`'s own layout test).
         assert_eq!(
             pointer_in_canvas(&workspace, (100.0, 50.0)),
@@ -7659,6 +7777,63 @@ mod tests {
     fn pointer_in_canvas_returns_none_over_the_rail() {
         let workspace = laid_out_workspace();
         assert_eq!(pointer_in_canvas(&workspace, (900.0, 50.0)), None);
+    }
+
+    #[test]
+    fn pointer_on_rail_divider_is_true_right_at_the_canvas_rail_boundary() {
+        let workspace = laid_out_workspace();
+        // The boundary sits at x=750 (see the comment above) -- the
+        // zero-width divider's own bounds.x.
+        assert!(pointer_on_rail_divider(&workspace, (750.0, 50.0)));
+        assert!(pointer_on_rail_divider(
+            &workspace,
+            (750.0 - RAIL_DIVIDER_HIT_TOLERANCE, 50.0)
+        ));
+        assert!(pointer_on_rail_divider(
+            &workspace,
+            (750.0 + RAIL_DIVIDER_HIT_TOLERANCE, 50.0)
+        ));
+    }
+
+    #[test]
+    fn pointer_on_rail_divider_is_false_away_from_the_boundary() {
+        let workspace = laid_out_workspace();
+        assert!(!pointer_on_rail_divider(&workspace, (100.0, 50.0)));
+        assert!(!pointer_on_rail_divider(&workspace, (900.0, 50.0)));
+        assert!(!pointer_on_rail_divider(&workspace, (750.0, 50.0 + 800.0)));
+    }
+
+    #[test]
+    // Plain subtraction of clean literal values, not accumulated float
+    // noise -- the same precedent `aurora_color`'s own round-trip tests
+    // already allow this lint for.
+    #[allow(clippy::float_cmp)]
+    fn resized_rail_width_shrinks_when_the_pointer_moves_right() {
+        let resize = RailResize {
+            start_pointer_x: 750.0,
+            start_width: 250.0,
+        };
+        assert_eq!(resized_rail_width(resize, 800.0), 200.0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn resized_rail_width_grows_when_the_pointer_moves_left() {
+        let resize = RailResize {
+            start_pointer_x: 750.0,
+            start_width: 250.0,
+        };
+        assert_eq!(resized_rail_width(resize, 700.0), 300.0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn resized_rail_width_is_unchanged_at_the_starting_pointer_position() {
+        let resize = RailResize {
+            start_pointer_x: 750.0,
+            start_width: 250.0,
+        };
+        assert_eq!(resized_rail_width(resize, 750.0), 250.0);
     }
 
     #[test]
