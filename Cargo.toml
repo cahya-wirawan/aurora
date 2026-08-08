@@ -9,7 +9,7 @@ exclude = ["spike"]
 # See CLAUDE.md's "Versioning" section: SemVer, minor bumped per PLAN.md
 # step, patch bumped per bug fix. A release is a `vX.Y.Z` tag matching
 # this exact value, pushed once the bump is committed.
-version = "0.1.0"
+version = "0.2.0"
 # Not published: `aurora-core` and `aurora` are taken on crates.io by unrelated
 # projects (PRD §12 Q2b), and nothing needs publishing to build or ship the
 # application. This also lets cargo-deny's allow-wildcard-paths exempt the
@@ -137,6 +137,18 @@ arboard = { version = "3", default-features = false }
 # separate `unsafe`-code decision -- both left open. Default features
 # off: `gtk`/`libxdo` are Linux-only optional deps, moot on macOS.
 muda = { version = "0.19", default-features = false }
+# macOS only (`aurora-app`'s own Cargo.toml adds this as a target-
+# specific dependency, same as `muda` above) -- `NSWorkspace`'s real
+# accessibility-display API (reduced motion, increase contrast),
+# PLAN.md M1.8's "OS settings" bullet. Already a transitive dependency
+# on this target via `winit`/`muda`/`rfd`/`arboard`'s own macOS
+# backends; this promotes it to direct rather than adding new surface
+# to the dependency graph. Default features off, only `NSWorkspace`
+# enabled -- this crate's own generated bindings are a safe Rust API,
+# so using it needs no `unsafe_code` lint override anywhere.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSWorkspace",
+] }
 # PRD §8.2's pre-decided pair for image codecs ("`image`, `zune-image` |
 # Mature, pure Rust") -- `zune-jpeg` is the focused, decode-only member
 # of that same `zune-image` family, matching this crate's existing

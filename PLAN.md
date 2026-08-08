@@ -3439,7 +3439,65 @@ check licenses` clean with the new `toml` dependency.
   blocked on `aurora-vector` (nothing draws a pixel yet regardless of
   DPI) — this bullet closes the layout-math half, not the pixel-crisp-
   rendering half.
-- [ ] OS settings: reduced motion, high contrast, text size
+- [~] **OS settings: reduced motion, high contrast, text size** — first
+  slice done 2026-08-08. Researched first (no ready-made cross-platform
+  Rust crate exists for this — confirmed via web search, not assumed):
+  each OS needs its own real API, and Linux has no OS-standard signal
+  at all, only DE-specific portals. Split accordingly: `aurora-theme`
+  gained a new, plain-data `AccessibilityPreferences { reduced_motion,
+  high_contrast, text_scale }` (`scales.rs`) and
+  `Scales::with_accessibility_preferences`, which returns an adjusted
+  copy — `reduced_motion` zeroes every `motion.duration` value,
+  `text_scale` multiplies every `typography.size` value, `high_contrast`
+  changes nothing yet (recorded, not acted on — no high-contrast theme
+  exists to switch to, still Cahya's own design decision, same gate as
+  Light/Colour-Critical). Deliberately distinct from the existing,
+  still-unconsumed `SpacingScale::density_multiplier` axis — that's a
+  separate, already-open gap this bullet doesn't attempt to fix. 4 new
+  `aurora-theme` tests (27 total): identity default, reduced-motion,
+  text-scale, and high-contrast-changes-nothing.
+
+  `aurora-app` gained the real, platform-facing half:
+  `detect_accessibility_preferences`, `#[cfg(target_os = "macos")]`
+  real, `#[cfg(not(target_os = "macos"))]` an honest
+  `AccessibilityPreferences::default()` (Windows/Linux are real,
+  separate follow-on spikes, not guessed at here). The macOS path calls
+  `NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()`/
+  `.accessibilityDisplayShouldIncreaseContrast()` via `objc2-app-kit`
+  (already a transitive dependency on this target via `winit`'s own
+  macOS backend and `muda`/`rfd`/`arboard`, promoted to direct — no new
+  surface added to the dependency graph) — its generated bindings are a
+  safe Rust API, so this needed **no `unsafe_code` lint override
+  anywhere**, confirmed by reading the crate's own generated source
+  (`pub fn`, not `pub unsafe fn`) before writing the call, not assumed.
+  `text_scale` stays `1.0` even on macOS: AppKit has no systemwide
+  text-scale preference equivalent to iOS's Dynamic Type, so there's
+  nothing real to read — an honest gap, not a stub. Wired into the one
+  real production path, `run()`: `load_scales()?.
+  with_accessibility_preferences(detect_accessibility_preferences())`.
+
+  **Verification, stated honestly**: this sandbox is Linux-only and its
+  `x86_64-apple-darwin` cross-compile of the full crate graph is blocked
+  by `lcms2-sys`'s vendored C build needing a real macOS SDK/cross-clang
+  neither installed here (pre-existing sandbox limitation, unrelated to
+  this change — any macOS-`cfg`'d code in this crate, including the
+  existing `muda` menu bar, has the same gap). Verified what's actually
+  checkable here: the exact `NSWorkspace` API surface used was proven to
+  compile as real, safe Rust for `x86_64-apple-darwin` in an isolated
+  scratch crate (only `objc2`/`objc2-app-kit`, no `lcms2` in that
+  dependency chain) before it was written into `aurora-app` itself;
+  `cargo build`/`clippy --all-targets --all-features -- -D warnings`/
+  `cargo test`/`cargo doc --no-deps -D warnings` all clean on the real
+  Linux target (the `#[cfg(not(macos))]` branch); `cargo deny check
+  all` clean (the `objc2-app-kit` version duplication it flags,
+  0.2.2 vs 0.3.2, already existed before this change — `winit` pins the
+  former, `muda`/`rfd`/`arboard` the latter, matched here). **Still
+  `[~]`, not `[x]`**: a full native macOS compile (CI's `macos-latest`
+  runner, not this sandbox's cross-compile) and real behavioural
+  verification (does it actually read the right OS flag) both remain —
+  the same "written here, confirmed on real hardware later" shape the
+  a11y spike and the DPI-scaling bullet both already went through.
+  Windows/Linux detection are still open, real follow-on spikes.
 - [~] **Crash recovery UI** — first slice done 2026-08-05. A new
   generic mechanism in `aurora-widgets`,
   `crates/aurora-widgets/src/widgets/dialog.rs` (new): a modal

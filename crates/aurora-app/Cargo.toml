@@ -41,9 +41,16 @@ arboard = { workspace = true }
 half = { workspace = true }
 
 # macOS only -- see the workspace `Cargo.toml`'s own comment on `muda`
-# for why Windows/Linux aren't included here.
+# for why Windows/Linux aren't included here. `objc2-app-kit` is already
+# a transitive dependency on this target (winit's own macOS backend,
+# and muda/rfd/arboard each pull their own copy) -- promoted to direct
+# here for `NSWorkspace`'s real accessibility-display API
+# (`accessibility::detect`, PLAN.md M1.8's "OS settings" bullet). Its
+# generated bindings are a safe Rust API (no `unsafe` needed in this
+# crate to call them), so this needs no `unsafe_code` lint override.
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { workspace = true }
+objc2-app-kit = { workspace = true }
 
 [dev-dependencies]
 accesskit = { workspace = true }

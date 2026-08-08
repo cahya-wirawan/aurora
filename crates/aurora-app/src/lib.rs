@@ -502,6 +502,46 @@ fn load_scales() -> anyhow::Result<Scales> {
     Ok(Scales::from_toml_str(SCALES_TOML)?)
 }
 
+/// Reads the real, current OS accessibility preferences (PLAN.md M1.8's
+/// "OS settings: reduced motion, high contrast, text size" bullet) —
+/// this crate is the one place in the workspace allowed to do this kind
+/// of platform-facing detection; [`aurora_theme::Scales`] itself stays
+/// plain data (`aurora_theme::AccessibilityPreferences`'s own doc
+/// comment).
+///
+/// **macOS only, for now.** `NSWorkspace`'s accessibility-display API
+/// (`objc2_app_kit`, already a transitive dependency via `winit`'s own
+/// macOS backend, promoted to direct here) is real and needs no
+/// `unsafe` to call — its generated bindings are the FFI boundary, not
+/// this function. Windows (`SystemParametersInfo`'s
+/// `SPI_GETCLIENTAREAANIMATION`/`SPI_GETHIGHCONTRAST`) and Linux (no
+/// OS-standard signal at all — desktop-environment-specific, e.g.
+/// GNOME's own D-Bus settings portal) are real, separate follow-on
+/// spikes, honestly left open rather than guessed at; every other
+/// target here returns [`AccessibilityPreferences::default`].
+/// `text_scale` stays `1.0` even on macOS: AppKit has no systemwide
+/// text-scale preference equivalent to iOS's Dynamic Type, so there is
+/// nothing real to read yet.
+#[must_use]
+#[cfg(target_os = "macos")]
+fn detect_accessibility_preferences() -> aurora_theme::AccessibilityPreferences {
+    let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+    aurora_theme::AccessibilityPreferences {
+        reduced_motion: workspace.accessibilityDisplayShouldReduceMotion(),
+        high_contrast: workspace.accessibilityDisplayShouldIncreaseContrast(),
+        text_scale: 1.0,
+    }
+}
+
+/// See the `#[cfg(target_os = "macos")]` overload's own doc comment —
+/// this platform has no real detection wired up yet, so the honest
+/// default applies rather than a guess.
+#[must_use]
+#[cfg(not(target_os = "macos"))]
+fn detect_accessibility_preferences() -> aurora_theme::AccessibilityPreferences {
+    aurora_theme::AccessibilityPreferences::default()
+}
+
 /// A small, clearly-fake document — there is no real "open a document"
 /// flow in this crate yet (separate, still-open M1.9 work), so this
 /// exists purely to give the Layers *and* History panels real content
@@ -4614,7 +4654,7 @@ impl std::fmt::Debug for App {
 pub fn run() -> anyhow::Result<()> {
     let theme = load_theme()?;
     let background = background_color_from_theme(&theme);
-    let scales = load_scales()?;
+    let scales = load_scales()?.with_accessibility_preferences(detect_accessibility_preferences());
     let marker_path = marker_path();
     // Checked *before* writing this run's own marker below -- otherwise
     // every run would see its own, brand-new marker and think the

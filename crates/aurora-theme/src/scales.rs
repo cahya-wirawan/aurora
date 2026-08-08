@@ -123,6 +123,47 @@ pub struct Scales {
     pub motion: MotionScale,
 }
 
+/// OS-level accessibility preferences a caller applies to a base
+/// [`Scales`] via [`Scales::with_accessibility_preferences`] — distinct
+/// from the density axis ([`SpacingScale::density_multiplier`], a
+/// user's own explicit in-app choice) and distinct from theme selection
+/// (`high_contrast` here only *records* the OS preference; switching to
+/// an actual high-contrast theme needs one to exist first, still
+/// Cahya's own design decision — see [`crate::Theme`]'s own doc
+/// comment). Detecting the real values is platform-specific (real,
+/// separate work per platform — `aurora-app` is the one crate allowed
+/// to do that OS-facing detection, this crate stays plain data).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AccessibilityPreferences {
+    /// The OS asked UI motion be minimized. `with_accessibility_preferences`
+    /// zeroes every `motion.duration` value under this preference, rather
+    /// than leaving it for each future animation call site to re-check —
+    /// a zero duration composes correctly with any code written against
+    /// [`MotionDuration`] without that code needing its own
+    /// reduced-motion branch.
+    pub reduced_motion: bool,
+    /// The OS' own high-contrast preference — see this struct's own doc
+    /// comment for why nothing here acts on it yet.
+    pub high_contrast: bool,
+    /// A multiplier over `typography.size.*`; `1.0` means "no change."
+    /// Not every platform exposes a real systemwide text-scale
+    /// preference an application can read (macOS' accessibility-display
+    /// API has no equivalent to iOS's Dynamic Type) — `1.0` is the
+    /// honest default wherever real detection doesn't exist, not a
+    /// stand-in for a value nobody could actually read.
+    pub text_scale: f32,
+}
+
+impl Default for AccessibilityPreferences {
+    fn default() -> Self {
+        Self {
+            reduced_motion: false,
+            high_contrast: false,
+            text_scale: 1.0,
+        }
+    }
+}
+
 impl Scales {
     /// Parses raw TOML source (e.g. the contents of `scales.toml`).
     ///
@@ -132,6 +173,39 @@ impl Scales {
     /// `source` isn't valid TOML matching this shape.
     pub fn from_toml_str(source: &str) -> Result<Self, crate::ThemeError> {
         Ok(toml::from_str(source)?)
+    }
+
+    /// A copy of `self` with `prefs` applied: `reduced_motion` zeroes
+    /// every `motion.duration` value; `text_scale` multiplies every
+    /// `typography.size` value, rounded to the nearest whole pixel (the
+    /// same integer unit every other scale value already uses).
+    /// `prefs.high_contrast` doesn't change anything returned here — see
+    /// [`AccessibilityPreferences::high_contrast`]'s own doc comment.
+    #[must_use]
+    pub fn with_accessibility_preferences(&self, prefs: AccessibilityPreferences) -> Self {
+        let mut scales = self.clone();
+        if prefs.reduced_motion {
+            scales.motion.duration = MotionDuration {
+                fast: 0,
+                base: 0,
+                slow: 0,
+            };
+        }
+        if (prefs.text_scale - 1.0).abs() > f32::EPSILON {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let scale = |value: u32| -> u32 { (value as f32 * prefs.text_scale).round() as u32 };
+            let size = scales.typography.size;
+            scales.typography.size = TypeSizeScale {
+                xs: scale(size.xs),
+                sm: scale(size.sm),
+                md: scale(size.md),
+                lg: scale(size.lg),
+                xl: scale(size.xl),
+                xxl: scale(size.xxl),
+                display: scale(size.display),
+            };
+        }
+        scales
     }
 }
 
@@ -179,5 +253,67 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert!((scales.spacing.density_multiplier.comfortable - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn default_accessibility_preferences_are_the_identity() {
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(s) => s,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let adjusted =
+            scales.with_accessibility_preferences(super::AccessibilityPreferences::default());
+        assert_eq!(adjusted.motion.duration.slow, scales.motion.duration.slow);
+        assert_eq!(adjusted.typography.size.md, scales.typography.size.md);
+    }
+
+    #[test]
+    fn reduced_motion_zeroes_every_duration() {
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(s) => s,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let adjusted = scales.with_accessibility_preferences(super::AccessibilityPreferences {
+            reduced_motion: true,
+            ..Default::default()
+        });
+        assert_eq!(adjusted.motion.duration.fast, 0);
+        assert_eq!(adjusted.motion.duration.base, 0);
+        assert_eq!(adjusted.motion.duration.slow, 0);
+        // Untouched by this preference.
+        assert_eq!(adjusted.typography.size.md, scales.typography.size.md);
+    }
+
+    #[test]
+    fn text_scale_multiplies_every_type_size() {
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(s) => s,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let adjusted = scales.with_accessibility_preferences(super::AccessibilityPreferences {
+            text_scale: 2.0,
+            ..Default::default()
+        });
+        assert_eq!(adjusted.typography.size.md, scales.typography.size.md * 2);
+        assert_eq!(
+            adjusted.typography.size.display,
+            scales.typography.size.display * 2
+        );
+        // Untouched by this preference.
+        assert_eq!(adjusted.motion.duration.slow, scales.motion.duration.slow);
+    }
+
+    #[test]
+    fn high_contrast_alone_changes_nothing() {
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(s) => s,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let adjusted = scales.with_accessibility_preferences(super::AccessibilityPreferences {
+            high_contrast: true,
+            ..Default::default()
+        });
+        assert_eq!(adjusted.typography.size.md, scales.typography.size.md);
+        assert_eq!(adjusted.motion.duration.slow, scales.motion.duration.slow);
     }
 }
