@@ -1297,20 +1297,30 @@ enum ActivatedCommand {
 const COMMAND_FOCUS_LAYERS: &str = "view.focus_layers";
 const COMMAND_FOCUS_PROPERTIES: &str = "view.focus_properties";
 const COMMAND_FOCUS_HISTORY: &str = "view.focus_history";
+const COMMAND_TOGGLE_LAYERS: &str = "view.toggle_layers";
+const COMMAND_TOGGLE_PROPERTIES: &str = "view.toggle_properties";
+const COMMAND_TOGGLE_HISTORY: &str = "view.toggle_history";
 const COMMAND_FILE_OPEN: &str = "file.open";
 const COMMAND_FILE_SAVE: &str = "file.save";
 const COMMAND_UNDO: &str = "edit.undo";
 const COMMAND_REDO: &str = "edit.redo";
 
 /// The command palette's own, real content: one command per docked
-/// panel, focusing it; real native "Open File…"/"Save As…" pickers; and
-/// `Undo`/`Redo`, the same commands `Ctrl+Z`/`Ctrl+Shift+Z` already run
-/// — previously shortcut-only, a real, named gap (a screen-reader user
-/// driving this crate through the palette had no way to reach either
-/// one). Genuine, not placeholder — each focus command moves real
-/// keyboard focus to a real, already-focusable panel region (see
-/// `aurora-ui`'s `insert_panel`), verifiable the same way any other
-/// focus change is (`push_accessibility`); `COMMAND_FILE_OPEN`/
+/// panel, focusing it; one more per panel, toggling its own
+/// collapsed/expanded state (`aurora_ui::set_panel_collapsed`, PLAN.md
+/// M1.8's docking bullet); real native "Open File…"/"Save As…"
+/// pickers; and `Undo`/`Redo`, the same commands `Ctrl+Z`/`Ctrl+Shift+Z`
+/// already run — previously shortcut-only, a real, named gap (a
+/// screen-reader user driving this crate through the palette had no way
+/// to reach either one). Genuine, not placeholder — each focus command
+/// moves real keyboard focus to a real, already-focusable panel region
+/// (see `aurora-ui`'s `insert_panel`), verifiable the same way any
+/// other focus change is (`push_accessibility`); each toggle command
+/// really collapses/expands its panel (`command_collapse_target`); the
+/// title itself doesn't reflect current state (a palette listing "Hide
+/// Layers Panel" vs "Show Layers Panel" would need the list rebuilt on
+/// every state change — real, separate follow-on work, a fixed "Toggle"
+/// label is the honest baseline this pass lands); `COMMAND_FILE_OPEN`/
 /// `COMMAND_FILE_SAVE` show a real, native `rfd::FileDialog` and the
 /// chosen path is really opened/saved (`App::open_file`/`save_file`);
 /// `COMMAND_UNDO`/`COMMAND_REDO` really undo/redo (see
@@ -1323,6 +1333,9 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
         CommandEntry::new(COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
         CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
+        CommandEntry::new(COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel"),
+        CommandEntry::new(COMMAND_TOGGLE_PROPERTIES, "Toggle Properties Panel"),
+        CommandEntry::new(COMMAND_TOGGLE_HISTORY, "Toggle History Panel"),
         CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
         CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
         CommandEntry::new(COMMAND_UNDO, "Undo"),
@@ -1344,17 +1357,33 @@ fn command_target(workspace: &aurora_ui::Workspace, id: &str) -> Option<WidgetId
     }
 }
 
+/// Resolves an activated command-palette entry's own `id` to the panel
+/// it should collapse/expand — the toggle-command counterpart to
+/// [`command_target`]'s own focus-command resolution.
+fn command_collapse_target(
+    workspace: &aurora_ui::Workspace,
+    id: &str,
+) -> Option<aurora_ui::PanelHandle> {
+    match id {
+        COMMAND_TOGGLE_LAYERS => Some(workspace.layers),
+        COMMAND_TOGGLE_PROPERTIES => Some(workspace.properties),
+        COMMAND_TOGGLE_HISTORY => Some(workspace.history),
+        _ => None,
+    }
+}
+
 /// Activates a command by its own opaque id — shared by the command
 /// palette's `Enter` key and, on macOS, the native menu bar
 /// (`App::handle_menu_event`): the same underlying action, reachable
 /// from two different UI surfaces, rather than two parallel
 /// implementations of "what does this command do." Moves focus for a
-/// panel-focus command ([`command_target`]); shows the native file
-/// dialog and returns the picked path, tagged by which one it was
-/// ([`ActivatedCommand`]), for [`COMMAND_FILE_OPEN`]/[`COMMAND_FILE_SAVE`];
-/// resolves `COMMAND_UNDO`/`COMMAND_REDO` to their own
-/// [`ActivatedCommand`] variant without running them here — this
-/// function is deliberately kept free of `layers`/`history`/
+/// panel-focus command ([`command_target`]); flips collapsed/expanded
+/// for a panel-toggle command ([`command_collapse_target`]); shows the
+/// native file dialog and returns the picked path, tagged by which one
+/// it was ([`ActivatedCommand`]), for [`COMMAND_FILE_OPEN`]/
+/// [`COMMAND_FILE_SAVE`]; resolves `COMMAND_UNDO`/`COMMAND_REDO` to
+/// their own [`ActivatedCommand`] variant without running them here —
+/// this function is deliberately kept free of `layers`/`history`/
 /// `pixel_history`/`aurora_tile::TileStore`, so it stays exactly as
 /// pure and unit-testable as it already was; the caller
 /// ([`App::handle_key_event`]/[`App::handle_menu_event`], both of
@@ -1370,6 +1399,13 @@ fn activate_command(
     if let Some(target) = command_target(workspace, id) {
         if let Err(err) = focus.focus(&mut workspace.tree, target) {
             tracing::warn!(?err, "activated command's target isn't focusable");
+        }
+        return None;
+    }
+    if let Some(panel) = command_collapse_target(workspace, id) {
+        let collapsed = aurora_ui::panel_is_collapsed(&workspace.tree, panel).unwrap_or(false);
+        if let Err(err) = aurora_ui::set_panel_collapsed(&mut workspace.tree, panel, !collapsed) {
+            tracing::warn!(?err, "failed to toggle panel collapse");
         }
         return None;
     }
@@ -4693,22 +4729,23 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::{
         ActivatedCommand, AppCommand, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
-        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_UNDO,
-        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key,
-        KeyChord, Modifiers, NamedKey, PointerButton, UndoKind, UndoOrder, activate_command,
-        apply_scroll_zoom, autosave_path, background_color_from_theme, begin_drag,
-        canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
-        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message, default_shortcuts,
-        demo_document, document_canvas_size, document_from_image, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path,
-        layer_local_point, load_scales, load_theme, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pointer_in_canvas, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, run_command, sample_pixel,
-        select_layer, tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
+        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
+        ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key, KeyChord, Modifiers,
+        NamedKey, PointerButton, UndoKind, UndoOrder, activate_command, apply_scroll_zoom,
+        autosave_path, background_color_from_theme, begin_drag, canvas_area_physical_rect,
+        canvas_area_physical_size, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, collect_widget_paints, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, default_shortcuts, demo_document, document_canvas_size,
+        document_from_image, handle_dialog_key, handle_dialog_pointer, handle_key,
+        handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point, load_scales,
+        load_theme, logical_point, logical_size, open_command_palette, open_crash_recovery_dialog,
+        open_image, open_tile_store, palette_commands, pointer_in_canvas,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, run_command, sample_pixel, select_layer, tile_origin_for_view,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -5852,7 +5889,10 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(state.query(), "lay");
-        assert_eq!(state.results().len(), 1);
+        // "Focus Layers Panel" and "Toggle Layers Panel" both match --
+        // the first inserted (`palette_commands`'s own order) is what
+        // ends up selected.
+        assert_eq!(state.results().len(), 2);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -6367,6 +6407,39 @@ mod tests {
     }
 
     #[test]
+    fn activate_command_toggles_collapse_for_every_known_toggle_id() {
+        fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> aurora_ui::PanelHandle) {
+            let mut workspace = aurora_ui::build_workspace();
+            let mut focus = FocusManager::default();
+            let mut file_dialog = FakeFileDialog::default();
+            let panel = expected(&workspace);
+            match aurora_ui::panel_is_collapsed(&workspace.tree, panel) {
+                Ok(collapsed) => assert!(!collapsed, "starts expanded"),
+                Err(err) => unreachable!("{err:?}"),
+            }
+
+            let picked = activate_command(&mut workspace, &mut focus, id, &mut file_dialog);
+
+            assert_eq!(picked, None);
+            match aurora_ui::panel_is_collapsed(&workspace.tree, panel) {
+                Ok(collapsed) => assert!(collapsed, "one toggle must collapse it"),
+                Err(err) => unreachable!("{err:?}"),
+            }
+
+            let picked_again = activate_command(&mut workspace, &mut focus, id, &mut file_dialog);
+            assert_eq!(picked_again, None);
+            match aurora_ui::panel_is_collapsed(&workspace.tree, panel) {
+                Ok(collapsed) => assert!(!collapsed, "a second toggle must expand it back"),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        check(COMMAND_TOGGLE_LAYERS, |workspace| workspace.layers);
+        check(COMMAND_TOGGLE_PROPERTIES, |workspace| workspace.properties);
+        check(COMMAND_TOGGLE_HISTORY, |workspace| workspace.history);
+    }
+
+    #[test]
     fn activate_command_returns_the_picked_path_for_file_open() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
@@ -6449,6 +6522,15 @@ mod tests {
         let ids: Vec<&str> = commands.iter().map(|entry| entry.id.as_str()).collect();
         assert!(ids.contains(&COMMAND_UNDO), "{ids:?}");
         assert!(ids.contains(&COMMAND_REDO), "{ids:?}");
+    }
+
+    #[test]
+    fn palette_commands_includes_a_toggle_for_every_panel() {
+        let commands = palette_commands();
+        let ids: Vec<&str> = commands.iter().map(|entry| entry.id.as_str()).collect();
+        assert!(ids.contains(&COMMAND_TOGGLE_LAYERS), "{ids:?}");
+        assert!(ids.contains(&COMMAND_TOGGLE_PROPERTIES), "{ids:?}");
+        assert!(ids.contains(&COMMAND_TOGGLE_HISTORY), "{ids:?}");
     }
 
     #[test]

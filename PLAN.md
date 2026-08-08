@@ -2827,6 +2827,52 @@ check licenses` clean with the new `toml` dependency.
   --no-deps --all-features` all clean; `cargo clippy --workspace
   --all-targets --all-features -- -D warnings` and `cargo test
   --workspace` both clean too, 0 failures across every crate.
+
+  **Panel collapse landed 2026-08-08** — the first real interactivity
+  this bullet has, picked over Windows OS-settings detection at Cahya's
+  own direction (`AskUserQuestion`): fully testable in this Linux
+  sandbox, unlike the platform-FFI work the last few steps needed.
+  `aurora-ui::panel::{set_panel_collapsed, panel_is_collapsed}`.
+  Collapsing keeps a panel's own body and its content in the tree (no
+  rebuild needed on expand) — only its layout style changes
+  (`Display::None`) and its `Node::set_expanded`/`Action::Collapse`/
+  `Action::Expand` are updated to match, the real disclosure-widget
+  shape a screen reader expects. **A real bug caught by the function's
+  own test, not shipped**: the first attempt only toggled the body's
+  `Display`, leaving `panel.root`'s own `flex_grow: 1.0` untouched —
+  since `panel.root`, not `panel.body`, is the actual flex item the
+  rail shares height between, a "collapsed" panel kept claiming its
+  full share of the rail regardless, an invisible-but-still-full-height
+  panel. Fixed by extracting a shared `root_style(collapsed: bool)`
+  (`flex_grow: 1.0` expanded, `0.0` collapsed) used by both
+  `insert_panel` and `set_panel_collapsed`, verified by a real layout
+  test proving a sibling's height actually grows to fill the space —
+  ordinary flexbox `flex_grow` sharing, not a special case. Wired into
+  `aurora-app`'s existing command-palette machinery (mirroring the
+  already-real `COMMAND_FOCUS_*` trio exactly): three new
+  `COMMAND_TOGGLE_*` commands, `command_collapse_target` (the toggle
+  counterpart to `command_target`), `activate_command` now flips a
+  panel's own collapsed state via `panel_is_collapsed`/
+  `set_panel_collapsed`. Deliberately not wired into the native macOS
+  menu bar this round — that function is `#[cfg(target_os = "macos")]`
+  and today's earlier accessibility-detection work already showed
+  macOS-only code needs real hardware to verify properly (two real
+  bugs caught only once Cahya ran it), so adding more of it in the same
+  session without a chance to verify wasn't worth the risk for what's
+  otherwise a low-value addition; a real, explicit follow-up, not a
+  silent gap. 9 new tests (6 in `aurora-ui::panel`, 3 in `aurora-app`)
+  — `aurora-ui`: 33 tests; `aurora-app`: 131. One pre-existing
+  `aurora-app` test needed updating, not because it was wrong but
+  because the new "Toggle Layers Panel" command genuinely does now
+  also match the query `"lay"` alongside "Focus Layers Panel" (2
+  results now, was 1) — a real behaviour change from adding real
+  commands, not a bug. `cargo fmt --all --check`/`clippy --workspace
+  --all-targets --all-features -- -D warnings`/`cargo test --workspace`
+  (0 failures)/`cargo doc --workspace --no-deps --all-features -D
+  warnings`/`cargo deny check all` all clean. Version bumped per
+  `CLAUDE.md`'s own convention (a PLAN.md step). Still open: resize,
+  close, drag-to-redock, floating, persisted layouts, and the native
+  menu bar's own toggle entries.
 - [~] **Canvas: infinite zoom, rotation, pan, rulers, guides, grid,
   snap** — real rendering landed 2026-08-06, in two commits, picking up
   directly from M1.9's "wire a live document" step (which gave the

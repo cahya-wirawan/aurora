@@ -3,18 +3,18 @@
 //! (`design/mockups/workspace.html`). PLAN.md M1.8's docking/panels
 //! bullet, first slice.
 //!
-//! **Static only.** A panel here is a labeled region with a body to put
-//! content in — there is no drag-to-redock, resize, collapse, close, or
-//! floating yet, and no persisted workspace layout. Those are the
-//! actual "docking" and "custom workspaces" half of that bullet,
+//! **Mostly static.** A panel here is a labeled region with a body to
+//! put content in. [`set_panel_collapsed`] is the one real piece of
+//! interactivity so far — there is still no drag-to-redock, resize,
+//! close, or floating, and no persisted workspace layout. Those remain
+//! the actual "docking" and "custom workspaces" half of that bullet,
 //! deliberately left open: each needs real interaction/drag-state
-//! machinery this first pass doesn't build. What exists here is the
-//! structural piece everything else will attach to.
+//! machinery this pass still doesn't build.
 
 use accesskit::{Action, Node, Role};
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
-use taffy::Style;
+use taffy::{Display, Style};
 
 /// One inserted panel's own widget ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +28,8 @@ pub struct PanelHandle {
     pub body: WidgetId,
 }
 
-/// Adds a new, empty, titled panel as the last child of `parent`.
+/// Adds a new, empty, titled panel as the last child of `parent`,
+/// initially expanded (not collapsed — see [`set_panel_collapsed`]).
 ///
 /// `Role::Region` (not `Role::GenericContainer`) — the ARIA concept of
 /// a perceivable, nameable section a user would want to navigate
@@ -38,6 +39,9 @@ pub struct PanelHandle {
 /// (individual layer/history rows) isn't focusable yet, matching this
 /// module's own "static skeleton" scope; landing on the panel itself is
 /// the first real, honest keyboard-navigation target that exists.
+/// `Action::Collapse` and `Node::set_expanded(true)` mark it as a real
+/// disclosure region from the moment it exists, not only once
+/// [`set_panel_collapsed`] is first called.
 ///
 /// # Errors
 ///
@@ -50,18 +54,27 @@ pub fn insert_panel(
     let mut root_node = Node::new(Role::Region);
     root_node.set_label(title.into());
     root_node.add_action(Action::Focus);
-    let root = tree.insert(
-        parent,
-        Style {
-            flex_direction: taffy::FlexDirection::Column,
-            flex_grow: 1.0,
-            ..Default::default()
-        },
-        root_node,
-        WidgetKind::Container,
-    )?;
+    root_node.add_action(Action::Collapse);
+    root_node.set_expanded(true);
+    let root = tree.insert(parent, root_style(false), root_node, WidgetKind::Container)?;
     let body = widgets::insert_container(tree, root, Style::default())?;
     Ok(PanelHandle { root, body })
+}
+
+/// A panel's own root style — `Column` (the body stacks under the
+/// header once one exists), `flex_grow` the one thing
+/// [`set_panel_collapsed`] actually toggles. `1.0` (share the rail's
+/// height with its siblings, same as every other docked panel) while
+/// expanded; `0.0` while collapsed, so it stops claiming a share at
+/// all and its siblings' own `flex_grow: 1.0` absorbs the space it
+/// gives up — the ordinary flexbox behaviour every sibling already
+/// has, not a special case.
+fn root_style(collapsed: bool) -> Style {
+    Style {
+        flex_direction: taffy::FlexDirection::Column,
+        flex_grow: if collapsed { 0.0 } else { 1.0 },
+        ..Default::default()
+    }
 }
 
 /// Removes every one of `body`'s current children — the "empty it
@@ -89,9 +102,87 @@ pub fn clear_panel_body(
     Ok(())
 }
 
+/// Whether `panel`'s own body is currently collapsed — the query half
+/// of [`set_panel_collapsed`].
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.body` doesn't
+/// exist.
+pub fn panel_is_collapsed(
+    tree: &WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+) -> Result<bool, WidgetError> {
+    let style = tree
+        .style(panel.body)
+        .ok_or(WidgetError::UnknownWidget(panel.body))?;
+    Ok(style.display == Display::None)
+}
+
+/// Collapses (`collapsed: true`) or expands `panel`.
+///
+/// Collapsing doesn't remove the body or its content from the tree —
+/// whatever a caller already populated it with (layer rows, history
+/// entries) survives, ready to reappear on expand without needing to be
+/// rebuilt. Two things change, both needed: the body's own layout style
+/// becomes `Display::None` ("the node is hidden, and its children will
+/// also be hidden," per `taffy`'s own docs), *and* `panel.root`'s own
+/// `flex_grow` drops to `0.0` — the body alone
+/// isn't enough, since `panel.root` (not `panel.body`) is the actual
+/// flex item the rail shares height between; a hidden-but-still-
+/// `flex_grow: 1.0` root would keep claiming its full share of the
+/// rail's height even with nothing visible inside it (caught by this
+/// function's own test, not assumed). With both set, the collapsed
+/// panel's share goes to its still-expanded siblings automatically —
+/// ordinary flexbox behaviour, not a special case. The region's own
+/// `Node::set_expanded`/`Action::Collapse`/`Action::Expand` are updated
+/// to match, the real disclosure-widget shape a screen reader already
+/// expects.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.root` or
+/// `panel.body` doesn't exist. Both styles are set before
+/// `panel.root`'s accessibility node is checked, so a missing
+/// accessibility node leaves the new layout state in place rather than
+/// rolling it back — the same "partial application on a genuinely
+/// malformed handle" tradeoff [`clear_panel_body`] already accepts
+/// mid-loop, not a new one introduced here.
+pub fn set_panel_collapsed(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    collapsed: bool,
+) -> Result<(), WidgetError> {
+    tree.set_style(panel.root, root_style(collapsed))?;
+
+    let body_style = if collapsed {
+        Style {
+            display: Display::None,
+            ..Default::default()
+        }
+    } else {
+        Style::default()
+    };
+    tree.set_style(panel.body, body_style)?;
+
+    let node = tree
+        .accessibility(panel.root)
+        .ok_or(WidgetError::UnknownWidget(panel.root))?;
+    let mut updated = node.clone();
+    updated.set_expanded(!collapsed);
+    if collapsed {
+        updated.remove_action(Action::Collapse);
+        updated.add_action(Action::Expand);
+    } else {
+        updated.remove_action(Action::Expand);
+        updated.add_action(Action::Collapse);
+    }
+    tree.set_accessibility(panel.root, updated)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clear_panel_body, insert_panel};
+    use super::{clear_panel_body, insert_panel, panel_is_collapsed, set_panel_collapsed};
     use aurora_widgets::WidgetError;
     use aurora_widgets::widgets::{self, WidgetKind};
     use taffy::Style;
@@ -110,9 +201,16 @@ mod tests {
         assert_eq!(accessibility.role(), accesskit::Role::Region);
         assert_eq!(accessibility.label(), Some("Layers"));
         assert!(accessibility.supports_action(accesskit::Action::Focus));
+        assert!(accessibility.supports_action(accesskit::Action::Collapse));
+        assert!(!accessibility.supports_action(accesskit::Action::Expand));
+        assert_eq!(accessibility.is_expanded(), Some(true));
         assert_eq!(tree.payload(panel.root), Some(&WidgetKind::Container));
         assert_eq!(tree.children(panel.body), Some([].as_slice()));
         assert_eq!(tree.parent(panel.body), Some(panel.root));
+        match panel_is_collapsed(&tree, panel) {
+            Ok(collapsed) => assert!(!collapsed, "a freshly inserted panel starts expanded"),
+            Err(err) => unreachable!("{err:?}"),
+        }
     }
 
     #[test]
@@ -154,6 +252,136 @@ mod tests {
         let (mut tree, _root) = widgets::new_tree(Style::default());
         let bogus = accesskit::NodeId(999);
         match clear_panel_body(&mut tree, bogus) {
+            Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
+            other => unreachable!("expected UnknownWidget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collapsing_a_panel_hides_its_body_and_survives_its_own_content() {
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Layers") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = widgets::insert_container(&mut tree, panel.body, Style::default()) {
+            unreachable!("{err:?}");
+        }
+
+        if let Err(err) = set_panel_collapsed(&mut tree, panel, true) {
+            unreachable!("{err:?}");
+        }
+
+        match panel_is_collapsed(&tree, panel) {
+            Ok(collapsed) => assert!(collapsed),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        let Some(style) = tree.style(panel.body) else {
+            unreachable!("body still exists");
+        };
+        assert_eq!(style.display, taffy::Display::None);
+        assert_eq!(
+            tree.children(panel.body).map(<[_]>::len),
+            Some(1),
+            "collapsing must not remove the body's own content"
+        );
+
+        let Some(accessibility) = tree.accessibility(panel.root) else {
+            unreachable!("still exists");
+        };
+        assert_eq!(accessibility.is_expanded(), Some(false));
+        assert!(!accessibility.supports_action(accesskit::Action::Collapse));
+        assert!(accessibility.supports_action(accesskit::Action::Expand));
+    }
+
+    #[test]
+    fn expanding_a_collapsed_panel_restores_its_bodys_own_layout() {
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Layers") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_panel_collapsed(&mut tree, panel, true) {
+            unreachable!("{err:?}");
+        }
+
+        if let Err(err) = set_panel_collapsed(&mut tree, panel, false) {
+            unreachable!("{err:?}");
+        }
+
+        match panel_is_collapsed(&tree, panel) {
+            Ok(collapsed) => assert!(!collapsed),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        let Some(accessibility) = tree.accessibility(panel.root) else {
+            unreachable!("still exists");
+        };
+        assert_eq!(accessibility.is_expanded(), Some(true));
+        assert!(accessibility.supports_action(accesskit::Action::Collapse));
+        assert!(!accessibility.supports_action(accesskit::Action::Expand));
+    }
+
+    #[test]
+    fn a_collapsed_panel_gives_its_own_height_back_to_its_siblings() {
+        let (mut tree, root) = widgets::new_tree(Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(100.0_f32),
+                height: taffy::style_helpers::length(200.0_f32),
+            },
+            ..Default::default()
+        });
+        let first = match insert_panel(&mut tree, root, "Layers") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let second = match insert_panel(&mut tree, root, "Properties") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(100.0, 200.0);
+        let Some(before) = tree.bounds(second.root) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(before.height, 100, "two panels share the height equally");
+
+        if let Err(err) = set_panel_collapsed(&mut tree, first, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(100.0, 200.0);
+        let Some(after) = tree.bounds(second.root) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            after.height, 200,
+            "the collapsed panel's own share must go to its still-expanded sibling, ordinary \
+             flex_grow sharing, not a special case"
+        );
+    }
+
+    #[test]
+    fn panel_is_collapsed_rejects_an_unknown_body() {
+        let (tree, _root) = widgets::new_tree(Style::default());
+        let bogus = accesskit::NodeId(999);
+        let panel = super::PanelHandle {
+            root: bogus,
+            body: bogus,
+        };
+        match panel_is_collapsed(&tree, panel) {
+            Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
+            other => unreachable!("expected UnknownWidget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_panel_collapsed_rejects_an_unknown_body() {
+        let (mut tree, _root) = widgets::new_tree(Style::default());
+        let bogus = accesskit::NodeId(999);
+        let panel = super::PanelHandle {
+            root: bogus,
+            body: bogus,
+        };
+        match set_panel_collapsed(&mut tree, panel, true) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
