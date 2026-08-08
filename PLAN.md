@@ -3498,6 +3498,27 @@ check licenses` clean with the new `toml` dependency.
   the same "written here, confirmed on real hardware later" shape the
   a11y spike and the DPI-scaling bullet both already went through.
   Windows/Linux detection are still open, real follow-on spikes.
+
+  **Real bug found on Cahya's own Mac, 2026-08-08, fixed same day**:
+  `cargo clippy` failed for real — `accessibilityDisplayShouldReduceMotion`/
+  `accessibilityDisplayShouldIncreaseContrast` weren't in scope.
+  Root cause: those methods live in `objc2-app-kit`'s own generated
+  `NSAccessibility` module, gated behind a separate `NSAccessibility`
+  feature — not bundled into `NSWorkspace` the way assumed. The
+  original scratch-crate proof that "worked" in the sandbox had also
+  enabled `NSApplication`, which transitively pulls in enough to mask
+  the gap; the real dependency declaration only had `NSWorkspace`,
+  narrower and wrong. Reproduced the exact failure in a fresh, minimal
+  scratch crate first (confirming the real root cause instead of
+  guessing), then fixed by adding `"NSAccessibility"` to
+  `objc2-app-kit`'s own feature list in the root `Cargo.toml` — same
+  safe-Rust API, still no `unsafe_code` override needed. `cargo build`/
+  `clippy --all-targets --all-features -- -D warnings`/`cargo test`/
+  `cargo doc --no-deps -D warnings`/`cargo deny check all` all
+  re-verified clean on Linux; the real, authoritative check is Cahya
+  re-running `cargo clippy` on his own Mac. Version bumped as a patch
+  (`CLAUDE.md`'s own convention — correcting something already landed
+  and wrong, not new work).
 - [~] **Crash recovery UI** — first slice done 2026-08-05. A new
   generic mechanism in `aurora-widgets`,
   `crates/aurora-widgets/src/widgets/dialog.rs` (new): a modal
