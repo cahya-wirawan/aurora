@@ -1300,6 +1300,9 @@ const COMMAND_FOCUS_HISTORY: &str = "view.focus_history";
 const COMMAND_TOGGLE_LAYERS: &str = "view.toggle_layers";
 const COMMAND_TOGGLE_PROPERTIES: &str = "view.toggle_properties";
 const COMMAND_TOGGLE_HISTORY: &str = "view.toggle_history";
+const COMMAND_CLOSE_LAYERS: &str = "view.close_layers";
+const COMMAND_CLOSE_PROPERTIES: &str = "view.close_properties";
+const COMMAND_CLOSE_HISTORY: &str = "view.close_history";
 const COMMAND_FILE_OPEN: &str = "file.open";
 const COMMAND_FILE_SAVE: &str = "file.save";
 const COMMAND_UNDO: &str = "edit.undo";
@@ -1307,27 +1310,37 @@ const COMMAND_REDO: &str = "edit.redo";
 
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
-/// collapsed/expanded state (`aurora_ui::set_panel_collapsed`, PLAN.md
-/// M1.8's docking bullet); real native "Open File…"/"Save As…"
-/// pickers; and `Undo`/`Redo`, the same commands `Ctrl+Z`/`Ctrl+Shift+Z`
-/// already run — previously shortcut-only, a real, named gap (a
-/// screen-reader user driving this crate through the palette had no way
-/// to reach either one). Genuine, not placeholder — each focus command
-/// moves real keyboard focus to a real, already-focusable panel region
-/// (see `aurora-ui`'s `insert_panel`), verifiable the same way any
-/// other focus change is (`push_accessibility`); each toggle command
-/// really collapses/expands its panel (`command_collapse_target`); the
-/// title itself doesn't reflect current state (a palette listing "Hide
-/// Layers Panel" vs "Show Layers Panel" would need the list rebuilt on
-/// every state change — real, separate follow-on work, a fixed "Toggle"
-/// label is the honest baseline this pass lands); `COMMAND_FILE_OPEN`/
-/// `COMMAND_FILE_SAVE` show a real, native `rfd::FileDialog` and the
-/// chosen path is really opened/saved (`App::open_file`/`save_file`);
-/// `COMMAND_UNDO`/`COMMAND_REDO` really undo/redo (see
-/// [`ActivatedCommand`]'s own doc comment for why `activate_command`
-/// itself doesn't run them directly). "Save As…", not "Save" — this
-/// crate tracks no "current document path" to reuse yet, so every save
-/// shows a picker.
+/// collapsed/expanded state (`aurora_ui::set_panel_collapsed`); one
+/// more still, closing it outright (`aurora_ui::close_panel` — collapse
+/// plus really freeing its current content, PLAN.md M1.8's docking
+/// bullet, Cahya's own scoping call: close reuses collapse's layout
+/// mechanism rather than making `Workspace`'s own panel fields
+/// optional, since nothing renders yet to make that extra honesty
+/// worth the ripple through every place this crate already assumes a
+/// docked panel exists); real native "Open File…"/"Save As…" pickers;
+/// and `Undo`/`Redo`, the same commands `Ctrl+Z`/`Ctrl+Shift+Z` already
+/// run — previously shortcut-only, a real, named gap (a screen-reader
+/// user driving this crate through the palette had no way to reach
+/// either one). Genuine, not placeholder — each focus command moves
+/// real keyboard focus to a real, already-focusable panel region (see
+/// `aurora-ui`'s `insert_panel`), verifiable the same way any other
+/// focus change is (`push_accessibility`); each toggle command really
+/// collapses/expands its panel (`command_collapse_target`); each close
+/// command really collapses *and* empties its panel's body
+/// (`command_close_target`) — reopening it (the same toggle command)
+/// shows it empty until the next real document-state change
+/// repopulates it, `close_panel`'s own doc comment names this
+/// honestly. Command titles don't reflect current state (a palette
+/// listing "Hide Layers Panel" vs "Show Layers Panel" would need the
+/// list rebuilt on every state change — real, separate follow-on work,
+/// fixed "Toggle"/"Close" labels are the honest baseline this pass
+/// lands); `COMMAND_FILE_OPEN`/`COMMAND_FILE_SAVE` show a real, native
+/// `rfd::FileDialog` and the chosen path is really opened/saved
+/// (`App::open_file`/`save_file`); `COMMAND_UNDO`/`COMMAND_REDO` really
+/// undo/redo (see [`ActivatedCommand`]'s own doc comment for why
+/// `activate_command` itself doesn't run them directly). "Save As…",
+/// not "Save" — this crate tracks no "current document path" to reuse
+/// yet, so every save shows a picker.
 fn palette_commands() -> Vec<CommandEntry> {
     vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
@@ -1336,6 +1349,9 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel"),
         CommandEntry::new(COMMAND_TOGGLE_PROPERTIES, "Toggle Properties Panel"),
         CommandEntry::new(COMMAND_TOGGLE_HISTORY, "Toggle History Panel"),
+        CommandEntry::new(COMMAND_CLOSE_LAYERS, "Close Layers Panel"),
+        CommandEntry::new(COMMAND_CLOSE_PROPERTIES, "Close Properties Panel"),
+        CommandEntry::new(COMMAND_CLOSE_HISTORY, "Close History Panel"),
         CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
         CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
         CommandEntry::new(COMMAND_UNDO, "Undo"),
@@ -1372,15 +1388,31 @@ fn command_collapse_target(
     }
 }
 
+/// Resolves an activated command-palette entry's own `id` to the panel
+/// it should close — the close-command counterpart to
+/// [`command_collapse_target`]'s own toggle-command resolution.
+fn command_close_target(
+    workspace: &aurora_ui::Workspace,
+    id: &str,
+) -> Option<aurora_ui::PanelHandle> {
+    match id {
+        COMMAND_CLOSE_LAYERS => Some(workspace.layers),
+        COMMAND_CLOSE_PROPERTIES => Some(workspace.properties),
+        COMMAND_CLOSE_HISTORY => Some(workspace.history),
+        _ => None,
+    }
+}
+
 /// Activates a command by its own opaque id — shared by the command
 /// palette's `Enter` key and, on macOS, the native menu bar
 /// (`App::handle_menu_event`): the same underlying action, reachable
 /// from two different UI surfaces, rather than two parallel
 /// implementations of "what does this command do." Moves focus for a
 /// panel-focus command ([`command_target`]); flips collapsed/expanded
-/// for a panel-toggle command ([`command_collapse_target`]); shows the
-/// native file dialog and returns the picked path, tagged by which one
-/// it was ([`ActivatedCommand`]), for [`COMMAND_FILE_OPEN`]/
+/// for a panel-toggle command ([`command_collapse_target`]); closes a
+/// panel outright for a panel-close command ([`command_close_target`]);
+/// shows the native file dialog and returns the picked path, tagged by
+/// which one it was ([`ActivatedCommand`]), for [`COMMAND_FILE_OPEN`]/
 /// [`COMMAND_FILE_SAVE`]; resolves `COMMAND_UNDO`/`COMMAND_REDO` to
 /// their own [`ActivatedCommand`] variant without running them here —
 /// this function is deliberately kept free of `layers`/`history`/
@@ -1406,6 +1438,12 @@ fn activate_command(
         let collapsed = aurora_ui::panel_is_collapsed(&workspace.tree, panel).unwrap_or(false);
         if let Err(err) = aurora_ui::set_panel_collapsed(&mut workspace.tree, panel, !collapsed) {
             tracing::warn!(?err, "failed to toggle panel collapse");
+        }
+        return None;
+    }
+    if let Some(panel) = command_close_target(workspace, id) {
+        if let Err(err) = aurora_ui::close_panel(&mut workspace.tree, panel) {
+            tracing::warn!(?err, "failed to close panel");
         }
         return None;
     }
@@ -1446,8 +1484,9 @@ fn activate_command(
 /// (About/Services/Hide/Quit — see this function's own doc comment
 /// below for why this exists at all), File > Open File…/Save As…,
 /// Edit > Undo/Redo, View > Focus Layers/Properties/History Panel, then
-/// (past a separator) Toggle Layers/Properties/History Panel — every
-/// one of those seven reusing the exact same `COMMAND_*` ids the
+/// (past a separator) Toggle Layers/Properties/History Panel, then
+/// (past another) Close Layers/Properties/History Panel — every one of
+/// those ten reusing the exact same `COMMAND_*` ids the
 /// command palette already uses (via `MenuItem::with_id`), so
 /// [`activate_command`] drives both UI surfaces identically; nothing
 /// here invents a second command vocabulary. No accelerator hint on
@@ -1550,6 +1589,15 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(COMMAND_TOGGLE_HISTORY, "Toggle History Panel", true, None),
+            &muda::PredefinedMenuItem::separator(),
+            &muda::MenuItem::with_id(COMMAND_CLOSE_LAYERS, "Close Layers Panel", true, None),
+            &muda::MenuItem::with_id(
+                COMMAND_CLOSE_PROPERTIES,
+                "Close Properties Panel",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(COMMAND_CLOSE_HISTORY, "Close History Panel", true, None),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -4738,7 +4786,8 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivatedCommand, AppCommand, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
+        ActivatedCommand, AppCommand, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_LAYERS,
+        COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key, KeyChord, Modifiers,
@@ -5899,10 +5948,10 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(state.query(), "lay");
-        // "Focus Layers Panel" and "Toggle Layers Panel" both match --
-        // the first inserted (`palette_commands`'s own order) is what
-        // ends up selected.
-        assert_eq!(state.results().len(), 2);
+        // "Focus Layers Panel", "Toggle Layers Panel", and "Close Layers
+        // Panel" all match -- the first inserted (`palette_commands`'s
+        // own order) is what ends up selected.
+        assert_eq!(state.results().len(), 3);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -6447,6 +6496,49 @@ mod tests {
         check(COMMAND_TOGGLE_LAYERS, |workspace| workspace.layers);
         check(COMMAND_TOGGLE_PROPERTIES, |workspace| workspace.properties);
         check(COMMAND_TOGGLE_HISTORY, |workspace| workspace.history);
+    }
+
+    #[test]
+    fn activate_command_closes_the_matching_panel_for_every_known_close_id() {
+        fn check(id: &str, expected: impl Fn(&aurora_ui::Workspace) -> aurora_ui::PanelHandle) {
+            let mut workspace = aurora_ui::build_workspace();
+            let mut focus = FocusManager::default();
+            let mut file_dialog = FakeFileDialog::default();
+            let panel = expected(&workspace);
+            if let Err(err) = aurora_widgets::widgets::insert_container(
+                &mut workspace.tree,
+                panel.body,
+                taffy::Style::default(),
+            ) {
+                unreachable!("{err:?}");
+            }
+
+            let picked = activate_command(&mut workspace, &mut focus, id, &mut file_dialog);
+
+            assert_eq!(picked, None);
+            match aurora_ui::panel_is_collapsed(&workspace.tree, panel) {
+                Ok(collapsed) => assert!(collapsed, "closing must also collapse"),
+                Err(err) => unreachable!("{err:?}"),
+            }
+            assert_eq!(
+                workspace.tree.children(panel.body),
+                Some([].as_slice()),
+                "closing must really empty the body, not just hide it"
+            );
+        }
+
+        check(COMMAND_CLOSE_LAYERS, |workspace| workspace.layers);
+        check(COMMAND_CLOSE_PROPERTIES, |workspace| workspace.properties);
+        check(COMMAND_CLOSE_HISTORY, |workspace| workspace.history);
+    }
+
+    #[test]
+    fn palette_commands_includes_a_close_for_every_panel() {
+        let commands = palette_commands();
+        let ids: Vec<&str> = commands.iter().map(|entry| entry.id.as_str()).collect();
+        assert!(ids.contains(&COMMAND_CLOSE_LAYERS), "{ids:?}");
+        assert!(ids.contains(&COMMAND_CLOSE_PROPERTIES), "{ids:?}");
+        assert!(ids.contains(&COMMAND_CLOSE_HISTORY), "{ids:?}");
     }
 
     #[test]

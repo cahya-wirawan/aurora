@@ -4,12 +4,18 @@
 //! bullet, first slice.
 //!
 //! **Mostly static.** A panel here is a labeled region with a body to
-//! put content in. [`set_panel_collapsed`] is the one real piece of
-//! interactivity so far — there is still no drag-to-redock, resize,
-//! close, or floating, and no persisted workspace layout. Those remain
-//! the actual "docking" and "custom workspaces" half of that bullet,
-//! deliberately left open: each needs real interaction/drag-state
-//! machinery this pass still doesn't build.
+//! put content in. [`set_panel_collapsed`] and [`close_panel`] are the
+//! real interactivity so far — there is still no drag-to-redock,
+//! resize, floating, or persisted workspace layout, and `panel.root`
+//! itself is never removed from the tree (only its own docked *slot*,
+//! `Workspace`'s own `layers`/`properties`/`history` fields, would need
+//! to become optional for that — a real, separate architecture decision
+//! deliberately not made here, since nothing renders yet to make a
+//! fully-removed panel's own extra honesty pay for the ripple it would
+//! cost through every place `aurora-app` already assumes a docked panel
+//! exists). Those remain the actual "docking" and "custom workspaces"
+//! half of that bullet, deliberately left open: each needs real
+//! interaction/drag-state machinery this pass still doesn't build.
 
 use accesskit::{Action, Node, Role};
 use aurora_widgets::widgets::{self, WidgetKind};
@@ -180,9 +186,40 @@ pub fn set_panel_collapsed(
     tree.set_accessibility(panel.root, updated)
 }
 
+/// Closes `panel`: the same layout/accessibility change
+/// [`set_panel_collapsed`]`(tree, panel, true)` already makes, plus
+/// really freeing its current content ([`clear_panel_body`]) rather
+/// than just hiding it. Unlike a plain collapse — which deliberately
+/// keeps content resident so a quick re-expand needs no rebuild, see
+/// that function's own doc comment — closing trades that cheap-toggle
+/// guarantee for actually reclaiming the memory and simplifying the
+/// accessibility tree down to just the region itself.
+///
+/// Reopening is the ordinary `set_panel_collapsed(tree, panel, false)`:
+/// the body comes back empty until whatever populated it before
+/// (`populate_layers_panel`/`populate_history_panel`, `aurora-ui`'s own
+/// higher-level callers) runs again on the next real document-state
+/// change — the same "one-shot, not reactive" contract those functions
+/// already document. This module knows nothing about layers or history
+/// to repopulate anything itself.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.root` or
+/// `panel.body` doesn't exist.
+pub fn close_panel(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+) -> Result<(), WidgetError> {
+    set_panel_collapsed(tree, panel, true)?;
+    clear_panel_body(tree, panel.body)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clear_panel_body, insert_panel, panel_is_collapsed, set_panel_collapsed};
+    use super::{
+        clear_panel_body, close_panel, insert_panel, panel_is_collapsed, set_panel_collapsed,
+    };
     use aurora_widgets::WidgetError;
     use aurora_widgets::widgets::{self, WidgetKind};
     use taffy::Style;
@@ -382,6 +419,87 @@ mod tests {
             body: bogus,
         };
         match set_panel_collapsed(&mut tree, panel, true) {
+            Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
+            other => unreachable!("expected UnknownWidget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closing_a_panel_collapses_it_and_really_empties_its_body() {
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Layers") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for _ in 0..3 {
+            if let Err(err) = widgets::insert_container(&mut tree, panel.body, Style::default()) {
+                unreachable!("{err:?}");
+            }
+        }
+        assert_eq!(tree.children(panel.body).map(<[_]>::len), Some(3));
+
+        if let Err(err) = close_panel(&mut tree, panel) {
+            unreachable!("{err:?}");
+        }
+
+        match panel_is_collapsed(&tree, panel) {
+            Ok(collapsed) => assert!(
+                collapsed,
+                "closing must collapse, same as set_panel_collapsed"
+            ),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert_eq!(
+            tree.children(panel.body),
+            Some([].as_slice()),
+            "unlike a plain collapse, closing must really empty the body"
+        );
+        assert!(
+            tree.contains(panel.body),
+            "the body itself must survive -- only its children are removed, same as \
+             clear_panel_body alone"
+        );
+    }
+
+    #[test]
+    fn reopening_a_closed_panel_restores_its_layout_with_an_empty_body() {
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Layers") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = widgets::insert_container(&mut tree, panel.body, Style::default()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = close_panel(&mut tree, panel) {
+            unreachable!("{err:?}");
+        }
+
+        if let Err(err) = set_panel_collapsed(&mut tree, panel, false) {
+            unreachable!("{err:?}");
+        }
+
+        match panel_is_collapsed(&tree, panel) {
+            Ok(collapsed) => assert!(!collapsed),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert_eq!(
+            tree.children(panel.body),
+            Some([].as_slice()),
+            "reopening doesn't repopulate on its own -- this module knows nothing about \
+             layers/history content, see close_panel's own doc comment"
+        );
+    }
+
+    #[test]
+    fn close_panel_rejects_an_unknown_body() {
+        let (mut tree, _root) = widgets::new_tree(Style::default());
+        let bogus = accesskit::NodeId(999);
+        let panel = super::PanelHandle {
+            root: bogus,
+            body: bogus,
+        };
+        match close_panel(&mut tree, panel) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }

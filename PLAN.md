@@ -2888,8 +2888,51 @@ check licenses` clean with the new `toml` dependency.
   function itself, which the scratch crate covers) also clean. No new
   tests — `build_menu` itself is deliberately untested (see this
   file's own comment on why: `muda::Menu::new()` panics outside a real
-  macOS GUI context), unchanged by this. Still open, unchanged: resize,
+  macOS GUI context), unchanged by this. Still open at the time: resize,
   close, drag-to-redock, floating, persisted layouts.
+
+  **Panel close landed 2026-08-08**, scoped with Cahya first
+  (`AskUserQuestion`-style discussion, not a guess) once the real
+  ripple was measured rather than assumed: making a closed panel
+  genuinely absent from the tree would mean `Workspace`'s own
+  `layers`/`properties`/`history` fields becoming `Option<PanelHandle>`
+  — a real ~35-call-site ripple through `aurora-app` (grepped, not
+  estimated), several inside functions that unconditionally refresh
+  panel content on every document change (`populate_layers_panel`/
+  `populate_history_panel`'s own call sites). Since nothing renders a
+  pixel yet, there's no visible difference today between "closed" and
+  "collapsed," so that ripple had no real payoff to justify it yet.
+  Cahya's own call: `aurora_ui::close_panel` reuses
+  `set_panel_collapsed`'s exact layout mechanism (same `Display::None`/
+  `flex_grow: 0.0` collapse) plus `clear_panel_body`, actually freeing
+  the panel's own content rather than just hiding it — the real,
+  cheaper half of "close" (reclaiming memory, simplifying the
+  accessibility tree down to the bare region) without touching
+  `Workspace`'s own field types at all. Reopening is the ordinary
+  `set_panel_collapsed(tree, panel, false)`; the body comes back empty
+  until the next real document-state change repopulates it (the same
+  "one-shot, not reactive" contract `populate_layers_panel`/
+  `populate_history_panel` already document) — `aurora-ui::panel`
+  knows nothing about layers/history content to refill anything
+  itself, an honest, stated gap, not a bug. Wired into the command
+  palette (`COMMAND_CLOSE_*` trio, `command_close_target`, mirroring
+  `command_collapse_target` exactly) and the native macOS menu bar (a
+  third `View` section, past another separator) the same session —
+  verified with the same isolated-scratch-crate-plus-real-`[lints]`-
+  table method the toggle-menu-entries fix established, this time
+  before pushing rather than after a real bug. 5 new tests
+  (`aurora-ui::panel`: 3, now 39 total; `aurora-app`: 2, now 133
+  total). One more pre-existing `aurora-app` test needed updating, same
+  reason as last time: the query `"lay"` now matches 3 commands (Focus/
+  Toggle/Close Layers Panel), not 2 — another real behaviour change
+  from adding real commands, not a bug. `cargo fmt --all --check`/
+  `clippy --workspace --all-targets --all-features -- -D warnings`/
+  `cargo test --workspace` (0 failures)/`cargo doc --workspace --no-deps
+  --all-features -D warnings`/`cargo deny check all` all clean. Version
+  bumped per `CLAUDE.md`'s own convention (a PLAN.md step). Still open,
+  unchanged: resize, drag-to-redock, floating, persisted layouts, and
+  the real `Option<PanelHandle>` version of close, left for whenever
+  rendering (or real panel content volume) gives it an actual payoff.
 - [~] **Canvas: infinite zoom, rotation, pan, rulers, guides, grid,
   snap** — real rendering landed 2026-08-06, in two commits, picking up
   directly from M1.9's "wire a live document" step (which gave the

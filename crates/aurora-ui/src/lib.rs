@@ -34,7 +34,8 @@ pub use canvas_view::CanvasView;
 pub use history_panel::populate_history_panel;
 pub use layers_panel::populate_layers_panel;
 pub use panel::{
-    PanelHandle, clear_panel_body, insert_panel, panel_is_collapsed, set_panel_collapsed,
+    PanelHandle, clear_panel_body, close_panel, insert_panel, panel_is_collapsed,
+    set_panel_collapsed,
 };
 pub use tool::Tool;
 pub use workspace::{Workspace, build_workspace};
