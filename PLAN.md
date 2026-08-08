@@ -2871,8 +2871,25 @@ check licenses` clean with the new `toml` dependency.
   (0 failures)/`cargo doc --workspace --no-deps --all-features -D
   warnings`/`cargo deny check all` all clean. Version bumped per
   `CLAUDE.md`'s own convention (a PLAN.md step). Still open: resize,
-  close, drag-to-redock, floating, persisted layouts, and the native
-  menu bar's own toggle entries.
+  close, drag-to-redock, floating, persisted layouts.
+
+  **The native menu bar's own toggle entries landed the same day**:
+  `build_menu`'s `View` submenu gained a separator plus the three
+  `COMMAND_TOGGLE_*` items, the exact same `MenuItem::with_id`/
+  `Submenu::with_items` shape the existing Focus trio already uses —
+  no new API surface, just more of an already-proven-correct pattern.
+  Verified properly this time, learning from the same day's earlier
+  accessibility-detection bugs rather than assuming a repeated pattern
+  is automatically safe: an isolated scratch crate with this
+  workspace's own real `[lints]` table, `cargo clippy --target
+  x86_64-apple-darwin --all-targets --all-features -- -D warnings`
+  against the real doc comment and menu-building code — clean. Full
+  Linux-side gate (everything but the `#[cfg(target_os = "macos")]`
+  function itself, which the scratch crate covers) also clean. No new
+  tests — `build_menu` itself is deliberately untested (see this
+  file's own comment on why: `muda::Menu::new()` panics outside a real
+  macOS GUI context), unchanged by this. Still open, unchanged: resize,
+  close, drag-to-redock, floating, persisted layouts.
 - [~] **Canvas: infinite zoom, rotation, pan, rulers, guides, grid,
   snap** — real rendering landed 2026-08-06, in two commits, picking up
   directly from M1.9's "wire a live document" step (which gave the

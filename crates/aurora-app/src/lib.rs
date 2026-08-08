@@ -1445,9 +1445,10 @@ fn activate_command(
 /// Builds the native menu's own cross-platform structure: an app menu
 /// (About/Services/Hide/Quit — see this function's own doc comment
 /// below for why this exists at all), File > Open File…/Save As…,
-/// Edit > Undo/Redo, View > Focus Layers/Properties/History Panel —
-/// the last three reusing the exact same `COMMAND_*` ids the command
-/// palette already uses (via `MenuItem::with_id`), so
+/// Edit > Undo/Redo, View > Focus Layers/Properties/History Panel, then
+/// (past a separator) Toggle Layers/Properties/History Panel — every
+/// one of those seven reusing the exact same `COMMAND_*` ids the
+/// command palette already uses (via `MenuItem::with_id`), so
 /// [`activate_command`] drives both UI surfaces identically; nothing
 /// here invents a second command vocabulary. No accelerator hint on
 /// Undo/Redo (the trailing `None`) — this crate's own keyboard
@@ -1540,6 +1541,15 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(COMMAND_FOCUS_HISTORY, "Focus History Panel", true, None),
+            &muda::PredefinedMenuItem::separator(),
+            &muda::MenuItem::with_id(COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel", true, None),
+            &muda::MenuItem::with_id(
+                COMMAND_TOGGLE_PROPERTIES,
+                "Toggle Properties Panel",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(COMMAND_TOGGLE_HISTORY, "Toggle History Panel", true, None),
         ],
     ) {
         Ok(submenu) => submenu,
