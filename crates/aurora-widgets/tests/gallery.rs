@@ -888,19 +888,16 @@ fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state() {
     );
 }
 
-/// **`#[ignore]`, deliberately, until a human blesses a real golden**
-/// — see `button_gallery_matches_the_golden_image`'s own doc comment
-/// for the general "never bless blind" reasoning, and this file's own
-/// module doc comment / `CommandPalette`'s own three-round history for
-/// why that discipline matters in practice, not just in principle. Run
-/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
-/// -- --ignored`, open the written
-/// `tests/golden/color_swatch_gallery.png`, confirm it shows three
-/// visually distinct squares (a red-ish one, a blue-ish one, and a
-/// dimmed red-ish one) in the right colours, then remove this
-/// attribute and commit the PNG alongside that commit.
+/// **Blessed and reviewed 2026-08-08**: Cahya ran the bless command on
+/// real macOS GPU hardware and pushed `tests/golden/
+/// color_swatch_gallery.png`. Confirmed by decoding its own raw pixel
+/// bytes, not just eyeballing a thumbnail: `[220,40,40]` (the first
+/// arbitrary colour), `[40,80,220]` (the second), `[88,16,16]` (the
+/// first colour again, disabled — exactly `red * disabled_opacity
+/// (0.4)`, `220*0.4=88`, `40*0.4=16`), and `[0,0,0]` at the corner (the
+/// plain black backdrop, confirming no bleed outside a swatch's own
+/// cell).
 #[test]
-#[ignore = "needs a human on real GPU hardware to bless and review tests/golden/color_swatch_gallery.png first"]
 fn color_swatch_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
         return;
@@ -1207,25 +1204,22 @@ fn command_palette_style_positions_the_panel_with_a_real_margin() {
     );
 }
 
-/// **Blessed three times already (2026-08-07)** — see `NEUTRAL_CLEAR`'s
-/// and `command_palette_style`'s own doc comments for that history
-/// (plain black hid a correct panel, then a correct backdrop still had
-/// no margin to contrast against, then a real 32px margin fixed it).
-/// **That golden is now stale and was removed (`git rm`)**: the result
-/// row is a real, painted `WidgetKind::ListRow` now
-/// (`command_palette::rebuild_rows`, `paint_list_row`), and this
-/// gallery's own single command is always the selected one, so the
+/// **Blessed a fourth time, 2026-08-08** — see `NEUTRAL_CLEAR`'s and
+/// `command_palette_style`'s own doc comments for the first three
+/// rounds (plain black hid a correct panel, then a correct backdrop
+/// still had no margin, then a real 32px margin fixed it), and the
+/// paragraph above for why a fourth bless was needed at all (the
+/// result row is now a real, painted `WidgetKind::ListRow` — the
 /// rendered image gained a real `accent.primary` highlight rectangle
-/// inside the panel that the third-bless image never had — a genuine
-/// visual change, not a regression, but the same "never bless blind"
-/// rule as every other golden here means it needs a fresh human review
-/// on real GPU hardware before this can be un-ignored again. Run
-/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
-/// -- --ignored` and check for: the same backdrop/panel/margin as
-/// before, plus a visibly distinct accent-coloured rectangle for the
-/// one (selected) result row.
+/// the third bless never had). Confirmed by decoding the new golden's
+/// own raw pixel bytes: `[127,127,127]` (`NEUTRAL_CLEAR`) at the
+/// corner and one pixel outside the panel's own left edge (`x=31`),
+/// `[120,172,255]` (`accent.primary`, the same byte value
+/// `checkbox_gallery_matches_the_golden_image`'s own doc comment
+/// already confirmed) at the panel's centre and one pixel inside its
+/// left edge (`x=33`) — the margin boundary lands exactly where
+/// `COMMAND_PALETTE_MARGIN` predicts, same as every prior bless.
 #[test]
-#[ignore = "needs a human on real GPU hardware to bless and review the row-highlight change to tests/golden/command_palette_gallery.png"]
 fn command_palette_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
         return;
