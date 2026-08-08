@@ -4,8 +4,8 @@
 //! this pipeline" step `render`'s own doc comment names as still open.
 //!
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
-//! `Checkbox`, `Slider`, `TextField`, `CommandPalette`, and
-//! `ColorSwatch` — solid rounded-rect shapes, the simplest of the
+//! `Checkbox`, `Slider`, `TextField`, `CommandPalette`, `ColorSwatch`,
+//! and `ListRow` — solid rounded-rect shapes, the simplest of the
 //! widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
@@ -19,13 +19,15 @@
 //! in this crate; `content`/`cursor`/`selection_anchor`/`composition`
 //! don't affect its paint at all today, only `disabled` does).
 //! `CommandPalette` paints its own outer panel only — its query field's
-//! own text, and every result row (a plain `WidgetKind::Container`,
-//! indistinguishable from any other container by its own payload
-//! alone, including the one currently selected), remain entirely
-//! unpainted; see [`paint_command_palette`]'s own doc comment for why
-//! that's a real, structural gap, not an oversight. Every other
-//! [`WidgetKind`] (`Container` on its own) returns `Ok(vec![])` — a
-//! real, deliberate "nothing to paint," not an error.
+//! own text still isn't drawn (the same "no real text shaping yet" gap
+//! `TextField` has). Its result rows now are painted, though: each is a
+//! real `WidgetKind::ListRow` (`command_palette::rebuild_rows`), and
+//! [`paint_list_row`] highlights the selected one with `accent.primary`
+//! — an unselected row still paints nothing, the same "nothing to
+//! highlight" `Ok(vec![])` every other unselected-state widget already
+//! returns. Every other [`WidgetKind`] (`Container` on its own) returns
+//! `Ok(vec![])` too — a real, deliberate "nothing to paint," not an
+//! error.
 //!
 //! [`paint_widget`] returns a `Vec<Paint>`, not a single `Paint` —
 //! `Button`/`Checkbox` only ever needed one shape, but `Slider` is the
@@ -67,7 +69,8 @@ use aurora_vector::{DEFAULT_TOLERANCE, Mesh, fill, rounded_rect};
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
-    ButtonState, CheckboxState, ColorSwatchState, SliderState, TextFieldState, WidgetKind,
+    ButtonState, CheckboxState, ColorSwatchState, ListRowState, SliderState, TextFieldState,
+    WidgetKind,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -114,6 +117,7 @@ pub fn paint_widget(
         WidgetKind::ColorSwatch(state) => {
             paint_color_swatch(*state, bounds, theme, scales).map(|p| vec![p])
         }
+        WidgetKind::ListRow(state) => paint_list_row(*state, bounds, theme, scales),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -269,31 +273,21 @@ fn paint_text_field(
     Ok((mesh, [r, g, b, alpha]))
 }
 
-/// `CommandPalette`'s own outer panel, nothing else. `scales.radius.md`
-/// (a floating panel reading as more rounded than a small control is a
-/// common convention, not `scales.radius.sm` — see this module's own
-/// doc comment). `surface.raised`, not `surface.overlay`:
-/// `design/tokens/vocabulary.md` defines `surface.raised` as
-/// "Elevation 1: dropdowns, popovers, context menus" and reserves
-/// `surface.overlay` for "Elevation 2: modals, dialogs" — a command
-/// palette is the former, a floating, dismissable popover, not a
-/// blocking modal.
+/// `CommandPalette`'s own outer panel, nothing else — `paint_list_row`
+/// covers the selected-row highlight separately, since each row now
+/// paints itself (`WidgetKind::ListRow`, dispatched independently by
+/// `paint_widget` when `WidgetTree::paint_order` reaches it, not drawn
+/// by this function). `scales.radius.md` (a floating panel reading as
+/// more rounded than a small control is a common convention, not
+/// `scales.radius.sm` — see this module's own doc comment).
+/// `surface.raised`, not `surface.overlay`: `design/tokens/vocabulary.md`
+/// defines `surface.raised` as "Elevation 1: dropdowns, popovers,
+/// context menus" and reserves `surface.overlay` for "Elevation 2:
+/// modals, dialogs" — a command palette is the former, a floating,
+/// dismissable popover, not a blocking modal.
 ///
-/// **A real, structural gap, not an oversight**: nothing here paints
-/// the query field's own text, or highlights the currently selected
-/// result row. `CommandPaletteState::selected_row` names exactly which
-/// row that is, but every row is inserted as a plain
-/// `WidgetKind::Container` (`command_palette::rebuild_rows`) —
-/// indistinguishable from *any* other container in this tree by its
-/// own payload alone (a panel body, a layout wrapper, another
-/// palette's own row). `paint_widget` dispatches purely on a widget's
-/// own local `WidgetKind`, with no notion of "is this container the
-/// selected row of some ancestor `CommandPalette`" — answering that
-/// would mean walking up the tree from every container on every frame,
-/// or giving row containers their own distinguishing `WidgetKind`
-/// variant carrying a "selected" flag. Either is a real, separate
-/// design decision (a new architecture, not a new token), not
-/// attempted here.
+/// Still a real, honest gap: the query field's own text isn't drawn
+/// (no text shaping in this crate yet, the same gap `TextField` has).
 fn paint_command_palette(
     bounds: Rect,
     theme: &Theme,
@@ -344,15 +338,52 @@ fn paint_color_swatch(
     Ok((mesh, [r, g, b, alpha]))
 }
 
+/// A list row's own highlight — nothing at all when `state.selected` is
+/// `false` (a real, deliberate "no paint," the same convention
+/// `WidgetKind::Container` uses, not a transparent fill), since an
+/// unselected row is indistinguishable from its own owning widget's
+/// background and needs no shape of its own. A selected row paints
+/// `accent.primary` — `design/tokens/vocabulary.md`'s own entry for
+/// that token names "selection highlight" explicitly, alongside
+/// "primary buttons, active tool," so this isn't a new use invented
+/// here. `scales.radius.sm`, the same small-control radius every other
+/// non-panel shape in this module uses.
+fn paint_list_row(
+    state: ListRowState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+) -> Result<Vec<Paint>, WidgetError> {
+    if !state.selected {
+        return Ok(vec![]);
+    }
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.accent.primary.to_srgb_f32();
+    let alpha = if state.disabled {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    Ok(vec![(mesh, [r, g, b, alpha])])
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        CommandEntry, WidgetKind, command_palette_state, insert_button, insert_checkbox,
-        insert_color_swatch, insert_command_palette, insert_slider, insert_text_field, new_tree,
-        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
-        set_slider_disabled, set_slider_value, set_text_field_disabled, toggle_checkbox,
+        CommandEntry, ListRowState, WidgetKind, command_palette_state, insert_button,
+        insert_checkbox, insert_color_swatch, insert_command_palette, insert_slider,
+        insert_text_field, new_tree, set_button_disabled, set_button_pressed,
+        set_checkbox_disabled, set_color_swatch_disabled, set_slider_disabled, set_slider_value,
+        set_text_field_disabled, toggle_checkbox,
     };
     use accesskit::Toggled;
     use aurora_core::Rect;
@@ -784,7 +815,8 @@ mod tests {
     }
 
     #[test]
-    fn a_command_palettes_own_result_row_has_no_paint_yet() {
+    #[allow(clippy::float_cmp)]
+    fn a_command_palettes_selected_result_row_paints_accent_primary() {
         let (mut tree, root) = new_tree(taffy::Style::default());
         let scales = scales();
         let commands = vec![CommandEntry::new("edit.undo", "Undo")];
@@ -799,16 +831,101 @@ mod tests {
         let Some(row) = selected_row else {
             unreachable!("one command was inserted, so the first result is selected");
         };
+        if let Err(err) = tree.set_bounds(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 24,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
         let theme = dark_theme();
 
-        let paints = match paint_widget(&tree, row, &theme, &scales) {
+        let (mesh, color) = single_paint(&tree, row, &theme, &scales);
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a 200x24 selected row must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert_eq!(
+            color,
+            [r, g, b, 1.0],
+            "design/tokens/vocabulary.md names accent.primary for exactly this, \
+             'selection highlight'"
+        );
+    }
+
+    #[test]
+    fn a_command_palettes_unselected_result_row_has_no_paint() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let commands = vec![
+            CommandEntry::new("edit.undo", "Undo"),
+            CommandEntry::new("edit.redo", "Redo"),
+        ];
+        let palette = match insert_command_palette(&mut tree, root, commands) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let body = match command_palette_state(&tree, palette) {
+            Ok(state) => state.body(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(rows) = tree.children(body) else {
+            unreachable!("just inserted");
+        };
+        let Some(&second_row) = rows.get(1) else {
+            unreachable!("two commands were inserted, so a second row exists");
+        };
+        let theme = dark_theme();
+
+        let paints = match paint_widget(&tree, second_row, &theme, &scales) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
         assert!(
             paints.is_empty(),
-            "a result row is a plain Container and has no paint defined yet -- see \
-             paint_command_palette's own doc comment for why"
+            "only the selected row paints a highlight; an unselected row paints nothing"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_selected_list_row_applies_the_theme_disabled_opacity() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match tree.insert(
+            root,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::ListBoxOption),
+            WidgetKind::ListRow(ListRowState {
+                selected: true,
+                disabled: true,
+            }),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 20,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (_, color) = single_paint(&tree, row, &theme, &scales);
+        assert_eq!(
+            color[3], theme.state.disabled_opacity,
+            "a disabled, selected row still dims like every other disabled widget's paint"
         );
     }
 

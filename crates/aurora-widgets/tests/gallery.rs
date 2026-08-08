@@ -80,9 +80,11 @@ const SLIDER_THUMB_SAMPLE_OFFSET_X: u32 = 16;
 const TEXT_FIELD_CELL: (u32, u32) = (192, 32);
 const TEXT_FIELD_GALLERY_SIZE: (u32, u32) = (TEXT_FIELD_CELL.0 * 2, TEXT_FIELD_CELL.1);
 
-/// `CommandPalette` has exactly one visual state today (`paint_widget`'s
-/// own doc comment: no query text, no result-row highlighting, just the
-/// outer panel) — one cell, not a row of them.
+/// `CommandPalette` still has no query-text rendering (`paint_widget`'s
+/// own doc comment), so one cell captures everything this gallery can
+/// show today — one command, always selected, so the row highlight is
+/// always visible too — not a row of cells the way a real per-state
+/// gallery (`Checkbox`, `Slider`) uses.
 const COMMAND_PALETTE_CELL: (u32, u32) = (192, 128);
 /// A real margin around the panel on every side, not just a bigger
 /// backdrop colour — found necessary the hard way (2026-08-07):
@@ -1080,17 +1082,24 @@ fn text_field_gallery_matches_the_golden_image() {
     }
 }
 
-/// `CommandPalette` has exactly one visual state today (`paint_widget`'s
-/// own doc comment), so there's no second state to compare against —
-/// this instead compares the panel's own centre against its own
-/// corner pixel `(0, 0)`. `scales.radius.md`'s real rounded corner
-/// (`paint_command_palette`'s own doc comment) means the very corner
-/// is *outside* the filled rounded rect regardless of what colour
-/// filled it, so this is a real, self-contained proof the panel was
-/// actually painted distinctly from its own surrounding clear colour
-/// — without hardcoding what that clear colour's own exact byte value
-/// is (see `NEUTRAL_CLEAR`'s own doc comment for why this gallery
-/// doesn't use plain black).
+/// This gallery's one command is always the selected result, and
+/// `command_palette_gallery_tree`'s own body/row layout
+/// (`command_palette::body_style`/`row_style`) makes that one row fill
+/// the entire panel interior — so the "panel centre" pixel this test
+/// samples is actually the row's own `accent.primary` highlight, painted
+/// on top of the panel's `surface.raised` fill beneath it, not
+/// `surface.raised` directly (see
+/// `command_palette_gallery_paints_the_selected_rows_own_highlight`
+/// below for the real, exact-colour proof of that). This test only
+/// proves the weaker, layout-agnostic thing: *something* opaque was
+/// painted across the panel's own interior, distinct from the
+/// surrounding clear colour — comparing the centre against corner pixel
+/// `(0, 0)`, which `scales.radius.md`'s real rounded corner
+/// (`paint_command_palette`'s own doc comment) keeps outside the filled
+/// rounded rect regardless of what colour filled it, without hardcoding
+/// what that clear colour's own exact byte value is (see
+/// `NEUTRAL_CLEAR`'s own doc comment for why this gallery doesn't use
+/// plain black).
 #[test]
 fn render_gallery_produces_the_command_palettes_own_panel() {
     let Some(context) = real_context() else {
@@ -1122,8 +1131,47 @@ fn render_gallery_produces_the_command_palettes_own_panel() {
     let corner = sample_at(&image, 0, 0);
     assert_ne!(
         corner, panel_centre,
-        "the panel's own centre must show surface.raised, not the same clear colour its own \
+        "the panel's own interior must show something opaque, not the same clear colour its own \
          margin (and rounded-off corner) shows"
+    );
+}
+
+/// The real, exact-colour proof `render_gallery_produces_the_command_
+/// palettes_own_panel`'s own doc comment names: with this gallery's one
+/// command always selected and its one row filling the whole panel
+/// interior, the panel's own centre pixel must be `accent.primary`
+/// itself, not `surface.raised` — `[120,172,255]`, the same Dark-theme
+/// byte value `checkbox_gallery_matches_the_golden_image`'s own doc
+/// comment already confirmed by decoding a real blessed golden, reused
+/// here rather than re-deriving it, since both ultimately resolve the
+/// same token against the same committed Dark theme.
+#[test]
+fn command_palette_gallery_paints_the_selected_rows_own_highlight() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = dark_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        NEUTRAL_CLEAR,
+    );
+    let panel_centre = sample_at(
+        &image,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+    );
+    assert_eq!(
+        panel_centre[..3],
+        [120, 172, 255],
+        "the sole, always-selected result row must paint accent.primary across the panel's own \
+         interior"
     );
 }
 
@@ -1159,23 +1207,25 @@ fn command_palette_style_positions_the_panel_with_a_real_margin() {
     );
 }
 
-/// **Blessed and reviewed 2026-08-07** (a third time — see
-/// `NEUTRAL_CLEAR`'s and `command_palette_style`'s own doc comments for
-/// the first two rejected rounds and why each failed: plain black hid
-/// a correct `surface.raised` panel, then a correct backdrop still had
-/// no margin to contrast against). This attempt added a real 32px
-/// `COMMAND_PALETTE_MARGIN` on every side via `command_palette_style`,
-/// verified headlessly first by
-/// `command_palette_style_positions_the_panel_with_a_real_margin`
-/// (proves the computed layout bounds are inset correctly, no GPU
-/// needed), then confirmed against the actual rendered PNG by decoding
-/// its raw pixel bytes directly: backdrop `[127,127,127]`
-/// (`NEUTRAL_CLEAR`) at both corners and at `x=31` (one pixel outside
-/// the panel's left edge), panel `[40,40,44]` (`surface.raised`) at its
-/// own centre and at `x=33` (one pixel inside), a real and visible
-/// margin all the way around — Cahya confirmed "looks better now"
-/// against this version.
+/// **Blessed three times already (2026-08-07)** — see `NEUTRAL_CLEAR`'s
+/// and `command_palette_style`'s own doc comments for that history
+/// (plain black hid a correct panel, then a correct backdrop still had
+/// no margin to contrast against, then a real 32px margin fixed it).
+/// **That golden is now stale and was removed (`git rm`)**: the result
+/// row is a real, painted `WidgetKind::ListRow` now
+/// (`command_palette::rebuild_rows`, `paint_list_row`), and this
+/// gallery's own single command is always the selected one, so the
+/// rendered image gained a real `accent.primary` highlight rectangle
+/// inside the panel that the third-bless image never had — a genuine
+/// visual change, not a regression, but the same "never bless blind"
+/// rule as every other golden here means it needs a fresh human review
+/// on real GPU hardware before this can be un-ignored again. Run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery
+/// -- --ignored` and check for: the same backdrop/panel/margin as
+/// before, plus a visibly distinct accent-coloured rectangle for the
+/// one (selected) result row.
 #[test]
+#[ignore = "needs a human on real GPU hardware to bless and review the row-highlight change to tests/golden/command_palette_gallery.png"]
 fn command_palette_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
         return;

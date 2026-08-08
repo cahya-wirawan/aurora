@@ -35,6 +35,7 @@ mod checkbox;
 mod color_swatch;
 mod command_palette;
 mod dialog;
+mod list_row;
 mod slider;
 mod text_field;
 
@@ -48,6 +49,7 @@ pub use command_palette::{
     move_command_palette_selection, set_command_palette_query,
 };
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};
+pub use list_row::ListRowState;
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
 pub use text_field::{
     Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
@@ -77,6 +79,12 @@ pub enum WidgetKind {
     TextField(TextFieldState),
     CommandPalette(CommandPaletteState),
     ColorSwatch(ColorSwatchState),
+    /// A selectable row within some owning widget's own list —
+    /// `CommandPalette`'s own result rows today, see
+    /// [`ListRowState`]'s own module doc comment for why this is a
+    /// deliberately shared, generic variant rather than one per
+    /// consumer.
+    ListRow(ListRowState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

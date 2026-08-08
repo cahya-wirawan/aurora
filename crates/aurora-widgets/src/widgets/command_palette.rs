@@ -25,13 +25,14 @@
 //! layout + accessibility content only.
 
 use accesskit::{Action, Node, Role};
-use taffy::Style;
+use taffy::style_helpers::{auto, percent};
+use taffy::{FlexDirection, Size, Style};
 
 use crate::error::WidgetError;
 use crate::shortcut::KeyChord;
 use crate::tree::{WidgetId, WidgetTree};
 
-use super::WidgetKind;
+use super::{ListRowState, WidgetKind};
 
 /// One entry a [`CommandPaletteState`] can offer — a title plus an
 /// optional shortcut label shown alongside it. Purely informational: a
@@ -128,6 +129,42 @@ impl CommandPaletteState {
     }
 }
 
+/// The results list's own layout: `Column`, filling the root panel
+/// (`percent(1.0)` on both axes) so its own rows stack top-to-bottom
+/// instead of the `Row`-direction default every `Style::default()`
+/// container otherwise gets — the same "labeled panel, `Column`,
+/// `flex_grow`" shape `aurora_ui::insert_panel` already establishes for
+/// stacking real content vertically.
+fn body_style() -> Style {
+    Style {
+        flex_direction: FlexDirection::Column,
+        size: Size {
+            width: percent(1.0_f32),
+            height: percent(1.0_f32),
+        },
+        ..Default::default()
+    }
+}
+
+/// One result row's own layout: full body width, sharing the body's
+/// available height equally with every other row (`flex_grow: 1.0`
+/// each — the same "N siblings dividing their container's height
+/// evenly" idiom `aurora_ui::workspace`'s own docked-panel rail
+/// already uses) rather than a fixed pixel height. Deliberately not a
+/// `Scales`-derived literal: an even flexbox split needs no absolute
+/// size at all, so this doesn't need `insert_command_palette`/
+/// `rebuild_rows` to take a `&Scales` they otherwise have no use for.
+fn row_style() -> Style {
+    Style {
+        flex_grow: 1.0,
+        size: Size {
+            width: percent(1.0_f32),
+            height: auto(),
+        },
+        ..Default::default()
+    }
+}
+
 fn root_node(query: &str) -> Node {
     let mut node = Node::new(Role::TextInput);
     node.set_label("Command Palette");
@@ -171,7 +208,7 @@ pub fn insert_command_palette(
 
     let mut body_node = Node::new(Role::ListBox);
     body_node.set_label("Results");
-    let body = tree.insert(root, Style::default(), body_node, WidgetKind::Container)?;
+    let body = tree.insert(root, body_style(), body_node, WidgetKind::Container)?;
 
     let Some(payload) = tree.payload_mut(root) else {
         unreachable!("root was just inserted above");
@@ -266,9 +303,12 @@ fn rebuild_rows(
         };
         let row = tree.insert(
             body,
-            Style::default(),
+            row_style(),
             row_node(entry, position == 0),
-            WidgetKind::Container,
+            WidgetKind::ListRow(ListRowState {
+                selected: position == 0,
+                disabled: false,
+            }),
         )?;
         rows.push(row);
     }
@@ -318,12 +358,18 @@ pub fn move_command_palette_selection(
         unreachable!("next_index is always < len by construction");
     };
 
-    if let Some(row) = old_row
-        && let Some(node) = tree.accessibility(row)
-    {
-        let mut updated = node.clone();
-        updated.set_selected(false);
-        tree.set_accessibility(row, updated)?;
+    if let Some(row) = old_row {
+        if let Some(WidgetKind::ListRow(row_state)) = tree.payload_mut(row) {
+            row_state.selected = false;
+        }
+        if let Some(node) = tree.accessibility(row) {
+            let mut updated = node.clone();
+            updated.set_selected(false);
+            tree.set_accessibility(row, updated)?;
+        }
+    }
+    if let Some(WidgetKind::ListRow(row_state)) = tree.payload_mut(new_row) {
+        row_state.selected = true;
     }
     if let Some(node) = tree.accessibility(new_row) {
         let mut updated = node.clone();
@@ -575,6 +621,144 @@ mod tests {
             Err(WidgetError::WrongWidgetKind(id)) => assert_eq!(id, root),
             other => unreachable!("expected WrongWidgetKind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rows_are_real_list_row_widgets_with_only_the_first_selected() {
+        let (mut tree, root) = new_tree(Style::default());
+        let palette = match insert_command_palette(&mut tree, root, commands()) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let body = match command_palette_state(&tree, palette) {
+            Ok(state) => state.body(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(rows) = tree.children(body) else {
+            unreachable!("just inserted");
+        };
+        let (Some(&first), Some(&second)) = (rows.first(), rows.get(1)) else {
+            unreachable!("3 commands were inserted above");
+        };
+        assert_eq!(
+            tree.payload(first),
+            Some(&WidgetKind::ListRow(super::ListRowState {
+                selected: true,
+                disabled: false,
+            }))
+        );
+        assert_eq!(
+            tree.payload(second),
+            Some(&WidgetKind::ListRow(super::ListRowState {
+                selected: false,
+                disabled: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn move_selection_updates_the_list_row_payloads_own_selected_flag_too() {
+        let (mut tree, root) = new_tree(Style::default());
+        let palette = match insert_command_palette(&mut tree, root, commands()) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (first_row, second_row) = {
+            let state = match command_palette_state(&tree, palette) {
+                Ok(state) => state,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(rows) = tree.children(state.body()) else {
+                unreachable!("just inserted");
+            };
+            let (Some(&a), Some(&b)) = (rows.first(), rows.get(1)) else {
+                unreachable!("3 commands were inserted above");
+            };
+            (a, b)
+        };
+
+        if let Err(err) = move_command_palette_selection(&mut tree, palette, true) {
+            unreachable!("{err:?}");
+        }
+
+        assert_eq!(
+            tree.payload(first_row),
+            Some(&WidgetKind::ListRow(super::ListRowState {
+                selected: false,
+                disabled: false,
+            })),
+            "the row moved away from must clear its own payload flag, not just its accessibility \
+             one -- paint_widget reads the payload"
+        );
+        assert_eq!(
+            tree.payload(second_row),
+            Some(&WidgetKind::ListRow(super::ListRowState {
+                selected: true,
+                disabled: false,
+            }))
+        );
+    }
+
+    /// Headless (no GPU) proof that the real layout `body_style`/
+    /// `row_style` apply actually produces non-degenerate, vertically
+    /// stacked row bounds -- written *before* asking for a gallery
+    /// bless, the same "prove the layout half without a GPU first"
+    /// discipline `command_palette_style_positions_the_panel_with_a_
+    /// real_margin` (`tests/gallery.rs`) already established. Without
+    /// this, `paint_list_row`'s own highlight would tessellate to a
+    /// real mesh but at a degenerate zero-size rect -- invisible, not a
+    /// compile or logic error, so only a real bounds assertion catches
+    /// it.
+    #[test]
+    fn results_stack_vertically_and_share_the_panels_height() {
+        let (mut tree, root) = new_tree(Style::default());
+        let palette = match insert_command_palette(&mut tree, root, commands()) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_style(
+            palette,
+            Style {
+                size: taffy::Size {
+                    width: taffy::style_helpers::length(300.0_f32),
+                    height: taffy::style_helpers::length(210.0_f32),
+                },
+                ..Default::default()
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(400.0, 300.0);
+
+        let body = match command_palette_state(&tree, palette) {
+            Ok(state) => state.body(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(rows) = tree.children(body) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(rows.len(), 3, "all 3 commands match the empty query");
+
+        let mut previous_bottom = None;
+        for &row in rows {
+            let Some(bounds) = tree.bounds(row) else {
+                unreachable!("just laid out");
+            };
+            assert!(bounds.width > 0, "a row must span real width: {bounds:?}");
+            assert!(bounds.height > 0, "a row must span real height: {bounds:?}");
+            if let Some(previous_bottom) = previous_bottom {
+                assert_eq!(
+                    bounds.y, previous_bottom,
+                    "rows must stack directly on top of one another, no gap or overlap"
+                );
+            }
+            previous_bottom = Some(bounds.y + i64::from(bounds.height));
+        }
+        assert_eq!(
+            previous_bottom,
+            tree.bounds(body).map(|b| b.y + i64::from(b.height)),
+            "the 3 rows together must exactly fill the body's own height"
+        );
     }
 
     #[test]
