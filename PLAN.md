@@ -3536,7 +3536,12 @@ check licenses` clean with the new `toml` dependency.
   `detect_accessibility_preferences` overloads' full real source
   (doc comments included) — clean. This is now the right verification
   method for any future `macOS`-only code in this crate, not just this
-  one fix.
+  one fix. **Confirmed 2026-08-08**: Cahya re-ran `cargo clippy` and
+  the full test suite on his own Mac — both clean. The macOS detection
+  code now genuinely compiles and lints clean on real hardware; real
+  *behavioural* verification (toggling Reduce Motion/Increase Contrast
+  in System Settings and confirming the read value changes) is still
+  open, as noted above.
 - [~] **Crash recovery UI** — first slice done 2026-08-05. A new
   generic mechanism in `aurora-widgets`,
   `crates/aurora-widgets/src/widgets/dialog.rs` (new): a modal
