@@ -39,6 +39,10 @@ wgpu = { workspace = true }
 rfd = { workspace = true }
 arboard = { workspace = true }
 half = { workspace = true }
+# `command_palette_style`'s own real `taffy::Style` (`Position::Absolute`
+# positioning for the command palette) -- was dev-only until this crate
+# actually needed to construct one in production code, not just tests.
+taffy = { workspace = true }
 
 # macOS only -- see the workspace `Cargo.toml`'s own comment on `muda`
 # for why Windows/Linux aren't included here. `objc2-app-kit` is already
@@ -54,7 +58,6 @@ objc2-app-kit = { workspace = true }
 
 [dev-dependencies]
 accesskit = { workspace = true }
-taffy = { workspace = true }
 tempfile = { workspace = true }
 
 [[bin]]

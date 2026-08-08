@@ -1610,9 +1610,72 @@ fn build_menu() -> muda::Menu {
     menu
 }
 
+/// The command palette's own real size and position within the window —
+/// `Position::Absolute` so it floats above `workspace.root`'s own
+/// canvas/divider/rail row instead of competing with them for space in
+/// it (`insert_command_palette` itself gives the palette's root only
+/// `Style::default()`, deliberately: the toolkit crate has no opinion
+/// on where its caller wants to place a popover).
+///
+/// **A real bug, found by Cahya actually trying `Ctrl+Shift+P` in the
+/// running app and seeing nothing.** Root cause: nothing in this crate
+/// had ever applied a real style to the palette's own root, so in a
+/// live window it resolved to 0×0 layout bounds — the same "an empty
+/// leaf gets zero size without an explicit style" issue this crate's
+/// own gallery harness already hit and fixed for the palette's *body*/
+/// *rows* (`aurora_widgets::widgets::command_palette`'s own
+/// `body_style`/`row_style`), except nothing had ever fixed it for the
+/// palette's own *root* outside that test file — `tests/gallery.rs`'s
+/// own `command_palette_style` is private to that file, so the real
+/// app never inherited the fix.
+///
+/// Fixed pixel width/height/top-inset, not a design token: no
+/// "command palette dimensions" token exists in `design/tokens/
+/// scales.toml`, and inventing one ad hoc is a design decision to
+/// raise, not a gap to fill locally — the same reasoning
+/// `aurora_ui::workspace`'s own `RAIL_MIN_WIDTH`/`RAIL_MAX_WIDTH`
+/// engineering defaults already established. Horizontally centred via
+/// `inset.left = inset.right = length(0.0)` plus
+/// `margin.left = margin.right = auto()`, with a definite `width` also
+/// set — the standard CSS absolute-position centring combination,
+/// confirmed here by a real headless layout test rather than assumed
+/// to work.
+fn command_palette_style() -> taffy::Style {
+    const WIDTH: f32 = 480.0;
+    const HEIGHT: f32 = 320.0;
+    const TOP_INSET: f32 = 96.0;
+
+    taffy::Style {
+        position: taffy::Position::Absolute,
+        size: taffy::Size {
+            width: taffy::style_helpers::length(WIDTH),
+            height: taffy::style_helpers::length(HEIGHT),
+        },
+        inset: taffy::Rect {
+            top: taffy::style_helpers::length(TOP_INSET),
+            left: taffy::style_helpers::length(0.0_f32),
+            right: taffy::style_helpers::length(0.0_f32),
+            bottom: taffy::style_helpers::auto(),
+        },
+        margin: taffy::Rect {
+            left: taffy::style_helpers::auto(),
+            right: taffy::style_helpers::auto(),
+            top: taffy::style_helpers::length(0.0_f32),
+            bottom: taffy::style_helpers::length(0.0_f32),
+        },
+        ..Default::default()
+    }
+}
+
 /// Opens the command palette (a no-op if one is already open): inserts
 /// it into `workspace.tree` under `workspace.root` with
-/// [`palette_commands`]'s own list, then moves keyboard focus to it.
+/// [`palette_commands`]'s own list, sizes and positions it
+/// ([`command_palette_style`] — see that function's own doc comment for
+/// why this step is real, not decorative), then moves keyboard focus to
+/// it. The caller still needs to re-run `WidgetTree::compute_layout`
+/// afterward for the new style to actually reach `WidgetTree::bounds`
+/// ([`App::handle_key_event`] does, right after the `Ctrl+Shift+P` that
+/// reaches this).
 fn open_command_palette(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
@@ -1629,6 +1692,9 @@ fn open_command_palette(
             return;
         }
     };
+    if let Err(err) = workspace.tree.set_style(root, command_palette_style()) {
+        tracing::warn!(?err, "failed to size the newly opened command palette");
+    }
     if let Err(err) = focus.focus(&mut workspace.tree, root) {
         tracing::warn!(?err, "failed to focus the newly opened command palette");
     }
@@ -3520,7 +3586,14 @@ impl App {
     /// otherwise every binding would fire twice), translates it into
     /// this crate's own platform-free vocabulary, and routes it via
     /// [`handle_key`] — the pure logic this method exists only to feed
-    /// real platform input into.
+    /// real platform input into. Re-runs layout unconditionally
+    /// afterward: pure CPU geometry on a small tree, no GPU involved
+    /// (`App::apply_resize`'s own doc comment), and genuinely needed
+    /// after more than just `Ctrl+Shift+P` opening the palette for the
+    /// first time — narrowing the query while it's open changes its own
+    /// result-row count, which changes each row's own share of the
+    /// body's height (`aurora_widgets::widgets::command_palette`'s own
+    /// `row_style`), not just the palette's own first appearance.
     fn handle_key_event(&mut self, event: &winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
@@ -3553,6 +3626,10 @@ impl App {
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             None => {}
+        }
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
         }
         self.push_accessibility();
     }
@@ -6023,6 +6100,35 @@ mod tests {
             focus.focused(),
             None,
             "focus left on the now-removed palette must be cleared"
+        );
+    }
+
+    /// The real bug Cahya found by actually trying `Ctrl+Shift+P`:
+    /// nothing had ever given the palette's own root a real style, so
+    /// it resolved to 0x0 in a live window. This proves the fix
+    /// headlessly (no GPU needed) -- real, nonzero bounds, and
+    /// genuinely centred horizontally, not just "not zero."
+    #[test]
+    fn opening_the_palette_gives_it_a_real_centred_size_and_position() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+
+        open_command_palette(&mut workspace, &mut focus, &mut palette);
+        let Some(root) = palette else {
+            unreachable!("just opened");
+        };
+        workspace.tree.compute_layout(1000.0, 800.0);
+
+        let Some(bounds) = workspace.tree.bounds(root) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(bounds.width, 480, "must be the real, fixed palette width");
+        assert_eq!(bounds.height, 320, "must be the real, fixed palette height");
+        assert_eq!(bounds.y, 96, "must sit at the real, fixed top inset");
+        assert_eq!(
+            bounds.x, 260,
+            "must be horizontally centred: (1000 - 480) / 2"
         );
     }
 

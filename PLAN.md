@@ -3261,6 +3261,56 @@ check licenses` clean with the new `toml` dependency.
   machinery); no fuzzy/subsequence match (plain substring only); and no
   user-facing way to see or rebind the shortcut list yet (it's a fixed,
   checked-in default).
+
+  **A real bug, found the honest way, 2026-08-08 — Cahya actually
+  pressed `Ctrl+Shift+P` in the running app and saw nothing.** Root
+  cause: `open_command_palette` had never applied a real layout style
+  to the palette's own root — every earlier "the palette works" claim
+  in this file was checked against the test/gallery harness, which
+  explicitly sizes the palette itself
+  (`tests/gallery.rs::command_palette_style`, private to that file), or
+  against pure tree-structure assertions, never against a real,
+  computed layout in a live window. Without a style, the palette's root
+  resolved to 0×0, the exact same "an empty leaf gets zero size without
+  an explicit style" issue this crate had already found and fixed for
+  the palette's own *body*/*rows* — just never for its *root*, and only
+  inside the test file, not the real app.
+
+  Fixed with a new, real `command_palette_style` in `aurora-app` itself
+  (a separate definition from the test file's own, private one — not
+  worth sharing for a single real call site): `Position::Absolute` so
+  the palette floats above the canvas/divider/rail row instead of
+  competing with them for space in it, a fixed 480×320 size with a
+  96px top inset (engineering defaults, not tokens — no "command
+  palette dimensions" token exists, same reasoning already applied to
+  `aurora_ui::workspace`'s own rail-width clamp), horizontally centred
+  via the standard CSS absolute-position `inset: 0 auto` / `margin:
+  auto` combination. `taffy` moved from `aurora-app`'s dev-dependencies
+  to real dependencies — this is genuine production code now, not test
+  scaffolding. Verified honestly this time, not assumed: a new headless
+  layout test opens the palette, computes real layout at a real
+  viewport size, and asserts the exact resulting bounds (width, height,
+  top inset, and — the part that actually needed checking, not just
+  "nonzero" — that it lands precisely centred). Also found and fixed
+  the matching gap one level up: nothing had ever re-run
+  `WidgetTree::compute_layout` after a key event either, so even a
+  correctly-styled palette's new bounds would never have reached
+  `WidgetTree::bounds` until the next window resize —
+  `App::handle_key_event` now reuses `App::apply_resize` against the
+  current window size unconditionally after every key event (pure CPU
+  geometry on a small tree, no GPU involved, and genuinely needed
+  beyond just the palette's first appearance: narrowing its own query
+  changes its result-row count, which changes each row's own share of
+  the body's height).
+
+  1 new test (`aurora-app`: 139 total). `cargo fmt --all --check`/
+  `clippy --workspace --all-targets --all-features -- -D warnings`/
+  `cargo test --workspace` (0 failures)/`cargo doc --workspace
+  --no-deps --all-features -D warnings`/`cargo deny check all` all
+  clean. Version bumped as a patch (`CLAUDE.md`'s own convention —
+  correcting something already landed and wrong, not new work) — the
+  real, authoritative check is Cahya re-running `Ctrl+Shift+P` on his
+  own Mac.
 - [~] **Native menus, file dialogs, drag & drop, clipboard** — file
   dialogs, clipboard, drag & drop, and a first native-menu slice
   (macOS only) done 2026-08-05. Picked the two remaining dependencies
