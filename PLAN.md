@@ -3311,6 +3311,19 @@ check licenses` clean with the new `toml` dependency.
   correcting something already landed and wrong, not new work) — the
   real, authoritative check is Cahya re-running `Ctrl+Shift+P` on his
   own Mac.
+
+  **Confirmed on real macOS hardware, 2026-08-08**: `Ctrl+Shift+P` now
+  shows a real dark panel (`surface.raised`) with a blue highlighted
+  strip (`accent.primary`, the first of the 13 built-in commands
+  matching the empty query, sharing the panel's height evenly with the
+  other 12 unpainted rows) — exactly the expected result given this
+  crate's own honestly-documented gap (real selection/filtering logic,
+  no text *rendering* yet, `aurora-text` still a skeleton). Cahya
+  confirmed the logic underneath is genuinely live, not just painted:
+  typing moves the highlight (real filtering), and `Escape` closes the
+  panel. The positioning/sizing fix, the layout-after-keypress fix, and
+  the row-highlight work from earlier the same day are all now verified
+  end-to-end on real hardware, not just headlessly.
 - [~] **Native menus, file dialogs, drag & drop, clipboard** — file
   dialogs, clipboard, drag & drop, and a first native-menu slice
   (macOS only) done 2026-08-05. Picked the two remaining dependencies
