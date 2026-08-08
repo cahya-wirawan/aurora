@@ -3519,6 +3519,24 @@ check licenses` clean with the new `toml` dependency.
   re-running `cargo clippy` on his own Mac. Version bumped as a patch
   (`CLAUDE.md`'s own convention — correcting something already landed
   and wrong, not new work).
+
+  **A second real bug, same day, same root cause class**: Cahya's
+  re-run hit `clippy::doc_markdown` on the `macOS`-only function's own
+  doc comment ("AppKit" needing backticks) — this sandbox's own
+  `cargo clippy --workspace` runs had genuinely stayed clean throughout,
+  but only because `#[cfg(target_os = "macos")]` means that whole
+  function, doc comment included, is invisible to a Linux clippy run —
+  the first bug's cross-compile workaround (a scratch crate) had only
+  ever run `cargo check`, not `cargo clippy`, so it could prove the API
+  calls typecheck but never actually exercise this lint. Fixed the
+  backticks, then closed the real verification gap: rebuilt the scratch
+  crate with this workspace's own real `[lints]` table (copied
+  verbatim) and ran `cargo clippy --target x86_64-apple-darwin
+  --all-targets --all-features -- -D warnings` against both
+  `detect_accessibility_preferences` overloads' full real source
+  (doc comments included) — clean. This is now the right verification
+  method for any future `macOS`-only code in this crate, not just this
+  one fix.
 - [~] **Crash recovery UI** — first slice done 2026-08-05. A new
   generic mechanism in `aurora-widgets`,
   `crates/aurora-widgets/src/widgets/dialog.rs` (new): a modal

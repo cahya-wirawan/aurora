@@ -519,7 +519,7 @@ fn load_scales() -> anyhow::Result<Scales> {
 /// GNOME's own D-Bus settings portal) are real, separate follow-on
 /// spikes, honestly left open rather than guessed at; every other
 /// target here returns [`AccessibilityPreferences::default`].
-/// `text_scale` stays `1.0` even on macOS: AppKit has no systemwide
+/// `text_scale` stays `1.0` even on macOS: `AppKit` has no systemwide
 /// text-scale preference equivalent to iOS's Dynamic Type, so there is
 /// nothing real to read yet.
 #[must_use]
