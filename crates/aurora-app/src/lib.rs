@@ -5032,9 +5032,26 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         // `window_event` sets it for every other real input.
         #[cfg(target_os = "macos")]
         {
+            // A real, found-not-assumed bug: a menu action (e.g. "Toggle
+            // Layers Panel") changes a panel's own layout *style*
+            // (`aurora_ui::set_panel_collapsed`/`close_panel`), but
+            // nothing re-runs `WidgetTree::compute_layout` afterward on
+            // this path — unlike `App::handle_key_event`, which already
+            // does this unconditionally after every key event for
+            // exactly this reason (see that method's own doc comment).
+            // Without it, the new style never reaches `WidgetTree::
+            // bounds`, so the menu action visibly does nothing at all
+            // until some *other* event (a real window resize) happens
+            // to force a relayout.
+            let mut menu_event_handled = false;
             while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
                 self.handle_menu_event(&event);
                 self.needs_redraw = true;
+                menu_event_handled = true;
+            }
+            if menu_event_handled && let Some(window) = self.window.as_ref() {
+                let size = window.inner_size();
+                self.apply_resize((size.width, size.height));
             }
             // `ControlFlow::Wait` (set once in `run`) would otherwise
             // block indefinitely, and muda's channel has no event-loop

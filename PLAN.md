@@ -3693,6 +3693,40 @@ check licenses` clean with the new `toml` dependency.
   the marker file would be left behind and the *next* launch would show
   a crash-recovery prompt for a session that actually exited cleanly.
   Worth Cahya specifically checking this one remaining risk.
+
+  **A second real bug found the same way, 2026-08-09**: Cahya toggled
+  "Toggle Layers Panel" via the real `View` menu and saw no visible
+  change at all. Root cause, found by re-reading `about_to_wait`'s own
+  macOS block rather than guessing: menu actions reach
+  `activate_command`/`aurora_ui::set_panel_collapsed`/`close_panel`
+  exactly as intended, correctly changing a panel's own layout style —
+  but nothing on that path ever re-ran `WidgetTree::compute_layout`
+  afterward, so the new style never reached `WidgetTree::bounds` at
+  all. This is the exact same class of bug the command-palette fix
+  (2026-08-08) already found and fixed for the *keyboard* path
+  (`App::handle_key_event`) — just never carried over to the *menu*
+  path, since the two are structurally separate (`WindowEvent`s vs.
+  `muda::MenuEvent`s polled in `about_to_wait`). Fixed the same way:
+  `about_to_wait`'s macOS block now calls `App::apply_resize` against
+  the current window size once, after draining any pending menu
+  events (not per-event — one relayout per `about_to_wait` iteration is
+  enough regardless of how many menu events arrived in it). Verified
+  what this sandbox can check: the change reuses only already-proven
+  APIs (`muda::MenuEvent`, `window.inner_size()`, `App::apply_resize`
+  — no new API surface, unlike the earlier `objc2`/menu-entries work),
+  and the new comment explaining it is a plain `//` block comment
+  inside a function body, not a `///`/`//!` doc comment — confirmed
+  `clippy::doc_markdown` (the lint that caught two real mistakes
+  earlier this week) structurally cannot apply to it regardless of
+  platform. Full workspace `cargo build`/`clippy --workspace
+  --all-targets --all-features -- -D warnings`/`cargo test --workspace`
+  (0 failures)/`cargo doc --no-deps --all-features -D warnings`/`cargo
+  deny check all` all clean on Linux — `about_to_wait`'s own macOS
+  block is still only reachable by actually running the app there, the
+  same standing limitation this bullet's own "Still `[~]`" paragraph
+  above already names. Version bumped as a patch (`CLAUDE.md`'s own
+  convention). The real, authoritative check is Cahya re-trying the
+  toggle on his own Mac.
 - [~] **Per-monitor DPI and fractional scaling** — first slice done
   2026-08-05, `crates/aurora-app/src/lib.rs`. Found and fixed a real,
   latent bug along the way: layout was being computed straight from
