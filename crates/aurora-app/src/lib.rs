@@ -937,6 +937,130 @@ fn recover_document(path: &Path) -> Option<(aurora_doc::LayerTree, aurora_doc::H
     Some((layers, history))
 }
 
+// -- Persisted workspace layout (rail width, panel collapsed state) --
+//
+// PLAN.md M1.8's docking bullet, "persisted layouts" — the one piece of
+// that bullet not scoped to real drag-state interaction. Unlike
+// `marker_path`/`autosave_path` above, which deliberately use
+// `std::env::temp_dir()` for genuinely ephemeral crash-recovery data, a
+// layout preference should survive a reboot, not just a clean run —
+// Cahya's own choice (`AskUserQuestion`) to use a real per-platform
+// app-support directory (`directories::ProjectDirs`) instead of
+// reusing `temp_dir()` for consistency with that existing precedent.
+// Applied once at construction, saved once on a clean shutdown — the
+// same "write once, at a real lifecycle boundary" discipline
+// `write_autosave` already established, not a reactive save on every
+// resize/collapse.
+
+/// The persisted half of a [`aurora_ui::Workspace`]'s own dock layout —
+/// rail width and whether each of the three panels is collapsed. A
+/// snapshot taken right before writing it to disk
+/// ([`save_workspace_layout`]), not a live view.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WorkspaceLayout {
+    rail_width: f32,
+    layers_collapsed: bool,
+    properties_collapsed: bool,
+    history_collapsed: bool,
+}
+
+/// Where this crate's own persisted workspace layout lives — `None` if
+/// the OS can't even report a home directory
+/// (`directories::ProjectDirs::from`'s own documented failure case);
+/// callers treat that the same as "no saved layout, and nowhere to
+/// save one this run," not a hard error. No qualifier or organization
+/// (both optional, only affecting macOS/Windows) — this project has
+/// neither, matching how `aurora_ui::workspace` already labels the
+/// window itself plain `"Aurora"`.
+fn layout_path() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "Aurora")?;
+    Some(dirs.config_dir().join("workspace-layout.postcard"))
+}
+
+/// Reads `workspace`'s own current rail width and each panel's
+/// collapsed state (`aurora_ui::rail_width`/`panel_is_collapsed`) and
+/// writes them to `path`, creating its parent directory first if
+/// needed. The same "errors are logged, not fatal" shape
+/// [`write_session_marker`]/[`write_autosave`] already use — failing to
+/// save a layout preference must never stop the application from
+/// closing.
+fn save_workspace_layout(path: &Path, workspace: &aurora_ui::Workspace) {
+    let Some(rail_width) = aurora_ui::rail_width(&workspace.tree, workspace.rail) else {
+        return;
+    };
+    let collapsed = |panel| aurora_ui::panel_is_collapsed(&workspace.tree, panel).unwrap_or(false);
+    let layout = WorkspaceLayout {
+        rail_width,
+        layers_collapsed: collapsed(workspace.layers),
+        properties_collapsed: collapsed(workspace.properties),
+        history_collapsed: collapsed(workspace.history),
+    };
+    let bytes = match postcard::to_allocvec(&layout) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(?err, "failed to serialize the workspace layout");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            ?err,
+            path = %parent.display(),
+            "failed to create the workspace layout's own directory"
+        );
+        return;
+    }
+    if let Err(err) = std::fs::write(path, bytes) {
+        tracing::warn!(?err, path = %path.display(), "failed to write the workspace layout");
+    }
+}
+
+/// Reads a previously saved layout at `path` and applies it to
+/// `workspace` — a real, silent no-op (not an error) for anything that
+/// keeps this from producing a usable layout (no file yet, unreadable
+/// bytes, `postcard` failing to parse), the same "missing/corrupt is a
+/// silent fallback, not a failure to start" shape [`recover_document`]
+/// already uses. Clamping a stale saved width (e.g. from a since-
+/// narrowed window) is `aurora_ui::set_rail_width`'s own job, not
+/// repeated here.
+fn load_workspace_layout(path: &Path, workspace: &mut aurora_ui::Workspace) {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(?err, path = %path.display(), "failed to read the workspace layout");
+            }
+            return;
+        }
+    };
+    let layout: WorkspaceLayout = match postcard::from_bytes(&bytes) {
+        Ok(layout) => layout,
+        Err(err) => {
+            tracing::warn!(?err, "failed to deserialize the workspace layout");
+            return;
+        }
+    };
+    if let Err(err) = aurora_ui::set_rail_width(
+        &mut workspace.tree,
+        workspace.rail,
+        workspace.divider,
+        layout.rail_width,
+    ) {
+        tracing::warn!(?err, "failed to apply the saved rail width");
+    }
+    for (panel, collapsed) in [
+        (workspace.layers, layout.layers_collapsed),
+        (workspace.properties, layout.properties_collapsed),
+        (workspace.history, layout.history_collapsed),
+    ] {
+        if let Err(err) = aurora_ui::set_panel_collapsed(&mut workspace.tree, panel, collapsed) {
+            tracing::warn!(?err, "failed to apply a saved panel's collapsed state");
+        }
+    }
+}
+
 const CRASH_RECOVERY_CONTINUE: &str = "recovery.continue";
 
 /// The crash-recovery dialog's own, honest content — a single "Continue"
@@ -3255,6 +3379,16 @@ struct App {
     /// before this `App` is built, cleared on a clean shutdown
     /// (`WindowEvent::CloseRequested`).
     marker_path: PathBuf,
+    /// Where this crate's own persisted workspace layout lives
+    /// ([`layout_path`]) — `None` if the OS couldn't report a real
+    /// app-support directory to save one in, treated as "layout
+    /// preferences aren't being persisted this run," not an error.
+    /// Applied once, at construction ([`load_workspace_layout`]); saved
+    /// once, on a clean shutdown ([`save_workspace_layout`],
+    /// `WindowEvent::CloseRequested`) — the same "write once, at a real
+    /// lifecycle boundary" discipline [`write_autosave`] already uses,
+    /// not a reactive save on every resize/collapse.
+    layout_path: Option<PathBuf>,
     /// The window's current DPI scale factor (`Window::scale_factor`) —
     /// read once the real window exists (`resumed`) and kept current via
     /// `WindowEvent::ScaleFactorChanged`, e.g. when the window moves to a
@@ -3453,6 +3587,7 @@ struct App {
 
 impl App {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         proxy: EventLoopProxy<accesskit_winit::Event>,
         theme: Theme,
@@ -3461,8 +3596,12 @@ impl App {
         marker_path: PathBuf,
         had_previous_marker: bool,
         autosave_path: &Path,
+        layout_path: Option<PathBuf>,
     ) -> Self {
         let mut workspace = aurora_ui::build_workspace();
+        if let Some(layout_path) = layout_path.as_deref() {
+            load_workspace_layout(layout_path, &mut workspace);
+        }
         // Only even try reading an autosave if the previous run left a
         // marker behind -- a clean shutdown never needs its own autosave
         // read back, and skipping the attempt means an autosave file left
@@ -3528,6 +3667,7 @@ impl App {
             command_palette: None,
             crash_recovery_dialog,
             marker_path,
+            layout_path,
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
@@ -4814,8 +4954,15 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 // A clean shutdown -- clear this run's own marker so the
                 // *next* run's `previous_session_left_a_marker` reads
                 // false, not true (see this crate's own "crash
-                // recovery" section).
+                // recovery" section), and save the current dock layout
+                // so the *next* run's own `App::new` can restore it
+                // (see the "persisted workspace layout" section's own
+                // doc comment for why this is the one point this crate
+                // writes it).
                 clear_session_marker(&self.marker_path);
+                if let Some(layout_path) = self.layout_path.as_deref() {
+                    save_workspace_layout(layout_path, &self.workspace);
+                }
                 el.exit();
             }
             WindowEvent::Resized(size) => self.apply_resize((size.width, size.height)),
@@ -4950,6 +5097,7 @@ pub fn run() -> anyhow::Result<()> {
     let had_previous_marker = previous_session_left_a_marker(&marker_path);
     write_session_marker(&marker_path);
     let autosave_path = autosave_path();
+    let layout_path = layout_path();
 
     let event_loop = EventLoop::<accesskit_winit::Event>::with_user_event()
         .build()
@@ -4965,6 +5113,7 @@ pub fn run() -> anyhow::Result<()> {
         marker_path,
         had_previous_marker,
         &autosave_path,
+        layout_path,
     );
     event_loop
         .run_app(&mut app)
@@ -7524,6 +7673,82 @@ mod tests {
             recovered_history.journal_descriptions(),
             original_descriptions
         );
+    }
+
+    #[test]
+    fn layout_path_is_real_and_distinct_from_the_marker_and_autosave_paths() {
+        // A real, if unremarkable, assertion: this sandbox's own home
+        // directory is real, so `directories::ProjectDirs::from` must
+        // succeed here -- the same "ordinary conditions" assumption
+        // `open_tile_store_succeeds_against_the_real_scratch_directory`
+        // already makes for `std::env::temp_dir()`.
+        let Some(path) = super::layout_path() else {
+            unreachable!("a real home directory exists in this environment");
+        };
+        assert_ne!(path, super::marker_path());
+        assert_ne!(path, autosave_path());
+    }
+
+    #[test]
+    fn writing_then_loading_a_workspace_layout_round_trips_the_real_values() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("workspace-layout.postcard");
+        let mut original = aurora_ui::build_workspace();
+        if let Err(err) =
+            aurora_ui::set_rail_width(&mut original.tree, original.rail, original.divider, 300.0)
+        {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) =
+            aurora_ui::set_panel_collapsed(&mut original.tree, original.properties, true)
+        {
+            unreachable!("{err:?}");
+        }
+
+        super::save_workspace_layout(&path, &original);
+        let mut loaded = aurora_ui::build_workspace();
+        super::load_workspace_layout(&path, &mut loaded);
+
+        assert_eq!(
+            aurora_ui::rail_width(&loaded.tree, loaded.rail),
+            Some(300.0)
+        );
+        match aurora_ui::panel_is_collapsed(&loaded.tree, loaded.layers) {
+            Ok(collapsed) => assert!(!collapsed, "layers was never collapsed in the original"),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        match aurora_ui::panel_is_collapsed(&loaded.tree, loaded.properties) {
+            Ok(collapsed) => assert!(collapsed, "properties must round-trip as collapsed"),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        match aurora_ui::panel_is_collapsed(&loaded.tree, loaded.history) {
+            Ok(collapsed) => assert!(!collapsed, "history was never collapsed in the original"),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn loading_a_missing_workspace_layout_leaves_the_workspace_at_its_own_defaults() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("does-not-exist.postcard");
+        let mut workspace = aurora_ui::build_workspace();
+
+        super::load_workspace_layout(&path, &mut workspace);
+
+        assert_eq!(
+            aurora_ui::rail_width(&workspace.tree, workspace.rail),
+            Some(250.0)
+        );
+        match aurora_ui::panel_is_collapsed(&workspace.tree, workspace.layers) {
+            Ok(collapsed) => assert!(!collapsed),
+            Err(err) => unreachable!("{err:?}"),
+        }
     }
 
     #[test]

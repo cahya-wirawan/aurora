@@ -3000,12 +3000,67 @@ check licenses` clean with the new `toml` dependency.
   --all-features -- -D warnings`/`cargo test --workspace` (0
   failures)/`cargo doc --workspace --no-deps --all-features -D
   warnings`/`cargo deny check all` all clean. Version bumped per
-  `CLAUDE.md`'s own convention. Still open: drag-to-redock, floating,
-  persisted layouts (including the resized rail width itself, which
-  resets to `RAIL_WIDTH_DEFAULT` every fresh `build_workspace` — no
-  session persistence exists anywhere in this crate yet), and real
+  `CLAUDE.md`'s own convention. Still open at the time: drag-to-redock,
+  floating, persisted layouts (including the resized rail width itself,
+  which reset to `RAIL_WIDTH_DEFAULT` every fresh `build_workspace` — no
+  session persistence existed anywhere in this crate yet), and real
   pixel rendering for the divider's own grab handle (blocked on
   `aurora-vector`, same as everything else in this workspace).
+
+  **Persisted layout landed 2026-08-09, scoped with Cahya first**:
+  rail width and each panel's collapsed state, the two "docking"
+  bits that are plain data rather than real drag interaction (drag-
+  to-redock/floating still need that, still open). The real scoping
+  question wasn't the data — it was *where* it lives. This crate's own
+  `marker_path`/`autosave_path` already use `std::env::temp_dir()`, but
+  that was a deliberate, explicitly-documented stopgap for genuinely
+  *ephemeral* crash-recovery data ("no `directories`-style crate is a
+  dependency yet"); a layout preference is durable by nature and should
+  survive a reboot, not just a clean run. Cahya's own call
+  (`AskUserQuestion`) was to finally add that dependency rather than
+  reuse `temp_dir()` for consistency with data that's ephemeral for a
+  different reason. New workspace dependency `directories` (MIT OR
+  Apache-2.0, no dependents of its own beyond small platform-path
+  shims) — `layout_path` resolves the real per-platform config
+  directory (`~/Library/Application Support/Aurora` on macOS,
+  `~/.config/aurora` on Linux, `%APPDATA%\Aurora` on Windows).
+
+  New `WorkspaceLayout` (`rail_width`, three `*_collapsed` bools),
+  encoded with `serde`+`postcard` — the same shape
+  `aurora_doc::History::save_journal`/`load_journal` already use for
+  the autosave journal, reused directly rather than hand-rolling a
+  second ad hoc binary format for a payload this small; both crates
+  were already real (non-dev) dependencies elsewhere in the workspace,
+  so this added no new external crate beyond `directories` itself.
+  `save_workspace_layout`/`load_workspace_layout` read/write it through
+  `aurora_ui::rail_width`/`panel_is_collapsed`/`set_rail_width`/
+  `set_panel_collapsed` — this crate's own existing query/mutator pairs
+  from the resize/collapse work earlier the same week, not new
+  plumbing into `aurora-ui` itself. Applied once, at `App::new`
+  construction (right after `build_workspace`, before any panel gets
+  real content); saved once, on `WindowEvent::CloseRequested` — the
+  same "write once, at a real lifecycle boundary" discipline
+  `write_autosave` already established, deliberately not a reactive
+  save on every resize-drag pointer-move (which would mean disk writes
+  on every frame of a drag) or every collapse toggle. Both directions
+  fail soft — a missing/corrupt/unwritable layout file logs a warning
+  and falls back to `build_workspace`'s own defaults, the same
+  "errors are logged, not fatal" shape `write_session_marker`/
+  `recover_document` already use; a layout preference that fails to
+  load or save must never stop the application starting or closing.
+
+  3 new tests (`aurora-app`: 142 total): a real save/load round trip
+  (non-default rail width, one collapsed panel) confirming the exact
+  values survive; loading a missing file leaves `build_workspace`'s own
+  defaults untouched; `layout_path` itself resolves to a real path,
+  distinct from the marker/autosave paths, in this sandbox's own real
+  home directory. `cargo fmt --all --check`/`clippy --workspace
+  --all-targets --all-features -- -D warnings`/`cargo test --workspace`
+  (0 failures)/`cargo doc --workspace --no-deps --all-features -D
+  warnings`/`cargo deny check all` all clean. Version bumped per
+  `CLAUDE.md`'s own convention. Still open: drag-to-redock, floating,
+  and real pixel rendering for the divider's own grab handle (blocked
+  on `aurora-vector`).
 - [~] **Canvas: infinite zoom, rotation, pan, rulers, guides, grid,
   snap** — real rendering landed 2026-08-06, in two commits, picking up
   directly from M1.9's "wire a live document" step (which gave the
