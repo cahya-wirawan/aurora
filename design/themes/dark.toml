@@ -10,9 +10,9 @@ is_default = true
 [surface]
 canvas  = "neutral.0"
 app     = "neutral.50"
-panel   = "neutral.100"
-raised  = "neutral.150"
-overlay = "neutral.200"
+panel   = "neutral.150"
+raised  = "neutral.200"
+overlay = "neutral.300"
 sunken  = "neutral.0"
 
 [text]
@@ -29,7 +29,7 @@ on_accent = "neutral.0"
 
 [border]
 default = "neutral.300"
-strong  = "neutral.400"
+strong  = "neutral.500"
 focus   = "accent.blue.500"
 
 [accent]

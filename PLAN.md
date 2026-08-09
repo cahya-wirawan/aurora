@@ -3728,6 +3728,34 @@ check licenses` clean with the new `toml` dependency.
   convention). **Confirmed on real hardware, 2026-08-09**: Cahya
   pulled and retried — all three panels (Layers, Properties, History)
   toggle and render correctly via the View menu now.
+
+  **A third real finding, same day**: even with the relayout fixed and
+  the border in place, Cahya reported the rail and panel backgrounds
+  "looked almost the same" — only the border was visibly appearing and
+  disappearing, not a perceived box. Root cause: the undocked rail
+  paints nothing (it's `WidgetKind::Container`, so it just shows
+  `surface.app`, `#1a1a1b`, through), and `surface.panel` was only one
+  neutral-ramp step up (`neutral.100`, `#212124`, ~7-in-255 per
+  channel). Cahya's own call (`AskUserQuestion`, design-token owner per
+  CLAUDE.md): shift `surface.panel`/`surface.raised`/`surface.overlay`
+  up one ramp step each in `design/themes/dark.toml`
+  (`neutral.100`/`.150`/`.200` -> `.150`/`.200`/`.300`) rather than
+  reuse `raised`'s old value outright, which would have collapsed
+  panels and popovers to one indistinguishable colour. This broke a
+  real, already-committed WCAG gate — `border.strong` on the now-
+  lighter `surface.panel` dropped to 2.91:1 against a 3.0:1 floor
+  (`aurora-theme`'s own `the_real_dark_theme_passes_every_gated_pair`
+  test caught it, not manual review) — fixed by also bumping
+  `border.strong` from `neutral.400` to `neutral.500` (3.45:1 with the
+  new panel, and only *more* contrast against `surface.app`, its other
+  gated pair, since that token didn't move). **Re-bless required**:
+  `command_palette_gallery.png` was blessed against `surface.raised`'s
+  old `#28282c`; this sandbox has no GPU adapter
+  (`command_palette_gallery_matches_the_golden_image` silently skips
+  here, as it always has), so the golden-diff test cannot be verified
+  locally — Cahya needs to re-run the bless flow on his own Mac, the
+  same one used for the ColorSwatch/CommandPalette goldens earlier.
+  Version bumped as a patch.
 - [~] **Per-monitor DPI and fractional scaling** — first slice done
   2026-08-05, `crates/aurora-app/src/lib.rs`. Found and fixed a real,
   latent bug along the way: layout was being computed straight from

@@ -103,8 +103,9 @@ const COMMAND_PALETTE_GALLERY_SIZE: (u32, u32) = (
 /// `render_gallery`'s own clear colour for `CommandPalette`/`TextField`
 /// specifically, not the plain `wgpu::Color::BLACK` every other
 /// gallery uses. Found by actually decoding the committed goldens'
-/// own raw pixel bytes, not by eye: `surface.raised`
-/// (`CommandPalette`'s own panel, `#28282c`) and `surface.sunken`
+/// own raw pixel bytes, not by eye: `surface.raised` (`CommandPalette`'s
+/// own panel, `#28282c` at the time — since shifted a ramp step
+/// higher, see `paint_panel`'s own doc comment) and `surface.sunken`
 /// (`TextField`'s own background, `#141414`, `#0a0a0a` once
 /// `disabled_opacity`-dimmed) are deliberately near-black by design
 /// (FR-027's own "near-neutral" principle) — correct data, confirmed

@@ -388,11 +388,11 @@ fn paint_list_row(
 /// **The border is a real, necessary follow-on, not decoration**: a
 /// plain fill alone was found — on real hardware, not assumed — to be
 /// nearly invisible against the window's own background
-/// (`surface.app`, `#1a1a1b`, next to `surface.panel`'s own `#212124`
-/// — a ~7-in-255 per-channel difference), the deliberately "quiet"
-/// neutral ramp `design/tokens/palette.toml`'s own comment names
-/// ("must stay quiet enough that they never compete with a user's
-/// image"). Cahya's own call (`AskUserQuestion`), once the real
+/// (`surface.app`, `#1a1a1b`, next to `surface.panel`'s own original
+/// `#212124` — a ~7-in-255 per-channel difference), the deliberately
+/// "quiet" neutral ramp `design/tokens/palette.toml`'s own comment
+/// names ("must stay quiet enough that they never compete with a
+/// user's image"). Cahya's own call (`AskUserQuestion`), once the real
 /// numbers were in front of him, was to add real definition via
 /// `border.default` rather than either leave it or brighten the fill
 /// itself (a design decision either way, not this crate's to make
@@ -401,6 +401,17 @@ fn paint_list_row(
 /// scales.toml` yet, and a one-pixel hairline is standard UI practice,
 /// not really a design decision to raise the way an arbitrary size or
 /// colour would be.
+///
+/// **The fill itself was later found — again on real hardware — to
+/// still read as almost identical to the undocked rail beside it**,
+/// even with the border in place (only the outline was visibly
+/// toggling, not a perceived box). Cahya's own second call was to
+/// shift `surface.panel`/`surface.raised`/`surface.overlay` up one
+/// ramp step each in `design/themes/dark.toml` (`neutral.100` ->
+/// `neutral.150`, `.150` -> `.200`, `.200` -> `.300`) rather than
+/// reuse `surface.raised`'s old value outright, which would have
+/// collapsed panels and popovers to the same colour. `surface.panel`
+/// is `#28282c` now, not `#212124`.
 ///
 /// No `disabled` state — a panel has no such concept — and no distinct
 /// paint for collapsed vs. expanded: a real collapsed panel's own root
