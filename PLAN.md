@@ -3748,13 +3748,24 @@ check licenses` clean with the new `toml` dependency.
   test caught it, not manual review) — fixed by also bumping
   `border.strong` from `neutral.400` to `neutral.500` (3.45:1 with the
   new panel, and only *more* contrast against `surface.app`, its other
-  gated pair, since that token didn't move). **Re-bless required**:
-  `command_palette_gallery.png` was blessed against `surface.raised`'s
-  old `#28282c`; this sandbox has no GPU adapter
-  (`command_palette_gallery_matches_the_golden_image` silently skips
-  here, as it always has), so the golden-diff test cannot be verified
-  locally — Cahya needs to re-run the bless flow on his own Mac, the
-  same one used for the ColorSwatch/CommandPalette goldens earlier.
+  gated pair, since that token didn't move). **Turned out not to need
+  a re-bless, confirmed 2026-08-09**: the claim above (this same
+  paragraph, first written) that `command_palette_gallery.png` needed
+  re-blessing against `surface.raised`'s shifted value was wrong.
+  Cahya ran the real bless command twice — first filtered with the
+  stale `-- --ignored` instruction this file's own history still had
+  lying around (matched zero tests, silently blessed nothing), then
+  correctly, after a `cargo clean -p aurora-widgets` forced a genuine
+  rebuild — and both times `git status` came back clean, no diff. Root
+  cause, found by decoding the committed golden's own raw pixel bytes
+  (this sandbox has no GPU adapter, so the golden-diff test itself
+  only ever skips here): the image contains exactly two colours across
+  all 49,152 pixels, the grey test backdrop and `accent.primary` — zero
+  `surface.raised` pixels anywhere. The gallery's one result row is
+  selected, and `ListRow`'s own highlight fills the panel's body edge
+  to edge, fully occluding the background it sits on. `surface.raised`
+  was never visible in this particular golden, so shifting its value
+  changed nothing about the rendered bytes. Nothing further needed.
   Version bumped as a patch.
 - [~] **Per-monitor DPI and fractional scaling** — first slice done
   2026-08-05, `crates/aurora-app/src/lib.rs`. Found and fixed a real,
