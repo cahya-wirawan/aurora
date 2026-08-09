@@ -3725,8 +3725,9 @@ check licenses` clean with the new `toml` dependency.
   block is still only reachable by actually running the app there, the
   same standing limitation this bullet's own "Still `[~]`" paragraph
   above already names. Version bumped as a patch (`CLAUDE.md`'s own
-  convention). The real, authoritative check is Cahya re-trying the
-  toggle on his own Mac.
+  convention). **Confirmed on real hardware, 2026-08-09**: Cahya
+  pulled and retried — all three panels (Layers, Properties, History)
+  toggle and render correctly via the View menu now.
 - [~] **Per-monitor DPI and fractional scaling** — first slice done
   2026-08-05, `crates/aurora-app/src/lib.rs`. Found and fixed a real,
   latent bug along the way: layout was being computed straight from
