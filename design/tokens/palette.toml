@@ -31,6 +31,15 @@ schema_version = 1
 [accent.blue]
 # Single accent hue for v1 (primary actions, active tool, selection, focus
 # ring). Additional accents are a post-Phase-0 decision.
+#
+# 100/200/300 are the dark end of the same hue -- added for Light (and the
+# future high-contrast/Colour-Critical themes) to fill against near-white
+# surfaces, the standard light-mode "dark fill, light text" button pattern.
+# Dark's own 400/500/600 are untouched and keep meaning what they already
+# meant (light accents on Dark's near-black surfaces).
+100 = "#0b3f91"
+200 = "#124fb0"
+300 = "#1a63d1"
 400 = "#5b9bff"
 500 = "#78acff"
 600 = "#a4c8ff"

@@ -1,0 +1,56 @@
+schema_version = 1
+name = "Light"
+extends = "Dark" # inherits any field it doesn't override; see theme.rs's extends_chain
+is_default = false
+
+# Every value here is a reference into ../tokens/palette.toml ("<ramp>.<step>"),
+# never a literal. Owner-approved (Cahya Wirawan, PRD FR-027 Ownership) and
+# contrast-checked; see contrast.rs's the_real_light_theme_passes_every_gated_pair.
+
+[surface]
+canvas  = "neutral.900" # f5f5f6 -- near-white, mirrors Dark's canvas being the darkest neutral extreme
+app     = "neutral.800" # e2e2e5 -- one visible step down from canvas, real chrome/canvas separation
+panel   = "neutral.900" # f5f5f6 -- panels are the "card" that sits brighter than app chrome; elevation
+raised  = "neutral.900" # f5f5f6 -- same as panel; elevation differentiated by scales.toml's shadow token,
+overlay = "neutral.900" # f5f5f6 --   not a neutral-step shift (unlike Dark: scales.toml's own elevation
+                         #   comment says Dark needs the tonal shift because "shadow alone barely reads
+                         #   on a dark background" -- a light background doesn't have that problem)
+sunken  = "neutral.700" # c1c1c7 -- visibly recessed inset wells
+
+[text]
+primary   = "neutral.0"   # 141414
+secondary = "neutral.100" # 212124
+disabled  = "neutral.400" # 6e6e76 -- not gated (WCAG-exempt for disabled content) but kept legible
+on_accent = "neutral.900" # f5f5f6 -- light text on the new dark accent.blue fills
+
+[icon]
+default   = "neutral.50"  # 1a1a1b
+secondary = "neutral.150" # 28282c
+disabled  = "neutral.400" # 6e6e76 -- shares text.disabled's value, mirroring Dark's own icon/text.disabled sharing
+on_accent = "neutral.900" # f5f5f6
+
+[border]
+default = "neutral.600"     # 9d9da5 -- decorative/ungated, but a real visible line against near-white
+                             #   surfaces (avoid repeating the near-invisible surface.panel/app bug Dark
+                             #   already hit and fixed with a border -- see PLAN.md M1.7's account of it)
+strong  = "neutral.200"     # 313136
+focus   = "accent.blue.200" # 124fb0 -- the new dark accent
+
+[accent]
+primary        = "accent.blue.200" # 124fb0
+primary_hover  = "accent.blue.300" # 1a63d1 -- lighter, mirrors Dark's own hover-lightens-the-base pattern
+primary_active = "accent.blue.100" # 0b3f91 -- darker, mirrors Dark's own active-darkens-the-base pattern
+
+[state]
+error   = "semantic.red.500"   # unchanged from Dark -- these were never contrast-gated even for Dark
+warning = "semantic.amber.500" #   (not in GATED_PAIRS/INFORMATIONAL), so this is an inherited, honest,
+success = "semantic.green.500" #   pre-existing gap, not a new one introduced here
+disabled_opacity = 0.4
+
+[state.hover_overlay]
+color = "neutral.0" # dark tint (Dark theme uses a light tint on hover; Light needs the opposite direction)
+alpha = 0.06
+
+[state.active_overlay]
+color = "neutral.0"
+alpha = 0.10

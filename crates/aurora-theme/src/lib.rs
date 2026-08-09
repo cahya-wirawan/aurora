@@ -19,11 +19,14 @@
 //! (§7.3.10)** needs real widget code to lint against, which doesn't
 //! exist yet either — both still open, see PLAN.md M1.6.
 //!
-//! **Only the Dark theme exists as a real design** (owner-approved, PLAN
-//! 0.5) — Light, the two high-contrast themes, and Colour-Critical are
-//! Cahya's design decisions to make (PRD FR-027 *Ownership*), not
-//! something this crate invents while implementing the parser. Everything
-//! here is generic over *any* correctly-shaped theme file.
+//! **Dark and Light exist as real designs** (owner-approved: Dark from
+//! PLAN 0.5, Light delegated to engineering for implementation once Cahya
+//! made the colour calls — see `design/themes/{dark,light}.toml` and
+//! `contrast::tests`' `the_real_{dark,light}_theme_passes_every_gated_pair`).
+//! The two high-contrast themes and Colour-Critical remain Cahya's open
+//! design decisions to make (PRD FR-027 *Ownership*), not something this
+//! crate invents while implementing the parser. Everything here is generic
+//! over *any* correctly-shaped theme file.
 
 pub mod contrast;
 

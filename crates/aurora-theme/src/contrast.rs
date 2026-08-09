@@ -185,6 +185,7 @@ mod tests {
 
     const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
     const DARK_TOML: &str = include_str!("../../../design/themes/dark.toml");
+    const LIGHT_TOML: &str = include_str!("../../../design/themes/light.toml");
 
     #[test]
     fn identical_colors_have_a_ratio_of_one() {
@@ -233,6 +234,42 @@ mod tests {
             unreachable!("{err:?}");
         }
         let theme = match set.resolve("Dark", &palette) {
+            Ok(t) => t,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let results = check_gated_pairs(&theme);
+        assert_eq!(
+            results.len(),
+            17,
+            "expected all 17 gated pairs to be checked"
+        );
+        for result in &results {
+            assert!(
+                result.passes(),
+                "{} failed: {:.2}:1 against a {:.1}:1 floor",
+                result.label,
+                result.ratio,
+                result.floor
+            );
+        }
+    }
+
+    #[test]
+    fn the_real_light_theme_passes_every_gated_pair() {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut set = ThemeSet::new();
+        // Light's `extends = "Dark"` needs the parent actually registered.
+        if let Err(err) = set.register(DARK_TOML) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set.register(LIGHT_TOML) {
+            unreachable!("{err:?}");
+        }
+        let theme = match set.resolve("Light", &palette) {
             Ok(t) => t,
             Err(err) => unreachable!("{err:?}"),
         };
