@@ -3,19 +3,22 @@
 //! (`design/mockups/workspace.html`). PLAN.md M1.8's docking/panels
 //! bullet, first slice.
 //!
-//! **Mostly static.** A panel here is a labeled region with a body to
-//! put content in. [`set_panel_collapsed`] and [`close_panel`] are the
-//! real interactivity so far — there is still no drag-to-redock,
-//! resize, floating, or persisted workspace layout, and `panel.root`
-//! itself is never removed from the tree (only its own docked *slot*,
-//! `Workspace`'s own `layers`/`properties`/`history` fields, would need
-//! to become optional for that — a real, separate architecture decision
-//! deliberately not made here, since nothing renders yet to make a
-//! fully-removed panel's own extra honesty pay for the ripple it would
-//! cost through every place `aurora-app` already assumes a docked panel
-//! exists). Those remain the actual "docking" and "custom workspaces"
-//! half of that bullet, deliberately left open: each needs real
-//! interaction/drag-state machinery this pass still doesn't build.
+//! A panel here is a labeled region with a body to put content in, a
+//! real painted background (`aurora_widgets::widgets::WidgetKind::
+//! Panel`, `surface.panel` — `aurora_widgets::paint`'s own
+//! `paint_panel`, not just an unpainted `Container` like most of this
+//! workspace's chrome still is), and real interactivity:
+//! [`set_panel_collapsed`]/[`close_panel`] (this module), plus resize
+//! (`aurora_ui::workspace::set_rail_width`, the rail's own width, not
+//! per-panel) and cross-session persistence (`aurora-app`'s own
+//! `save_workspace_layout`/`load_workspace_layout`) landed as separate,
+//! later work. `panel.root` itself is never removed from the tree —
+//! only its own docked *slot*, `Workspace`'s own `layers`/`properties`/
+//! `history` fields, would need to become optional for that, a real,
+//! separate architecture decision deliberately not made
+//! ([`close_panel`]'s own doc comment). Still genuinely open: drag-to-
+//! redock and floating panels — both need real interaction/drag-state
+//! machinery this crate doesn't build yet.
 
 use accesskit::{Action, Node, Role};
 use aurora_widgets::widgets::{self, WidgetKind};
@@ -47,7 +50,9 @@ pub struct PanelHandle {
 /// the first real, honest keyboard-navigation target that exists.
 /// `Action::Collapse` and `Node::set_expanded(true)` mark it as a real
 /// disclosure region from the moment it exists, not only once
-/// [`set_panel_collapsed`] is first called.
+/// [`set_panel_collapsed`] is first called. `WidgetKind::Panel` (not
+/// `Container`) gives the root a real painted background — see this
+/// module's own doc comment.
 ///
 /// # Errors
 ///
@@ -62,7 +67,7 @@ pub fn insert_panel(
     root_node.add_action(Action::Focus);
     root_node.add_action(Action::Collapse);
     root_node.set_expanded(true);
-    let root = tree.insert(parent, root_style(false), root_node, WidgetKind::Container)?;
+    let root = tree.insert(parent, root_style(false), root_node, WidgetKind::Panel)?;
     let body = widgets::insert_container(tree, root, Style::default())?;
     Ok(PanelHandle { root, body })
 }
@@ -241,7 +246,7 @@ mod tests {
         assert!(accessibility.supports_action(accesskit::Action::Collapse));
         assert!(!accessibility.supports_action(accesskit::Action::Expand));
         assert_eq!(accessibility.is_expanded(), Some(true));
-        assert_eq!(tree.payload(panel.root), Some(&WidgetKind::Container));
+        assert_eq!(tree.payload(panel.root), Some(&WidgetKind::Panel));
         assert_eq!(tree.children(panel.body), Some([].as_slice()));
         assert_eq!(tree.parent(panel.body), Some(panel.root));
         match panel_is_collapsed(&tree, panel) {

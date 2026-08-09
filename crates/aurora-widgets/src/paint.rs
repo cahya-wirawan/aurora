@@ -5,8 +5,8 @@
 //!
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
 //! `Checkbox`, `Slider`, `TextField`, `CommandPalette`, `ColorSwatch`,
-//! and `ListRow` — solid rounded-rect shapes, the simplest of the
-//! widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
+//! `ListRow`, and `Panel` — solid rounded-rect shapes, the simplest of
+//! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
 //! solid fills only, `render`'s own doc comment); `Toggled::True` and
@@ -118,6 +118,7 @@ pub fn paint_widget(
             paint_color_swatch(*state, bounds, theme, scales).map(|p| vec![p])
         }
         WidgetKind::ListRow(state) => paint_list_row(*state, bounds, theme, scales),
+        WidgetKind::Panel => paint_panel(bounds, theme, scales).map(|p| vec![p]),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -372,6 +373,32 @@ fn paint_list_row(
         1.0
     };
     Ok(vec![(mesh, [r, g, b, alpha])])
+}
+
+/// A docked panel's own flat background — `surface.panel`,
+/// `design/tokens/vocabulary.md`'s own entry for exactly this ("Default
+/// panel background (Layers, Properties, Tool Options, ...)"), not a
+/// use invented here. `scales.radius.sm`, the same small-control radius
+/// every other non-floating shape in this module already uses (a
+/// docked panel reads as a small, fixed region, not a floating popover
+/// like `CommandPalette`'s own `scales.radius.md`). No `disabled`
+/// state — a panel has no such concept — and no distinct paint for
+/// collapsed vs. expanded: a real collapsed panel's own root already
+/// resolves to a near-zero-height rect (`aurora_ui::set_panel_
+/// collapsed`'s own `flex_grow: 0.0`), so an unconditional fill here
+/// already reads as "nothing visible" without this function needing to
+/// know about collapse at all.
+fn paint_panel(bounds: Rect, theme: &Theme, scales: &Scales) -> Result<Paint, WidgetError> {
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.sm as f32,
+    );
+    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.surface.panel.to_srgb_f32();
+    Ok((mesh, [r, g, b, 1.0]))
 }
 
 #[cfg(test)]
@@ -994,6 +1021,46 @@ mod tests {
             paint_color,
             [r, g, b, theme.state.disabled_opacity],
             "a disabled swatch still shows its own color, just dimmed"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_panel_paints_surface_panel() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let panel = match tree.insert(
+            root,
+            taffy::Style::default(),
+            accesskit::Node::new(accesskit::Role::Region),
+            WidgetKind::Panel,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            panel,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 240,
+                height: 400,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (mesh, color) = single_paint(&tree, panel, &theme, &scales);
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a 240x400 panel must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.surface.panel.to_srgb_f32();
+        assert_eq!(
+            color,
+            [r, g, b, 1.0],
+            "a panel's own background must use surface.panel at full opacity"
         );
     }
 

@@ -85,6 +85,16 @@ pub enum WidgetKind {
     /// deliberately shared, generic variant rather than one per
     /// consumer.
     ListRow(ListRowState),
+    /// A titled, dockable region's own root — `aurora-ui`'s own
+    /// `insert_panel` (Layers/Properties/History today) is the first
+    /// real consumer, but nothing about this variant is document- or
+    /// layer-aware (no state at all, in fact — see this variant's own
+    /// paint for why none is needed), the same "generic primitive,
+    /// Aurora-specific *content* stays one layer up" split
+    /// [`ListRowState`] already draws. Not one of `design/gallery/
+    /// index.html`'s own 12 named widgets — it's workspace chrome, not
+    /// a component in that gallery's own sense.
+    Panel,
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]
