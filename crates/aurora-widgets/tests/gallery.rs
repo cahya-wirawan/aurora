@@ -22,16 +22,16 @@
 //!
 //! **Per-theme coverage, started narrow.** Every widget above is Dark
 //! theme only. Now that the Light theme exists and passes its own
-//! contrast gate (`aurora-theme::contrast`), `Button` and `Checkbox`
-//! each get a first Light-theme slice — their own `light_theme()`/
-//! `LIGHT_CLEAR` (shared, not redefined per widget), a real
-//! self-contained distinct-pixels test, and an `#[ignore]`d golden-diff
-//! test pending a human bless, the same shape Dark's own coverage
-//! started with (`Button` first, `Checkbox` second) before extending to
-//! the other widgets. The other four widgets' (`Slider`/`TextField`/
-//! `CommandPalette`/`ColorSwatch`) Light coverage, and both
-//! high-contrast themes' and Colour-Critical's coverage entirely,
-//! remain open — deliberately not attempted here.
+//! contrast gate (`aurora-theme::contrast`), `Button`, `Checkbox`, and
+//! `Slider` each get a first Light-theme slice — their own
+//! `light_theme()`/`LIGHT_CLEAR` (shared, not redefined per widget), a
+//! real self-contained distinct-pixels test, and an `#[ignore]`d
+//! golden-diff test pending a human bless, the same shape Dark's own
+//! coverage started with (`Button` first, `Checkbox` second, `Slider`
+//! third) before extending to the other widgets. The other three
+//! widgets' (`TextField`/`CommandPalette`/`ColorSwatch`) Light
+//! coverage, and both high-contrast themes' and Colour-Critical's
+//! coverage entirely, remain open — deliberately not attempted here.
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -1221,6 +1221,104 @@ fn slider_gallery_matches_the_golden_image() {
     );
     let golden_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/slider_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_slider_state`, but
+/// against the Light theme (`light_theme()`/`LIGHT_CLEAR`) instead of
+/// Dark. `slider_gallery_tree` itself is unchanged and reused as-is —
+/// the tree doesn't depend on theme, only rendering does. Light's own
+/// `surface.sunken` (`neutral.700`, `#c1c1c7`) against `LIGHT_CLEAR`
+/// (`neutral.900`, `#f5f5f6`) is a real, if modest, contrast — the same
+/// spirit as `Checkbox`'s own unchecked box getting away with a modest
+/// contrast because a brighter cell (here, the thumb's own
+/// `accent.primary`, `#124fb0` in Light) anchors the review; no new
+/// backdrop constant was needed.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = slider_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        SLIDER_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, SLIDER_GALLERY_SIZE.0);
+    assert_eq!(image.height, SLIDER_GALLERY_SIZE.1);
+
+    let near_left_edge = |cell: u32| {
+        sample_at(
+            &image,
+            cell * SLIDER_CELL.0 + SLIDER_THUMB_SAMPLE_OFFSET_X,
+            SLIDER_CELL.1 / 2,
+        )
+    };
+    let at_min = near_left_edge(0);
+    let at_max = near_left_edge(1);
+    let disabled = near_left_edge(2);
+    assert_ne!(
+        at_min, at_max,
+        "the thumb must be at a different x offset for a slider at its own minimum vs maximum value in Light theme too"
+    );
+    assert_ne!(
+        at_max[..3],
+        disabled[..3],
+        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+    );
+}
+
+/// The Light-theme counterpart of `slider_gallery_matches_the_golden_
+/// image` — same tree, same three states, `light_theme()`/`LIGHT_CLEAR`
+/// instead of Dark's `dark_theme()`/`wgpu::Color::BLACK`, diffed against
+/// its own golden target (`tests/golden/slider_gallery_light.png`, which
+/// does not exist yet). The same reasoning
+/// `render_gallery_produces_distinct_pixels_for_each_slider_state_in_
+/// light_theme`'s own doc comment gives for why no special backdrop
+/// handling is needed applies here too: `surface.sunken` against
+/// `LIGHT_CLEAR` is a real, if modest, contrast, and the thumb's own
+/// bright `accent.primary` gives a human reviewing the golden a genuine
+/// reference point regardless.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// slider_gallery_light.png`, and confirm it actually shows the thumb at
+/// three visually distinct positions/opacities in Light-theme colours
+/// before this attribute comes off — the same step every other golden
+/// in this file went through before being trusted.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn slider_gallery_matches_the_golden_image_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = slider_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        SLIDER_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/slider_gallery_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }

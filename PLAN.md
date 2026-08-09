@@ -2612,12 +2612,49 @@ check licenses` clean with the new `toml` dependency.
   checked cell gives a reviewer a genuine reference point regardless of
   theme. `gallery.rs`: 16 passed + 2 ignored (both Light golden-diffs).
 
-  **Still genuinely open, unchanged except for these two widgets**: the
-  other four widgets' (`Slider`/`TextField`/`CommandPalette`/
-  `ColorSwatch`) Light coverage; both high-contrast themes' and
-  Colour-Critical's coverage entirely (none of those three themes exist
-  as owner-approved TOML yet); both pending Light golden blesses
-  (`Button`'s and `Checkbox`'s); everything else this note already
+  **`Slider` gained the same Light-theme slice too, 2026-08-09**
+  (third widget, same one-at-a-time pattern): two new tests reusing
+  `slider_gallery_tree` unchanged, `light_theme()`/`LIGHT_CLEAR` (both
+  already existed from `Button`'s own slice above, not redefined).
+  `render_gallery_produces_distinct_pixels_for_each_slider_state_in_
+  light_theme` is real and self-contained (no golden), sampling the
+  same fixed offset from each cell's own left edge the Dark version
+  already established. `slider_gallery_matches_the_golden_image_in_
+  light_theme` is the real golden-diff test, targeting `tests/golden/
+  slider_gallery_light.png` (does not exist yet, not created here) —
+  `#[ignore]`d for the same "never bless blind" reason as `Button`'s
+  and `Checkbox`'s own; a human on real GPU hardware still needs to run
+  `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+  --ignored`, open the written PNG, and confirm it actually shows the
+  thumb at three visually distinct positions/opacities in Light-theme
+  colours before that attribute comes off. Checked, not guessed,
+  whether `Slider` needed a `NEUTRAL_CLEAR`-style backdrop fix the way
+  `CommandPalette`/`TextField` did: Light's `surface.sunken`
+  (`neutral.700`, `#c1c1c7`) against `LIGHT_CLEAR` (`neutral.900`,
+  `#f5f5f6`) is a real, if modest, contrast, and the thumb's own bright
+  `accent.primary` (`#124fb0` in Light) gives a reviewer a genuine
+  reference point regardless — the same shape `Checkbox`'s own modest
+  unchecked-box contrast already gets away with — so no new backdrop
+  constant was added. Ran `cargo test -p aurora-widgets --test gallery
+  -- --nocapture` in this sandbox and grepped its own output for
+  `SKIPPED`: zero matches, so this sandbox had a real (possibly
+  software) GPU adapter and the render path genuinely executed — 17
+  passed, 3 ignored (all three Light golden-diffs: `Button`'s,
+  `Checkbox`'s, `Slider`'s), 0 failed. `cargo fmt --all --check` and
+  `cargo clippy -p aurora-widgets --all-targets --all-features -- -D
+  warnings` both clean; `python3 scripts/check_no_hardcoded_style.py`
+  clean (25 files scanned, this sandbox does have a working `python3`
+  this time); `check_layering.py` still fails in this sandbox with the
+  same pre-existing `ModuleNotFoundError: No module named 'tomllib'`
+  (system Python <3.11), unrelated to this change. Version bumped
+  `0.13.0` → `0.14.0` per `CLAUDE.md`'s own convention.
+
+  **Still genuinely open, unchanged except for these three widgets**:
+  the other three widgets' (`TextField`/`CommandPalette`/`ColorSwatch`)
+  Light coverage; both high-contrast themes' and Colour-Critical's
+  coverage entirely (none of those three themes exist as owner-approved
+  TOML yet); all three pending Light golden blesses (`Button`'s,
+  `Checkbox`'s, and now `Slider`'s); everything else this note already
   listed above.
 - [x] **Headless mode for automated UI tests** — done 2026-08-02. Every
   test in this crate already ran with no window/GPU/platform adapter;
