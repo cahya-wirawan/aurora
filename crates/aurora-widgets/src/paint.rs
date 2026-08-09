@@ -64,7 +64,7 @@
 use accesskit::Toggled;
 use aurora_core::Rect;
 use aurora_theme::{Scales, Theme};
-use aurora_vector::{DEFAULT_TOLERANCE, Mesh, fill, rounded_rect};
+use aurora_vector::{DEFAULT_TOLERANCE, Mesh, fill, rounded_rect, stroke};
 
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
@@ -118,7 +118,7 @@ pub fn paint_widget(
             paint_color_swatch(*state, bounds, theme, scales).map(|p| vec![p])
         }
         WidgetKind::ListRow(state) => paint_list_row(*state, bounds, theme, scales),
-        WidgetKind::Panel => paint_panel(bounds, theme, scales).map(|p| vec![p]),
+        WidgetKind::Panel => paint_panel(bounds, theme, scales),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -375,20 +375,42 @@ fn paint_list_row(
     Ok(vec![(mesh, [r, g, b, alpha])])
 }
 
-/// A docked panel's own flat background — `surface.panel`,
-/// `design/tokens/vocabulary.md`'s own entry for exactly this ("Default
-/// panel background (Layers, Properties, Tool Options, ...)"), not a
-/// use invented here. `scales.radius.sm`, the same small-control radius
-/// every other non-floating shape in this module already uses (a
-/// docked panel reads as a small, fixed region, not a floating popover
-/// like `CommandPalette`'s own `scales.radius.md`). No `disabled`
-/// state — a panel has no such concept — and no distinct paint for
-/// collapsed vs. expanded: a real collapsed panel's own root already
-/// resolves to a near-zero-height rect (`aurora_ui::set_panel_
-/// collapsed`'s own `flex_grow: 0.0`), so an unconditional fill here
-/// already reads as "nothing visible" without this function needing to
-/// know about collapse at all.
-fn paint_panel(bounds: Rect, theme: &Theme, scales: &Scales) -> Result<Paint, WidgetError> {
+/// A docked panel's own flat background, plus a real outline —
+/// `surface.panel`/`border.default`, `design/tokens/vocabulary.md`'s
+/// own entries for exactly this ("Default panel background (Layers,
+/// Properties, Tool Options, ...)"; "Emphasized borders" is
+/// `border.strong`'s own job, not this one's), not uses invented here.
+/// `scales.radius.sm`, the same small-control radius every other
+/// non-floating shape in this module already uses (a docked panel
+/// reads as a small, fixed region, not a floating popover like
+/// `CommandPalette`'s own `scales.radius.md`).
+///
+/// **The border is a real, necessary follow-on, not decoration**: a
+/// plain fill alone was found — on real hardware, not assumed — to be
+/// nearly invisible against the window's own background
+/// (`surface.app`, `#1a1a1b`, next to `surface.panel`'s own `#212124`
+/// — a ~7-in-255 per-channel difference), the deliberately "quiet"
+/// neutral ramp `design/tokens/palette.toml`'s own comment names
+/// ("must stay quiet enough that they never compete with a user's
+/// image"). Cahya's own call (`AskUserQuestion`), once the real
+/// numbers were in front of him, was to add real definition via
+/// `border.default` rather than either leave it or brighten the fill
+/// itself (a design decision either way, not this crate's to make
+/// alone). Stroke width (`1.0` logical px) is a plain engineering
+/// default — no "border width" token exists in `design/tokens/
+/// scales.toml` yet, and a one-pixel hairline is standard UI practice,
+/// not really a design decision to raise the way an arbitrary size or
+/// colour would be.
+///
+/// No `disabled` state — a panel has no such concept — and no distinct
+/// paint for collapsed vs. expanded: a real collapsed panel's own root
+/// already resolves to a near-zero-height rect (`aurora_ui::
+/// set_panel_collapsed`'s own `flex_grow: 0.0`), so an unconditional
+/// fill-plus-border here already reads as "nothing visible" without
+/// this function needing to know about collapse at all.
+fn paint_panel(bounds: Rect, theme: &Theme, scales: &Scales) -> Result<Vec<Paint>, WidgetError> {
+    const BORDER_WIDTH: f32 = 1.0;
+
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,
@@ -396,9 +418,16 @@ fn paint_panel(bounds: Rect, theme: &Theme, scales: &Scales) -> Result<Paint, Wi
         bounds.height as f32,
         scales.radius.sm as f32,
     );
-    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
-    let [r, g, b] = theme.surface.panel.to_srgb_f32();
-    Ok((mesh, [r, g, b, 1.0]))
+    let fill_mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let [fr, fg, fb] = theme.surface.panel.to_srgb_f32();
+
+    let border_mesh = stroke(&path, BORDER_WIDTH, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let [br, bg, bb] = theme.border.default.to_srgb_f32();
+
+    Ok(vec![
+        (fill_mesh, [fr, fg, fb, 1.0]),
+        (border_mesh, [br, bg, bb, 1.0]),
+    ])
 }
 
 #[cfg(test)]
@@ -1051,16 +1080,32 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (mesh, color) = single_paint(&tree, panel, &theme, &scales);
+        let mut paints = match paint_widget(&tree, panel, &theme, &scales) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(paints.len(), 2, "a panel paints a fill and a border");
+        let (border_mesh, border_color) = paints.remove(1);
+        let (fill_mesh, fill_color) = paints.remove(0);
         assert!(
-            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
-            "a 240x400 panel must tessellate to real geometry"
+            !fill_mesh.vertices.is_empty() && !fill_mesh.indices.is_empty(),
+            "a 240x400 panel's own fill must tessellate to real geometry"
+        );
+        assert!(
+            !border_mesh.vertices.is_empty() && !border_mesh.indices.is_empty(),
+            "a 240x400 panel's own border must tessellate to real geometry"
         );
         let [r, g, b] = theme.surface.panel.to_srgb_f32();
         assert_eq!(
-            color,
+            fill_color,
             [r, g, b, 1.0],
             "a panel's own background must use surface.panel at full opacity"
+        );
+        let [r, g, b] = theme.border.default.to_srgb_f32();
+        assert_eq!(
+            border_color,
+            [r, g, b, 1.0],
+            "a panel's own border must use border.default at full opacity"
         );
     }
 
