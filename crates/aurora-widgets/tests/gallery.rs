@@ -22,16 +22,32 @@
 //!
 //! **Per-theme coverage, started narrow.** Every widget above is Dark
 //! theme only. Now that the Light theme exists and passes its own
-//! contrast gate (`aurora-theme::contrast`), `Button`, `Checkbox`, and
-//! `Slider` each get a first Light-theme slice — their own
-//! `light_theme()`/`LIGHT_CLEAR` (shared, not redefined per widget), a
-//! real self-contained distinct-pixels test, and an `#[ignore]`d
+//! contrast gate (`aurora-theme::contrast`), `Button`, `Checkbox`,
+//! `Slider`, and `TextField` each get a first Light-theme slice — their
+//! own `light_theme()`/`LIGHT_CLEAR` (shared, not redefined per widget),
+//! a real self-contained distinct-pixels test, and an `#[ignore]`d
 //! golden-diff test pending a human bless, the same shape Dark's own
 //! coverage started with (`Button` first, `Checkbox` second, `Slider`
-//! third) before extending to the other widgets. The other three
-//! widgets' (`TextField`/`CommandPalette`/`ColorSwatch`) Light
-//! coverage, and both high-contrast themes' and Colour-Critical's
-//! coverage entirely, remain open — deliberately not attempted here.
+//! third, `TextField` fourth) before extending to the other widgets.
+//! `TextField`'s own Dark-theme gallery needed `NEUTRAL_CLEAR` (see that
+//! constant's own doc comment) because `surface.sunken` is near-black
+//! there; in Light, `surface.sunken` resolves to `neutral.700`
+//! (`#c1c1c7`) against `LIGHT_CLEAR`'s `neutral.900` (`#f5f5f6`) — a real
+//! but modest ≈1.65:1 contrast, and only ≈1.36:1 between the enabled and
+//! disabled cells themselves (the only two states this widget has).
+//! That's better than the ≈1.09:1 Dark's own first `TextField` bless
+//! attempt was rejected for ("effectively unreviewable"), but well
+//! short of the ≈2.47:1 `NEUTRAL_CLEAR` achieved for the same widget —
+//! and unlike `Slider`, there's no bright `accent.primary` element here
+//! to anchor a human's eye regardless of the fill's own contrast. So
+//! this is a **provisional, unconfirmed** choice, not a settled "no
+//! backdrop needed" finding: `LIGHT_CLEAR` alone is used for now, but
+//! the human bless step should scrutinize this one closely and may need
+//! its own backdrop fix, the same two-iteration path Dark's `TextField`
+//! itself took. The other two widgets'
+//! (`CommandPalette`/`ColorSwatch`) Light coverage, and both
+//! high-contrast themes' and Colour-Critical's coverage entirely, remain
+//! open — deliberately not attempted here.
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -1392,6 +1408,108 @@ fn text_field_gallery_matches_the_golden_image() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/text_field_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_text_field_state`,
+/// but against the Light theme (`light_theme()`/`LIGHT_CLEAR`) instead
+/// of Dark's `dark_theme()`/`NEUTRAL_CLEAR`. `text_field_gallery_tree`
+/// itself is unchanged and reused as-is — the tree doesn't depend on
+/// theme, only rendering does. `LIGHT_CLEAR`, not `NEUTRAL_CLEAR`:
+/// unlike Dark's `surface.sunken` (near-black, invisible against a pure
+/// black clear — see `NEUTRAL_CLEAR`'s own doc comment for why Dark's
+/// `TextField` gallery needed the fix), Light's own `surface.sunken`
+/// resolves to `neutral.700` (`#c1c1c7`), which already contrasts
+/// against `LIGHT_CLEAR`'s own `neutral.900` (`#f5f5f6`) — confirmed by
+/// checking `paint_text_field` itself: `surface.sunken` plus
+/// `state.disabled_opacity` is the only thing it ever paints, nothing
+/// else theme-dependent affects visibility. But the actual contrast is
+/// modest (≈1.65:1 fill-vs-canvas, ≈1.36:1 between the enabled and
+/// disabled cells themselves) — worse than the ≈2.47:1 `NEUTRAL_CLEAR`
+/// achieved for this exact widget in Dark, and `TextField` has no bright
+/// accent element like `Slider`'s thumb to anchor a human's eye
+/// regardless. This is a **provisional** choice pending the human bless,
+/// not a confirmed "no backdrop needed" finding — see this file's own
+/// top doc comment for the full reasoning.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_text_field_state_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, TEXT_FIELD_GALLERY_SIZE.0);
+    assert_eq!(image.height, TEXT_FIELD_GALLERY_SIZE.1);
+
+    let enabled_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 0);
+    let disabled_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 1);
+    assert_ne!(
+        enabled_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render differently from full \
+         opacity in Light theme too"
+    );
+}
+
+/// The Light-theme counterpart of `text_field_gallery_matches_the_
+/// golden_image` — same tree, same two states, `light_theme()`/
+/// `LIGHT_CLEAR` instead of Dark's `dark_theme()`/`NEUTRAL_CLEAR`,
+/// diffed against its own golden target (`tests/golden/
+/// text_field_gallery_light.png`, which does not exist yet). Uses
+/// `LIGHT_CLEAR` alone, **provisionally** — see
+/// `render_gallery_produces_distinct_pixels_for_each_text_field_state_
+/// in_light_theme`'s own doc comment: the real contrast here (≈1.65:1
+/// fill-vs-canvas, ≈1.36:1 between states) is weaker than the ≈2.47:1
+/// Dark's own `NEUTRAL_CLEAR` fix achieved for this exact widget, and
+/// there's no bright accent element to compensate the way `Slider` has.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// text_field_gallery_light.png`, and confirm it actually shows two
+/// visually distinct text fields in Light-theme colours before this
+/// attribute comes off — the same step every other golden in this file
+/// went through before being trusted. Given the modest contrast noted
+/// above, this one deserves particular scrutiny: if it reads as
+/// "effectively unreviewable" the way Dark's own first `TextField`
+/// attempt did, the fix is a `TextField`-specific backdrop (mirroring
+/// `NEUTRAL_CLEAR`'s own history), not forcing a pass through this
+/// comment alone.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn text_field_gallery_matches_the_golden_image_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/text_field_gallery_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
