@@ -22,14 +22,16 @@
 //!
 //! **Per-theme coverage, started narrow.** Every widget above is Dark
 //! theme only. Now that the Light theme exists and passes its own
-//! contrast gate (`aurora-theme::contrast`), `Button` gets a first
-//! Light-theme slice — its own `light_theme()`/`LIGHT_CLEAR`, a real
+//! contrast gate (`aurora-theme::contrast`), `Button` and `Checkbox`
+//! each get a first Light-theme slice — their own `light_theme()`/
+//! `LIGHT_CLEAR` (shared, not redefined per widget), a real
 //! self-contained distinct-pixels test, and an `#[ignore]`d golden-diff
-//! test pending a human bless, the same shape Dark's own `Button`
-//! coverage started with before extending to the other five widgets.
-//! The other five widgets' Light coverage, and both high-contrast
-//! themes' and Colour-Critical's coverage entirely, remain open —
-//! deliberately not attempted here.
+//! test pending a human bless, the same shape Dark's own coverage
+//! started with (`Button` first, `Checkbox` second) before extending to
+//! the other widgets. The other four widgets' (`Slider`/`TextField`/
+//! `CommandPalette`/`ColorSwatch`) Light coverage, and both
+//! high-contrast themes' and Colour-Critical's coverage entirely,
+//! remain open — deliberately not attempted here.
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -971,6 +973,95 @@ fn checkbox_gallery_matches_the_golden_image() {
     );
     let golden_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/checkbox_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_checkbox_state`, but
+/// against the Light theme (`light_theme()`/`LIGHT_CLEAR`) instead of
+/// Dark. `checkbox_gallery_tree` itself is unchanged and reused as-is —
+/// the tree doesn't depend on theme, only rendering does.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_checkbox_state_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = checkbox_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        CHECKBOX_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, CHECKBOX_GALLERY_SIZE.0);
+    assert_eq!(image.height, CHECKBOX_GALLERY_SIZE.1);
+
+    let unchecked_px = sample_cell_centre(&image, CHECKBOX_CELL, 0);
+    let checked_px = sample_cell_centre(&image, CHECKBOX_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, CHECKBOX_CELL, 2);
+    assert_ne!(
+        unchecked_px, checked_px,
+        "surface.sunken vs accent.primary must render differently in Light theme too"
+    );
+    assert_ne!(
+        unchecked_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+    );
+}
+
+/// The Light-theme counterpart of `checkbox_gallery_matches_the_golden_
+/// image` — same tree, same three states, `light_theme()`/`LIGHT_CLEAR`
+/// instead of Dark's `dark_theme()`/`wgpu::Color::BLACK`, diffed against
+/// its own golden target (`tests/golden/checkbox_gallery_light.png`,
+/// which does not exist yet). The same reasoning
+/// `checkbox_gallery_matches_the_golden_image`'s own doc comment gives
+/// for why Dark's `Checkbox` gallery needed no `NEUTRAL_CLEAR`-style
+/// backdrop fix applies here too: a real, bright `accent.primary` checked
+/// cell gives a human reviewing the golden a genuine reference point,
+/// and Light's own fills already contrast fine against `LIGHT_CLEAR`
+/// (see `LIGHT_CLEAR`'s own doc comment) — so no special-casing beyond
+/// swapping the theme and clear colour is needed.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// checkbox_gallery_light.png`, and confirm it actually shows three
+/// visually distinct checkboxes in Light-theme colours before this
+/// attribute comes off — the same step every other golden in this file
+/// went through before being trusted. This holds regardless of whether
+/// the sandbox that ran this test happened to have some GPU adapter
+/// (possibly software) available — "real GPU hardware" plus human
+/// visual review is the bar, not just "some renderer produced pixels."
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn checkbox_gallery_matches_the_golden_image_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = checkbox_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        CHECKBOX_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/checkbox_gallery_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }

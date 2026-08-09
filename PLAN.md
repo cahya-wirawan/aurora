@@ -2583,12 +2583,42 @@ check licenses` clean with the new `toml` dependency.
   GPU hardware still needs to** run `AURORA_BLESS_GOLDEN=1 cargo test -p
   aurora-widgets --test gallery -- --ignored` and confirm the written
   PNG actually shows three visually distinct buttons in Light-theme
-  colours before that attribute comes off. **Still genuinely open,
-  unchanged except for this one widget**: the other five widgets'
-  (`Checkbox`/`Slider`/`TextField`/`CommandPalette`/`ColorSwatch`) Light
-  coverage; both high-contrast themes' and Colour-Critical's coverage
-  entirely (none of those three themes exist as owner-approved TOML yet);
-  everything else this note already listed above.
+  colours before that attribute comes off.
+
+  **`Checkbox` gained the same Light-theme slice too, 2026-08-09**
+  (second widget, same one-at-a-time pattern): two new tests reusing
+  `checkbox_gallery_tree` unchanged, `light_theme()`/`LIGHT_CLEAR`
+  (both already existed from `Button`'s own slice above, not redefined).
+  `render_gallery_produces_distinct_pixels_for_each_checkbox_state_
+  in_light_theme` is real and self-contained (no golden). The sandbox
+  that landed this happened to have a working GPU adapter (confirmed by
+  actually grepping `cargo test -p aurora-widgets --test gallery --
+  --nocapture`'s own output for `SKIPPED` — zero matches, `real_context`'s
+  own no-adapter early-return never fired), so this is an honest "it ran
+  and passed here," not an inference from a passing test count alone.
+  `checkbox_gallery_matches_the_golden_image_in_light_theme` is the real
+  golden-diff test, targeting `tests/golden/checkbox_gallery_light.png`
+  (does not exist yet) — `#[ignore]`d for the same "never bless blind"
+  reason as `Button`'s own, regardless of this sandbox's adapter: a
+  human on real GPU hardware still needs to run
+  `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+  --ignored`, open the written PNG, and confirm it actually shows three
+  visually distinct checkboxes in Light-theme colours before that
+  attribute comes off — "some renderer produced pixels" is not the same
+  bar as "a human looked at it," even when the renderer happens to be a
+  real one. No `NEUTRAL_CLEAR`-style backdrop fix was needed, the same
+  reasoning `checkbox_gallery_matches_the_golden_image`'s own doc
+  comment already gives for Dark: a real, bright `accent.primary`
+  checked cell gives a reviewer a genuine reference point regardless of
+  theme. `gallery.rs`: 16 passed + 2 ignored (both Light golden-diffs).
+
+  **Still genuinely open, unchanged except for these two widgets**: the
+  other four widgets' (`Slider`/`TextField`/`CommandPalette`/
+  `ColorSwatch`) Light coverage; both high-contrast themes' and
+  Colour-Critical's coverage entirely (none of those three themes exist
+  as owner-approved TOML yet); both pending Light golden blesses
+  (`Button`'s and `Checkbox`'s); everything else this note already
+  listed above.
 - [x] **Headless mode for automated UI tests** — done 2026-08-02. Every
   test in this crate already ran with no window/GPU/platform adapter;
   what was missing was making that a *checked* fact rather than an
