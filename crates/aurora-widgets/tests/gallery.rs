@@ -20,6 +20,17 @@
 //! for that; this file only proves the render pipeline actually
 //! produces the pixels those decisions imply.
 //!
+//! **Per-theme coverage, started narrow.** Every widget above is Dark
+//! theme only. Now that the Light theme exists and passes its own
+//! contrast gate (`aurora-theme::contrast`), `Button` gets a first
+//! Light-theme slice — its own `light_theme()`/`LIGHT_CLEAR`, a real
+//! self-contained distinct-pixels test, and an `#[ignore]`d golden-diff
+//! test pending a human bless, the same shape Dark's own `Button`
+//! coverage started with before extending to the other five widgets.
+//! The other five widgets' Light coverage, and both high-contrast
+//! themes' and Colour-Critical's coverage entirely, remain open —
+//! deliberately not attempted here.
+//!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
 //! already established for this crate's integration tests.
@@ -38,6 +49,7 @@ use taffy::{FlexDirection, Rect as LayoutRect, Size, Style};
 
 const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
 const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
+const LIGHT_THEME_TOML: &str = include_str!("../../../design/themes/light.toml");
 const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 
 /// `Button`'s own gallery cell size. Deliberately explicit, not the
@@ -129,6 +141,21 @@ const NEUTRAL_CLEAR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+/// The Light theme's own real `surface.canvas` colour (`design/themes/
+/// light.toml` → `neutral.900` → `design/tokens/palette.toml` →
+/// `#f5f5f6`), used as `Button`'s own Light-theme gallery backdrop —
+/// what the actual UI would show, not an arbitrary pick. Unlike
+/// `NEUTRAL_CLEAR`'s near-black Dark-theme tokens, Light's own fills
+/// here (the `accent.blue` family) already contrast fine against this
+/// real light backdrop, so no separate margin/positioning fix
+/// (`CommandPalette`/`TextField`'s own) is needed for `Button` in Light.
+const LIGHT_CLEAR: wgpu::Color = wgpu::Color {
+    r: 0xf5 as f64 / 255.0,
+    g: 0xf5 as f64 / 255.0,
+    b: 0xf6 as f64 / 255.0,
+    a: 1.0,
+};
+
 /// Serializes this file's real-GPU tests, this integration test's own
 /// copy of the same "one `wgpu::Instance`/`Device` at a time" lock
 /// every other real-GPU test file in this workspace carries
@@ -185,6 +212,28 @@ fn dark_theme() -> Theme {
     match themes.resolve("Dark", &palette) {
         Ok(theme) => theme,
         Err(err) => unreachable!("the committed Dark theme must resolve: {err:?}"),
+    }
+}
+
+/// Mirrors [`dark_theme`], but for Light. Light's own `extends = "Dark"`
+/// needs the parent actually registered first — the exact pattern
+/// `contrast.rs`'s own `the_real_light_theme_passes_every_gated_pair`
+/// test already establishes for this same pair of TOML files.
+fn light_theme() -> Theme {
+    let palette = match Palette::from_toml_str(PALETTE_TOML) {
+        Ok(palette) => palette,
+        Err(err) => unreachable!("the committed palette must parse: {err:?}"),
+    };
+    let mut themes = ThemeSet::new();
+    if let Err(err) = themes.register(DARK_THEME_TOML) {
+        unreachable!("the committed Dark theme must register: {err:?}");
+    }
+    if let Err(err) = themes.register(LIGHT_THEME_TOML) {
+        unreachable!("the committed Light theme must register: {err:?}");
+    }
+    match themes.resolve("Light", &palette) {
+        Ok(theme) => theme,
+        Err(err) => unreachable!("the committed Light theme must resolve: {err:?}"),
     }
 }
 
@@ -771,6 +820,85 @@ fn button_gallery_matches_the_golden_image() {
     );
     let golden_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/button_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_button_state`, but
+/// against the Light theme (`light_theme()`/`LIGHT_CLEAR`) instead of
+/// Dark. `button_gallery_tree` itself is unchanged and reused as-is —
+/// the tree doesn't depend on theme, only rendering does.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_button_state_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = button_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        BUTTON_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, BUTTON_GALLERY_SIZE.0);
+    assert_eq!(image.height, BUTTON_GALLERY_SIZE.1);
+
+    let enabled_px = sample_cell_centre(&image, BUTTON_CELL, 0);
+    let pressed_px = sample_cell_centre(&image, BUTTON_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, BUTTON_CELL, 2);
+    assert_ne!(
+        enabled_px, pressed_px,
+        "accent.primary vs accent.primary_active must render differently in Light theme too"
+    );
+    assert_ne!(
+        enabled_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+    );
+}
+
+/// The Light-theme counterpart of `button_gallery_matches_the_golden_
+/// image` — same tree, same three states, `light_theme()`/`LIGHT_CLEAR`
+/// instead of Dark's `dark_theme()`/`wgpu::Color::BLACK`, diffed
+/// against its own golden target (`tests/golden/button_gallery_light.
+/// png`, which does not exist yet).
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// button_gallery_light.png`, and confirm it actually shows three
+/// visually distinct buttons in Light-theme colours before this
+/// attribute comes off — the same step every other golden in this file
+/// went through before being trusted.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn button_gallery_matches_the_golden_image_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = button_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        BUTTON_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/button_gallery_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }

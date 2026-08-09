@@ -2557,6 +2557,38 @@ check licenses` clean with the new `toml` dependency.
   which `aurora-text` doesn't have yet; `Scrollbar`/`Tree`/`Menu`/
   `Curve editor` are explicitly deferred further by that file's own
   "needs more structural design work" note).
+
+  **Per-theme coverage partially unblocked, 2026-08-09**: the Light
+  theme now exists (`design/themes/light.toml`) and passes its own
+  17/17 gated-pair contrast check (`crates/aurora-theme/src/
+  contrast.rs`'s own `the_real_light_theme_passes_every_gated_pair`),
+  so `Button` — deliberately only `Button`, the same widget Dark's own
+  gallery coverage started with before extending to the other five —
+  gets a first Light-theme slice in `crates/aurora-widgets/tests/
+  gallery.rs`: `LIGHT_THEME_TOML`/`light_theme()` (registers both
+  `DARK_THEME_TOML` and `LIGHT_THEME_TOML` into one `ThemeSet` before
+  resolving "Light", mirroring `contrast.rs`'s own registration order —
+  Light's `extends = "Dark"` needs the parent registered first), and
+  `LIGHT_CLEAR` (Light's own real `surface.canvas` token, `#f5f5f6`, not
+  an arbitrary pick — its `accent.blue` fills already contrast fine
+  against it, so unlike `CommandPalette`/`TextField`'s own `NEUTRAL_
+  CLEAR` fix no separate margin/positioning change was needed). Two new
+  tests: `render_gallery_produces_distinct_pixels_for_each_button_
+  state_in_light_theme` is real and self-contained (no golden), reuses
+  `button_gallery_tree` unchanged, and passes here today.
+  `button_gallery_matches_the_golden_image_in_light_theme` is the real
+  golden-diff test, targeting `tests/golden/button_gallery_light.png`
+  (does not exist yet) — `#[ignore]`d, the same "never bless blind"
+  discipline every other golden in this file follows; **a human on real
+  GPU hardware still needs to** run `AURORA_BLESS_GOLDEN=1 cargo test -p
+  aurora-widgets --test gallery -- --ignored` and confirm the written
+  PNG actually shows three visually distinct buttons in Light-theme
+  colours before that attribute comes off. **Still genuinely open,
+  unchanged except for this one widget**: the other five widgets'
+  (`Checkbox`/`Slider`/`TextField`/`CommandPalette`/`ColorSwatch`) Light
+  coverage; both high-contrast themes' and Colour-Critical's coverage
+  entirely (none of those three themes exist as owner-approved TOML yet);
+  everything else this note already listed above.
 - [x] **Headless mode for automated UI tests** — done 2026-08-02. Every
   test in this crate already ran with no window/GPU/platform adapter;
   what was missing was making that a *checked* fact rather than an
