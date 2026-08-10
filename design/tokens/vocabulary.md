@@ -57,6 +57,8 @@ adjacent surfaces.
 | `border.default` | Subtle dividers, panel edges, default input borders. |
 | `border.strong` | Emphasized borders — active panel edge, pressed/selected state outline. |
 | `border.focus` | Focus ring. Must hit 3:1 against every surface it can appear on (acceptance criterion 2) — checked independently of `border.default`/`strong` because it's a11y-load-bearing, not decorative. |
+| `border.control` | The colour of a mandatory outline drawn around every interactive control (buttons, checkboxes, sliders, text fields, the command palette panel, colour swatches) — invisible by default (`border.control_opacity` at `0`), opaque in the two High Contrast themes, where relying on fill-colour contrast alone isn't enough. |
+| `border.control_opacity` | Opacity multiplier for `border.control`'s stroke — `0.0` in every theme except the two High Contrast ones, where it's `1.0`. A theme toggle, not a widget-state one (contrast `state.disabled_opacity`, which is about a control's own enabled/disabled state, not the active theme). |
 
 ## Accent
 

@@ -35,6 +35,10 @@ default = "neutral.600"     # 9d9da5 -- decorative/ungated, but a real visible l
                              #   already hit and fixed with a border -- see PLAN.md M1.7's account of it)
 strong  = "neutral.200"     # 313136
 focus   = "accent.blue.200" # 124fb0 -- the new dark accent
+control = "neutral.200"     # reuses border.strong's own reference -- if control_opacity were
+                             #   ever raised above 0, this degrades to something sane rather
+                             #   than an arbitrary colour; see vocabulary.md
+control_opacity = 0.0
 
 [accent]
 primary        = "accent.blue.200" # 124fb0

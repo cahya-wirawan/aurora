@@ -64,7 +64,7 @@
 use accesskit::Toggled;
 use aurora_core::Rect;
 use aurora_theme::{Scales, Theme};
-use aurora_vector::{DEFAULT_TOLERANCE, Mesh, fill, rounded_rect, stroke};
+use aurora_vector::{DEFAULT_TOLERANCE, Mesh, Path, fill, rounded_rect, stroke};
 
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
@@ -80,6 +80,31 @@ use crate::widgets::{
 /// ([`paint_widget`]'s own return type) — see this module's own doc
 /// comment for why a single widget can need more than one.
 pub type Paint = (Mesh, [f32; 4]);
+
+/// The mandatory control-outline stroke `border.control`/
+/// `border.control_opacity` describe (`design/tokens/vocabulary.md`) —
+/// `None` when the opacity is exactly `0.0` (every theme except the two
+/// High Contrast ones, not yet landed), so a widget's shape count and
+/// every existing test that depends on it are completely unaffected
+/// until an HC theme actually sets the opacity above zero. This is the
+/// same "conditional, not padded" idiom [`paint_list_row`] already uses
+/// for an unselected row's own `Ok(vec![])`, not a new pattern invented
+/// here. `alpha` lets the caller fold in `state.disabled_opacity` too —
+/// a disabled control's outline should dim along with everything else
+/// about it, the same as its fill already does.
+fn control_outline(path: &Path, theme: &Theme, alpha: f32) -> Result<Option<Paint>, WidgetError> {
+    const CONTROL_BORDER_WIDTH: f32 = 1.0;
+
+    if theme.border.control_opacity <= 0.0 {
+        return Ok(None);
+    }
+    let mesh = stroke(path, CONTROL_BORDER_WIDTH, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.border.control.to_srgb_f32();
+    Ok(Some((
+        mesh,
+        [r, g, b, theme.border.control_opacity * alpha],
+    )))
+}
 
 /// Resolves `id`'s own paint from its current layout bounds
 /// ([`WidgetTree::bounds`]) and state — zero or more shapes, in the
@@ -103,20 +128,12 @@ pub fn paint_widget(
     let bounds = tree.bounds(id).ok_or(WidgetError::UnknownWidget(id))?;
     let kind = tree.payload(id).ok_or(WidgetError::UnknownWidget(id))?;
     match kind {
-        WidgetKind::Button(state) => paint_button(state, bounds, theme, scales).map(|p| vec![p]),
-        WidgetKind::Checkbox(state) => {
-            paint_checkbox(state, bounds, theme, scales).map(|p| vec![p])
-        }
+        WidgetKind::Button(state) => paint_button(state, bounds, theme, scales),
+        WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales),
         WidgetKind::Slider(state) => paint_slider(state, bounds, theme, scales),
-        WidgetKind::TextField(state) => {
-            paint_text_field(state, bounds, theme, scales).map(|p| vec![p])
-        }
-        WidgetKind::CommandPalette(_) => {
-            paint_command_palette(bounds, theme, scales).map(|p| vec![p])
-        }
-        WidgetKind::ColorSwatch(state) => {
-            paint_color_swatch(*state, bounds, theme, scales).map(|p| vec![p])
-        }
+        WidgetKind::TextField(state) => paint_text_field(state, bounds, theme, scales),
+        WidgetKind::CommandPalette(_) => paint_command_palette(bounds, theme, scales),
+        WidgetKind::ColorSwatch(state) => paint_color_swatch(*state, bounds, theme, scales),
         WidgetKind::ListRow(state) => paint_list_row(*state, bounds, theme, scales),
         WidgetKind::Panel => paint_panel(bounds, theme, scales),
         WidgetKind::Container => Ok(vec![]),
@@ -128,7 +145,7 @@ fn paint_button(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
-) -> Result<Paint, WidgetError> {
+) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,
@@ -153,7 +170,11 @@ fn paint_button(
     } else {
         1.0
     };
-    Ok((mesh, [r, g, b, alpha]))
+    let mut paints = vec![(mesh, [r, g, b, alpha])];
+    if let Some(outline) = control_outline(&path, theme, alpha)? {
+        paints.push(outline);
+    }
+    Ok(paints)
 }
 
 fn paint_checkbox(
@@ -161,7 +182,7 @@ fn paint_checkbox(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
-) -> Result<Paint, WidgetError> {
+) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,
@@ -184,7 +205,11 @@ fn paint_checkbox(
     } else {
         1.0
     };
-    Ok((mesh, [r, g, b, alpha]))
+    let mut paints = vec![(mesh, [r, g, b, alpha])];
+    if let Some(outline) = control_outline(&path, theme, alpha)? {
+        paints.push(outline);
+    }
+    Ok(paints)
 }
 
 /// `Slider`'s own two shapes, in draw order: a track (a thin, full-width
@@ -243,7 +268,14 @@ fn paint_slider(
     let [r, g, b] = theme.accent.primary.to_srgb_f32();
     let thumb = (thumb_mesh, [r, g, b, alpha]);
 
-    Ok(vec![track, thumb])
+    let mut paints = vec![track, thumb];
+    // The thumb, not the track: the track is a groove, not itself a
+    // focusable control -- the thumb is the actual interactive handle a
+    // user grabs (this module's own doc comment / `control_outline`'s).
+    if let Some(outline) = control_outline(&thumb_path, theme, alpha)? {
+        paints.push(outline);
+    }
+    Ok(paints)
 }
 
 fn paint_text_field(
@@ -251,7 +283,7 @@ fn paint_text_field(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
-) -> Result<Paint, WidgetError> {
+) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,
@@ -271,7 +303,11 @@ fn paint_text_field(
     } else {
         1.0
     };
-    Ok((mesh, [r, g, b, alpha]))
+    let mut paints = vec![(mesh, [r, g, b, alpha])];
+    if let Some(outline) = control_outline(&path, theme, alpha)? {
+        paints.push(outline);
+    }
+    Ok(paints)
 }
 
 /// `CommandPalette`'s own outer panel, nothing else — `paint_list_row`
@@ -293,7 +329,7 @@ fn paint_command_palette(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
-) -> Result<Paint, WidgetError> {
+) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,
@@ -303,7 +339,11 @@ fn paint_command_palette(
     );
     let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
     let [r, g, b] = theme.surface.raised.to_srgb_f32();
-    Ok((mesh, [r, g, b, 1.0]))
+    let mut paints = vec![(mesh, [r, g, b, 1.0])];
+    if let Some(outline) = control_outline(&path, theme, 1.0)? {
+        paints.push(outline);
+    }
+    Ok(paints)
 }
 
 /// A colour swatch's own fill: `state.color` itself — the one widget in
@@ -321,7 +361,7 @@ fn paint_color_swatch(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
-) -> Result<Paint, WidgetError> {
+) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,
@@ -336,7 +376,11 @@ fn paint_color_swatch(
     } else {
         1.0
     };
-    Ok((mesh, [r, g, b, alpha]))
+    let mut paints = vec![(mesh, [r, g, b, alpha])];
+    if let Some(outline) = control_outline(&path, theme, alpha)? {
+        paints.push(outline);
+    }
+    Ok(paints)
 }
 
 /// A list row's own highlight — nothing at all when `state.selected` is
@@ -482,6 +526,41 @@ mod tests {
         }
     }
 
+    /// A synthetic child of the real, committed Dark theme with
+    /// `border.control_opacity` raised above `0.0` -- proves
+    /// `control_outline` actually turns the outline on, without
+    /// inventing a real second High Contrast design (Cahya's own call
+    /// per FR-027 *Ownership*, not this test's to make). The same
+    /// "synthetic child theme" pattern `aurora_theme::theme`'s own tests
+    /// already use to prove `extends` merging generically.
+    fn high_contrast_theme() -> Theme {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(palette) => palette,
+            Err(err) => unreachable!("the committed palette must parse: {err:?}"),
+        };
+        let mut themes = ThemeSet::new();
+        if let Err(err) = themes.register(DARK_THEME_TOML) {
+            unreachable!("the committed Dark theme must register: {err:?}");
+        }
+        let child = r#"
+            schema_version = 1
+            name = "TestHighContrast"
+            extends = "Dark"
+            is_default = false
+
+            [border]
+            control = "neutral.900"
+            control_opacity = 1.0
+        "#;
+        if let Err(err) = themes.register(child) {
+            unreachable!("{err:?}");
+        }
+        match themes.resolve("TestHighContrast", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
     /// Resolves `id`'s own paint and asserts it's exactly one shape --
     /// `Button`/`Checkbox`'s own case -- returning that shape.
     fn single_paint(
@@ -572,6 +651,93 @@ mod tests {
 
         let (_, color) = single_paint(&tree, button, &theme, &scales);
         assert_eq!(color[3], theme.state.disabled_opacity);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_button_gains_a_second_outline_shape_when_border_control_opacity_is_above_zero() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let button = match insert_button(&mut tree, root, &scales, "OK") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            button,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 32,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = high_contrast_theme();
+
+        let paints = match paint_widget(&tree, button, &theme, &scales) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            paints.len(),
+            2,
+            "border.control_opacity above 0 must add a second, outline shape on top of the fill"
+        );
+        let Some((outline_mesh, outline_color)) = paints.get(1) else {
+            unreachable!("just asserted len == 2");
+        };
+        assert!(
+            !outline_mesh.vertices.is_empty() && !outline_mesh.indices.is_empty(),
+            "the outline must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.border.control.to_srgb_f32();
+        assert_eq!(
+            *outline_color,
+            [r, g, b, theme.border.control_opacity],
+            "the outline must use border.control at border.control_opacity"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_buttons_outline_dims_by_the_same_disabled_opacity_as_its_fill() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let button = match insert_button(&mut tree, root, &scales, "OK") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_button_disabled(&mut tree, button, true) {
+            unreachable!("{err:?}");
+        }
+        let theme = high_contrast_theme();
+
+        let paints = match paint_widget(&tree, button, &theme, &scales) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(paints.len(), 2);
+        let Some((_, outline_color)) = paints.get(1) else {
+            unreachable!("just asserted len == 2");
+        };
+        assert_eq!(
+            outline_color[3],
+            theme.border.control_opacity * theme.state.disabled_opacity,
+            "a disabled control's outline dims the same way its fill already does"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn dark_theme_has_border_control_opacity_at_zero() {
+        // The load-bearing property this whole task rests on: the real,
+        // committed Dark theme must resolve `border.control_opacity` to
+        // exactly `0.0`, which is what makes every `control_outline`
+        // call above return `None` and every pre-existing paint test's
+        // shape count stay unchanged.
+        let theme = dark_theme();
+        assert_eq!(theme.border.control_opacity, 0.0);
     }
 
     #[test]

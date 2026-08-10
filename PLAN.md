@@ -1394,6 +1394,60 @@ every widget in every state across all built-in themes with contrast checks gree
   (2× high contrast, Colour-Critical) — those stay out of scope per PRD
   FR-027 *Ownership*; this pass deliberately didn't invent their colours.
   The parser needs no changes to accept them once designed.
+  **The infrastructure prerequisite for the two High Contrast themes
+  landed 2026-08-10**, ahead of the themes themselves: Cahya was asked
+  how far High Contrast should push beyond the WCAG AA floor every theme
+  already meets (three options) and chose "match OS-level high-contrast
+  conventions" — pure black/white surfaces, a mandatory strong outline on
+  every control, a single bold saturated accent. The outline is real new
+  scope beyond a theme file, since every widget's own paint function
+  needs to be able to draw one, so this step landed just that plumbing,
+  not the two theme files (still Cahya's own design work, still
+  blocked). New tokens `border.control` (`Color`) / `border.control_
+  opacity` (`f32`, a theme toggle, not a widget-state one like `state.
+  disabled_opacity`) in `design/tokens/vocabulary.md` and `BorderTokens`;
+  wired into `ThemeSet::resolve` as required tokens the same way every
+  existing one is, so both committed theme files needed the addition too
+  — `design/themes/{dark,light}.toml` each got `control` reusing that
+  theme's own `border.strong` reference (a misconfigured opacity degrades
+  to something sane rather than an arbitrary colour) and `control_opacity
+  = 0.0`. `aurora-widgets/src/paint.rs` gained `control_outline` (a
+  private helper: `None` when `border.control_opacity <= 0.0`, else a
+  real stroke at `border.control` × `border.control_opacity` × the
+  caller's own `alpha`, so a disabled control's outline dims exactly like
+  its fill already does) and wired it into `paint_button`/`paint_
+  checkbox`/`paint_text_field`/`paint_color_swatch`/`paint_command_
+  palette` (its outer panel, not `paint_list_row`'s row highlight — out
+  of scope) /`paint_slider` (the thumb specifically, not the track — a
+  groove isn't itself a focusable control). **The critical design choice
+  that keeps this a zero-risk landing**: conditional inclusion, not an
+  always-drawn invisible shape — `control_outline` returns `Option<Paint>`
+  and is only pushed onto the result `Vec` when `Some`, so with both
+  committed themes at `control_opacity = 0.0` every widget's shape count,
+  colours, and every existing assertion in `paint.rs`/`aurora-app::lib.rs`
+  that hard-asserts an exact `paints.len()` stay byte-for-byte identical
+  to before this change — the same "conditional, not padded" idiom
+  `paint_list_row` already uses for an unselected row's `Ok(vec![])`.
+  Confirmed, not assumed: full `cargo test -p aurora-theme` (28/28),
+  `cargo test -p aurora-widgets` (176 lib + 1 headless, was 173 lib
+  before — the 3 new tests below), `cargo test -p aurora-app` (142/142),
+  and `cargo test -p aurora-widgets --test gallery -- --nocapture` all
+  green with **zero behavioural change**: gallery is still 21 passed + 6
+  ignored (the `_in_light_theme` golden-bless tests), no `SKIPPED` output
+  (a real, software GPU adapter is present in this sandbox). 3 new tests
+  in `paint.rs` prove the mechanism actually works, not just that it's
+  inert when off: a synthetic `TestHighContrast` child theme (the same
+  "synthetic child, not a real second design" pattern this file's own
+  `theme::tests` already established) with `control_opacity = 1.0` shows
+  a button gains a real second outline shape at the right colour/alpha,
+  that a disabled control's outline folds in `state.disabled_opacity`
+  too, and that the real committed Dark theme itself resolves `border.
+  control_opacity` to exactly `0.0` — the load-bearing property this
+  whole landing rests on. fmt/clippy (`-D warnings`)/`check_no_hardcoded_
+  style.py` all clean. **The two High Contrast theme files themselves are
+  still not started** — separate, later work, still gated on Cahya's own
+  colour decisions per FR-027 *Ownership*; this step only made the
+  plumbing ready for them.
 - [x] **Automated WCAG contrast validation over the token set** — done
   2026-08-01, `crates/aurora-theme/src/contrast.rs`
   (`contrast_ratio`, `check_gated_pairs`). The real, CI-enforced version

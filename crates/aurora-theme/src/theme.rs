@@ -49,6 +49,8 @@ pub struct BorderTokens {
     pub default: Color,
     pub strong: Color,
     pub focus: Color,
+    pub control: Color,
+    pub control_opacity: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -207,6 +209,8 @@ impl ThemeSet {
                 default: resolve_color(&merged, "border.default", palette)?,
                 strong: resolve_color(&merged, "border.strong", palette)?,
                 focus: resolve_color(&merged, "border.focus", palette)?,
+                control: resolve_color(&merged, "border.control", palette)?,
+                control_opacity: require_f32(&merged, "border.control_opacity")?,
             },
             accent: AccentTokens {
                 primary: resolve_color(&merged, "accent.primary", palette)?,

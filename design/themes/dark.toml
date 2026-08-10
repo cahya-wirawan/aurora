@@ -31,6 +31,10 @@ on_accent = "neutral.0"
 default = "neutral.300"
 strong  = "neutral.500"
 focus   = "accent.blue.500"
+control = "neutral.500"          # reuses border.strong's own reference -- if control_opacity
+                                  #   were ever raised above 0, this degrades to something sane
+                                  #   rather than an arbitrary colour; see vocabulary.md
+control_opacity = 0.0
 
 [accent]
 primary        = "accent.blue.500"
