@@ -1488,6 +1488,43 @@ every widget in every state across all built-in themes with contrast checks gree
   Gallery coverage for this theme is explicitly out of scope for this
   step, mirroring how Light's own gallery coverage followed its theme-file
   landing as a separate later round.
+  **High Contrast Light landed 2026-08-10 too**, closing out both High
+  Contrast themes: High Contrast Dark's philosophy inverted -- pure white
+  surfaces, pure black text, mandatory black control outlines at full
+  opacity -- with one deliberate non-inversion. High Contrast Dark's
+  yellow accent is illegible against white, so this theme needed its own
+  accent hue (`hc.blue`/`hc.blue_dark`, the conventional OS high-contrast
+  "hyperlink/hot" colour on light backgrounds), and it needed its own
+  darker semantic state-color set rather than reusing High Contrast
+  Dark's. The real, non-obvious finding: High Contrast Dark's pure,
+  fully-saturated red/orange/green read fine against black (computed
+  5.25:1 / 10.63:1 / 15.30:1) but are markedly worse against white
+  (computed 4.00:1 / 1.97:1 / 1.37:1 -- green in particular is nearly
+  invisible), so reusing them would have quietly broken the theme's own
+  purpose for exactly the tokens meant to carry urgent meaning. Five new
+  `[hc]` entries in `design/tokens/palette.toml` (`blue`/`blue_dark` for
+  the accent; `darkred` 5.89:1 / `amber_dark` 5.31:1 / `darkgreen` 5.14:1
+  for `state.error`/`warning`/`success`), the existing eight left
+  untouched. `design/themes/high-contrast-light.toml` (`extends = "Dark"`,
+  same precedent as every other built-in theme) references only `hc.*`:
+  all six surfaces pure white, `text.secondary` undimmed at 21:1 (same
+  no-de-emphasis rationale as High Contrast Dark), `border.control`/
+  `control_opacity` at `hc.black`/`1.0` (the second real theme to turn
+  this on), `state.disabled_opacity` at `0.6` matching High Contrast
+  Dark's own reasoning. Verified by a new dedicated test, `contrast::
+  tests::the_real_high_contrast_light_theme_passes_every_gated_pair`
+  (registers `dark.toml` then `high-contrast-light.toml`, resolves
+  `"High Contrast Light"`, asserts all 17/17 gated pairs pass) -- wide
+  margins throughout (black-on-white is the WCAG maximum 21:1, blue-vs-
+  white ≈8.59:1), consistent with High Contrast Dark's own comfortable
+  margins. `cargo test -p aurora-theme` now 30/30 (was 29). fmt/clippy
+  (`-D warnings`) clean. **This closes out both High Contrast themes --
+  Colour-Critical is now the only remaining theme from PRD.md's list of
+  five.** Gallery/visual coverage for both High Contrast themes is still
+  fully open: no widget has ever actually been rendered with `border.
+  control_opacity` on and reviewed, for either theme -- a separate,
+  later round, same as Light's own gallery coverage following its
+  theme-file landing.
 - [x] **Automated WCAG contrast validation over the token set** — done
   2026-08-01, `crates/aurora-theme/src/contrast.rs`
   (`contrast_ratio`, `check_gated_pairs`). The real, CI-enforced version

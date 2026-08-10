@@ -1,0 +1,80 @@
+schema_version = 1
+name = "High Contrast Light"
+extends = "Dark" # inherits any field it doesn't override; see theme.rs's extends_chain
+is_default = false
+
+# Every value here is a reference into ../tokens/palette.toml's [hc] table
+# ("hc.<name>"), never a literal. Owner-approved (Cahya Wirawan, PRD FR-027
+# Ownership): High Contrast Dark's philosophy, inverted -- pure white
+# surfaces, pure black text, mandatory black control outlines at full
+# opacity -- except the accent hue, which is NOT simply inverted: High
+# Contrast Dark's yellow accent is illegible against white, so this theme
+# uses blue instead, plus its own darker error/warning/success variants
+# (see palette.toml's own comment on `hc.darkred`/`hc.amber_dark`/
+# `hc.darkgreen` for why the pure hues High Contrast Dark uses don't work
+# here). Contrast-verified against the real WCAG 2.1 formula and by a
+# dedicated test, contrast::tests::the_real_high_contrast_light_theme_
+# passes_every_gated_pair.
+
+[surface]
+canvas  = "hc.white"
+app     = "hc.white"
+panel   = "hc.white"
+raised  = "hc.white"
+overlay = "hc.white"
+sunken  = "hc.white"
+# All pure white -- OS-level high-contrast convention leans on borders for
+# elevation/region cues, not subtle fill gradation (which would undermine
+# the whole point: any gradation the fill relies on is exactly the kind of
+# low-contrast signal a high-contrast theme exists to eliminate).
+
+[text]
+primary   = "hc.black"
+secondary = "hc.black"   # deliberately NOT dimmed -- same "no de-emphasis via reduced
+                          # contrast" rationale High Contrast Dark's own text.secondary
+                          # already used
+disabled  = "hc.mid_gray" # reuses the same hc.mid_gray High Contrast Dark uses (3.95:1 on
+                           # white -- lower than its 5.32:1 on black, but WCAG-exempt for
+                           # disabled content and still real and legible; reusing the same
+                           # token rather than adding a near-duplicate is the simpler,
+                           # more consistent choice)
+on_accent = "hc.white"    # white text on the blue accent fill
+
+[icon]
+default   = "hc.black"
+secondary = "hc.black"
+disabled  = "hc.mid_gray"
+on_accent = "hc.white"
+
+[border]
+default = "hc.mid_gray"    # ~3.95:1 vs white -- same two-tier default/strong distinction
+                            # High Contrast Dark established, mirrored
+strong  = "hc.black"        # 21:1 vs white -- maximum emphasis
+focus   = "hc.blue"          # reuses the accent, same pattern every theme so far uses
+control = "hc.black"         # the mandatory per-control outline -- maximally visible
+                              # against white
+control_opacity = 1.0
+
+[accent]
+primary        = "hc.blue"
+primary_hover  = "hc.blue"       # unused today -- no hover flag exists on ButtonState yet,
+                                   # same documented gap every other theme's own
+                                   # primary_hover already has
+primary_active = "hc.blue_dark"
+
+[state]
+error   = "hc.darkred"
+warning = "hc.amber_dark"
+success = "hc.darkgreen"
+disabled_opacity = 0.6   # matches High Contrast Dark's own reasoning: 0.4 would undercut
+                          # this theme's whole purpose more than it does against Dark/
+                          # Light's lower baseline contrast
+
+[state.hover_overlay]
+color = "hc.black"   # a DARK tint over white surfaces -- the inverse of High Contrast
+                      # Dark's light tint over black surfaces
+alpha = 0.15
+
+[state.active_overlay]
+color = "hc.black"
+alpha = 0.25
