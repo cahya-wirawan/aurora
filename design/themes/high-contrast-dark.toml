@@ -1,0 +1,74 @@
+schema_version = 1
+name = "High Contrast Dark"
+extends = "Dark" # inherits any field it doesn't override; see theme.rs's extends_chain
+is_default = false
+
+# Every value here is a reference into ../tokens/palette.toml's new [hc] table
+# ("hc.<name>"), never a literal. Owner-approved (Cahya Wirawan, PRD FR-027
+# Ownership): "match OS-level high-contrast conventions" -- pure black/white
+# surfaces, mandatory strong borders on every control, single bold saturated
+# accent. Contrast-verified against the real WCAG 2.1 formula and by a
+# dedicated test, contrast::tests::the_real_high_contrast_dark_theme_passes_
+# every_gated_pair.
+
+[surface]
+canvas  = "hc.black"
+app     = "hc.black"
+panel   = "hc.black"
+raised  = "hc.black"
+overlay = "hc.black"
+sunken  = "hc.black"
+# All pure black -- OS-level high-contrast convention leans on borders for
+# elevation/region cues, not subtle fill gradation (which would undermine
+# the whole point: any gradation the fill relies on is exactly the kind of
+# low-contrast signal a high-contrast theme exists to eliminate).
+
+[text]
+primary   = "hc.white"
+secondary = "hc.white"   # deliberately NOT dimmed -- HC philosophy avoids conveying
+                          # de-emphasis via reduced contrast; text.secondary in this
+                          # theme carries the same 21:1 as text.primary
+disabled  = "hc.mid_gray" # WCAG-exempt (see vocabulary.md), but still real and legible
+on_accent = "hc.black"    # dark text on the bright yellow accent fill
+
+[icon]
+default   = "hc.white"
+secondary = "hc.white"
+disabled  = "hc.mid_gray"
+on_accent = "hc.black"
+
+[border]
+default = "hc.mid_gray"    # ~5.3:1 vs black -- still clearly visible, decorative/ungated,
+                            # but real two-tier distinction from `strong` below (no separate
+                            # border-*weight* token exists yet, only color, so this is the
+                            # only way to keep `default` meaningfully different from `strong`)
+strong  = "hc.white"        # 21:1 vs black -- maximum emphasis
+focus   = "hc.yellow"       # reuses the accent, same pattern Dark/Light already use
+control = "hc.white"        # the mandatory per-control outline -- maximally visible,
+                             # matching "mandatory strong borders on every control" literally
+control_opacity = 1.0       # THE first real theme to turn this on (Dark/Light both use 0.0)
+
+[accent]
+primary        = "hc.yellow"
+primary_hover  = "hc.yellow"      # unused today -- no hover flag exists on ButtonState yet
+                                   # (see paint.rs's own doc comment on this same gap for Dark/
+                                   # Light); kept equal to primary rather than inventing an
+                                   # unexercised third value, revisit when real hover state lands
+primary_active = "hc.yellow_dark"
+
+[state]
+error   = "hc.red"
+warning = "hc.orange"
+success = "hc.green"
+disabled_opacity = 0.6   # NOT Dark/Light's 0.4 -- deliberately less aggressive: fading pure
+                          # white-on-black by 0.4 would undercut this theme's entire purpose
+                          # more than the same multiplier does against Dark/Light's already-
+                          # lower-baseline contrast; still clearly reads as "disabled"
+
+[state.hover_overlay]
+color = "hc.white"
+alpha = 0.15
+
+[state.active_overlay]
+color = "hc.white"
+alpha = 0.25

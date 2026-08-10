@@ -1448,6 +1448,46 @@ every widget in every state across all built-in themes with contrast checks gree
   still not started** — separate, later work, still gated on Cahya's own
   colour decisions per FR-027 *Ownership*; this step only made the
   plumbing ready for them.
+  **High Contrast Dark landed 2026-08-10**, the first of the two High
+  Contrast themes (High Contrast Light and Colour-Critical remain out of
+  scope, separate later work — same one-at-a-time cadence Light's own
+  landing and each widget's gallery coverage already used). Cahya's design
+  call from the prerequisite step above — "match OS-level high-contrast
+  conventions": pure black/white surfaces, mandatory strong borders on
+  every control, single bold saturated accent — implemented literally. A
+  new `[hc]` table in `design/tokens/palette.toml` holds the literal,
+  maximum-contrast primitives (`black`/`white`/`mid_gray`/`yellow`/
+  `yellow_dark`/`red`/`orange`/`green`), deliberately separate from
+  `[neutral]`/`[accent.blue]` (which are tuned to stay "quiet" and never
+  reach true black/white/max-saturation on purpose — a different design
+  intent, not a further step on the same ramp). `design/themes/
+  high-contrast-dark.toml` (`extends = "Dark"`, consistent with `dark.
+  toml`'s own comment and Light's precedent, even though every token is
+  overridden explicitly) references only `hc.*`: all six surfaces pure
+  black; `text.secondary` deliberately equal to `text.primary` (21:1, not
+  dimmed — HC philosophy avoids conveying de-emphasis via reduced
+  contrast); `border.control`/`control_opacity` set to `hc.white`/`1.0` —
+  **the first real theme to turn `control_opacity` above `0.0`**, so every
+  widget already wired into `aurora-widgets/src/paint.rs`'s
+  `control_outline` (`Button`/`Checkbox`/`TextField`/`ColorSwatch`/
+  `CommandPalette`'s panel/`Slider`'s thumb) will draw a real second
+  outline shape when this theme is active — though no gallery coverage
+  proves that visually yet, that's explicitly still open, same as High
+  Contrast Light and Colour-Critical themselves. `state.disabled_opacity`
+  set to `0.6`, not Dark/Light's `0.4` — deliberately less aggressive,
+  since fading pure white-on-black by `0.4` would undercut the theme's
+  purpose more than the same multiplier does against Dark/Light's already
+  lower baseline. Verified by a new dedicated test, `contrast::tests::
+  the_real_high_contrast_dark_theme_passes_every_gated_pair` (registers
+  `dark.toml` then `high-contrast-dark.toml` into one `ThemeSet` so
+  `extends` resolves, resolves `"High Contrast Dark"`, asserts all 17/17
+  gated pairs pass) — every pair clears its floor by an enormous margin
+  given the literal black/white/yellow extremes (yellow-on-black alone is
+  ≈19.6:1 against even the strictest 4.5:1 floor). `cargo test -p
+  aurora-theme` now 29/29 (was 28). fmt/clippy (`-D warnings`) clean.
+  Gallery coverage for this theme is explicitly out of scope for this
+  step, mirroring how Light's own gallery coverage followed its theme-file
+  landing as a separate later round.
 - [x] **Automated WCAG contrast validation over the token set** — done
   2026-08-01, `crates/aurora-theme/src/contrast.rs`
   (`contrast_ratio`, `check_gated_pairs`). The real, CI-enforced version
