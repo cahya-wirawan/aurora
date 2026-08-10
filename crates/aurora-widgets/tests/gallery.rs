@@ -20,16 +20,17 @@
 //! for that; this file only proves the render pipeline actually
 //! produces the pixels those decisions imply.
 //!
-//! **Per-theme coverage, started narrow.** Every widget above is Dark
-//! theme only. Now that the Light theme exists and passes its own
-//! contrast gate (`aurora-theme::contrast`), `Button`, `Checkbox`,
-//! `Slider`, `TextField`, and `CommandPalette` each get a first
-//! Light-theme slice — their own `light_theme()`/`LIGHT_CLEAR` (shared,
-//! not redefined per widget), a real self-contained distinct-pixels
-//! test, and an `#[ignore]`d golden-diff test pending a human bless, the
-//! same shape Dark's own coverage started with (`Button` first,
-//! `Checkbox` second, `Slider` third, `TextField` fourth,
-//! `CommandPalette` fifth) before extending to the other widgets.
+//! **Per-theme coverage, started narrow.** Every widget above was
+//! originally Dark theme only. Now that the Light theme exists and
+//! passes its own contrast gate (`aurora-theme::contrast`), all six
+//! widgets — `Button`, `Checkbox`, `Slider`, `TextField`,
+//! `CommandPalette`, and `ColorSwatch` — each have a first Light-theme
+//! slice — their own `light_theme()`/`LIGHT_CLEAR` (shared, not
+//! redefined per widget), a real self-contained distinct-pixels test,
+//! and an `#[ignore]`d golden-diff test pending a human bless, the same
+//! shape Dark's own coverage started with (`Button` first, `Checkbox`
+//! second, `Slider` third, `TextField` fourth, `CommandPalette` fifth,
+//! `ColorSwatch` sixth and last).
 //! `TextField`'s own Dark-theme gallery needed `NEUTRAL_CLEAR` (see that
 //! constant's own doc comment) because `surface.sunken` is near-black
 //! there; in Light, `surface.sunken` resolves to `neutral.700`
@@ -53,9 +54,26 @@
 //! reproduced Dark's own original "just a black image" bug
 //! (`NEUTRAL_CLEAR`'s own doc comment) in the light direction, as "just
 //! a white image." See `COMMAND_PALETTE_LIGHT_CLEAR`'s own doc comment
-//! for the real numbers. `ColorSwatch`'s Light coverage, and both
-//! high-contrast themes' and Colour-Critical's coverage entirely, remain
-//! open — deliberately not attempted here.
+//! for the real numbers. `ColorSwatch`'s own Light-theme gallery is
+//! different again: it's the one widget whose displayed colour is
+//! arbitrary caller data, not a theme-resolved fill (`ColorSwatchState::
+//! color`), so the question wasn't "does a token collide with
+//! `LIGHT_CLEAR`" but "do the same arbitrary bright colours the Dark
+//! gallery already uses still contrast a near-white backdrop" — checked
+//! with real WCAG numbers (`aurora_theme::contrast::contrast_ratio`),
+//! not assumed: plain `LIGHT_CLEAR` turned out fine (≈4.40:1 and
+//! ≈5.89:1 for the two swatch colours used, comparable to Dark's own
+//! plain-black backdrop), so no special-cased backdrop was needed. See
+//! `render_gallery_produces_distinct_pixels_for_each_color_swatch_state_
+//! in_light_theme`'s own doc comment for the full numbers, including how
+//! `disabled_opacity` blends differently over a light backdrop than a
+//! dark one. That closes out a first Light slice for all six widgets
+//! `paint_widget` covers. Both high-contrast themes' and
+//! Colour-Critical's coverage remain open for every widget — those theme
+//! files don't exist yet at all, so it isn't a gallery-code gap — and all
+//! six widgets' Light golden PNGs are still pending a single human bless
+//! session on real GPU hardware (every Light golden test in this file is
+//! `#[ignore]`d for exactly that reason).
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -1187,6 +1205,137 @@ fn color_swatch_gallery_matches_the_golden_image() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/color_swatch_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The Light-theme counterpart of
+/// `render_gallery_produces_distinct_pixels_for_each_color_swatch_state`,
+/// against `light_theme()`/`LIGHT_CLEAR` instead of Dark's
+/// `dark_theme()`/`wgpu::Color::BLACK`. `color_swatch_gallery_tree` is
+/// reused unchanged — the tree, and the two arbitrary swatch colours it
+/// picks (`state.color`, "content, not chrome" — see that function's own
+/// doc comment), don't depend on theme at all; only `scales.radius.sm`
+/// and `theme.state.disabled_opacity` do (`paint_color_swatch`), and
+/// neither is colour-visible in a flat fill the way a token-resolved
+/// fill would be. So unlike every other widget's Light slice, the real
+/// question here isn't "does the theme's own fill still contrast" (there
+/// is no theme-resolved fill) but "do these same arbitrary bright
+/// colours still read against a near-white backdrop instead of Dark's
+/// near-black one" — checked here with real numbers via
+/// `aurora_theme::contrast::contrast_ratio`'s own WCAG 2.1 formula, not
+/// assumed from the pattern the other widgets' `LIGHT_CLEAR` reasoning
+/// established.
+///
+/// The first swatch colour (`(220,40,40)`) against `LIGHT_CLEAR`
+/// (`(245,245,246)`) is ≈4.40:1, the second (`(40,80,220)`) ≈5.89:1 —
+/// both comfortably distinct, similar in magnitude to `(220,40,40)`
+/// against Dark's own plain black backdrop (≈4.38:1). So no
+/// `COMMAND_PALETTE_LIGHT_CLEAR`-style special-cased backdrop is needed
+/// here: unlike that widget's panel fill, these swatch colours never
+/// collide with `LIGHT_CLEAR` the way `surface.raised` did with it (see
+/// `COMMAND_PALETTE_LIGHT_CLEAR`'s own doc comment) — plain `LIGHT_CLEAR`
+/// is the right backdrop, the same conclusion `Button`/`Checkbox`/
+/// `Slider` already reached for their own theme-resolved fills.
+///
+/// The disabled cell is worth checking on its own, since
+/// `disabled_opacity` blends the swatch colour over whatever backdrop is
+/// in use, and Dark's near-black backdrop and Light's near-white one
+/// blend very differently: blending `(220,40,40)` at `disabled_opacity`
+/// `0.4` over `LIGHT_CLEAR` gives ≈`(235,163,164)` (contrast ≈2.35:1
+/// against the enabled first cell), versus Dark's own already-blessed
+/// `(88,16,16)` over black (contrast ≈2.92:1 against its own enabled
+/// cell — see `color_swatch_gallery_matches_the_golden_image`'s own doc
+/// comment for that byte value). The Light-blended result reads visibly
+/// lighter and less saturated than Dark's, as expected from blending
+/// toward a light backdrop instead of a dark one — but both stay clearly
+/// distinguishable from their own enabled cell (2.35:1 and 2.92:1 are
+/// both well above "the same colour"), so this is a real difference
+/// worth a human's attention during the bless step, not a defect: it
+/// doesn't change which backdrop is correct here, just what the dimmed
+/// cell will look like.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = color_swatch_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COLOR_SWATCH_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, COLOR_SWATCH_GALLERY_SIZE.0);
+    assert_eq!(image.height, COLOR_SWATCH_GALLERY_SIZE.1);
+
+    let first_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 0);
+    let second_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 2);
+    assert_ne!(
+        first_px, second_px,
+        "two different swatch colours must render differently in Light theme too"
+    );
+    assert_ne!(
+        first_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over LIGHT_CLEAR must render dimmer than full opacity, \
+         even though both cells share the same underlying color"
+    );
+}
+
+/// The Light-theme counterpart of `color_swatch_gallery_matches_the_
+/// golden_image` — same tree, same three states, `light_theme()`/
+/// `LIGHT_CLEAR` instead of Dark's `dark_theme()`/`wgpu::Color::BLACK`,
+/// diffed against its own golden target (`tests/golden/
+/// color_swatch_gallery_light.png`, which does not exist yet). The
+/// backdrop reasoning is `render_gallery_produces_distinct_pixels_for_
+/// each_color_swatch_state_in_light_theme`'s own doc comment: both
+/// arbitrary swatch colours contrast plain `LIGHT_CLEAR` at ≈4.40:1 and
+/// ≈5.89:1, comparable to Dark's own plain-black backdrop, so no special
+/// casing beyond swapping the theme and clear colour is needed.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+/// --ignored`, open the written `tests/golden/
+/// color_swatch_gallery_light.png`, and confirm it actually shows three
+/// visually distinct swatches in the expected colours (including the
+/// disabled cell's own lighter, desaturated blend against `LIGHT_CLEAR`
+/// — see this test's own sibling doc comment for why that blend looks
+/// different from Dark's) before this attribute comes off — the same
+/// step every other golden in this file went through before being
+/// trusted. This holds regardless of whether the sandbox that ran this
+/// test happened to have some GPU adapter (possibly software) available
+/// — "real GPU hardware" plus human visual review is the bar, not just
+/// "some renderer produced pixels."
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn color_swatch_gallery_matches_the_golden_image_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = color_swatch_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COLOR_SWATCH_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/color_swatch_gallery_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }

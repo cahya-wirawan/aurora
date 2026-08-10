@@ -2746,12 +2746,67 @@ check licenses` clean with the new `toml` dependency.
   (system Python <3.11), unrelated to this change. Version bumped
   `0.15.0` → `0.16.0` per `CLAUDE.md`'s own convention.
 
-  **Still genuinely open**: `ColorSwatch`'s own Light coverage; both
-  high-contrast themes' and Colour-Critical's coverage entirely (none of
-  those three themes exist as owner-approved TOML yet); all five pending
-  Light golden blesses (`Button`'s, `Checkbox`'s, `Slider`'s,
-  `TextField`'s, and now `CommandPalette`'s); everything else this note
-  already listed above.
+  **`ColorSwatch` gained the same Light-theme slice too, 2026-08-10** —
+  the sixth and last widget `paint_widget` covers, closing out a first
+  Light slice for all six. Different reasoning from every widget before
+  it: `ColorSwatch`'s own displayed colour is arbitrary caller data
+  (`ColorSwatchState::color`, "content, not chrome" — this file's own
+  2026-08-07 `ColorSwatch` entry above), not a theme-resolved fill, so
+  there was no token to check for a `LIGHT_CLEAR` collision the way
+  `CommandPalette`'s `surface.raised` had. The real question was narrower:
+  do the same two arbitrary swatch colours the Dark gallery already picks
+  (`(220,40,40)`, `(40,80,220)`) still read against a near-white backdrop
+  instead of Dark's near-black one. Checked with real numbers via
+  `aurora_theme::contrast::contrast_ratio` (WCAG 2.1), not assumed from
+  the other widgets' pattern: `(220,40,40)` against `LIGHT_CLEAR`
+  (`(245,245,246)`) is ≈4.40:1, `(40,80,220)` is ≈5.89:1 — both
+  comfortably distinct and comparable in magnitude to `(220,40,40)`
+  against Dark's own plain-black backdrop (≈4.38:1) — so plain
+  `LIGHT_CLEAR` is the right backdrop, no special-cased constant needed.
+  Checked the disabled cell separately too, since `disabled_opacity`
+  (`0.4`, same value in both `dark.toml` and `light.toml`) blends the
+  swatch colour over whatever backdrop is active, and Dark's near-black
+  backdrop and Light's near-white one blend very differently: blending
+  `(220,40,40)` over `LIGHT_CLEAR` gives ≈`(235,163,164)` (contrast
+  ≈2.35:1 against the enabled cell), versus Dark's own already-blessed
+  `(88,16,16)` over black (≈2.92:1 against its own enabled cell) — the
+  Light-blended disabled cell reads visibly lighter and less saturated
+  than Dark's, a real difference worth a human's attention at bless time,
+  but not one that changes which backdrop is correct; both stay clearly
+  distinguishable from their own enabled cell. Two new tests, mirroring
+  the shape every other widget's Light slice already used:
+  `render_gallery_produces_distinct_pixels_for_each_color_swatch_state_
+  in_light_theme` (real, self-contained, no golden — reuses
+  `color_swatch_gallery_tree` unchanged, since the tree itself doesn't
+  depend on theme) and `color_swatch_gallery_matches_the_golden_image_in_
+  light_theme` (the golden-diff test, targeting `tests/golden/
+  color_swatch_gallery_light.png`, which does not exist yet —
+  `#[ignore]`d for the same "never bless blind" reason as every other
+  Light golden here; no golden was created or blessed as part of this
+  change). Ran `cargo test -p aurora-widgets --test gallery --
+  --nocapture` in this sandbox and grepped its own output for `SKIPPED`:
+  zero matches, so this sandbox had a real (possibly software) GPU
+  adapter and the render path genuinely executed, including the new
+  self-contained test (passed) — `gallery.rs`: 21 passed, 6 ignored (all
+  six Light golden-diffs: `Button`'s, `Checkbox`'s, `Slider`'s,
+  `TextField`'s, `CommandPalette`'s, and now `ColorSwatch`'s), 0 failed.
+  `cargo fmt --all --check` and `cargo clippy -p aurora-widgets
+  --all-targets --all-features -- -D warnings` both clean; `python3
+  scripts/check_no_hardcoded_style.py` clean (25 files scanned);
+  `check_layering.py` still fails in this sandbox with the same
+  pre-existing `ModuleNotFoundError: No module named 'tomllib'` (system
+  Python <3.11), unrelated to this change. Version bumped `0.16.0` →
+  `0.17.0` per `CLAUDE.md`'s own convention.
+
+  **Still genuinely open, now that all six widgets have a first Light
+  slice**: both high-contrast themes' and Colour-Critical's coverage
+  entirely — those three themes don't exist as owner-approved TOML files
+  at all yet (Cahya's own design work, FR-027 *Ownership*), so this is a
+  design-input blocker, not a gallery-code gap; and all six widgets' Light
+  golden PNGs (`Button`'s, `Checkbox`'s, `Slider`'s, `TextField`'s,
+  `CommandPalette`'s, `ColorSwatch`'s) are still pending a single human
+  bless session on real GPU hardware — none has been run yet, this note
+  included.
 - [x] **Headless mode for automated UI tests** — done 2026-08-02. Every
   test in this crate already ran with no window/GPU/platform adapter;
   what was missing was making that a *checked* fact rather than an
