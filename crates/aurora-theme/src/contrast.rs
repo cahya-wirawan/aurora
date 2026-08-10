@@ -190,6 +190,7 @@ mod tests {
         include_str!("../../../design/themes/high-contrast-dark.toml");
     const HIGH_CONTRAST_LIGHT_TOML: &str =
         include_str!("../../../design/themes/high-contrast-light.toml");
+    const COLOR_CRITICAL_TOML: &str = include_str!("../../../design/themes/color-critical.toml");
 
     #[test]
     fn identical_colors_have_a_ratio_of_one() {
@@ -346,6 +347,42 @@ mod tests {
             unreachable!("{err:?}");
         }
         let theme = match set.resolve("High Contrast Light", &palette) {
+            Ok(t) => t,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let results = check_gated_pairs(&theme);
+        assert_eq!(
+            results.len(),
+            17,
+            "expected all 17 gated pairs to be checked"
+        );
+        for result in &results {
+            assert!(
+                result.passes(),
+                "{} failed: {:.2}:1 against a {:.1}:1 floor",
+                result.label,
+                result.ratio,
+                result.floor
+            );
+        }
+    }
+
+    #[test]
+    fn the_real_color_critical_theme_passes_every_gated_pair() {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut set = ThemeSet::new();
+        // Color-Critical's `extends = "Dark"` needs the parent actually registered.
+        if let Err(err) = set.register(DARK_TOML) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set.register(COLOR_CRITICAL_TOML) {
+            unreachable!("{err:?}");
+        }
+        let theme = match set.resolve("Color-Critical", &palette) {
             Ok(t) => t,
             Err(err) => unreachable!("{err:?}"),
         };

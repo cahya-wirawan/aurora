@@ -1,0 +1,75 @@
+schema_version = 1
+name = "Color-Critical"
+extends = "Dark"
+is_default = false
+
+# Every value here is a reference into ../tokens/palette.toml's new [cc] table
+# ("cc.<name>"), never a literal. Owner-approved (Cahya Wirawan, PRD FR-027
+# Ownership): genuinely neutral (R == G == B, verified by construction) gray
+# chrome for colour-accurate work -- the professional convention (an 18%
+# gray-card / neutral-surround editing environment) of a UI that doesn't tint
+# the user's perception of their own image's colours. A different brief from
+# the two High Contrast themes: not extreme contrast, just non-biasing chroma.
+# Contrast-verified against the real WCAG 2.1 formula and by a dedicated test,
+# contrast::tests::the_real_color_critical_theme_passes_every_gated_pair.
+# Neutrality (PRD.md acceptance criterion 8) is verified by a dedicated test,
+# neutrality::tests::the_real_color_critical_theme_has_neutral_surfaces.
+
+[surface]
+canvas  = "cc.canvas"
+app     = "cc.app"
+panel   = "cc.panel"
+raised  = "cc.raised"
+overlay = "cc.overlay"
+sunken  = "cc.sunken"
+
+[text]
+primary   = "cc.white"
+secondary = "cc.light"
+disabled  = "cc.mid"      # not gated (WCAG-exempt), but still real and legible
+on_accent = "cc.near_black"
+
+[icon]
+default   = "cc.white"
+secondary = "cc.mid_light"
+disabled  = "cc.mid"
+on_accent = "cc.near_black"
+
+[border]
+default = "cc.border_mid"   # decorative/ungated, but real and visible
+strong  = "cc.near_white"
+focus   = "accent.blue.600" # reuses the accent, same pattern every theme uses
+control = "cc.near_white"   # reused reference for a sane fallback if opacity were ever
+                             #   misconfigured -- this theme is not High Contrast, so...
+control_opacity = 0.0       # ...this stays 0.0, same as Dark/Light. Colour-Critical is
+                             #   about neutral chroma, not maximum contrast/mandatory outlines.
+
+[accent]
+primary        = "accent.blue.600" # NOT the existing accent.blue.500 Dark uses -- this
+                                    #   theme's surfaces are much lighter than Dark's near-black
+                                    #   ones (this theme's darkest surface, sunken, is #242424 vs
+                                    #   Dark's #141414-ish; canvas is #545454, a genuine mid-tone),
+                                    #   so accent.blue.500 only clears ~3.30:1 against canvas
+                                    #   (barely over the 3:1 floor) while .600 clears ~4.43:1 --
+                                    #   computed, not guessed
+primary_hover  = "accent.blue.600" # unused today -- no hover flag exists on ButtonState
+                                    #   yet, same documented gap every other theme's own
+                                    #   primary_hover already has
+primary_active = "accent.blue.500" # darker than primary, same "active darkens the base"
+                                    #   pattern Dark/Light/High Contrast already use
+
+[state]
+error   = "semantic.red.500"   # reused as-is from the existing palette -- not gated for
+warning = "semantic.amber.500" #   any theme (never has been, see contrast.rs's own GATED_PAIRS),
+success = "semantic.green.500" #   an honest, pre-existing, inherited gap, not a new one
+disabled_opacity = 0.4          # same as Dark/Light -- this theme isn't accessibility-
+                                 #   focused the way the two High Contrast themes are, no
+                                 #   reason to deviate from the established default
+
+[state.hover_overlay]
+color = "cc.white"
+alpha = 0.06
+
+[state.active_overlay]
+color = "cc.white"
+alpha = 0.10

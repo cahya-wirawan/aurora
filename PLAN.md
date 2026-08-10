@@ -1376,7 +1376,7 @@ every widget in every state across all built-in themes with contrast checks gree
   thin glue with no caller to drive it yet (`aurora-widgets` is still a
   skeleton) — same "primitive built, real consumer decides the rest
   later" shape used elsewhere.
-- [!] **Built-in themes: Dark, Light, 2× high contrast, Colour-Critical**
+- [x] **Built-in themes: Dark, Light, 2× high contrast, Colour-Critical**
   — Dark already existed (owner-approved, PLAN 0.5) and is what the
   parser above is verified against end to end. **Light landed
   2026-08-09**: Cahya delegated design-owner authority (PRD FR-027
@@ -1525,6 +1525,67 @@ every widget in every state across all built-in themes with contrast checks gree
   control_opacity` on and reviewed, for either theme -- a separate,
   later round, same as Light's own gallery coverage following its
   theme-file landing.
+  **Colour-Critical landed 2026-08-10, closing out all five PRD-named
+  built-in themes**: a different brief from the two High Contrast
+  themes — not extreme contrast, but genuinely non-biasing, neutral-gray
+  chrome for accurate colour judgement (the professional 18%-gray-card /
+  neutral-surround editing-environment convention), per PRD.md's own
+  acceptance criterion 8 ("Colour-critical theme surfaces are verified
+  neutral"). **The existing `[neutral]` ramp in `design/tokens/
+  palette.toml` could not be reused** — checked its own entries by hand:
+  every step from `50` through `900` has a real, consistent, intentional
+  cool tint (B channel 1-9 units higher than R/G at each step; only the
+  pure-black `0` step happens to be exactly neutral), a deliberate
+  choice for Dark/Light/both High Contrast themes but the opposite of
+  what this theme needs. So: a dedicated new `[cc]` table in `palette.
+  toml`, 13 primitives chosen as literal repeated-hex-pair values
+  (`#545454`, `#464646`, ... `#1a1a1a`) so `r == g == b` holds by
+  construction, not by rounding coincidence. `design/themes/
+  color-critical.toml` (`extends = "Dark"`, same precedent as every
+  other built-in theme) references only `cc.*`, plus `accent.blue.600`
+  (not Dark's `accent.blue.500`) for the accent — this theme's surfaces
+  are genuine mid-tones (`canvas` `#545454`, `sunken` `#242424`) rather
+  than Dark's near-black extremes, and `accent.blue.500` only clears
+  ≈3.30:1 against `canvas` (barely over the 3:1 floor) where `.600`
+  clears ≈4.43:1, computed and independently re-verified, not guessed.
+  **Two new, real automated checks, not just "the hex codes look
+  gray"**: a new dedicated test, `contrast::tests::the_real_color_
+  critical_theme_passes_every_gated_pair` (registers `dark.toml` then
+  `color-critical.toml`, resolves `"Color-Critical"`, asserts all 17/17
+  gated pairs pass) — real but tighter margins than the two High
+  Contrast themes' pure-black/white extremes (≈4.43:1 to ≈15.52:1
+  across the 17 pairs, every one clearing its floor with genuine room,
+  none by a hair). And a new module, `crates/aurora-theme/src/
+  neutrality.rs` (`NeutralityResult`/`check_surface_neutrality`, shaped
+  like `contrast.rs`'s own `ContrastResult`/`check_gated_pairs` for
+  consistency) — **the real, CI-enforced satisfaction of PRD.md
+  acceptance criterion 8**, not a design-review-only claim: checks a
+  resolved theme's six `SurfaceTokens` fields (PRD's literal "surfaces")
+  plus, going deliberately further than the PRD's literal wording since
+  this theme's text/icon/border tokens were also designed neutral,
+  `TextTokens`/`IconTokens`/`BorderTokens` minus `focus`/`control` (both
+  legitimately reuse the accent hue, same as every other theme, and are
+  not expected to be neutral). `neutrality::tests::the_real_color_
+  critical_theme_has_neutral_surfaces` asserts all 16 checked tokens on
+  the real committed theme report `is_neutral() == true`; two more tests
+  prove the check has genuine discriminating power rather than passing
+  vacuously — a synthetic tinted colour (`r=0x40, g=0x40, b=0x48`, lifted
+  from `[neutral]`'s own real tint) correctly fails, and the real Dark
+  theme (whose surfaces resolve through the tinted `[neutral]` ramp)
+  correctly comes back with at least one non-neutral token. `cargo test
+  -p aurora-theme` now 35/35 (was 30: +1 contrast test, +4 neutrality
+  tests). fmt/clippy (`-D warnings`) clean. **This closes out
+  theme-file-level work for all five PRD-named built-in themes** (Dark,
+  Light, High Contrast Dark, High Contrast Light, Colour-Critical) — the
+  M1.6 bullet above is now `[x]`: its own stated done-condition ("Dark,
+  Light, 2× high contrast, Colour-Critical") is about the theme files
+  existing and being verified, which is now true for all five. **What
+  remains fully open, tracked separately, not by this bullet**: gallery/
+  visual coverage for the three newer themes (High Contrast Dark, High
+  Contrast Light, Colour-Critical) across all six painted widgets, plus
+  the human-on-real-GPU-hardware bless step every one of those goldens
+  still needs — the same still-open item this section already named for
+  the two High Contrast themes, now including Colour-Critical too.
 - [x] **Automated WCAG contrast validation over the token set** — done
   2026-08-01, `crates/aurora-theme/src/contrast.rs`
   (`contrast_ratio`, `check_gated_pairs`). The real, CI-enforced version

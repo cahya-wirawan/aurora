@@ -79,3 +79,23 @@ darkred     = "#cc0000"   # state.error -- pure #ff0000 is only 4.00:1 on white,
 amber_dark  = "#a05a00"   # state.warning -- pure #ffa500 is only 1.97:1 on white (nearly invisible),
                            # this is 5.31:1
 darkgreen   = "#008000"   # state.success -- pure #00ff00 is only 1.37:1 on white (worse), this is 5.14:1
+
+[cc]
+# Genuinely neutral (R == G == B, verified by construction, not approximately) primitives
+# for the Colour-Critical theme -- PRD.md's own acceptance criterion 8 ("Colour-critical
+# theme surfaces are verified neutral"). Deliberately a new table, not [neutral]: that
+# ramp has a small, intentional cool tint on every step (check its own entries -- R/G and
+# B differ by 1-9 units throughout), the opposite of what this theme needs.
+canvas     = "#545454"
+app        = "#464646"
+panel      = "#3c3c3c"
+raised     = "#4c4c4c"
+overlay    = "#5a5a5a"
+sunken     = "#242424"
+white      = "#ffffff"
+near_white = "#ebebeb"
+light      = "#d6d6d6"
+mid_light  = "#c2c2c2"
+mid        = "#999999"
+border_mid = "#6e6e6e"
+near_black = "#1a1a1a"
