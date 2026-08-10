@@ -23,12 +23,13 @@
 //! **Per-theme coverage, started narrow.** Every widget above is Dark
 //! theme only. Now that the Light theme exists and passes its own
 //! contrast gate (`aurora-theme::contrast`), `Button`, `Checkbox`,
-//! `Slider`, and `TextField` each get a first Light-theme slice — their
-//! own `light_theme()`/`LIGHT_CLEAR` (shared, not redefined per widget),
-//! a real self-contained distinct-pixels test, and an `#[ignore]`d
-//! golden-diff test pending a human bless, the same shape Dark's own
-//! coverage started with (`Button` first, `Checkbox` second, `Slider`
-//! third, `TextField` fourth) before extending to the other widgets.
+//! `Slider`, `TextField`, and `CommandPalette` each get a first
+//! Light-theme slice — their own `light_theme()`/`LIGHT_CLEAR` (shared,
+//! not redefined per widget), a real self-contained distinct-pixels
+//! test, and an `#[ignore]`d golden-diff test pending a human bless, the
+//! same shape Dark's own coverage started with (`Button` first,
+//! `Checkbox` second, `Slider` third, `TextField` fourth,
+//! `CommandPalette` fifth) before extending to the other widgets.
 //! `TextField`'s own Dark-theme gallery needed `NEUTRAL_CLEAR` (see that
 //! constant's own doc comment) because `surface.sunken` is near-black
 //! there; in Light, `surface.sunken` resolves to `neutral.700`
@@ -44,8 +45,15 @@
 //! backdrop needed" finding: `LIGHT_CLEAR` alone is used for now, but
 //! the human bless step should scrutinize this one closely and may need
 //! its own backdrop fix, the same two-iteration path Dark's `TextField`
-//! itself took. The other two widgets'
-//! (`CommandPalette`/`ColorSwatch`) Light coverage, and both
+//! itself took. `CommandPalette`'s own Light-theme gallery, by contrast,
+//! needed a **confirmed, computed** backdrop fix, not a provisional
+//! guess: Light's `surface.raised` (the panel fill) and `surface.canvas`
+//! (`LIGHT_CLEAR`'s own source token) both resolve to the exact same
+//! `neutral.900`/`#f5f5f6` — using `LIGHT_CLEAR` here would have
+//! reproduced Dark's own original "just a black image" bug
+//! (`NEUTRAL_CLEAR`'s own doc comment) in the light direction, as "just
+//! a white image." See `COMMAND_PALETTE_LIGHT_CLEAR`'s own doc comment
+//! for the real numbers. `ColorSwatch`'s Light coverage, and both
 //! high-contrast themes' and Colour-Critical's coverage entirely, remain
 //! open — deliberately not attempted here.
 //!
@@ -173,6 +181,33 @@ const LIGHT_CLEAR: wgpu::Color = wgpu::Color {
     b: 0xf6 as f64 / 255.0,
     a: 1.0,
 };
+
+/// `CommandPalette`'s own Light-theme backdrop — deliberately not plain
+/// `LIGHT_CLEAR`. Computed, not assumed: `design/themes/light.toml`
+/// resolves both `surface.raised` (`CommandPalette`'s own panel fill,
+/// `paint_command_palette`) and `surface.canvas` (`LIGHT_CLEAR`'s own
+/// source token) to the exact same `neutral.900` → `#f5f5f6`. Rendering
+/// against `LIGHT_CLEAR` would therefore paint the panel a colour
+/// byte-for-byte identical to its own backdrop — precisely the "just a
+/// black image" bug `NEUTRAL_CLEAR`'s own doc comment already records
+/// for Dark (`surface.raised` there was merely near-black and hard to
+/// see; here it's not merely close to the backdrop, it *is* the
+/// backdrop), mirrored into Light as "just a white image" instead. So
+/// this reuses `NEUTRAL_CLEAR`'s own value (`#808080`, already chosen as
+/// "a mid-tone, distinct from every real surface token this crate
+/// resolves") rather than inventing a new number: `128` sits ~117 levels
+/// from Light's own `#f5f5f6` panel/canvas and nowhere near
+/// `accent.primary`'s own `#124fb0` (`(18, 79, 176)` — the selected
+/// row's highlight, a distinctly different hue as well as luma from
+/// `128,128,128`), so the panel, its margin, and the row highlight all
+/// stay visually distinct from one another and from the backdrop. Named
+/// separately rather than calling `NEUTRAL_CLEAR` directly at each call
+/// site, so a reader doesn't have to cross-reference Dark's own token
+/// values to see why the same byte value is also correct for Light.
+/// `command_palette_style`'s own `COMMAND_PALETTE_MARGIN` fix is pure
+/// layout, not colour, so it already carries over unchanged regardless
+/// of theme — no Light-specific margin constant is needed here.
+const COMMAND_PALETTE_LIGHT_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
 
 /// Serializes this file's real-GPU tests, this integration test's own
 /// copy of the same "one `wgpu::Instance`/`Device` at a time" lock
@@ -1674,6 +1709,138 @@ fn command_palette_gallery_matches_the_golden_image() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/command_palette_gallery.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The Light-theme counterpart of `render_gallery_produces_the_command_
+/// palettes_own_panel` — same tree, same weaker "something opaque was
+/// painted, distinct from the surrounding clear colour" proof, but
+/// against `light_theme()`/`COMMAND_PALETTE_LIGHT_CLEAR` instead of
+/// Dark's `dark_theme()`/`NEUTRAL_CLEAR`. `COMMAND_PALETTE_LIGHT_CLEAR`,
+/// not plain `LIGHT_CLEAR` — see that constant's own doc comment for why
+/// `LIGHT_CLEAR` would collide byte-for-byte with `surface.raised` in
+/// Light and hide the panel entirely, mirroring Dark's own original
+/// "just a black image" bug in the opposite direction.
+#[test]
+fn render_gallery_produces_the_command_palettes_own_panel_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        COMMAND_PALETTE_LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, COMMAND_PALETTE_GALLERY_SIZE.0);
+    assert_eq!(image.height, COMMAND_PALETTE_GALLERY_SIZE.1);
+
+    let panel_centre = sample_at(
+        &image,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+    );
+    let corner = sample_at(&image, 0, 0);
+    assert_ne!(
+        corner, panel_centre,
+        "the panel's own interior must show something opaque, not the same clear colour its own \
+         margin (and rounded-off corner) shows, in Light theme too"
+    );
+}
+
+/// The Light-theme counterpart of `command_palette_gallery_paints_the_
+/// selected_rows_own_highlight` — the real, exact-colour proof that the
+/// panel's own centre pixel is `accent.primary` itself, not
+/// `surface.raised`. `[18,79,176]`, Light's own real `accent.blue.200`
+/// (`design/themes/light.toml` → `design/tokens/palette.toml`'s
+/// `[accent.blue]` table, `#124fb0` → `(0x12, 0x4f, 0xb0)`), computed
+/// directly from the committed TOML rather than assumed — a genuinely
+/// different byte value from Dark's own `[120,172,255]`, as expected
+/// (Light's accent ramp uses the new dark 100/200/300 steps added
+/// specifically to fill against near-white surfaces, not Dark's
+/// 400/500/600).
+#[test]
+fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        COMMAND_PALETTE_LIGHT_CLEAR,
+    );
+    let panel_centre = sample_at(
+        &image,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+    );
+    assert_eq!(
+        panel_centre[..3],
+        [18, 79, 176],
+        "the sole, always-selected result row must paint Light's own accent.primary across the \
+         panel's own interior"
+    );
+}
+
+/// The Light-theme counterpart of `command_palette_gallery_matches_the_
+/// golden_image` — same tree, same one always-selected row,
+/// `light_theme()`/`COMMAND_PALETTE_LIGHT_CLEAR` instead of Dark's
+/// `dark_theme()`/`NEUTRAL_CLEAR`, diffed against its own golden target
+/// (`tests/golden/command_palette_gallery_light.png`, which does not
+/// exist yet). `command_palette_style`'s own `COMMAND_PALETTE_MARGIN` is
+/// reused completely unchanged — pure layout, no theme parameter, so it
+/// needs no Light-specific counterpart the way the backdrop colour did.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// command_palette_gallery_light.png`, and confirm it actually shows a
+/// visible panel with a visible selected-row highlight in Light-theme
+/// colours before this attribute comes off — the same step every other
+/// golden in this file went through before being trusted.
+/// `CommandPalette` has the most complex visibility history of any
+/// widget in this file (`NEUTRAL_CLEAR`'s own doc comment: Dark's
+/// gallery needed *two* separate fixes, backdrop then margin, before its
+/// own golden was trustworthy), so this Light golden deserves the same
+/// level of scrutiny, not a rubber stamp just because the backdrop
+/// collision was caught and fixed here before any bless was attempted.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn command_palette_gallery_matches_the_golden_image_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = light_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        COMMAND_PALETTE_LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/command_palette_gallery_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }

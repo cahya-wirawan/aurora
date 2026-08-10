@@ -2694,12 +2694,64 @@ check licenses` clean with the new `toml` dependency.
   Python 3.10, needs 3.11+), unrelated to this change. Version bumped
   `0.14.0` → `0.15.0` per `CLAUDE.md`'s own convention.
 
-  **Still genuinely open, unchanged except for `TextField`**: the other
-  two widgets' (`CommandPalette`/`ColorSwatch`) Light coverage; both
+  **`CommandPalette` gained the same Light-theme slice too, 2026-08-10**
+  (fifth widget, same one-at-a-time pattern) — but unlike the four
+  before it, this one needed a real, **confirmed** backdrop fix before
+  any test could be trusted, not just a provisional contrast note.
+  Checked, not assumed: read `design/themes/light.toml` directly and
+  found `surface.raised` (`CommandPalette`'s own panel fill,
+  `paint_command_palette`) and `surface.canvas` (`LIGHT_CLEAR`'s own
+  source token) both resolve to the exact same `neutral.900` →
+  `#f5f5f6`. Rendering against plain `LIGHT_CLEAR` would have painted
+  the panel a colour byte-for-byte identical to its own backdrop —
+  reproducing Dark's own original "just a black image" bug
+  (`NEUTRAL_CLEAR`'s own doc comment, this file's earlier account below)
+  in the light direction, as "just a white image," and this time not
+  merely *near*-invisible the way Dark's near-black `surface.raised` was
+  against plain black, but literally identical bytes. Fixed with a new
+  `COMMAND_PALETTE_LIGHT_CLEAR` constant in `gallery.rs` — reuses
+  `NEUTRAL_CLEAR`'s own mid-grey value (`#808080`) rather than inventing
+  a new number, since that value was already chosen as "distinct from
+  every real surface token this crate resolves" and the real numbers
+  confirm it holds for Light too: `128` sits ~117 levels from
+  `#f5f5f6` (panel/canvas) and is a distinctly different hue and luma
+  from `accent.primary`'s own Light value `#124fb0`/`(18, 79, 176)` (the
+  selected row's highlight). `command_palette_style`'s own
+  `COMMAND_PALETTE_MARGIN` fix is pure layout (no theme parameter at
+  all, confirmed by reading its own code) and carries over unchanged —
+  no Light-specific margin constant was needed, only the backdrop
+  colour. Three new tests, mirroring Dark's own three self-contained
+  `CommandPalette` tests exactly:
+  `render_gallery_produces_the_command_palettes_own_panel_in_light_theme`
+  (the weaker "something opaque was painted" proof),
+  `command_palette_gallery_paints_the_selected_rows_own_highlight_in_
+  light_theme` (the exact-colour proof, asserting `[18,79,176]` — Light's
+  real `accent.blue.200`, computed from the committed palette/theme TOML,
+  not guessed), and `command_palette_gallery_matches_the_golden_image_in_
+  light_theme` (the golden-diff test, targeting `tests/golden/
+  command_palette_gallery_light.png`, which does not exist yet —
+  `#[ignore]`d for the same "never bless blind" reason as every other
+  Light golden here). Ran `cargo test -p aurora-widgets --test gallery --
+  --nocapture` in this sandbox and grepped its own output for `SKIPPED`:
+  zero matches, so this sandbox had a real (possibly software) GPU
+  adapter and the render path genuinely executed, including both new
+  self-contained tests (both passed) — `gallery.rs`: 20 passed, 5 ignored
+  (all five Light golden-diffs: `Button`'s, `Checkbox`'s, `Slider`'s,
+  `TextField`'s, and now `CommandPalette`'s), 0 failed. `cargo fmt --all
+  --check` and `cargo clippy -p aurora-widgets --all-targets
+  --all-features -- -D warnings` both clean;
+  `python3 scripts/check_no_hardcoded_style.py` clean (25 files
+  scanned); `check_layering.py` still fails in this sandbox with the
+  same pre-existing `ModuleNotFoundError: No module named 'tomllib'`
+  (system Python <3.11), unrelated to this change. Version bumped
+  `0.15.0` → `0.16.0` per `CLAUDE.md`'s own convention.
+
+  **Still genuinely open**: `ColorSwatch`'s own Light coverage; both
   high-contrast themes' and Colour-Critical's coverage entirely (none of
-  those three themes exist as owner-approved TOML yet); all four pending
-  Light golden blesses (`Button`'s, `Checkbox`'s, `Slider`'s, and now
-  `TextField`'s); everything else this note already listed above.
+  those three themes exist as owner-approved TOML yet); all five pending
+  Light golden blesses (`Button`'s, `Checkbox`'s, `Slider`'s,
+  `TextField`'s, and now `CommandPalette`'s); everything else this note
+  already listed above.
 - [x] **Headless mode for automated UI tests** — done 2026-08-02. Every
   test in this crate already ran with no window/GPU/platform adapter;
   what was missing was making that a *checked* fact rather than an
