@@ -12,11 +12,13 @@
 //! CPU-side sibling for *multi*-layer compositing: straight-alpha
 //! "source over" generalized by a real per-layer [`BlendMode`] — `Normal`,
 //! the 8-mode "simple separable" family (`Darken`/`Multiply`/`Lighten`/
-//! `Screen`/`Difference`/`Exclusion`/`Subtract`/`Divide`), and the 4-mode
+//! `Screen`/`Difference`/`Exclusion`/`Subtract`/`Divide`), the 4-mode
 //! "dodge and burn" family (`ColorDodge`/`LinearDodge`/`ColorBurn`/
-//! `LinearBurn`); the ~14 remaining `aurora_doc::BlendMode` variants
-//! (overlay/light family, non-separable Hue/Saturation/Color/Luminosity,
-//! Dissolve, DarkerColor/LighterColor) are separate, still-open follow-on
+//! `LinearBurn`), and the 7-mode "overlay and light" family (`Overlay`/
+//! `SoftLight`/`HardLight`/`VividLight`/`LinearLight`/`PinLight`/
+//! `HardMix`); the 7 remaining `aurora_doc::BlendMode` variants
+//! (non-separable Hue/Saturation/Color/Luminosity, Dissolve,
+//! DarkerColor/LighterColor) are separate, still-open follow-on
 //! work — run entirely on the CPU because the orchestration crate
 //! (`aurora-app`) needs to walk a real `aurora_doc::LayerTree` — a sibling
 //! crate this one can't depend on — per visible tile, every frame a layer

@@ -73,9 +73,11 @@
 //! read and translated (`translate_blend_mode`) into
 //! `aurora_render::BlendMode` — `Normal`, the 8-mode "simple
 //! separable" family (`Darken`/`Multiply`/`Lighten`/`Screen`/
-//! `Difference`/`Exclusion`/`Subtract`/`Divide`), and the 4-mode
+//! `Difference`/`Exclusion`/`Subtract`/`Divide`), the 4-mode
 //! "dodge and burn" family (`ColorDodge`/`LinearDodge`/`ColorBurn`/
-//! `LinearBurn`) are real; the ~14 remaining `aurora_doc::BlendMode`
+//! `LinearBurn`), and the 7-mode "overlay and light" family
+//! (`Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
+//! `PinLight`/`HardMix`) are real; the 7 remaining `aurora_doc::BlendMode`
 //! variants still silently fall back to `Normal` — and still never
 //! recurses into layer groups for paint
 //! order (`LayerTree::paint_order`'s own documented scope) — both real,
@@ -2837,9 +2839,10 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 
 /// Converts a real, stored `aurora_doc::BlendMode` (the 27-variant,
 /// PSD-round-trippable enum a layer's own `blend_mode` actually holds)
-/// into `aurora_render`'s own narrower [`aurora_render::BlendMode`] (13
-/// variants: `Normal`, the 8 "simple separable" modes, and the 4
-/// "dodge and burn" modes it has real math for) — the same "app
+/// into `aurora_render`'s own narrower [`aurora_render::BlendMode`] (20
+/// variants: `Normal`, the 8 "simple separable" modes, the 4
+/// "dodge and burn" modes, and the 7 "overlay and light" modes it has
+/// real math for) — the same "app
 /// translates a doc-crate type into an engine-crate type at the
 /// boundary" pattern [`surface_id_for`] above already establishes for
 /// `LayerId` -> `SurfaceId`, needed for the same structural reason:
@@ -2849,9 +2852,9 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 /// the translation has to happen.
 ///
 /// Deliberately an **exhaustive match, no wildcard arm**: every one of
-/// `aurora_doc::BlendMode`'s 27 real variants is named individually, 13
+/// `aurora_doc::BlendMode`'s 27 real variants is named individually, 20
 /// mapped to their real `aurora_render::BlendMode` counterpart and the
-/// remaining ~14 explicitly mapped to `Normal` — an honest, documented
+/// remaining 7 explicitly mapped to `Normal` — an honest, documented
 /// fallback (those modes' real math is separate, still-open follow-on
 /// work; falling back to `Normal` degrades a layer's *appearance*
 /// without corrupting or losing any document data, the same
@@ -2887,6 +2890,13 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
         aurora_doc::BlendMode::LinearDodge => aurora_render::BlendMode::LinearDodge,
         aurora_doc::BlendMode::ColorBurn => aurora_render::BlendMode::ColorBurn,
         aurora_doc::BlendMode::LinearBurn => aurora_render::BlendMode::LinearBurn,
+        aurora_doc::BlendMode::Overlay => aurora_render::BlendMode::Overlay,
+        aurora_doc::BlendMode::SoftLight => aurora_render::BlendMode::SoftLight,
+        aurora_doc::BlendMode::HardLight => aurora_render::BlendMode::HardLight,
+        aurora_doc::BlendMode::VividLight => aurora_render::BlendMode::VividLight,
+        aurora_doc::BlendMode::LinearLight => aurora_render::BlendMode::LinearLight,
+        aurora_doc::BlendMode::PinLight => aurora_render::BlendMode::PinLight,
+        aurora_doc::BlendMode::HardMix => aurora_render::BlendMode::HardMix,
         // Not yet implemented in `aurora_render::BlendMode` — real,
         // separate, still-open follow-on work, not an oversight. Each
         // named individually rather than behind a wildcard so a future
@@ -2895,13 +2905,6 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
         aurora_doc::BlendMode::Dissolve
         | aurora_doc::BlendMode::DarkerColor
         | aurora_doc::BlendMode::LighterColor
-        | aurora_doc::BlendMode::Overlay
-        | aurora_doc::BlendMode::SoftLight
-        | aurora_doc::BlendMode::HardLight
-        | aurora_doc::BlendMode::VividLight
-        | aurora_doc::BlendMode::LinearLight
-        | aurora_doc::BlendMode::PinLight
-        | aurora_doc::BlendMode::HardMix
         | aurora_doc::BlendMode::Hue
         | aurora_doc::BlendMode::Saturation
         | aurora_doc::BlendMode::Color
@@ -2931,17 +2934,21 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
 /// four of that layer's own tiles together when origins aren't
 /// tile-aligned.
 ///
-/// **Blend modes, real for 13 of 27**: each layer's own real
+/// **Blend modes, real for 20 of 27**: each layer's own real
 /// `blend_mode` is read here and translated via `translate_blend_mode`
 /// into `aurora_render::BlendMode` before reaching
 /// `composite_tile_cpu` — `Normal`, the 8-mode "simple separable"
 /// family (`Darken`/`Multiply`/`Lighten`/`Screen`/`Difference`/
-/// `Exclusion`/`Subtract`/`Divide`), and the 4-mode "dodge and burn"
-/// family (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`)
-/// composite with their own real math; the ~14 remaining
-/// `aurora_doc::BlendMode` variants still silently fall back to
-/// `Normal` at that same translation boundary — a real, separate,
-/// still-open gap, not silently glossed over.
+/// `Exclusion`/`Subtract`/`Divide`), the 4-mode "dodge and burn"
+/// family (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`), and
+/// the 7-mode "overlay and light" family (`Overlay`/`SoftLight`/
+/// `HardLight`/`VividLight`/`LinearLight`/`PinLight`/`HardMix`)
+/// composite with their own real math; the 7 remaining
+/// `aurora_doc::BlendMode` variants (non-separable
+/// `Hue`/`Saturation`/`Color`/`Luminosity`, `Dissolve`, and
+/// `DarkerColor`/`LighterColor`) still silently fall back to `Normal`
+/// at that same translation boundary — a real, separate, still-open
+/// gap, not silently glossed over.
 ///
 /// **Performance, incremental but coarse**: a visible tile already
 /// current in `cache` is skipped entirely — see [`CompositeCache`]'s
@@ -3218,11 +3225,14 @@ fn read_layer_window(
 /// each layer's own real `blend_mode` is read and translated
 /// (`translate_blend_mode`) — `Normal`, the 8-mode "simple
 /// separable" family (`Darken`/`Multiply`/`Lighten`/`Screen`/
-/// `Difference`/`Exclusion`/`Subtract`/`Divide`), and the 4-mode
+/// `Difference`/`Exclusion`/`Subtract`/`Divide`), the 4-mode
 /// "dodge and burn" family (`ColorDodge`/`LinearDodge`/`ColorBurn`/
-/// `LinearBurn`) are real; the ~14 remaining `aurora_doc::BlendMode`
-/// variants still silently fall back to `Normal` at that same
-/// translation boundary. Layer groups are
+/// `LinearBurn`), and the 7-mode "overlay and light" family
+/// (`Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
+/// `PinLight`/`HardMix`) are real; the 7 remaining `aurora_doc::BlendMode`
+/// variants (non-separable `Hue`/`Saturation`/`Color`/`Luminosity`,
+/// `Dissolve`, and `DarkerColor`/`LighterColor`) still silently fall
+/// back to `Normal` at that same translation boundary. Layer groups are
 /// still never recursed into (`LayerTree::paint_order`'s own
 /// documented, tested scope — see
 /// `paint_order_never_includes_a_layer_nested_inside_a_group`) — both
@@ -4229,15 +4239,17 @@ impl App {
     /// composite the canvas itself already shows
     /// ([`recomposite_visible_tiles`], called from [`Self::redraw`]) —
     /// no longer just the active layer's own pixels, the bug this
-    /// function used to have. Blend modes are real for `Normal` plus 12
-    /// of the ~26 others — the "simple separable" family
+    /// function used to have. Blend modes are real for `Normal` plus 19
+    /// of the 26 others — the "simple separable" family
     /// (`Darken`/`Multiply`/`Lighten`/`Screen`/`Difference`/`Exclusion`/
-    /// `Subtract`/`Divide`) and the "dodge and burn" family
-    /// (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`), via
+    /// `Subtract`/`Divide`), the "dodge and burn" family
+    /// (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`), and the
+    /// "overlay and light" family (`Overlay`/`SoftLight`/`HardLight`/
+    /// `VividLight`/`LinearLight`/`PinLight`/`HardMix`), via
     /// `translate_blend_mode` and `aurora_render::composite_tile_cpu`'s
-    /// own current scope — with the remaining ~14 `aurora_doc::BlendMode`
-    /// variants (overlay/light family, non-separable Hue/Saturation/
-    /// Color/Luminosity, Dissolve, DarkerColor/LighterColor) still
+    /// own current scope — with the remaining 7 `aurora_doc::BlendMode`
+    /// variants (non-separable Hue/Saturation/Color/Luminosity,
+    /// Dissolve, DarkerColor/LighterColor) still
     /// silently falling back to `Normal`. Also still never recurses into
     /// layer groups for paint order (`aurora_doc::LayerTree::paint_order`'s
     /// own documented scope) — both real, separate, still-open gaps,
@@ -7981,6 +7993,77 @@ mod tests {
                 image_pixel(&image, 0, 0),
                 [0.75, 0.75, 0.75, 1.0],
                 "ColorDodge of backdrop 0.375 by source 0.5 must yield 0.75, not the Normal (0.5) or Multiply (0.1875) result"
+            );
+        }
+    }
+
+    #[test]
+    // Same shape as the Multiply/ColorDodge tests just above, retargeted
+    // at `BlendMode::Overlay` -- one of the 7 "overlay and light" modes
+    // added this round. Proves the real per-layer blend mode set on a
+    // `LayerTree` layer actually reaches `translate_blend_mode` and
+    // `composite_tile_cpu` through the export path, not just that
+    // `Overlay`'s own formula is correct in isolation (already covered
+    // by `aurora-render`'s own
+    // `composite_tile_cpu_overlay_uses_the_direct_multiply_form_when_the_backdrop_is_at_or_below_half`).
+    // Bottom (backdrop) composites first over transparent black and
+    // reproduces itself exactly: (0.25, 0.25, 0.25, 1.0). Top (source,
+    // full opacity) then composites over that with `Overlay`, and since
+    // both layers are fully opaque at full layer opacity (`as = ab =
+    // 1.0`), the general formula reduces to exactly `B(Cb, Cs)` per
+    // channel; the backdrop (0.25) is `<= 0.5`, so Overlay's own direct
+    // branch fires: `2 * Cb * Cs = 2 * 0.25 * 0.75 = 0.375` ->
+    // (0.375, 0.375, 0.375, 1.0). A Normal blend of the same two layers
+    // would instead just reproduce the top layer unchanged
+    // (0.75, 0.75, 0.75, 1.0), a Multiply blend would darken to
+    // (0.1875, 0.1875, 0.1875, 1.0), and a ColorDodge blend would yield
+    // (1.0, 1.0, 1.0, 1.0) (backdrop 0.25 is `Cb / (1-Cs) = 0.25/0.25 =
+    // 1.0`) -- all differ from Overlay's own 0.375, so this genuinely
+    // distinguishes "Overlay was read and applied" from either "blend
+    // mode was silently ignored" or "the wrong mode's math ran".
+    fn composite_document_blends_two_layers_overlay_blend_matching_the_hand_computed_result() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Overlay) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (bottom, [0.25, 0.25, 0.25, 1.0]),
+            (top, [0.75, 0.75, 0.75, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [0.375, 0.375, 0.375, 1.0],
+                "Overlay of backdrop 0.25 by source 0.75 must yield 0.375, not the Normal (0.75), Multiply (0.1875), or ColorDodge (1.0) result"
             );
         }
     }

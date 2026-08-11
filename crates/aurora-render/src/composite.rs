@@ -45,6 +45,34 @@ pub enum BlendMode {
     LinearDodge,
     ColorBurn,
     LinearBurn,
+    Overlay,
+    SoftLight,
+    HardLight,
+    VividLight,
+    LinearLight,
+    PinLight,
+    HardMix,
+}
+
+/// `SoftLight`'s own `D(x)` helper (W3C Compositing and Blending Level 1),
+/// nested two-branch logic distinct from `SoftLight`'s own `Cs <= 0.5`
+/// branch: a polynomial below `x = 0.25`, `sqrt(x)` at and above it.
+/// Continuous at that boundary — confirmed by hand, not just asserted: at
+/// `x = 0.25`, the polynomial gives
+/// `((16*0.25-12)*0.25+4)*0.25 = ((4-12)*0.25+4)*0.25 = (-2+4)*0.25 = 0.5`,
+/// and `sqrt(0.25) = 0.5` — the two branches agree exactly at the
+/// boundary, so `SoftLight` itself has no discontinuity there (also
+/// exercised through the real per-texel path, not just this helper in
+/// isolation, by
+/// `composite_tile_cpu_soft_light_has_no_discontinuity_across_the_d_helpers_own_branch_boundary`
+/// below).
+#[must_use]
+fn soft_light_d(x: f32) -> f32 {
+    if x <= 0.25 {
+        ((16.0 * x - 12.0) * x + 4.0) * x
+    } else {
+        x.sqrt()
+    }
 }
 
 /// The per-channel blend function `B(Cb, Cs)` for `mode`, given one
@@ -108,6 +136,81 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
             }
         }
         BlendMode::LinearBurn => (cb + cs - 1.0).max(0.0),
+        // HardLight (W3C spec): branches on the *source*. Composed from
+        // the two families already implemented above rather than
+        // re-derived: `Cs <= 0.5` is `Multiply(Cb, 2*Cs)`, else
+        // `Screen(Cb, 2*Cs-1)`.
+        BlendMode::HardLight => {
+            if cs <= 0.5 {
+                blend_channel(BlendMode::Multiply, cb, 2.0 * cs)
+            } else {
+                blend_channel(BlendMode::Screen, cb, 2.0 * cs - 1.0)
+            }
+        }
+        // Overlay (W3C spec): `Overlay(Cb, Cs) = HardLight(Cs, Cb)` --
+        // the exact same two formulas as HardLight above, just branching
+        // on the backdrop instead of the source. Expressed literally as
+        // that relationship (swap the two channel arguments into
+        // HardLight's own arm above) rather than as an independently
+        // re-derived pair of branches, so the "same shape, one flipped"
+        // relationship is visible in the code, not just in a comment.
+        BlendMode::Overlay => blend_channel(BlendMode::HardLight, cs, cb),
+        // VividLight: branches on the source, reusing ColorBurn/
+        // ColorDodge's own already-implemented 0/1 edge-case handling
+        // rather than re-deriving it. `2*Cs` (Cs<=0.5, range [0,1]) and
+        // `2*Cs-1` (Cs>0.5, range (0,1]) are both valid inputs to those
+        // arms as-is.
+        BlendMode::VividLight => {
+            if cs <= 0.5 {
+                blend_channel(BlendMode::ColorBurn, cb, 2.0 * cs)
+            } else {
+                blend_channel(BlendMode::ColorDodge, cb, 2.0 * cs - 1.0)
+            }
+        }
+        // LinearLight: the branch form is `Cs <= 0.5 -> LinearBurn(Cb,
+        // 2*Cs) = max(Cb+2*Cs-1, 0)`, else `LinearDodge(Cb, 2*Cs-1) =
+        // min(Cb+2*Cs-1, 1)`. Using the algebraically equivalent
+        // single-expression simplification instead (see this crate's own
+        // tests for a numeric proof against the branch form): in the
+        // `Cs<=0.5` branch, `2*Cs` is in `[0,1]` so `Cb+2*Cs-1` tops out
+        // at `Cb <= 1` -- the `min(...,1)` clamp the other branch applies
+        // is never actually reachable here, only the `max(...,0)` one is.
+        // Symmetrically, in the `Cs>0.5` branch, `2*Cs-1` is in `(0,1]`
+        // so `Cb+2*Cs-1` never goes below `0` -- only the `min(...,1)`
+        // clamp is reachable. A plain `clamp(Cb+2*Cs-1, 0, 1)` applies
+        // both bounds unconditionally, but since each branch only ever
+        // needs the one bound it would have applied anyway, the two
+        // forms agree on every input in `[0,1]^2`.
+        BlendMode::LinearLight => (cb + 2.0 * cs - 1.0).clamp(0.0, 1.0),
+        // PinLight: branches on the source, reusing Darken/Lighten's own
+        // already-implemented per-channel min/max rather than
+        // re-deriving it.
+        BlendMode::PinLight => {
+            if cs <= 0.5 {
+                blend_channel(BlendMode::Darken, cb, 2.0 * cs)
+            } else {
+                blend_channel(BlendMode::Lighten, cb, 2.0 * cs - 1.0)
+            }
+        }
+        // HardMix: a hard threshold on VividLight's own result, reusing
+        // that arm directly rather than re-deriving its branch logic.
+        BlendMode::HardMix => {
+            if blend_channel(BlendMode::VividLight, cb, cs) < 0.5 {
+                0.0
+            } else {
+                1.0
+            }
+        }
+        // SoftLight (W3C spec): the most mathematically distinct mode in
+        // this family -- no reuse of another arm above, real cross-term
+        // math via its own `soft_light_d` helper.
+        BlendMode::SoftLight => {
+            if cs <= 0.5 {
+                cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+            } else {
+                cb + (2.0 * cs - 1.0) * (soft_light_d(cb) - cb)
+            }
+        }
     }
 }
 
@@ -155,21 +258,24 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
 /// exactly matching what a document with no visible pixel layers should
 /// show.
 ///
-/// **Scope, stated honestly**: [`BlendMode`] implements 13 of
+/// **Scope, stated honestly**: [`BlendMode`] implements 20 of
 /// `aurora_doc::BlendMode`'s real 27 variants — `Normal`, the
 /// "simple separable" family (`Darken`, `Multiply`, `Lighten`,
 /// `Screen`, `Difference`, `Exclusion`, `Subtract`, `Divide`), each a
 /// pure per-channel function of backdrop and source with no cross-
-/// channel or midpoint-branching logic, and the "dodge and burn"
+/// channel or midpoint-branching logic, the "dodge and burn"
 /// family (`ColorDodge`, `LinearDodge`, `ColorBurn`, `LinearBurn`),
 /// each also a pure per-channel function but with real 0/1 edge-case
 /// branches (division by a zero or saturated channel must not produce
-/// `NaN`/`Infinity`). The remaining ~14
-/// (`Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
-/// `PinLight`/`HardMix` "overlay and light"; the non-separable
-/// `Hue`/`Saturation`/`Color`/`Luminosity`; `Dissolve`; and
-/// `DarkerColor`/`LighterColor`) are separate, still-open follow-on
-/// work — a layer using one of those falls back to `Normal` at the
+/// `NaN`/`Infinity`), and the "overlay and light" family (`Overlay`,
+/// `SoftLight`, `HardLight`, `VividLight`, `LinearLight`, `PinLight`,
+/// `HardMix`), each a source-or-backdrop-midpoint-branching function
+/// that (`SoftLight` aside) composes directly from the two families
+/// above rather than needing new math of its own. The remaining 7
+/// (the non-separable `Hue`/`Saturation`/`Color`/`Luminosity`;
+/// `Dissolve`; and `DarkerColor`/`LighterColor`) are separate,
+/// still-open follow-on work — a layer using one of those falls back
+/// to `Normal` at the
 /// `aurora-app` translation boundary (`translate_blend_mode`), not
 /// here. This is a CPU implementation specifically because the
 /// orchestration crate (`aurora-app`) needs to run it per visible tile,
@@ -377,7 +483,7 @@ impl std::fmt::Debug for TileCompositor {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlendMode, TileCompositor, composite_tile_cpu};
+    use super::{BlendMode, TileCompositor, blend_channel, composite_tile_cpu, soft_light_d};
     use crate::test_support::real_context;
     use aurora_tile::{SAMPLES, TILE};
     use half::f16;
@@ -816,6 +922,374 @@ mod tests {
             (&top, 1.0, BlendMode::LinearBurn),
         ]);
         assert_eq!(first_texel(&out), (0.0, 0.25, 0.0, 1.0));
+    }
+
+    // -- Blend-mode math: the 7 "overlay and light" modes added this
+    // round (`Overlay`, `SoftLight`, `HardLight`, `VividLight`,
+    // `LinearLight`, `PinLight`, `HardMix`), reusing the "simple
+    // separable" and "dodge and burn" families' own already-tested arms
+    // above wherever the spec formula decomposes that way (`HardLight`
+    // reuses `Multiply`/`Screen`, `Overlay` reuses `HardLight` itself,
+    // `VividLight` reuses `ColorBurn`/`ColorDodge`, `PinLight` reuses
+    // `Darken`/`Lighten`, `HardMix` reuses `VividLight`) -- only
+    // `SoftLight` has genuinely new per-mode math. All literals below are
+    // exact eighths/sixteenths (like the prior two rounds' own eighths/
+    // quarters, never decimal tenths), so both the constructed input
+    // texels and the hand-computed expected outputs round-trip bit-exact
+    // through `f16`.
+
+    #[test]
+    // HardLight (W3C spec), Cs <= 0.5 branch: B = Multiply(Cb, 2*Cs).
+    // Backdrop 0.75, source 0.25 (Cs <= 0.5) -> Multiply(0.75, 2*0.25) =
+    // Multiply(0.75, 0.5) = 0.375.
+    fn composite_tile_cpu_hard_light_uses_multiply_when_the_source_is_at_or_below_half() {
+        let bottom = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let top = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::HardLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.375, 0.375, 0.375, 1.0));
+    }
+
+    #[test]
+    // HardLight, Cs > 0.5 branch: B = Screen(Cb, 2*Cs - 1). Backdrop
+    // 0.25, source 0.75 (Cs > 0.5) -> Screen(0.25, 2*0.75-1) =
+    // Screen(0.25, 0.5) = 0.25 + 0.5 - 0.25*0.5 = 0.75 - 0.125 = 0.625.
+    fn composite_tile_cpu_hard_light_uses_screen_when_the_source_is_above_half() {
+        let bottom = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::HardLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.625, 0.625, 0.625, 1.0));
+    }
+
+    #[test]
+    // Overlay, Cb <= 0.5 branch: B = 2*Cb*Cs. Backdrop 0.25 (Cb <= 0.5),
+    // source 0.75 -> 2*0.25*0.75 = 0.375.
+    fn composite_tile_cpu_overlay_uses_the_direct_multiply_form_when_the_backdrop_is_at_or_below_half()
+     {
+        let bottom = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Overlay),
+        ]);
+        assert_eq!(first_texel(&out), (0.375, 0.375, 0.375, 1.0));
+    }
+
+    #[test]
+    // Overlay, Cb > 0.5 branch: B = 1 - 2*(1-Cb)*(1-Cs). Backdrop 0.75
+    // (Cb > 0.5), source 0.25 -> 1 - 2*0.25*0.75 = 1 - 0.375 = 0.625.
+    fn composite_tile_cpu_overlay_uses_the_inverse_screen_form_when_the_backdrop_is_above_half() {
+        let bottom = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let top = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Overlay),
+        ]);
+        assert_eq!(first_texel(&out), (0.625, 0.625, 0.625, 1.0));
+    }
+
+    #[test]
+    // The stated relationship, checked directly rather than just claimed
+    // in a doc comment: `Overlay(Cb, Cs) == HardLight(Cs, Cb)`, i.e.
+    // swapping which layer is "backdrop" and which is "source" between
+    // the two modes must produce the same result. Backdrop 0.625, source
+    // 0.375 through Overlay (Cb=0.625 > 0.5, so the inverse-screen
+    // branch fires): 1 - 2*(1-0.625)*(1-0.375) = 1 - 2*0.375*0.625 =
+    // 1 - 0.46875 = 0.53125. The mirrored document -- backdrop 0.375,
+    // source 0.625 through HardLight (Cs=0.625 > 0.5, so its own
+    // Screen branch fires): Screen(0.375, 2*0.625-1) = Screen(0.375,
+    // 0.25) = 0.375 + 0.25 - 0.375*0.25 = 0.625 - 0.09375 = 0.53125 --
+    // the same value, confirming the two computations (not just the two
+    // formulas on paper) genuinely agree.
+    fn composite_tile_cpu_overlay_and_hard_light_agree_when_their_arguments_are_swapped() {
+        let overlay_bottom = solid_texels([0.625, 0.625, 0.625, 1.0]);
+        let overlay_top = solid_texels([0.375, 0.375, 0.375, 1.0]);
+        let overlay_out = composite_tile_cpu(&[
+            (&overlay_bottom, 1.0, BlendMode::Normal),
+            (&overlay_top, 1.0, BlendMode::Overlay),
+        ]);
+
+        let hard_light_bottom = solid_texels([0.375, 0.375, 0.375, 1.0]);
+        let hard_light_top = solid_texels([0.625, 0.625, 0.625, 1.0]);
+        let hard_light_out = composite_tile_cpu(&[
+            (&hard_light_bottom, 1.0, BlendMode::Normal),
+            (&hard_light_top, 1.0, BlendMode::HardLight),
+        ]);
+
+        assert_eq!(first_texel(&overlay_out), (0.53125, 0.53125, 0.53125, 1.0));
+        assert_eq!(
+            first_texel(&overlay_out),
+            first_texel(&hard_light_out),
+            "Overlay(Cb, Cs) and HardLight(Cs, Cb) must agree exactly, not just approximately"
+        );
+    }
+
+    #[test]
+    // VividLight, Cs <= 0.5 branch: B = ColorBurn(Cb, 2*Cs). Backdrop
+    // 0.875, source 0.25 (Cs <= 0.5) -> ColorBurn(0.875, 0.5) =
+    // 1 - min(1, (1-0.875)/0.5) = 1 - min(1, 0.25) = 0.75 -- the same
+    // ColorBurn inputs/output this file's own
+    // `composite_tile_cpu_color_burn_computes_the_clamped_per_channel_ratio`
+    // proves in isolation, reused here through VividLight's own
+    // composition rather than re-derived.
+    fn composite_tile_cpu_vivid_light_uses_color_burn_when_the_source_is_at_or_below_half() {
+        let bottom = solid_texels([0.875, 0.875, 0.875, 1.0]);
+        let top = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::VividLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 0.75, 0.75, 1.0));
+    }
+
+    #[test]
+    // VividLight, Cs > 0.5 branch: B = ColorDodge(Cb, 2*Cs - 1). Backdrop
+    // 0.375, source 0.75 (Cs > 0.5) -> ColorDodge(0.375, 0.5) =
+    // min(1, 0.375/0.5) = 0.75 -- the same ColorDodge inputs/output this
+    // file's own `composite_tile_cpu_color_dodge_computes_the_clamped_per_channel_ratio`
+    // proves in isolation, reused here through VividLight's own
+    // composition rather than re-derived.
+    fn composite_tile_cpu_vivid_light_uses_color_dodge_when_the_source_is_above_half() {
+        let bottom = solid_texels([0.375, 0.375, 0.375, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::VividLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 0.75, 0.75, 1.0));
+    }
+
+    #[test]
+    // LinearLight via the simplified single-expression form:
+    // clamp(Cb + 2*Cs - 1, 0, 1). Backdrop 0.5, source 0.625 (Cs > 0.5,
+    // so the branch form would use LinearDodge) -> 0.5 + 1.25 - 1 = 0.75,
+    // comfortably inside the clamp on both sides -- a genuine non-
+    // boundary result, not one where the clamp is doing the work (that's
+    // what the dedicated equivalence test below is for).
+    fn composite_tile_cpu_linear_light_computes_the_clamped_sum() {
+        let bottom = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let top = solid_texels([0.625, 0.625, 0.625, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::LinearLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 0.75, 0.75, 1.0));
+    }
+
+    #[test]
+    // Proves the algebraic equivalence claim in `blend_channel`'s own
+    // `LinearLight` arm numerically rather than just asserting it in a
+    // doc comment: for each `(cb, cs)` pair below, computes the
+    // branch-form value independently right here in the test (not by
+    // calling the implementation) and compares it against
+    // `blend_channel`'s actual (simplified single-expression) output.
+    // Covers both branches (`cs <= 0.5` and `cs > 0.5`) and the `cs ==
+    // 0.5` boundary itself, plus cases on each side of both the lower
+    // and upper clamp.
+    //
+    // Both forms here are exact dyadic-rational arithmetic (add,
+    // multiply by 2, subtract 1, clamp) over the same eighths-only
+    // inputs `blend_channel` itself is proven against elsewhere in this
+    // file, so an exact `f32` equality is the right check, not a
+    // rounding-tolerant one -- the same reasoning `blend_channel`'s own
+    // `float_cmp` allow already documents.
+    #[allow(clippy::float_cmp)]
+    fn linear_light_simplified_form_matches_the_branch_form_for_several_inputs() {
+        let cases: [(f32, f32); 6] = [
+            (0.25, 0.25), // cs <= 0.5 branch, clamps down to 0
+            (0.75, 0.75), // cs > 0.5 branch, clamps up to 1
+            (0.5, 0.5),   // the cs == 0.5 boundary itself
+            (0.125, 0.875),
+            (0.875, 0.125),
+            (0.375, 0.625),
+        ];
+        for (cb, cs) in cases {
+            let branch_form = if cs <= 0.5 {
+                (cb + 2.0 * cs - 1.0).max(0.0)
+            } else {
+                (cb + 2.0 * cs - 1.0).min(1.0)
+            };
+            let simplified_form = blend_channel(BlendMode::LinearLight, cb, cs);
+            assert_eq!(
+                branch_form, simplified_form,
+                "branch and simplified forms must agree exactly for cb={cb}, cs={cs}"
+            );
+        }
+    }
+
+    #[test]
+    // PinLight, Cs <= 0.5 branch: B = Darken(Cb, 2*Cs) = min(Cb, 2*Cs).
+    // Backdrop 0.375, source 0.125 (Cs <= 0.5) -> min(0.375, 0.25) =
+    // 0.25.
+    fn composite_tile_cpu_pin_light_uses_darken_when_the_source_is_at_or_below_half() {
+        let bottom = solid_texels([0.375, 0.375, 0.375, 1.0]);
+        let top = solid_texels([0.125, 0.125, 0.125, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::PinLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.25, 0.25, 0.25, 1.0));
+    }
+
+    #[test]
+    // PinLight, Cs > 0.5 branch: B = Lighten(Cb, 2*Cs - 1) = max(Cb,
+    // 2*Cs - 1). Backdrop 0.625, source 0.875 (Cs > 0.5) ->
+    // max(0.625, 0.75) = 0.75.
+    fn composite_tile_cpu_pin_light_uses_lighten_when_the_source_is_above_half() {
+        let bottom = solid_texels([0.625, 0.625, 0.625, 1.0]);
+        let top = solid_texels([0.875, 0.875, 0.875, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::PinLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 0.75, 0.75, 1.0));
+    }
+
+    #[test]
+    // HardMix's own defining property: its result is *always* exactly
+    // `0.0` or `1.0`, never an intermediate value, since it thresholds
+    // VividLight's own continuous result at `0.5`. Exercises six pairs
+    // via `blend_channel` directly (no texel/f16 round-trip needed here,
+    // since the property under test -- "the output is one of exactly two
+    // values" -- holds in plain `f32` and doesn't depend on `f16`
+    // storage), including two pairs (`(0.6, 0.39)` and `(0.6, 0.41)`)
+    // deliberately chosen so VividLight's own intermediate result lands
+    // just below and just above `0.5`: VividLight(0.6, 0.39) uses the
+    // `Cs <= 0.5` branch, `ColorBurn(0.6, 0.78) = 1 - min(1, 0.4/0.78)`
+    // ~= 1 - 0.513 = 0.487 (just under 0.5, so HardMix must floor to
+    // `0.0`); VividLight(0.6, 0.41) uses the same branch,
+    // `ColorBurn(0.6, 0.82) = 1 - min(1, 0.4/0.82)` ~= 1 - 0.488 = 0.512
+    // (just over 0.5, so HardMix must ceiling to `1.0`) -- proving the
+    // threshold is a genuine hard cut, not a value that merely tends
+    // toward the extremes.
+    //
+    // `HardMix`'s own arm returns the literal `0.0`/`1.0` constants, not
+    // an accumulated-rounding-error value, so an exact comparison is the
+    // right check here -- the same reasoning `blend_channel`'s own
+    // `float_cmp` allow already documents.
+    #[allow(clippy::float_cmp)]
+    fn hard_mix_produces_only_pure_black_or_white() {
+        let cases: [((f32, f32), f32); 6] = [
+            ((0.875, 0.25), 1.0), // VividLight = 0.75
+            ((0.25, 0.25), 0.0),  // VividLight = 0.0
+            ((0.6, 0.39), 0.0),   // VividLight just under 0.5
+            ((0.6, 0.41), 1.0),   // VividLight just over 0.5
+            ((0.3, 0.9), 1.0),    // VividLight's ColorDodge branch, = 1.0
+            ((0.1, 0.6), 0.0),    // VividLight's ColorDodge branch, < 0.5
+        ];
+        for ((cb, cs), expected) in cases {
+            let result = blend_channel(BlendMode::HardMix, cb, cs);
+            assert!(
+                result == 0.0 || result == 1.0,
+                "HardMix({cb}, {cs}) = {result} must be exactly 0.0 or 1.0, never an intermediate value"
+            );
+            assert_eq!(
+                result, expected,
+                "HardMix({cb}, {cs}) landed on the wrong side of the threshold"
+            );
+        }
+    }
+
+    #[test]
+    // SoftLight (W3C spec), Cs <= 0.5 branch: B = Cb - (1-2*Cs)*Cb*(1-Cb).
+    // Backdrop 0.5, source 0.25 (Cs <= 0.5) -> 0.5 - (1-0.5)*0.5*0.5 =
+    // 0.5 - 0.5*0.25 = 0.5 - 0.125 = 0.375.
+    fn composite_tile_cpu_soft_light_darkens_when_the_source_is_at_or_below_half() {
+        let bottom = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let top = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::SoftLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.375, 0.375, 0.375, 1.0));
+    }
+
+    #[test]
+    // SoftLight, Cs > 0.5 branch: B = Cb + (2*Cs-1)*(D(Cb)-Cb), where
+    // `D` is `soft_light_d`'s own polynomial branch (Cb = 0.0625 <=
+    // 0.25). D(0.0625): x=1/16, 16x=1, 16x-12=-11, (16x-12)*x=-11/16,
+    // +4 = 53/16, *x = 53/256 = 0.20703125. Backdrop 0.0625, source 0.75
+    // (Cs > 0.5): 2*Cs-1 = 0.5; D(Cb)-Cb = 53/256 - 16/256 = 37/256;
+    // 0.5 * 37/256 = 37/512; B = 1/16 + 37/512 = 32/512 + 37/512 =
+    // 69/512 = 0.134765625 -- a dyadic rational (denominator a power of
+    // two) chosen deliberately so the exact result round-trips bit-exact
+    // through `f16`, the same discipline every other hand-computed test
+    // in this file already follows.
+    fn composite_tile_cpu_soft_light_lightens_via_the_d_helper_when_the_source_is_above_half() {
+        let bottom = solid_texels([0.0625, 0.0625, 0.0625, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::SoftLight),
+        ]);
+        assert_eq!(
+            first_texel(&out),
+            (0.134_765_63, 0.134_765_63, 0.134_765_63, 1.0)
+        );
+    }
+
+    #[test]
+    // SoftLight with the backdrop exactly at `soft_light_d`'s own
+    // `x = 0.25` branch boundary (Cs > 0.5, so `D` is actually invoked):
+    // D(0.25) = 0.5 (proven exactly, both branches, by
+    // `soft_light_d_agrees_at_and_around_its_own_branch_boundary` below).
+    // B = Cb + (2*Cs-1)*(D(Cb)-Cb) with Cb=0.25, Cs=0.75 ->
+    // 0.25 + 0.5*(0.5-0.25) = 0.25 + 0.125 = 0.375 -- a plain, exact
+    // eighth, confirming the boundary itself produces a well-defined,
+    // unsurprising result through the real per-texel path, not just
+    // through `soft_light_d` in isolation.
+    fn composite_tile_cpu_soft_light_at_the_d_helpers_own_branch_boundary() {
+        let bottom = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::SoftLight),
+        ]);
+        assert_eq!(first_texel(&out), (0.375, 0.375, 0.375, 1.0));
+    }
+
+    #[test]
+    // `soft_light_d`'s own two-branch continuity, checked directly
+    // rather than only in a doc comment. At the boundary itself
+    // (x = 0.25), both formulas are computed independently right here
+    // (not by calling the two branches of the real implementation, which
+    // only ever takes one of them) and must agree exactly: the
+    // polynomial ((16*0.25-12)*0.25+4)*0.25 = ((4-12)*0.25+4)*0.25 =
+    // (-2+4)*0.25 = 0.5, and sqrt(0.25) = 0.5. Also checks a pair of
+    // values straddling the boundary (0.249 via the polynomial branch,
+    // 0.251 via the sqrt branch, each 0.001 off the boundary) stay close
+    // together rather than jumping -- proving "no discontinuity"
+    // empirically around the boundary, not just exactly at it. Both
+    // branches also have derivative exactly `1` at `x = 0.25`
+    // (`d/dx[(16x-12)x+4)x] = 48x^2-24x+4`, which is `1` at `x=0.25`;
+    // `d/dx[sqrt(x)] = 1/(2*sqrt(x))`, also `1` at `x=0.25`) -- so `D` is
+    // not just continuous but `C1` there, which is why a `0.001`-wide
+    // straddle only moves the value by about `0.001` on each side.
+    //
+    // The boundary-value comparisons below are both `0.5` computed two
+    // independent, exact ways (a literal and this crate's own helper),
+    // not an accumulated-rounding-error comparison -- the same reasoning
+    // `blend_channel`'s own `float_cmp` allow already documents.
+    #[allow(clippy::float_cmp)]
+    fn soft_light_d_agrees_at_and_around_its_own_branch_boundary() {
+        let polynomial_at_boundary = ((16.0f32 * 0.25 - 12.0) * 0.25 + 4.0) * 0.25;
+        let sqrt_at_boundary = 0.25f32.sqrt();
+        assert_eq!(polynomial_at_boundary, 0.5);
+        assert_eq!(sqrt_at_boundary, 0.5);
+        assert_eq!(polynomial_at_boundary, sqrt_at_boundary);
+        assert_eq!(soft_light_d(0.25), 0.5);
+
+        let just_below = soft_light_d(0.249); // polynomial branch
+        let just_above = soft_light_d(0.251); // sqrt branch
+        assert!(
+            (just_above - just_below).abs() < 0.005,
+            "soft_light_d must not jump across its own branch boundary: D(0.249)={just_below}, D(0.251)={just_above}"
+        );
     }
 
     /// A `TILE`x`TILE` `Rgba16Float` texture, pre-filled solid `rgba` via

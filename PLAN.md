@@ -6400,6 +6400,132 @@ structural design work.
   13 of 27, not "done." Dodge/burn as a family is not being claimed
   "complete" beyond these 4 named modes — there is no fifth dodge/burn
   variant in `aurora_doc::BlendMode` to close.
+- [x] **Real blend-mode math: the 7 "overlay and light" modes** — done
+  2026-08-11, extending the same pattern the prior two rounds
+  established, not a new one: `Overlay`, `SoftLight`, `HardLight`,
+  `VividLight`, `LinearLight`, `PinLight`, `HardMix`.
+  `aurora_render::BlendMode` widened from 13 to 20 variants. Unlike the
+  first two rounds, this family is genuinely composable from what
+  already existed — 6 of the 7 new `blend_channel` arms call an
+  already-implemented arm with transformed inputs rather than
+  introducing new formula math: `HardLight` (W3C spec) branches on the
+  source — `Cs <= 0.5` is `Multiply(Cb, 2*Cs)`, else `Screen(Cb,
+  2*Cs-1)`. `Overlay` is the W3C spec's own stated identity,
+  `Overlay(Cb, Cs) = HardLight(Cs, Cb)`, written as a literal recursive
+  call with the two channel arguments swapped rather than as an
+  independently re-derived pair of branches, so the "same shape, one
+  flipped" relationship is visible in the code, not just asserted in a
+  comment. `VividLight` branches on the source and calls straight into
+  the already-implemented `ColorBurn`/`ColorDodge` arms with `2*Cs`/
+  `2*Cs-1` — `Cs <= 0.5` is `ColorBurn(Cb, 2*Cs)`, else `ColorDodge(Cb,
+  2*Cs-1)`. `PinLight` branches on the source and calls into `Darken`/
+  `Lighten` the same way. `HardMix` is a hard `0.5` threshold on
+  `VividLight`'s own result, calling that arm directly rather than
+  re-deriving its branch logic. `LinearLight` uses the algebraically
+  simplified single-expression form `clamp(Cb + 2*Cs - 1, 0, 1)` in
+  place of its own two-branch definition (`Cs <= 0.5` ->
+  `LinearBurn(Cb, 2*Cs)`, else `LinearDodge(Cb, 2*Cs-1)`) — proven
+  equivalent by hand before writing it, not assumed: in the `Cs <= 0.5`
+  branch, `2*Cs` is in `[0,1]` so `Cb + 2*Cs - 1` tops out at `Cb <= 1`,
+  meaning the `min(...,1)` clamp the other branch applies is never
+  actually reachable there, only `max(...,0)` is; symmetrically, in the
+  `Cs > 0.5` branch, `2*Cs-1` is in `(0,1]` so the sum never goes below
+  `0`, meaning only `min(...,1)` is ever reachable — so a single
+  `clamp(...,0,1)` applies both bounds unconditionally but agrees with
+  the branch form on every input, since each branch only ever needed
+  the one bound it would already have applied. `SoftLight` (W3C spec)
+  is the one genuinely new formula, and the most mathematically
+  distinct mode in the family: `Cs <= 0.5` is `Cb - (1-2*Cs)*Cb*(1-Cb)`,
+  else `Cb + (2*Cs-1)*(D(Cb)-Cb)`, where `D` is its own nested
+  two-branch helper (`soft_light_d`) — a polynomial
+  `((16x-12)x+4)x` below `x=0.25`, `sqrt(x)` at and above it. Confirmed
+  by hand that `D` is continuous at its own `x=0.25` boundary before
+  trusting it: the polynomial gives `((16*0.25-12)*0.25+4)*0.25 =
+  ((4-12)*0.25+4)*0.25 = (-2+4)*0.25 = 0.5`, and `sqrt(0.25) = 0.5` —
+  exact agreement, and (checked further, not just at the exact point)
+  both branches have derivative exactly `1` at `x=0.25`
+  (`d/dx[(16x-12)x+4)x] = 48x^2-24x+4 = 1` at `x=0.25`;
+  `d/dx[sqrt(x)] = 1/(2*sqrt(x)) = 1` at `x=0.25`), so `D` is `C1`
+  there, not merely continuous.
+
+  16 new `aurora-render` tests (was 53, now 69): at least one
+  hand-computed case per mode (all literals exact eighths/sixteenths,
+  never decimal tenths — the same discipline the prior two rounds
+  already established, needed again here since a first-draft check
+  confirmed 0.375/0.625/0.75/0.134765625/etc. all round-trip bit-exact
+  through `f16` before relying on them), both branches covered for
+  every mode that has one, a dedicated `Overlay`/`HardLight` relationship
+  test (`composite_tile_cpu_overlay_and_hard_light_agree_when_their_arguments_are_swapped`
+  — computes both directions through the real `composite_tile_cpu` path
+  and asserts they land on the identical value `0.53125`, not just that
+  the two formulas look alike on paper), a `LinearLight` equivalence
+  test (`linear_light_simplified_form_matches_the_branch_form_for_several_inputs`
+  — computes the branch form independently in the test itself, not by
+  calling the implementation, across 6 pairs including the `Cs == 0.5`
+  boundary and cases on each side of both clamps, and asserts exact
+  agreement with `blend_channel`'s actual simplified-form output), a
+  `HardMix` test (`hard_mix_produces_only_pure_black_or_white` — 6
+  pairs, asserting the result is always exactly `0.0` or `1.0`, including
+  two pairs, `(0.6, 0.39)` and `(0.6, 0.41)`, deliberately chosen so
+  VividLight's own intermediate result lands just under and just over
+  `0.5`, proving the threshold is a genuine hard cut and not merely a
+  tendency toward the extremes), and 3 `SoftLight` tests — one per
+  branch plus
+  `composite_tile_cpu_soft_light_at_the_d_helpers_own_branch_boundary`
+  (backdrop exactly at `Cb=0.25`) — backed by a dedicated
+  `soft_light_d_agrees_at_and_around_its_own_branch_boundary` unit test
+  that checks the polynomial and `sqrt` formulas agree exactly at
+  `x=0.25` and stay close (within `0.005`) at `x=0.249`/`x=0.251`,
+  proving "no discontinuity" empirically, not just in a doc comment.
+  1 new `aurora-app` test (was 147, now 148): a real
+  two-layer `LayerTree` with the top layer's `blend_mode` set to
+  `Overlay`, composited through `composite_document`, asserting the real
+  Overlay result (`0.375` for backdrop `0.25`/source `0.75`) against the
+  Normal (`0.75`), Multiply (`0.1875`), and ColorDodge (`1.0`) results
+  for the same inputs — all four differ, so this genuinely proves the
+  real per-layer blend mode reaches the compositor through the
+  translation boundary, not just that Overlay's own formula is correct
+  in isolation.
+
+  `aurora-app::translate_blend_mode` gained 7 new 1:1 arms (`Overlay`/
+  `SoftLight`/`HardLight`/`VividLight`/`LinearLight`/`PinLight`/
+  `HardMix`, moved out of the fallback arm into their own real
+  mappings), still an exhaustive match with every one of the remaining 7
+  `aurora_doc::BlendMode` variants named individually rather than a
+  wildcard. Every doc comment claiming "13 of 27"/"9-mode"/"~14
+  remaining" (this crate's own top-level module doc, `translate_blend_mode`,
+  `recomposite_visible_tiles`, `composite_document`, `App::save_file`,
+  plus `aurora-render`'s own crate doc and `composite_tile_cpu`'s doc)
+  updated to name the real 20-mode scope and the accurate, now-final 7
+  still-open variants: the non-separable `Hue`/`Saturation`/`Color`/
+  `Luminosity`, `Dissolve`, and `DarkerColor`/`LighterColor`.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-render` (69 passed, 0 failed — 53 before), `cargo test -p
+  aurora-app` (148 passed, 0 failed — 147 before), `cargo test
+  --workspace` (0 failures across every crate), `python3
+  scripts/check_no_hardcoded_style.py` clean (25 files scanned).
+  `scripts/check_layering.py` again the one unrun check (pre-existing
+  `tomllib` gap in this sandbox) — reasoned through by hand instead,
+  same as the prior two rounds: `aurora-render`'s own `Cargo.toml`
+  gained no new dependency (confirmed by reading it — still just
+  `aurora-core`/`aurora-tile`/`aurora-graph`/`aurora-gpu`/
+  `aurora-testkit`), so the only crate naming both `aurora_doc` and
+  `aurora_render` types together is still `aurora-app`, unchanged. No
+  new dependencies.
+
+  **Explicitly still NOT fixed by this change** (scoped out on purpose,
+  separate, later rounds, and now the *complete, final* remaining list —
+  no more "~" approximation, since every one of `aurora_doc::BlendMode`'s
+  27 real variants is now individually named somewhere in
+  `translate_blend_mode`): the non-separable modes (`Hue`/`Saturation`/
+  `Color`/`Luminosity`, which need HSL math across all three channels
+  together, not a per-channel function), `Dissolve` (needs per-pixel
+  randomness, a different shape entirely), and `DarkerColor`/
+  `LighterColor` (compare *luminosity* across the whole pixel, not
+  per-channel) — plus layer-group render-order recursion, unchanged from
+  the bullets above. Blend modes are real for 20 of 27, not "done."
 
 ### M1.10 — Phase 1 gate
 
