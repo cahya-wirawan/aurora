@@ -75,11 +75,13 @@
 //! separable" family (`Darken`/`Multiply`/`Lighten`/`Screen`/
 //! `Difference`/`Exclusion`/`Subtract`/`Divide`), the 4-mode
 //! "dodge and burn" family (`ColorDodge`/`LinearDodge`/`ColorBurn`/
-//! `LinearBurn`), and the 7-mode "overlay and light" family
+//! `LinearBurn`), the 7-mode "overlay and light" family
 //! (`Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
-//! `PinLight`/`HardMix`) are real; the 7 remaining `aurora_doc::BlendMode`
-//! variants still silently fall back to `Normal` — and still never
-//! recurses into layer groups for paint
+//! `PinLight`/`HardMix`), and the 4-mode non-separable family
+//! (`Hue`/`Saturation`/`Color`/`Luminosity`) are real; the 3 remaining
+//! `aurora_doc::BlendMode` variants (`Dissolve`,
+//! `DarkerColor`/`LighterColor`) still silently fall back to `Normal`
+//! — and still never recurses into layer groups for paint
 //! order (`LayerTree::paint_order`'s own documented scope) — both real,
 //! separate, still-open gaps. **A `.aur`
 //! path (ADR 0009) takes a different, real route
@@ -2839,10 +2841,10 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 
 /// Converts a real, stored `aurora_doc::BlendMode` (the 27-variant,
 /// PSD-round-trippable enum a layer's own `blend_mode` actually holds)
-/// into `aurora_render`'s own narrower [`aurora_render::BlendMode`] (20
+/// into `aurora_render`'s own narrower [`aurora_render::BlendMode`] (24
 /// variants: `Normal`, the 8 "simple separable" modes, the 4
-/// "dodge and burn" modes, and the 7 "overlay and light" modes it has
-/// real math for) — the same "app
+/// "dodge and burn" modes, the 7 "overlay and light" modes, and the 4
+/// non-separable modes it has real math for) — the same "app
 /// translates a doc-crate type into an engine-crate type at the
 /// boundary" pattern [`surface_id_for`] above already establishes for
 /// `LayerId` -> `SurfaceId`, needed for the same structural reason:
@@ -2852,14 +2854,17 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 /// the translation has to happen.
 ///
 /// Deliberately an **exhaustive match, no wildcard arm**: every one of
-/// `aurora_doc::BlendMode`'s 27 real variants is named individually, 20
+/// `aurora_doc::BlendMode`'s 27 real variants is named individually, 24
 /// mapped to their real `aurora_render::BlendMode` counterpart and the
-/// remaining 7 explicitly mapped to `Normal` — an honest, documented
-/// fallback (those modes' real math is separate, still-open follow-on
-/// work; falling back to `Normal` degrades a layer's *appearance*
-/// without corrupting or losing any document data, the same
-/// "unpainted `WidgetKind` returns `Ok(vec![])` rather than erroring"
-/// honesty `paint_widget` already uses elsewhere in this codebase).
+/// remaining 3 (`Dissolve`, `DarkerColor`, `LighterColor` — this
+/// family's own explicit boundary, qualitatively different from every
+/// mode mapped above) explicitly mapped to `Normal` — an honest,
+/// documented fallback (those modes' real math is separate, still-open
+/// follow-on work; falling back to `Normal` degrades a layer's
+/// *appearance* without corrupting or losing any document data, the
+/// same "unpainted `WidgetKind` returns `Ok(vec![])` rather than
+/// erroring" honesty `paint_widget` already uses elsewhere in this
+/// codebase).
 /// Exhaustiveness matters here specifically: a wildcard `_ => Normal`
 /// arm would make a *future* `aurora_doc::BlendMode` variant compile
 /// silently into an unreviewed `Normal` fallback forever; without one,
@@ -2897,18 +2902,24 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
         aurora_doc::BlendMode::LinearLight => aurora_render::BlendMode::LinearLight,
         aurora_doc::BlendMode::PinLight => aurora_render::BlendMode::PinLight,
         aurora_doc::BlendMode::HardMix => aurora_render::BlendMode::HardMix,
+        aurora_doc::BlendMode::Hue => aurora_render::BlendMode::Hue,
+        aurora_doc::BlendMode::Saturation => aurora_render::BlendMode::Saturation,
+        aurora_doc::BlendMode::Color => aurora_render::BlendMode::Color,
+        aurora_doc::BlendMode::Luminosity => aurora_render::BlendMode::Luminosity,
         // Not yet implemented in `aurora_render::BlendMode` — real,
         // separate, still-open follow-on work, not an oversight. Each
         // named individually rather than behind a wildcard so a future
         // `aurora_render::BlendMode` addition forces this match to be
-        // revisited instead of silently staying stubbed.
+        // revisited instead of silently staying stubbed. This is the
+        // family's own explicit remainder: `Dissolve` is stochastic
+        // per-pixel selection, not a deterministic blend function at
+        // all, and `DarkerColor`/`LighterColor` compare backdrop and
+        // source by overall luminosity rather than blending them —
+        // both qualitatively different from every mode implemented so
+        // far, not just unimplemented instances of the same shape.
         aurora_doc::BlendMode::Dissolve
         | aurora_doc::BlendMode::DarkerColor
-        | aurora_doc::BlendMode::LighterColor
-        | aurora_doc::BlendMode::Hue
-        | aurora_doc::BlendMode::Saturation
-        | aurora_doc::BlendMode::Color
-        | aurora_doc::BlendMode::Luminosity => aurora_render::BlendMode::Normal,
+        | aurora_doc::BlendMode::LighterColor => aurora_render::BlendMode::Normal,
     }
 }
 
@@ -2934,21 +2945,22 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
 /// four of that layer's own tiles together when origins aren't
 /// tile-aligned.
 ///
-/// **Blend modes, real for 20 of 27**: each layer's own real
+/// **Blend modes, real for 24 of 27**: each layer's own real
 /// `blend_mode` is read here and translated via `translate_blend_mode`
 /// into `aurora_render::BlendMode` before reaching
 /// `composite_tile_cpu` — `Normal`, the 8-mode "simple separable"
 /// family (`Darken`/`Multiply`/`Lighten`/`Screen`/`Difference`/
 /// `Exclusion`/`Subtract`/`Divide`), the 4-mode "dodge and burn"
-/// family (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`), and
-/// the 7-mode "overlay and light" family (`Overlay`/`SoftLight`/
-/// `HardLight`/`VividLight`/`LinearLight`/`PinLight`/`HardMix`)
-/// composite with their own real math; the 7 remaining
-/// `aurora_doc::BlendMode` variants (non-separable
-/// `Hue`/`Saturation`/`Color`/`Luminosity`, `Dissolve`, and
-/// `DarkerColor`/`LighterColor`) still silently fall back to `Normal`
-/// at that same translation boundary — a real, separate, still-open
-/// gap, not silently glossed over.
+/// family (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`), the
+/// 7-mode "overlay and light" family (`Overlay`/`SoftLight`/
+/// `HardLight`/`VividLight`/`LinearLight`/`PinLight`/`HardMix`), and
+/// the 4-mode non-separable family (`Hue`/`Saturation`/`Color`/
+/// `Luminosity`) composite with their own real math; the 3 remaining
+/// `aurora_doc::BlendMode` variants (`Dissolve` and
+/// `DarkerColor`/`LighterColor` — this family's own explicit boundary)
+/// still silently fall back to `Normal` at that same translation
+/// boundary — a real, separate, still-open gap, not silently glossed
+/// over.
 ///
 /// **Performance, incremental but coarse**: a visible tile already
 /// current in `cache` is skipped entirely — see [`CompositeCache`]'s
@@ -3227,13 +3239,15 @@ fn read_layer_window(
 /// separable" family (`Darken`/`Multiply`/`Lighten`/`Screen`/
 /// `Difference`/`Exclusion`/`Subtract`/`Divide`), the 4-mode
 /// "dodge and burn" family (`ColorDodge`/`LinearDodge`/`ColorBurn`/
-/// `LinearBurn`), and the 7-mode "overlay and light" family
+/// `LinearBurn`), the 7-mode "overlay and light" family
 /// (`Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
-/// `PinLight`/`HardMix`) are real; the 7 remaining `aurora_doc::BlendMode`
-/// variants (non-separable `Hue`/`Saturation`/`Color`/`Luminosity`,
-/// `Dissolve`, and `DarkerColor`/`LighterColor`) still silently fall
-/// back to `Normal` at that same translation boundary. Layer groups are
-/// still never recursed into (`LayerTree::paint_order`'s own
+/// `PinLight`/`HardMix`), and the 4-mode non-separable family
+/// (`Hue`/`Saturation`/`Color`/`Luminosity`) are real; the 3 remaining
+/// `aurora_doc::BlendMode` variants (`Dissolve`, and
+/// `DarkerColor`/`LighterColor` — this family's own explicit boundary)
+/// still silently fall back to `Normal` at that same translation
+/// boundary. Layer groups are still never recursed into
+/// (`LayerTree::paint_order`'s own
 /// documented, tested scope — see
 /// `paint_order_never_includes_a_layer_nested_inside_a_group`) — both
 /// real, separate, still-open gaps this function does not attempt to
@@ -4239,17 +4253,18 @@ impl App {
     /// composite the canvas itself already shows
     /// ([`recomposite_visible_tiles`], called from [`Self::redraw`]) —
     /// no longer just the active layer's own pixels, the bug this
-    /// function used to have. Blend modes are real for `Normal` plus 19
+    /// function used to have. Blend modes are real for `Normal` plus 23
     /// of the 26 others — the "simple separable" family
     /// (`Darken`/`Multiply`/`Lighten`/`Screen`/`Difference`/`Exclusion`/
     /// `Subtract`/`Divide`), the "dodge and burn" family
-    /// (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`), and the
+    /// (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`), the
     /// "overlay and light" family (`Overlay`/`SoftLight`/`HardLight`/
-    /// `VividLight`/`LinearLight`/`PinLight`/`HardMix`), via
-    /// `translate_blend_mode` and `aurora_render::composite_tile_cpu`'s
-    /// own current scope — with the remaining 7 `aurora_doc::BlendMode`
-    /// variants (non-separable Hue/Saturation/Color/Luminosity,
-    /// Dissolve, DarkerColor/LighterColor) still
+    /// `VividLight`/`LinearLight`/`PinLight`/`HardMix`), and the
+    /// non-separable family (`Hue`/`Saturation`/`Color`/`Luminosity`),
+    /// via `translate_blend_mode` and `aurora_render::composite_tile_cpu`'s
+    /// own current scope — with the remaining 3 `aurora_doc::BlendMode`
+    /// variants (`Dissolve`, `DarkerColor`/`LighterColor` — this
+    /// family's own explicit boundary) still
     /// silently falling back to `Normal`. Also still never recurses into
     /// layer groups for paint order (`aurora_doc::LayerTree::paint_order`'s
     /// own documented scope) — both real, separate, still-open gaps,
@@ -8066,6 +8081,78 @@ mod tests {
                 "Overlay of backdrop 0.25 by source 0.75 must yield 0.375, not the Normal (0.75), Multiply (0.1875), or ColorDodge (1.0) result"
             );
         }
+    }
+
+    #[test]
+    // Same shape as the Multiply/ColorDodge/Overlay tests above,
+    // retargeted at `BlendMode::Luminosity` -- one of the 4
+    // non-separable modes added this round, proving the real per-layer
+    // blend mode set on a `LayerTree` layer reaches `translate_blend_mode`
+    // and `aurora_render::composite_tile_cpu`'s own `blend_rgb` path
+    // through the export path, not just that `Luminosity`'s own formula
+    // is correct in isolation (already covered by `aurora-render`'s own
+    // `composite_tile_cpu_luminosity_matches_the_worked_example`). Uses
+    // this round's own worked example: backdrop (bottom) 50% grey,
+    // source (top) pure red. Bottom composites first over transparent
+    // black and reproduces itself exactly: (0.5, 0.5, 0.5, 1.0). Top
+    // then composites over that with `Luminosity`, and since both
+    // layers are fully opaque at full layer opacity (`as = ab = 1.0`),
+    // the general formula reduces to exactly `B(Cb, Cs) =
+    // Luminosity(Cb, Cs) = SetLum(Cb, Lum(Cs))`: `Lum(Cs) = 0.3`, `d =
+    // 0.3 - 0.5 = -0.2`, `C' = (0.3, 0.3, 0.3)`, already in gamut ->
+    // (0.3, 0.3, 0.3, 1.0). A Normal blend of the same two layers would
+    // instead just reproduce the top layer unchanged (1.0, 0.0, 0.0,
+    // 1.0) -- clearly different from Luminosity's own (0.3, 0.3, 0.3),
+    // so this genuinely distinguishes "Luminosity was read and applied"
+    // from "blend mode was silently ignored" (which would fall back to
+    // `Normal` at the `translate_blend_mode` boundary, exactly as it
+    // did before this round). Epsilon tolerance, not exact equality:
+    // the W3C spec's own `Lum` weights (0.3/0.59/0.11) aren't exact
+    // binary fractions, so `aurora-render`'s own
+    // `composite_tile_cpu_luminosity_matches_the_worked_example` and
+    // this integration test both use the same `1e-3` tolerance rather
+    // than `assert_eq!`.
+    fn composite_document_blends_two_layers_luminosity_blend_matching_the_hand_computed_result() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Luminosity) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [0.5, 0.5, 0.5, 1.0]), (top, [1.0, 0.0, 0.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let [r, g, b, a] = image_pixel(&image, 0, 0);
+        let epsilon = 1e-3;
+        assert!(
+            (r - 0.3).abs() < epsilon && (g - 0.3).abs() < epsilon && (b - 0.3).abs() < epsilon,
+            "Luminosity of backdrop (0.5,0.5,0.5) by source (1,0,0) must land near (0.3, 0.3, 0.3), got ({r}, {g}, {b})"
+        );
+        assert!((a - 1.0).abs() < epsilon);
     }
 
     #[test]

@@ -26,9 +26,12 @@ const LABEL: &str = "composite";
 ///
 /// `aurora-app`'s `translate_blend_mode` maps a real
 /// `aurora_doc::BlendMode` onto this one, one implemented variant at a
-/// time, falling every one of the ~14 not-yet-implemented modes back to
-/// [`Self::Normal`] as an honest, documented degrade — not a bug, since
-/// those modes' real math is separate, still-open follow-on work.
+/// time, falling every one of the 3 not-yet-implemented modes
+/// (`Dissolve`, `DarkerColor`, `LighterColor` — this family's own
+/// explicit remainder, see [`composite_tile_cpu`]'s own doc comment)
+/// back to [`Self::Normal`] as an honest, documented degrade — not a
+/// bug, since those modes' real math is separate, still-open follow-on
+/// work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendMode {
     #[default]
@@ -52,6 +55,14 @@ pub enum BlendMode {
     LinearLight,
     PinLight,
     HardMix,
+    // -- Non-separable modes (this round): each is a function of the
+    // whole (R,G,B) triple, not a per-channel function of one channel in
+    // isolation -- see `blend_rgb` below, not `blend_channel`, for their
+    // real math.
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
 
 /// `SoftLight`'s own `D(x)` helper (W3C Compositing and Blending Level 1),
@@ -99,6 +110,15 @@ fn soft_light_d(x: f32) -> f32 {
 // bit-exact through `f16`, confirmed by `spike/FINDINGS.md`), and the
 // spec requires exactly these two literals, not an epsilon band.
 #[allow(clippy::float_cmp)]
+// `clippy::match_same_arms` wants the `Hue`/`Saturation`/`Color`/
+// `Luminosity` arm merged into the literal `Normal` arm above (both
+// return `cs`) -- rejected deliberately, the same reasoning
+// `aurora-app`'s own `translate_blend_mode` already documents for its
+// own identical-bodied arms: collapsing them would blur "this is
+// Normal's own real mapping" from "this mode has no per-channel mapping
+// at all, and this arm exists purely for exhaustiveness", even though
+// both currently produce the same value.
+#[allow(clippy::match_same_arms)]
 fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
     match mode {
         BlendMode::Normal => cs,
@@ -211,6 +231,234 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
                 cb + (2.0 * cs - 1.0) * (soft_light_d(cb) - cb)
             }
         }
+        // `Hue`/`Saturation`/`Color`/`Luminosity` are non-separable --
+        // no per-channel value of `B(Cb,Cs)` can express a property of
+        // a whole colour (see this function's own module-level doc
+        // comment, and `blend_rgb`'s own doc comment, for why). Named
+        // individually rather than folded into a wildcard so the match
+        // stays exhaustive (the same discipline `aurora-app`'s own
+        // `translate_blend_mode` already uses), but
+        // [`blend_rgb`] intercepts all 4 before ever reaching this
+        // function, so these arms are never actually exercised by any
+        // real caller in this crate -- they exist purely so this match
+        // still compiles against the shared, now-24-variant
+        // [`BlendMode`] enum. Each degrades to the same pass-through
+        // `cs` the `Normal` arm above already returns, rather than
+        // introducing a new path that could panic if some future
+        // caller ever did reach this function directly with one of
+        // these 4 modes -- the same "honest fallback over panicking"
+        // discipline `aurora-app`'s own `translate_blend_mode` already
+        // uses at its own translation boundary for these same 4 modes.
+        BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity => cs,
+    }
+}
+
+/// `Lum(C)`, the W3C Compositing and Blending Level 1 spec's own
+/// luminance weighting for exactly this family of blend modes:
+/// `0.3*r + 0.59*g + 0.11*b` — NTSC-luma-style weights, **not**
+/// `aurora_color`'s WCAG relative-luminance weights (`0.2126`/`0.7152`/
+/// `0.0722`) already used elsewhere in this codebase for contrast
+/// checking. A different, unrelated weighting the spec defines
+/// specifically for `Hue`/`Saturation`/`Color`/`Luminosity` below — not
+/// interchangeable with, and not to be confused with, that other one.
+#[must_use]
+// Single-letter names (`c`, `r`/`g`/`b`) throughout this helper and its
+// siblings below (`sat`, `clip_color`, `set_lum`, `set_sat`) are the
+// W3C spec's own literal variable names -- kept as-is so the code reads
+// side-by-side against the spec text quoted in each doc comment, rather
+// than renamed to something clippy would consider more descriptive but
+// that no longer lines up with the source of truth.
+#[allow(clippy::many_single_char_names)]
+fn lum(c: [f32; 3]) -> f32 {
+    let [r, g, b] = c;
+    0.3 * r + 0.59 * g + 0.11 * b
+}
+
+/// `Sat(C) = max(r,g,b) - min(r,g,b)`, the W3C spec's own saturation
+/// measure for this family of blend modes.
+#[must_use]
+fn sat(c: [f32; 3]) -> f32 {
+    let [r, g, b] = c;
+    r.max(g).max(b) - r.min(g).min(b)
+}
+
+/// `ClipColor(C)`, the W3C spec's own gamut-remapping step: `SetLum`
+/// shifts every channel by the same additive delta to hit a target
+/// luminance, which can push a channel outside `0.0..=1.0`; this pulls
+/// it back in while preserving that luminance exactly. Two independent
+/// clip conditions, in the spec's own literal order — `n < 0` (a
+/// channel went negative) applied first, then `x > 1` (a channel
+/// overshot `1.0`) applied to *that* branch's own result, not to the
+/// original `c` — both may fire on the same input (see `blend_color`'s
+/// own worked example in this module's tests, where only the `x > 1`
+/// branch fires, and the module-level doc comment on this file's own
+/// non-separable-mode tests for one where neither does). `l`, `n`, and
+/// `x` are each computed once from the original input before either
+/// branch runs; only the three channel values themselves carry forward
+/// from the first branch into the second.
+#[must_use]
+#[allow(clippy::many_single_char_names)]
+fn clip_color(c: [f32; 3]) -> [f32; 3] {
+    let l = lum(c);
+    let [r, g, b] = c;
+    let n = r.min(g).min(b);
+    let x = r.max(g).max(b);
+    let [r, g, b] = if n < 0.0 {
+        [
+            l + (r - l) * l / (l - n),
+            l + (g - l) * l / (l - n),
+            l + (b - l) * l / (l - n),
+        ]
+    } else {
+        [r, g, b]
+    };
+    if x > 1.0 {
+        [
+            l + (r - l) * (1.0 - l) / (x - l),
+            l + (g - l) * (1.0 - l) / (x - l),
+            l + (b - l) * (1.0 - l) / (x - l),
+        ]
+    } else {
+        [r, g, b]
+    }
+}
+
+/// `SetLum(C, l)`: shifts `C` by the same additive delta on every
+/// channel so its own [`lum`] becomes exactly `l`, then [`clip_color`]s
+/// the (possibly now out-of-gamut) result back into range.
+#[must_use]
+#[allow(clippy::many_single_char_names)]
+fn set_lum(c: [f32; 3], l: f32) -> [f32; 3] {
+    let d = l - lum(c);
+    let [r, g, b] = c;
+    clip_color([r + d, g + d, b + d])
+}
+
+/// `SetSat(C, s)`: reassigns `C`'s own [`sat`] to `s` while preserving
+/// which channel is largest/smallest. The W3C spec states this as a
+/// three-branch, channel-*identifying* algorithm ("find whichever
+/// channel currently holds the max/mid/min value, assign each a
+/// different expression, reassemble in R/G/B order"); this instead
+/// applies one formula, `(v - min) * s / (max - min)`, to every channel
+/// `v` directly, whichever R/G/B position it happens to occupy — no
+/// explicit identification or reassembly step. These are algebraically
+/// the same function: substituting `v = max` gives exactly `s` (the
+/// spec's own `Cmax = s`), `v = min` gives exactly `0` (the spec's own
+/// `Cmin = 0`), and `v = mid` gives exactly `(Cmid - Cmin) * s /
+/// (Cmax - Cmin)` (the spec's own `Cmid` formula) — so running the one
+/// formula across all three channels reproduces the spec's three
+/// per-role assignments without ever needing to know which channel
+/// holds which role. Proved numerically against the spec's own literal
+/// three-branch form for several inputs, including one where the
+/// max/mid/min channels are not in R/G/B order, by
+/// `set_sat_matches_the_specs_explicit_max_mid_min_form` below — the
+/// same "simplify, then prove the simplification numerically"
+/// discipline `blend_channel`'s own `LinearLight` arm already uses in
+/// this file.
+///
+/// `max == min` (every channel equal — a fully achromatic input, the
+/// only case where `Cmax > Cmin` is false) divides by zero in that
+/// formula; guarded explicitly to return `(0.0, 0.0, 0.0)`, matching
+/// the spec's own `else` branch — there is no "direction" to
+/// redistribute saturation into an achromatic colour, so zeroing every
+/// channel is the spec's own defined behaviour here, not a bug.
+#[must_use]
+#[allow(clippy::many_single_char_names)]
+fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
+    let [r, g, b] = c;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    if max > min {
+        let scale = s / (max - min);
+        [(r - min) * scale, (g - min) * scale, (b - min) * scale]
+    } else {
+        [0.0, 0.0, 0.0]
+    }
+}
+
+/// The 4 non-separable blend functions, character for character the
+/// W3C spec's own definitions in terms of [`set_lum`]/[`set_sat`]/
+/// [`lum`]/[`sat`] above. Unlike every [`blend_channel`] arm, each of
+/// these needs the whole `(R,G,B)` triple of both backdrop and source
+/// at once — `Hue`/`Saturation`/`Color`/`Luminosity` are properties of
+/// a whole colour, not of one channel in isolation, so no per-channel
+/// formula can express them.
+#[must_use]
+fn blend_hue(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
+    set_lum(set_sat(cs, sat(cb)), lum(cb))
+}
+
+#[must_use]
+fn blend_saturation(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
+    set_lum(set_sat(cb, sat(cs)), lum(cb))
+}
+
+#[must_use]
+fn blend_color(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
+    set_lum(cs, lum(cb))
+}
+
+#[must_use]
+fn blend_luminosity(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
+    set_lum(cb, lum(cs))
+}
+
+/// The whole-triple counterpart of [`blend_channel`]: `B(Cb, Cs)` for
+/// `mode`, given the backdrop's and source's own full `(R,G,B)` triples
+/// rather than one channel each. Exists because the 4 non-separable
+/// modes ([`blend_hue`], [`blend_saturation`], [`blend_color`],
+/// [`blend_luminosity`]) genuinely cannot be expressed as
+/// [`blend_channel`]'s own per-channel signature — every one of the 20
+/// separable modes, by contrast, delegates straight back to
+/// [`blend_channel`] three times, once per channel, unchanged from
+/// before this function existed: [`composite_tile_cpu`] below now calls
+/// this once per texel instead of calling [`blend_channel`] three
+/// times, but for those 20 modes the actual arithmetic performed is
+/// identical, so their own results are bit-for-bit unchanged (see this
+/// file's own
+/// `composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey`-
+/// style tests, re-asserted after this refactor with no changes to
+/// their expected values).
+///
+/// Deliberately an exhaustive match, no wildcard arm, for the same
+/// reason `aurora-app`'s own `translate_blend_mode` gives for its own
+/// exhaustive match: a future [`BlendMode`] addition should force this
+/// function to be revisited, not silently fall through some default.
+#[must_use]
+fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
+    match mode {
+        BlendMode::Hue => blend_hue(cb, cs),
+        BlendMode::Saturation => blend_saturation(cb, cs),
+        BlendMode::Color => blend_color(cb, cs),
+        BlendMode::Luminosity => blend_luminosity(cb, cs),
+        BlendMode::Normal
+        | BlendMode::Darken
+        | BlendMode::Multiply
+        | BlendMode::Lighten
+        | BlendMode::Screen
+        | BlendMode::Difference
+        | BlendMode::Exclusion
+        | BlendMode::Subtract
+        | BlendMode::Divide
+        | BlendMode::ColorDodge
+        | BlendMode::LinearDodge
+        | BlendMode::ColorBurn
+        | BlendMode::LinearBurn
+        | BlendMode::Overlay
+        | BlendMode::SoftLight
+        | BlendMode::HardLight
+        | BlendMode::VividLight
+        | BlendMode::LinearLight
+        | BlendMode::PinLight
+        | BlendMode::HardMix => {
+            let [br, bg, bb] = cb;
+            let [sr, sg, sb] = cs;
+            [
+                blend_channel(mode, br, sr),
+                blend_channel(mode, bg, sg),
+                blend_channel(mode, bb, sb),
+            ]
+        }
     }
 }
 
@@ -235,7 +483,7 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
 /// Per texel, per RGB channel: `Co = (1-as)*Cb + as*[(1-ab)*Cs +
 /// ab*B(Cb,Cs)]`, where `Cb`/`Cs` are the backdrop/source channel,
 /// `as = src_a * opacity` (clamped to `0.0..=1.0`), `ab` is the
-/// backdrop's own alpha, and `B` is [`blend_channel`]'s own per-mode
+/// backdrop's own alpha, and `B` is `blend_channel`'s own per-mode
 /// function. The alpha channel itself is blend-mode-independent:
 /// `result_a = as + dst_a * (1 - as)`, unchanged from before blend
 /// modes existed and the same formula [`TileCompositor::composite_over`]'s
@@ -258,7 +506,7 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
 /// exactly matching what a document with no visible pixel layers should
 /// show.
 ///
-/// **Scope, stated honestly**: [`BlendMode`] implements 20 of
+/// **Scope, stated honestly**: [`BlendMode`] implements 24 of
 /// `aurora_doc::BlendMode`'s real 27 variants — `Normal`, the
 /// "simple separable" family (`Darken`, `Multiply`, `Lighten`,
 /// `Screen`, `Difference`, `Exclusion`, `Subtract`, `Divide`), each a
@@ -267,17 +515,23 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
 /// family (`ColorDodge`, `LinearDodge`, `ColorBurn`, `LinearBurn`),
 /// each also a pure per-channel function but with real 0/1 edge-case
 /// branches (division by a zero or saturated channel must not produce
-/// `NaN`/`Infinity`), and the "overlay and light" family (`Overlay`,
+/// `NaN`/`Infinity`), the "overlay and light" family (`Overlay`,
 /// `SoftLight`, `HardLight`, `VividLight`, `LinearLight`, `PinLight`,
 /// `HardMix`), each a source-or-backdrop-midpoint-branching function
 /// that (`SoftLight` aside) composes directly from the two families
-/// above rather than needing new math of its own. The remaining 7
-/// (the non-separable `Hue`/`Saturation`/`Color`/`Luminosity`;
-/// `Dissolve`; and `DarkerColor`/`LighterColor`) are separate,
-/// still-open follow-on work — a layer using one of those falls back
-/// to `Normal` at the
-/// `aurora-app` translation boundary (`translate_blend_mode`), not
-/// here. This is a CPU implementation specifically because the
+/// above rather than needing new math of its own, and the
+/// non-separable family (`Hue`, `Saturation`, `Color`, `Luminosity`),
+/// each a whole-`(R,G,B)`-triple function via `blend_rgb` rather
+/// than `blend_channel` (see that function's own doc comment for
+/// why). The remaining 3 (`Dissolve`, stochastic per-pixel selection
+/// rather than a deterministic blend function at all; and
+/// `DarkerColor`/`LighterColor`, which compare backdrop and source by
+/// overall luminosity rather than blending them) are this family's own
+/// explicit boundary — qualitatively different from every mode
+/// implemented so far, separate, still-open follow-on work. A layer
+/// using one of those 3 falls back to `Normal` at the `aurora-app`
+/// translation boundary (`translate_blend_mode`), not here. This is a
+/// CPU implementation specifically because the
 /// orchestration crate (`aurora-app`) needs to run it per visible tile,
 /// per layer, every time any constituent layer changes —
 /// GPU-accelerated multi-layer compositing (reusing [`TileCompositor`]
@@ -298,12 +552,14 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
             let inverse = 1.0 - alpha;
             let backdrop_alpha = da.to_f32();
             let backdrop_inverse = 1.0 - backdrop_alpha;
-            let blended_r = backdrop_inverse * sr.to_f32()
-                + backdrop_alpha * blend_channel(mode, dr.to_f32(), sr.to_f32());
-            let blended_g = backdrop_inverse * sg.to_f32()
-                + backdrop_alpha * blend_channel(mode, dg.to_f32(), sg.to_f32());
-            let blended_b = backdrop_inverse * sb.to_f32()
-                + backdrop_alpha * blend_channel(mode, db.to_f32(), sb.to_f32());
+            let [br, bg, bb] = blend_rgb(
+                mode,
+                [dr.to_f32(), dg.to_f32(), db.to_f32()],
+                [sr.to_f32(), sg.to_f32(), sb.to_f32()],
+            );
+            let blended_r = backdrop_inverse * sr.to_f32() + backdrop_alpha * br;
+            let blended_g = backdrop_inverse * sg.to_f32() + backdrop_alpha * bg;
+            let blended_b = backdrop_inverse * sb.to_f32() + backdrop_alpha * bb;
             *dr = f16::from_f32(inverse * dr.to_f32() + alpha * blended_r);
             *dg = f16::from_f32(inverse * dg.to_f32() + alpha * blended_g);
             *db = f16::from_f32(inverse * db.to_f32() + alpha * blended_b);
@@ -483,7 +739,10 @@ impl std::fmt::Debug for TileCompositor {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlendMode, TileCompositor, blend_channel, composite_tile_cpu, soft_light_d};
+    use super::{
+        BlendMode, TileCompositor, blend_channel, blend_color, blend_hue, blend_luminosity,
+        blend_saturation, clip_color, composite_tile_cpu, lum, sat, set_lum, set_sat, soft_light_d,
+    };
     use crate::test_support::real_context;
     use aurora_tile::{SAMPLES, TILE};
     use half::f16;
@@ -1642,5 +1901,360 @@ mod tests {
             1,
             "a second call with the same key must not rebuild"
         );
+    }
+
+    // -- Non-separable blend modes (this round): `Hue`, `Saturation`,
+    // `Color`, `Luminosity`, each a function of the whole `(R,G,B)`
+    // triple via `blend_hue`/`blend_saturation`/`blend_color`/
+    // `blend_luminosity` and dispatched through `blend_rgb` --
+    // `blend_channel`'s own per-channel signature cannot express them.
+    // Unlike every prior round's tests in this file, the W3C spec's own
+    // weights (0.3/0.59/0.11) are not exact binary fractions, so exact
+    // `assert_eq!` isn't achievable here; `assert_close`/
+    // `assert_texel_close` below use a small epsilon instead -- a
+    // deliberate, reasoned exception to this file's otherwise bit-exact
+    // test discipline (the same real floating-point/precision-limit
+    // reasoning `aurora_testkit::compare_to_golden`'s own tolerance
+    // already uses elsewhere in this codebase), not a lowering of
+    // rigor. `1e-3` is roughly `f16`'s own precision at these
+    // magnitudes.
+
+    /// Epsilon-tolerance comparison of an `[f32; 3]` triple, used by
+    /// every non-separable-mode test below.
+    fn assert_close(actual: [f32; 3], expected: [f32; 3], epsilon: f32) {
+        let [ar, ag, ab] = actual;
+        let [er, eg, eb] = expected;
+        assert!(
+            (ar - er).abs() < epsilon && (ag - eg).abs() < epsilon && (ab - eb).abs() < epsilon,
+            "expected {expected:?} within {epsilon}, got {actual:?}"
+        );
+    }
+
+    /// Epsilon-tolerance comparison of a whole texel's own `(r,g,b,a)`,
+    /// the [`assert_close`] above's sibling for tests that go through
+    /// [`composite_tile_cpu`]'s full per-texel path rather than calling
+    /// a blend function directly.
+    fn assert_texel_close(
+        actual: (f32, f32, f32, f32),
+        expected: (f32, f32, f32, f32),
+        epsilon: f32,
+    ) {
+        let (ar, ag, ab, aa) = actual;
+        let (er, eg, eb, ea) = expected;
+        assert!(
+            (ar - er).abs() < epsilon
+                && (ag - eg).abs() < epsilon
+                && (ab - eb).abs() < epsilon
+                && (aa - ea).abs() < epsilon,
+            "expected {expected:?} within {epsilon}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn lum_uses_the_specs_own_ntsc_weighted_average_not_wcag_weights() {
+        // Isolate each weight via a pure primary, then a mixed case --
+        // confirms these are the spec's own 0.3/0.59/0.11, not
+        // `aurora_color`'s own WCAG 0.2126/0.7152/0.0722 weights used
+        // elsewhere in this codebase for contrast checking.
+        assert!((lum([1.0, 0.0, 0.0]) - 0.3).abs() < 1e-6);
+        assert!((lum([0.0, 1.0, 0.0]) - 0.59).abs() < 1e-6);
+        assert!((lum([0.0, 0.0, 1.0]) - 0.11).abs() < 1e-6);
+        assert!((lum([0.6, 0.3, 0.1]) - 0.368).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sat_is_the_max_minus_min_channel() {
+        assert!((sat([0.6, 0.3, 0.1]) - 0.5).abs() < 1e-6);
+        assert!((sat([0.2, 0.8, 0.5]) - 0.6).abs() < 1e-6);
+        assert!(
+            sat([0.4, 0.4, 0.4]).abs() < 1e-6,
+            "an achromatic triple has zero saturation"
+        );
+    }
+
+    #[test]
+    fn clip_color_leaves_an_in_gamut_color_unchanged() {
+        let c = [0.3, 0.5, 0.7];
+        assert_close(clip_color(c), c, 1e-6);
+    }
+
+    #[test]
+    // Only the `n < 0` branch fires: min channel is -0.2, max channel
+    // is 0.9 (in [0,1], so the `x > 1` branch does not fire).
+    // Independently computed via a from-scratch Python
+    // re-implementation of the spec (not this crate's own Rust code).
+    // The min channel must land at exactly 0 -- a general property of
+    // this branch, since `n + (n-l)*l/(l-n)... ` reduces to `0` for the
+    // channel equal to `n` itself -- and luminance must be preserved
+    // exactly; both checked directly, not just the raw output values.
+    fn clip_color_pulls_a_negative_channel_up_to_zero_preserving_luminance() {
+        let c = [-0.2, 0.5, 0.9];
+        let result = clip_color(c);
+        assert_close(result, [0.0, 0.437_827_7, 0.688_015], 1e-3);
+        assert!(
+            (lum(result) - lum(c)).abs() < 1e-3,
+            "ClipColor must preserve luminance exactly"
+        );
+    }
+
+    #[test]
+    // Only the `x > 1` branch fires -- exactly the input
+    // `set_lum_shifts_and_clips_matching_the_worked_color_example`
+    // below produces internally (`SetLum(Cs=(1,0,0), l=0.5)` computes
+    // `C'=(1.2,0.2,0.2)` before clipping).
+    fn clip_color_pulls_an_overshot_channel_down_to_one_preserving_luminance() {
+        let c = [1.2, 0.2, 0.2];
+        let result = clip_color(c);
+        assert_close(result, [1.0, 2.0 / 7.0, 2.0 / 7.0], 1e-3);
+        assert!((lum(result) - lum(c)).abs() < 1e-3);
+    }
+
+    #[test]
+    // Both branches fire on the same input: the `n < 0` branch (per
+    // the spec's own literal order) runs first, and the `x > 1` branch
+    // then runs on *that* branch's own already-updated channel values,
+    // not the original `c` -- `clip_color`'s own doc comment names this
+    // ordering explicitly. Independently computed via Python.
+    fn clip_color_applies_both_branches_in_the_specs_own_order_when_both_fire() {
+        let c = [-0.5, 0.9, 1.3];
+        let result = clip_color(c);
+        assert_close(result, [0.202_577, 0.642_022, 0.767_578], 1e-3);
+        assert!((lum(result) - lum(c)).abs() < 1e-3);
+    }
+
+    #[test]
+    // Cb=(0.5,0.5,0.5), target l=Lum(Cs=(1,0,0))=0.3: d=-0.2,
+    // C'=(0.3,0.3,0.3), already in gamut -- no clipping needed.
+    fn set_lum_shifts_and_clips_matching_the_worked_luminosity_example() {
+        assert_close(set_lum([0.5, 0.5, 0.5], 0.3), [0.3, 0.3, 0.3], 1e-3);
+    }
+
+    #[test]
+    // Cs=(1,0,0), target l=Lum(Cb=(0.5,0.5,0.5))=0.5: d=0.2,
+    // C'=(1.2,0.2,0.2), clipped by `ClipColor`'s own `x > 1` branch
+    // down to (1.0, 2/7, 2/7) -- this round's own worked `Color`
+    // example.
+    fn set_lum_shifts_and_clips_matching_the_worked_color_example() {
+        assert_close(
+            set_lum([1.0, 0.0, 0.0], 0.5),
+            [1.0, 2.0 / 7.0, 2.0 / 7.0],
+            1e-3,
+        );
+    }
+
+    #[test]
+    // The task's own worked non-R/G/B-order example: for C=(0.2, 0.8,
+    // 0.5), max is G (0.8), mid is B (0.5), min is R (0.2) -- the "max"
+    // role is held by the *middle* array slot, not the first, proving
+    // `set_sat`'s channel handling is genuinely value-based rather than
+    // accidentally tied to array position. scale = s/(max-min) =
+    // 0.6/(0.8-0.2) = 1.0; R (min) -> 0, G (max) -> s = 0.6, B (mid) ->
+    // (0.5-0.2)*1.0 = 0.3.
+    fn set_sat_reassigns_saturation_when_the_max_mid_min_order_is_not_r_g_b() {
+        assert_close(set_sat([0.2, 0.8, 0.5], 0.6), [0.0, 0.6, 0.3], 1e-6);
+    }
+
+    #[test]
+    // The spec's own defined degenerate case: an achromatic (all-equal)
+    // input has no "direction" to redistribute saturation into, so
+    // every channel becomes exactly 0, regardless of `s` -- the spec's
+    // own `else` branch, not a bug to special-case around. `set_sat`'s
+    // own achromatic arm returns the literal `[0.0, 0.0, 0.0]` array,
+    // not an accumulated-rounding-error value, so an exact comparison
+    // is the right check here -- the same reasoning `blend_channel`'s
+    // own `float_cmp` allow already documents.
+    #[allow(clippy::float_cmp)]
+    fn set_sat_of_an_equal_channel_input_is_pure_zero() {
+        assert_eq!(set_sat([0.4, 0.4, 0.4], 0.6), [0.0, 0.0, 0.0]);
+        assert_eq!(set_sat([0.0, 0.0, 0.0], 1.0), [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    // Proves `set_sat`'s own single-formula shape against the W3C
+    // spec's literal three-branch, channel-*identifying* form -- the
+    // same "simplify, then prove the simplification numerically"
+    // discipline `blend_channel`'s own `LinearLight` arm already uses
+    // in this file (see
+    // `linear_light_simplified_form_matches_the_branch_form_for_several_inputs`).
+    // The spec form here is computed via a completely independent
+    // method (sort the three channels by value to find which R/G/B
+    // slot holds the max/mid/min role, then assign each its own spec
+    // expression and reassemble) -- not by calling or mirroring any
+    // part of `set_sat`'s own implementation. Covers an R/G/B-ordered
+    // input, a not-R/G/B-ordered input, and two tie cases (a max/mid
+    // tie and a mid/min tie) -- ties are provably safe for this
+    // simplification (see `set_sat`'s own doc comment) since the
+    // formula gives the same value to both tied channels either way.
+    fn set_sat_matches_the_specs_explicit_max_mid_min_form_for_several_inputs() {
+        let cases: [([f32; 3], f32); 4] = [
+            ([0.6, 0.3, 0.1], 0.5), // max=R, mid=G, min=B: R/G/B order
+            ([0.2, 0.8, 0.5], 0.6), // max=G, mid=B, min=R: not R/G/B order
+            ([0.9, 0.9, 0.1], 0.4), // a max/mid tie
+            ([0.5, 0.2, 0.2], 0.3), // a mid/min tie
+        ];
+        for (c, s) in cases {
+            let [r, g, b] = c;
+            let mut channels = [("r", r), ("g", g), ("b", b)];
+            channels.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let (min_name, min_v) = channels[0];
+            let (mid_name, mid_v) = channels[1];
+            let (max_name, max_v) = channels[2];
+            let assign = |name: &str| -> f32 {
+                if max_v <= min_v || name == min_name {
+                    0.0
+                } else if name == mid_name {
+                    (mid_v - min_v) * s / (max_v - min_v)
+                } else {
+                    debug_assert_eq!(name, max_name);
+                    s
+                }
+            };
+            let expected = [assign("r"), assign("g"), assign("b")];
+            assert_close(set_sat(c, s), expected, 1e-6);
+        }
+    }
+
+    #[test]
+    // Luminosity(Cb=(0.5,0.5,0.5), Cs=(1,0,0)), this round's own worked
+    // example: Lum(Cb)=0.5, Lum(Cs)=0.3, d=-0.2, C'=(0.3,0.3,0.3),
+    // already in gamut -> exactly (0.3, 0.3, 0.3).
+    fn composite_tile_cpu_luminosity_matches_the_worked_example() {
+        let bottom = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let top = solid_texels([1.0, 0.0, 0.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Luminosity),
+        ]);
+        assert_texel_close(first_texel(&out), (0.3, 0.3, 0.3, 1.0), 1e-3);
+    }
+
+    #[test]
+    // Color(Cb=(0.5,0.5,0.5), Cs=(1,0,0)): SetLum(Cs, l=0.5), d=0.2,
+    // C'=(1.2,0.2,0.2), clipped by ClipColor's own `x > 1` branch to
+    // (1.0, 2/7, 2/7).
+    fn composite_tile_cpu_color_matches_the_worked_example() {
+        let bottom = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let top = solid_texels([1.0, 0.0, 0.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Color),
+        ]);
+        assert_texel_close(first_texel(&out), (1.0, 2.0 / 7.0, 2.0 / 7.0, 1.0), 1e-3);
+    }
+
+    #[test]
+    // Saturation and Hue both degenerate to plain gray for this
+    // specific input, because Cb=(0.5,0.5,0.5) is perfectly achromatic
+    // (Sat(Cb)=0): `set_sat`'s own degenerate case
+    // (`set_sat_of_an_equal_channel_input_is_pure_zero`) makes
+    // `SetSat(Cb, s)` for *any* `s` collapse to `(0,0,0)` when `Cb`
+    // itself is achromatic, and `SetLum((0,0,0), 0.5)` then yields
+    // `(0.5, 0.5, 0.5)`.
+    fn composite_tile_cpu_saturation_matches_the_worked_example() {
+        let bottom = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let top = solid_texels([1.0, 0.0, 0.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Saturation),
+        ]);
+        assert_texel_close(first_texel(&out), (0.5, 0.5, 0.5, 1.0), 1e-3);
+    }
+
+    #[test]
+    fn composite_tile_cpu_hue_matches_the_worked_example() {
+        let bottom = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let top = solid_texels([1.0, 0.0, 0.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Hue),
+        ]);
+        assert_texel_close(first_texel(&out), (0.5, 0.5, 0.5, 1.0), 1e-3);
+    }
+
+    // -- General (non-degenerate) cases for all 4 non-separable modes,
+    // all three channels genuinely different in both Cb and Cs:
+    // Cb=(0.6,0.3,0.1), Cs=(0.2,0.5,0.9). Independently computed via a
+    // from-scratch Python re-implementation of the W3C spec (not by
+    // trusting this crate's own Rust output): Lum(Cb)=0.368,
+    // Lum(Cs)=0.454, Sat(Cb)=0.5, Sat(Cs)=0.7. Calls the blend
+    // functions directly (not through `composite_tile_cpu`) so no
+    // `f16` round-trip of these non-dyadic inputs adds a second source
+    // of imprecision on top of the spec's own non-dyadic weights.
+
+    #[test]
+    // d = Lum(Cs) - Lum(Cb) = 0.454 - 0.368 = 0.086; Cb + d stays in
+    // [0,1] on every channel, so no clipping fires: (0.686, 0.386,
+    // 0.186).
+    fn blend_luminosity_matches_an_independently_computed_general_case() {
+        let cb = [0.6, 0.3, 0.1];
+        let cs = [0.2, 0.5, 0.9];
+        assert_close(blend_luminosity(cb, cs), [0.686, 0.386, 0.186], 1e-3);
+    }
+
+    #[test]
+    // d = Lum(Cb) - Lum(Cs) = 0.368 - 0.454 = -0.086; Cs + d stays in
+    // [0,1] on every channel, so no clipping fires: (0.114, 0.414,
+    // 0.814).
+    fn blend_color_matches_an_independently_computed_general_case() {
+        let cb = [0.6, 0.3, 0.1];
+        let cs = [0.2, 0.5, 0.9];
+        assert_close(blend_color(cb, cs), [0.114, 0.414, 0.814], 1e-3);
+    }
+
+    #[test]
+    // SetSat(Cb, Sat(Cs)=0.7) then SetLum(..., Lum(Cb)=0.368):
+    // (0.686567..., 0.274627..., 0.0).
+    fn blend_saturation_matches_an_independently_computed_general_case() {
+        let cb = [0.6, 0.3, 0.1];
+        let cs = [0.2, 0.5, 0.9];
+        assert_close(blend_saturation(cb, cs), [0.686_567, 0.274_627, 0.0], 1e-3);
+    }
+
+    #[test]
+    // SetSat(Cs, Sat(Cb)=0.5) then SetLum(..., Lum(Cb)=0.368):
+    // (0.186571..., 0.400857..., 0.686571...).
+    fn blend_hue_matches_an_independently_computed_general_case() {
+        let cb = [0.6, 0.3, 0.1];
+        let cs = [0.2, 0.5, 0.9];
+        assert_close(blend_hue(cb, cs), [0.186_571, 0.400_857, 0.686_571], 1e-3);
+    }
+
+    #[test]
+    // Regression check for the `blend_rgb` refactor: re-asserts a
+    // handful of already-landed separable-mode values (Multiply,
+    // Overlay, ColorDodge -- one from each of the three previously
+    // added families) unchanged now that `composite_tile_cpu`'s inner
+    // loop calls `blend_rgb` once per texel instead of calling
+    // `blend_channel` three times directly. `blend_rgb`'s own
+    // separable-mode arm just delegates back to `blend_channel` per
+    // channel, unchanged, so these must remain bit-for-bit identical to
+    // the values already proven (before this round) by
+    // `composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey`,
+    // `composite_tile_cpu_overlay_uses_the_direct_multiply_form_when_the_backdrop_is_at_or_below_half`,
+    // and
+    // `composite_tile_cpu_color_dodge_computes_the_clamped_per_channel_ratio`.
+    fn composite_tile_cpu_separable_modes_are_bit_identical_after_the_blend_rgb_refactor() {
+        let grey = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&grey, 1.0, BlendMode::Normal),
+            (&grey, 1.0, BlendMode::Multiply),
+        ]);
+        assert_eq!(first_texel(&out), (0.25, 0.25, 0.25, 1.0));
+
+        let bottom = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Overlay),
+        ]);
+        assert_eq!(first_texel(&out), (0.375, 0.375, 0.375, 1.0));
+
+        let bottom = solid_texels([0.375, 0.375, 0.375, 1.0]);
+        let top = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::ColorDodge),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 0.75, 0.75, 1.0));
     }
 }

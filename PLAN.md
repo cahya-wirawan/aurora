@@ -6526,6 +6526,126 @@ structural design work.
   `LighterColor` (compare *luminosity* across the whole pixel, not
   per-channel) — plus layer-group render-order recursion, unchanged from
   the bullets above. Blend modes are real for 20 of 27, not "done."
+- [x] **Real blend-mode math: the 4 non-separable modes** — done
+  2026-08-11, closing out this series' family-by-family rounds: `Hue`,
+  `Saturation`, `Color`, `Luminosity`. Architecturally different from
+  every round so far: these 4 are functions of a whole `(R,G,B)` colour
+  triple, not of one channel independently — `Hue`/`Saturation`/
+  `Color`/`Luminosity` are properties of an entire colour, so
+  `blend_channel`'s own per-channel `(cb: f32, cs: f32) -> f32`
+  signature genuinely cannot express them, unlike every one of the
+  prior 20 modes (all separable). New `blend_rgb(mode, cb: [f32; 3],
+  cs: [f32; 3]) -> [f32; 3]` is the whole-triple dispatch this needed:
+  the 20 already-implemented separable modes delegate straight back to
+  `blend_channel` three times, once per channel, unchanged; the 4 new
+  modes implement the real W3C spec math directly on the triple.
+  `composite_tile_cpu`'s inner loop now calls `blend_rgb` once per
+  texel instead of `blend_channel` three times — the same "widen
+  exactly when needed" shape this series' own dispatch has used before
+  (`Vec<Paint>`, `BlendMode` itself, twice already).
+
+  The W3C Compositing and Blending Level 1 spec's own non-separable
+  formulas, implemented via five new private helpers operating on
+  `[f32; 3]`: `Lum(C) = 0.3r+0.59g+0.11b` (NTSC-luma-style weights — a
+  different, unrelated weighting from `aurora_color`'s own WCAG
+  relative-luminance weights `0.2126/0.7152/0.0722` used elsewhere in
+  this codebase for contrast checking, not to be confused with it),
+  `Sat(C) = max-min`, `ClipColor(C)` (pulls an out-of-gamut colour,
+  from `SetLum`'s own additive shift, back into `[0,1]` while
+  preserving luminance — two branches in the spec's own literal order,
+  `n<0` first then `x>1` on that branch's own result), `SetLum(C,l)`
+  (shift then clip), and `SetSat(C,s)` — the trickiest one, restated
+  here as a single formula `(v-min)*s/(max-min)` applied to every
+  channel directly rather than the spec's own literal "identify which
+  channel holds max/mid/min by value, assign each a different
+  expression, reassemble" shape; proved algebraically equivalent
+  (substituting `v=max`/`v=min`/`v=mid` reproduces exactly the spec's
+  own three per-role values) and proved numerically against the spec's
+  own literal three-branch form for several inputs, including one where
+  max/mid/min aren't in R/G/B order, by a dedicated test. Achromatic
+  input (`max==min`) is the spec's own defined degenerate case — zero
+  for every channel, not a bug to special-case around.
+  `Hue(Cb,Cs)=SetLum(SetSat(Cs,Sat(Cb)),Lum(Cb))`,
+  `Saturation(Cb,Cs)=SetLum(SetSat(Cb,Sat(Cs)),Lum(Cb))`,
+  `Color(Cb,Cs)=SetLum(Cs,Lum(Cb))`,
+  `Luminosity(Cb,Cs)=SetLum(Cb,Lum(Cs))`.
+
+  **A deliberate, reasoned exception to every prior round's bit-exact
+  test discipline**: the spec's own weights (`0.3`/`0.59`/`0.11`) are
+  not exact binary fractions, unlike every earlier round's own
+  eighths/quarters/sixteenths, so `ClipColor`'s division steps don't
+  round-trip bit-exact through `f32`/`f16` even from otherwise-clean
+  inputs — tests here use a `1e-3` epsilon
+  (`aurora_testkit::compare_to_golden`'s own tolerance uses the same
+  real floating-point-precision reasoning elsewhere in this codebase)
+  instead of `assert_eq!`. Worked example, hand-verified before writing
+  any test: `Cb=(0.5,0.5,0.5)` (gray), `Cs=(1,0,0)` (red) —
+  `Lum(Cb)=0.5`, `Lum(Cs)=0.3`; `Luminosity` = `SetLum(Cb,0.3)` =
+  `(0.3,0.3,0.3)` exactly, no clip needed; `Color` = `SetLum(Cs,0.5)` =
+  `(1,2/7,2/7)` after `ClipColor`'s own `x>1` branch fires
+  (`C'=(1.2,0.2,0.2)` before clipping); `Saturation` and `Hue` both
+  degenerate to plain `(0.5,0.5,0.5)` since `Cb` is perfectly
+  achromatic (`Sat(Cb)=0`).
+
+  Every arm in `blend_channel` itself is unchanged; the 4 new
+  `BlendMode` variants get their own arms there too (returning the same
+  pass-through `cs` `Normal` already does, purely for match
+  exhaustiveness — `blend_rgb` intercepts all 4 before ever reaching
+  `blend_channel`, so those arms are never actually exercised, the same
+  "honest fallback over introducing a new panic path" discipline
+  `translate_blend_mode` already established for its own
+  not-yet-implemented variants).
+
+  20 new `aurora-render` tests (was 69, now 89): unit tests for each of
+  the 5 helpers in isolation (including `SetSat`'s degenerate
+  all-equal-channel case producing exactly `(0,0,0)`, and a
+  non-R/G/B-ordered case — `C=(0.2,0.8,0.5)`, max held by the *middle*
+  slot — proving the channel handling is genuinely value-based); the
+  worked example above for all 4 modes via the real `composite_tile_cpu`
+  path; one additional, independently-computed (via a from-scratch
+  Python re-implementation of the spec, not by trusting this crate's
+  own Rust output) general case per mode with all three channels
+  genuinely different in both `Cb`/`Cs`; and an explicit regression
+  check re-asserting 3 already-landed separable-mode values
+  (`Multiply`/`Overlay`/`ColorDodge`, one per prior round) bit-identical
+  through the new `blend_rgb`-based code path. 1 new `aurora-app` test
+  (was 148, now 149): a real two-layer `LayerTree` with the top layer's
+  `blend_mode` set to `Luminosity`, composited through
+  `composite_document`, landing near `(0.3,0.3,0.3)` within the same
+  `1e-3` epsilon.
+
+  `aurora-app::translate_blend_mode` gained 4 new 1:1 arms
+  (`Hue`/`Saturation`/`Color`/`Luminosity`, moved out of the fallback
+  arm into their own real mappings), still an exhaustive match. Every
+  doc comment claiming "20 of 27"/"19 of the 26"/"7 remaining" (this
+  crate's own top-level module doc, `translate_blend_mode`,
+  `recomposite_visible_tiles`, `composite_document`, `App::save_file`,
+  plus `aurora-render`'s own crate doc and `composite_tile_cpu`'s doc)
+  updated to name the real 24-mode scope and the final 3 remaining
+  variants.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-render` (89 passed, 0 failed — 69 before), `cargo test -p
+  aurora-app` (149 passed, 0 failed — 148 before), `python3
+  scripts/check_no_hardcoded_style.py` clean (25 files scanned).
+  `scripts/check_layering.py` again the one unrun check (pre-existing
+  `tomllib` gap in this sandbox) — reasoned through by hand instead,
+  same as every prior round: `aurora-render`'s own `Cargo.toml` gained
+  no new dependency (confirmed by reading it), so `aurora-app` remains
+  the only crate naming both `aurora_doc` and `aurora_render` types
+  together. No new dependencies.
+
+  **This is the last "normal" round in this series.** Blend modes are
+  real for 24 of 27; the remaining 3 — `Dissolve` (stochastic per-pixel
+  selection, not a deterministic blend function at all), and
+  `DarkerColor`/`LighterColor` (compare backdrop and source by overall
+  luminosity, a selection between the two whole colours rather than a
+  blend between them) — are qualitatively different from every mode
+  implemented across all four rounds so far and may warrant their own
+  separate treatment rather than a fifth instance of this same pattern.
+  Layer-group render-order recursion remains unchanged from the bullets
+  above, still separate follow-on work.
 
 ### M1.10 — Phase 1 gate
 

@@ -14,12 +14,16 @@
 //! the 8-mode "simple separable" family (`Darken`/`Multiply`/`Lighten`/
 //! `Screen`/`Difference`/`Exclusion`/`Subtract`/`Divide`), the 4-mode
 //! "dodge and burn" family (`ColorDodge`/`LinearDodge`/`ColorBurn`/
-//! `LinearBurn`), and the 7-mode "overlay and light" family (`Overlay`/
+//! `LinearBurn`), the 7-mode "overlay and light" family (`Overlay`/
 //! `SoftLight`/`HardLight`/`VividLight`/`LinearLight`/`PinLight`/
-//! `HardMix`); the 7 remaining `aurora_doc::BlendMode` variants
-//! (non-separable Hue/Saturation/Color/Luminosity, Dissolve,
-//! DarkerColor/LighterColor) are separate, still-open follow-on
-//! work — run entirely on the CPU because the orchestration crate
+//! `HardMix`), and the 4-mode non-separable family (`Hue`/`Saturation`/
+//! `Color`/`Luminosity`, each a function of the whole `(R,G,B)` triple
+//! via `blend_rgb` rather than per-channel `blend_channel`); the 3
+//! remaining `aurora_doc::BlendMode` variants (`Dissolve`,
+//! `DarkerColor`/`LighterColor`) are this family's own explicit
+//! boundary, qualitatively different (stochastic and whole-colour-
+//! comparison rather than a blend function) and separate, still-open
+//! follow-on work — run entirely on the CPU because the orchestration crate
 //! (`aurora-app`) needs to walk a real `aurora_doc::LayerTree` — a sibling
 //! crate this one can't depend on — per visible tile, every frame a layer
 //! changes, translating that real document blend mode into this crate's
