@@ -6744,6 +6744,75 @@ waiting on `directories`/`winit`/`tempfile` upstream to align their own
 unaddressed, consistent with `deny.toml`'s own existing, deliberate
 severity choice.
 
+- [x] **`LayerTree::paint_order` now recurses into layer groups** — done
+  2026-08-11, closing the "layer-group render-order recursion" gap
+  named directly in both the flat-export fix and every blend-mode round
+  above. Confirmed real, not assumed: a pixel layer nested inside any
+  group, at any depth, previously never appeared in `paint_order()`'s
+  output at all (`paint_order_never_includes_a_layer_nested_inside_a_group`,
+  now renamed and rewritten to prove the opposite), so it never
+  composited on the live canvas (`recomposite_visible_tiles`) or in
+  export (`composite_document`) — both just call `paint_order()` and
+  iterate the result, so neither needed its own code change, only this
+  fix and the tests below proving it actually reaches them.
+
+  **The algorithm**: a new private `paint_order_into(&self, siblings:
+  &[LayerId], out: &mut Vec<LayerId>)` walks a sibling list (`roots()`
+  or a group's own `children()`, both stored top-to-bottom) reversed —
+  bottom-to-top — and for each: skip if `visible(id) != Some(true)`;
+  push it if it's `Pixel`; recurse into its own `children` if it's
+  `Group`. `paint_order()` itself is now a thin wrapper calling this on
+  `self.roots()`. This makes a group "unpack" at its own stacking
+  position among its siblings rather than, say, being appended
+  separately, and an invisible group's whole subtree is skipped without
+  ever being recursed into — which is what makes ancestor-visibility
+  gating transitive for free, with no separate "is some ancestor
+  hidden" flag needed.
+
+  **Explicitly, deliberately still out of scope, named directly in the
+  method's own doc comment**: a group's own `opacity`/`blend_mode`/mask
+  are *not* aggregated into its children's effective compositing — a
+  child nested in a group still composites using only its own
+  opacity/blend mode, exactly as before this fix (a group at 50%
+  opacity does not yet fade its contents). Same real, separate,
+  still-open gap `history.rs`'s own `layer_dirty_rect` helper has for
+  groups (subtree-bounds/effective-visibility aggregation for dirty-
+  rect purposes) — untouched by this change, on purpose.
+
+  7 new `aurora-doc` tests: a layer one level inside a visible group
+  appearing in the right position relative to root-level siblings both
+  above and below the group (`bottom, group[g_bottom, g_top], top` →
+  `[bottom, g_bottom, g_top, top]`); an invisible group hiding a nested
+  layer whose own `visible` flag is `true`; two levels of nested groups
+  (`outer(group) → inner(group) → leaf(pixel)`); a group with a mix of
+  visible/hidden children plus a second, wholly hidden group (proving
+  ancestor-gating is transitive, not just one level); and confirming a
+  `Group` id is never itself pushed to the result even though it's
+  walked during recursion. Plus 2 new real, end-to-end `aurora-app`
+  integration tests — the load-bearing proof this reaches actual
+  compositing, not just that `LayerTree` in isolation is now correct:
+  `composite_document_includes_a_layer_nested_inside_a_group` (an
+  opaque-red root layer under a visible group containing an opaque-green
+  nested layer — the composited pixel is green, proving the nested
+  layer's real pixels reached the real compositor) and
+  `composite_document_excludes_a_layer_nested_inside_an_invisible_group`
+  (the same shape with the group hidden — the composited pixel stays
+  red, proving the invisible-group gate holds end to end, not just in
+  `LayerTree`).
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-doc`, `cargo test -p aurora-app` all green, no regressions.
+  `scripts/check_layering.py` remains the one unrun check (pre-existing
+  `tomllib` gap in this sandbox). No new dependencies or `aurora-*`
+  edges. Version bumped `0.32.1` → `0.33.0` per `CLAUDE.md`'s own
+  convention.
+
+  **Still genuinely open, stated honestly**: group `opacity`/
+  `blend_mode`/mask aggregation into children's effective compositing
+  is real, separate, unimplemented work — groups do not "fully work"
+  after this change, only their render-order recursion does.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG

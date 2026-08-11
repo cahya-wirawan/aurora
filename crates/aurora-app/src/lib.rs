@@ -83,9 +83,12 @@
 //! real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`
 //! — this family's own explicit, now sole boundary) still silently
 //! falls back to `Normal`
-//! — and still never recurses into layer groups for paint
-//! order (`LayerTree::paint_order`'s own documented scope) — both real,
-//! separate, still-open gaps. **A `.aur`
+//! — a real, still-open gap. `LayerTree::paint_order` now recurses into
+//! layer groups at any depth (ancestor-visibility-gated: an invisible
+//! group hides its whole subtree), so a layer nested inside a group
+//! does composite and export now; a group's own `opacity`/`blend_mode`
+//! are not yet aggregated into its children's effective compositing,
+//! which remains a separate, still-open gap. **A `.aur`
 //! path (ADR 0009) takes a different, real route
 //! through both**: `App::open_aur_file`/`App::save_aur_file` call
 //! `aurora_io::read_aur`/`write_aur` directly — a real, possibly
@@ -3250,13 +3253,13 @@ fn read_layer_window(
 /// whole-colour-selection family (`DarkerColor`/`LighterColor`) are
 /// real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`
 /// — this family's own explicit, now sole boundary) still silently
-/// falls back to `Normal` at that same translation boundary. Layer
-/// groups are still never recursed into
-/// (`LayerTree::paint_order`'s own
-/// documented, tested scope — see
-/// `paint_order_never_includes_a_layer_nested_inside_a_group`) — both
-/// real, separate, still-open gaps this function does not attempt to
-/// close.
+/// falls back to `Normal` at that same translation boundary — a real,
+/// still-open gap. Layer groups are now recursed into at any depth
+/// (`LayerTree::paint_order`'s own documented, tested behaviour), so a
+/// layer nested inside a visible group's ancestor chain composites into
+/// this export too; a group's own `opacity`/`blend_mode` are not
+/// aggregated into its children's effective compositing, which remains
+/// a separate, still-open gap this function does not attempt to close.
 ///
 /// A layer whose own tile fails to load for a given output tile is
 /// logged and skipped for that tile only, the same "one bad tile
@@ -4272,10 +4275,12 @@ impl App {
     /// own current scope — with the one remaining `aurora_doc::BlendMode`
     /// variant (`Dissolve` — this family's own explicit, now sole
     /// boundary) still
-    /// silently falling back to `Normal`. Also still never recurses into
-    /// layer groups for paint order (`aurora_doc::LayerTree::paint_order`'s
-    /// own documented scope) — both real, separate, still-open gaps,
-    /// the blend-mode one narrowed but not closed by this fix.
+    /// silently falling back to `Normal` — a real, still-open gap. Layer
+    /// groups are now recursed into at any depth, ancestor-visibility-
+    /// gated (`aurora_doc::LayerTree::paint_order`'s own documented,
+    /// tested behaviour) — a group's own `opacity`/`blend_mode` are not
+    /// yet aggregated into its children's effective compositing, which
+    /// remains a separate, still-open gap.
     /// `.aur`, by contrast, saves every layer's own real tiles
     /// regardless of which one is active, plus history/layer metadata
     /// this flat path has no format to carry — see
@@ -8415,6 +8420,131 @@ mod tests {
                 image_pixel(&image, 299, 299),
                 [0.0, 1.0, 0.0, 1.0],
                 "the bottom-right corner, inside the partially-covered edge tile"
+            );
+        }
+    }
+
+    #[test]
+    // The real end-to-end proof that `aurora_doc::LayerTree::paint_order`'s
+    // group-recursion fix actually reaches `composite_document`, not just
+    // that `LayerTree` in isolation now returns the right ids -- this is
+    // the exact shape of test that would have caught the original bug
+    // (a nested pixel layer silently never composited or exported).
+    // `outer` (opaque red, full extent) sits at the bottom of the
+    // document; `group` (a visible group) sits on top of it and contains
+    // one pixel layer, `nested` (opaque green) -- a colour `outer` never
+    // has. `nested`'s own opacity/blend mode are both left at their
+    // documented defaults (full opacity, `Normal`), so it fully covers
+    // `outer` wherever they overlap; asserting the composited output is
+    // exactly `nested`'s own green, not `outer`'s red or a blend of the
+    // two, proves the nested layer's real pixels reached the real
+    // compositor through a real, multi-layer `LayerTree`, not just that
+    // `paint_order()` returns the right id in isolation.
+    fn composite_document_includes_a_layer_nested_inside_a_group() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let outer = match layers.add_pixel_layer("outer", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let nested = match layers.add_pixel_layer("nested", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // group was added after outer, so it's the topmost root -- its
+        // own contents must paint over outer.
+        assert_eq!(layers.roots(), [group, outer]);
+        assert_eq!(layers.children(group), Some([nested].as_slice()));
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (outer, [1.0, 0.0, 0.0, 1.0]),
+            (nested, [0.0, 1.0, 0.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [0.0, 1.0, 0.0, 1.0],
+                "the nested layer's own green must reach the real composite, over outer's red"
+            );
+        }
+    }
+
+    #[test]
+    // The negative counterpart to
+    // `composite_document_includes_a_layer_nested_inside_a_group`: an
+    // *invisible* group must still hide its whole subtree in the real,
+    // end-to-end export path -- not just in `LayerTree::paint_order`'s
+    // own isolated return value.
+    fn composite_document_excludes_a_layer_nested_inside_an_invisible_group() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let outer = match layers.add_pixel_layer("outer", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let nested = match layers.add_pixel_layer("nested", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_visible(group, false) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (outer, [1.0, 0.0, 0.0, 1.0]),
+            (nested, [0.0, 1.0, 0.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [1.0, 0.0, 0.0, 1.0],
+                "the invisible group's nested green layer must not reach the real composite"
             );
         }
     }

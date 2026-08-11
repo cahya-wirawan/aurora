@@ -674,33 +674,72 @@ impl LayerTree {
         }
     }
 
-    /// The root-level pixel layers a compositor should actually draw,
-    /// bottom-to-top (paint order — later entries draw over earlier
-    /// ones): [`Self::roots`] reversed (it's top-to-bottom, matching how
-    /// `add_pixel_layer`/`add_group` always insert as the new topmost
-    /// root), filtered to [`LayerKind::Pixel`] entries whose own
-    /// `visible` flag is `true`. A hidden or non-pixel root is skipped
-    /// entirely, not composited at reduced strength — visibility is
-    /// binary, matching `set_visible`'s own semantics.
+    /// Every pixel layer a compositor should actually draw, bottom-to-top
+    /// (paint order — later entries draw over earlier ones), recursing
+    /// into groups at any depth: for each sibling list (starting at
+    /// [`Self::roots`], then, recursively, a visible group's own
+    /// [`Self::children`]), siblings are walked bottom-to-top (reversed
+    /// from their stored top-to-bottom order — see this type's own doc
+    /// comment for that convention) and a [`LayerKind::Pixel`] entry is
+    /// pushed directly, while a [`LayerKind::Group`] entry "unpacks" in
+    /// place at its own stacking position by recursing into its
+    /// children with the same logic. This correctly interleaves a
+    /// group's contents among its siblings rather than, say, appending
+    /// them all at the end.
     ///
-    /// **Scope, stated honestly**: groups are never recursed into — a
-    /// layer nested inside one, visible or not, simply never appears
-    /// here, the same real, named gap this crate's own private
-    /// `layer_dirty_rect` helper (`history.rs`) already has for groups
-    /// (no subtree-bounds/effective-visibility aggregation exists yet).
-    /// This makes the method's own name honest about groups today: it
-    /// names *root* paint order, not the whole tree's.
+    /// **Ancestor-gated visibility**: a layer only appears if it and
+    /// *every* group in its ancestor chain up to the root has its own
+    /// `visible` flag `true` — an invisible group hides its whole
+    /// subtree regardless of any individual descendant's own `visible`
+    /// flag, matching every mainstream layer-based editor's "folder
+    /// visibility gates its contents" behaviour. A hidden or invisible
+    /// layer (pixel or group) is skipped entirely, not composited at
+    /// reduced strength — visibility is binary, matching `set_visible`'s
+    /// own semantics.
+    ///
+    /// [`LayerKind::Group`] entries themselves are never pushed to the
+    /// result — a group isn't a compositable object, only its pixel-
+    /// layer contents are.
+    ///
+    /// **Scope, stated honestly — what this does *not* do**: a group's
+    /// own `opacity`/`blend_mode`/mask are **not** aggregated into its
+    /// children's effective compositing. A child nested in a group at
+    /// 50% opacity still composites using only its *own* opacity/blend
+    /// mode, exactly as if it were a root layer — a group set to 50%
+    /// opacity does not (yet) make its contents appear at half strength.
+    /// That aggregation, and the same subtree-bounds/effective-
+    /// visibility aggregation this crate's own private
+    /// `layer_dirty_rect` helper (`history.rs`) still lacks for groups,
+    /// are separate, still-open gaps this method does not attempt to
+    /// close.
     #[must_use]
     pub fn paint_order(&self) -> Vec<LayerId> {
-        self.roots
-            .iter()
-            .rev()
-            .copied()
-            .filter(|&id| {
-                matches!(self.kind(id), Some(LayerKind::Pixel { .. }))
-                    && self.visible(id) == Some(true)
-            })
-            .collect()
+        let mut out = Vec::new();
+        self.paint_order_into(&self.roots, &mut out);
+        out
+    }
+
+    /// [`Self::paint_order`]'s own recursive worker: walks `siblings`
+    /// (a sibling list in its stored top-to-bottom order — either
+    /// [`Self::roots`] or a group's own [`Self::children`]) bottom-to-top,
+    /// appending each visible [`LayerKind::Pixel`] directly to `out` and
+    /// recursing into each visible [`LayerKind::Group`]'s own children.
+    /// An invisible layer, pixel or group, is skipped — for a group,
+    /// that skips its whole subtree without recursing into it at all,
+    /// which is what makes ancestor visibility gate transitively rather
+    /// than needing a separately tracked "is some ancestor hidden"
+    /// flag.
+    fn paint_order_into(&self, siblings: &[LayerId], out: &mut Vec<LayerId>) {
+        for &id in siblings.iter().rev() {
+            if self.visible(id) != Some(true) {
+                continue;
+            }
+            match self.kind(id) {
+                Some(LayerKind::Pixel { .. }) => out.push(id),
+                Some(LayerKind::Group { children }) => self.paint_order_into(children, out),
+                None => {}
+            }
+        }
     }
 }
 
@@ -926,19 +965,186 @@ mod tests {
     }
 
     #[test]
-    fn paint_order_never_includes_a_layer_nested_inside_a_group() {
+    fn paint_order_includes_a_layer_nested_inside_a_visible_group() {
         let mut tree = LayerTree::new();
         let group = match tree.add_group("g", None) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = tree.add_pixel_layer("child", bounds(), Some(group)) {
+        let child = match tree.add_pixel_layer("child", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            tree.paint_order(),
+            [child],
+            "a layer nested inside a visible group must now appear in paint order"
+        );
+    }
+
+    #[test]
+    fn paint_order_interleaves_a_groups_contents_at_its_own_stacking_position() {
+        // Tree shape (roots, top-to-bottom): [top, group, bottom], with
+        // group containing [g_top, g_bottom] (also top-to-bottom).
+        //
+        // Expected bottom-to-top paint order: the group "unpacks" at its
+        // own position among its root-level siblings, so `bottom` (below
+        // the group) comes first, then the group's own contents
+        // bottom-to-top (g_bottom, g_top), then `top` (above the group)
+        // last.
+        let mut tree = LayerTree::new();
+        let bottom = match tree.add_pixel_layer("bottom", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match tree.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match tree.add_pixel_layer("top", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // roots() is top-to-bottom, newest on top: [top, group, bottom].
+        assert_eq!(tree.roots(), [top, group, bottom]);
+
+        let g_bottom = match tree.add_pixel_layer("g_bottom", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let g_top = match tree.add_pixel_layer("g_top", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // children(group) is top-to-bottom, newest on top: [g_top, g_bottom].
+        assert_eq!(tree.children(group), Some([g_top, g_bottom].as_slice()));
+
+        assert_eq!(tree.paint_order(), [bottom, g_bottom, g_top, top]);
+    }
+
+    #[test]
+    fn paint_order_excludes_a_layer_nested_inside_an_invisible_group_even_if_the_layer_itself_is_visible()
+     {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match tree.add_pixel_layer("child", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // The child's own visible flag stays true (the default) -- only
+        // the group is hidden.
+        assert_eq!(tree.visible(child), Some(true));
+        if let Err(err) = tree.set_visible(group, false) {
             unreachable!("{err:?}");
         }
         assert_eq!(
             tree.paint_order(),
             [],
-            "groups are never recursed into, per this method's own scope"
+            "an invisible group must hide its whole subtree regardless of a child's own visible flag"
+        );
+    }
+
+    #[test]
+    fn paint_order_recurses_two_levels_deep() {
+        // outer(group) -> inner(group) -> leaf(pixel), all visible.
+        let mut tree = LayerTree::new();
+        let outer = match tree.add_group("outer", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let inner = match tree.add_group("inner", Some(outer)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let leaf = match tree.add_pixel_layer("leaf", bounds(), Some(inner)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            tree.paint_order(),
+            [leaf],
+            "recursion must not be hardcoded to one level of nesting"
+        );
+    }
+
+    #[test]
+    fn paint_order_of_a_mixed_visible_and_hidden_children_group_only_includes_the_visible_ones() {
+        // group -> [visible_a (top), hidden_b, visible_c (bottom)],
+        // plus a second, entirely hidden group -> hidden_group_child,
+        // proving a hidden group also transitively hides its own
+        // visible children.
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let visible_c = match tree.add_pixel_layer("visible_c", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let hidden_b = match tree.add_pixel_layer("hidden_b", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let visible_a = match tree.add_pixel_layer("visible_a", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_visible(hidden_b, false) {
+            unreachable!("{err:?}");
+        }
+        // children(group) top-to-bottom, newest on top: [visible_a, hidden_b, visible_c].
+        assert_eq!(
+            tree.children(group),
+            Some([visible_a, hidden_b, visible_c].as_slice())
+        );
+
+        let hidden_group = match tree.add_group("hidden_group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let hidden_group_child =
+            match tree.add_pixel_layer("hidden_group_child", bounds(), Some(hidden_group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        // hidden_group_child's own visible flag stays true -- only the
+        // parent group is hidden.
+        assert_eq!(tree.visible(hidden_group_child), Some(true));
+        if let Err(err) = tree.set_visible(hidden_group, false) {
+            unreachable!("{err:?}");
+        }
+
+        // roots() top-to-bottom, newest on top: [hidden_group, group].
+        assert_eq!(tree.roots(), [hidden_group, group]);
+
+        assert_eq!(
+            tree.paint_order(),
+            [visible_c, visible_a],
+            "only the visible children appear, in their own bottom-to-top order, \
+             and the hidden group's own visible child never appears at all"
+        );
+    }
+
+    #[test]
+    fn paint_order_never_includes_a_group_entry_itself() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match tree.add_pixel_layer("child", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let order = tree.paint_order();
+        assert_eq!(order, [child]);
+        assert!(
+            !order.contains(&group),
+            "a group is walked during recursion but must never itself be pushed"
         );
     }
 
