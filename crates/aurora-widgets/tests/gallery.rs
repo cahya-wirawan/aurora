@@ -1352,7 +1352,6 @@ fn render_gallery_produces_distinct_pixels_for_each_button_state_in_light_theme(
 /// attribute comes off — the same step every other golden in this file
 /// went through before being trusted.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn button_gallery_matches_the_golden_image_in_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -1515,7 +1514,6 @@ fn render_gallery_button_outline_proves_border_control_opacity_in_high_contrast_
 /// high_contrast_dark_theme`'s own doc comment), before this attribute
 /// comes off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn button_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     let Some(context) = real_context() else {
         return;
@@ -1641,7 +1639,6 @@ fn render_gallery_button_outline_proves_border_control_opacity_in_high_contrast_
 /// including the black outline stroke around each, before this attribute
 /// comes off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn button_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -1725,7 +1722,6 @@ fn render_gallery_produces_distinct_pixels_for_each_button_state_in_color_critic
 /// attribute comes off — the same step every other golden in this file
 /// went through before being trusted.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn button_gallery_matches_the_golden_image_in_color_critical_theme() {
     let Some(context) = real_context() else {
         return;
@@ -1886,7 +1882,6 @@ fn render_gallery_produces_distinct_pixels_for_each_checkbox_state_in_light_them
 /// (possibly software) available — "real GPU hardware" plus human
 /// visual review is the bar, not just "some renderer produced pixels."
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn checkbox_gallery_matches_the_golden_image_in_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -1972,7 +1967,6 @@ fn render_gallery_produces_distinct_pixels_for_each_checkbox_state_in_high_contr
 /// opacity_in_high_contrast_dark_theme`'s own doc comment for the first
 /// widget this was proven for) — before this attribute comes off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn checkbox_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2055,7 +2049,6 @@ fn render_gallery_produces_distinct_pixels_for_each_checkbox_state_in_high_contr
 /// including the black outline around every box (`border.control_opacity
 /// = 1.0`) — before this attribute comes off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn checkbox_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2139,7 +2132,6 @@ fn render_gallery_produces_distinct_pixels_for_each_checkbox_state_in_color_crit
 /// this attribute comes off — the same step every other golden in this
 /// file went through before being trusted.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn checkbox_gallery_matches_the_golden_image_in_color_critical_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2344,7 +2336,6 @@ fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state_in_light_
 /// — "real GPU hardware" plus human visual review is the bar, not just
 /// "some renderer produced pixels."
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn color_swatch_gallery_matches_the_golden_image_in_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2427,7 +2418,6 @@ fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state_in_high_c
 /// ring (`border.control_opacity = 1.0`), before this attribute comes
 /// off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn color_swatch_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2509,7 +2499,6 @@ fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state_in_high_c
 /// ring (`border.control_opacity = 1.0`), before this attribute comes
 /// off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn color_swatch_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2613,7 +2602,6 @@ fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state_in_color_
 /// or `COMMAND_PALETTE_COLOR_CRITICAL_CLEAR`'s own history), not forcing
 /// a pass through this comment's chroma argument alone.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn color_swatch_gallery_matches_the_golden_image_in_color_critical_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2796,7 +2784,6 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_light_theme(
 /// before this attribute comes off — the same step every other golden
 /// in this file went through before being trusted.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn slider_gallery_matches_the_golden_image_in_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2885,7 +2872,6 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_high_contras
 /// track — see `paint_slider`'s own doc comment), before this attribute
 /// comes off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn slider_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     let Some(context) = real_context() else {
         return;
@@ -2974,7 +2960,6 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_high_contras
 /// (`control_outline` is applied to the thumb path only, not the track),
 /// before this attribute comes off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn slider_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -3067,7 +3052,6 @@ fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_color_critic
 /// step every other golden in this file went through before being
 /// trusted.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn slider_gallery_matches_the_golden_image_in_color_critical_theme() {
     let Some(context) = real_context() else {
         return;
@@ -3242,7 +3226,6 @@ fn render_gallery_produces_distinct_pixels_for_each_text_field_state_in_light_th
 /// `NEUTRAL_CLEAR`'s own history), not forcing a pass through this
 /// comment alone.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn text_field_gallery_matches_the_golden_image_in_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -3379,7 +3362,6 @@ fn render_gallery_text_field_outline_proves_border_control_opacity_in_high_contr
 /// values, now checked as a whole image — before this attribute comes
 /// off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn text_field_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     let Some(context) = real_context() else {
         return;
@@ -3505,7 +3487,6 @@ fn render_gallery_text_field_outline_proves_border_control_opacity_in_high_contr
 /// values, now checked as a whole image — before this attribute comes
 /// off.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn text_field_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -3592,7 +3573,6 @@ fn render_gallery_produces_distinct_pixels_for_each_text_field_state_in_color_cr
 /// fix is a `TextField`-specific backdrop (mirroring `NEUTRAL_CLEAR`'s
 /// own history), not forcing a pass through this comment alone.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn text_field_gallery_matches_the_golden_image_in_color_critical_theme() {
     let Some(context) = real_context() else {
         return;
@@ -3888,7 +3868,6 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_light_theme
 /// level of scrutiny, not a rubber stamp just because the backdrop
 /// collision was caught and fixed here before any bless was attempted.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn command_palette_gallery_matches_the_golden_image_in_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -4035,7 +4014,6 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_high_contra
 /// painted after -- overwrites it). Expect a crisp L-shaped white line,
 /// not a uniformly faint one, when actually looking at the image.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn command_palette_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     let Some(context) = real_context() else {
         return;
@@ -4174,7 +4152,6 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_high_contra
 /// crisp L-shaped black line, not a uniformly faint one, is what the
 /// human bless should expect to see.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn command_palette_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     let Some(context) = real_context() else {
         return;
@@ -4310,7 +4287,6 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_color_criti
 /// backdrop collision was caught and fixed here before any bless was
 /// attempted.
 #[test]
-#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
 fn command_palette_gallery_matches_the_golden_image_in_color_critical_theme() {
     let Some(context) = real_context() else {
         return;

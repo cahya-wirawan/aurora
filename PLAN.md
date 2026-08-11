@@ -3298,6 +3298,30 @@ check licenses` clean with the new `toml` dependency.
   this change) — per-crate verification (`aurora-widgets`, `aurora-theme`,
   `aurora-core`) substitutes.
 
+**All 24 non-Dark golden PNGs blessed, 2026-08-11**: Cahya reviewed and
+committed real golden images for every `_in_light_theme`/
+`_in_high_contrast_dark_theme`/`_in_high_contrast_light_theme`/
+`_in_color_critical_theme` golden-diff test across all six gallery-covered
+widgets (`Button`/`Checkbox`/`Slider`/`TextField`/`CommandPalette`/
+`ColorSwatch`) — the full backlog this section's own history has been
+tracking as "pending human bless" since Light's own gallery coverage
+first landed. Ran every one of the 24 with `-- --ignored` against the
+newly-committed images before touching any code: all 24 passed
+(`aurora_testkit::compare_to_golden` genuinely matched, not just "a file
+exists at that path"), then the corresponding `#[ignore]` attribute was
+removed from each — mechanical once the pass was confirmed, the same
+"never bless blind" discipline every earlier un-ignore in this file
+followed, just at 24x the scale of any single prior bless round.
+`gallery.rs`: 70 passed, 0 ignored (was 46 passed, 24 ignored) — every
+gallery test in the file now runs by default, no theme/widget
+combination left gated behind `--ignored`. `cargo fmt --all --check` and
+`cargo clippy -p aurora-widgets --all-targets --all-features -- -D
+warnings` both clean. Every built-in theme's gallery coverage is now
+fully reviewed, not just code-complete — the one remaining gap this
+section has open is per-density coverage and the ~6 named widgets
+(dropdown, tab bar, tooltip, ...) still deferred pending their own
+structural design work.
+
 ### M1.8 — Application shell (`aurora-ui`, `aurora-app`)
 
 - [~] **Window/event loop; create hidden → attach a11y adapter → show**
