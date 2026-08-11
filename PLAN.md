@@ -4620,6 +4620,69 @@ check licenses` clean with the new `toml` dependency.
   *behavioural* verification (toggling Reduce Motion/Increase Contrast
   in System Settings and confirming the read value changes) is still
   open, as noted above.
+- [~] **Density axis (`SpacingScale::density_multiplier`)** — landed
+  2026-08-11, closing the "separate, already-open gap" this section's own
+  accessibility-preferences bullet flagged above. Brought
+  `[spacing.density_multiplier]` (`design/tokens/scales.toml`, real,
+  already-decided numbers that sat as pure unused data — no `Density`
+  enum existed anywhere in the workspace) up to the exact same
+  integration level `AccessibilityPreferences` already has, deliberately
+  no further: a new `Density { Compact, #[default] Comfortable,
+  Spacious }` enum (`aurora-theme/src/scales.rs`) and
+  `Scales::with_density`, which multiplies every `SpacingScale` field
+  except `density_multiplier` itself (`base`/`xxs`/`xs`/`sm`/`md`/`lg`/
+  `xl`/`xxl`/`xxxl`) by the matching real multiplier read from
+  `self.spacing.density_multiplier` (never a hardcoded `0.75`/`1.0`/
+  `1.25`), rounded to the nearest `u32` the same way
+  `with_accessibility_preferences`'s own `text_scale` handling already
+  rounds `typography.size`. `typography`/`radius`/`elevation`/`motion`
+  are untouched, per `scales.toml`'s own explicit "never `type`" carve-
+  out (nothing else is named as scaling either). 5 new `aurora-theme`
+  tests (39 total in the crate): `Density::default()` is `Comfortable`;
+  `with_density(Comfortable)` on the real committed `scales.toml` is a
+  genuine bit-exact no-op (multiplier is exactly `1.0`); `with_density
+  (Compact)` and `with_density(Spacious)` assert real hand-computed
+  values, not just "changed" — e.g. `spacing.md` (`16`) becomes `12`
+  under Compact's real `0.75` and `20` under Spacious's real `1.25`,
+  `spacing.xxxl` (`64`) becomes `48`/`80` — every committed spacing
+  value is a multiple of 4, so both multipliers land on an exact integer
+  with no rounding ambiguity to argue about; a third test confirms
+  `typography`/`radius`/`elevation`/`motion` are byte-identical under
+  both non-default densities. Wired into `aurora-app`'s one real
+  production path, `run()`: `load_scales()?.
+  with_accessibility_preferences(detect_accessibility_preferences())
+  .with_density(aurora_theme::Density::Comfortable)` — a **hardcoded**
+  `Comfortable` default, not a real user preference, deliberately
+  mirroring how `run()` already hardcodes loading the Dark theme with no
+  live switcher; this is consistent with where theme switching already
+  stands in this codebase, not a new gap. Confirmed the two `with_*`
+  calls commute before relying on chaining order not mattering:
+  `with_accessibility_preferences` only ever touches `motion`/
+  `typography.size`, `with_density` only ever touches `spacing` —
+  disjoint fields on `Scales`. `Density` exported from
+  `aurora-theme`'s own `lib.rs` alongside `AccessibilityPreferences`.
+  **Explicitly, deliberately out of scope, not an oversight**:
+  `scales.toml`'s own comment says density is "Applied to the spacing
+  scale and to minimum interactive control height" — no such "minimum
+  interactive control height" field or token exists anywhere in this
+  codebase yet (confirmed by grep), and inventing one is a real design
+  decision (a new token, with real pixel values not specified anywhere)
+  outside this change's scope, left as a clearly-flagged gap in
+  `Density`'s own doc comment rather than guessed at. Also explicitly
+  out of scope: a settings UI, a live density-switching mechanism,
+  persisted user state, and per-widget/per-theme gallery coverage for
+  density — none of that exists for theme switching either yet, so
+  none of it is a regression here. **Do not read this bullet as "density
+  support is complete"** — the *mechanism* (enum, transformation, tests,
+  hardcoded-default wiring) is what landed, the same honest framing this
+  section's own accessibility-preferences bullet already uses. Verified:
+  `cargo fmt --all --check`/`cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`/`cargo test -p aurora-theme` (39
+  passed)/`cargo test -p aurora-app` all clean;
+  `scripts/check_no_hardcoded_style.py` clean (25 files scanned,
+  unaffected either way — this change touches `aurora-theme`/
+  `aurora-app`, not widget code). Version bumped per `CLAUDE.md`'s own
+  convention.
 - [~] **Crash recovery UI** — first slice done 2026-08-05. A new
   generic mechanism in `aurora-widgets`,
   `crates/aurora-widgets/src/widgets/dialog.rs` (new): a modal

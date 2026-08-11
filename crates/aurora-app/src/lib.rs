@@ -5106,7 +5106,17 @@ impl std::fmt::Debug for App {
 pub fn run() -> anyhow::Result<()> {
     let theme = load_theme()?;
     let background = background_color_from_theme(&theme);
-    let scales = load_scales()?.with_accessibility_preferences(detect_accessibility_preferences());
+    // Order doesn't matter between these two: `with_accessibility_preferences`
+    // only ever touches `motion`/`typography.size`, `with_density` only
+    // ever touches `spacing` (see each method's own doc comment) -- disjoint
+    // fields, so the two are commutative. `Density::Comfortable` is a
+    // hardcoded default here, the same honest starting point
+    // `load_theme()` above already uses for the Dark theme -- a real
+    // density preference (settings UI, persisted choice) is separate,
+    // later work, not a regression introduced here.
+    let scales = load_scales()?
+        .with_accessibility_preferences(detect_accessibility_preferences())
+        .with_density(aurora_theme::Density::Comfortable);
     let marker_path = marker_path();
     // Checked *before* writing this run's own marker below -- otherwise
     // every run would see its own, brand-new marker and think the

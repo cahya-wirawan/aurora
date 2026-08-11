@@ -164,6 +164,35 @@ impl Default for AccessibilityPreferences {
     }
 }
 
+/// A user's own explicit density choice — "Compact / Comfortable /
+/// Spacious are supported modes, not one designer's preference" (PRD's
+/// own design principles). Distinct from [`AccessibilityPreferences`],
+/// which records OS-level *accessibility* signals; this is an ordinary
+/// in-app UI preference. Applied via [`Scales::with_density`], which
+/// reads the actual multiplier values from
+/// [`SpacingScale::density_multiplier`] (`design/tokens/scales.toml`'s
+/// own `[spacing.density_multiplier]` table) rather than duplicating
+/// `0.75`/`1.0`/`1.25` here as magic numbers — this enum only names the
+/// three modes `scales.toml` itself defines.
+///
+/// `scales.toml`'s own comment says density is "Applied to the spacing
+/// scale and to minimum interactive control height." Only the spacing
+/// half is implemented here: no "minimum interactive control height"
+/// field or token exists anywhere in this codebase yet, and inventing
+/// one (a new token, with real pixel values not specified anywhere) is
+/// a real design decision outside this change's scope, not an
+/// oversight. `typography`/`radius`/`elevation`/`motion` are also
+/// untouched by [`Scales::with_density`] — `scales.toml`'s own comment
+/// is explicit that density "never" scales `type`, and nothing else is
+/// named as scaling either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Density {
+    Compact,
+    #[default]
+    Comfortable,
+    Spacious,
+}
+
 impl Scales {
     /// Parses raw TOML source (e.g. the contents of `scales.toml`).
     ///
@@ -205,6 +234,54 @@ impl Scales {
                 display: scale(size.display),
             };
         }
+        scales
+    }
+
+    /// A copy of `self` with `density` applied: every [`SpacingScale`]
+    /// field except `density_multiplier` itself is multiplied by the
+    /// matching entry of `self.spacing.density_multiplier` (read from
+    /// the parsed `scales.toml`, not hardcoded — see [`Density`]'s own
+    /// doc comment) and rounded to the nearest `u32`, the same integer
+    /// unit every spacing value already uses. `Comfortable`'s multiplier
+    /// is `1.0` in the real committed `scales.toml`, so applying it is a
+    /// genuine no-op.
+    ///
+    /// `typography`/`radius`/`elevation`/`motion` are untouched — see
+    /// [`Density`]'s own doc comment for why (`scales.toml`'s explicit
+    /// "never `type`," and the "minimum interactive control height" gap
+    /// this method deliberately doesn't attempt to fill).
+    #[must_use]
+    pub fn with_density(&self, density: Density) -> Self {
+        let mut scales = self.clone();
+        let multiplier = scales.spacing.density_multiplier;
+        let factor = match density {
+            Density::Compact => multiplier.compact,
+            Density::Comfortable => multiplier.comfortable,
+            Density::Spacious => multiplier.spacious,
+        };
+        // `cast_possible_truncation`/`cast_sign_loss`: spacing values are
+        // small positive pixel counts (tens to low hundreds) and `factor`
+        // is a small positive multiplier (0.75/1.0/1.25 in the real
+        // committed scale), so the rounded product stays well within
+        // `u32` range with no sign loss in practice; `round()` (rather
+        // than truncation) is the "nearest whole pixel" behaviour also
+        // used by `with_accessibility_preferences`'s own `text_scale`
+        // handling above.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let scale = |value: u32| -> u32 { (value as f32 * factor).round() as u32 };
+        let spacing = scales.spacing;
+        scales.spacing = SpacingScale {
+            base: scale(spacing.base),
+            xxs: scale(spacing.xxs),
+            xs: scale(spacing.xs),
+            sm: scale(spacing.sm),
+            md: scale(spacing.md),
+            lg: scale(spacing.lg),
+            xl: scale(spacing.xl),
+            xxl: scale(spacing.xxl),
+            xxxl: scale(spacing.xxxl),
+            density_multiplier: spacing.density_multiplier,
+        };
         scales
     }
 }
@@ -314,6 +391,93 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(adjusted.typography.size.md, scales.typography.size.md);
+        assert_eq!(adjusted.motion.duration.slow, scales.motion.duration.slow);
+    }
+
+    #[test]
+    fn density_default_is_comfortable() {
+        assert_eq!(super::Density::default(), super::Density::Comfortable);
+    }
+
+    #[test]
+    fn comfortable_density_leaves_every_spacing_field_bit_exact() {
+        // Comfortable's multiplier is exactly 1.0 in the real committed
+        // scales.toml (see `comfortable_density_is_the_identity_multiplier`
+        // above) -- applying it must be a genuine no-op, zero blast radius.
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(s) => s,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let adjusted = scales.with_density(super::Density::Comfortable);
+        assert_eq!(adjusted.spacing.base, scales.spacing.base);
+        assert_eq!(adjusted.spacing.xxs, scales.spacing.xxs);
+        assert_eq!(adjusted.spacing.xs, scales.spacing.xs);
+        assert_eq!(adjusted.spacing.sm, scales.spacing.sm);
+        assert_eq!(adjusted.spacing.md, scales.spacing.md);
+        assert_eq!(adjusted.spacing.lg, scales.spacing.lg);
+        assert_eq!(adjusted.spacing.xl, scales.spacing.xl);
+        assert_eq!(adjusted.spacing.xxl, scales.spacing.xxl);
+        assert_eq!(adjusted.spacing.xxxl, scales.spacing.xxxl);
+    }
+
+    #[test]
+    fn compact_density_scales_spacing_by_the_real_075_multiplier() {
+        // Real committed scales.toml: spacing.{base,xxs,xs,sm,md,lg,xl,
+        // xxl,xxxl} = {4,4,8,12,16,24,32,48,64}; density_multiplier.compact
+        // = 0.75. Hand-computed: 4*0.75=3, 8*0.75=6, 16*0.75=12, 64*0.75=48
+        // -- all exact (every spacing value is a multiple of 4, and
+        // 4*0.75=3 is itself an integer), so rounding doesn't even come
+        // into play for this particular committed data.
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(s) => s,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let adjusted = scales.with_density(super::Density::Compact);
+        assert_eq!(adjusted.spacing.base, 3);
+        assert_eq!(adjusted.spacing.xxs, 3);
+        assert_eq!(adjusted.spacing.xs, 6);
+        assert_eq!(adjusted.spacing.sm, 9);
+        assert_eq!(adjusted.spacing.md, 12);
+        assert_eq!(adjusted.spacing.lg, 18);
+        assert_eq!(adjusted.spacing.xl, 24);
+        assert_eq!(adjusted.spacing.xxl, 36);
+        assert_eq!(adjusted.spacing.xxxl, 48);
+        // Untouched by this axis.
+        assert_eq!(adjusted.typography.size.md, scales.typography.size.md);
+        assert_eq!(adjusted.radius.pill, scales.radius.pill);
+        assert_eq!(
+            adjusted.elevation.level_2.blur,
+            scales.elevation.level_2.blur
+        );
+        assert_eq!(adjusted.motion.duration.slow, scales.motion.duration.slow);
+    }
+
+    #[test]
+    fn spacious_density_scales_spacing_by_the_real_125_multiplier() {
+        // Real committed scales.toml: same base spacing values as above;
+        // density_multiplier.spacious = 1.25. Hand-computed: 4*1.25=5,
+        // 8*1.25=10, 16*1.25=20, 64*1.25=80 -- again all exact.
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(s) => s,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let adjusted = scales.with_density(super::Density::Spacious);
+        assert_eq!(adjusted.spacing.base, 5);
+        assert_eq!(adjusted.spacing.xxs, 5);
+        assert_eq!(adjusted.spacing.xs, 10);
+        assert_eq!(adjusted.spacing.sm, 15);
+        assert_eq!(adjusted.spacing.md, 20);
+        assert_eq!(adjusted.spacing.lg, 30);
+        assert_eq!(adjusted.spacing.xl, 40);
+        assert_eq!(adjusted.spacing.xxl, 60);
+        assert_eq!(adjusted.spacing.xxxl, 80);
+        // Untouched by this axis.
+        assert_eq!(adjusted.typography.size.md, scales.typography.size.md);
+        assert_eq!(adjusted.radius.pill, scales.radius.pill);
+        assert_eq!(
+            adjusted.elevation.level_2.blur,
+            scales.elevation.level_2.blur
+        );
         assert_eq!(adjusted.motion.duration.slow, scales.motion.duration.slow);
     }
 }

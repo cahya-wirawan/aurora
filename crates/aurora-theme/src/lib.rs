@@ -58,9 +58,9 @@ pub use color::Color;
 pub use error::ThemeError;
 pub use palette::Palette;
 pub use scales::{
-    AccessibilityPreferences, DensityMultiplier, ElevationLevel, ElevationScale, MotionDuration,
-    MotionEasing, MotionScale, RadiusScale, Scales, SpacingScale, TypeLineHeightScale, TypeScale,
-    TypeSizeScale, TypeWeightScale,
+    AccessibilityPreferences, Density, DensityMultiplier, ElevationLevel, ElevationScale,
+    MotionDuration, MotionEasing, MotionScale, RadiusScale, Scales, SpacingScale,
+    TypeLineHeightScale, TypeScale, TypeSizeScale, TypeWeightScale,
 };
 pub use theme::{
     AccentTokens, BorderTokens, IconTokens, Overlay, StateTokens, SurfaceTokens, TextTokens, Theme,
