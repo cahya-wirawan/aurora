@@ -2999,6 +2999,85 @@ check licenses` clean with the new `toml` dependency.
   `CommandPalette`'s, `ColorSwatch`'s) are still pending a single human
   bless session on real GPU hardware — none has been run yet, this note
   included.
+  **High Contrast Dark's own full six-widget gallery slice landed
+  2026-08-11**, now that `design/themes/high-contrast-dark.toml` exists
+  (M1.6's own entry above) — the first gallery coverage for either High
+  Contrast theme, and the first time `border.control_opacity = 1.0`'s
+  effect has actually been rendered and verified, not just resolved as a
+  `Paint` value. **The backdrop question needed real analysis, not a
+  copy of `LIGHT_CLEAR`'s reasoning**: unlike every theme landed so far,
+  High Contrast Dark resolves `surface.canvas`, `surface.app`,
+  `surface.panel`, `surface.raised`, `surface.overlay`, *and*
+  `surface.sunken` to the exact same `hc.black` — a deliberate
+  OS-high-contrast design choice, not an oversight (that theme's own
+  header comment: it leans on borders for elevation, not fill
+  gradation). A plain-black gallery backdrop would therefore have
+  collided with `Checkbox`'s unchecked box, `TextField`'s fill,
+  `Slider`'s track, and `CommandPalette`'s panel all at once — not
+  `CommandPalette`'s own narrow single-widget collision Dark/Light's own
+  history already has, but nearly every widget in this theme's gallery
+  simultaneously. Decision: one shared `HIGH_CONTRAST_DARK_CLEAR`
+  constant, reusing `NEUTRAL_CLEAR`'s own `#808080` value rather than
+  inventing a new number, applied uniformly across all six widgets'
+  galleries rather than special-casing any one of them — checked, not
+  assumed, against every colour these six widgets actually paint
+  (`border.control`/`text.primary` = `hc.white`, `accent.primary` =
+  `hc.yellow`, `accent.primary_active` = `hc.yellow_dark`, and
+  `state.disabled_opacity` = `0.6` blended over it), all clearly distinct
+  from the mid-grey backdrop. See `HIGH_CONTRAST_DARK_CLEAR`'s own doc
+  comment in `gallery.rs` for the full per-token check. **Two real,
+  rendered outline-proof tests, the first of their kind**:
+  `render_gallery_button_outline_proves_border_control_opacity_in_
+  high_contrast_dark_theme` and `render_gallery_text_field_outline_
+  proves_border_control_opacity_in_high_contrast_dark_theme` each sample
+  a real GPU-rendered pixel one pixel in from a widget's own edge and
+  assert it reads pure `[255,255,255]` (`border.control` at full
+  opacity), distinct from that widget's own fill (`[255,255,0]` for the
+  enabled button's `accent.primary`; `[0,0,0]` for the enabled text
+  field's `surface.sunken`). The sample coordinates weren't guessed: a
+  throwaway debug scan of the actual rendered image (real GPU readback,
+  removed before landing) confirmed empirically that a `lyon`
+  centre-aligned 1px stroke around a widget's own bounds only reliably
+  shows up one pixel in from the *far* edge (e.g. `BUTTON_CELL.0 - 1`,
+  not `0` or `BUTTON_CELL.0`) — this pipeline's rasterizer treats the
+  stroke's coverage band as half-open, so the near/top/left edge of a
+  cell starting at a coordinate of `0` shows no stroke pixel at all,
+  while the far/bottom/right edge one pixel in from its own boundary
+  reliably does. `CommandPalette` was deliberately *not* used for either
+  proof: its selected row's own fill occupies the exact same bounds as
+  the panel itself (`body_style`/`row_style` both `percent(1.0)`), so
+  most of the panel's own outline stroke is almost certainly covered by
+  the row's fill on top of it — flagged in that widget's own golden
+  test's doc comment as a real open question for the human bless step,
+  not settled here. All twelve new tests (six real self-contained
+  distinct-pixels/outline-proof tests, six `#[ignore]`d golden-diffs
+  targeting `tests/golden/*_gallery_high_contrast_dark.png`, none of
+  which exist yet or were created) mirror the exact shape Light's own
+  six-widget slice already established, plus the two extra outline-proof
+  tests. Ran `cargo test -p aurora-widgets --test gallery -- --nocapture`
+  in this sandbox and grepped for `SKIPPED`: zero matches — this sandbox
+  has a real (possibly software/llvmpipe) GPU adapter, so every test
+  above, including both outline-proof tests, genuinely executed against
+  real rendered pixels, not a skip. `gallery.rs`: 30 passed, 12 ignored,
+  0 failed (was 21 passed, 6 ignored before this change — +9 real tests:
+  6 distinct-pixels + 1 command-palette-row-highlight + 2 outline-proof;
+  +6 `#[ignore]`d golden-diffs, one per widget). `cargo fmt --all --check`
+  and `cargo
+  clippy -p aurora-widgets --all-targets --all-features -- -D warnings`
+  both clean; `python3 scripts/check_no_hardcoded_style.py` clean (25
+  files scanned) — this change is test-only, no widget/token code
+  touched. Version bumped `0.21.0` → `0.22.0` per `CLAUDE.md`'s own
+  convention.
+  **Now genuinely open**: High Contrast Light's and Colour-Critical's
+  gallery coverage remain entirely untouched (same design-input-blocker
+  status as before this change, now narrowed from three themes to two);
+  and all eighteen golden PNGs landed across Dark (blessed), Light, and
+  High Contrast Dark are still pending human bless sessions on real GPU
+  hardware — Dark's own six were blessed first (see each one's own doc
+  comment in `gallery.rs`), Light's six and High Contrast Dark's six
+  (twelve total) are not, and none of this change's own work blessed or
+  created a golden PNG, consistent with this file's "never bless blind"
+  discipline throughout.
 - [x] **Headless mode for automated UI tests** — done 2026-08-02. Every
   test in this crate already ran with no window/GPU/platform adapter;
   what was missing was making that a *checked* fact rather than an
