@@ -6707,6 +6707,43 @@ structural design work.
   multi-layer compositing both remain unchanged, still separate
   follow-on work.
 
+**`RUSTSEC-2026-0253` fixed, 2026-08-11**: GitHub Actions' `cargo deny
+check` failed CI with a real `unsound` advisory — `lru` 0.18.1's
+`LruCache::pop()` wasn't panic-safe (a panicking `Drop` mid-`pop()`
+could leave dangling pointers in the internal linked list, a real
+use-after-free/double-free risk under `catch_unwind`). `aurora-tile`
+(the only real consumer, via the workspace-shared `lru` dependency)
+doesn't itself call `pop()` inside a `catch_unwind` boundary today, but
+the fix costs nothing — `lru = "0.18.1"` → `"0.18.2"` in root
+`Cargo.toml` (the advisory's own stated fix, upstream PR
+[lru-rs#238](https://github.com/jeromefroe/lru-rs/pull/238)), `cargo
+update -p lru`. Reproduced the CI failure locally first (`cargo deny
+check` → `advisories FAILED`), confirmed the bump alone resolves it
+(`advisories ok, bans ok, licenses ok, sources ok`). Full gate re-run
+clean: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo test -p
+aurora-tile` (16/16 passed, unaffected). Version bumped `0.32.0` →
+`0.32.1` — a **patch**, not minor, per `CLAUDE.md`'s own convention
+(correcting something already-landed-and-wrong, not new work).
+
+**The `getrandom` triplication CI also warned about is a separate,
+lower-stakes finding, left as-is**: `deny.toml`'s own `[bans]` section
+already sets `multiple-versions = "warn"`, a deliberate choice — this
+is a `warn`, not a `deny`, so it was never actually failing CI (the
+GitHub Actions log itself distinguished `warning[duplicate]` from
+`error[unsound]`, only the latter blocking). Traced the three separate
+transitive chains pulling each version in: `getrandom 0.2.17` via
+`directories → dirs-sys → redox_users` (Redox-OS-conditional, present
+in the lock regardless of host target); `0.3.4` via `ahash → winit`
+(a real `aurora-app` dependency); `0.4.3` via `tempfile` (a
+dev-dependency). None of these are direct `aurora-*` dependencies —
+`getrandom` doesn't appear anywhere in any crate's own `Cargo.toml` —
+so there's no single version pin to bump; consolidating would mean
+waiting on `directories`/`winit`/`tempfile` upstream to align their own
+`getrandom` majors, not something to force from this side. Left
+unaddressed, consistent with `deny.toml`'s own existing, deliberate
+severity choice.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
