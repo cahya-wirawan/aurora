@@ -2,7 +2,7 @@
 
 A modern, GPU-accelerated, non-destructive professional image editor for Windows, macOS, and Linux — written in Rust.
 
-> **Status: pre-implementation, Phase 0 about half done.** The workspace skeleton, CI, architecture decisions, and two measured prototypes are in place; **no features are implemented yet**. The 19 crates compile and CI is green, but nothing does anything. Track progress in **[PLAN.md](PLAN.md)**. Stars and discussion are welcome; working software is not.
+> **Status: an early but real editor, Phase 1 in progress.** You can already open a PNG/JPEG/TIFF (or Aurora's own round-tripping `.aur` format), paint and erase on real pixels with undo/redo, work across multiple layers with opacity/blend-mode/mask data, and save back out — verified end to end on real macOS hardware, including a screen reader announcing the window. What isn't real yet: PSD/PSB (a feasibility spike only — not wired into the app), filters and adjustments, selection tools beyond a raw data model, blend modes beyond Normal in the actual compositor, smart objects, and RAW import. The 20 crates compile, CI is green on Linux/macOS/Windows, and 786 tests pass. Track progress in **[PLAN.md](PLAN.md)**.
 
 ---
 
@@ -43,16 +43,14 @@ The design rests on a short list of invariants documented in [PRD §7.3](PRD.md)
 
 ## Roadmap
 
-| Phase | Focus | Duration |
-|---|---|---|
-| **0** | Technical de-risking: GPU validation, tile paging, accessibility & IME spikes, design language | 3 months |
-| **1** | Document system, canvas, layers, rendering, widget toolkit, application shell | 9 months |
-| **2** | Selections, brushes, masks, filters, adjustments | 8 months |
-| **3** | Smart objects, Camera RAW, colour management, PSD/PSB read+write | 10 months |
-| **4** | AI features, plugin SDK, automation, cloud sync | 10 months |
-| **5** | Collaboration, animation, mobile, web | 12 months |
+| Phase | Focus |
+|---|---|
+| **0** | Technical de-risking: GPU validation, tile paging, accessibility & IME spikes, design language — done, Phase 1 gated on it |
+| **1** | Document system, canvas, layers, rendering, widget toolkit, application shell — **in progress** |
+| **2** | Selections, brushes, masks, filters, adjustments |
+| **3** | Smart objects, Camera RAW, colour management, full PSD/PSB read+write |
 
-Every phase has a measurable exit criterion rather than a feature checklist — see [PRD §9](PRD.md). The durations assume a staffed team and were estimated before any code existed; now that the prototype has produced real numbers, they are due a revision (PRD §13 Step 7).
+Every phase has a measurable exit criterion rather than a feature checklist — see [PRD §9](PRD.md). Calendar durations were dropped 2026-07-28 (PRD §13 Step 7): this is solo development, so phases are milestone-based, not date-committed. What were previously dated "Phase 4" (AI features, plugin SDK, automation, cloud sync) and "Phase 5" (collaboration, animation, mobile, web) moved to an explicitly uncommitted "Beyond v1.0" backlog in [PRD §9](PRD.md) — real ideas, not discarded, just no longer carrying a team-sized commitment for a project of one.
 
 ## What has been measured
 
@@ -68,6 +66,12 @@ An 80 GB document edits comfortably in a 64 MB memory budget, and half-float sav
 
 A second spike covers [accessibility and IME](spike/a11y-ime/FINDINGS.md), the two risks that could still overturn the custom-UI decision. It is **partially** complete: the accessibility tree builds and the platform adapter initializes, but confirming that a screen reader speaks the field and that CJK composition works needs a human on each platform. **Help wanted** — the checklist is in that document.
 
+## What has been built
+
+**The app itself is real, not a mockup.** `cargo run -p aurora-app` opens a native window (macOS-verified, including VoiceOver announcing it) with a canvas, a dockable Layers/History/Properties rail, a native menu bar, and a command palette (`Ctrl+Shift+P`). A brush and eraser tool paint real pixels into `aurora-tile`'s tile store with unified undo/redo across both structural edits (add/delete/reorder a layer) and pixel strokes. The document model (`aurora-doc`) has real layers and groups, opacity, a 27-mode blend-mode enum, masks (bounds only, no mask pixels yet), and an unlimited undo/redo history. Import/export (`aurora-io`) reads and writes PNG, JPEG, TIFF, and Aurora's own round-tripping `.aur` format; autosave/crash-recovery is wired up. What's still a data model without a real consumer: blend modes other than Normal (the compositor treats every layer as Normal today), layer groups in render order, and full-document export (export currently writes the active layer's own pixels, not the composited result). PSD/PSB has neither a reader nor a writer in the app — only a separate feasibility spike, deliberately excluded from the workspace so it can never become a real dependency.
+
+**The custom widget toolkit** (`aurora-widgets`) and design-token system (`aurora-theme`) are what the app's own UI is built from: nine widget kinds with real layout, focus, hit-testing, and IME composition, eight of them with real GPU-rendered paint through `aurora-vector`'s tessellation (verified with real pixel-readback tests), six of those additionally covered by a golden-image gallery harness. All five of PRD.md's built-in themes exist as real, verified design files, not just names: Dark, Light, High Contrast Dark, High Contrast Light, and a neutral-grey Colour-Critical theme, each automatically checked against the same 17 WCAG 2.1 AA contrast pairs (Colour-Critical additionally has its surfaces checked for genuine chroma neutrality — an automated satisfaction of the PRD's own acceptance criterion for that theme, not just "we picked hex codes that look gray"). What's still outstanding is a human reviewing the ~24 rendered goldens on real GPU hardware before they're trusted as regression baselines — themes are never blessed blind.
+
 ## Building
 
 ```sh
@@ -79,8 +83,15 @@ Requires Rust 1.97+ (pinned in `rust-toolchain.toml`, edition 2024). The full CI
 
 ```sh
 cargo fmt --all --check && python3 scripts/check_layering.py \
+  && python3 scripts/check_no_hardcoded_style.py \
   && cargo clippy --workspace --all-targets --all-features -- -D warnings \
   && cargo nextest run --workspace
+```
+
+To run the app itself — macOS-verified; Linux/Windows build but haven't had a real desktop session confirm the window and menu behave:
+
+```sh
+cargo run -p aurora-app
 ```
 
 To run the prototype (a separate crate, outside the workspace):
@@ -107,7 +118,7 @@ cargo run                           # windowed — needs a screen reader to judg
 
 ## Contributing
 
-Aurora is MIT licensed and open to contribution, but there are no features to build on yet — the workspace is a skeleton and Phase 0 is where the real work starts. [PLAN.md](PLAN.md) shows exactly what is open. Contributions are made under the MIT licence; sign off your commits with `git commit -s` (DCO). What is genuinely useful right now:
+Aurora is MIT licensed and open to contribution. It's an early, working editor, not a finished product — most Photoshop-parity features (selections tooling, filters, adjustments, PSD, smart objects, RAW) don't exist yet. [PLAN.md](PLAN.md) shows exactly what is open. Contributions are made under the MIT licence; sign off your commits with `git commit -s` (DCO). What is genuinely useful right now:
 
 - **Review the [PRD](PRD.md).** Particularly §11 (Risks) and §12 (Open Questions). Several open questions are unresolved and shape the architecture, notably the PSD round-trip target versions and the handling of Photoshop features with no Aurora equivalent.
 - **Tell us about your workflow.** [PRD §13 Step 2](PRD.md) calls for a ranked list of the Photoshop workflows that actually matter to professionals. First-hand accounts are more valuable than speculation.
