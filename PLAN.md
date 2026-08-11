@@ -3078,6 +3078,79 @@ check licenses` clean with the new `toml` dependency.
   (twelve total) are not, and none of this change's own work blessed or
   created a golden PNG, consistent with this file's "never bless blind"
   discipline throughout.
+  **High Contrast Light's own full six-widget gallery slice landed
+  2026-08-11 too**, now that `design/themes/high-contrast-light.toml`
+  exists (M1.6's own entry above) — mirroring High Contrast Dark's own
+  round exactly, one theme after the other, the same one-at-a-time
+  cadence this section's own history already established. **The backdrop
+  question was checked fresh, not carried over on the assumption it would
+  obviously still work**: `design/themes/high-contrast-light.toml`
+  resolves the same "every `surface.*` token identical" shape High
+  Contrast Dark has, just inverted — all six to `hc.white` rather than
+  `hc.black` — so the same collision (a plain backdrop matching
+  `Checkbox`'s unchecked box, `TextField`'s fill, `Slider`'s track, and
+  `CommandPalette`'s panel all at once) applied in the opposite direction.
+  Decision: reuse the same shared `HIGH_CONTRAST_LIGHT_CLEAR` constant
+  (still `NEUTRAL_CLEAR`'s own `#808080` value — equidistant from
+  `hc.black` and `hc.white` by construction, so a fix proven against an
+  all-black surface set carries the same logic to an all-white one) —
+  but checked, not assumed, against this theme's own actual colours:
+  `border.control`/`text.primary` = `hc.black`, `accent.primary` =
+  `hc.blue` (not High Contrast Dark's yellow — that theme's own header
+  comment already explains why yellow is illegible on white and blue
+  replaces it, a colour-legibility concern separate from this backdrop's
+  own grey-vs-blue contrast, which is unambiguous), `accent.primary_
+  active` = `hc.blue_dark`, and `state.disabled_opacity` = `0.6` blended
+  over it — all clearly distinct from the mid-grey backdrop. See
+  `HIGH_CONTRAST_LIGHT_CLEAR`'s own doc comment in `gallery.rs` for the
+  full per-token check. **Both outline-proof tests transferred directly,
+  confirmed by actually running them, not assumed**:
+  `render_gallery_button_outline_proves_border_control_opacity_in_
+  high_contrast_light_theme` and `render_gallery_text_field_outline_
+  proves_border_control_opacity_in_high_contrast_light_theme` reuse the
+  exact same sample coordinates High Contrast Dark's own debug scan
+  established (one pixel in from the far/bottom/right edge — a property
+  of this pipeline's own stroke tessellation, not of any theme's
+  colours) and both passed, reading pure `[0,0,0]` (`border.control` at
+  `hc.black`, alpha `1.0`) — the inverse byte value of High Contrast
+  Dark's own `[255,255,255]`, exactly as expected, with no new debug scan
+  needed. **`CommandPalette`'s own asymmetric-occlusion situation matched
+  High Contrast Dark's exactly**: nothing about `command_palette_style`'s
+  own layout or `paint_list_row`'s own fill logic is theme-dependent, so
+  the same selected-row-occludes-the-panel-outline mechanism (top/left
+  edges visible in the margin, right/bottom edges overwritten by the
+  row's own identical-bounds fill) applies unchanged here — documented in
+  `command_palette_gallery_matches_the_golden_image_in_high_contrast_
+  light_theme`'s own doc comment by reference to High Contrast Dark's
+  own already-worked-out account, not re-derived from scratch. All
+  fifteen new tests (nine real self-contained distinct-pixels/outline-
+  proof tests, six `#[ignore]`d golden-diffs targeting `tests/golden/
+  *_gallery_high_contrast_light.png`, none of which exist yet or were
+  created) mirror High Contrast Dark's own slice exactly. Ran `cargo test
+  -p aurora-widgets --test gallery -- --nocapture` in this sandbox and
+  grepped for `SKIPPED`: zero matches — this sandbox's render path
+  genuinely executed against real rendered pixels for every test above,
+  not a skip. `gallery.rs`: 39 passed, 18 ignored, 0 failed (was 30
+  passed, 12 ignored before this change — +9 real tests, +6 `#[ignore]`d
+  golden-diffs, exactly mirroring High Contrast Dark's own +9/+6). `cargo
+  fmt --all --check` and `cargo clippy -p aurora-widgets --all-targets
+  --all-features -- -D warnings` both clean; `python3 scripts/
+  check_no_hardcoded_style.py` clean (25 files scanned) — this change is
+  test-only, no widget/token code touched; `check_layering.py` unrun in
+  this sandbox (no `python3` needed for it to be known pre-existing
+  broken, same `tomllib` gap noted throughout this file, unrelated to
+  this change). Version bumped `0.22.0` → `0.23.0` per `CLAUDE.md`'s own
+  convention.
+  **Now genuinely open**: Colour-Critical's gallery coverage is the
+  **only** remaining theme without any — same design-input-blocker
+  history this section already used for the other three, now narrowed to
+  one; and all twenty-four golden PNGs landed across Dark (blessed),
+  Light, High Contrast Dark, and High Contrast Light are still pending
+  human bless sessions on real GPU hardware — Dark's own six were
+  blessed first, Light's/High Contrast Dark's/High Contrast Light's
+  eighteen (six each) are not, and none of this change's own work
+  blessed or created a golden PNG, consistent with this file's "never
+  bless blind" discipline throughout.
 - [x] **Headless mode for automated UI tests** — done 2026-08-02. Every
   test in this crate already ran with no window/GPU/platform adapter;
   what was missing was making that a *checked* fact rather than an

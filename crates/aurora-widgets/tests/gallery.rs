@@ -118,13 +118,40 @@
 //! golden_image_in_high_contrast_dark_theme`'s own doc comment for why
 //! that's flagged for the human bless step instead of settled here.
 //!
-//! High Contrast Light and Colour-Critical's coverage remain open for
-//! every widget — those theme files don't exist yet at all, so it isn't
-//! a gallery-code gap — and all eighteen golden PNGs landed so far across
-//! Dark, Light, and High Contrast Dark (six widgets each) are still
-//! pending human bless sessions on real GPU hardware (every non-Dark
-//! golden test in this file is `#[ignore]`d for exactly that reason;
-//! Dark's own six were blessed first, see each one's own doc comment).
+//! **High Contrast Light** now has coverage for all six widgets too —
+//! `design/themes/high-contrast-light.toml` exists and resolves the same
+//! "every `surface.*` token identical" shape High Contrast Dark has, just
+//! inverted (all six to `hc.white` rather than `hc.black`), so the same
+//! collision problem applied and the same fix works: `HIGH_CONTRAST_
+//! LIGHT_CLEAR` reuses `NEUTRAL_CLEAR`'s own `#808080` value again,
+//! checked against this theme's actual colours (`border.control`/
+//! `text.primary` = `hc.black`, `accent.primary` = `hc.blue`,
+//! `accent.primary_active` = `hc.blue_dark`) rather than assumed to carry
+//! over unchanged — see that constant's own doc comment for the numbers.
+//! The two outline-proof tests (`Button`, `TextField`) transferred
+//! directly: the same edge-sampling coordinates (one pixel in from the
+//! bottom/right edge) that High Contrast Dark's own debug scan
+//! established are a property of this rendering pipeline's stroke
+//! tessellation, not of any theme's colours, and re-running them here
+//! confirmed the outline pixel reads `border.control`'s `hc.black`
+//! (`[0,0,0]`) — the inverse of High Contrast Dark's `hc.white`, as
+//! expected. `CommandPalette`'s own asymmetric-occlusion situation (the
+//! selected row's fill sharing the panel's exact bounds, occluding the
+//! right/bottom edges of the outline stroke while leaving top/left
+//! visible) is the same, already-understood mechanism as High Contrast
+//! Dark's — nothing about `command_palette_style`'s layout or
+//! `paint_list_row`'s fill logic is theme-dependent, so it reproduces
+//! identically here; see `command_palette_gallery_matches_the_golden_
+//! image_in_high_contrast_light_theme`'s own doc comment.
+//!
+//! Colour-Critical's coverage remains open — that theme file doesn't
+//! exist yet at all, so it isn't a gallery-code gap — and it is now the
+//! **only** theme without gallery coverage. All twenty-four golden PNGs
+//! landed so far across Dark, Light, High Contrast Dark, and High
+//! Contrast Light (six widgets each) are still pending human bless
+//! sessions on real GPU hardware (every non-Dark golden test in this
+//! file is `#[ignore]`d for exactly that reason; Dark's own six were
+//! blessed first, see each one's own doc comment).
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -147,6 +174,8 @@ const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
 const LIGHT_THEME_TOML: &str = include_str!("../../../design/themes/light.toml");
 const HIGH_CONTRAST_DARK_THEME_TOML: &str =
     include_str!("../../../design/themes/high-contrast-dark.toml");
+const HIGH_CONTRAST_LIGHT_THEME_TOML: &str =
+    include_str!("../../../design/themes/high-contrast-light.toml");
 const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 
 /// `Button`'s own gallery cell size. Deliberately explicit, not the
@@ -329,6 +358,52 @@ const COMMAND_PALETTE_LIGHT_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
 /// (every `surface.*` token being identical) isn't narrow here either.
 const HIGH_CONTRAST_DARK_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
 
+/// High Contrast Light's own gallery backdrop, used for **every** widget
+/// in this theme's slice, the same shared-not-per-widget shape
+/// `HIGH_CONTRAST_DARK_CLEAR` already established. Computed, not assumed
+/// to carry over unchanged just because the same constant already
+/// worked once: `design/themes/high-contrast-light.toml` resolves
+/// `surface.canvas`, `surface.app`, `surface.panel`, `surface.raised`,
+/// `surface.overlay`, *and* `surface.sunken` to the exact same
+/// `hc.white` (`#ffffff`) — that theme's own header comment: "High
+/// Contrast Dark's philosophy, inverted." A plain white backdrop here
+/// would collide byte-for-byte with `Checkbox`'s unchecked box,
+/// `TextField`'s fill, `Slider`'s track (all `surface.sunken`), and
+/// `CommandPalette`'s panel (`surface.raised`) all at once — the exact
+/// same shape of problem `HIGH_CONTRAST_DARK_CLEAR`'s own doc comment
+/// already records, just with the collision colour inverted.
+///
+/// Reuses `NEUTRAL_CLEAR`'s own value (`#808080`) rather than inventing a
+/// third number: it is equidistant from `hc.black` and `hc.white` by
+/// construction, so a fix already proven against an all-black surface
+/// set is, by the same reasoning, proven against an all-white one too —
+/// but checked here against every other colour this theme's six widgets
+/// actually paint, not just assumed:
+/// - `border.control`/`text.primary` = `hc.black` (`#000000`) — contrasts
+///   `#808080` clearly (the same relationship `HIGH_CONTRAST_DARK_CLEAR`
+///   already established works, just with fill and stroke swapped).
+/// - `accent.primary` = `hc.blue` (`#0000ff`) — `Button`'s enabled fill
+///   and `CommandPalette`'s selected-row highlight; distinct from grey in
+///   both hue and luma, unlike High Contrast Dark's yellow this needed no
+///   substitute hue (`high-contrast-light.toml`'s own header comment
+///   already explains *why* blue replaces yellow here, a colour-legibility
+///   concern separate from this backdrop's own grey-vs-blue contrast,
+///   which is unambiguous).
+/// - `accent.primary_active` = `hc.blue_dark` (`#00008b`) — `Button`'s
+///   pressed fill, still visibly distinct from both grey and full blue.
+/// - `state.disabled_opacity` = `0.6` (this theme's own value, same as
+///   High Contrast Dark, see its own `[state]` comment) blended over
+///   `#808080`: e.g. a disabled white `surface.sunken` fill becomes
+///   `255*0.6 + 128*0.4 ≈ 204` — still clearly lighter than the `128`
+///   backdrop and clearly distinct from the full-opacity `255` fill, not
+///   a collision either direction.
+///
+/// So the same one constant, shared across all six widgets, is the right
+/// fix here too — not a fourth colour value, because the underlying
+/// problem (every `surface.*` token being identical) is the same problem,
+/// just mirrored.
+const HIGH_CONTRAST_LIGHT_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
+
 /// Serializes this file's real-GPU tests, this integration test's own
 /// copy of the same "one `wgpu::Instance`/`Device` at a time" lock
 /// every other real-GPU test file in this workspace carries
@@ -430,6 +505,29 @@ fn high_contrast_dark_theme() -> Theme {
     match themes.resolve("High Contrast Dark", &palette) {
         Ok(theme) => theme,
         Err(err) => unreachable!("the committed High Contrast Dark theme must resolve: {err:?}"),
+    }
+}
+
+/// Mirrors [`high_contrast_dark_theme`], but for High Contrast Light.
+/// `design/themes/high-contrast-light.toml` also `extends = "Dark"` (see
+/// that file's own header comment), so — exactly like the others — the
+/// parent needs registering first before `resolve` can walk the
+/// `extends` chain.
+fn high_contrast_light_theme() -> Theme {
+    let palette = match Palette::from_toml_str(PALETTE_TOML) {
+        Ok(palette) => palette,
+        Err(err) => unreachable!("the committed palette must parse: {err:?}"),
+    };
+    let mut themes = ThemeSet::new();
+    if let Err(err) = themes.register(DARK_THEME_TOML) {
+        unreachable!("the committed Dark theme must register: {err:?}");
+    }
+    if let Err(err) = themes.register(HIGH_CONTRAST_LIGHT_THEME_TOML) {
+        unreachable!("the committed High Contrast Light theme must register: {err:?}");
+    }
+    match themes.resolve("High Contrast Light", &palette) {
+        Ok(theme) => theme,
+        Err(err) => unreachable!("the committed High Contrast Light theme must resolve: {err:?}"),
     }
 }
 
@@ -1263,6 +1361,132 @@ fn button_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     }
 }
 
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_button_state`, but
+/// against High Contrast Light (`high_contrast_light_theme()`/
+/// `HIGH_CONTRAST_LIGHT_CLEAR`) instead of Dark, Light, or High Contrast
+/// Dark. `button_gallery_tree` itself is unchanged and reused as-is.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_button_state_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = button_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        BUTTON_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, BUTTON_GALLERY_SIZE.0);
+    assert_eq!(image.height, BUTTON_GALLERY_SIZE.1);
+
+    let enabled_px = sample_cell_centre(&image, BUTTON_CELL, 0);
+    let pressed_px = sample_cell_centre(&image, BUTTON_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, BUTTON_CELL, 2);
+    assert_ne!(
+        enabled_px, pressed_px,
+        "accent.primary (hc.blue) vs accent.primary_active (hc.blue_dark) must render \
+         differently in High Contrast Light too"
+    );
+    assert_ne!(
+        enabled_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+    );
+}
+
+/// The High Contrast Light counterpart of `render_gallery_button_
+/// outline_proves_border_control_opacity_in_high_contrast_dark_theme` —
+/// the same real, rendered proof that `border.control_opacity = 1.0`
+/// paints a visible outline through the whole real pipeline, now for the
+/// theme where `border.control` resolves to `hc.black` rather than
+/// `hc.white`. See that test's own doc comment for how the sample point
+/// (one pixel in from the enabled button's own right edge,
+/// `BUTTON_CELL.0 - 1`, at mid-height `BUTTON_CELL.1 / 2`) was
+/// originally derived from a real debug scan of this pipeline's own
+/// stroke tessellation — that geometry is a property of the pipeline,
+/// not of any theme's colours, so it transfers directly here rather than
+/// needing its own scan; running this test confirms that empirically
+/// rather than assuming it.
+#[test]
+fn render_gallery_button_outline_proves_border_control_opacity_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = button_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        BUTTON_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+
+    let fill_px = sample_cell_centre(&image, BUTTON_CELL, 0);
+    let edge_px = sample_at(&image, BUTTON_CELL.0 - 1, BUTTON_CELL.1 / 2);
+    assert_eq!(
+        edge_px,
+        [0, 0, 0, 255],
+        "border.control (hc.black) at alpha=1.0 must paint pure opaque black one pixel in from \
+         the enabled button's own right edge"
+    );
+    assert_ne!(
+        edge_px, fill_px,
+        "the outline pixel must read differently from the button's own accent.primary fill"
+    );
+}
+
+/// The High Contrast Light counterpart of `button_gallery_matches_the_
+/// golden_image_in_high_contrast_dark_theme` — same tree, same three
+/// states, `high_contrast_light_theme()`/`HIGH_CONTRAST_LIGHT_CLEAR`
+/// instead of any other theme's own pairing, diffed against its own
+/// golden target (`tests/golden/button_gallery_high_contrast_light.png`,
+/// which does not exist yet).
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// button_gallery_high_contrast_light.png`, and confirm it actually shows
+/// three visually distinct buttons in High Contrast Light colours,
+/// including the black outline stroke around each, before this attribute
+/// comes off.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn button_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = button_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        BUTTON_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/button_gallery_high_contrast_light.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
 /// The same "distinct pixels, no golden needed" proof as `Button`'s
 /// own, for `Checkbox`: unchecked (`surface.sunken`) vs checked
 /// (`accent.primary`) must render differently outright; unchecked vs
@@ -1505,6 +1729,89 @@ fn checkbox_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/checkbox_gallery_high_contrast_dark.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_checkbox_state`, but
+/// against High Contrast Light (`high_contrast_light_theme()`/
+/// `HIGH_CONTRAST_LIGHT_CLEAR`) instead of any other theme.
+/// `checkbox_gallery_tree` itself is unchanged and reused as-is. Unlike
+/// Dark/Light, `surface.sunken` here is `hc.white` (pure `#ffffff`,
+/// identical to every other `surface.*` token in this theme — see
+/// `HIGH_CONTRAST_LIGHT_CLEAR`'s own doc comment) — the reason this
+/// gallery needs the mid-grey backdrop at all: against a plain white
+/// clear, the unchecked box would be invisible, the same failure
+/// `HIGH_CONTRAST_DARK_CLEAR`'s own doc comment already records, mirrored.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_checkbox_state_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = checkbox_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        CHECKBOX_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, CHECKBOX_GALLERY_SIZE.0);
+    assert_eq!(image.height, CHECKBOX_GALLERY_SIZE.1);
+
+    let unchecked_px = sample_cell_centre(&image, CHECKBOX_CELL, 0);
+    let checked_px = sample_cell_centre(&image, CHECKBOX_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, CHECKBOX_CELL, 2);
+    assert_ne!(
+        unchecked_px, checked_px,
+        "surface.sunken (hc.white) vs accent.primary (hc.blue) must render differently"
+    );
+    assert_ne!(
+        unchecked_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+    );
+}
+
+/// The High Contrast Light counterpart of `checkbox_gallery_matches_the_
+/// golden_image_in_high_contrast_dark_theme` — same tree, same three
+/// states, `high_contrast_light_theme()`/`HIGH_CONTRAST_LIGHT_CLEAR`,
+/// diffed against its own golden target (`tests/golden/
+/// checkbox_gallery_high_contrast_light.png`, which does not exist yet).
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline**: a human on real GPU hardware needs to run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+/// --ignored`, open the written golden, and confirm it actually shows
+/// three visually distinct checkboxes in High Contrast Light colours —
+/// including the black outline around every box (`border.control_opacity
+/// = 1.0`) — before this attribute comes off.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn checkbox_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = checkbox_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        CHECKBOX_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/checkbox_gallery_high_contrast_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
@@ -1798,6 +2105,88 @@ fn color_swatch_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     }
 }
 
+/// The High Contrast Light counterpart of
+/// `render_gallery_produces_distinct_pixels_for_each_color_swatch_state`.
+/// `color_swatch_gallery_tree` is reused unchanged — the two arbitrary
+/// swatch colours (`(220,40,40)`, `(40,80,220)`) are content, not
+/// theme-resolved chrome, so this is "do these same arbitrary colours
+/// still contrast `HIGH_CONTRAST_LIGHT_CLEAR`'s own mid-grey" — an easy
+/// yes here too, both are far from `#808080` in every channel, the same
+/// conclusion the High Contrast Dark counterpart already reached.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state_in_high_contrast_light_theme()
+ {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = color_swatch_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COLOR_SWATCH_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, COLOR_SWATCH_GALLERY_SIZE.0);
+    assert_eq!(image.height, COLOR_SWATCH_GALLERY_SIZE.1);
+
+    let first_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 0);
+    let second_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 2);
+    assert_ne!(
+        first_px, second_px,
+        "two different swatch colours must render differently in High Contrast Light too"
+    );
+    assert_ne!(
+        first_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity (0.6 here, same as High Contrast Dark -- see this theme's own \
+         [state] comment) blended over HIGH_CONTRAST_LIGHT_CLEAR must render dimmer than full \
+         opacity, even though both cells share the same underlying colour"
+    );
+}
+
+/// The High Contrast Light counterpart of `color_swatch_gallery_matches_
+/// the_golden_image_in_high_contrast_dark_theme` — diffed against
+/// `tests/golden/color_swatch_gallery_high_contrast_light.png`, which
+/// does not exist yet.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline**: a human on real GPU hardware needs to run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+/// --ignored`, open the written golden, and confirm it actually shows
+/// three visually distinct swatches, each with its own black outline
+/// ring (`border.control_opacity = 1.0`), before this attribute comes
+/// off.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn color_swatch_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = color_swatch_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COLOR_SWATCH_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/color_swatch_gallery_high_contrast_light.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
 /// `Slider`'s own "distinct pixels" proof is shaped differently from
 /// the others: instead of comparing each cell's own centre (which
 /// would just show the track, not the thumb, for anything but a
@@ -2065,6 +2454,95 @@ fn slider_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/slider_gallery_high_contrast_dark.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_slider_state`, but
+/// against High Contrast Light (`high_contrast_light_theme()`/
+/// `HIGH_CONTRAST_LIGHT_CLEAR`) instead of any other theme.
+/// `slider_gallery_tree` itself is unchanged and reused as-is. As with
+/// High Contrast Dark, the track (`surface.sunken`, `hc.white` here)
+/// needs `HIGH_CONTRAST_LIGHT_CLEAR` to be visible at all against the
+/// clear colour, the same reasoning `Checkbox`'s own High Contrast Light
+/// test gives (`HIGH_CONTRAST_LIGHT_CLEAR`'s own doc comment).
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = slider_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        SLIDER_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, SLIDER_GALLERY_SIZE.0);
+    assert_eq!(image.height, SLIDER_GALLERY_SIZE.1);
+
+    let near_left_edge = |cell: u32| {
+        sample_at(
+            &image,
+            cell * SLIDER_CELL.0 + SLIDER_THUMB_SAMPLE_OFFSET_X,
+            SLIDER_CELL.1 / 2,
+        )
+    };
+    let at_min = near_left_edge(0);
+    let at_max = near_left_edge(1);
+    let disabled = near_left_edge(2);
+    assert_ne!(
+        at_min, at_max,
+        "the thumb must be at a different x offset for a slider at its own minimum vs maximum \
+         value in High Contrast Light too"
+    );
+    assert_ne!(
+        at_max[..3],
+        disabled[..3],
+        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+    );
+}
+
+/// The High Contrast Light counterpart of `slider_gallery_matches_the_
+/// golden_image_in_high_contrast_dark_theme` — diffed against
+/// `tests/golden/slider_gallery_high_contrast_light.png`, which does not
+/// exist yet.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline**: a human on real GPU hardware needs to run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+/// --ignored`, open the written golden, and confirm it actually shows the
+/// thumb at three visually distinct positions/opacities in High Contrast
+/// Light colours, with a visible black ring around the thumb itself
+/// (`control_outline` is applied to the thumb path only, not the track),
+/// before this attribute comes off.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn slider_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = slider_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        SLIDER_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/slider_gallery_high_contrast_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
@@ -2377,6 +2855,132 @@ fn text_field_gallery_matches_the_golden_image_in_high_contrast_dark_theme() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/text_field_gallery_high_contrast_dark.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_text_field_state`,
+/// but against High Contrast Light (`high_contrast_light_theme()`/
+/// `HIGH_CONTRAST_LIGHT_CLEAR`) instead of any other theme.
+/// `text_field_gallery_tree` itself is unchanged and reused as-is.
+/// `surface.sunken` here is `hc.white`, exactly the same "invisible
+/// against a plain white clear" problem as every other widget in this
+/// theme — already solved once for the whole theme by
+/// `HIGH_CONTRAST_LIGHT_CLEAR`'s own reasoning, not re-solved per widget.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_text_field_state_in_high_contrast_light_theme()
+{
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, TEXT_FIELD_GALLERY_SIZE.0);
+    assert_eq!(image.height, TEXT_FIELD_GALLERY_SIZE.1);
+
+    let enabled_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 0);
+    let disabled_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 1);
+    assert_ne!(
+        enabled_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over HIGH_CONTRAST_LIGHT_CLEAR must render differently \
+         from full opacity in High Contrast Light too"
+    );
+}
+
+/// The High Contrast Light counterpart of `render_gallery_text_field_
+/// outline_proves_border_control_opacity_in_high_contrast_dark_theme` —
+/// the second of this theme's two required real, rendered proofs that
+/// `border.control_opacity = 1.0` actually paints a visible outline
+/// through the whole real pipeline. Same sample coordinates as the Dark
+/// counterpart (`TEXT_FIELD_CELL.0 - 1` for the right edge,
+/// `TEXT_FIELD_CELL.1 - 1` for the bottom edge, both one pixel in from
+/// their own boundary) — that geometry is a property of this pipeline's
+/// own stroke tessellation, not of any theme's colours, confirmed by
+/// actually running this test rather than assumed to transfer.
+#[test]
+fn render_gallery_text_field_outline_proves_border_control_opacity_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+
+    let fill_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 0);
+    let right_edge_px = sample_at(&image, TEXT_FIELD_CELL.0 - 1, TEXT_FIELD_CELL.1 / 2);
+    let bottom_edge_px = sample_at(&image, TEXT_FIELD_CELL.0 / 2, TEXT_FIELD_CELL.1 - 1);
+    for (label, edge_px) in [("right", right_edge_px), ("bottom", bottom_edge_px)] {
+        assert_eq!(
+            edge_px,
+            [0, 0, 0, 255],
+            "border.control (hc.black) at alpha=1.0 must paint pure opaque black one pixel in \
+             from the enabled text field's own {label} edge"
+        );
+        assert_ne!(
+            edge_px, fill_px,
+            "the {label} outline pixel must read differently from the field's own surface.sunken \
+             fill"
+        );
+    }
+}
+
+/// The High Contrast Light counterpart of `text_field_gallery_matches_
+/// the_golden_image_in_high_contrast_dark_theme` — diffed against
+/// `tests/golden/text_field_gallery_high_contrast_light.png`, which does
+/// not exist yet.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline**: a human on real GPU hardware needs to run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+/// --ignored`, open the written golden, and confirm it actually shows two
+/// visually distinct text fields in High Contrast Light colours, each
+/// with a visible black outline — the same outline
+/// `render_gallery_text_field_outline_proves_border_control_opacity_in_
+/// high_contrast_light_theme` already proved lands at the right byte
+/// values, now checked as a whole image — before this attribute comes
+/// off.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn text_field_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/text_field_gallery_high_contrast_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
@@ -2820,6 +3424,145 @@ fn command_palette_gallery_matches_the_golden_image_in_high_contrast_dark_theme(
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/command_palette_gallery_high_contrast_dark.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The High Contrast Light counterpart of `render_gallery_produces_the_
+/// command_palettes_own_panel_in_high_contrast_dark_theme` — same tree,
+/// same weaker "something opaque was painted, distinct from the
+/// surrounding clear colour" proof, but against
+/// `high_contrast_light_theme()`/`HIGH_CONTRAST_LIGHT_CLEAR` instead of
+/// any other theme's own pairing. No separate `COMMAND_PALETTE_HIGH_
+/// CONTRAST_LIGHT_CLEAR` constant is needed, for the same reason
+/// `HIGH_CONTRAST_DARK_CLEAR` already didn't need one: `HIGH_CONTRAST_
+/// LIGHT_CLEAR` was already chosen as one shared backdrop for every
+/// widget in this theme's gallery, `CommandPalette` included (see that
+/// constant's own doc comment) — its own `surface.raised` collision with
+/// a plain-white backdrop is exactly the same "every surface token is
+/// `hc.white`" problem every other widget here has, not a distinct one
+/// worth its own constant.
+#[test]
+fn render_gallery_produces_the_command_palettes_own_panel_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    assert_eq!(image.width, COMMAND_PALETTE_GALLERY_SIZE.0);
+    assert_eq!(image.height, COMMAND_PALETTE_GALLERY_SIZE.1);
+
+    let panel_centre = sample_at(
+        &image,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+    );
+    let corner = sample_at(&image, 0, 0);
+    assert_ne!(
+        corner, panel_centre,
+        "the panel's own interior must show something opaque, not the same clear colour its own \
+         margin (and rounded-off corner) shows, in High Contrast Light too"
+    );
+}
+
+/// The High Contrast Light counterpart of `command_palette_gallery_
+/// paints_the_selected_rows_own_highlight_in_high_contrast_dark_theme` —
+/// the real, exact-colour proof that the panel's own centre pixel is
+/// `accent.primary` itself, not `surface.raised`. `[0,0,255]`, this
+/// theme's own `hc.blue` (`design/tokens/palette.toml`'s `[hc]` table,
+/// `#0000ff`) — a value with no fractional byte rounding ambiguity (each
+/// channel is either `0x00` or `0xff`), safe to assert as an exact
+/// literal the same way High Contrast Dark's own `[255,255,0]` already
+/// is.
+#[test]
+fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    let panel_centre = sample_at(
+        &image,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+    );
+    assert_eq!(
+        panel_centre[..3],
+        [0, 0, 255],
+        "the sole, always-selected result row must paint High Contrast Light's own accent.primary \
+         (hc.blue) across the panel's own interior"
+    );
+}
+
+/// The High Contrast Light counterpart of `command_palette_gallery_
+/// matches_the_golden_image_in_high_contrast_dark_theme` — diffed against
+/// `tests/golden/command_palette_gallery_high_contrast_light.png`, which
+/// does not exist yet. `command_palette_style`'s own `COMMAND_PALETTE_
+/// MARGIN` is reused completely unchanged, same as every other theme's
+/// own `CommandPalette` gallery.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline**: a human on real GPU hardware needs to run
+/// `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test gallery --
+/// --ignored`, open the written golden, and confirm it actually shows a
+/// visible panel with a visible selected-row highlight and a visible
+/// black panel outline (`border.control_opacity = 1.0`) before this
+/// attribute comes off.
+///
+/// **Same asymmetric occlusion as High Contrast Dark, not a new
+/// investigation**: nothing about `command_palette_style`'s own layout or
+/// `paint_list_row`'s own fill logic is theme-dependent (see
+/// `command_palette_gallery_matches_the_golden_image_in_high_contrast_
+/// dark_theme`'s own doc comment for the full, already-worked-out
+/// mechanism), so the same selected-row-occludes-the-panel-outline
+/// situation applies here unchanged: the panel's own outline is expected
+/// to be genuinely visible along the **top and left** edges (that band's
+/// included pixel falls just outside the panel, in the margin) and
+/// genuinely invisible along the **right and bottom** edges (there the
+/// row's own identical-bounds fill, painted after, overwrites it) — a
+/// crisp L-shaped black line, not a uniformly faint one, is what the
+/// human bless should expect to see.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn command_palette_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = high_contrast_light_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/command_palette_gallery_high_contrast_light.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
