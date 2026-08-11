@@ -6292,6 +6292,90 @@ check licenses` clean with the new `toml` dependency.
   across the whole pixel, not per-channel) — plus layer-group
   render-order recursion, unchanged from the bullet above. Blend modes
   are real for 9 of 27, not "done."
+- [x] **Real blend-mode math: the 4 "dodge and burn" modes** — done
+  2026-08-11, extending the same pattern the "first 8 non-Normal modes"
+  bullet above already established, not a new one: `ColorDodge`,
+  `LinearDodge`, `ColorBurn`, `LinearBurn`. `aurora_render::BlendMode`
+  widened from 9 to 13 variants; `blend_channel` gained 4 new match arms
+  with the exact W3C Compositing and Blending Level 1 formulas
+  (Photoshop's own convention too):
+  `LinearDodge = min(Cb + Cs, 1)`, `LinearBurn = max(Cb + Cs - 1, 0)` —
+  plain addition/subtraction and a clamp, no division, so no 0/1
+  special-casing needed — and the two with a real division to guard:
+  `ColorDodge = if Cb == 0 { 0 } else if Cs == 1 { 1 } else
+  { min(1, Cb / (1 - Cs)) }`, `ColorBurn = if Cb == 1 { 1 } else if
+  Cs == 0 { 0 } else { 1 - min(1, (1 - Cb) / Cs) }`. Branch **order**
+  matters and is spec-mandated: the backdrop's own extreme (`Cb == 0`
+  for Dodge, `Cb == 1` for Burn) is checked before the source's
+  (`Cs == 1`/`Cs == 0`) — confirmed, not assumed, that both conditions
+  really can be true on the same real pixel simultaneously (`Cb`/`Cs`
+  are independent per-channel scalars, e.g. a transparent-black backdrop
+  dodge-blended with a fully white source genuinely has `Cb == 0` *and*
+  `Cs == 1` at once), so the order is not a hypothetical edge the spec
+  happens to mention — it is the thing that decides the real answer for
+  that pixel. Needed a scoped `#[allow(clippy::float_cmp)]` on
+  `blend_channel` (the same established pattern `aurora-doc`/
+  `aurora-tile`/`aurora-widgets`/etc. already use for their own
+  bit-exact, not-accumulated-rounding-error float comparisons) since
+  `cs == 1.0`/`cb == 1.0` are the spec's own literal boundary, not an
+  epsilon band.
+
+  `aurora-app::translate_blend_mode` gained 4 new 1:1 arms
+  (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`, moved out of the
+  fallback arm into their own real mappings), still an exhaustive match
+  with every one of the remaining ~14 `aurora_doc::BlendMode` variants
+  named individually rather than a wildcard. Every doc comment claiming
+  "9 of 27"/"8-mode simple separable family only" (this crate's own
+  top-level module doc, `translate_blend_mode`, `recomposite_visible_tiles`,
+  `composite_document`, `App::save_file`, plus `aurora-render`'s own
+  crate doc and `composite_tile_cpu`'s doc) updated to name the real
+  13-mode scope and the accurate ~14 still-open variants.
+
+  8 new `aurora-render` tests (was 45, now 53): one hand-computed
+  in-range case per mode plus all 4 required edge-case branches
+  (`ColorDodge` with `Cb == 0` — proven regardless of `Cs`, including a
+  channel where `Cs == 1` too, the literal both-conditions-true pixel;
+  `ColorDodge` with `Cs == 1` and `Cb > 0`; `ColorBurn` with `Cb == 1` —
+  proven regardless of `Cs`, including a channel where `Cs == 0` too;
+  `ColorBurn` with `Cs == 0` and `Cb < 1`), each edge-case test asserting
+  `is_finite()` before the exact literal value so a stray `NaN`/`Infinity`
+  would fail the test, not just look plausible. Test literals are exact
+  eighths/quarters (0.375/0.5/0.75/0.875/0.125/0.25), not 0.4/0.6/0.8 —
+  a first draft used the latter and 4 tests failed by ~2 ULP (e.g.
+  `0.7998047` vs `0.8`), since only powers-of-two fractions round-trip
+  bit-exact through `f16`; caught by actually running the tests, not
+  assumed, and fixed by switching to the same "exact literal round-trip"
+  discipline this file's own pre-existing Normal-mode test already
+  documents. 1 new `aurora-app` test (was 146, now 147): a real two-layer
+  `LayerTree` with the top layer's `blend_mode` actually set to
+  `ColorDodge`, composited through `composite_document`, asserting the
+  real ColorDodge result (0.75) against backdrop 0.375/source 0.5 —
+  distinct from both the Normal (0.5) and Multiply (0.1875) results for
+  the same inputs, so it genuinely proves the real per-layer blend mode
+  reaches the compositor through the translation boundary.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-render` (53 passed, 0 failed — 45 before), `cargo test -p
+  aurora-app` (147 passed, 0 failed — 146 before), `python3
+  scripts/check_no_hardcoded_style.py` clean. `scripts/check_layering.py`
+  again the one unrun check (pre-existing `tomllib` gap in this sandbox)
+  — reasoned through by hand instead, same as the prior round:
+  `aurora-render`'s own `Cargo.toml` gained no new dependency (confirmed
+  by reading it), so the only crate naming both `aurora_doc` and
+  `aurora_render` types together is still `aurora-app`, unchanged. No
+  new dependencies.
+
+  **Explicitly still NOT fixed by this change** (scoped out on purpose,
+  separate, later rounds): the ~14 remaining `aurora_doc::BlendMode`
+  variants — the overlay/light family (`Overlay`/`SoftLight`/
+  `HardLight`/`VividLight`/`LinearLight`/`PinLight`/`HardMix`), the
+  non-separable modes (`Hue`/`Saturation`/`Color`/`Luminosity`), `Dissolve`,
+  and `DarkerColor`/`LighterColor` — plus layer-group render-order
+  recursion, unchanged from the bullets above. Blend modes are real for
+  13 of 27, not "done." Dodge/burn as a family is not being claimed
+  "complete" beyond these 4 named modes — there is no fifth dodge/burn
+  variant in `aurora_doc::BlendMode` to close.
 
 ### M1.10 — Phase 1 gate
 

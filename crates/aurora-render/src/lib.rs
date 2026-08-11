@@ -10,11 +10,12 @@
 //! replacing the CPU per-pixel merge `spike/FINDINGS.md` finding #1 named
 //! as the real compositing bottleneck. [`composite_tile_cpu`] is its
 //! CPU-side sibling for *multi*-layer compositing: straight-alpha
-//! "source over" generalized by a real per-layer [`BlendMode`] — `Normal`
-//! plus the 8-mode "simple separable" family (`Darken`/`Multiply`/
-//! `Lighten`/`Screen`/`Difference`/`Exclusion`/`Subtract`/`Divide`); the
-//! ~18 remaining `aurora_doc::BlendMode` variants (dodge/burn,
-//! overlay/light family, non-separable Hue/Saturation/Color/Luminosity,
+//! "source over" generalized by a real per-layer [`BlendMode`] — `Normal`,
+//! the 8-mode "simple separable" family (`Darken`/`Multiply`/`Lighten`/
+//! `Screen`/`Difference`/`Exclusion`/`Subtract`/`Divide`), and the 4-mode
+//! "dodge and burn" family (`ColorDodge`/`LinearDodge`/`ColorBurn`/
+//! `LinearBurn`); the ~14 remaining `aurora_doc::BlendMode` variants
+//! (overlay/light family, non-separable Hue/Saturation/Color/Luminosity,
 //! Dissolve, DarkerColor/LighterColor) are separate, still-open follow-on
 //! work — run entirely on the CPU because the orchestration crate
 //! (`aurora-app`) needs to walk a real `aurora_doc::LayerTree` — a sibling

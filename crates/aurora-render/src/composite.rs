@@ -26,7 +26,7 @@ const LABEL: &str = "composite";
 ///
 /// `aurora-app`'s `translate_blend_mode` maps a real
 /// `aurora_doc::BlendMode` onto this one, one implemented variant at a
-/// time, falling every one of the ~18 not-yet-implemented modes back to
+/// time, falling every one of the ~14 not-yet-implemented modes back to
 /// [`Self::Normal`] as an honest, documented degrade — not a bug, since
 /// those modes' real math is separate, still-open follow-on work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,6 +41,10 @@ pub enum BlendMode {
     Exclusion,
     Subtract,
     Divide,
+    ColorDodge,
+    LinearDodge,
+    ColorBurn,
+    LinearBurn,
 }
 
 /// The per-channel blend function `B(Cb, Cs)` for `mode`, given one
@@ -57,6 +61,16 @@ pub enum BlendMode {
 /// every pre-existing Normal-mode test in this file still passing
 /// unchanged against the generalized code.
 #[must_use]
+// `ColorDodge`/`ColorBurn`'s `cs == 1.0`/`cb == 1.0` branch checks are
+// the W3C Compositing and Blending spec's own literal 0/1 boundary
+// conditions (guarding a division that would otherwise divide by zero),
+// not the "accumulated rounding error" smell `clippy::float_cmp`
+// otherwise warns about (the same reasoning `aurora-doc`'s and this
+// crate's own other `float_cmp` allows already document) -- `cb`/`cs`
+// arrive here as exact `f16`-sourced values (`0.0`/`1.0` round-trip
+// bit-exact through `f16`, confirmed by `spike/FINDINGS.md`), and the
+// spec requires exactly these two literals, not an epsilon band.
+#[allow(clippy::float_cmp)]
 fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
     match mode {
         BlendMode::Normal => cs,
@@ -74,6 +88,26 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
                 (cb / cs).min(1.0)
             }
         }
+        BlendMode::ColorDodge => {
+            if cb == 0.0 {
+                0.0
+            } else if cs == 1.0 {
+                1.0
+            } else {
+                (cb / (1.0 - cs)).min(1.0)
+            }
+        }
+        BlendMode::LinearDodge => (cb + cs).min(1.0),
+        BlendMode::ColorBurn => {
+            if cb == 1.0 {
+                1.0
+            } else if cs == 0.0 {
+                0.0
+            } else {
+                1.0 - ((1.0 - cb) / cs).min(1.0)
+            }
+        }
+        BlendMode::LinearBurn => (cb + cs - 1.0).max(0.0),
     }
 }
 
@@ -121,14 +155,17 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
 /// exactly matching what a document with no visible pixel layers should
 /// show.
 ///
-/// **Scope, stated honestly**: [`BlendMode`] implements 9 of
-/// `aurora_doc::BlendMode`'s real 27 variants — `Normal` plus the
+/// **Scope, stated honestly**: [`BlendMode`] implements 13 of
+/// `aurora_doc::BlendMode`'s real 27 variants — `Normal`, the
 /// "simple separable" family (`Darken`, `Multiply`, `Lighten`,
 /// `Screen`, `Difference`, `Exclusion`, `Subtract`, `Divide`), each a
 /// pure per-channel function of backdrop and source with no cross-
-/// channel or midpoint-branching logic. The remaining ~18
-/// (`ColorBurn`/`LinearBurn`/`ColorDodge`/`LinearDodge` "dodge and
-/// burn"; `Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
+/// channel or midpoint-branching logic, and the "dodge and burn"
+/// family (`ColorDodge`, `LinearDodge`, `ColorBurn`, `LinearBurn`),
+/// each also a pure per-channel function but with real 0/1 edge-case
+/// branches (division by a zero or saturated channel must not produce
+/// `NaN`/`Infinity`). The remaining ~14
+/// (`Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
 /// `PinLight`/`HardMix` "overlay and light"; the non-separable
 /// `Hue`/`Saturation`/`Color`/`Luminosity`; `Dissolve`; and
 /// `DarkerColor`/`LighterColor`) are separate, still-open follow-on
@@ -609,6 +646,176 @@ mod tests {
         let (r, g, b, a) = first_texel(&out);
         assert!(r.is_finite() && g.is_finite() && b.is_finite());
         assert_eq!((r, g, b, a), (1.0, 0.5, 1.0, 1.0));
+    }
+
+    // -- Blend-mode math: the 4 "dodge and burn" modes added this round
+    // (`ColorDodge`, `LinearDodge`, `ColorBurn`, `LinearBurn`), the same
+    // W3C-spec formulas the module-level doc comment on [`blend_channel`]
+    // names, following the exact same `as = ab = 1.0` reduction to
+    // `Co = B(Cb,Cs)` the 9 pre-existing non-Normal-mode tests above
+    // already establish. `ColorDodge`/`ColorBurn` both branch on which of
+    // two 0/1 extremes fires first -- the W3C spec (and Photoshop) check
+    // the *backdrop*'s own extreme before the *source*'s, so each gets a
+    // dedicated test proving the documented branch, not just the smooth
+    // in-range formula.
+
+    #[test]
+    // ColorDodge in-range case: min(1, Cb / (1 - Cs)). Backdrop 0.375,
+    // source 0.5 -> min(1, 0.375 / 0.5) = min(1, 0.75) = 0.75. 0.375 and
+    // 0.75 (like 0.25/0.5, unlike 0.4/0.6) are exact eighths, so they
+    // round-trip bit-exact through `f16` -- the same discipline this
+    // file's own Normal-mode test documents for its own literal choice.
+    fn composite_tile_cpu_color_dodge_computes_the_clamped_per_channel_ratio() {
+        let bottom = solid_texels([0.375, 0.375, 0.375, 1.0]);
+        let top = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::ColorDodge),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 0.75, 0.75, 1.0));
+    }
+
+    #[test]
+    // ColorDodge's own `Cb == 0` branch, required to fire (and yield 0,
+    // not attempt a division) regardless of `Cs` -- proven with three
+    // different source values sharing a zero backdrop: R is a plain
+    // in-range source (0.3), B is also `Cs == 0` (both formal edge
+    // conditions simultaneously zero), and G is `Cs == 1` -- the one
+    // input where *both* of `blend_channel`'s `ColorDodge` conditions
+    // (`Cb == 0` and `Cs == 1`) are true at once. `Cb` and `Cs` are
+    // independent per-channel scalars (one backdrop, one source texel,
+    // no relationship enforced between them), so this input is a real,
+    // reachable pixel, not a hypothetical -- e.g. a transparent-black
+    // backdrop dodge-blended with a fully white source. The W3C order
+    // (check the backdrop's own `Cb == 0` extreme first, exactly as
+    // `blend_channel` does) resolves it to 0, matching this assertion;
+    // checking `Cs == 1` first instead would wrongly yield 1 for that
+    // channel -- this test is what would catch that ordering bug.
+    fn composite_tile_cpu_color_dodge_with_a_zero_backdrop_yields_zero_regardless_of_source() {
+        let bottom = solid_texels([0.0, 0.0, 0.0, 1.0]);
+        let top = solid_texels([0.3, 1.0, 0.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::ColorDodge),
+        ]);
+        let (r, g, b, a) = first_texel(&out);
+        assert!(r.is_finite() && g.is_finite() && b.is_finite());
+        assert_eq!((r, g, b, a), (0.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    // ColorDodge's own `Cs == 1` branch (backdrop non-zero, so the
+    // `Cb == 0` branch above does not fire first): must yield 1 without
+    // ever computing `Cb / (1 - Cs)`, which would be a division by zero.
+    fn composite_tile_cpu_color_dodge_with_a_saturated_source_yields_one_when_backdrop_is_nonzero()
+    {
+        let bottom = solid_texels([0.3, 0.6, 0.9, 1.0]);
+        let top = solid_texels([1.0, 1.0, 1.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::ColorDodge),
+        ]);
+        let (r, g, b, a) = first_texel(&out);
+        assert!(r.is_finite() && g.is_finite() && b.is_finite());
+        assert_eq!((r, g, b, a), (1.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    // ColorBurn in-range case: 1 - min(1, (1 - Cb) / Cs). Backdrop 0.875,
+    // source 0.5 -> 1 - min(1, 0.125 / 0.5) = 1 - 0.25 = 0.75. 0.875,
+    // 0.125, and 0.25 (like 0.25/0.5, unlike 0.6/0.4) are exact
+    // eighths/quarters, so they round-trip bit-exact through `f16` --
+    // the same discipline this file's own Normal-mode test documents for
+    // its own literal choice. The result (0.75) is deliberately distinct
+    // from both inputs and from what a Normal blend of the same two
+    // layers would produce (0.5), so it can't be mistaken for either.
+    fn composite_tile_cpu_color_burn_computes_the_clamped_per_channel_ratio() {
+        let bottom = solid_texels([0.875, 0.875, 0.875, 1.0]);
+        let top = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::ColorBurn),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 0.75, 0.75, 1.0));
+    }
+
+    #[test]
+    // ColorBurn's own `Cb == 1` branch, required to fire (and yield 1,
+    // not attempt a division) regardless of `Cs` -- the mirror image of
+    // the ColorDodge zero-backdrop test above. R is a plain in-range
+    // source (0.3), B is `Cs == 1`, and G is `Cs == 0` -- the one input
+    // where *both* of `blend_channel`'s `ColorBurn` conditions (`Cb == 1`
+    // and `Cs == 0`) are true at once (a fully white backdrop burned by a
+    // fully black source, a perfectly ordinary real pixel, not a
+    // hypothetical). The W3C order (check the backdrop's own `Cb == 1`
+    // extreme first, exactly as `blend_channel` does) resolves it to 1,
+    // matching this assertion; checking `Cs == 0` first instead would
+    // wrongly yield 0 for that channel -- this test is what would catch
+    // that ordering bug.
+    fn composite_tile_cpu_color_burn_with_a_saturated_backdrop_yields_one_regardless_of_source() {
+        let bottom = solid_texels([1.0, 1.0, 1.0, 1.0]);
+        let top = solid_texels([0.3, 0.0, 1.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::ColorBurn),
+        ]);
+        let (r, g, b, a) = first_texel(&out);
+        assert!(r.is_finite() && g.is_finite() && b.is_finite());
+        assert_eq!((r, g, b, a), (1.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    // ColorBurn's own `Cs == 0` branch (backdrop not saturated, so the
+    // `Cb == 1` branch above does not fire first): must yield 0 without
+    // ever computing `(1 - Cb) / Cs`, which would be a division by zero.
+    fn composite_tile_cpu_color_burn_with_a_zero_source_yields_zero_when_backdrop_is_not_saturated()
+    {
+        let bottom = solid_texels([0.2, 0.5, 0.9, 1.0]);
+        let top = solid_texels([0.0, 0.0, 0.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::ColorBurn),
+        ]);
+        let (r, g, b, a) = first_texel(&out);
+        assert!(r.is_finite() && g.is_finite() && b.is_finite());
+        assert_eq!((r, g, b, a), (0.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    // LinearDodge: min(Cb + Cs, 1.0) -- plain addition and a clamp, no
+    // division so no 0/1 special-casing is needed. All literals are
+    // exact quarters/eighths (unlike 0.4/0.7), so they round-trip
+    // bit-exact through `f16`. R: 0.25 + 0.5 = 0.75, under the clamp.
+    // G: 0.75 + 0.5 = 1.25, clamped down to 1.0. B: 1.0 + 1.0 = 2.0,
+    // clamped down to 1.0 -- proving the clamp holds even well past the
+    // boundary, not just just-over-1.
+    fn composite_tile_cpu_linear_dodge_adds_and_clamps_to_one() {
+        let bottom = solid_texels([0.25, 0.75, 1.0, 1.0]);
+        let top = solid_texels([0.5, 0.5, 1.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::LinearDodge),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    // LinearBurn: max(Cb + Cs - 1.0, 0.0) -- plain subtraction and a
+    // clamp, no division so no 0/1 special-casing is needed. All
+    // literals are exact quarters (unlike 0.4/0.7), so they round-trip
+    // bit-exact through `f16`. R: 0.25 + 0.5 - 1.0 = -0.25, clamped up
+    // to 0.0. G: 0.75 + 0.5 - 1.0 = 0.25, under the clamp (a genuine
+    // non-zero result, for contrast against R and B). B:
+    // 0.0 + 0.0 - 1.0 = -1.0, clamped up to 0.0 -- proving the clamp
+    // holds even well past the boundary, not just just-under-0.
+    fn composite_tile_cpu_linear_burn_subtracts_and_clamps_to_zero() {
+        let bottom = solid_texels([0.25, 0.75, 0.0, 1.0]);
+        let top = solid_texels([0.5, 0.5, 0.0, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::LinearBurn),
+        ]);
+        assert_eq!(first_texel(&out), (0.0, 0.25, 0.0, 1.0));
     }
 
     /// A `TILE`x`TILE` `Rgba16Float` texture, pre-filled solid `rgba` via
