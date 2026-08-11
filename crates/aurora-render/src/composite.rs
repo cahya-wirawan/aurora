@@ -10,6 +10,10 @@ use half::f16;
 
 const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
 const LABEL: &str = "composite";
+/// The byte size of `composite_over_with_opacity`'s own uniform buffer —
+/// a real `f32` opacity value plus 12 bytes of padding, matching
+/// `shaders/composite.wgsl`'s own `Opacity` struct exactly.
+const OPACITY_UNIFORM_SIZE: u64 = 16;
 
 /// The subset of `aurora_doc::BlendMode`'s real 27-variant, PSD-
 /// round-trippable enum this crate actually implements blend math for.
@@ -630,16 +634,35 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// frame (that's still-open M1.3 scope: progressive rendering, async
 /// evaluation).
 ///
-/// Deliberately minimal: blends exactly one source tile over one
-/// destination tile via straight-alpha "source-over"
-/// (`Blend::AlphaBlending`). No blend-mode or opacity parameter — those
-/// are a layer's properties, and the layer model (`aurora-doc`) doesn't
-/// exist yet; `aurora-render` sits below it in the layering (PRD §7.2)
-/// and has no way to know either. This is the primitive real layer
-/// compositing will call once that model exists, not a full compositor
-/// on its own.
+/// Deliberately minimal: [`Self::composite_over`] blends exactly one
+/// source tile over one destination tile via straight-alpha
+/// "source-over" (`Blend::AlphaBlending`), no blend-mode or opacity
+/// parameter of its own — those are a layer's properties, and when this
+/// method was first written the layer model (`aurora-doc`) didn't exist
+/// yet, nor could it: `aurora-render` sits below it in the layering (PRD
+/// §7.2) and has no way to know either.
+///
+/// [`Self::composite_over_with_opacity`] is the real, additive opacity-
+/// aware sibling that followed once a caller (`aurora-app`, which
+/// depends on both `aurora-render` and `aurora-doc`) actually had a
+/// per-layer opacity to apply — `composite_over` itself is unchanged, so
+/// every existing caller/test keeps its exact prior behaviour. Neither
+/// method knows about blend *modes* (`Multiply`, `Screen`, ...) — those
+/// stay CPU-only (`composite_tile_cpu`); see `aurora-app`'s own
+/// `gpu_composite_tile`/`document_qualifies_for_gpu_compositing` (a
+/// higher crate — `aurora-render` cannot name it directly, PRD §7.2's
+/// layering) for exactly which tiles this primitive can and can't
+/// correctly express on its own.
 pub struct TileCompositor {
     bind_group_layout: wgpu::BindGroupLayout,
+    /// The [`Self::composite_over_with_opacity`]-only sibling of
+    /// `bind_group_layout` above: the same texture + sampler pair, plus
+    /// a third binding for the opacity uniform buffer.
+    /// [`Self::composite_over`] itself never touches this — kept
+    /// entirely separate so that method's own layout, and therefore its
+    /// exact prior pipeline shape/behaviour, is untouched by this
+    /// addition.
+    bind_group_layout_opacity: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     shader: wgpu::ShaderModule,
     pipelines: PipelineCache,
@@ -669,6 +692,38 @@ impl TileCompositor {
                 },
             ],
         });
+        let bind_group_layout_opacity =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(LABEL),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some(LABEL),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -681,6 +736,7 @@ impl TileCompositor {
         });
         Self {
             bind_group_layout,
+            bind_group_layout_opacity,
             sampler,
             shader,
             pipelines: PipelineCache::new(),
@@ -752,6 +808,141 @@ impl TileCompositor {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(LABEL) });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(LABEL),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        context.queue().submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Blends `src` over `dst` in place exactly like [`Self::composite_over`]
+    /// (`LoadOp::Load`, straight-alpha "source-over" via the same
+    /// `Blend::AlphaBlending` fixed-function state), except `src`'s own
+    /// alpha channel is scaled by `opacity` (clamped to `0.0..=1.0`)
+    /// before the blend unit ever sees it — the GPU counterpart of
+    /// [`composite_tile_cpu`]'s own `alpha = src_alpha * opacity` step.
+    /// The fixed-function blend unit itself has no uniform input, so
+    /// this runs a real, separate fragment shader entry point
+    /// (`fs_composite_opacity`, `shaders/composite.wgsl`) that computes
+    /// the scaled alpha in the shader instead; the *same* blend state
+    /// then does the rest, unchanged. Both views must be `Rgba16Float`,
+    /// the same size, and `dst`'s owning texture must include
+    /// `RENDER_ATTACHMENT` usage — identical preconditions to
+    /// `composite_over`.
+    ///
+    /// A separate bind group layout/pipeline from `composite_over`'s own
+    /// (a third binding, the opacity uniform buffer) — `composite_over`
+    /// itself is entirely unchanged by this method's existence: same
+    /// signature, same shader entry point, same pipeline key, so every
+    /// caller/test of it keeps its exact prior behaviour.
+    pub fn composite_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        dst: &wgpu::TextureView,
+        src: &wgpu::TextureView,
+        opacity: f32,
+    ) {
+        let device = context.device();
+        let opacity = opacity.clamp(0.0, 1.0);
+        let key = PipelineKey {
+            shader: LABEL,
+            vertex_entry: "vs_composite",
+            fragment_entry: "fs_composite_opacity",
+            target_format: wgpu::TextureFormat::Rgba16Float,
+            blend: Blend::AlphaBlending,
+        };
+        let layout = &self.bind_group_layout_opacity;
+        let shader = &self.shader;
+        let pipeline = self.pipelines.get_or_create_with(key.clone(), || {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(LABEL),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(LABEL),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some(key.vertex_entry),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(key.fragment_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: key.target_format,
+                        blend: key.blend.to_wgpu(),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                multiview_mask: None,
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+            })
+        });
+
+        // 16 bytes: a real `f32` opacity value plus 12 bytes of padding,
+        // matching `shaders/composite.wgsl`'s own `Opacity` struct
+        // (`value: f32, _pad0: f32, _pad1: f32, _pad2: f32` — plain
+        // scalar padding fields, not a `vec3<f32>`; see that struct's
+        // own doc comment for why) byte for byte — the same "pad a
+        // small scalar uniform to 16 bytes for defensive cross-backend
+        // alignment" shape `aurora-widgets`' own
+        // `PathPipeline::bind_group` already uses.
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(LABEL),
+            size: OPACITY_UNIFORM_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut bytes = Vec::with_capacity(OPACITY_UNIFORM_SIZE as usize);
+        bytes.extend_from_slice(&opacity.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 12]);
+        context.queue().write_buffer(&uniform_buffer, 0, &bytes);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(LABEL),
+            layout: &self.bind_group_layout_opacity,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1955,6 +2146,172 @@ mod tests {
             compositor.pipelines.len(),
             1,
             "a second call with the same key must not rebuild"
+        );
+    }
+
+    // -- `composite_over_with_opacity`: the opacity-aware GPU primitive
+    // real multi-layer compositing (`aurora-app`'s `gpu_composite_tile`)
+    // needs. Every hand-computed expected value below uses exact powers
+    // of two (0.25, 0.5, 0.75, 1.0) deliberately -- these round-trip
+    // bit-exactly through both `f16` and every intermediate `f32`
+    // multiply/add this formula performs, so `assert_eq!` below is a
+    // real bit-exact check, not a "close enough" one, the same
+    // "0.25/0.5/0.75, powers of two round-trip exactly" reasoning this
+    // file's own `composite_tile_cpu` tests already document.
+
+    #[test]
+    // Opaque blue dst, opaque red src, opacity 0.25 -> effective alpha
+    // 1.0*0.25 = 0.25. Straight-alpha "over":
+    // r = (1-0.25)*0 + 0.25*1 = 0.25, g = 0,
+    // b = (1-0.25)*1 + 0.25*0 = 0.75, a = 0.25 + 1.0*(1-0.25) = 1.0.
+    fn composite_over_with_opacity_scales_the_sources_own_alpha() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let dst = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 1.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let src = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::empty(),
+        );
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        compositor.composite_over_with_opacity(&context, &dst_view, &src_view, 0.25);
+
+        let (r, g, b, a) = read_first_texel(device, queue, &dst);
+        assert_eq!((r, g, b, a), (0.25, 0.0, 0.75, 1.0));
+    }
+
+    #[test]
+    // A fully opaque source at zero opacity must leave the destination
+    // completely unchanged -- the opacity-driven counterpart of
+    // `composite_over_with_fully_transparent_source_leaves_destination_unchanged`,
+    // which proves the same property via the source's own alpha instead.
+    fn composite_over_with_opacity_of_zero_leaves_destination_unchanged() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let dst = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 1.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let src = solid_tile(
+            device,
+            queue,
+            [1.0, 1.0, 1.0, 1.0],
+            wgpu::TextureUsages::empty(),
+        );
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        compositor.composite_over_with_opacity(&context, &dst_view, &src_view, 0.0);
+
+        let (r, g, b, a) = read_first_texel(device, queue, &dst);
+        assert_eq!((r, g, b, a), (0.0, 0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    // An opacity above 1.0 must clamp, not overshoot -- the GPU-path
+    // counterpart of `composite_tile_cpu_clamps_an_out_of_range_opacity`.
+    fn composite_over_with_opacity_clamps_an_out_of_range_opacity() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let dst = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let src = solid_tile(
+            device,
+            queue,
+            [1.0, 1.0, 1.0, 1.0],
+            wgpu::TextureUsages::empty(),
+        );
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        compositor.composite_over_with_opacity(&context, &dst_view, &src_view, 5.0);
+
+        let (r, g, b, a) = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            (r, g, b, a),
+            (1.0, 1.0, 1.0, 1.0),
+            "an opacity above 1.0 must clamp, not overshoot"
+        );
+    }
+
+    #[test]
+    /// The GPU/CPU parity proof `composite_over_with_opacity`'s own doc
+    /// comment promises: the exact same layer data run through this
+    /// method and through [`composite_tile_cpu`] (`Normal` blend mode,
+    /// full-opacity backdrop drawn first) must land on the identical
+    /// result. Uses the same exact-power-of-two values as this module's
+    /// other `composite_over_with_opacity` tests above, so the two
+    /// independently-implemented formulas (one a hardware fixed-function
+    /// blend unit fed by a real fragment shader, the other a plain CPU
+    /// loop) are expected to agree bit-for-bit here, not just within a
+    /// tolerance -- and do, confirmed by this test actually running
+    /// against real GPU hardware.
+    fn composite_over_with_opacity_matches_composite_tile_cpus_own_normal_mode_formula() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let dst_rgba = [0.0, 0.0, 1.0, 1.0];
+        let src_rgba = [1.0, 0.0, 0.0, 1.0];
+        let opacity = 0.25;
+
+        let dst = solid_tile(
+            device,
+            queue,
+            dst_rgba,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let src = solid_tile(device, queue, src_rgba, wgpu::TextureUsages::empty());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        compositor.composite_over_with_opacity(&context, &dst_view, &src_view, opacity);
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let dst_texels = solid_texels(dst_rgba);
+        let src_texels = solid_texels(src_rgba);
+        let cpu_out = composite_tile_cpu(&[
+            (&dst_texels, 1.0, BlendMode::Normal),
+            (&src_texels, opacity, BlendMode::Normal),
+        ]);
+        let cpu_result = first_texel(&cpu_out);
+
+        assert_eq!(
+            gpu_result, cpu_result,
+            "the GPU shader path and the CPU path must agree exactly on this Normal-mode, \
+             exact-power-of-two case"
         );
     }
 

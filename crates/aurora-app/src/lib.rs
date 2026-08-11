@@ -3145,6 +3145,301 @@ fn resolve_tile(
     }
 }
 
+/// Whether every visible root-level layer in `layers` is a `Normal`-blend
+/// [`aurora_doc::LayerKind::Pixel`] layer — no groups, no other blend
+/// mode — the exact case [`gpu_composite_tile`] can correctly express via
+/// `aurora_render::TileCompositor::composite_over_with_opacity`'s
+/// fixed-function alpha blend unit (opacity-scaled `Normal` "source-
+/// over," nothing else). A single disqualifying layer (a visible group,
+/// or a visible pixel layer at any blend mode other than
+/// [`aurora_doc::BlendMode::Normal`]) routes the *whole document* back
+/// to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which already
+/// composites every one of those cases correctly — this only exists to
+/// find a faster path for the common case, never to replace the CPU
+/// path's own correctness. An invisible layer never disqualifies (it
+/// contributes nothing on either path), matching [`resolve_tile`]'s own
+/// `layers.visible(id) != Some(true)` early return; a layer with no
+/// explicit `blend_mode` recorded is treated as `Normal`, matching
+/// `resolve_tile`'s own `.unwrap_or(aurora_doc::BlendMode::Normal)`.
+///
+/// **Document-wide, not per-tile**: a layer's own kind and blend mode
+/// don't vary from one composite tile to the next (only its *texels*
+/// do), so [`recomposite_visible_tiles`] calls this once per redraw,
+/// outside its own per-tile loop, rather than re-checking it once per
+/// visible [`aurora_tile::TileId`] for no additional correctness.
+#[must_use]
+fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> bool {
+    layers.roots().iter().all(|&id| {
+        layers.visible(id) != Some(true)
+            || matches!(
+                (layers.kind(id), layers.blend_mode(id)),
+                (
+                    Some(aurora_doc::LayerKind::Pixel { .. }),
+                    Some(aurora_doc::BlendMode::Normal) | None
+                )
+            )
+    })
+}
+
+/// Reads back the whole `aurora_tile::TILE`×`aurora_tile::TILE` `texture`
+/// as a real, [`aurora_tile::SAMPLES`]-length `Vec<half::f16>` — the
+/// real, non-test promotion of the map-then-poll-then-copy readback
+/// pattern `aurora-render`'s own test module already established for a
+/// single-texel readback (`composite.rs`'s own `read_first_texel`/
+/// `read_rgba8` test helpers), generalized here to every texel
+/// [`gpu_composite_tile`] needs to hand back in `composite_tile_cpu`'s
+/// own returned shape.
+///
+/// `texture` must be `Rgba16Float`, `TILE`×`TILE`, with `COPY_SRC` usage.
+/// Blocks the calling thread until the submitted copy and the readback
+/// map both complete (`Device::poll(PollType::Wait)`) — the same
+/// synchronous readback every real-GPU test in this workspace already
+/// uses; acceptable here because this runs once per qualifying composite
+/// tile per redraw (a canvas operation, not the render loop's own
+/// present-this-frame path), not per frame unconditionally.
+///
+/// `None` if the map genuinely fails (e.g. a lost device) — logged, not
+/// a panic: unlike this crate's own test helpers, which can safely
+/// `unreachable!` a map failure because the test just wrote the buffer
+/// itself moments earlier under fully controlled conditions, this runs
+/// against a real user's live session, where a device loss is a real,
+/// if rare, possible event, not a logic bug. [`gpu_composite_tile`]
+/// propagates a `None` here as its own `None`, which routes the caller
+/// back to the CPU path for that one tile — the same "one bad tile
+/// shouldn't abort the rest" discipline [`resolve_tile`]'s own callers
+/// already use for a failed [`aurora_tile::TileStore::get`].
+fn read_tile_f16(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+) -> Option<Vec<half::f16>> {
+    let bytes_per_row = aurora_tile::TILE * 8; // Rgba16Float, already 256-byte aligned.
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gpu-composite-readback"),
+        size: u64::from(bytes_per_row) * u64::from(aurora_tile::TILE),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu-composite-readback"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(aurora_tile::TILE),
+            },
+        },
+        wgpu::Extent3d {
+            width: aurora_tile::TILE,
+            height: aurora_tile::TILE,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        other => {
+            tracing::warn!(
+                ?other,
+                "GPU composite readback map failed; falling back to CPU"
+            );
+            return None;
+        }
+    }
+    let Ok(data) = slice.get_mapped_range() else {
+        tracing::warn!("GPU composite readback reported success but the range is unavailable");
+        return None;
+    };
+    let mut out = Vec::with_capacity(aurora_tile::SAMPLES);
+    for bytes in data.chunks_exact(2) {
+        let Ok(pair) = <[u8; 2]>::try_from(bytes) else {
+            continue;
+        };
+        out.push(half::f16::from_le_bytes(pair));
+    }
+    drop(data);
+    readback.unmap();
+    if out.len() == aurora_tile::SAMPLES {
+        Some(out)
+    } else {
+        tracing::warn!(
+            len = out.len(),
+            expected = aurora_tile::SAMPLES,
+            "GPU composite readback returned an unexpected sample count; falling back to CPU"
+        );
+        None
+    }
+}
+
+/// GPU-accelerated compositing for one visible composite tile, for the
+/// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
+/// the whole document: every visible top-level layer is a `Normal`-blend
+/// [`aurora_doc::LayerKind::Pixel`] layer, no groups. Callers must check
+/// that first — this function does not re-check it itself.
+///
+/// Reuses [`resolve_tile`] once per visible root-level layer, bottom to
+/// top, exactly as [`recomposite_visible_tiles`]'s own CPU path already
+/// does — the same per-layer-origin conversion
+/// (`read_layer_window`/direct `TileStore::get`) `resolve_tile`'s own
+/// `Pixel` branch already establishes, not reimplemented here. Since
+/// [`document_qualifies_for_gpu_compositing`] has already ruled out every
+/// group and every non-`Normal` blend mode for this document,
+/// `resolve_tile`'s own returned `aurora_render::BlendMode` is guaranteed
+/// `Normal` for every entry this collects — `composite_over_with_opacity`'s
+/// own fixed-function "source-over" *is* that formula exactly, so unlike
+/// `composite_tile_cpu` this needs no blend-mode dispatch of its own.
+///
+/// For each collected layer (bottom to top): uploads its own tile-sized
+/// texel window into a fresh scratch `Rgba16Float` source texture
+/// (`TEXTURE_BINDING | COPY_DST`), then
+/// `aurora_render::TileCompositor::composite_over_with_opacity` blends it
+/// onto one shared destination texture (`RENDER_ATTACHMENT | COPY_SRC`,
+/// cleared to fully transparent black first, since `composite_over_with_opacity`
+/// always uses `LoadOp::Load`). The destination is then read back
+/// ([`read_tile_f16`]) into a real `Vec<half::f16>`, [`aurora_tile::SAMPLES`]
+/// long — the exact same shape `composite_tile_cpu` returns, so this is a
+/// drop-in alternative for a tile that qualifies.
+///
+/// **Scope, stated honestly**: this itself is a GPU → CPU (readback) →
+/// GPU (`residency.sync`'s own later upload) round trip, not a direct
+/// GPU-to-atlas write — eliminating that round trip is separate,
+/// still-open follow-on work; see [`recomposite_visible_tiles`]'s own doc
+/// comment for the full picture. Export (`composite_document`) is
+/// untouched by this — it stays CPU-only, a one-shot operation where this
+/// isn't latency-critical the way the live canvas is.
+///
+/// `None` if there are no visible root-level layers at all (an empty
+/// composite tile — cheaper handled by the CPU path's own "empty
+/// `layers` → transparent black" default than by a real, empty GPU round
+/// trip) or if the real GPU work itself fails ([`read_tile_f16`]'s own
+/// `None`) — either way, the caller falls back to the CPU path for this
+/// one tile, the same "one bad tile shouldn't abort the rest" discipline
+/// [`resolve_tile`]'s own callers already use.
+fn gpu_composite_tile(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+) -> Option<Vec<half::f16>> {
+    let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::new();
+    for &id in layers.roots().iter().rev() {
+        if let Some((texels, opacity, _blend_mode)) =
+            resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
+        {
+            layer_texels.push((texels, opacity));
+        }
+    }
+    if layer_texels.is_empty() {
+        return None;
+    }
+
+    let device = gpu.device();
+    let queue = gpu.queue();
+    let tile_extent = wgpu::Extent3d {
+        width: aurora_tile::TILE,
+        height: aurora_tile::TILE,
+        depth_or_array_layers: 1,
+    };
+    let dst_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("gpu-composite-dst"),
+        size: tile_extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let dst_view = dst_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // Clear to fully transparent black -- `composite_over_with_opacity`
+    // always preserves existing content (`LoadOp::Load`), so the
+    // destination needs real, known-transparent content before the first
+    // real layer blends onto it.
+    {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-composite-clear"),
+        });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gpu-composite-clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &dst_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    for (texels, opacity) in &layer_texels {
+        let src_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpu-composite-src"),
+            size: tile_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut bytes = Vec::with_capacity(texels.len() * 2);
+        for sample in texels {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(aurora_tile::TILE * 8),
+                rows_per_image: Some(aurora_tile::TILE),
+            },
+            tile_extent,
+        );
+        let src_view = src_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        compositor.composite_over_with_opacity(gpu, &dst_view, &src_view, *opacity);
+    }
+
+    read_tile_f16(device, queue, &dst_texture)
+}
+
 /// Recomposites every tile in `residency`'s own currently-visible grid
 /// from `layers.roots()`'s own bottom-to-top, visible root-level
 /// entries into `store`'s reserved composite surface
@@ -3203,22 +3498,49 @@ fn resolve_tile(
 /// own doc comment for what invalidates it. Still not per-tile-dirty-
 /// aware *within* one invalidation: a single edit anywhere forces a
 /// full recompute of every visible tile on the next redraw, not just
-/// the one(s) it actually touched, so active painting still pays
-/// something close to `spike/FINDINGS.md`'s own ~20ms "merging whole
-/// tiles" cost per redraw — the exact cost that finding named as the
-/// reason GPU tile compositing (`aurora_render::TileCompositor`) exists
-/// at all. True per-tile dirty tracking across layers, and GPU-side
-/// compositing, are both separate, still-open follow-on work. A
-/// document with zero or one visible pixel layer (the common case so
-/// far) is unaffected in practice either way:
-/// `aurora_render::composite_tile_cpu` reproduces a single full-opacity
-/// layer's own texels exactly.
+/// the one(s) it actually touched.
+///
+/// **GPU-accelerated for the common case, real now, not just a primitive
+/// sitting unwired**: when `gpu`/`compositor` are both `Some` *and*
+/// [`document_qualifies_for_gpu_compositing`] confirms the whole document
+/// is GPU-tractable (every visible root-level layer a `Normal`-blend
+/// [`aurora_doc::LayerKind::Pixel`] layer, no groups), each tile is
+/// composited via [`gpu_composite_tile`] —
+/// `aurora_render::TileCompositor::composite_over_with_opacity`'s real
+/// fixed-function blend unit, not the CPU loop — closing the exact gap
+/// `spike/FINDINGS.md`'s own ~20ms "merging whole tiles" finding named as
+/// the reason `aurora_render::TileCompositor` exists at all. A tile whose
+/// document doesn't qualify, or whose own GPU work fails
+/// ([`gpu_composite_tile`]'s own `None`), or when `gpu`/`compositor`
+/// aren't available at all (`None`, e.g. no GPU device this session)
+/// falls straight back to the exact same CPU path
+/// (`resolve_tile`/`composite_tile_cpu`) this function always used before
+/// — every blend mode, every group, un-premultiplied isolation, all of
+/// it, unchanged. **Explicitly still CPU-only, by design, not by gap**:
+/// non-`Normal` blend modes and group isolation on the GPU (would need a
+/// full WGSL port of all 26 blend formulas, or per-group isolated GPU
+/// passes — separate, much bigger follow-on work), and export
+/// (`composite_document`, a one-shot operation, not latency-critical the
+/// way the live canvas is). **Also still open**: this GPU path is itself
+/// a GPU → CPU (readback) → GPU (`residency.sync`'s own later upload)
+/// round trip, not a direct GPU-to-atlas write — eliminating that is
+/// separate, further follow-on work, not attempted here. True per-tile
+/// dirty tracking across layers (recomposite only the tile(s) an edit
+/// actually touched) also remains separate, still-open follow-on work
+/// regardless of which path composites a given tile.
+///
+/// A document with zero or one visible pixel layer (the common case so
+/// far) is unaffected in practice either way: `composite_tile_cpu`
+/// reproduces a single full-opacity layer's own texels exactly, and (once
+/// GPU-tractable) so does `gpu_composite_tile`.
 fn recomposite_visible_tiles(
     residency: &aurora_gpu::TileResidency,
     layers: &aurora_doc::LayerTree,
     active_layer: Option<aurora_doc::LayerId>,
     store: &mut aurora_tile::TileStore,
     cache: &mut CompositeCache,
+    gpu: Option<&aurora_gpu::GpuContext>,
+    mut compositor: Option<&mut aurora_render::TileCompositor>,
 ) {
     // The tile grid `residency.visible_tiles()` walks is anchored to the
     // *active* layer's own origin (`tile_origin_for_view`'s own doc
@@ -3227,6 +3549,11 @@ fn recomposite_visible_tiles(
     // every `tile_id` below needs converting back out of.
     let reference_origin =
         active_pixel_layer(layers, active_layer).map_or((0, 0), |(_, b)| (b.x, b.y));
+
+    // Document-wide, computed once per call, not once per tile — see
+    // `document_qualifies_for_gpu_compositing`'s own doc comment for why
+    // that's correct, not just an optimization.
+    let gpu_qualifies = document_qualifies_for_gpu_compositing(layers);
 
     let full_tile = aurora_core::Rect {
         x: 0,
@@ -3243,20 +3570,42 @@ fn recomposite_visible_tiles(
             reference_origin.0 + i64::from(tile_id.x) * tile_size,
             reference_origin.1 + i64::from(tile_id.y) * tile_size,
         );
-        let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
-            Vec::with_capacity(layers.roots().len());
-        for &id in layers.roots().iter().rev() {
-            if let Some(resolved) =
-                resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
-            {
-                layer_texels.push(resolved);
+
+        let gpu_result = if gpu_qualifies {
+            match (gpu, compositor.as_deref_mut()) {
+                (Some(gpu), Some(compositor)) => gpu_composite_tile(
+                    gpu,
+                    compositor,
+                    layers,
+                    store,
+                    tile_id,
+                    doc_origin,
+                    reference_origin,
+                ),
+                _ => None,
             }
-        }
-        let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
-            .iter()
-            .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
-            .collect();
-        let composited = aurora_render::composite_tile_cpu(&refs);
+        } else {
+            None
+        };
+
+        let composited = if let Some(texels) = gpu_result {
+            texels
+        } else {
+            let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
+                Vec::with_capacity(layers.roots().len());
+            for &id in layers.roots().iter().rev() {
+                if let Some(resolved) =
+                    resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
+                {
+                    layer_texels.push(resolved);
+                }
+            }
+            let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
+                .iter()
+                .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
+                .collect();
+            aurora_render::composite_tile_cpu(&refs)
+        };
         let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
             continue;
         };
@@ -3994,6 +4343,15 @@ struct App {
     /// screen (`aurora_gpu::CanvasPipeline`) — built alongside
     /// `residency`, `None` under the same conditions.
     canvas_pipeline: Option<aurora_gpu::CanvasPipeline>,
+    /// The GPU-side multi-layer tile compositor
+    /// (`aurora_render::TileCompositor`) `recomposite_visible_tiles`
+    /// uses for the qualifying-tile fast path
+    /// (`document_qualifies_for_gpu_compositing`/`gpu_composite_tile`) —
+    /// built alongside `residency`/`canvas_pipeline` (same "needs a real
+    /// device" constraint), `None` under the same conditions, in which
+    /// case `recomposite_visible_tiles` falls straight back to its own
+    /// CPU path for every tile, same as before this field existed.
+    compositor: Option<aurora_render::TileCompositor>,
     /// The GPU path renderer (`aurora_widgets::PathPipeline`) every
     /// widget's own paint (`aurora_widgets::paint_widget`) draws
     /// through — built in `resumed` alongside `canvas_pipeline` (same
@@ -4162,6 +4520,7 @@ impl App {
             tile_store,
             residency: None,
             canvas_pipeline: None,
+            compositor: None,
             path_pipeline: None,
             pointer_position: None,
             drag: None,
@@ -5149,6 +5508,8 @@ impl App {
                             self.active_layer,
                             store,
                             &mut self.composite_cache,
+                            Some(gpu),
+                            self.compositor.as_mut(),
                         );
                         let _ = residency.sync(
                             gpu.queue(),
@@ -5391,6 +5752,7 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 canvas_size,
             ));
             self.canvas_pipeline = Some(aurora_gpu::CanvasPipeline::new(gpu.device()));
+            self.compositor = Some(aurora_render::TileCompositor::new(gpu.device()));
         } else {
             tracing::warn!(
                 "canvas area has no computed layout yet; canvas rendering disabled this session"
@@ -5663,15 +6025,16 @@ mod tests {
         close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
         composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
         default_shortcuts, demo_document, document_canvas_size, document_from_image,
-        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
-        handle_zoom_tool_click, is_aur_path, layer_local_point, load_scales, load_theme,
-        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
-        open_tile_store, palette_commands, pointer_in_canvas, pointer_on_rail_divider,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, resized_rail_width, run_command, sample_pixel, select_layer,
-        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        document_qualifies_for_gpu_compositing, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point,
+        load_scales, load_theme, logical_point, logical_size, open_command_palette,
+        open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
+        pointer_in_canvas, pointer_on_rail_divider, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, resized_rail_width,
+        run_command, sample_pixel, select_layer, tile_origin_for_view, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -7870,7 +8233,16 @@ mod tests {
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
         let mut cache = CompositeCache::default();
-        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
 
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
         assert_eq!(
@@ -7979,7 +8351,16 @@ mod tests {
         // anchored to its own origin (0, 0) -- `shifted` is the one that
         // needs `read_layer_window`'s own re-tiling.
         let mut cache = CompositeCache::default();
-        recomposite_visible_tiles(&residency, &layers, Some(bottom), &mut store, &mut cache);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(bottom),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
 
         let composite_surface = composite_surface_id();
         let at_shifted_origin =
@@ -9191,7 +9572,16 @@ mod tests {
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
         let mut cache = CompositeCache::default();
-        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
 
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
         assert_eq!(
@@ -9213,7 +9603,16 @@ mod tests {
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
         let mut cache = CompositeCache::default();
-        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
 
         let tile_id = aurora_tile::TileId { x: 0, y: 0 };
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
@@ -9246,7 +9645,16 @@ mod tests {
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
         let mut cache = CompositeCache::default();
-        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
         assert_eq!(
             read_first_texel(&mut store, composite_surface_id(), tile_id),
             (1.0, 0.0, 0.0, 1.0),
@@ -9264,7 +9672,16 @@ mod tests {
             tile_id,
             [0.0, 1.0, 0.0, 1.0],
         );
-        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
         assert_eq!(
             read_first_texel(&mut store, composite_surface_id(), tile_id),
             (0.0, 1.0, 0.0, 1.0),
@@ -9298,7 +9715,16 @@ mod tests {
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
         let mut cache = CompositeCache::default();
-        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
 
         fill_solid(
             &mut store,
@@ -9307,11 +9733,322 @@ mod tests {
             [0.0, 1.0, 0.0, 1.0],
         );
         cache.bump();
-        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
         assert_eq!(
             read_first_texel(&mut store, composite_surface_id(), tile_id),
             (1.0, 0.0, 0.0, 1.0),
             "bump must force a real recompute, overwriting the poked value"
+        );
+    }
+
+    // -- `document_qualifies_for_gpu_compositing`: pure, headless, no real
+    // GPU device needed -- these check `aurora_doc::LayerTree` state only.
+
+    #[test]
+    fn document_qualifies_for_gpu_compositing_of_normal_blend_pixel_layers_only() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.add_pixel_layer("b", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        assert!(document_qualifies_for_gpu_compositing(&layers));
+    }
+
+    #[test]
+    fn document_qualifies_for_gpu_compositing_is_false_for_a_visible_group() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_pixel_layer("b", bounds, Some(group)) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            !document_qualifies_for_gpu_compositing(&layers),
+            "a visible group at the root must disqualify the whole document"
+        );
+    }
+
+    #[test]
+    fn document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            !document_qualifies_for_gpu_compositing(&layers),
+            "a non-Normal blend mode anywhere at the root must disqualify the whole document"
+        );
+    }
+
+    #[test]
+    fn document_qualifies_for_gpu_compositing_ignores_an_invisible_disqualifying_layer() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        // A hidden group would disqualify the document if it were visible
+        // (previous test), but a hidden one contributes nothing to either
+        // path, so it must not disqualify.
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_visible(group, false) {
+            unreachable!("{err:?}");
+        }
+        assert!(document_qualifies_for_gpu_compositing(&layers));
+    }
+
+    /// The most important test in this round: a real, multi-layer,
+    /// several-layer document (three `Normal`-blend, non-grouped pixel
+    /// layers at different opacities) run through **both**
+    /// `recomposite_visible_tiles`'s new GPU path and its pre-existing CPU
+    /// path — controlled directly via this function's own `gpu`/
+    /// `compositor` parameters, `Some` for the GPU run and `None` to force
+    /// the CPU fallback for the second run — and asserted to land on the
+    /// exact same pixels. Also checked against an independently
+    /// hand-computed expected value (worked below), so this proves not
+    /// just "the two paths agree with each other" but "both are actually
+    /// correct."
+    ///
+    /// **Exact equality, not a tolerance**: every input/intermediate value
+    /// here (1.0, 0.5, 0.25, and the sums/products of the straight-alpha
+    /// "over" formula they produce) is an exact power-of-two binary
+    /// fraction, so both the CPU path (`f32` arithmetic rounded to `f16`)
+    /// and the GPU path (the same formula, computed by real hardware) are
+    /// expected to land on bit-identical results, not just close ones —
+    /// and this test confirms that expectation actually holds by running
+    /// against real GPU hardware, not just asserting it should.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_real_multi_layer_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let middle = match layers.add_pixel_layer("middle", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(middle, 0.5) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(top, 0.25) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (bottom, [1.0, 0.0, 0.0, 1.0]),
+            (middle, [0.0, 1.0, 0.0, 1.0]),
+            (top, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "three Normal-blend, non-grouped pixel layers must qualify for the GPU path"
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        // Run 1: the real GPU path.
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        // Run 2: force the CPU path by passing no GPU/compositor at all --
+        // `document_qualifies_for_gpu_compositing` still says yes, but
+        // `recomposite_visible_tiles` must fall back cleanly when the GPU
+        // side simply isn't available, exactly like a session with no GPU
+        // device.
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        assert_eq!(
+            gpu_result, cpu_result,
+            "the GPU path and the CPU path must composite this real multi-layer document to \
+             the exact same pixels"
+        );
+
+        // Hand-computed, bottom to top, straight-alpha "over"
+        // (`Co = (1-as)*Cb + as*Cs` per channel, `Ca = as + Cb.a*(1-as)`,
+        // `as = src_a * opacity`):
+        //   bottom (opaque red, opacity 1.0) over transparent black
+        //     -> (1.0, 0.0, 0.0, 1.0), reproduces the source exactly.
+        //   middle (opaque green, opacity 0.5): as = 1.0*0.5 = 0.5
+        //     r = 0.5*1.0 + 0.5*0.0 = 0.5, g = 0.5*0.0 + 0.5*1.0 = 0.5,
+        //     b = 0.0, a = 0.5 + 1.0*0.5 = 1.0 -> (0.5, 0.5, 0.0, 1.0).
+        //   top (opaque blue, opacity 0.25): as = 1.0*0.25 = 0.25
+        //     r = 0.75*0.5 + 0.25*0.0 = 0.375,
+        //     g = 0.75*0.5 + 0.25*0.0 = 0.375,
+        //     b = 0.75*0.0 + 0.25*1.0 = 0.25,
+        //     a = 0.25 + 1.0*0.75 = 1.0 -> (0.375, 0.375, 0.25, 1.0).
+        assert_eq!(gpu_result, (0.375, 0.375, 0.25, 1.0));
+    }
+
+    /// The fallback's own correctness proof, not just that it was taken:
+    /// a document with one `Multiply`-blend layer (a case the GPU path
+    /// structurally cannot express — `composite_over_with_opacity`'s own
+    /// fixed-function blend unit only ever computes `Normal`'s "source
+    /// over") must still composite to `Multiply`'s own real result, not to
+    /// whatever `Normal` would have produced for the same inputs — which
+    /// would be a different, wrong value here, so this genuinely
+    /// distinguishes "fell back and composited correctly" from "silently
+    /// used the GPU's own Normal-only math anyway."
+    #[test]
+    fn recomposite_visible_tiles_falls_back_to_the_cpu_path_for_a_non_normal_blend_mode() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            !document_qualifies_for_gpu_compositing(&layers),
+            "a Multiply-blend layer must disqualify the document"
+        );
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        // Two mid-greys: Multiply(0.5, 0.5) = 0.25, the same worked case
+        // `composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey`
+        // (aurora-render) already proves for the CPU formula in isolation
+        // -- if the GPU path were mistakenly used here anyway (treating
+        // `Multiply` as `Normal`, opaque top over opaque bottom at full
+        // opacity), the result would be the top layer's own colour
+        // unchanged, (0.5, 0.5, 0.5, 1.0), not (0.25, 0.25, 0.25, 1.0).
+        for (id, rgba) in [(bottom, [0.5, 0.5, 0.5, 1.0]), (top, [0.5, 0.5, 0.5, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        // GPU/compositor are both real and available here -- proving the
+        // fallback is `document_qualifies_for_gpu_compositing`-driven, not
+        // just "happens to fall back because nothing GPU was passed in,"
+        // the same distinction the other GPU-path tests above are
+        // structured to rule out.
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+        assert_eq!(
+            result,
+            (0.25, 0.25, 0.25, 1.0),
+            "Multiply's own real math must run via the CPU fallback, not Normal's"
         );
     }
 
