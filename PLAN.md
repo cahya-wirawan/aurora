@@ -6647,6 +6647,66 @@ structural design work.
   Layer-group render-order recursion remains unchanged from the bullets
   above, still separate follow-on work.
 
+  **`DarkerColor`/`LighterColor` landed too, 2026-08-11**: whole-colour
+  selection (`Lum(Cb) <= Lum(Cs) ? Cb : Cs` for `DarkerColor`, `>=` for
+  `LighterColor`), reusing `lum` from the non-separable HSL round rather
+  than a second luminosity function, dispatched through `blend_rgb`
+  alongside `Hue`/`Saturation`/`Color`/`Luminosity` (whole-triple, not
+  per-channel — `blend_channel`'s own already-dead exhaustiveness arm
+  widened to cover these 2 as well, still genuinely unreachable since
+  `blend_rgb` intercepts all 6 non-separable variants first). Tie-break
+  (`Lum(Cb) == Lum(Cs)` exactly) is a deliberate, undocumented-by-any-
+  spec convention — both modes resolve to `Cb`, the backdrop — since
+  neither mode is part of the W3C spec (they're Photoshop-specific
+  extensions unlike the HSL family). Proved with a genuinely
+  bit-exact-equal-Lum pair from two *different* colours (not `Cb==Cs`,
+  which would only prove early-return-on-identity, not a real Lum
+  comparison), checked by actually running it through this crate's own
+  `f32` `lum` before relying on it, since `0.3`/`0.59`/`0.11` aren't
+  exact binary fractions and two different real-valued constructions
+  aren't guaranteed to round to the same bit pattern in general.
+
+  The real distinguishing property from the already-implemented,
+  separable `Darken`/`Lighten` (per-channel `min`/`max`, can produce a
+  hybrid colour with channels from both inputs) — `DarkerColor`/
+  `LighterColor` always pick one *whole* input triple, never a hybrid —
+  is proven with a real test, not just asserted: `Cb=(0.8,0.1,0.1)`
+  (dark-average red) vs `Cs=(0.1,0.8,0.1)` (dark-average green),
+  `Lum(Cb)=0.31 < Lum(Cs)=0.513`, so `DarkerColor` must return `Cb`
+  exactly `(0.8,0.1,0.1)` — explicitly asserted `!=` the per-channel
+  minimum `(0.1,0.1,0.1)`, which is a real colour equal to neither
+  input and would be the (wrong) result of accidentally implementing
+  this as separable `Darken` instead.
+
+  `translate_blend_mode` moved both variants out of the fallback arm
+  into real 1:1 mappings; match stays exhaustive (26 real + 1 fallback
+  — `Dissolve` alone — all 27 named, no wildcard). Two real integration
+  tests in `aurora-app` (mirroring every prior round's shape) set each
+  mode via `LayerTree::set_blend_mode`'s own real API and confirm the
+  composited result is the whole-colour pick, not a per-channel hybrid
+  and not what `Normal` would give.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-render` (94 passed, 0 failed — 89 before), `cargo test -p
+  aurora-app` (151 passed, 0 failed — 149 before). `aurora-render`'s own
+  `Cargo.toml` gained no new dependency (layering intact, confirmed by
+  reading it — `scripts/check_layering.py` itself still can't run in
+  this sandbox, the same pre-existing `tomllib` gap every round has
+  noted). Version bumped `0.31.0` → `0.32.0` per `CLAUDE.md`'s own
+  convention.
+
+  **Blend modes are real for 26 of 27 now — only `Dissolve` remains**,
+  and it stays deliberately unattempted here: stochastic per-pixel
+  selection needs its own reproducibility design decision (does a given
+  pixel's outcome need to be stable across re-renders and re-exports of
+  the same document? seeded by what — pixel position, a per-layer seed,
+  something else?) before any implementation is even the right shape to
+  attempt, not just new formula math the way every other mode in this
+  series has been. Layer-group render-order recursion and GPU-side
+  multi-layer compositing both remain unchanged, still separate
+  follow-on work.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG

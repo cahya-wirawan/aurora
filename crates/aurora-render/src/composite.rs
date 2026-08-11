@@ -26,12 +26,12 @@ const LABEL: &str = "composite";
 ///
 /// `aurora-app`'s `translate_blend_mode` maps a real
 /// `aurora_doc::BlendMode` onto this one, one implemented variant at a
-/// time, falling every one of the 3 not-yet-implemented modes
-/// (`Dissolve`, `DarkerColor`, `LighterColor` — this family's own
-/// explicit remainder, see [`composite_tile_cpu`]'s own doc comment)
-/// back to [`Self::Normal`] as an honest, documented degrade — not a
-/// bug, since those modes' real math is separate, still-open follow-on
-/// work.
+/// time, falling the one not-yet-implemented mode (`Dissolve` — this
+/// family's own explicit remainder, see [`composite_tile_cpu`]'s own
+/// doc comment) back to [`Self::Normal`] as an honest, documented
+/// degrade — not a bug, since `Dissolve`'s real math (stochastic
+/// per-pixel selection, needing its own reproducibility design
+/// decision) is separate, still-open follow-on work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendMode {
     #[default]
@@ -55,7 +55,7 @@ pub enum BlendMode {
     LinearLight,
     PinLight,
     HardMix,
-    // -- Non-separable modes (this round): each is a function of the
+    // -- Non-separable modes: each is a function of the
     // whole (R,G,B) triple, not a per-channel function of one channel in
     // isolation -- see `blend_rgb` below, not `blend_channel`, for their
     // real math.
@@ -63,6 +63,16 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
+    // -- DarkerColor/LighterColor (this round): also whole-colour,
+    // non-separable modes, but a different shape from the 4 above --
+    // those blend via SetLum/SetSat (a real mixed result); these two
+    // instead *select* one whole input colour outright, by comparing
+    // `lum(Cb)` against `lum(Cs)`, and return that colour's exact
+    // triple unchanged -- never a per-channel hybrid the way separable
+    // `Darken`/`Lighten` above (`min`/`max` of each channel
+    // independently) can produce. See `blend_rgb` below.
+    DarkerColor,
+    LighterColor,
 }
 
 /// `SoftLight`'s own `D(x)` helper (W3C Compositing and Blending Level 1),
@@ -231,25 +241,31 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
                 cb + (2.0 * cs - 1.0) * (soft_light_d(cb) - cb)
             }
         }
-        // `Hue`/`Saturation`/`Color`/`Luminosity` are non-separable --
-        // no per-channel value of `B(Cb,Cs)` can express a property of
-        // a whole colour (see this function's own module-level doc
-        // comment, and `blend_rgb`'s own doc comment, for why). Named
-        // individually rather than folded into a wildcard so the match
-        // stays exhaustive (the same discipline `aurora-app`'s own
+        // `Hue`/`Saturation`/`Color`/`Luminosity`/`DarkerColor`/
+        // `LighterColor` are all non-separable -- no per-channel value
+        // of `B(Cb,Cs)` can express a property of a whole colour (see
+        // this function's own module-level doc comment, and
+        // `blend_rgb`'s own doc comment, for why). Named individually
+        // rather than folded into a wildcard so the match stays
+        // exhaustive (the same discipline `aurora-app`'s own
         // `translate_blend_mode` already uses), but
-        // [`blend_rgb`] intercepts all 4 before ever reaching this
+        // [`blend_rgb`] intercepts all 6 before ever reaching this
         // function, so these arms are never actually exercised by any
         // real caller in this crate -- they exist purely so this match
-        // still compiles against the shared, now-24-variant
+        // still compiles against the shared, now-26-variant
         // [`BlendMode`] enum. Each degrades to the same pass-through
         // `cs` the `Normal` arm above already returns, rather than
         // introducing a new path that could panic if some future
         // caller ever did reach this function directly with one of
-        // these 4 modes -- the same "honest fallback over panicking"
+        // these 6 modes -- the same "honest fallback over panicking"
         // discipline `aurora-app`'s own `translate_blend_mode` already
-        // uses at its own translation boundary for these same 4 modes.
-        BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity => cs,
+        // uses at its own translation boundary for these same 6 modes.
+        BlendMode::Hue
+        | BlendMode::Saturation
+        | BlendMode::Color
+        | BlendMode::Luminosity
+        | BlendMode::DarkerColor
+        | BlendMode::LighterColor => cs,
     }
 }
 
@@ -403,16 +419,48 @@ fn blend_luminosity(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
     set_lum(cb, lum(cs))
 }
 
+/// `DarkerColor(Cb, Cs) = Lum(Cb) <= Lum(Cs) ? Cb : Cs` — picks
+/// whichever *whole* input colour has the lower overall [`lum`] and
+/// returns that triple exactly, unmodified. Not part of the W3C
+/// Compositing and Blending Level 1 spec (`Hue`/`Saturation`/`Color`/
+/// `Luminosity` above are; `DarkerColor`/`LighterColor` are Photoshop-
+/// specific extensions) — but the same "whole-colour, not per-channel"
+/// shape, so it lives alongside them here rather than in
+/// [`blend_channel`].
+///
+/// **Tie-breaking, a deliberate convention, not spec-mandated (there is
+/// no spec for these two modes) and not an accidental artifact of
+/// `<=`**: when `Lum(Cb) == Lum(Cs)` exactly, this resolves to `Cb`,
+/// the backdrop. Chosen because it's symmetric with
+/// [`blend_lighter_color`]'s own tie-break (that one resolves to `Cb`
+/// too, via `>=`) — both modes agree on what a tie means: "leave the
+/// backdrop in place" — rather than the two modes disagreeing about
+/// which input wins an exact tie.
+#[must_use]
+fn blend_darker_color(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
+    if lum(cb) <= lum(cs) { cb } else { cs }
+}
+
+/// `LighterColor(Cb, Cs) = Lum(Cb) >= Lum(Cs) ? Cb : Cs` — the mirror
+/// image of [`blend_darker_color`]: picks whichever whole input colour
+/// has the *higher* overall [`lum`]. Same tie-break convention, stated
+/// there: `Lum(Cb) == Lum(Cs)` resolves to `Cb`.
+#[must_use]
+fn blend_lighter_color(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
+    if lum(cb) >= lum(cs) { cb } else { cs }
+}
+
 /// The whole-triple counterpart of [`blend_channel`]: `B(Cb, Cs)` for
 /// `mode`, given the backdrop's and source's own full `(R,G,B)` triples
-/// rather than one channel each. Exists because the 4 non-separable
+/// rather than one channel each. Exists because the 4 non-separable HSL
 /// modes ([`blend_hue`], [`blend_saturation`], [`blend_color`],
-/// [`blend_luminosity`]) genuinely cannot be expressed as
-/// [`blend_channel`]'s own per-channel signature — every one of the 20
-/// separable modes, by contrast, delegates straight back to
-/// [`blend_channel`] three times, once per channel, unchanged from
-/// before this function existed: [`composite_tile_cpu`] below now calls
-/// this once per texel instead of calling [`blend_channel`] three
+/// [`blend_luminosity`]) and the 2 whole-colour-selection modes
+/// ([`blend_darker_color`], [`blend_lighter_color`]) genuinely cannot
+/// be expressed as [`blend_channel`]'s own per-channel signature —
+/// every one of the 20 separable modes, by contrast, delegates straight
+/// back to [`blend_channel`] three times, once per channel, unchanged
+/// from before this function existed: [`composite_tile_cpu`] below now
+/// calls this once per texel instead of calling [`blend_channel`] three
 /// times, but for those 20 modes the actual arithmetic performed is
 /// identical, so their own results are bit-for-bit unchanged (see this
 /// file's own
@@ -431,6 +479,8 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
         BlendMode::Saturation => blend_saturation(cb, cs),
         BlendMode::Color => blend_color(cb, cs),
         BlendMode::Luminosity => blend_luminosity(cb, cs),
+        BlendMode::DarkerColor => blend_darker_color(cb, cs),
+        BlendMode::LighterColor => blend_lighter_color(cb, cs),
         BlendMode::Normal
         | BlendMode::Darken
         | BlendMode::Multiply
@@ -506,7 +556,7 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// exactly matching what a document with no visible pixel layers should
 /// show.
 ///
-/// **Scope, stated honestly**: [`BlendMode`] implements 24 of
+/// **Scope, stated honestly**: [`BlendMode`] implements 26 of
 /// `aurora_doc::BlendMode`'s real 27 variants — `Normal`, the
 /// "simple separable" family (`Darken`, `Multiply`, `Lighten`,
 /// `Screen`, `Difference`, `Exclusion`, `Subtract`, `Divide`), each a
@@ -519,19 +569,23 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// `SoftLight`, `HardLight`, `VividLight`, `LinearLight`, `PinLight`,
 /// `HardMix`), each a source-or-backdrop-midpoint-branching function
 /// that (`SoftLight` aside) composes directly from the two families
-/// above rather than needing new math of its own, and the
-/// non-separable family (`Hue`, `Saturation`, `Color`, `Luminosity`),
+/// above rather than needing new math of its own, the
+/// HSL non-separable family (`Hue`, `Saturation`, `Color`, `Luminosity`),
 /// each a whole-`(R,G,B)`-triple function via `blend_rgb` rather
 /// than `blend_channel` (see that function's own doc comment for
-/// why). The remaining 3 (`Dissolve`, stochastic per-pixel selection
-/// rather than a deterministic blend function at all; and
-/// `DarkerColor`/`LighterColor`, which compare backdrop and source by
-/// overall luminosity rather than blending them) are this family's own
-/// explicit boundary — qualitatively different from every mode
-/// implemented so far, separate, still-open follow-on work. A layer
-/// using one of those 3 falls back to `Normal` at the `aurora-app`
-/// translation boundary (`translate_blend_mode`), not here. This is a
-/// CPU implementation specifically because the
+/// why), and the whole-colour-selection family (`DarkerColor`,
+/// `LighterColor`), also dispatched via `blend_rgb` but selecting one
+/// entire input colour by comparing overall luminosity rather than
+/// blending the two via `SetLum`/`SetSat` the way the HSL family does.
+/// The sole remaining variant, `Dissolve`, is this family's own
+/// explicit boundary — stochastic per-pixel selection, not a
+/// deterministic blend function at all, so it needs its own
+/// reproducibility design decision (does a given pixel's outcome need
+/// to be stable across re-renders? seeded by what?) before any
+/// implementation, not just new math — separate, still-open follow-on
+/// work. A layer using `Dissolve` falls back to `Normal` at the
+/// `aurora-app` translation boundary (`translate_blend_mode`), not
+/// here. This is a CPU implementation specifically because the
 /// orchestration crate (`aurora-app`) needs to run it per visible tile,
 /// per layer, every time any constituent layer changes —
 /// GPU-accelerated multi-layer compositing (reusing [`TileCompositor`]
@@ -740,8 +794,9 @@ impl std::fmt::Debug for TileCompositor {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlendMode, TileCompositor, blend_channel, blend_color, blend_hue, blend_luminosity,
-        blend_saturation, clip_color, composite_tile_cpu, lum, sat, set_lum, set_sat, soft_light_d,
+        BlendMode, TileCompositor, blend_channel, blend_color, blend_darker_color, blend_hue,
+        blend_lighter_color, blend_luminosity, blend_saturation, clip_color, composite_tile_cpu,
+        lum, sat, set_lum, set_sat, soft_light_d,
     };
     use crate::test_support::real_context;
     use aurora_tile::{SAMPLES, TILE};
@@ -2256,5 +2311,193 @@ mod tests {
             (&top, 1.0, BlendMode::ColorDodge),
         ]);
         assert_eq!(first_texel(&out), (0.75, 0.75, 0.75, 1.0));
+    }
+
+    // -- DarkerColor/LighterColor (this round): whole-colour-selection
+    // modes, non-separable like Hue/Saturation/Color/Luminosity above
+    // but a different shape -- no SetLum/SetSat blending, just a
+    // straight comparison of `lum(Cb)` against `lum(Cs)` that returns
+    // one whole input triple unchanged. `blend_darker_color`/
+    // `blend_lighter_color` are called directly (not through
+    // `composite_tile_cpu`'s f16 texel round-trip) for the tests that
+    // need bit-exact equality, since the function performs no
+    // arithmetic on the selected triple -- it returns `cb` or `cs`
+    // verbatim, so there is no rounding to tolerate; epsilon comparisons
+    // are used only where indicated.
+
+    #[test]
+    // The real distinguishing property between DarkerColor (whole-
+    // colour selection) and the already-implemented, separable Darken
+    // (per-channel `min`): Cb=(0.8, 0.1, 0.1) is a fairly dark-average
+    // red (high R, low G/B); Cs=(0.1, 0.8, 0.1) is a fairly dark-average
+    // green. Lum(Cb) = 0.3*0.8 + 0.59*0.1 + 0.11*0.1 = 0.24 + 0.059 +
+    // 0.011 = 0.31; Lum(Cs) = 0.3*0.1 + 0.59*0.8 + 0.11*0.1 = 0.03 +
+    // 0.472 + 0.011 = 0.513 -- independently confirmed by actually
+    // running this exact pair through this crate's own `lum` (real f32
+    // arithmetic, not hand-rounded): `lum(cb) = 0.3100000024`,
+    // `lum(cs) = 0.5129999518`, `lum(cb) < lum(cs)`. Since Lum(Cb) is
+    // lower, DarkerColor must return `Cb` **whole** -- exactly
+    // `(0.8, 0.1, 0.1)`, bit-for-bit the same triple passed in as `cb`,
+    // not a recomputed value. The per-channel minimum of the same two
+    // inputs would instead be `(min(0.8,0.1), min(0.1,0.8),
+    // min(0.1,0.1)) = (0.1, 0.1, 0.1)` -- a hybrid colour equal to
+    // *neither* input -- asserted against directly below to prove the
+    // distinction is real and checkable, not just claimed in a comment.
+    #[allow(clippy::float_cmp)]
+    fn blend_darker_color_picks_the_whole_lower_luminance_colour_not_a_per_channel_hybrid() {
+        let cb = [0.8, 0.1, 0.1];
+        let cs = [0.1, 0.8, 0.1];
+        assert!(
+            (lum(cb) - 0.31).abs() < 1e-6,
+            "Lum(Cb) must be 0.31, got {}",
+            lum(cb)
+        );
+        assert!(
+            (lum(cs) - 0.513).abs() < 1e-6,
+            "Lum(Cs) must be 0.513, got {}",
+            lum(cs)
+        );
+        assert!(
+            lum(cb) < lum(cs),
+            "this test requires a genuinely non-tied Lum(Cb) < Lum(Cs)"
+        );
+
+        let result = blend_darker_color(cb, cs);
+        assert_eq!(
+            result, cb,
+            "DarkerColor must pick the whole backdrop colour when it has the lower Lum"
+        );
+
+        let per_channel_min = [cb[0].min(cs[0]), cb[1].min(cs[1]), cb[2].min(cs[2])];
+        assert_eq!(
+            per_channel_min,
+            [0.1, 0.1, 0.1],
+            "sanity check on the hybrid this test must NOT produce"
+        );
+        assert_ne!(
+            result, per_channel_min,
+            "DarkerColor must not degrade to Darken's own per-channel minimum"
+        );
+    }
+
+    #[test]
+    // The mirror image of the DarkerColor test above, same pair: since
+    // Lum(Cb)=0.31 < Lum(Cs)=0.513, LighterColor must pick the whole
+    // *source* colour, `Cs = (0.1, 0.8, 0.1)` exactly -- and must not
+    // degrade to Lighten's own per-channel maximum,
+    // `(max(0.8,0.1), max(0.1,0.8), max(0.1,0.1)) = (0.8, 0.8, 0.1)`,
+    // a hybrid equal to neither input.
+    #[allow(clippy::float_cmp)]
+    fn blend_lighter_color_picks_the_whole_higher_luminance_colour_not_a_per_channel_hybrid() {
+        let cb = [0.8, 0.1, 0.1];
+        let cs = [0.1, 0.8, 0.1];
+        assert!(lum(cb) < lum(cs));
+
+        let result = blend_lighter_color(cb, cs);
+        assert_eq!(
+            result, cs,
+            "LighterColor must pick the whole source colour when it has the higher Lum"
+        );
+
+        let per_channel_max = [cb[0].max(cs[0]), cb[1].max(cs[1]), cb[2].max(cs[2])];
+        assert_eq!(per_channel_max, [0.8, 0.8, 0.1]);
+        assert_ne!(
+            result, per_channel_max,
+            "LighterColor must not degrade to Lighten's own per-channel maximum"
+        );
+    }
+
+    #[test]
+    // The documented tie-breaking convention (`blend_darker_color`'s
+    // own doc comment): when `Lum(Cb) == Lum(Cs)` exactly, both
+    // DarkerColor and LighterColor resolve to `Cb`, the backdrop.
+    // Cb=(0.6, 0.3, 0.1) and Cs=(0.659, 0.27, 0.1) are two genuinely
+    // *different* colours (not `Cb == Cs`, which would only prove the
+    // functions return early on object identity, not that they compare
+    // by Lum) engineered to share the same Lum: starting from
+    // Cb=(0.6,0.3,0.1) (this file's own pre-existing general-case Lum,
+    // 0.368 -- see `blend_luminosity_matches_an_independently_computed_general_case`
+    // and friends), shift R up and G down by amounts that keep the
+    // weighted sum fixed: `0.3*dr + 0.59*dg = 0` requires
+    // `dr = 0.59*k`, `dg = -0.3*k` for any `k`; taking `k = 0.1` gives
+    // `dr = 0.059`, `dg = -0.03`, so
+    // `Cs = (0.6+0.059, 0.3-0.03, 0.1) = (0.659, 0.27, 0.1)`.
+    // `Lum(Cs) = 0.3*0.659 + 0.59*0.27 + 0.11*0.1 = 0.1977 + 0.1593 +
+    // 0.011 = 0.368`, matching `Lum(Cb) = 0.3*0.6 + 0.59*0.3 + 0.11*0.1
+    // = 0.18 + 0.177 + 0.011 = 0.368` in exact real-number arithmetic --
+    // and independently confirmed to be **bit-exactly** equal under
+    // this crate's own real `f32` `lum` (not just equal on paper): both
+    // evaluate to `0.3680000007` (`0x3ebc6a7f`), verified by actually
+    // compiling and running this exact pair through `lum` before
+    // relying on it here, since `0.3`/`0.59`/`0.11` are not exact binary
+    // fractions and two different real-valued constructions are not
+    // guaranteed to round to the same `f32` bit pattern in general --
+    // this specific pair was checked, not assumed.
+    #[allow(clippy::float_cmp)]
+    fn blend_darker_color_and_blend_lighter_color_break_an_exact_luminance_tie_in_favour_of_the_backdrop()
+     {
+        let cb = [0.6, 0.3, 0.1];
+        let cs = [0.659, 0.27, 0.1];
+        assert_ne!(cb, cs, "the two colours must be genuinely different");
+        assert_eq!(
+            lum(cb),
+            lum(cs),
+            "this test requires bit-exact equal Lum, not merely close"
+        );
+
+        assert_eq!(
+            blend_darker_color(cb, cs),
+            cb,
+            "on an exact Lum tie, DarkerColor must resolve to the backdrop"
+        );
+        assert_eq!(
+            blend_lighter_color(cb, cs),
+            cb,
+            "on an exact Lum tie, LighterColor must also resolve to the backdrop"
+        );
+    }
+
+    #[test]
+    // DarkerColor, a plain non-tied case run through the real per-texel
+    // `composite_tile_cpu` path (not `blend_darker_color` directly),
+    // verified against `lum`: backdrop (bottom) Cb=(0.5, 0.2, 0.9) --
+    // Lum(Cb) = 0.3*0.5 + 0.59*0.2 + 0.11*0.9 = 0.15 + 0.118 + 0.099 =
+    // 0.367 -- versus source (top) Cs=(0.4, 0.4, 0.4), an achromatic
+    // grey whose own Lum always equals its own channel value (the
+    // spec's weights sum to exactly 0.3+0.59+0.11=1.0), so
+    // Lum(Cs)=0.4. Lum(Cb)=0.367 < Lum(Cs)=0.4, so DarkerColor must
+    // pick the whole backdrop `(0.5, 0.2, 0.9)` -- not the per-channel
+    // minimum `(min(0.5,0.4), min(0.2,0.4), min(0.9,0.4)) =
+    // (0.4, 0.2, 0.4)`, a different, hybrid result Darken would give for
+    // these same two inputs. Epsilon tolerance (not `assert_eq!`): like
+    // the non-separable HSL family's own tests, `0.3`/`0.59`/`0.11`
+    // aren't exact binary fractions, so this goes through both `lum`'s
+    // own rounding and an `f16` texel round-trip.
+    fn composite_tile_cpu_darker_color_picks_the_whole_lower_luminance_backdrop() {
+        let bottom = solid_texels([0.5, 0.2, 0.9, 1.0]);
+        let top = solid_texels([0.4, 0.4, 0.4, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::DarkerColor),
+        ]);
+        assert_texel_close(first_texel(&out), (0.5, 0.2, 0.9, 1.0), 1e-3);
+    }
+
+    #[test]
+    // LighterColor's own mirror image of the test directly above, same
+    // two layers: since Lum(Cb)=0.367 < Lum(Cs)=0.4, LighterColor must
+    // pick the whole *source* colour, `(0.4, 0.4, 0.4)` -- distinct from
+    // both DarkerColor's own result for this pair (`(0.5, 0.2, 0.9)`)
+    // and from what Lighten's own per-channel maximum would give
+    // (`(max(0.5,0.4), max(0.2,0.4), max(0.9,0.4)) = (0.5, 0.4, 0.9)`,
+    // a hybrid equal to neither input).
+    fn composite_tile_cpu_lighter_color_picks_the_whole_higher_luminance_source() {
+        let bottom = solid_texels([0.5, 0.2, 0.9, 1.0]);
+        let top = solid_texels([0.4, 0.4, 0.4, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::LighterColor),
+        ]);
+        assert_texel_close(first_texel(&out), (0.4, 0.4, 0.4, 1.0), 1e-3);
     }
 }
