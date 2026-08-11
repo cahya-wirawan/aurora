@@ -6813,6 +6813,186 @@ severity choice.
   is real, separate, unimplemented work — groups do not "fully work"
   after this change, only their render-order recursion does.
 
+- [x] **Group `opacity`/`blend_mode` aggregation, via isolated
+  compositing** — done 2026-08-11, closing the gap the render-order fix
+  above left open on purpose. `aurora_doc::BlendMode`'s 27 variants have
+  no "Pass Through" mode — Photoshop's own real isolated-vs-pass-through
+  group distinction isn't modeled in this schema at all. Given that,
+  isolating *every* group, always, is the only semantic this data model
+  can actually express, so that's the semantic implemented: for a given
+  tile, a group's own visible, direct children (`LayerTree::roots`/
+  `children` — deliberately **not** `paint_order`, which stays a flat,
+  group-blind list for other callers) composite bottom-to-top into a
+  fresh, fully-transparent buffer using their own opacity/blend mode,
+  recursing first for a child that's itself a group; that buffer is then
+  treated as one pseudo-layer, composited one level up using the
+  *group's own* opacity/blend mode. A group's own `bounds`/offset don't
+  exist (only a `Pixel` layer's do, always document-absolute regardless
+  of nesting depth), so no new origin logic was needed beyond what
+  `read_layer_window`/`reference_origin`/`doc_origin` already handled —
+  threaded unchanged through every recursive call.
+
+  **The algorithm, shared**: one new private `aurora-app` function,
+  `resolve_tile(id, layers, store, tile_id, doc_origin,
+  reference_origin) -> Option<(Vec<half::f16>, f32,
+  aurora_render::BlendMode)>`, called once per visible root-level entry
+  by both `recomposite_visible_tiles` (live canvas) and
+  `composite_document` (export) — the same shared-worker discipline
+  `paint_order_into` itself already established inside `aurora-doc`, so
+  the isolation recursion lives in exactly one place, not two
+  independently-drifting copies. A `Pixel` layer resolves to its own
+  texels (read directly, or via `read_layer_window` when its `bounds`
+  origin doesn't match `reference_origin` — unchanged from before this
+  round). A `Group` resolves by recursing into its own visible direct
+  children, compositing them via `aurora_render::composite_tile_cpu`
+  into an isolated buffer, and returning that buffer alongside the
+  group's *own* opacity/blend mode for the caller to apply one level up.
+
+  **The regression-safety property, precisely — narrower than it first
+  looks, and a real finding along the way**: `composite_tile_cpu`
+  already documents that it reproduces a single *full-opacity*
+  (`opacity = 1.0`) layer's own texels bit-exactly. A group whose own
+  isolated content is fully opaque wherever it isn't fully transparent —
+  trivially true for a single child left at *its own* default opacity —
+  composites identically to the pre-this-round flattening through that
+  same property, applied twice (once to isolate, once to re-apply the
+  group's own default opacity/`Normal` one level up). **Originally
+  found not to extend to a group whose isolated content has fractional
+  alpha anywhere** (a lone child at `opacity < 1`, in particular):
+  confirmed by direct calculation (not assumed) that
+  `composite_tile_cpu`'s own straight-alpha accumulation, run onto a
+  starting-*transparent* destination, produces a **premultiplied**
+  result whenever the accumulated alpha is fractional — isolating a lone
+  50%-opacity child alone onto a transparent backdrop yields
+  `(0.0, 0.0, 0.5, 0.5)`, not that child's own straight colour at
+  reduced alpha. `resolve_tile` was, at the time, handing that
+  premultiplied buffer back up as if it were straight alpha, so the next
+  `composite_tile_cpu` pass one level up double-attenuated it.
+
+  **Fixed the same day**: `resolve_tile`'s own group branch now
+  un-premultiplies its isolated buffer (divides `r`/`g`/`b` by `a`,
+  guarded against `a == 0.0`) before returning it, so what it hands back
+  is always true straight alpha, matching what every other branch
+  already returns and what the caller's own `composite_tile_cpu` call
+  expects. Verified by direct calculation this closes the gap for the
+  common case — a single child of any opacity, or multiple children
+  combining via `Normal` — where isolating then re-applying the group's
+  own settings now reproduces the exact flat result:
+  `(0, 0, 0.5, 0.5)` un-premultiplies to `(0, 0, 1.0, 0.5)`, and
+  compositing that over an opaque white backdrop at the group's own
+  default settings gives `(0.5, 0.5, 1.0, 1.0)` — bit-for-bit what a
+  flat, non-isolated composite of the same content gives, not the
+  `(0.5, 0.5, 0.75, 1.0)` the pre-fix double-attenuation produced.
+
+  **A narrower gap genuinely remains, and the fix does not reach it**:
+  when a group's own children combine via a **non-`Normal` blend mode**
+  against each other (e.g. one child `Multiply`d against another,
+  within the same isolation pass), `composite_tile_cpu`'s own
+  `blend_channel`/`blend_rgb` math runs *during* accumulation against
+  whatever the accumulating buffer's backdrop value already is at that
+  intermediate step, which partway through a still-translucent
+  accumulation is not yet a true straight colour. Un-premultiplying only
+  after the whole isolation pass finishes can't retroactively correct
+  blend math that already ran mid-pass against a premultiplied
+  intermediate — a deeper limitation of `composite_tile_cpu`'s own
+  accumulate-in-place design, not fixable from `resolve_tile` alone;
+  real, separate, still-open follow-on work (most plausibly: giving
+  `composite_tile_cpu` itself an un-premultiply step between layers, not
+  just at the end).
+
+  A new regression test
+  (`composite_document_un_premultiplies_a_groups_own_translucent_isolated_child`)
+  proves the fix with the worked example above, asserting the flat
+  `(0.5, 0.5, 1.0, 1.0)` result and explicitly asserting *against* the
+  pre-fix `(0.5, 0.5, 0.75, 1.0)`. Confirmed, not just asserted: every
+  existing group-recursion test from the round above, and every existing
+  multi-layer/blend-mode test with no groups at all, still passes
+  unchanged (`aurora-doc`: 108 tests, unchanged — no `aurora-doc`
+  production code touched, only its `paint_order` doc comment, correcting
+  its own "scope, stated honestly" paragraph now that aggregation is real
+  elsewhere; `aurora-app`: 153 → 158 tests, 5 new — the 4 from this
+  checkbox's own original isolated-compositing work plus 1 new from
+  today's un-premultiply fix — all previously-passing tests green).
+
+  4 new `aurora-app` integration tests, each hand-computed against
+  `composite_tile_cpu`'s own real straight-alpha formula (not an
+  idealized/simplified model — the two differ once a backdrop isn't
+  fully opaque, confirmed by simulating the exact formula rather than
+  assuming a shortcut): (1) group opacity 0.5/`Normal` around one opaque
+  blue child at *its own* default opacity — isolated buffer is pure
+  blue (compositing one full-opacity layer reproduces it exactly), real
+  50/50 blend result `(0.0, 0.5, 0.5, 1.0)`, not pure blue (what the bug
+  would give); (2) group opacity 1.0/`Multiply` around one opaque blue
+  child, opaque green below — isolated buffer is pure blue, `Multiply`
+  applied to the *isolated result* gives opaque black `(0.0, 0.0, 0.0,
+  1.0)`, not pure blue; (3) two nested groups, both opacity 0.5/`Normal`,
+  around one opaque red leaf, opaque white below — proves the recursion
+  actually recurses. **Updated the same day the un-premultiply fix
+  landed**: originally asserted `(0.875, 0.75, 0.75, 1.0)`, reasoned at
+  the time as "not a naive opacities-multiplied 0.25-alpha shortcut" —
+  that was actually Finding 1's own premultiplication bug surfacing a
+  second time, one recursion level up (`outer_group`'s own isolated
+  buffer was itself handed to the root still premultiplied). With the
+  un-premultiply fix applied at every group level, the real result is
+  `(1.0, 0.75, 0.75, 1.0)` — which *is* exactly the naive
+  "0.5 × 0.5 = 0.25 combined opacity" shortcut applied directly to `x`
+  over white, confirming that's what correctly-un-premultiplied nested
+  isolation should give for a single content path; (4) regression —
+  `recomposite_visible_tiles_of_a_default_settings_group_matches_flat_compositing`
+  reuses `recomposite_visible_tiles_blends_visible_layers_bottom_to_top_and_skips_hidden_ones`'s
+  `bottom`/`hidden`/`top` shape with `top` moved inside a default-settings
+  group, `top` itself *also* left at its own default (fully opaque)
+  opacity — the real condition the regression property needs, per the
+  finding above — asserting the identical full-occlusion `(0.0, 0.0,
+  1.0, 1.0)` result a plain opaque root layer would give. (The existing
+  `composite_document_includes_a_layer_nested_inside_a_group` test from
+  the round above, unmodified — its own nested child also at default,
+  fully-opaque, settings — is a second live regression check on the
+  export path.) A 5th test,
+  `composite_document_un_premultiplies_a_groups_own_translucent_isolated_child`,
+  landed the same day once the fractional-alpha gap above was actually
+  fixed: a *translucent* (`opacity = 0.5`) opaque-blue child inside a
+  group left at its own default settings, opaque white below — asserts
+  the isolated-then-reapplied result now matches the flat result exactly
+  (`(0.5, 0.5, 1.0, 1.0)`) and explicitly asserts against the pre-fix
+  double-attenuated value (`(0.5, 0.5, 0.75, 1.0)`) so a regression back
+  to premultiplied hand-off would be caught, not just a missing
+  improvement.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-doc`, `cargo test -p aurora-app` all green, zero regressions.
+  `scripts/check_layering.py` remains the one unrun check (pre-existing
+  `tomllib` gap in this sandbox). No new dependencies, no `aurora-*`
+  layering edges, no lint weakened, `composite_tile_cpu`'s own
+  signature/internals untouched throughout (both the original isolated-
+  compositing round and this round's own un-premultiply fix compose it,
+  never modify it). Version bumped `0.33.0` → `0.34.0` per `CLAUDE.md`'s
+  own convention (the un-premultiply fix landed within this same round,
+  no further bump).
+
+  **Still genuinely open, stated honestly**: a group whose own children
+  combine via a **non-`Normal` blend mode against each other** (not the
+  group's own blend mode one level up — that part is real) while the
+  isolation buffer is still translucent partway through remains unfixed
+  — `resolve_tile`'s own un-premultiply step only runs once, at the end
+  of isolation, and can't retroactively correct `blend_channel`/
+  `blend_rgb` math that already ran mid-pass against a premultiplied
+  intermediate; see `resolve_tile`'s own doc comment for the precise
+  boundary. GPU-side multi-layer compositing (`aurora_render::
+  TileCompositor`) — everything above still runs through the CPU path,
+  `composite_tile_cpu`, per `spike/FINDINGS.md`'s own "CPU compositing is
+  the bottleneck" finding. `Dissolve` still silently falls back to
+  `Normal` at the
+  `translate_blend_mode` boundary — stochastic per-pixel selection needs
+  its own reproducibility design decision before any implementation, not
+  just new math. Per-layer/per-group *masks* remain wholly unaggregated
+  (same as before this round — masks were never in this round's scope).
+  And `history.rs`'s own `layer_dirty_rect` helper still lacks
+  subtree-bounds/effective-visibility aggregation for groups — a
+  separate gap this round didn't touch, since it's about dirty-rect
+  computation, not compositing.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG

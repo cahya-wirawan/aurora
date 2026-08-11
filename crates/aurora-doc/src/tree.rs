@@ -701,17 +701,28 @@ impl LayerTree {
     /// result — a group isn't a compositable object, only its pixel-
     /// layer contents are.
     ///
-    /// **Scope, stated honestly — what this does *not* do**: a group's
-    /// own `opacity`/`blend_mode`/mask are **not** aggregated into its
-    /// children's effective compositing. A child nested in a group at
-    /// 50% opacity still composites using only its *own* opacity/blend
-    /// mode, exactly as if it were a root layer — a group set to 50%
-    /// opacity does not (yet) make its contents appear at half strength.
-    /// That aggregation, and the same subtree-bounds/effective-
-    /// visibility aggregation this crate's own private
-    /// `layer_dirty_rect` helper (`history.rs`) still lacks for groups,
-    /// are separate, still-open gaps this method does not attempt to
-    /// close.
+    /// **Scope, stated honestly — what this method itself does *not*
+    /// do**: this flat list carries no group boundaries, so a group's
+    /// own `opacity`/`blend_mode`/mask cannot be aggregated into its
+    /// children's effective compositing from `paint_order`'s own return
+    /// value alone — a real compositor cannot reconstruct "which run of
+    /// entries came from the same group" after the fact. That real
+    /// aggregation now exists, but as its own separate recursive walk
+    /// over [`Self::roots`]/[`Self::children`] (`aurora-app`'s
+    /// `resolve_tile`, isolating each group's own visible direct
+    /// children before applying the group's own opacity/blend mode one
+    /// level up — the only semantic `aurora_doc::BlendMode` can express,
+    /// since it has no "Pass Through" variant to model Photoshop's own
+    /// isolated-vs-pass-through distinction with), not a feature of this
+    /// method. Callers that need real per-group compositing should walk
+    /// the tree shape directly rather than call `paint_order`, which
+    /// remains what it always was: a flat, group-blind paint list for
+    /// callers (a Layers-panel row order, for instance) that only need
+    /// "every visible pixel layer, correctly stacked" and no group-level
+    /// aggregation at all. The same subtree-bounds/effective-visibility
+    /// aggregation this crate's own private `layer_dirty_rect` helper
+    /// (`history.rs`) still lacks for groups remains a separate,
+    /// still-open gap.
     #[must_use]
     pub fn paint_order(&self) -> Vec<LayerId> {
         let mut out = Vec::new();

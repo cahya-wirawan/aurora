@@ -83,12 +83,25 @@
 //! real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`
 //! — this family's own explicit, now sole boundary) still silently
 //! falls back to `Normal`
-//! — a real, still-open gap. `LayerTree::paint_order` now recurses into
-//! layer groups at any depth (ancestor-visibility-gated: an invisible
-//! group hides its whole subtree), so a layer nested inside a group
-//! does composite and export now; a group's own `opacity`/`blend_mode`
-//! are not yet aggregated into its children's effective compositing,
-//! which remains a separate, still-open gap. **A `.aur`
+//! — a real, still-open gap. Layer groups recurse at any depth
+//! (ancestor-visibility-gated: an invisible group hides its whole
+//! subtree), so a layer nested inside a group does composite and export
+//! now; a group's own `opacity`/`blend_mode` **are** now aggregated
+//! into its children's effective compositing too, via `resolve_tile`'s
+//! shared recursion (`recomposite_visible_tiles`/`composite_document`
+//! both call it once per `LayerTree::roots` entry): every group
+//! composites its own visible direct children in isolation, then that
+//! isolated result is composited one level up using the group's own
+//! opacity/blend mode — the only semantic `aurora_doc::BlendMode`'s
+//! 27 variants can actually express, since the schema has no "Pass
+//! Through" mode to model Photoshop's own isolated-vs-pass-through
+//! distinction with. Real for the common cases — a single child of any
+//! opacity, or multiple children combining via `Normal` — after
+//! `resolve_tile`'s own un-premultiply fix; a group whose *own*
+//! children combine via a non-`Normal` blend mode against each other
+//! while the isolation buffer is still translucent partway through
+//! remains a real, narrower, still-open gap — see `resolve_tile`'s own
+//! doc comment for the precise boundary. **A `.aur`
 //! path (ADR 0009) takes a different, real route
 //! through both**: `App::open_aur_file`/`App::save_aur_file` call
 //! `aurora_io::read_aur`/`write_aur` directly — a real, possibly
@@ -2930,9 +2943,211 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
     }
 }
 
+/// Resolves `id`'s own composited texels for one `aurora_tile::TILE`-
+/// sized window at document-space `doc_origin` (`tile_id`'s own meaning
+/// once converted out of `reference_origin`'s frame — see
+/// [`recomposite_visible_tiles`]'s own doc comment) — the shared
+/// recursive worker both [`recomposite_visible_tiles`] and
+/// [`composite_document`] call once per root-level visible entry
+/// (`aurora_doc::LayerTree::roots`), so the "a group composites in
+/// isolation" recursion below lives in exactly one place rather than
+/// two independently-drifting copies.
+///
+/// For a [`aurora_doc::LayerKind::Pixel`] layer: its own texels, read
+/// directly from `store` when its `bounds` origin already matches
+/// `reference_origin`, or re-tiled via [`read_layer_window`] when it
+/// doesn't — exactly what every existing call site already did for one
+/// layer in a flat list, unchanged.
+///
+/// For a [`aurora_doc::LayerKind::Group`]: its own **isolated**
+/// composite of its visible, direct children only
+/// ([`aurora_doc::LayerTree::children`], **not**
+/// [`aurora_doc::LayerTree::paint_order`] — a nested group's own
+/// contents stay scoped to their own immediate parent's compositing
+/// pass rather than unpacking into a grandparent's), bottom-to-top,
+/// each recursively resolved by this same function, into a fresh
+/// buffer starting fully transparent via the same
+/// `aurora_render::composite_tile_cpu` this function's own caller uses
+/// one level up. A child that is itself a group is resolved by
+/// recursing into this branch again, so nesting to any depth falls out
+/// for free.
+///
+/// **No "Pass Through" mode**: `aurora_doc::BlendMode`'s 27 variants
+/// have no such variant — Photoshop's real distinction between an
+/// isolated and a pass-through group isn't modeled in this schema at
+/// all. Given that, isolating *every* group, always, is the only
+/// semantic this data model can actually express, so that is what this
+/// function implements — a deliberate, documented simplification, not
+/// an oversight; real Pass Through semantics (if ever wanted) would
+/// need a new field on [`aurora_doc::LayerKind::Group`] first, which is
+/// separate, still-open follow-on work.
+///
+/// The returned `(texels, opacity, blend_mode)` are **`id`'s own,
+/// unapplied** — the caller (whichever level actually contains `id`:
+/// the document root, or a parent group's own recursive call into this
+/// function) is the one that applies them, via its own
+/// `aurora_render::composite_tile_cpu` call.
+///
+/// **The regression-safety property, precisely**: `composite_tile_cpu`
+/// already reproduces a single full-opacity (`opacity = 1.0`) layer's
+/// own texels bit-exactly (its own doc comment; also
+/// [`recomposite_visible_tiles`]'s own doc comment names this). A group
+/// whose own isolated content is therefore **fully opaque wherever it
+/// isn't fully transparent** — trivially true for the schema's own
+/// default, a single visible child left at *its own* default opacity —
+/// composites identically to today's pre-recursion flattening: applying
+/// the group's own default `opacity = 1.0`/`blend_mode = Normal` one
+/// level up is then a bit-exact round trip through that same "reproduces
+/// a full-opacity layer exactly" property, applied to the isolated
+/// buffer as if it were one flat layer. This is the regression safety
+/// net for every document with no groups, or only default-settings
+/// groups wrapping default-settings (fully opaque) content.
+///
+/// **A group whose isolated content has fractional alpha anywhere** (a
+/// lone child at `opacity < 1`, a feathered/partially-transparent edge,
+/// or overlapping semi-transparent children) needs more than that
+/// round trip, because `composite_tile_cpu` accumulates straight-alpha
+/// "over" math onto a starting-*transparent* destination, which
+/// produces a **premultiplied** result whenever the accumulated alpha
+/// ends up fractional — confirmed by direct calculation, not assumed: a
+/// lone child at `opacity = 0.5` isolated alone onto a transparent
+/// backdrop yields `(0.0, 0.0, 0.5, 0.5)`, not that child's own straight
+/// `(0.0, 0.0, 1.0, 1.0)` at reduced alpha. Handing that premultiplied
+/// buffer back up as if it were straight-alpha texels — what every
+/// other branch of this function actually returns, and what the
+/// caller's own `composite_tile_cpu` call one level up actually expects
+/// — would double-attenuate the colour on the next pass. **Fixed**: the
+/// code below this doc comment un-premultiplies the isolated buffer
+/// (dividing `r`/`g`/`b` by `a`, guarded against `a == 0.0`) before
+/// returning it, so a group's own isolated content is always handed
+/// back as true straight alpha. Verified this closes the gap for the
+/// common case — a single child of any opacity, or multiple children
+/// combining via `Normal` — where un-premultiplying reproduces the
+/// exact flat (non-isolated) result: e.g. `(0, 0, 0.5, 0.5)` →
+/// un-premultiply → `(0, 0, 1.0, 0.5)`, and re-compositing that at the
+/// group's own default settings over an opaque white backdrop gives
+/// `(0.5, 0.5, 1.0, 1.0)`, bit-for-bit what direct (non-isolated)
+/// compositing of the same content gives.
+///
+/// **Still genuinely open, and this fix does not reach it**: when a
+/// group's own children combine via a **non-`Normal` blend mode**
+/// against each other (e.g. one child set to `Multiply` against another
+/// child, both inside the same isolation pass), `composite_tile_cpu`'s
+/// own `blend_channel`/`blend_rgb` math runs *during* accumulation,
+/// against whatever the accumulating buffer's `Cb` (backdrop) value
+/// already is at that intermediate step — which, partway through a
+/// still-translucent accumulation, is not yet a true straight colour.
+/// Un-premultiplying only after the whole isolation pass finishes (the
+/// fix above) cannot retroactively correct blend math that already ran
+/// mid-pass against a premultiplied intermediate. This is a deeper
+/// limitation of `composite_tile_cpu`'s own accumulate-in-place design,
+/// not something fixable from `resolve_tile` alone — real, still open,
+/// separate follow-on work (most plausibly: giving `composite_tile_cpu`
+/// itself an un-premultiply step between layers, not just at the end).
+///
+/// `None` if `id` doesn't exist, isn't visible, or (for a
+/// [`aurora_doc::LayerKind::Pixel`]) its tile fails to load — the same
+/// "one bad tile shouldn't abort the rest" discipline
+/// [`recomposite_visible_tiles`]/[`composite_document`] already use:
+/// the caller simply omits this contributor from its own composite
+/// rather than propagating the error further.
+///
+/// **Origin handling doesn't get any harder with nesting**:
+/// [`aurora_doc::LayerKind::Group`] has no `bounds`/offset of its own —
+/// every [`aurora_doc::LayerKind::Pixel`] layer's own `bounds` is
+/// already document-absolute regardless of how deeply it's nested — so
+/// `(tile_id, doc_origin, reference_origin)` are threaded through every
+/// recursive call completely unchanged; no new origin logic is needed
+/// beyond what a `Pixel` layer's own branch already had.
+fn resolve_tile(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+) -> Option<(Vec<half::f16>, f32, aurora_render::BlendMode)> {
+    if layers.visible(id) != Some(true) {
+        return None;
+    }
+    let opacity = layers.opacity(id)?;
+    let blend_mode = translate_blend_mode(
+        layers
+            .blend_mode(id)
+            .unwrap_or(aurora_doc::BlendMode::Normal),
+    );
+    match layers.kind(id)? {
+        aurora_doc::LayerKind::Pixel { .. } => {
+            let surface = layers.surface_id(id)?;
+            let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+            let texels = if origin == reference_origin {
+                match store.get(surface, tile_id) {
+                    Ok(tile) => tile.texels().to_vec(),
+                    Err(err) => {
+                        tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
+                        return None;
+                    }
+                }
+            } else {
+                read_layer_window(store, surface, origin, doc_origin)
+            };
+            Some((texels, opacity, blend_mode))
+        }
+        aurora_doc::LayerKind::Group { children } => {
+            let mut child_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> = Vec::new();
+            for &child_id in children.iter().rev() {
+                if let Some(resolved) = resolve_tile(
+                    child_id,
+                    layers,
+                    store,
+                    tile_id,
+                    doc_origin,
+                    reference_origin,
+                ) {
+                    child_texels.push(resolved);
+                }
+            }
+            let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = child_texels
+                .iter()
+                .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
+                .collect();
+            let mut isolated = aurora_render::composite_tile_cpu(&refs);
+            // Un-premultiply: `composite_tile_cpu` accumulates straight-
+            // alpha "over" math onto a starting-*transparent* destination,
+            // which yields a *premultiplied* result whenever the
+            // accumulated alpha ends up fractional (see this function's
+            // own doc comment's worked example: a lone `opacity = 0.5`
+            // child alone on transparent gives `(0, 0, 0.5, 0.5)`, not the
+            // straight `(0, 0, 1.0, 0.5)`). Every other branch of this
+            // function returns true straight-alpha texels, and the
+            // caller's own `composite_tile_cpu` call one level up expects
+            // straight-alpha inputs too -- so divide `r`/`g`/`b` by `a`
+            // here to convert this group's own isolated buffer back to
+            // straight alpha before handing it back as `id`'s own
+            // pseudo-layer texels. Guarded against `a == 0.0` (fully
+            // transparent texels have no meaningful colour to recover;
+            // leave them at `0.0` rather than dividing by zero).
+            for texel in isolated.chunks_exact_mut(aurora_tile::CHANNELS) {
+                let [r, g, b, a] = texel else { continue };
+                let alpha = a.to_f32();
+                if alpha > 0.0 {
+                    *r = half::f16::from_f32(r.to_f32() / alpha);
+                    *g = half::f16::from_f32(g.to_f32() / alpha);
+                    *b = half::f16::from_f32(b.to_f32() / alpha);
+                } else {
+                    *r = half::f16::from_f32(0.0);
+                    *g = half::f16::from_f32(0.0);
+                    *b = half::f16::from_f32(0.0);
+                }
+            }
+            Some((isolated, opacity, blend_mode))
+        }
+    }
+}
+
 /// Recomposites every tile in `residency`'s own currently-visible grid
-/// from `layers.paint_order()`'s own bottom-to-top, visible pixel
-/// layers into `store`'s reserved composite surface
+/// from `layers.roots()`'s own bottom-to-top, visible root-level
+/// entries into `store`'s reserved composite surface
 /// ([`composite_surface_id`]), via `aurora_render::composite_tile_cpu`'s
 /// per-texel math — what [`App::redraw`] calls before syncing the
 /// atlas, so the canvas shows every visible pixel layer's real content
@@ -2950,16 +3165,18 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
 /// space tile is converted into that specific layer's own local
 /// window via [`read_layer_window`], which may need blending up to
 /// four of that layer's own tiles together when origins aren't
-/// tile-aligned.
+/// tile-aligned. All of this — including a group's own recursive
+/// isolation — lives in [`resolve_tile`], called once per visible
+/// root-level entry (`aurora_doc::LayerTree::roots`) for every tile.
 ///
-/// **Blend modes, real for 26 of 27**: each layer's own real
-/// `blend_mode` is read here and translated via `translate_blend_mode`
-/// into `aurora_render::BlendMode` before reaching
-/// `composite_tile_cpu` — `Normal`, the 8-mode "simple separable"
-/// family (`Darken`/`Multiply`/`Lighten`/`Screen`/`Difference`/
-/// `Exclusion`/`Subtract`/`Divide`), the 4-mode "dodge and burn"
-/// family (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`), the
-/// 7-mode "overlay and light" family (`Overlay`/`SoftLight`/
+/// **Blend modes, real for 26 of 27, and groups now aggregated for
+/// real**: each layer's own real `blend_mode` is read and translated
+/// via `translate_blend_mode` into `aurora_render::BlendMode` before
+/// reaching `composite_tile_cpu` — `Normal`, the 8-mode "simple
+/// separable" family (`Darken`/`Multiply`/`Lighten`/`Screen`/
+/// `Difference`/`Exclusion`/`Subtract`/`Divide`), the 4-mode "dodge and
+/// burn" family (`ColorDodge`/`LinearDodge`/`ColorBurn`/`LinearBurn`),
+/// the 7-mode "overlay and light" family (`Overlay`/`SoftLight`/
 /// `HardLight`/`VividLight`/`LinearLight`/`PinLight`/`HardMix`), the
 /// 4-mode non-separable HSL family (`Hue`/`Saturation`/`Color`/
 /// `Luminosity`), and the 2-mode whole-colour-selection family
@@ -2967,7 +3184,19 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
 /// the one remaining `aurora_doc::BlendMode` variant (`Dissolve` —
 /// this family's own explicit, now sole boundary) still silently falls
 /// back to `Normal` at that same translation boundary — a real,
-/// separate, still-open gap, not silently glossed over.
+/// separate, still-open gap, not silently glossed over. A group's own
+/// `opacity`/`blend_mode` **are** now aggregated into its children's
+/// effective compositing — [`resolve_tile`]'s own doc comment has the
+/// real isolated-compositing semantic (every group isolates, always;
+/// there is no "Pass Through" mode in `aurora_doc::BlendMode` to
+/// express Photoshop's own distinction, so this is the only semantic
+/// the schema can actually express) — real for the common cases (a
+/// single child of any opacity, or multiple children combining via
+/// `Normal`) after [`resolve_tile`]'s own un-premultiply fix, with a
+/// narrower, still-open gap remaining for a group's own children
+/// combining via a non-`Normal` blend mode against each other
+/// mid-isolation — see [`resolve_tile`]'s own doc comment for the exact
+/// boundary, not "still entirely broken" and not "fully fixed" either.
 ///
 /// **Performance, incremental but coarse**: a visible tile already
 /// current in `cache` is skipped entirely — see [`CompositeCache`]'s
@@ -2991,18 +3220,6 @@ fn recomposite_visible_tiles(
     store: &mut aurora_tile::TileStore,
     cache: &mut CompositeCache,
 ) {
-    let mut paint_layers = Vec::new();
-    for id in layers.paint_order() {
-        if let (Some(surface), Some(opacity)) = (layers.surface_id(id), layers.opacity(id)) {
-            let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
-            let blend_mode = translate_blend_mode(
-                layers
-                    .blend_mode(id)
-                    .unwrap_or(aurora_doc::BlendMode::Normal),
-            );
-            paint_layers.push((surface, opacity, origin, blend_mode));
-        }
-    }
     // The tile grid `residency.visible_tiles()` walks is anchored to the
     // *active* layer's own origin (`tile_origin_for_view`'s own doc
     // comment) — every other layer's own document-space tile boundaries
@@ -3027,20 +3244,13 @@ fn recomposite_visible_tiles(
             reference_origin.1 + i64::from(tile_id.y) * tile_size,
         );
         let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
-            Vec::with_capacity(paint_layers.len());
-        for &(surface, opacity, origin, blend_mode) in &paint_layers {
-            let texels = if origin == reference_origin {
-                match store.get(surface, tile_id) {
-                    Ok(tile) => tile.texels().to_vec(),
-                    Err(err) => {
-                        tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
-                        continue;
-                    }
-                }
-            } else {
-                read_layer_window(store, surface, origin, doc_origin)
-            };
-            layer_texels.push((texels, opacity, blend_mode));
+            Vec::with_capacity(layers.roots().len());
+        for &id in layers.roots().iter().rev() {
+            if let Some(resolved) =
+                resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
+            {
+                layer_texels.push(resolved);
+            }
         }
         let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
             .iter()
@@ -3254,12 +3464,24 @@ fn read_layer_window(
 /// real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`
 /// — this family's own explicit, now sole boundary) still silently
 /// falls back to `Normal` at that same translation boundary — a real,
-/// still-open gap. Layer groups are now recursed into at any depth
-/// (`LayerTree::paint_order`'s own documented, tested behaviour), so a
-/// layer nested inside a visible group's ancestor chain composites into
-/// this export too; a group's own `opacity`/`blend_mode` are not
-/// aggregated into its children's effective compositing, which remains
-/// a separate, still-open gap this function does not attempt to close.
+/// still-open gap. Layer groups are recursed into at any depth via
+/// [`resolve_tile`] (walking `aurora_doc::LayerTree::roots`/
+/// `LayerTree::children`, not `LayerTree::paint_order`, which stays a
+/// flat list for other, non-compositing callers), ancestor-visibility-
+/// gated, so a layer nested inside a visible group's ancestor chain
+/// composites into this export too — and a group's own `opacity`/
+/// `blend_mode` **are** now aggregated into its children's effective
+/// compositing, via the same isolated-compositing semantic
+/// [`resolve_tile`]'s own doc comment lays out (every group composites
+/// in isolation, always — `aurora_doc::BlendMode` has no "Pass Through"
+/// variant to express Photoshop's own distinction, so isolation is the
+/// only semantic this schema can actually express). Real for the common
+/// cases (a single child of any opacity, or multiple children combining
+/// via `Normal`) after [`resolve_tile`]'s own un-premultiply fix — a
+/// narrower, still-open gap remains for a group's own children
+/// combining via a non-`Normal` blend mode against each other
+/// mid-isolation; see [`resolve_tile`]'s own doc comment for the exact
+/// boundary.
 ///
 /// A layer whose own tile fails to load for a given output tile is
 /// logged and skipped for that tile only, the same "one bad tile
@@ -3284,19 +3506,6 @@ fn composite_document(
         vec![half::f16::from_f32(0.0); width as usize * height as usize * aurora_tile::CHANNELS];
 
     if width > 0 && height > 0 {
-        let mut paint_layers = Vec::new();
-        for id in layers.paint_order() {
-            if let (Some(surface), Some(opacity)) = (layers.surface_id(id), layers.opacity(id)) {
-                let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
-                let blend_mode = translate_blend_mode(
-                    layers
-                        .blend_mode(id)
-                        .unwrap_or(aurora_doc::BlendMode::Normal),
-                );
-                paint_layers.push((surface, opacity, origin, blend_mode));
-            }
-        }
-
         let tile_size = aurora_tile::TILE;
         let tiles_x = width.div_ceil(tile_size);
         let tiles_y = height.div_ceil(tile_size);
@@ -3310,24 +3519,13 @@ fn composite_document(
                 );
 
                 let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
-                    Vec::with_capacity(paint_layers.len());
-                for &(surface, opacity, origin, blend_mode) in &paint_layers {
-                    let texels = if origin == (0, 0) {
-                        match store.get(surface, tile_id) {
-                            Ok(tile) => tile.texels().to_vec(),
-                            Err(err) => {
-                                tracing::warn!(
-                                    ?err,
-                                    ?tile_id,
-                                    "skipping layer for this export tile"
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        read_layer_window(store, surface, origin, doc_origin)
-                    };
-                    layer_texels.push((texels, opacity, blend_mode));
+                    Vec::with_capacity(layers.roots().len());
+                for &id in layers.roots().iter().rev() {
+                    if let Some(resolved) =
+                        resolve_tile(id, layers, store, tile_id, doc_origin, (0, 0))
+                    {
+                        layer_texels.push(resolved);
+                    }
                 }
                 let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
                     .iter()
@@ -4276,11 +4474,20 @@ impl App {
     /// variant (`Dissolve` — this family's own explicit, now sole
     /// boundary) still
     /// silently falling back to `Normal` — a real, still-open gap. Layer
-    /// groups are now recursed into at any depth, ancestor-visibility-
-    /// gated (`aurora_doc::LayerTree::paint_order`'s own documented,
-    /// tested behaviour) — a group's own `opacity`/`blend_mode` are not
-    /// yet aggregated into its children's effective compositing, which
-    /// remains a separate, still-open gap.
+    /// groups are recursed into at any depth, ancestor-visibility-gated
+    /// (`resolve_tile`'s own shared recursion, walking
+    /// `aurora_doc::LayerTree::roots`/`LayerTree::children`) — a
+    /// group's own `opacity`/`blend_mode` **are** now aggregated into
+    /// its children's effective compositing, by isolating a group's own
+    /// visible direct children first and then compositing that isolated
+    /// result one level up using the group's own opacity/blend mode
+    /// (the only semantic `aurora_doc::BlendMode` can express, since it
+    /// has no "Pass Through" variant) — real for the common cases (a
+    /// single child of any opacity, or multiple children combining via
+    /// `Normal`) after `resolve_tile`'s own un-premultiply fix, with a
+    /// narrower, still-open gap for a group's own children combining
+    /// via a non-`Normal` blend mode against each other mid-isolation;
+    /// see `resolve_tile`'s own doc comment for the exact boundary.
     /// `.aur`, by contrast, saves every layer's own real tiles
     /// regardless of which one is active, plus history/layer metadata
     /// this flat path has no format to carry — see
@@ -8547,6 +8754,453 @@ mod tests {
                 "the invisible group's nested green layer must not reach the real composite"
             );
         }
+    }
+
+    #[test]
+    // Distinguishes "the fix works" from "still ignoring group settings":
+    // `group` (opacity 0.5, `Normal`) contains one opaque blue child at
+    // its own documented-default opacity (1.0)/blend mode (`Normal`).
+    // `background` (opaque green) sits at the root, below `group`.
+    //
+    // Hand-computed, following `resolve_tile`'s own isolate-then-apply
+    // semantic: `group`'s own isolated buffer is exactly its child's
+    // opaque blue (compositing one full-opacity `Normal` layer onto a
+    // transparent backdrop reproduces that layer's own texels exactly,
+    // `composite_tile_cpu`'s own documented property) -- then that
+    // isolated blue buffer is composited over `background`'s green using
+    // `group`'s *own* opacity (0.5): straight-alpha "over" an *opaque*
+    // backdrop reduces to `alpha*src + (1-alpha)*dst` per channel, so
+    // r = 0.5*0 + 0.5*0 = 0.0, g = 0.5*0 + 0.5*1 = 0.5,
+    // b = 0.5*1 + 0.5*0 = 0.5, a = 1.0 -> (0.0, 0.5, 0.5, 1.0), a real
+    // 50/50 blue-green blend.
+    //
+    // If group opacity were still being ignored (the pre-fix bug this
+    // test exists to catch), the child would composite at its own full
+    // opacity as if it were a root layer, fully occluding `background`:
+    // the result would be pure blue (0.0, 0.0, 1.0, 1.0), not the
+    // blended value asserted below.
+    fn composite_document_applies_a_groups_own_opacity_to_its_isolated_children() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match layers.add_pixel_layer("child", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(group, 0.5) {
+            unreachable!("{err:?}");
+        }
+        // `blend_mode` defaults to `Normal` and is left untouched --
+        // this test isolates the opacity aggregation specifically.
+        assert_eq!(layers.roots(), [group, background]);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [0.0, 1.0, 0.0, 1.0]),
+            (child, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            let result = image_pixel(&image, 0, 0);
+            assert_eq!(
+                result,
+                [0.0, 0.5, 0.5, 1.0],
+                "group opacity must attenuate its own isolated composite, not be ignored"
+            );
+            assert_ne!(
+                result,
+                [0.0, 0.0, 1.0, 1.0],
+                "pure blue would mean the child ignored the group's own opacity entirely"
+            );
+        }
+    }
+
+    #[test]
+    // Proves `resolve_tile`'s own un-premultiply fix (Finding 1): `group`
+    // is left at its own documented defaults (opacity 1.0, `Normal`) and
+    // contains one **translucent** (`opacity = 0.5`) opaque-blue
+    // (0, 0, 1) child. `background` is opaque white, below `group` at
+    // the root.
+    //
+    // Hand-computed, following `resolve_tile`'s own doc comment:
+    //   `group`'s own isolated buffer, pre-fix (premultiplied, the bug):
+    //     compositing the translucent blue child alone onto a
+    //     transparent backdrop gives alpha = 0.5, then
+    //     b = inverse(0)*0 + alpha(0.5)*blended_b(1.0) = 0.5,
+    //     so `(0, 0, 0.5, 0.5)` -- note the blue channel (0.5) does not
+    //     equal the straight colour (1.0) at this alpha; that's the
+    //     premultiplied contamination the fix removes.
+    //   `group`'s own isolated buffer, post-fix (straight, un-
+    //     premultiplied): b = 0.5 / 0.5 = 1.0, so `(0, 0, 1.0, 0.5)` --
+    //     the child's own true straight colour (opaque blue) at its own
+    //     0.5 alpha, exactly what un-premultiplying should recover.
+    //   Root composite: `background`'s opaque white (1, 1, 1, 1), then
+    //     `group`'s own straight `(0, 0, 1.0, 0.5)` composited at
+    //     `group`'s own opacity 1.0 over that *opaque* backdrop --
+    //     alpha = 0.5, inverse = 0.5, backdrop_alpha = 1.0,
+    //     backdrop_inverse = 0.0, so per channel:
+    //     r = 0.5*1 + 0.5*0 = 0.5, g = 0.5*1 + 0.5*0 = 0.5,
+    //     b = 0.5*1 + 0.5*1.0 = 1.0, a = 0.5 + 1.0*0.5 = 1.0
+    //     -> `(0.5, 0.5, 1.0, 1.0)`, bit-for-bit the same result a flat
+    //     (non-isolated) composite of a single 0.5-opacity blue layer
+    //     over opaque white would give -- proving isolation is no longer
+    //     lossy for this shape.
+    //
+    // Before the fix, the *premultiplied* `(0, 0, 0.5, 0.5)` would have
+    // been composited instead: alpha = 0.5, inverse = 0.5,
+    // backdrop_alpha = 1.0, backdrop_inverse = 0.0, so
+    // b = 0.5*1 + 0.5*0.5 = 0.75 (the other channels unchanged) --
+    // `(0.5, 0.5, 0.75, 1.0)`, double-attenuated blue, the exact bug
+    // Finding 1 fixes.
+    fn composite_document_un_premultiplies_a_groups_own_translucent_isolated_child() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match layers.add_pixel_layer("child", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(child, 0.5) {
+            unreachable!("{err:?}");
+        }
+        // `group` itself is left at its own documented defaults
+        // (opacity 1.0, `Normal`) -- this test isolates the
+        // un-premultiply fix specifically, not group-level aggregation
+        // (already covered by the sibling opacity/blend-mode tests
+        // above).
+        assert_eq!(layers.roots(), [group, background]);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [1.0, 1.0, 1.0, 1.0]),
+            (child, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            let result = image_pixel(&image, 0, 0);
+            assert_eq!(
+                result,
+                [0.5, 0.5, 1.0, 1.0],
+                "un-premultiplying the group's own isolated buffer must reproduce the flat \
+                 (non-isolated) result exactly"
+            );
+            assert_ne!(
+                result,
+                [0.5, 0.5, 0.75, 1.0],
+                "0.75 blue would mean the isolated buffer is still premultiplied \
+                 (double-attenuated), the pre-fix Finding-1 bug"
+            );
+        }
+    }
+
+    #[test]
+    // The blend-mode counterpart to
+    // `composite_document_applies_a_groups_own_opacity_to_its_isolated_children`:
+    // `group` (opacity 1.0, `Multiply`) contains one opaque pure-blue
+    // child (0, 0, 1) at its own documented defaults (opacity 1.0,
+    // `Normal`). `background` is opaque pure-green (0, 1, 0), below
+    // `group` at the root.
+    //
+    // Hand-computed: `group`'s own isolated buffer is exactly opaque
+    // blue (same reasoning as the opacity test above -- compositing over
+    // a transparent backdrop reproduces the single child's own texels
+    // regardless of mode, since the backdrop contributes nothing).  That
+    // isolated blue buffer is then composited over `background` using
+    // `group`'s *own* `Multiply` -- over an opaque backdrop,
+    // `Multiply(Cb, Cs)` per channel: (0*0, 1*0, 0*1) = (0, 0, 0), so the
+    // real result is opaque black: (0.0, 0.0, 0.0, 1.0).
+    //
+    // If the group's own blend mode were still being ignored, the child
+    // would composite directly with its *own* `Normal` mode, giving pure
+    // blue (0.0, 0.0, 1.0, 1.0), not black -- proving real isolate-then-
+    // blend happened, not per-child blending with the group's mode
+    // merely read and discarded.
+    fn composite_document_applies_a_groups_own_blend_mode_to_its_isolated_result() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match layers.add_pixel_layer("child", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(group, aurora_doc::BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(layers.roots(), [group, background]);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [0.0, 1.0, 0.0, 1.0]),
+            (child, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            let result = image_pixel(&image, 0, 0);
+            assert_eq!(
+                result,
+                [0.0, 0.0, 0.0, 1.0],
+                "group's own Multiply must apply to its isolated result, not be ignored"
+            );
+            assert_ne!(
+                result,
+                [0.0, 0.0, 1.0, 1.0],
+                "pure blue would mean the child used its own Normal mode instead of the group's Multiply"
+            );
+        }
+    }
+
+    #[test]
+    // Proves the recursion actually recurses, not just one level:
+    // `outer_group` (opacity 0.5, `Normal`) contains `inner_group`
+    // (opacity 0.5, `Normal`), which contains one opaque pure-red pixel
+    // child `x` at its own documented defaults. `background` is opaque
+    // white, below `outer_group` at the root.
+    //
+    // Hand-computed with `resolve_tile`'s own un-premultiply fix applied
+    // at *every* group level (it runs bottom-up, so `inner_group`'s own
+    // return is fixed before `outer_group` ever uses it, and
+    // `outer_group`'s own return is fixed before the root uses it):
+    //   inner_group's own isolated buffer: opaque red (1, 0, 0, 1) --
+    //     one full-opacity `Normal` child over a transparent backdrop
+    //     reproduces itself exactly (alpha = 1, so un-premultiplying is a
+    //     no-op here).
+    //   outer_group's own isolated buffer, pre-un-premultiply: inner_
+    //     group's own red buffer composited (as `inner_group`'s own
+    //     opacity 0.5, `Normal`) onto a transparent backdrop ->
+    //     (0.5, 0.0, 0.0, 0.5), premultiplied (0.5 red at 0.5 alpha, not
+    //     straight red at 0.5 alpha). Un-premultiplied:
+    //     r = 0.5 / 0.5 = 1.0 -> (1.0, 0.0, 0.0, 0.5), straight red at
+    //     0.5 alpha -- `outer_group`'s own real isolated content.
+    //   Root composite: `background`'s opaque white, then that straight
+    //     `(1.0, 0.0, 0.0, 0.5)` composited at outer_group's own opacity
+    //     0.5 over that *opaque* white backdrop -- alpha = 0.5*0.5 =
+    //     0.25, inverse = 0.75:
+    //     r = 0.75*1 + 0.25*1.0 = 1.0, g = 0.75*1 + 0.25*0 = 0.75,
+    //     b = 0.75*1 + 0.25*0 = 0.75, a = 1.0
+    //     -> (1.0, 0.75, 0.75, 1.0) -- exactly what directly compositing
+    //     `x` at its own combined effective opacity (0.5 * 0.5 = 0.25)
+    //     over white would give, confirming two un-premultiplied
+    //     isolation levels compound correctly.
+    //
+    // Before the un-premultiply fix, `outer_group`'s own *premultiplied*
+    // `(0.5, 0.0, 0.0, 0.5)` was handed to the root as if straight,
+    // double-attenuating the red channel a second time:
+    // r = 0.75*1 + 0.25*0.5 = 0.875 -- the old, buggy expected value
+    // this test used to assert, now known to be Finding 1's same bug
+    // surfacing one level up.
+    fn composite_document_recurses_two_levels_of_nested_groups() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let outer_group = match layers.add_group("outer_group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let inner_group = match layers.add_group("inner_group", Some(outer_group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let x = match layers.add_pixel_layer("x", bounds, Some(inner_group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(outer_group, 0.5) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_opacity(inner_group, 0.5) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(layers.roots(), [outer_group, background]);
+        assert_eq!(layers.children(outer_group), Some([inner_group].as_slice()));
+        assert_eq!(layers.children(inner_group), Some([x].as_slice()));
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [1.0, 1.0, 1.0, 1.0]),
+            (x, [1.0, 0.0, 0.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [1.0, 0.75, 0.75, 1.0],
+                "two levels of nested, non-default-opacity groups must both actually apply, \
+                 with each level's own isolated buffer correctly un-premultiplied"
+            );
+        }
+    }
+
+    #[test]
+    // Regression, live-canvas path: the same
+    // `bottom`/`hidden`/`top` shape
+    // `recomposite_visible_tiles_blends_visible_layers_bottom_to_top_and_skips_hidden_ones`
+    // already proves for a flat root-level list, with `top` moved inside
+    // a group left at the schema's own default opacity (1.0)/blend mode
+    // (`Normal`) -- and `top` itself *also* left at its own default
+    // opacity, deliberately: `resolve_tile`'s own doc comment names
+    // exactly this as the real, narrower condition under which isolation
+    // is bit-identical to flattening (`composite_tile_cpu` already
+    // reproduces one full-opacity layer's own texels exactly, so
+    // isolating a lone full-opacity child and re-applying the group's
+    // own default opacity/`Normal` is a bit-exact round trip through
+    // that same property) -- a lone *translucent* child would not
+    // reproduce the flat result (`composite_tile_cpu`'s own straight-
+    // alpha accumulation isn't exactly re-entrant for fractional alpha),
+    // so this test deliberately keeps `top` fully opaque to exercise the
+    // real invariant rather than a false one.
+    fn recomposite_visible_tiles_of_a_default_settings_group_matches_flat_compositing() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let hidden = match layers.add_pixel_layer("hidden", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_visible(hidden, false) {
+            unreachable!("{err:?}");
+        }
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // `group` and `top` are both left at the schema's own defaults
+        // (opacity 1.0, blend mode `Normal`) -- deliberately untouched,
+        // the condition that makes isolation a bit-exact round trip.
+        let top = match layers.add_pixel_layer("top", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (bottom, [1.0, 0.0, 0.0, 1.0]),
+            (hidden, [0.0, 1.0, 0.0, 1.0]),
+            (top, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, &layers, None, &mut store, &mut cache);
+
+        let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+        assert_eq!(
+            result,
+            (0.0, 0.0, 1.0, 1.0),
+            "an opaque top layer nested in a default-settings group must fully occlude bottom, \
+             exactly as it would as a plain root layer -- and the invisible hidden layer must \
+             still never contribute"
+        );
     }
 
     #[test]
