@@ -6129,6 +6129,68 @@ check licenses` clean with the new `toml` dependency.
   alone was judged sufficient); PNG's own "detect exact sRGB" file-size
   optimization; a colour-management/JPEG-quality UI in `aurora-app` to
   drive any of this with anything other than sRGB/default quality.
+- [x] **Fix flat export: composite the real document, not just the
+  active layer** — done 2026-08-11. `App::save_file`'s own doc comment
+  had already been rewritten (the canvas-size work above) to claim the
+  non-`.aur` PNG/JPEG/TIFF export path writes what the canvas shows —
+  but the code underneath still called `aurora_io::read_from_store`
+  against only the *active* layer's own surface via its own `bounds`,
+  a stale, real, user-facing bug for any multi-layer document:
+  `recomposite_visible_tiles` (called from `App::redraw`) has done real
+  multi-layer CPU compositing into a dedicated `composite_surface_id()`
+  destination for a while now, so the canvas itself shows every visible
+  layer blended — export just never caught up.
+
+  New `composite_document(layers, store, width, height) ->
+  Result<aurora_io::Image, aurora_io::IoError>` closes the gap by
+  gluing `recomposite_visible_tiles`'s own per-tile Normal-blend
+  compositing (`aurora_render::composite_tile_cpu`) and moved-layer
+  origin conversion (`read_layer_window`, reused as-is for a layer
+  whose own `bounds` origin isn't the document's `(0, 0)`) onto
+  `aurora_io::read_from_store`'s own tile-walk/flat-output-buffer shape
+  — but walking the *document's* own full `width`×`height` extent
+  (`self.canvas_size`, `tiles_x`/`tiles_y` via `div_ceil`, tiles
+  anchored at document `(0, 0)`) rather than
+  `TileResidency::visible_tiles()`'s viewport-scoped set, since export
+  must cover the whole document regardless of which corner the canvas
+  happens to be scrolled to. A layer's tile that fails to load is
+  logged and skipped for that tile only, the same "one bad tile
+  shouldn't abort the rest" discipline `recomposite_visible_tiles`
+  already uses. `App::save_file`'s non-`.aur` branch now calls this
+  against `self.canvas_size` instead of reading the active layer's own
+  `bounds`; its doc comment (and this crate's own top-level module doc
+  comment, which had the same stale "active layer only" claim) updated
+  to state the real, current behaviour. 3 new `aurora-app` tests (145
+  total, was 142): a two-layer Normal-blend composite checked against
+  the hand-computed `src*alpha + dst*(1-alpha)` result (opaque red under
+  opaque blue at 50% opacity → `(0.5, 0.0, 0.5, 1.0)`, the same value
+  `recomposite_visible_tiles`'s own sibling test asserts for the
+  live-canvas path); a moved layer (`bounds` origin `(40, 40)`, not
+  `(0, 0)`) landing at its real document-space position rather than
+  silently misaligning to the document's own tile grid; and a
+  non-tile-aligned document (300×300, spanning a 2×2 tile grid) keeping
+  its own real width/height and clamping correctly at the partially-
+  covered bottom-right edge tile.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-app` (145 passed, 0 failed — 142 before), `python3
+  scripts/check_no_hardcoded_style.py` clean. `scripts/check_layering.py`
+  remains the one unrun check (pre-existing `tomllib` gap in this
+  sandbox, unrelated to this change). No new dependencies or
+  `aurora-*` edges.
+
+  **Confirmed, not assumed, while in this code**: layer groups are
+  genuinely still never recursed into for paint order —
+  `aurora_doc::LayerTree::paint_order`'s own doc comment and its
+  `paint_order_never_includes_a_layer_nested_inside_a_group` test both
+  state and prove this directly, so a pixel layer nested inside a group
+  contributes to neither the live canvas composite nor this fixed
+  export path. **Explicitly still NOT fixed by this change** (scoped
+  out on purpose, real separate follow-on work): blend modes beyond
+  Normal (`composite_tile_cpu`'s own current, unchanged scope) and
+  layer-group render-order recursion, both named directly rather than
+  silently left for a reader to discover.
 
 ### M1.10 — Phase 1 gate
 

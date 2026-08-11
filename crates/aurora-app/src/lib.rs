@@ -57,17 +57,22 @@
 //! `aurora_io::write_into_store` so the canvas actually shows it. A bad
 //! file (unreadable, undecodable, unrecognised extension) is logged and
 //! leaves the current document untouched. **"Save As…" is the reverse**
-//! (`App::save_file`): the active layer's own pixels are read back out
-//! of the tile store (`aurora_io::read_from_store`), encoded by the
-//! chosen path's own extension (`aurora_io::encode_by_extension`), and
-//! written to disk via `write_verified` — a sibling temp file, verified
-//! by reading it back and decoding it, then renamed over the real
-//! destination, so a failed export never corrupts or overwrites
-//! whatever was already there. Exports the active layer's own pixels
-//! only, not a composited whole document — this crate has no
-//! compositor wired in yet, and the canvas itself only ever shows the
-//! active layer's own surface today (see `App::redraw`'s own doc
-//! comment). **A `.aur` path (ADR 0009) takes a different, real route
+//! (`App::save_file`): every visible pixel layer is composited across
+//! the real document extent (`composite_document`, reusing
+//! `recomposite_visible_tiles`'s own per-tile Normal-blend and
+//! moved-layer origin-conversion logic against the whole
+//! `self.canvas_size` rect rather than just the on-screen viewport),
+//! encoded by the chosen path's own extension
+//! (`aurora_io::encode_by_extension`), and written to disk via
+//! `write_verified` — a sibling temp file, verified by reading it back
+//! and decoding it, then renamed over the real destination, so a failed
+//! export never corrupts or overwrites whatever was already there. This
+//! is the same real multi-layer composite the canvas itself already
+//! shows (`App::redraw`), not just the active layer's own pixels — the
+//! bug this path used to have. Still Normal-blend-only and still never
+//! recurses into layer groups for paint order (`LayerTree::paint_order`'s
+//! own documented scope) — real, separate, still-open gaps. **A `.aur`
+//! path (ADR 0009) takes a different, real route
 //! through both**: `App::open_aur_file`/`App::save_aur_file` call
 //! `aurora_io::read_aur`/`write_aur` directly — a real, possibly
 //! multi-layer document, not a single flat image, verified on save the
@@ -76,14 +81,12 @@
 //! single "does this decode to the right width/height" check the way a
 //! flat image does. `App::open_file`/`save_file` dispatch to the `.aur`
 //! path or the flat-image path by extension (`is_aur_path`). `.aur`
-//! saves every real pixel layer's own tiles (`document_canvas_size`
-//! stands in for a real document-level canvas size, which nothing
-//! tracks separately yet), unlike the flat-image path's active-layer-
-//! only limit — and, since Undo/Redo (below) gave `App` a real, kept-
-//! alive `history` field, `history` written is that real journal, not
-//! the fresh empty one this path used to write; it's still partial,
-//! since `Brush`/`Eraser` don't record through it (see the Undo/Redo
-//! paragraph below).
+//! saves every real pixel layer's own tiles plus real history/layer
+//! metadata the flat-image path has no format to carry — and, since
+//! Undo/Redo (below) gave `App` a real, kept-alive `history` field,
+//! `history` written is that real journal, not the fresh empty one this
+//! path used to write; it's still partial, since `Brush`/`Eraser` don't
+//! record through it (see the Undo/Redo paragraph below).
 //!
 //! **DPI/scale-factor aware layout**: `logical_size` divides a real
 //! physical window size by `Window::scale_factor` before it reaches
@@ -3081,6 +3084,134 @@ fn read_layer_window(
     out
 }
 
+/// Composites every visible pixel layer in `layers` across the whole
+/// `width`x`height` document rect into a flat `aurora_io::Image`, ready
+/// for `aurora_io::encode_by_extension` — the real multi-layer read
+/// [`App::save_file`]'s flat-format export path needs, in place of the
+/// old "read the active layer's own surface" behaviour.
+///
+/// Shares both halves of its logic rather than reinventing either:
+/// per-tile Normal-blend compositing and moved-layer origin conversion
+/// come straight from [`recomposite_visible_tiles`]/[`read_layer_window`]
+/// (`aurora_render::composite_tile_cpu`), while the tile-walk/output-buffer
+/// shape — deriving `tiles_x`/`tiles_y` from `width`/`height` via
+/// `div_ceil`, and copying each tile's real `w`x`h` sub-region (clamped
+/// at the bottom/right edge for a non-tile-aligned document) into a flat
+/// row-major buffer — is [`aurora_io::read_from_store`]'s own shape.
+///
+/// The one deliberate difference from [`recomposite_visible_tiles`]:
+/// this walks the *document's* own full extent (`width`x`height`,
+/// `tile_id`s starting at `(0, 0)`), not
+/// `aurora_gpu::TileResidency::visible_tiles()` — export must cover the
+/// whole document regardless of which corner the canvas happens to be
+/// scrolled to. Document tiles are therefore always anchored at
+/// document `(0, 0)`: a layer whose own `bounds` origin is also
+/// `(0, 0)` reads directly through `TileStore::get`, matching
+/// `recomposite_visible_tiles`'s own `origin == reference_origin` fast
+/// path; any other origin (a moved layer) goes through
+/// [`read_layer_window`], the same general re-tiling that function
+/// already establishes.
+///
+/// **Scope, same as [`recomposite_visible_tiles`]/`composite_tile_cpu`**:
+/// Normal blend mode only, and layer groups are never recursed into
+/// (`LayerTree::paint_order`'s own documented, tested scope — see
+/// `paint_order_never_includes_a_layer_nested_inside_a_group`) — both
+/// real, separate, still-open gaps this function does not attempt to
+/// close.
+///
+/// A layer whose own tile fails to load for a given output tile is
+/// logged and skipped for that tile only, the same "one bad tile
+/// shouldn't abort the rest" discipline [`recomposite_visible_tiles`]
+/// already uses — not grounds to abort the whole export.
+///
+/// # Errors
+///
+/// Returns [`aurora_io::IoError`] if the assembled buffer doesn't come
+/// out to exactly `width * height * 4` samples — structurally
+/// unreachable given this function's own tile walk, but surfaced
+/// through the same `aurora_io::Image::new` contract
+/// [`aurora_io::read_from_store`] already goes through, rather than
+/// asserted away.
+fn composite_document(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    width: u32,
+    height: u32,
+) -> Result<aurora_io::Image, aurora_io::IoError> {
+    let mut samples =
+        vec![half::f16::from_f32(0.0); width as usize * height as usize * aurora_tile::CHANNELS];
+
+    if width > 0 && height > 0 {
+        let mut paint_layers = Vec::new();
+        for id in layers.paint_order() {
+            if let (Some(surface), Some(opacity)) = (layers.surface_id(id), layers.opacity(id)) {
+                let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+                paint_layers.push((surface, opacity, origin));
+            }
+        }
+
+        let tile_size = aurora_tile::TILE;
+        let tiles_x = width.div_ceil(tile_size);
+        let tiles_y = height.div_ceil(tile_size);
+
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let tile_id = aurora_tile::TileId { x: tx, y: ty };
+                let doc_origin = (
+                    i64::from(tx) * i64::from(tile_size),
+                    i64::from(ty) * i64::from(tile_size),
+                );
+
+                let mut layer_texels: Vec<(Vec<half::f16>, f32)> =
+                    Vec::with_capacity(paint_layers.len());
+                for &(surface, opacity, origin) in &paint_layers {
+                    let texels = if origin == (0, 0) {
+                        match store.get(surface, tile_id) {
+                            Ok(tile) => tile.texels().to_vec(),
+                            Err(err) => {
+                                tracing::warn!(
+                                    ?err,
+                                    ?tile_id,
+                                    "skipping layer for this export tile"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        read_layer_window(store, surface, origin, doc_origin)
+                    };
+                    layer_texels.push((texels, opacity));
+                }
+                let refs: Vec<(&[half::f16], f32)> = layer_texels
+                    .iter()
+                    .map(|(texels, opacity)| (texels.as_slice(), *opacity))
+                    .collect();
+                let composited = aurora_render::composite_tile_cpu(&refs);
+
+                let origin_x = tx * tile_size;
+                let origin_y = ty * tile_size;
+                let w = (width - origin_x).min(tile_size);
+                let h = (height - origin_y).min(tile_size);
+                for ly in 0..h {
+                    let dst_start = ((origin_y + ly) as usize * width as usize + origin_x as usize)
+                        * aurora_tile::CHANNELS;
+                    let dst_end = dst_start + (w as usize) * aurora_tile::CHANNELS;
+                    let src_start = (ly * tile_size) as usize * aurora_tile::CHANNELS;
+                    let src_end = src_start + (w as usize) * aurora_tile::CHANNELS;
+                    if let (Some(dst), Some(src)) = (
+                        samples.get_mut(dst_start..dst_end),
+                        composited.get(src_start..src_end),
+                    ) {
+                        dst.copy_from_slice(src);
+                    }
+                }
+            }
+        }
+    }
+
+    aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples)
+}
+
 /// Selects `layer_id` as the active layer: sets `*active_layer` and
 /// marks its own Layers-panel row (`layer_rows` —
 /// `aurora_ui::populate_layers_panel`'s own return value) as accessibly
@@ -3969,52 +4100,47 @@ impl App {
 
     /// Saves to `path` — the whole document, real and multi-layer
     /// ([`Self::save_aur_file`]), if the extension names `.aur`;
-    /// otherwise the active layer's own pixels alone, reading them back
-    /// out of the live tile store (`aurora_io::read_from_store`),
-    /// encoding via whichever format `path`'s own extension names
-    /// (`aurora_io::encode_by_extension`), and writing the result to
-    /// disk with [`write_verified`]'s own "never leave a corrupt file
-    /// in place" discipline.
+    /// otherwise a flat, composited export of the real document, built
+    /// by [`composite_document`] (every visible pixel layer, Normal
+    /// blend mode, walking `self.canvas_size` — see that field's own
+    /// doc comment for why it, not any one layer's own `bounds`, is the
+    /// real document extent), encoding via whichever format `path`'s
+    /// own extension names (`aurora_io::encode_by_extension`), and
+    /// writing the result to disk with [`write_verified`]'s own "never
+    /// leave a corrupt file in place" discipline.
     ///
-    /// **Scope, stated honestly**: the non-`.aur` path exports the
-    /// *active layer's* own pixels, not a composited whole document —
-    /// this crate has no document compositor wired in yet
-    /// (`aurora_render::TileCompositor` exists, but nothing in
-    /// `aurora-app` calls it), and the canvas itself only ever shows
-    /// the active layer's own surface today (see [`Self::redraw`]'s own
-    /// doc comment) — so a flat-format save round-trips exactly what
-    /// the canvas already shows, no more. `.aur`, by contrast, saves
-    /// every layer's own real tiles regardless of which one is active
-    /// — see [`Self::save_aur_file`]'s own doc comment for that path's
-    /// own scope.
+    /// **Scope, stated honestly**: this is the same real multi-layer
+    /// composite the canvas itself already shows
+    /// ([`recomposite_visible_tiles`], called from [`Self::redraw`]) —
+    /// no longer just the active layer's own pixels, the bug this
+    /// function used to have. Still Normal-blend-only
+    /// (`aurora_render::composite_tile_cpu`'s own current scope) and
+    /// still never recurses into layer groups for paint order
+    /// (`aurora_doc::LayerTree::paint_order`'s own documented scope) —
+    /// both real, separate, still-open gaps, unchanged by this fix.
+    /// `.aur`, by contrast, saves every layer's own real tiles
+    /// regardless of which one is active, plus history/layer metadata
+    /// this flat path has no format to carry — see
+    /// [`Self::save_aur_file`]'s own doc comment for that path's own
+    /// scope.
     ///
-    /// A silent no-op if there's no live tile store, no active layer,
-    /// or that layer isn't a pixel layer — the same absent-precondition
-    /// honesty [`Self::paint_dab`] already uses. A real, logged failure
-    /// (reading the pixels, encoding, or writing the file) is worth a
-    /// warning, though.
+    /// A silent no-op if there's no live tile store — the same
+    /// absent-precondition honesty [`Self::paint_dab`] already uses. A
+    /// real, logged failure (compositing the pixels, encoding, or
+    /// writing the file) is worth a warning, though.
     fn save_file(&mut self, path: &Path) {
         if is_aur_path(path) {
             self.save_aur_file(path);
             return;
         }
-        let Some(layer_id) = self.active_layer else {
-            return;
-        };
-        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
-        else {
-            return;
-        };
-        let Some(surface) = self.layers.surface_id(layer_id) else {
-            return;
-        };
         let Some(store) = self.tile_store.as_mut() else {
             return;
         };
-        let image = match aurora_io::read_from_store(store, surface, bounds.width, bounds.height) {
+        let (width, height) = self.canvas_size;
+        let image = match composite_document(&self.layers, store, width, height) {
             Ok(image) => image,
             Err(err) => {
-                tracing::warn!(?err, "failed to read the active layer's pixels for export");
+                tracing::warn!(?err, "failed to composite the document for export");
                 return;
             }
         };
@@ -4026,7 +4152,7 @@ impl App {
             }
         };
         if write_verified(path, &bytes, image.width(), image.height()) {
-            tracing::info!(path = %path.display(), "exported the active layer");
+            tracing::info!(path = %path.display(), "exported the composited document");
         }
     }
 
@@ -5165,12 +5291,12 @@ mod tests {
         activate_command, apply_scroll_zoom, autosave_path, background_color_from_theme,
         begin_drag, canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
         close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message, default_shortcuts,
-        demo_document, document_canvas_size, document_from_image, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path,
-        layer_local_point, load_scales, load_theme, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
+        composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
+        default_shortcuts, demo_document, document_canvas_size, document_from_image,
+        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
+        handle_zoom_tool_click, is_aur_path, layer_local_point, load_scales, load_theme,
+        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
+        open_tile_store, palette_commands, pointer_in_canvas, pointer_on_rail_divider,
         previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
         replace_document, resized_rail_width, run_command, sample_pixel, select_layer,
         tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
@@ -7507,6 +7633,216 @@ mod tests {
                 outside_shifted,
                 [1.0, 0.0, 0.0, 1.0],
                 "outside shifted's own bounds, only bottom's opaque red should show"
+            );
+        }
+    }
+
+    /// `image`'s own real RGBA sample at document-space `(x, y)`, read
+    /// straight out of `aurora_io::Image::samples`' own row-major
+    /// layout -- the flat-buffer counterpart to `read_first_texel`/
+    /// `sample_pixel` above, which read a *tile store*'s own texels
+    /// instead.
+    // The clearest names for one pixel's own coordinate/RGBA sample,
+    // the same justification `sample_pixel`/`read_first_texel` already
+    // use for the same lint.
+    #[allow(clippy::many_single_char_names)]
+    fn image_pixel(image: &aurora_io::Image, x: u32, y: u32) -> [f32; 4] {
+        let idx = (y as usize * image.width() as usize + x as usize) * aurora_tile::CHANNELS;
+        let samples = image.samples();
+        let (Some(r), Some(g), Some(b), Some(a)) = (
+            samples.get(idx),
+            samples.get(idx + 1),
+            samples.get(idx + 2),
+            samples.get(idx + 3),
+        ) else {
+            unreachable!("(x, y) is within the image's own real width/height");
+        };
+        [r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]
+    }
+
+    #[test]
+    // Hand-computed expected value, following `composite_tile_cpu`'s own
+    // documented `src*alpha + dst*(1-alpha)` straight-alpha "over" math:
+    // bottom (opaque red, opacity 1.0) composites first over fully
+    // transparent black and reproduces itself exactly: (1, 0, 0, 1).
+    // Top (opaque blue, opacity 0.5) then composites over that with
+    // effective alpha = 1.0 (its own texel alpha) * 0.5 (layer opacity)
+    // = 0.5:
+    //   r = 0*0.5 + 1*0.5 = 0.5
+    //   g = 0*0.5 + 0*0.5 = 0.0
+    //   b = 1*0.5 + 0*0.5 = 0.5
+    //   a = 0.5   + 1*0.5 = 1.0
+    // -> (0.5, 0.0, 0.5, 1.0), the same result
+    // `recomposite_visible_tiles_blends_visible_layers_bottom_to_top_and_skips_hidden_ones`
+    // asserts for the live-canvas path -- this proves the export path
+    // reaches the same real composite, not just "something different
+    // from the old active-layer-only read".
+    fn composite_document_blends_two_layers_normal_blend_matching_the_hand_computed_result() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(image.width(), 10);
+        assert_eq!(image.height(), 10);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [0.5, 0.0, 0.5, 1.0],
+                "opaque red bottom under opaque blue top at 50% opacity"
+            );
+        }
+    }
+
+    #[test]
+    // The subtlest part of the export path: a layer whose own `bounds`
+    // origin isn't the document's `(0, 0)` (a moved layer) must still
+    // land at its real document-space position, not silently misalign
+    // to the reference tile grid -- the same case
+    // `recomposite_visible_tiles_blends_a_layer_at_a_different_origin_than_the_active_layer`
+    // proves for the live-canvas path, retargeted at `composite_document`
+    // since export has no "active layer" concept to anchor against --
+    // every document tile is anchored at document `(0, 0)` instead.
+    fn composite_document_places_a_moved_layers_content_at_its_real_document_position() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bottom_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 60,
+        };
+        let shifted_bounds = aurora_core::Rect {
+            x: 40,
+            y: 40,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bottom_bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let shifted = match layers.add_pixel_layer("shifted", shifted_bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let Some(bottom_surface) = layers.surface_id(bottom) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            bottom_surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        let Some(shifted_surface) = layers.surface_id(shifted) else {
+            unreachable!("just created as a pixel layer");
+        };
+        // `shifted`'s own bounds start at document (40, 40); painting a
+        // solid tile at its own local (0, 0) covers document
+        // [40, 40 + TILE) on each axis, same reasoning the
+        // `recomposite_visible_tiles` sibling test above documents.
+        fill_solid(
+            &mut store,
+            shifted_surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        let image = match composite_document(&layers, &mut store, 60, 60) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 40, 40),
+                [0.0, 0.0, 1.0, 1.0],
+                "shifted's own opaque blue must land at its real document position, not (0, 0)"
+            );
+            assert_eq!(
+                image_pixel(&image, 5, 5),
+                [1.0, 0.0, 0.0, 1.0],
+                "outside shifted's own bounds, only bottom's opaque red should show"
+            );
+        }
+    }
+
+    #[test]
+    // A document whose extent isn't a whole number of `aurora_tile::TILE`
+    // (256px) needs the same bottom/right partial-tile clamp
+    // `aurora_io::read_from_store` already proves
+    // (`write_into_store_spanning_multiple_tiles_touches_exactly_the_overlapping_ones`)
+    // -- this is `composite_document`'s own version of that same case,
+    // now across two tiles in each axis.
+    fn composite_document_of_a_non_tile_aligned_document_covers_its_whole_real_extent() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 300,
+        };
+        let solid = match layers.add_pixel_layer("solid", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(solid) else {
+            unreachable!("just created as a pixel layer");
+        };
+        for tile in [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+            aurora_tile::TileId { x: 1, y: 1 },
+        ] {
+            fill_solid(&mut store, surface, tile, [0.0, 1.0, 0.0, 1.0]);
+        }
+
+        let image = match composite_document(&layers, &mut store, 300, 300) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(image.width(), 300, "the real document width, not 512");
+        assert_eq!(image.height(), 300, "the real document height, not 512");
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 299, 299),
+                [0.0, 1.0, 0.0, 1.0],
+                "the bottom-right corner, inside the partially-covered edge tile"
             );
         }
     }
