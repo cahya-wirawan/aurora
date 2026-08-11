@@ -59,8 +59,8 @@
 //! leaves the current document untouched. **"Save As…" is the reverse**
 //! (`App::save_file`): every visible pixel layer is composited across
 //! the real document extent (`composite_document`, reusing
-//! `recomposite_visible_tiles`'s own per-tile Normal-blend and
-//! moved-layer origin-conversion logic against the whole
+//! `recomposite_visible_tiles`'s own per-tile, per-layer-blend-mode-aware
+//! and moved-layer origin-conversion logic against the whole
 //! `self.canvas_size` rect rather than just the on-screen viewport),
 //! encoded by the chosen path's own extension
 //! (`aurora_io::encode_by_extension`), and written to disk via
@@ -69,9 +69,15 @@
 //! export never corrupts or overwrites whatever was already there. This
 //! is the same real multi-layer composite the canvas itself already
 //! shows (`App::redraw`), not just the active layer's own pixels — the
-//! bug this path used to have. Still Normal-blend-only and still never
-//! recurses into layer groups for paint order (`LayerTree::paint_order`'s
-//! own documented scope) — real, separate, still-open gaps. **A `.aur`
+//! bug this path used to have. Each layer's own real `blend_mode` is
+//! read and translated (`translate_blend_mode`) into
+//! `aurora_render::BlendMode` — `Normal` plus the 8-mode "simple
+//! separable" family (`Darken`/`Multiply`/`Lighten`/`Screen`/
+//! `Difference`/`Exclusion`/`Subtract`/`Divide`) are real; the ~18
+//! remaining `aurora_doc::BlendMode` variants still silently fall back
+//! to `Normal` — and still never recurses into layer groups for paint
+//! order (`LayerTree::paint_order`'s own documented scope) — both real,
+//! separate, still-open gaps. **A `.aur`
 //! path (ADR 0009) takes a different, real route
 //! through both**: `App::open_aur_file`/`App::save_aur_file` call
 //! `aurora_io::read_aur`/`write_aur` directly — a real, possibly
@@ -2827,6 +2833,79 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
     aurora_tile::SurfaceId::from_raw(id.to_raw())
 }
 
+/// Converts a real, stored `aurora_doc::BlendMode` (the 27-variant,
+/// PSD-round-trippable enum a layer's own `blend_mode` actually holds)
+/// into `aurora_render`'s own narrower [`aurora_render::BlendMode`] (9
+/// variants: `Normal` plus the 8 "simple separable" modes it has real
+/// math for) — the same "app translates a doc-crate type into an
+/// engine-crate type at the boundary" pattern [`surface_id_for`] above
+/// already establishes for `LayerId` -> `SurfaceId`, needed for the
+/// same structural reason: `aurora-render` and `aurora-doc` are sibling
+/// crates in PRD §7.2's layering (neither may depend on the other), so
+/// neither can name the other's type directly, and `aurora-app`
+/// (depending on both) is where the translation has to happen.
+///
+/// Deliberately an **exhaustive match, no wildcard arm**: every one of
+/// `aurora_doc::BlendMode`'s 27 real variants is named individually, 8
+/// mapped to their real `aurora_render::BlendMode` counterpart and the
+/// remaining ~18 explicitly mapped to `Normal` — an honest, documented
+/// fallback (those modes' real math is separate, still-open follow-on
+/// work; falling back to `Normal` degrades a layer's *appearance*
+/// without corrupting or losing any document data, the same
+/// "unpainted `WidgetKind` returns `Ok(vec![])` rather than erroring"
+/// honesty `paint_widget` already uses elsewhere in this codebase).
+/// Exhaustiveness matters here specifically: a wildcard `_ => Normal`
+/// arm would make a *future* `aurora_doc::BlendMode` variant compile
+/// silently into an unreviewed `Normal` fallback forever; without one,
+/// the compiler forces this function itself to be revisited the next
+/// time either enum grows.
+#[must_use]
+// `clippy::match_same_arms` wants the literal `Normal` arm merged into
+// the identical-bodied fallback arm below it — rejected deliberately:
+// collapsing them would blur the one distinction this function exists
+// to keep legible, "this variant's own real mapping is Normal" versus
+// "this variant has no real mapping yet, so it falls back to Normal",
+// even though both currently produce the same value. Every arm still
+// names its own variant explicitly rather than using a wildcard, so
+// exhaustiveness checking is unaffected by this allow.
+#[allow(clippy::match_same_arms)]
+const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::BlendMode {
+    match mode {
+        aurora_doc::BlendMode::Normal => aurora_render::BlendMode::Normal,
+        aurora_doc::BlendMode::Darken => aurora_render::BlendMode::Darken,
+        aurora_doc::BlendMode::Multiply => aurora_render::BlendMode::Multiply,
+        aurora_doc::BlendMode::Lighten => aurora_render::BlendMode::Lighten,
+        aurora_doc::BlendMode::Screen => aurora_render::BlendMode::Screen,
+        aurora_doc::BlendMode::Difference => aurora_render::BlendMode::Difference,
+        aurora_doc::BlendMode::Exclusion => aurora_render::BlendMode::Exclusion,
+        aurora_doc::BlendMode::Subtract => aurora_render::BlendMode::Subtract,
+        aurora_doc::BlendMode::Divide => aurora_render::BlendMode::Divide,
+        // Not yet implemented in `aurora_render::BlendMode` — real,
+        // separate, still-open follow-on work, not an oversight. Each
+        // named individually rather than behind a wildcard so a future
+        // `aurora_render::BlendMode` addition forces this match to be
+        // revisited instead of silently staying stubbed.
+        aurora_doc::BlendMode::Dissolve
+        | aurora_doc::BlendMode::ColorBurn
+        | aurora_doc::BlendMode::LinearBurn
+        | aurora_doc::BlendMode::DarkerColor
+        | aurora_doc::BlendMode::ColorDodge
+        | aurora_doc::BlendMode::LinearDodge
+        | aurora_doc::BlendMode::LighterColor
+        | aurora_doc::BlendMode::Overlay
+        | aurora_doc::BlendMode::SoftLight
+        | aurora_doc::BlendMode::HardLight
+        | aurora_doc::BlendMode::VividLight
+        | aurora_doc::BlendMode::LinearLight
+        | aurora_doc::BlendMode::PinLight
+        | aurora_doc::BlendMode::HardMix
+        | aurora_doc::BlendMode::Hue
+        | aurora_doc::BlendMode::Saturation
+        | aurora_doc::BlendMode::Color
+        | aurora_doc::BlendMode::Luminosity => aurora_render::BlendMode::Normal,
+    }
+}
+
 /// Recomposites every tile in `residency`'s own currently-visible grid
 /// from `layers.paint_order()`'s own bottom-to-top, visible pixel
 /// layers into `store`'s reserved composite surface
@@ -2848,6 +2927,16 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 /// window via [`read_layer_window`], which may need blending up to
 /// four of that layer's own tiles together when origins aren't
 /// tile-aligned.
+///
+/// **Blend modes, real for 9 of 27**: each layer's own real
+/// `blend_mode` is read here and translated via `translate_blend_mode`
+/// into `aurora_render::BlendMode` before reaching
+/// `composite_tile_cpu` — `Normal` plus the 8-mode "simple separable"
+/// family (`Darken`/`Multiply`/`Lighten`/`Screen`/`Difference`/
+/// `Exclusion`/`Subtract`/`Divide`) composite with their own real math;
+/// the ~18 remaining `aurora_doc::BlendMode` variants still silently
+/// fall back to `Normal` at that same translation boundary — a real,
+/// separate, still-open gap, not silently glossed over.
 ///
 /// **Performance, incremental but coarse**: a visible tile already
 /// current in `cache` is skipped entirely — see [`CompositeCache`]'s
@@ -2875,7 +2964,12 @@ fn recomposite_visible_tiles(
     for id in layers.paint_order() {
         if let (Some(surface), Some(opacity)) = (layers.surface_id(id), layers.opacity(id)) {
             let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
-            paint_layers.push((surface, opacity, origin));
+            let blend_mode = translate_blend_mode(
+                layers
+                    .blend_mode(id)
+                    .unwrap_or(aurora_doc::BlendMode::Normal),
+            );
+            paint_layers.push((surface, opacity, origin, blend_mode));
         }
     }
     // The tile grid `residency.visible_tiles()` walks is anchored to the
@@ -2901,8 +2995,9 @@ fn recomposite_visible_tiles(
             reference_origin.0 + i64::from(tile_id.x) * tile_size,
             reference_origin.1 + i64::from(tile_id.y) * tile_size,
         );
-        let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::with_capacity(paint_layers.len());
-        for &(surface, opacity, origin) in &paint_layers {
+        let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
+            Vec::with_capacity(paint_layers.len());
+        for &(surface, opacity, origin, blend_mode) in &paint_layers {
             let texels = if origin == reference_origin {
                 match store.get(surface, tile_id) {
                     Ok(tile) => tile.texels().to_vec(),
@@ -2914,11 +3009,11 @@ fn recomposite_visible_tiles(
             } else {
                 read_layer_window(store, surface, origin, doc_origin)
             };
-            layer_texels.push((texels, opacity));
+            layer_texels.push((texels, opacity, blend_mode));
         }
-        let refs: Vec<(&[half::f16], f32)> = layer_texels
+        let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
             .iter()
-            .map(|(texels, opacity)| (texels.as_slice(), *opacity))
+            .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
             .collect();
         let composited = aurora_render::composite_tile_cpu(&refs);
         let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
@@ -3091,9 +3186,11 @@ fn read_layer_window(
 /// old "read the active layer's own surface" behaviour.
 ///
 /// Shares both halves of its logic rather than reinventing either:
-/// per-tile Normal-blend compositing and moved-layer origin conversion
-/// come straight from [`recomposite_visible_tiles`]/[`read_layer_window`]
-/// (`aurora_render::composite_tile_cpu`), while the tile-walk/output-buffer
+/// per-tile, per-layer-blend-mode-aware compositing and moved-layer
+/// origin conversion come straight from
+/// [`recomposite_visible_tiles`]/[`read_layer_window`]
+/// (`aurora_render::composite_tile_cpu`, via `translate_blend_mode`),
+/// while the tile-walk/output-buffer
 /// shape — deriving `tiles_x`/`tiles_y` from `width`/`height` via
 /// `div_ceil`, and copying each tile's real `w`x`h` sub-region (clamped
 /// at the bottom/right edge for a non-tile-aligned document) into a flat
@@ -3113,8 +3210,14 @@ fn read_layer_window(
 /// already establishes.
 ///
 /// **Scope, same as [`recomposite_visible_tiles`]/`composite_tile_cpu`**:
-/// Normal blend mode only, and layer groups are never recursed into
-/// (`LayerTree::paint_order`'s own documented, tested scope — see
+/// each layer's own real `blend_mode` is read and translated
+/// (`translate_blend_mode`) — `Normal` plus the 8-mode "simple
+/// separable" family (`Darken`/`Multiply`/`Lighten`/`Screen`/
+/// `Difference`/`Exclusion`/`Subtract`/`Divide`) are real; the ~18
+/// remaining `aurora_doc::BlendMode` variants still silently fall back
+/// to `Normal` at that same translation boundary. Layer groups are
+/// still never recursed into (`LayerTree::paint_order`'s own
+/// documented, tested scope — see
 /// `paint_order_never_includes_a_layer_nested_inside_a_group`) — both
 /// real, separate, still-open gaps this function does not attempt to
 /// close.
@@ -3146,7 +3249,12 @@ fn composite_document(
         for id in layers.paint_order() {
             if let (Some(surface), Some(opacity)) = (layers.surface_id(id), layers.opacity(id)) {
                 let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
-                paint_layers.push((surface, opacity, origin));
+                let blend_mode = translate_blend_mode(
+                    layers
+                        .blend_mode(id)
+                        .unwrap_or(aurora_doc::BlendMode::Normal),
+                );
+                paint_layers.push((surface, opacity, origin, blend_mode));
             }
         }
 
@@ -3162,9 +3270,9 @@ fn composite_document(
                     i64::from(ty) * i64::from(tile_size),
                 );
 
-                let mut layer_texels: Vec<(Vec<half::f16>, f32)> =
+                let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
                     Vec::with_capacity(paint_layers.len());
-                for &(surface, opacity, origin) in &paint_layers {
+                for &(surface, opacity, origin, blend_mode) in &paint_layers {
                     let texels = if origin == (0, 0) {
                         match store.get(surface, tile_id) {
                             Ok(tile) => tile.texels().to_vec(),
@@ -3180,11 +3288,11 @@ fn composite_document(
                     } else {
                         read_layer_window(store, surface, origin, doc_origin)
                     };
-                    layer_texels.push((texels, opacity));
+                    layer_texels.push((texels, opacity, blend_mode));
                 }
-                let refs: Vec<(&[half::f16], f32)> = layer_texels
+                let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
                     .iter()
-                    .map(|(texels, opacity)| (texels.as_slice(), *opacity))
+                    .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
                     .collect();
                 let composited = aurora_render::composite_tile_cpu(&refs);
 
@@ -4101,23 +4209,31 @@ impl App {
     /// Saves to `path` — the whole document, real and multi-layer
     /// ([`Self::save_aur_file`]), if the extension names `.aur`;
     /// otherwise a flat, composited export of the real document, built
-    /// by [`composite_document`] (every visible pixel layer, Normal
-    /// blend mode, walking `self.canvas_size` — see that field's own
-    /// doc comment for why it, not any one layer's own `bounds`, is the
-    /// real document extent), encoding via whichever format `path`'s
-    /// own extension names (`aurora_io::encode_by_extension`), and
-    /// writing the result to disk with [`write_verified`]'s own "never
-    /// leave a corrupt file in place" discipline.
+    /// by [`composite_document`] (every visible pixel layer, each
+    /// composited with its own real, translated blend mode — see below
+    /// — walking `self.canvas_size` — see that field's own doc comment
+    /// for why it, not any one layer's own `bounds`, is the real
+    /// document extent), encoding via whichever format `path`'s own
+    /// extension names (`aurora_io::encode_by_extension`), and writing
+    /// the result to disk with [`write_verified`]'s own "never leave a
+    /// corrupt file in place" discipline.
     ///
     /// **Scope, stated honestly**: this is the same real multi-layer
     /// composite the canvas itself already shows
     /// ([`recomposite_visible_tiles`], called from [`Self::redraw`]) —
     /// no longer just the active layer's own pixels, the bug this
-    /// function used to have. Still Normal-blend-only
-    /// (`aurora_render::composite_tile_cpu`'s own current scope) and
-    /// still never recurses into layer groups for paint order
-    /// (`aurora_doc::LayerTree::paint_order`'s own documented scope) —
-    /// both real, separate, still-open gaps, unchanged by this fix.
+    /// function used to have. Blend modes are real for `Normal` plus 8
+    /// of the ~26 others — the "simple separable" family
+    /// (`Darken`/`Multiply`/`Lighten`/`Screen`/`Difference`/`Exclusion`/
+    /// `Subtract`/`Divide`), via `translate_blend_mode` and
+    /// `aurora_render::composite_tile_cpu`'s own current scope — with
+    /// the remaining ~18 `aurora_doc::BlendMode` variants (dodge/burn,
+    /// overlay/light family, non-separable Hue/Saturation/Color/
+    /// Luminosity, Dissolve, DarkerColor/LighterColor) still silently
+    /// falling back to `Normal`. Also still never recurses into layer
+    /// groups for paint order (`aurora_doc::LayerTree::paint_order`'s
+    /// own documented scope) — both real, separate, still-open gaps,
+    /// the blend-mode one narrowed but not closed by this fix.
     /// `.aur`, by contrast, saves every layer's own real tiles
     /// regardless of which one is active, plus history/layer metadata
     /// this flat path has no format to carry — see
@@ -7719,6 +7835,71 @@ mod tests {
                 image_pixel(&image, 0, 0),
                 [0.5, 0.0, 0.5, 1.0],
                 "opaque red bottom under opaque blue top at 50% opacity"
+            );
+        }
+    }
+
+    #[test]
+    // Proves the real per-layer `blend_mode` stored on the document
+    // actually reaches `composite_tile_cpu` through
+    // `composite_document`/`translate_blend_mode` -- not just that
+    // `Multiply`'s own math is correct in isolation (already covered by
+    // `aurora-render`'s own
+    // `composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey`),
+    // but that setting `BlendMode::Multiply` on a real `LayerTree` layer
+    // changes what this export path actually produces, versus the
+    // Normal-blend result the sibling test just above asserts for the
+    // same-shaped document. Both layers are 50% grey, opaque, full
+    // opacity: bottom composites first over transparent black and
+    // reproduces itself exactly (0.5, 0.5, 0.5, 1.0); top then
+    // composites over that with `Multiply`, and since both layers are
+    // fully opaque at full layer opacity (`as = ab = 1.0`), the general
+    // formula reduces to exactly `B(Cb, Cs) = Cb * Cs` per channel:
+    // 0.5 * 0.5 = 0.25 -> (0.25, 0.25, 0.25, 1.0). A Normal blend of the
+    // same two layers would instead just reproduce the top layer
+    // unchanged (0.5, 0.5, 0.5, 1.0) -- the two results are different,
+    // so this genuinely distinguishes "blend mode was read and applied"
+    // from "blend mode was silently ignored".
+    fn composite_document_blends_two_layers_multiply_blend_matching_the_hand_computed_result() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [0.5, 0.5, 0.5, 1.0]), (top, [0.5, 0.5, 0.5, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [0.25, 0.25, 0.25, 1.0],
+                "50% grey multiplied by 50% grey must darken to 25% grey, not stay 50%"
             );
         }
     }

@@ -6191,6 +6191,107 @@ check licenses` clean with the new `toml` dependency.
   Normal (`composite_tile_cpu`'s own current, unchanged scope) and
   layer-group render-order recursion, both named directly rather than
   silently left for a reader to discover.
+- [x] **Real blend-mode math: the first 8 non-Normal modes** — done
+  2026-08-11, closing exactly the "blend modes beyond Normal" gap the
+  bullet above named. `composite_tile_cpu` treated every layer as
+  `BlendMode::Normal` regardless of its own real, stored
+  `aurora_doc::LayerTree::blend_mode` (a 27-variant enum, already fully
+  modeled and PSD-round-trippable, but never actually read by the
+  compositor). This wires real math for the "simple separable" family —
+  each a pure per-channel function of backdrop and source, no
+  cross-channel or midpoint-branching logic: `Darken` (`min(Cb,Cs)`),
+  `Multiply` (`Cb*Cs`), `Lighten` (`max(Cb,Cs)`), `Screen`
+  (`Cb+Cs-Cb*Cs`), `Difference` (`|Cb-Cs|`), `Exclusion`
+  (`Cb+Cs-2*Cb*Cs`), `Subtract` (`max(Cb-Cs,0)`), and `Divide`
+  (`Cs==0 ? 1.0 : min(Cb/Cs,1.0)` — Photoshop's own "divide by zero
+  source is white" convention). General per-texel formula (straight,
+  unpremultiplied alpha): `Co = (1-as)*Cb + as*[(1-ab)*Cs + ab*B(Cb,Cs)]`
+  where `as = src_a*opacity`, `ab` = backdrop alpha, and `B` is the
+  per-mode function above; `Normal`'s own `B(Cb,Cs) = Cs` reduces this
+  to exactly the pre-existing `(1-as)*Cb + as*Cs` formula, confirmed by
+  every pre-existing Normal-mode test passing unchanged against the
+  generalized code.
+
+  **The same sibling-crate problem the `.aur`/pixel-storage decisions
+  already established a pattern for**: `aurora-render` and `aurora-doc`
+  are siblings in PRD §7.2's layering (neither may depend on the
+  other), so `composite_tile_cpu` structurally cannot take an
+  `aurora_doc::BlendMode` directly. Solved the same way
+  `surface_id_for` already converts `aurora_doc::LayerId` ->
+  `aurora_tile::SurfaceId` at the `aurora-app` boundary: a new,
+  deliberately narrower `aurora_render::BlendMode` (9 variants —
+  `Normal` plus the 8 above — not all 27 with 18 unimplemented, which
+  would force either a forbidden panic/unwrap fallback or silently
+  wrong pixels), plus a new `aurora-app::translate_blend_mode`
+  function mapping the 8 real modes 1:1 and every one of the other ~18
+  real `aurora_doc::BlendMode` variants (`ColorBurn`/`LinearBurn`/
+  `ColorDodge`/`LinearDodge`, `DarkerColor`/`LighterColor`,
+  `Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
+  `PinLight`/`HardMix`, `Hue`/`Saturation`/`Color`/`Luminosity`,
+  `Dissolve`) to `Normal` — an honest, documented degrade, not a bug.
+  The match is deliberately exhaustive with **no wildcard arm**, each
+  of the ~18 fallback variants named individually, so a future addition
+  to either enum forces a compile error here instead of silently
+  staying stubbed forever (needed `#[allow(clippy::match_same_arms)]`
+  on the function, since `clippy::match_same_arms` otherwise wants the
+  literal `Normal` arm merged into the identical-bodied fallback arm —
+  rejected on purpose, to keep "this variant's own real mapping" and
+  "this variant has no real mapping yet" legible as two different
+  claims even though both produce the same value today).
+
+  `composite_tile_cpu`'s signature widened from `&[(&[f16], f32)]` to
+  `&[(&[f16], f32, aurora_render::BlendMode)]`; both real call sites in
+  `aurora-app` (`recomposite_visible_tiles` — the live canvas — and
+  `composite_document` — flat export) now read each layer's own real
+  `blend_mode` via `LayerTree::blend_mode`, translate it, and pass it
+  through, rather than defaulting every layer to Normal implicitly.
+  Every doc comment that previously claimed "Normal blend mode only"
+  (this crate's own top-level module doc, `recomposite_visible_tiles`,
+  `composite_document`, and `App::save_file`) updated to name the real
+  9-mode scope and the ~18 still-open variants explicitly, rather than
+  leaving a stale claim for a future reader to trip over.
+
+  10 new `aurora-render` tests (was 35, now 45): one hand-computed case
+  per mode (e.g. Multiply: 50% grey over 50% grey -> 25% grey, since
+  0.5*0.5=0.25) plus a dedicated Subtract-clamps-to-zero case and a
+  dedicated Divide-by-zero case proving the result is the documented
+  `1.0` white fallback and not `NaN`/`inf` (`half::f16` doesn't panic on
+  a `0.0/0.0`-shaped division, but the *value* still had to be checked,
+  not assumed). 1 new `aurora-app` test (was 145, now 146): a real
+  two-layer `LayerTree` with the top layer's `blend_mode` actually set
+  to `Multiply` via `set_blend_mode`, composited through
+  `composite_document`, asserting the real Multiply result (0.25 grey)
+  rather than the Normal-blend result (0.5 grey) the sibling test just
+  above asserts for the same-shaped document — proving the real
+  per-layer blend mode is actually read from the document and reaches
+  the compositor, not just that the underlying formula is correct in
+  isolation.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-render` (45 passed, 0 failed — 35 before), `cargo test -p
+  aurora-app` (146 passed, 0 failed — 145 before), `cargo test
+  --workspace` (0 failures across every crate), `python3
+  scripts/check_no_hardcoded_style.py` clean. `scripts/check_layering.py`
+  remains the one unrun check (pre-existing `tomllib` gap in this
+  sandbox) — reasoned through by hand instead: `aurora-render`'s own
+  `Cargo.toml` gained no new dependency (confirmed by reading it), so
+  the only crate that now names both `aurora_doc` and `aurora_render`
+  types together is `aurora-app`, which already depended on both before
+  this change. No new dependencies.
+
+  **Explicitly still NOT fixed by this change** (scoped out on purpose,
+  separate, later rounds): the ~18 remaining `aurora_doc::BlendMode`
+  variants — dodge/burn (`ColorBurn`/`LinearBurn`/`ColorDodge`/
+  `LinearDodge`), the overlay/light family (`Overlay`/`SoftLight`/
+  `HardLight`/`VividLight`/`LinearLight`/`PinLight`/`HardMix`), the
+  non-separable modes (`Hue`/`Saturation`/`Color`/`Luminosity`, which
+  need HSL math across all three channels together, not a per-channel
+  function), `Dissolve` (needs per-pixel randomness, a different shape
+  entirely), and `DarkerColor`/`LighterColor` (compare *luminosity*
+  across the whole pixel, not per-channel) — plus layer-group
+  render-order recursion, unchanged from the bullet above. Blend modes
+  are real for 9 of 27, not "done."
 
 ### M1.10 — Phase 1 gate
 

@@ -11,28 +11,102 @@ use half::f16;
 const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
 const LABEL: &str = "composite";
 
-/// Composites `layers` (bottom-to-top; each entry is one tile's own full
-/// [`aurora_tile::SAMPLES`]-length `f16` texel buffer, plus that layer's
-/// own opacity) via straight-alpha "source over" — the CPU-side sibling
-/// of [`TileCompositor::composite_over`]'s own GPU shader math, needed
-/// because the actual orchestration this crate can't do itself (walking
-/// a real `aurora_doc::LayerTree` to decide *which* layers, in what
-/// order, at what opacity) can't live here: `aurora-render` and
-/// `aurora-doc` are sibling crates in PRD §7.2's layering (neither
-/// depends on the other), so `aurora-app`, which depends on both, is
-/// where that walk actually happens — this is the pure per-tile math it
-/// calls once it has real layer data in hand, exactly what this
-/// module's own [`TileCompositor`] doc comment already anticipated
-/// ("the primitive real layer compositing will call once that model
-/// exists").
+/// The subset of `aurora_doc::BlendMode`'s real 27-variant, PSD-
+/// round-trippable enum this crate actually implements blend math for.
+/// `aurora-render` sits below `aurora-doc` in PRD §7.2's layering (the
+/// two are siblings — neither may depend on the other), so this can't
+/// just be `aurora_doc::BlendMode` reused directly; it's a deliberately
+/// narrower, purely additive enum, the same "widen when you actually
+/// need to" discipline `aurora_widgets::paint::paint_widget`'s own
+/// `Vec<Paint>` return type already established (see that module's own
+/// doc comment) — only variants with real, implemented math below, not
+/// all 27 with most unimplemented (which would force either a
+/// forbidden `panic!`/`unwrap`/`unreachable!` fallback or silently
+/// wrong pixels for an unhandled mode).
 ///
-/// Per texel: `result_rgb = src_rgb * a + dst_rgb * (1 - a)`,
-/// `result_a = a + dst_a * (1 - a)`, where `a = src_a * opacity` — the
-/// same formula [`TileCompositor::composite_over`]'s own GPU blend unit
-/// computes (proven by that function's own
-/// `composite_over_blends_source_over_destination` test), just run on
-/// the CPU and with an opacity factor the fixed-function blend unit has
-/// no way to express. `opacity` is clamped to `0.0..=1.0`.
+/// `aurora-app`'s `translate_blend_mode` maps a real
+/// `aurora_doc::BlendMode` onto this one, one implemented variant at a
+/// time, falling every one of the ~18 not-yet-implemented modes back to
+/// [`Self::Normal`] as an honest, documented degrade — not a bug, since
+/// those modes' real math is separate, still-open follow-on work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Darken,
+    Multiply,
+    Lighten,
+    Screen,
+    Difference,
+    Exclusion,
+    Subtract,
+    Divide,
+}
+
+/// The per-channel blend function `B(Cb, Cs)` for `mode`, given one
+/// backdrop channel `cb` and one source channel `cs`, both straight
+/// (unpremultiplied) and in `0.0..=1.0` — the piece of the general
+/// compositing formula
+/// `Co = (1-as)*Cb + as*[(1-ab)*Cs + ab*B(Cb,Cs)]` that actually varies
+/// by blend mode; everything else in that formula is blend-mode-
+/// independent alpha compositing, unchanged by `mode`.
+///
+/// `Normal`'s own `B(Cb, Cs) = Cs` — the generalized formula above
+/// reduces to exactly `(1-as)*Cb + as*Cs`, character for character the
+/// same formula this module used before blend modes existed, proven by
+/// every pre-existing Normal-mode test in this file still passing
+/// unchanged against the generalized code.
+#[must_use]
+fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
+    match mode {
+        BlendMode::Normal => cs,
+        BlendMode::Darken => cb.min(cs),
+        BlendMode::Multiply => cb * cs,
+        BlendMode::Lighten => cb.max(cs),
+        BlendMode::Screen => cb + cs - cb * cs,
+        BlendMode::Difference => (cb - cs).abs(),
+        BlendMode::Exclusion => cb + cs - 2.0 * cb * cs,
+        BlendMode::Subtract => (cb - cs).max(0.0),
+        BlendMode::Divide => {
+            if cs == 0.0 {
+                1.0
+            } else {
+                (cb / cs).min(1.0)
+            }
+        }
+    }
+}
+
+/// Composites `layers` (bottom-to-top; each entry is one tile's own full
+/// [`aurora_tile::SAMPLES`]-length `f16` texel buffer, that layer's own
+/// opacity, and that layer's own [`BlendMode`]) via straight-alpha
+/// compositing generalized to a per-blend-mode source colour — the
+/// CPU-side sibling of [`TileCompositor::composite_over`]'s own GPU
+/// shader math, needed because the actual orchestration this crate
+/// can't do itself (walking a real `aurora_doc::LayerTree` to decide
+/// *which* layers, in what order, at what opacity and blend mode)
+/// can't live here: `aurora-render` and `aurora-doc` are sibling crates
+/// in PRD §7.2's layering (neither depends on the other), so
+/// `aurora-app`, which depends on both, is where that walk actually
+/// happens (`translate_blend_mode` converts a real
+/// `aurora_doc::BlendMode` into this crate's own [`BlendMode`] at that
+/// boundary) — this is the pure per-tile math it calls once it has
+/// real layer data in hand, exactly what this module's own
+/// [`TileCompositor`] doc comment already anticipated ("the primitive
+/// real layer compositing will call once that model exists").
+///
+/// Per texel, per RGB channel: `Co = (1-as)*Cb + as*[(1-ab)*Cs +
+/// ab*B(Cb,Cs)]`, where `Cb`/`Cs` are the backdrop/source channel,
+/// `as = src_a * opacity` (clamped to `0.0..=1.0`), `ab` is the
+/// backdrop's own alpha, and `B` is [`blend_channel`]'s own per-mode
+/// function. The alpha channel itself is blend-mode-independent:
+/// `result_a = as + dst_a * (1 - as)`, unchanged from before blend
+/// modes existed and the same formula [`TileCompositor::composite_over`]'s
+/// own GPU blend unit computes (proven by that function's own
+/// `composite_over_blends_source_over_destination` test) — this
+/// function is that same math run on the CPU, generalized by
+/// blend mode, and with an opacity factor the fixed-function blend unit
+/// has no way to express.
 ///
 /// A `texels` slice whose length isn't a multiple of [`CHANNELS`] has
 /// its trailing partial texel silently dropped (`chunks_exact`) rather
@@ -47,20 +121,29 @@ const LABEL: &str = "composite";
 /// exactly matching what a document with no visible pixel layers should
 /// show.
 ///
-/// **Scope, stated honestly**: Normal blend mode only — every layer
-/// composites as if `BlendMode::Normal` regardless of its own
-/// `blend_mode`, the same "first slice, full mode set is Phase 2"
-/// scoping `aurora-brush`'s own real-engine bullet already uses. This
-/// is a CPU implementation specifically because the orchestration
-/// crate (`aurora-app`) needs to run it per visible tile, per layer,
-/// every time any constituent layer changes — GPU-accelerated
-/// multi-layer compositing (reusing [`TileCompositor`] properly, with a
-/// real opacity/blend-mode-aware shader) is separate, still-open
-/// follow-on work.
+/// **Scope, stated honestly**: [`BlendMode`] implements 9 of
+/// `aurora_doc::BlendMode`'s real 27 variants — `Normal` plus the
+/// "simple separable" family (`Darken`, `Multiply`, `Lighten`,
+/// `Screen`, `Difference`, `Exclusion`, `Subtract`, `Divide`), each a
+/// pure per-channel function of backdrop and source with no cross-
+/// channel or midpoint-branching logic. The remaining ~18
+/// (`ColorBurn`/`LinearBurn`/`ColorDodge`/`LinearDodge` "dodge and
+/// burn"; `Overlay`/`SoftLight`/`HardLight`/`VividLight`/`LinearLight`/
+/// `PinLight`/`HardMix` "overlay and light"; the non-separable
+/// `Hue`/`Saturation`/`Color`/`Luminosity`; `Dissolve`; and
+/// `DarkerColor`/`LighterColor`) are separate, still-open follow-on
+/// work — a layer using one of those falls back to `Normal` at the
+/// `aurora-app` translation boundary (`translate_blend_mode`), not
+/// here. This is a CPU implementation specifically because the
+/// orchestration crate (`aurora-app`) needs to run it per visible tile,
+/// per layer, every time any constituent layer changes —
+/// GPU-accelerated multi-layer compositing (reusing [`TileCompositor`]
+/// properly, with a real opacity/blend-mode-aware shader) is separate,
+/// still-open follow-on work.
 #[must_use]
-pub fn composite_tile_cpu(layers: &[(&[f16], f32)]) -> Vec<f16> {
+pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
     let mut out = vec![f16::from_f32(0.0); SAMPLES];
-    for &(texels, opacity) in layers {
+    for &(texels, opacity, mode) in layers {
         let opacity = opacity.clamp(0.0, 1.0);
         for (dst, src) in out
             .chunks_exact_mut(CHANNELS)
@@ -70,9 +153,17 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32)]) -> Vec<f16> {
             let [sr, sg, sb, sa] = src else { continue };
             let alpha = sa.to_f32() * opacity;
             let inverse = 1.0 - alpha;
-            *dr = f16::from_f32(sr.to_f32() * alpha + dr.to_f32() * inverse);
-            *dg = f16::from_f32(sg.to_f32() * alpha + dg.to_f32() * inverse);
-            *db = f16::from_f32(sb.to_f32() * alpha + db.to_f32() * inverse);
+            let backdrop_alpha = da.to_f32();
+            let backdrop_inverse = 1.0 - backdrop_alpha;
+            let blended_r = backdrop_inverse * sr.to_f32()
+                + backdrop_alpha * blend_channel(mode, dr.to_f32(), sr.to_f32());
+            let blended_g = backdrop_inverse * sg.to_f32()
+                + backdrop_alpha * blend_channel(mode, dg.to_f32(), sg.to_f32());
+            let blended_b = backdrop_inverse * sb.to_f32()
+                + backdrop_alpha * blend_channel(mode, db.to_f32(), sb.to_f32());
+            *dr = f16::from_f32(inverse * dr.to_f32() + alpha * blended_r);
+            *dg = f16::from_f32(inverse * dg.to_f32() + alpha * blended_g);
+            *db = f16::from_f32(inverse * db.to_f32() + alpha * blended_b);
             *da = f16::from_f32(alpha + da.to_f32() * inverse);
         }
     }
@@ -249,7 +340,7 @@ impl std::fmt::Debug for TileCompositor {
 
 #[cfg(test)]
 mod tests {
-    use super::{TileCompositor, composite_tile_cpu};
+    use super::{BlendMode, TileCompositor, composite_tile_cpu};
     use crate::test_support::real_context;
     use aurora_tile::{SAMPLES, TILE};
     use half::f16;
@@ -289,7 +380,10 @@ mod tests {
         // -> (0.5, 0.0, 0.5, 1.0).
         let dst = solid_texels([0.0, 0.0, 1.0, 1.0]);
         let src = solid_texels([1.0, 0.0, 0.0, 0.5]);
-        let out = composite_tile_cpu(&[(&dst, 1.0), (&src, 1.0)]);
+        let out = composite_tile_cpu(&[
+            (&dst, 1.0, BlendMode::Normal),
+            (&src, 1.0, BlendMode::Normal),
+        ]);
         assert_eq!(first_texel(&out), (0.5, 0.0, 0.5, 1.0));
     }
 
@@ -300,7 +394,7 @@ mod tests {
     // allows.
     fn composite_tile_cpu_a_single_layer_at_full_opacity_reproduces_it_over_transparent() {
         let src = solid_texels([0.25, 0.5, 0.75, 1.0]);
-        let out = composite_tile_cpu(&[(&src, 1.0)]);
+        let out = composite_tile_cpu(&[(&src, 1.0, BlendMode::Normal)]);
         // Over fully transparent black, straight-alpha "over" at full
         // opacity reproduces the source exactly.
         assert_eq!(first_texel(&out), (0.25, 0.5, 0.75, 1.0));
@@ -312,7 +406,10 @@ mod tests {
         // effective alpha, not its own texel alpha unmodified.
         let dst = solid_texels([0.0, 0.0, 0.0, 0.0]);
         let src = solid_texels([1.0, 1.0, 1.0, 1.0]);
-        let out = composite_tile_cpu(&[(&dst, 1.0), (&src, 0.5)]);
+        let out = composite_tile_cpu(&[
+            (&dst, 1.0, BlendMode::Normal),
+            (&src, 0.5, BlendMode::Normal),
+        ]);
         assert_eq!(first_texel(&out), (0.5, 0.5, 0.5, 0.5));
     }
 
@@ -320,7 +417,10 @@ mod tests {
     fn composite_tile_cpu_clamps_an_out_of_range_opacity() {
         let dst = solid_texels([0.0, 0.0, 0.0, 0.0]);
         let src = solid_texels([1.0, 1.0, 1.0, 1.0]);
-        let out = composite_tile_cpu(&[(&dst, 1.0), (&src, 5.0)]);
+        let out = composite_tile_cpu(&[
+            (&dst, 1.0, BlendMode::Normal),
+            (&src, 5.0, BlendMode::Normal),
+        ]);
         assert_eq!(
             first_texel(&out),
             (1.0, 1.0, 1.0, 1.0),
@@ -332,7 +432,10 @@ mod tests {
     fn composite_tile_cpu_with_a_fully_transparent_top_layer_leaves_the_bottom_unchanged() {
         let dst = solid_texels([0.25, 0.5, 0.75, 1.0]);
         let src = solid_texels([1.0, 1.0, 1.0, 0.0]);
-        let out = composite_tile_cpu(&[(&dst, 1.0), (&src, 1.0)]);
+        let out = composite_tile_cpu(&[
+            (&dst, 1.0, BlendMode::Normal),
+            (&src, 1.0, BlendMode::Normal),
+        ]);
         assert_eq!(first_texel(&out), (0.25, 0.5, 0.75, 1.0));
     }
 
@@ -343,8 +446,169 @@ mod tests {
         let bottom = solid_texels([1.0, 0.0, 0.0, 1.0]);
         let middle = solid_texels([0.0, 1.0, 0.0, 1.0]);
         let top = solid_texels([0.0, 0.0, 1.0, 0.0]);
-        let out = composite_tile_cpu(&[(&bottom, 1.0), (&middle, 0.5), (&top, 1.0)]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&middle, 0.5, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Normal),
+        ]);
         assert_eq!(first_texel(&out), (0.5, 0.5, 0.0, 1.0));
+    }
+
+    // -- Blend-mode math: each of the 8 newly-implemented non-Normal
+    // modes below, plus Normal itself already proven above. Every test
+    // uses a fully opaque backdrop and source at full layer opacity
+    // (`as = ab = 1.0`), so the general formula
+    // `Co = (1-as)*Cb + as*[(1-ab)*Cs + ab*B(Cb,Cs)]` reduces to exactly
+    // `Co = B(Cb,Cs)` -- the bottom layer is drawn `Normal` (over fully
+    // transparent black, any mode reproduces the source exactly, so
+    // `Normal` there is neutral) purely to seed a real backdrop colour
+    // for the top layer's own real blend mode to react against.
+
+    #[test]
+    // Darken: min(Cb, Cs) per channel. Bottom (backdrop) 0.25/0.75/0.5,
+    // top (source) 0.75/0.25/0.5 -> min(0.25,0.75)=0.25,
+    // min(0.75,0.25)=0.25, min(0.5,0.5)=0.5 -> (0.25, 0.25, 0.5, 1.0).
+    fn composite_tile_cpu_darken_takes_the_per_channel_minimum() {
+        let bottom = solid_texels([0.25, 0.75, 0.5, 1.0]);
+        let top = solid_texels([0.75, 0.25, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Darken),
+        ]);
+        assert_eq!(first_texel(&out), (0.25, 0.25, 0.5, 1.0));
+    }
+
+    #[test]
+    // Multiply: Cb * Cs. 50% grey multiplied by 50% grey -> 0.5*0.5 =
+    // 0.25 per channel, the textbook "multiply darkens" case.
+    fn composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey() {
+        let bottom = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let top = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Multiply),
+        ]);
+        assert_eq!(first_texel(&out), (0.25, 0.25, 0.25, 1.0));
+    }
+
+    #[test]
+    // Lighten: max(Cb, Cs) per channel -- the mirror image of Darken's
+    // own test case above: (0.25,0.75,0.5) vs (0.75,0.25,0.5) ->
+    // max(0.25,0.75)=0.75, max(0.75,0.25)=0.75, max(0.5,0.5)=0.5 ->
+    // (0.75, 0.75, 0.5, 1.0).
+    fn composite_tile_cpu_lighten_takes_the_per_channel_maximum() {
+        let bottom = solid_texels([0.25, 0.75, 0.5, 1.0]);
+        let top = solid_texels([0.75, 0.25, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Lighten),
+        ]);
+        assert_eq!(first_texel(&out), (0.75, 0.75, 0.5, 1.0));
+    }
+
+    #[test]
+    // Screen: Cb + Cs - Cb*Cs. Backdrop 0.25, source 0.75 ->
+    // 0.25 + 0.75 - (0.25*0.75) = 1.0 - 0.1875 = 0.8125.
+    fn composite_tile_cpu_screen_lightens_by_the_inverse_multiply_formula() {
+        let bottom = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Screen),
+        ]);
+        assert_eq!(first_texel(&out), (0.8125, 0.8125, 0.8125, 1.0));
+    }
+
+    #[test]
+    // Difference: |Cb - Cs|. Backdrop 0.75, source 0.25 ->
+    // |0.75 - 0.25| = 0.5.
+    fn composite_tile_cpu_difference_is_the_absolute_per_channel_delta() {
+        let bottom = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let top = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Difference),
+        ]);
+        assert_eq!(first_texel(&out), (0.5, 0.5, 0.5, 1.0));
+    }
+
+    #[test]
+    // Exclusion: Cb + Cs - 2*Cb*Cs. Backdrop 0.25, source 0.75 ->
+    // 0.25 + 0.75 - 2*(0.25*0.75) = 1.0 - 0.375 = 0.625 -- lower
+    // contrast than Difference's own 0.5 for the swapped colour pair
+    // above, matching Exclusion's own textbook "softer Difference"
+    // description.
+    fn composite_tile_cpu_exclusion_is_a_softer_difference() {
+        let bottom = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Exclusion),
+        ]);
+        assert_eq!(first_texel(&out), (0.625, 0.625, 0.625, 1.0));
+    }
+
+    #[test]
+    // Subtract: max(Cb - Cs, 0). Backdrop 0.75, source 0.25 ->
+    // max(0.75 - 0.25, 0) = 0.5.
+    fn composite_tile_cpu_subtract_takes_the_clamped_per_channel_difference() {
+        let bottom = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let top = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Subtract),
+        ]);
+        assert_eq!(first_texel(&out), (0.5, 0.5, 0.5, 1.0));
+    }
+
+    #[test]
+    // Subtract's own clamp: backdrop 0.25, source 0.75 ->
+    // 0.25 - 0.75 = -0.5, clamped to 0 rather than going negative.
+    fn composite_tile_cpu_subtract_clamps_a_negative_result_to_zero() {
+        let bottom = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let top = solid_texels([0.75, 0.75, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Subtract),
+        ]);
+        assert_eq!(first_texel(&out), (0.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    // Divide: min(Cb / Cs, 1.0) for a non-zero source. Backdrop 0.25,
+    // source 0.5 -> 0.25 / 0.5 = 0.5, well under the 1.0 clamp.
+    fn composite_tile_cpu_divide_computes_the_clamped_per_channel_ratio() {
+        let bottom = solid_texels([0.25, 0.25, 0.25, 1.0]);
+        let top = solid_texels([0.5, 0.5, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Divide),
+        ]);
+        assert_eq!(first_texel(&out), (0.5, 0.5, 0.5, 1.0));
+    }
+
+    #[test]
+    // Divide's own two documented edge cases in one texel, each channel
+    // proving one: R has a zero source channel (0.0), which Photoshop's
+    // own convention treats as "divide by zero -> white" (1.0), not
+    // NaN/infinity -- `half::f16` arithmetic wouldn't panic on a literal
+    // 0.0/0.0 either, but the *value* must still be the documented 1.0
+    // fallback, which this asserts directly (a stray NaN or +inf would
+    // both fail this `assert_eq!`, since neither compares equal to
+    // 1.0). B has a non-zero source (0.5) but a larger backdrop (0.75),
+    // so 0.75 / 0.5 = 1.5 must clamp down to 1.0 rather than overshoot.
+    // G is a plain in-range case (0.25 / 0.5 = 0.5) for contrast against
+    // the two edge channels.
+    fn composite_tile_cpu_divide_by_a_zero_source_channel_yields_white_not_nan_or_infinity() {
+        let bottom = solid_texels([0.5, 0.25, 0.75, 1.0]);
+        let top = solid_texels([0.0, 0.5, 0.5, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 1.0, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Divide),
+        ]);
+        let (r, g, b, a) = first_texel(&out);
+        assert!(r.is_finite() && g.is_finite() && b.is_finite());
+        assert_eq!((r, g, b, a), (1.0, 0.5, 1.0, 1.0));
     }
 
     /// A `TILE`x`TILE` `Rgba16Float` texture, pre-filled solid `rgba` via

@@ -9,11 +9,18 @@
 //! tile over another via the GPU's fixed-function alpha blend unit,
 //! replacing the CPU per-pixel merge `spike/FINDINGS.md` finding #1 named
 //! as the real compositing bottleneck. [`composite_tile_cpu`] is its
-//! CPU-side sibling for *multi*-layer compositing: the same straight-alpha
-//! "source over" math, opacity-aware, run entirely on the CPU because the
-//! orchestration crate (`aurora-app`) needs to walk a real
-//! `aurora_doc::LayerTree` — a sibling crate this one can't depend on —
-//! per visible tile, every frame a layer changes; a real GPU-accelerated
+//! CPU-side sibling for *multi*-layer compositing: straight-alpha
+//! "source over" generalized by a real per-layer [`BlendMode`] — `Normal`
+//! plus the 8-mode "simple separable" family (`Darken`/`Multiply`/
+//! `Lighten`/`Screen`/`Difference`/`Exclusion`/`Subtract`/`Divide`); the
+//! ~18 remaining `aurora_doc::BlendMode` variants (dodge/burn,
+//! overlay/light family, non-separable Hue/Saturation/Color/Luminosity,
+//! Dissolve, DarkerColor/LighterColor) are separate, still-open follow-on
+//! work — run entirely on the CPU because the orchestration crate
+//! (`aurora-app`) needs to walk a real `aurora_doc::LayerTree` — a sibling
+//! crate this one can't depend on — per visible tile, every frame a layer
+//! changes, translating that real document blend mode into this crate's
+//! own narrower [`BlendMode`] at the boundary; a real GPU-accelerated
 //! version is separate, still-open follow-on work (PLAN.md M1.9).
 //!
 //! Progressive rendering (finding
@@ -36,7 +43,7 @@ mod schedule;
 #[cfg(test)]
 mod test_support;
 
-pub use composite::{TileCompositor, composite_tile_cpu};
+pub use composite::{BlendMode, TileCompositor, composite_tile_cpu};
 pub use executor::{Executor, TaskId};
 pub use mip::{MipLevel, downsample};
 pub use preview::{PreviewError, upload_preview};
