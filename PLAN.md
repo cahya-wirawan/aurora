@@ -3141,16 +3141,119 @@ check licenses` clean with the new `toml` dependency.
   broken, same `tomllib` gap noted throughout this file, unrelated to
   this change). Version bumped `0.22.0` → `0.23.0` per `CLAUDE.md`'s own
   convention.
-  **Now genuinely open**: Colour-Critical's gallery coverage is the
-  **only** remaining theme without any — same design-input-blocker
-  history this section already used for the other three, now narrowed to
-  one; and all twenty-four golden PNGs landed across Dark (blessed),
-  Light, High Contrast Dark, and High Contrast Light are still pending
-  human bless sessions on real GPU hardware — Dark's own six were
-  blessed first, Light's/High Contrast Dark's/High Contrast Light's
-  eighteen (six each) are not, and none of this change's own work
-  blessed or created a golden PNG, consistent with this file's "never
-  bless blind" discipline throughout.
+  **Colour-Critical's own full six-widget gallery slice landed
+  2026-08-11 too**, now that `design/themes/color-critical.toml` exists
+  (M1.6's own entry above) — closing out gallery-code coverage for
+  **all five** built-in themes across all six widgets. Structurally
+  this theme is the closer analog to Light, not either High Contrast
+  theme, and the backdrop work followed that shape rather than reusing
+  the High Contrast rounds' "one uniform mid-grey for everything"
+  shortcut: `border.control_opacity = 0.0` (same as Dark/Light, so no
+  outline-proof tests were added — that mechanism has nothing new to
+  prove here), and its six `surface.*` tokens are **not** all identical
+  the way both High Contrast themes' are (`cc.canvas #545454`, `cc.app
+  #464646`, `cc.panel #3c3c3c`, `cc.raised #4c4c4c`, `cc.overlay
+  #5a5a5a`, `cc.sunken #242424` — six genuinely different points on a
+  real, narrow-range ramp). New `COLOR_CRITICAL_CLEAR` (`surface.canvas`,
+  `#545454`, the same "what the real UI would show" choice `LIGHT_CLEAR`
+  already established) is used for `Button`/`Checkbox`/`Slider`/
+  `TextField`/`ColorSwatch`, computed per widget, not assumed:
+  `accent.primary` (`accent.blue.600`, `#a4c8ff`) clears it at ≈4.43:1,
+  `accent.primary_active` (`accent.blue.500`, `#78acff`) at ≈3.30:1 (the
+  same two numbers `color-critical.toml`'s own `[accent]` comment already
+  computed when justifying `.600` over `.500` as `primary`) — no
+  collision for `Button`. `surface.sunken` (`Checkbox`'s unchecked box,
+  `Slider`'s track, `TextField`'s fill) clears at ≈2.05:1 — real and
+  modest, a touch stronger than Light's own ≈1.65:1 `TextField` number;
+  `Checkbox`/`Slider` both still have a bright `accent.primary` element
+  to anchor a human's eye, so those two golden-diffs are treated as
+  settled the way Light's were, but `TextField`'s has no such anchor, so
+  — mirroring Light's own exact treatment — it's flagged provisional,
+  pending particular bless-time scrutiny rather than a settled "fine"
+  finding. `ColorSwatch`'s own two fixed arbitrary swatch colours
+  (`(220,40,40)`, `(40,80,220)`, unchanged) came back weaker than
+  expected when actually computed: only ≈1.58:1 and ≈1.18:1 against
+  `COLOR_CRITICAL_CLEAR` by the real WCAG luminance formula — well below
+  Light's own ≈4.40:1/≈5.89:1 for the same two colours, because this
+  theme's canvas (`#545454`) is a genuine mid-tone much closer in raw
+  luminance to both swatch colours than Light's near-white one was.
+  Documented honestly rather than smoothed over: the pixels are never
+  byte-identical to the backdrop, and this theme's whole premise is
+  *chromatic* neutrality (every chrome token `R==G==B`), so a saturated
+  hue against genuinely neutral gray should still read as visibly
+  distinct even at weak luminance contrast — but that's a claim about
+  human colour perception no headless harness can verify, so
+  `ColorSwatch`'s own golden-diff test is flagged for the same scrutiny
+  as `TextField`'s, not waved through on the strength of "arbitrary
+  colours are unlikely to collide."
+
+  **`CommandPalette`'s own backdrop needed real computation, and the
+  answer was "yes, it needs its own constant, but for a narrower reason
+  than Dark/Light's original bug"**: `surface.raised` (the panel fill,
+  `cc.raised`, `#4c4c4c`) against `COLOR_CRITICAL_CLEAR` (`cc.canvas`,
+  `#545454`) is ≈1.13:1 — the two token values are close but genuinely
+  *not* identical (unlike Dark's original bug or Light's own
+  `CommandPalette` collision, both byte-for-byte identical panel/backdrop
+  values), yet an 8-level, ≈1.13:1 gap is close enough to invisible that
+  it's the same failure in substance: a human reviewing the golden would
+  see essentially no panel. New `COMMAND_PALETTE_COLOR_CRITICAL_CLEAR`
+  reuses `NEUTRAL_CLEAR`'s own `#808080` value (exactly as
+  `COMMAND_PALETTE_LIGHT_CLEAR` already does for the analogous Light
+  problem) — checked, not carried over blind: `surface.raised` vs
+  `NEUTRAL_CLEAR` is ≈2.17:1, real and adequate, comparable to the
+  ≈2.05:1 already accepted above for `surface.sunken`, and
+  `accent.primary` (`#a4c8ff`, the selected row's own highlight) is
+  nowhere near `#808080` either. `command_palette_style`'s own
+  `COMMAND_PALETTE_MARGIN` needed no Colour-Critical-specific
+  counterpart — pure layout, theme-independent, same as every other
+  theme's own slice.
+
+  Thirteen new tests, mirroring Light's own per-widget shape (not High
+  Contrast's uniform-backdrop shape): seven real, self-contained
+  distinct-pixels/panel/highlight proofs (`CommandPalette` alone
+  contributes two — its own panel-visibility proof and its selected
+  row's own highlight proof, the same two-real-test shape every other
+  theme's `CommandPalette` slice already has), six `#[ignore]`d
+  golden-diffs targeting `tests/golden/*_gallery_color_critical.png`,
+  none of which exist yet or were created. Ran `cargo test -p
+  aurora-widgets --test gallery -- --nocapture` in this sandbox and
+  grepped for `SKIPPED`: zero matches — this sandbox has a real GPU
+  adapter and every test above genuinely rendered real pixels, not a
+  skip. `gallery.rs`: 46 passed, 24 ignored, 0 failed (was 39 passed, 18
+  ignored before this change — +7 real tests, +6 `#[ignore]`d
+  golden-diffs, two fewer real tests than High Contrast's own +9 because
+  this theme adds no outline-proof tests).
+  `cargo fmt --all --check` and `cargo clippy -p aurora-widgets
+  --all-targets --all-features -- -D warnings` both clean; `python3
+  scripts/check_no_hardcoded_style.py` clean (25 files scanned) — this
+  change is test-only, no widget/token code touched. `python3
+  scripts/check_layering.py` was run and confirmed still failing on this
+  sandbox's own Python 3.10.12 (`ModuleNotFoundError: No module named
+  'tomllib'`, added in 3.11) — the same pre-existing, unrelated gap noted
+  throughout this file, re-confirmed rather than assumed since `python3`
+  itself is present here (unlike some earlier sessions) and
+  `check_no_hardcoded_style.py` ran fine from the same interpreter; the
+  failure is specifically `tomllib`'s absence on this Python version, not
+  `python3` itself being missing. Version bumped `0.23.0` → `0.24.0` per
+  `CLAUDE.md`'s own convention.
+
+  **This closes out gallery-code coverage for all five built-in themes
+  across all six widgets — Dark, Light, High Contrast Dark, High
+  Contrast Light, and Colour-Critical.** What remains, genuinely open:
+  visual human-bless review, a separate matter entirely. Of the thirty
+  goldens this file now has code for (six widgets × five themes), only
+  Dark's own six are actually blessed; the other twenty-four (Light,
+  High Contrast Dark, High Contrast Light, and Colour-Critical, six
+  each) remain `#[ignore]`d pending a human on real GPU hardware, and
+  none of this change's own work blessed or created a golden PNG,
+  consistent with this file's "never bless blind" discipline throughout.
+  That bless step may well surface real findings, mirroring Dark's own
+  `TextField`/`CommandPalette` history (`NEUTRAL_CLEAR`'s and
+  `command_palette_style`'s own doc comments, both above): the first
+  Dark bless attempt found the `CommandPalette`/`TextField` backdrop was
+  wrong, and a second found the margin was still missing — nothing in
+  this session's own careful, computed backdrop reasoning replaces an
+  actual human looking at the actual pixels on actual hardware.
 - [x] **Headless mode for automated UI tests** — done 2026-08-02. Every
   test in this crate already ran with no window/GPU/platform adapter;
   what was missing was making that a *checked* fact rather than an

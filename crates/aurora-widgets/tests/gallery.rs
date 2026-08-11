@@ -144,14 +144,98 @@
 //! identically here; see `command_palette_gallery_matches_the_golden_
 //! image_in_high_contrast_light_theme`'s own doc comment.
 //!
-//! Colour-Critical's coverage remains open — that theme file doesn't
-//! exist yet at all, so it isn't a gallery-code gap — and it is now the
-//! **only** theme without gallery coverage. All twenty-four golden PNGs
-//! landed so far across Dark, Light, High Contrast Dark, and High
-//! Contrast Light (six widgets each) are still pending human bless
-//! sessions on real GPU hardware (every non-Dark golden test in this
-//! file is `#[ignore]`d for exactly that reason; Dark's own six were
-//! blessed first, see each one's own doc comment).
+//! **Colour-Critical closes out gallery-code coverage for all five
+//! built-in themes.** `design/themes/color-critical.toml` now exists —
+//! a genuinely neutral-gray chrome theme (every surface/text/icon/border
+//! token `R==G==B`, verified by construction, see that file's own header
+//! comment and `aurora-theme`'s `neutrality` module) for colour-accurate
+//! work, `extends = "Dark"`, `name = "Color-Critical"` (the exact,
+//! case-sensitive string `color_critical_theme()`'s own `resolve` call
+//! looks up, the same gotcha every prior theme's own helper function had
+//! to get right). Structurally it's the closer analog to Light, not to
+//! either High Contrast theme: `border.control_opacity = 0.0` (same as
+//! Dark/Light — no mandatory-outline feature active here, so unlike
+//! High Contrast Dark/Light this slice adds no outline-proof tests), and
+//! its six `surface.*` tokens are **not** all identical the way both
+//! High Contrast themes' are — `cc.canvas` (`#545454`), `cc.app`
+//! (`#464646`), `cc.panel` (`#3c3c3c`), `cc.raised` (`#4c4c4c`),
+//! `cc.overlay` (`#5a5a5a`), and `cc.sunken` (`#242424`) are six genuinely
+//! different points on a real, if narrow-range, gray ramp. So this slice
+//! uses `COLOR_CRITICAL_CLEAR` (`surface.canvas`, the same "what the real
+//! UI would show" choice `LIGHT_CLEAR` already established) as the
+//! backdrop for `Button`, `Checkbox`, `Slider`, `TextField`, and
+//! `ColorSwatch` — computed, not assumed, per widget:
+//! - `Button`: `accent.primary` (`accent.blue.600`, `#a4c8ff`) clears
+//!   `COLOR_CRITICAL_CLEAR` at ≈4.43:1, `accent.primary_active`
+//!   (`accent.blue.500`, `#78acff`) at ≈3.30:1 — both the exact numbers
+//!   `design/themes/color-critical.toml`'s own `[accent]` comment already
+//!   computed for choosing `.600` over `.500` as `primary` in the first
+//!   place, reused here rather than re-derived. No collision.
+//! - `Checkbox`/`Slider`/`TextField` (all resolve `surface.sunken` for
+//!   their own recessed fill/track): `cc.sunken` vs `COLOR_CRITICAL_CLEAR`
+//!   is ≈2.05:1 — real and, if modest, actually a touch stronger than the
+//!   ≈1.65:1 Light's own provisional `TextField` fill-vs-canvas number
+//!   (this file's own "Per-theme coverage, started narrow" paragraph
+//!   above). `Checkbox`/`Slider` both still have a bright `accent.primary`
+//!   element (the checked box, the thumb) to anchor a human's eye
+//!   regardless; `TextField` doesn't, so — mirroring Light's own
+//!   provisional treatment exactly — its Colour-Critical golden-diff test
+//!   is flagged for particular bless-time scrutiny rather than treated as
+//!   a settled "no backdrop needed" finding.
+//! - `ColorSwatch`: the two arbitrary swatch colours
+//!   (`color_swatch_gallery_tree`'s own `red = (220,40,40)`,
+//!   `blue = (40,80,220)`, unchanged) contrast `COLOR_CRITICAL_CLEAR` at
+//!   only ≈1.58:1 and ≈1.18:1 respectively by the real WCAG luminance
+//!   formula — markedly weaker than Light's own ≈4.40:1/≈5.89:1 for the
+//!   same two colours, because Colour-Critical's canvas (`#545454`, a
+//!   genuine mid-tone) sits far closer in raw luminance to both swatch
+//!   colours than Light's near-white canvas did. The pixels themselves
+//!   are never byte-identical to the backdrop (grey `(84,84,84)` vs
+//!   saturated `(220,40,40)`/`(40,80,220)`), and this theme's whole
+//!   premise is a *chromatically* neutral surround, so a saturated hue
+//!   against genuinely neutral gray should still read as a visibly
+//!   distinct region to a human even where luminance-only contrast is
+//!   weak — but that's a claim about human colour vision, not something
+//!   this headless harness can verify. Flagged honestly, not smoothed
+//!   over: this golden-diff test deserves the same bless-time scrutiny as
+//!   `TextField`'s, not a rubber stamp on the strength of "arbitrary
+//!   colours are unlikely to collide with a mid-tone grey ramp."
+//!
+//! `CommandPalette` is the one widget that needed its own backdrop
+//! constant, `COMMAND_PALETTE_COLOR_CRITICAL_CLEAR` — computed, not
+//! assumed either way. `surface.raised` (the panel fill, `cc.raised`,
+//! `#4c4c4c`) against `COLOR_CRITICAL_CLEAR` (`cc.canvas`, `#545454`) is
+//! ≈1.13:1 — the two values are close but *not* identical (unlike Dark's
+//! original bug or Light's own `CommandPalette` collision, where panel
+//! and backdrop were byte-for-byte the same token value), yet 1.13:1 is
+//! close enough to invisible that it's the same failure in substance: a
+//! human reviewing the golden would see essentially no panel at all
+//! against `COLOR_CRITICAL_CLEAR`. So `CommandPalette`'s own slice reuses
+//! `NEUTRAL_CLEAR` (`#808080`) instead, exactly as `COMMAND_PALETTE_
+//! LIGHT_CLEAR` already does — checked, not carried over blind:
+//! `surface.raised` vs `NEUTRAL_CLEAR` is ≈2.17:1, a real and adequate
+//! gap (comparable to the ≈2.05:1 already accepted above for `Checkbox`/
+//! `Slider`/`TextField`'s own `surface.sunken` vs `COLOR_CRITICAL_CLEAR`),
+//! and `accent.primary` (the selected row's highlight) is nowhere near
+//! `#808080` either. `command_palette_style`'s own `COMMAND_PALETTE_
+//! MARGIN` needs no Colour-Critical-specific counterpart — pure layout,
+//! theme-independent, same as every other theme's own `CommandPalette`
+//! slice already established.
+//!
+//! **That closes out gallery-code coverage for all five built-in themes
+//! across all six widgets** — Dark, Light, High Contrast Dark, High
+//! Contrast Light, and now Colour-Critical. Visual human-bless review of
+//! any of it is a separate, entirely open matter: of the thirty goldens
+//! this file now has code for (six widgets × five themes), only Dark's
+//! own six are actually blessed; the other twenty-four (Light, High
+//! Contrast Dark, High Contrast Light, and Colour-Critical, six each)
+//! remain `#[ignore]`d pending a human on real GPU hardware, the same
+//! "never bless blind" discipline every golden in this file already
+//! follows. That bless step may well surface real findings of its own —
+//! Dark's own `TextField`/`CommandPalette` history (`NEUTRAL_CLEAR`'s and
+//! `command_palette_style`'s own doc comments) is exactly why this file
+//! doesn't treat "the code compiles and the distinct-pixels test passes"
+//! as equivalent to "the golden is trustworthy."
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -176,6 +260,7 @@ const HIGH_CONTRAST_DARK_THEME_TOML: &str =
     include_str!("../../../design/themes/high-contrast-dark.toml");
 const HIGH_CONTRAST_LIGHT_THEME_TOML: &str =
     include_str!("../../../design/themes/high-contrast-light.toml");
+const COLOR_CRITICAL_THEME_TOML: &str = include_str!("../../../design/themes/color-critical.toml");
 const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 
 /// `Button`'s own gallery cell size. Deliberately explicit, not the
@@ -404,6 +489,72 @@ const HIGH_CONTRAST_DARK_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
 /// just mirrored.
 const HIGH_CONTRAST_LIGHT_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
 
+/// Colour-Critical's own gallery backdrop for every widget *except*
+/// `CommandPalette` (see `COMMAND_PALETTE_COLOR_CRITICAL_CLEAR` below) —
+/// `design/themes/color-critical.toml`'s own `surface.canvas`
+/// (`cc.canvas`, `#545454`), the same "what the real UI would show"
+/// choice `LIGHT_CLEAR` already established, not an arbitrary pick.
+/// Checked against every colour this theme's widgets actually paint, not
+/// assumed to carry over from Light just because the same reasoning
+/// pattern applies:
+/// - `accent.primary` (`accent.blue.600`, `#a4c8ff`) — `Button`'s enabled
+///   fill, `Checkbox`'s checked box, `Slider`'s thumb,
+///   `CommandPalette`'s selected-row highlight — clears this backdrop at
+///   ≈4.43:1, the same number `color-critical.toml`'s own `[accent]`
+///   comment already computed when justifying `.600` over `.500` as
+///   `primary` in the first place.
+/// - `accent.primary_active` (`accent.blue.500`, `#78acff`) — `Button`'s
+///   pressed fill — clears at ≈3.30:1, again the same number that file's
+///   own comment already gives.
+/// - `surface.sunken` (`cc.sunken`, `#242424`) — `Checkbox`'s unchecked
+///   box, `Slider`'s track, `TextField`'s fill — clears at ≈2.05:1: real
+///   and, if modest, slightly stronger than the ≈1.65:1 Light's own
+///   provisional `TextField` number, computed the same way (the real
+///   WCAG 2.1 relative-luminance formula, not eyeballed).
+/// - `ColorSwatch`'s two arbitrary swatch colours (`(220,40,40)`,
+///   `(40,80,220)`, unchanged from every other theme's slice) clear at
+///   only ≈1.58:1 and ≈1.18:1 — genuinely weaker than every other
+///   colour checked here, and weaker than Light's own ≈4.40:1/≈5.89:1 for
+///   the same two colours, because this backdrop is a real mid-tone
+///   rather than Light's near-white one. See this file's own module doc
+///   comment for the full reasoning on why that's used anyway (never
+///   byte-identical to the backdrop, and this theme's whole premise is
+///   *chromatic* neutrality, not luminance separation) and why that
+///   golden-diff test is flagged for particular bless-time scrutiny
+///   rather than treated as settled.
+const COLOR_CRITICAL_CLEAR: wgpu::Color = wgpu::Color {
+    r: 0x54 as f64 / 255.0,
+    g: 0x54 as f64 / 255.0,
+    b: 0x54 as f64 / 255.0,
+    a: 1.0,
+};
+
+/// `CommandPalette`'s own Colour-Critical backdrop — deliberately not
+/// plain `COLOR_CRITICAL_CLEAR`. Computed, not assumed: `design/themes/
+/// color-critical.toml` resolves `surface.raised` (`CommandPalette`'s own
+/// panel fill, `paint_command_palette`) to `cc.raised` (`#4c4c4c`), and
+/// `COLOR_CRITICAL_CLEAR` resolves to `cc.canvas` (`#545454`) — these are
+/// two genuinely *different* token values, unlike Dark's original bug or
+/// Light's own `CommandPalette` collision (where panel and backdrop were
+/// byte-for-byte the same token), but the real WCAG contrast between them
+/// is only ≈1.13:1: an 8-level gap out of 255, close enough to invisible
+/// that it's the same failure in substance — a human reviewing the golden
+/// would see essentially no panel at all against `COLOR_CRITICAL_CLEAR`.
+/// So this reuses `NEUTRAL_CLEAR`'s own value (`#808080`) instead, exactly
+/// as `COMMAND_PALETTE_LIGHT_CLEAR` already does for the analogous Light
+/// problem — checked, not carried over blind: `surface.raised`
+/// (`#4c4c4c`) vs `NEUTRAL_CLEAR` (`#808080`) is ≈2.17:1, a real and
+/// adequate gap, comparable to the ≈2.05:1 `COLOR_CRITICAL_CLEAR`'s own
+/// doc comment already accepts for `Checkbox`/`Slider`/`TextField`'s
+/// `surface.sunken`, and `accent.primary` (`#a4c8ff`, the selected row's
+/// own highlight) is nowhere near `#808080` either — the panel, its
+/// margin, and the row highlight all stay visually distinct from each
+/// other and from the backdrop. `command_palette_style`'s own
+/// `COMMAND_PALETTE_MARGIN` fix is pure layout, not colour, so it already
+/// carries over unchanged regardless of theme — no Colour-Critical-
+/// specific margin constant is needed here either.
+const COMMAND_PALETTE_COLOR_CRITICAL_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
+
 /// Serializes this file's real-GPU tests, this integration test's own
 /// copy of the same "one `wgpu::Instance`/`Device` at a time" lock
 /// every other real-GPU test file in this workspace carries
@@ -528,6 +679,33 @@ fn high_contrast_light_theme() -> Theme {
     match themes.resolve("High Contrast Light", &palette) {
         Ok(theme) => theme,
         Err(err) => unreachable!("the committed High Contrast Light theme must resolve: {err:?}"),
+    }
+}
+
+/// Mirrors [`high_contrast_dark_theme`]/[`high_contrast_light_theme`],
+/// but for Colour-Critical. `design/themes/color-critical.toml` also
+/// `extends = "Dark"` (see that file's own header comment), so — exactly
+/// like the others — the parent needs registering first before `resolve`
+/// can walk the `extends` chain. `"Color-Critical"`, not `"Colour-
+/// Critical"` — the exact, case-sensitive string that file's own `name`
+/// field holds, confirmed by reading the committed TOML directly rather
+/// than assumed from this file's own prose (which uses the British
+/// spelling throughout, matching the design brief's own wording).
+fn color_critical_theme() -> Theme {
+    let palette = match Palette::from_toml_str(PALETTE_TOML) {
+        Ok(palette) => palette,
+        Err(err) => unreachable!("the committed palette must parse: {err:?}"),
+    };
+    let mut themes = ThemeSet::new();
+    if let Err(err) = themes.register(DARK_THEME_TOML) {
+        unreachable!("the committed Dark theme must register: {err:?}");
+    }
+    if let Err(err) = themes.register(COLOR_CRITICAL_THEME_TOML) {
+        unreachable!("the committed Color-Critical theme must register: {err:?}");
+    }
+    match themes.resolve("Color-Critical", &palette) {
+        Ok(theme) => theme,
+        Err(err) => unreachable!("the committed Color-Critical theme must resolve: {err:?}"),
     }
 }
 
@@ -1487,6 +1665,90 @@ fn button_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     }
 }
 
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_button_state`, but
+/// against Colour-Critical (`color_critical_theme()`/
+/// `COLOR_CRITICAL_CLEAR`) instead of any other theme's own pairing.
+/// `button_gallery_tree` itself is unchanged and reused as-is.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_button_state_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = button_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        BUTTON_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    assert_eq!(image.width, BUTTON_GALLERY_SIZE.0);
+    assert_eq!(image.height, BUTTON_GALLERY_SIZE.1);
+
+    let enabled_px = sample_cell_centre(&image, BUTTON_CELL, 0);
+    let pressed_px = sample_cell_centre(&image, BUTTON_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, BUTTON_CELL, 2);
+    assert_ne!(
+        enabled_px, pressed_px,
+        "accent.primary (accent.blue.600) vs accent.primary_active (accent.blue.500) must render \
+         differently in Colour-Critical too"
+    );
+    assert_ne!(
+        enabled_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+    );
+}
+
+/// The Colour-Critical counterpart of `button_gallery_matches_the_golden_
+/// image` — same tree, same three states, `color_critical_theme()`/
+/// `COLOR_CRITICAL_CLEAR` instead of any other theme's own pairing,
+/// diffed against its own golden target (`tests/golden/
+/// button_gallery_color_critical.png`, which does not exist yet). No
+/// special backdrop handling needed: `accent.primary` clears
+/// `COLOR_CRITICAL_CLEAR` at ≈4.43:1 and `accent.primary_active` at
+/// ≈3.30:1 (`COLOR_CRITICAL_CLEAR`'s own doc comment), both comfortably
+/// distinct from the backdrop and from each other.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// button_gallery_color_critical.png`, and confirm it actually shows
+/// three visually distinct buttons in Colour-Critical colours before this
+/// attribute comes off — the same step every other golden in this file
+/// went through before being trusted.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn button_gallery_matches_the_golden_image_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = button_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        BUTTON_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/button_gallery_color_critical.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
 /// The same "distinct pixels, no golden needed" proof as `Button`'s
 /// own, for `Checkbox`: unchecked (`surface.sunken`) vs checked
 /// (`accent.primary`) must render differently outright; unchecked vs
@@ -1812,6 +2074,90 @@ fn checkbox_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/checkbox_gallery_high_contrast_light.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_checkbox_state`, but
+/// against Colour-Critical (`color_critical_theme()`/
+/// `COLOR_CRITICAL_CLEAR`) instead of any other theme's own pairing.
+/// `checkbox_gallery_tree` itself is unchanged and reused as-is.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_checkbox_state_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = checkbox_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        CHECKBOX_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    assert_eq!(image.width, CHECKBOX_GALLERY_SIZE.0);
+    assert_eq!(image.height, CHECKBOX_GALLERY_SIZE.1);
+
+    let unchecked_px = sample_cell_centre(&image, CHECKBOX_CELL, 0);
+    let checked_px = sample_cell_centre(&image, CHECKBOX_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, CHECKBOX_CELL, 2);
+    assert_ne!(
+        unchecked_px, checked_px,
+        "surface.sunken vs accent.primary must render differently in Colour-Critical too"
+    );
+    assert_ne!(
+        unchecked_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render dimmer than full opacity"
+    );
+}
+
+/// The Colour-Critical counterpart of `checkbox_gallery_matches_the_
+/// golden_image` — same tree, same three states, `color_critical_theme()`
+/// /`COLOR_CRITICAL_CLEAR` instead of any other theme's own pairing,
+/// diffed against its own golden target (`tests/golden/
+/// checkbox_gallery_color_critical.png`, which does not exist yet).
+/// `surface.sunken` clears `COLOR_CRITICAL_CLEAR` at ≈2.05:1
+/// (`COLOR_CRITICAL_CLEAR`'s own doc comment) — real and modest, but the
+/// checked cell's own bright `accent.primary` gives a human reviewing the
+/// golden a genuine reference point regardless, the same reasoning
+/// Light's own `Checkbox` slice already used.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// checkbox_gallery_color_critical.png`, and confirm it actually shows
+/// three visually distinct checkboxes in Colour-Critical colours before
+/// this attribute comes off — the same step every other golden in this
+/// file went through before being trusted.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn checkbox_gallery_matches_the_golden_image_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = checkbox_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        CHECKBOX_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/checkbox_gallery_color_critical.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
@@ -2187,6 +2533,110 @@ fn color_swatch_gallery_matches_the_golden_image_in_high_contrast_light_theme() 
     }
 }
 
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_color_swatch_state`,
+/// but against Colour-Critical (`color_critical_theme()`/
+/// `COLOR_CRITICAL_CLEAR`) instead of any other theme's own pairing.
+/// `color_swatch_gallery_tree` itself is unchanged and reused as-is — the
+/// two arbitrary swatch colours (`(220,40,40)`, `(40,80,220)`) are
+/// content, not theme-resolved chrome, so distinctness between the two
+/// enabled cells and between enabled/disabled is a property of the
+/// colours and `state.disabled_opacity`, not this theme.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_color_swatch_state_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = color_swatch_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COLOR_SWATCH_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    assert_eq!(image.width, COLOR_SWATCH_GALLERY_SIZE.0);
+    assert_eq!(image.height, COLOR_SWATCH_GALLERY_SIZE.1);
+
+    let first_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 0);
+    let second_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 1);
+    let disabled_px = sample_cell_centre(&image, COLOR_SWATCH_CELL, 2);
+    assert_ne!(
+        first_px, second_px,
+        "two different swatch colours must render differently in Colour-Critical too"
+    );
+    assert_ne!(
+        first_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over COLOR_CRITICAL_CLEAR must render dimmer than full \
+         opacity, even though both cells share the same underlying color"
+    );
+}
+
+/// The Colour-Critical counterpart of `color_swatch_gallery_matches_the_
+/// golden_image` — same tree, same three states, `color_critical_theme()`
+/// /`COLOR_CRITICAL_CLEAR` instead of any other theme's own pairing,
+/// diffed against its own golden target (`tests/golden/
+/// color_swatch_gallery_color_critical.png`, which does not exist yet).
+///
+/// **Weaker numbers than every other theme's own `ColorSwatch` slice,
+/// stated plainly, not smoothed over**: the real WCAG luminance contrast
+/// of the two swatch colours against `COLOR_CRITICAL_CLEAR` is only
+/// ≈1.58:1 (`(220,40,40)`) and ≈1.18:1 (`(40,80,220)`) —
+/// `COLOR_CRITICAL_CLEAR`'s own doc comment has the numbers — markedly
+/// below Light's own ≈4.40:1/≈5.89:1 for these exact same two colours,
+/// because Colour-Critical's canvas (`#545454`) is a real mid-tone
+/// close in raw luminance to both swatch colours, unlike Light's
+/// near-white one. The pixels are never byte-identical to the backdrop
+/// (`(84,84,84)` vs `(220,40,40)`/`(40,80,220)`), and this theme's whole
+/// premise is *chromatic* neutrality (every chrome token `R==G==B`) — so
+/// a saturated hue against a genuinely neutral gray surround should still
+/// read as a visibly distinct region even where luminance-only contrast
+/// is weak, but that's a claim about human colour perception this
+/// headless harness cannot itself verify.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// color_swatch_gallery_color_critical.png`, and confirm it actually
+/// shows three visually distinct swatches before this attribute comes
+/// off. Given the weaker computed numbers above, this golden deserves
+/// the same particular scrutiny `TextField`'s own Colour-Critical golden
+/// does — if it reads as ambiguous against its backdrop, the fix is a
+/// `ColorSwatch`-specific backdrop constant (mirroring `NEUTRAL_CLEAR`'s
+/// or `COMMAND_PALETTE_COLOR_CRITICAL_CLEAR`'s own history), not forcing
+/// a pass through this comment's chroma argument alone.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn color_swatch_gallery_matches_the_golden_image_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = color_swatch_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COLOR_SWATCH_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/color_swatch_gallery_color_critical.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
 /// `Slider`'s own "distinct pixels" proof is shaped differently from
 /// the others: instead of comparing each cell's own centre (which
 /// would just show the track, not the thumb, for anything but a
@@ -2543,6 +2993,99 @@ fn slider_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/slider_gallery_high_contrast_light.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_slider_state`, but
+/// against Colour-Critical (`color_critical_theme()`/
+/// `COLOR_CRITICAL_CLEAR`) instead of any other theme's own pairing.
+/// `slider_gallery_tree` itself is unchanged and reused as-is.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_slider_state_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = slider_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        SLIDER_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    assert_eq!(image.width, SLIDER_GALLERY_SIZE.0);
+    assert_eq!(image.height, SLIDER_GALLERY_SIZE.1);
+
+    let near_left_edge = |cell: u32| {
+        sample_at(
+            &image,
+            cell * SLIDER_CELL.0 + SLIDER_THUMB_SAMPLE_OFFSET_X,
+            SLIDER_CELL.1 / 2,
+        )
+    };
+    let at_min = near_left_edge(0);
+    let at_max = near_left_edge(1);
+    let disabled = near_left_edge(2);
+    assert_ne!(
+        at_min, at_max,
+        "the thumb must be at a different x offset for a slider at its own minimum vs maximum \
+         value in Colour-Critical too"
+    );
+    assert_ne!(
+        at_max[..3],
+        disabled[..3],
+        "state.disabled_opacity must render the track dimmer than full opacity, at the same offset"
+    );
+}
+
+/// The Colour-Critical counterpart of `slider_gallery_matches_the_golden_
+/// image` — same tree, same three states, `color_critical_theme()`/
+/// `COLOR_CRITICAL_CLEAR` instead of any other theme's own pairing,
+/// diffed against its own golden target (`tests/golden/
+/// slider_gallery_color_critical.png`, which does not exist yet).
+/// `surface.sunken` clears `COLOR_CRITICAL_CLEAR` at ≈2.05:1
+/// (`COLOR_CRITICAL_CLEAR`'s own doc comment) — real and modest, but the
+/// thumb's own bright `accent.primary` gives a human reviewing the golden
+/// a genuine reference point regardless, the same reasoning Light's own
+/// `Slider` slice already used.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// slider_gallery_color_critical.png`, and confirm it actually shows the
+/// thumb at three visually distinct positions/opacities in
+/// Colour-Critical colours before this attribute comes off — the same
+/// step every other golden in this file went through before being
+/// trusted.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn slider_gallery_matches_the_golden_image_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = slider_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        SLIDER_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/slider_gallery_color_critical.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
@@ -2981,6 +3524,93 @@ fn text_field_gallery_matches_the_golden_image_in_high_contrast_light_theme() {
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/text_field_gallery_high_contrast_light.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The same real, self-contained proof as
+/// `render_gallery_produces_distinct_pixels_for_each_text_field_state`,
+/// but against Colour-Critical (`color_critical_theme()`/
+/// `COLOR_CRITICAL_CLEAR`) instead of any other theme's own pairing.
+/// `text_field_gallery_tree` itself is unchanged and reused as-is.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_text_field_state_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    assert_eq!(image.width, TEXT_FIELD_GALLERY_SIZE.0);
+    assert_eq!(image.height, TEXT_FIELD_GALLERY_SIZE.1);
+
+    let enabled_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 0);
+    let disabled_px = sample_cell_centre(&image, TEXT_FIELD_CELL, 1);
+    assert_ne!(
+        enabled_px[..3],
+        disabled_px[..3],
+        "state.disabled_opacity blended over the clear colour must render differently from full \
+         opacity in Colour-Critical too"
+    );
+}
+
+/// The Colour-Critical counterpart of `text_field_gallery_matches_the_
+/// golden_image` — same tree, same two states, `color_critical_theme()`/
+/// `COLOR_CRITICAL_CLEAR` instead of any other theme's own pairing,
+/// diffed against its own golden target (`tests/golden/
+/// text_field_gallery_color_critical.png`, which does not exist yet).
+/// Uses `COLOR_CRITICAL_CLEAR` alone, **provisionally** — mirroring
+/// Light's own exact treatment of this widget: `surface.sunken` clears
+/// `COLOR_CRITICAL_CLEAR` at ≈2.05:1 (`COLOR_CRITICAL_CLEAR`'s own doc
+/// comment), a touch stronger than Light's own ≈1.65:1 fill-vs-canvas
+/// number for this same widget, but still modest, and — unlike `Slider`
+/// — there's no bright `accent.primary` element here to anchor a human's
+/// eye regardless of the fill's own contrast.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// text_field_gallery_color_critical.png`, and confirm it actually shows
+/// two visually distinct text fields in Colour-Critical colours before
+/// this attribute comes off — the same step every other golden in this
+/// file went through before being trusted. Given the modest contrast
+/// noted above, this one deserves particular scrutiny, the same as
+/// Light's own first `TextField` slice: if it reads as "effectively
+/// unreviewable" the way Dark's own first `TextField` attempt did, the
+/// fix is a `TextField`-specific backdrop (mirroring `NEUTRAL_CLEAR`'s
+/// own history), not forcing a pass through this comment alone.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn text_field_gallery_matches_the_golden_image_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = text_field_gallery_tree(&scales);
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        TEXT_FIELD_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/text_field_gallery_color_critical.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
@@ -3563,6 +4193,142 @@ fn command_palette_gallery_matches_the_golden_image_in_high_contrast_light_theme
     );
     let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/command_palette_gallery_high_contrast_light.png");
+    if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+        unreachable!("{err}");
+    }
+}
+
+/// The Colour-Critical counterpart of `render_gallery_produces_the_
+/// command_palettes_own_panel` — same tree, same weaker "something opaque
+/// was painted, distinct from the surrounding clear colour" proof, but
+/// against `color_critical_theme()`/`COMMAND_PALETTE_COLOR_CRITICAL_
+/// CLEAR` instead of any other theme's own pairing.
+/// `COMMAND_PALETTE_COLOR_CRITICAL_CLEAR`, not plain `COLOR_CRITICAL_
+/// CLEAR` — see that constant's own doc comment for why `COLOR_CRITICAL_
+/// CLEAR` (`cc.canvas`, `#545454`) would sit only ≈1.13:1 from
+/// `surface.raised` (`cc.raised`, `#4c4c4c`), close enough to invisible
+/// for a human reviewing the golden even though the two token values
+/// aren't byte-identical the way Dark's/Light's own `CommandPalette`
+/// collisions were.
+#[test]
+fn render_gallery_produces_the_command_palettes_own_panel_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        COMMAND_PALETTE_COLOR_CRITICAL_CLEAR,
+    );
+    assert_eq!(image.width, COMMAND_PALETTE_GALLERY_SIZE.0);
+    assert_eq!(image.height, COMMAND_PALETTE_GALLERY_SIZE.1);
+
+    let panel_centre = sample_at(
+        &image,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+    );
+    let corner = sample_at(&image, 0, 0);
+    assert_ne!(
+        corner, panel_centre,
+        "the panel's own interior must show something opaque, not the same clear colour its own \
+         margin (and rounded-off corner) shows, in Colour-Critical too"
+    );
+}
+
+/// The Colour-Critical counterpart of `command_palette_gallery_paints_
+/// the_selected_rows_own_highlight` — the real, exact-colour proof that
+/// the panel's own centre pixel is `accent.primary` itself, not
+/// `surface.raised`. `[164,200,255]`, Colour-Critical's own real
+/// `accent.blue.600` (`design/themes/color-critical.toml` → `design/
+/// tokens/palette.toml`'s `[accent.blue]` table, `#a4c8ff` →
+/// `(0xa4, 0xc8, 0xff)`), computed directly from the committed TOML
+/// rather than assumed — the same value `COLOR_CRITICAL_CLEAR`'s own doc
+/// comment already gives when computing the ≈4.43:1 contrast against the
+/// backdrop.
+#[test]
+fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        COMMAND_PALETTE_COLOR_CRITICAL_CLEAR,
+    );
+    let panel_centre = sample_at(
+        &image,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
+        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+    );
+    assert_eq!(
+        panel_centre[..3],
+        [164, 200, 255],
+        "the sole, always-selected result row must paint Colour-Critical's own accent.primary \
+         across the panel's own interior"
+    );
+}
+
+/// The Colour-Critical counterpart of `command_palette_gallery_matches_
+/// the_golden_image` — same tree, same one always-selected row,
+/// `color_critical_theme()`/`COMMAND_PALETTE_COLOR_CRITICAL_CLEAR`
+/// instead of any other theme's own pairing, diffed against its own
+/// golden target (`tests/golden/command_palette_gallery_color_critical.
+/// png`, which does not exist yet). `command_palette_style`'s own
+/// `COMMAND_PALETTE_MARGIN` is reused completely unchanged — pure
+/// layout, no theme parameter, so it needs no Colour-Critical-specific
+/// counterpart the way the backdrop colour did.
+///
+/// **`#[ignore]`d, deliberately — this file's own "never bless blind"
+/// discipline** (see `aurora_testkit::compare_to_golden`'s own
+/// `AURORA_BLESS_GOLDEN` gate): a human on real GPU hardware needs to
+/// run `AURORA_BLESS_GOLDEN=1 cargo test -p aurora-widgets --test
+/// gallery -- --ignored`, open the written `tests/golden/
+/// command_palette_gallery_color_critical.png`, and confirm it actually
+/// shows a visible panel with a visible selected-row highlight in
+/// Colour-Critical colours before this attribute comes off — the same
+/// step every other golden in this file went through before being
+/// trusted. `CommandPalette` has the most complex visibility history of
+/// any widget in this file (`NEUTRAL_CLEAR`'s own doc comment: Dark's
+/// gallery needed *two* separate fixes, backdrop then margin, before its
+/// own golden was trustworthy), so this Colour-Critical golden deserves
+/// the same level of scrutiny, not a rubber stamp just because the
+/// backdrop collision was caught and fixed here before any bless was
+/// attempted.
+#[test]
+#[ignore = "needs a human bless on real GPU hardware -- see this test's own doc comment"]
+fn command_palette_gallery_matches_the_golden_image_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let theme = color_critical_theme();
+    let (tree, _ids) = command_palette_gallery_tree();
+
+    let image = render_gallery(
+        &context,
+        &tree,
+        &theme,
+        &scales,
+        COMMAND_PALETTE_GALLERY_SIZE,
+        COMMAND_PALETTE_COLOR_CRITICAL_CLEAR,
+    );
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/command_palette_gallery_color_critical.png");
     if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
         unreachable!("{err}");
     }
