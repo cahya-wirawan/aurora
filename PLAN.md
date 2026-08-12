@@ -6986,12 +6986,180 @@ severity choice.
   `Normal` at the
   `translate_blend_mode` boundary — stochastic per-pixel selection needs
   its own reproducibility design decision before any implementation, not
-  just new math. Per-layer/per-group *masks* remain wholly unaggregated
-  (same as before this round — masks were never in this round's scope).
-  And `history.rs`'s own `layer_dirty_rect` helper still lacks
-  subtree-bounds/effective-visibility aggregation for groups — a
-  separate gap this round didn't touch, since it's about dirty-rect
-  computation, not compositing.
+  just new math **(closed the same day — see below)**. Per-layer/per-group
+  *masks* remain wholly unaggregated (same as before this round — masks
+  were never in this round's scope). And `history.rs`'s own
+  `layer_dirty_rect` helper still lacks subtree-bounds/effective-
+  visibility aggregation for groups — a separate gap this round didn't
+  touch, since it's about dirty-rect computation, not compositing.
+
+- [x] **`Dissolve`, the 27th and final blend mode — done 2026-08-11,
+  closing the blend-mode series this session has been running since
+  0.27.0.** `aurora_doc::BlendMode::Dissolve` is qualitatively different
+  from every other variant, named as such back when `DarkerColor`/
+  `LighterColor` landed: it's not a per-pixel-color blend *function* at
+  all (nothing computes a new colour from source+backdrop) — real
+  Photoshop semantics are a binary, stochastic per-pixel choice, weighted
+  by that pixel's own effective alpha (`texel_alpha * opacity`) as a
+  probability: a layer at 30% opacity shows ~30% of its pixels at full
+  strength and ~70% not at all, not a smooth 30%-transparent fade
+  everywhere.
+
+  **Design**: mirrors the group-opacity-aggregation round's own
+  precedent — keep `aurora-render`'s `composite_tile_cpu`/`BlendMode`
+  completely untouched (position-agnostic, well-tested, stays that way),
+  and do the position-*aware* work one level up in `aurora-app::
+  resolve_tile`, which already has real `tile_id`/`doc_origin` in scope.
+  `resolve_tile`'s `Pixel` branch now inspects a layer's raw,
+  untranslated `aurora_doc::BlendMode` before ever calling
+  `translate_blend_mode`: if it's `Dissolve`, a new `dissolve_gate`
+  function runs directly on that layer's own texels (using its real
+  opacity), and the gated result is handed up as `(gated_texels, opacity
+  = 1.0, blend_mode = Normal)` — the stochastic decision already fully
+  accounts for the layer's own opacity, so a straight Normal composite of
+  the now-binary-alpha result is exactly correct; re-applying opacity a
+  second time would double-attenuate it. `translate_blend_mode`'s own
+  `Dissolve -> Normal` fallback arm is untouched (still exhaustive, still
+  the safe default for a hypothetical caller that skips `resolve_tile`'s
+  own interception) but is dead code for the one real caller — its own
+  doc comment now says so directly instead of describing Dissolve as
+  unimplemented. Confirmed `resolve_tile` is genuinely the only real
+  caller of `translate_blend_mode` before relying on that (`grep` across
+  `aurora-app`).
+
+  **Determinism, the load-bearing requirement this round's correctness
+  bar turns on**: the same document must composite bit-identically every
+  time — on screen, after scrolling, on export, on reopen — not a fresh
+  speckle pattern per render. The "random" decision for each pixel is a
+  pure function of that pixel's own **absolute document-space position**
+  (`doc_origin` plus its local row/col within the tile, **never**
+  `tile_id` or a tile-relative coordinate alone — a tile-relative hash
+  would visibly repeat at every `TILE`-pixel boundary once a layer's own
+  tiles don't line up with the view's). New `splitmix64` (Sebastiano
+  Vigna's public-domain, widely-used 64-bit mixing function,
+  <https://prng.di.unimi.it/splitmix64.c> — chosen specifically because
+  it's a real, citable, independently-verifiable algorithm, not an ad hoc
+  one-liner) hashes a seed built by a new `hash_position(x, y)`: each
+  axis zigzag-encoded (protobuf's own signed-to-unsigned scheme, needed
+  since document coordinates go negative) then multiplied by its own
+  distinct odd 64-bit constant before combining with XOR and a final
+  `splitmix64` mix — two *different* constants specifically so
+  `hash_position(a, b) != hash_position(b, a)` in general (a naive
+  symmetric `zigzag(x) ^ zigzag(y)` combine would alias the whole noise
+  field across the diagonal, checked directly and confirmed it would
+  fail without the asymmetry). New `hash_to_unit_f32` takes the hash's
+  own top 24 bits (`f32`'s real mantissa precision) and scales by
+  `1/2^24` into a uniform `[0, 1)` value — deliberately not a naive
+  `hash as f32 / u64::MAX as f32`, which throws away almost all the
+  entropy unevenly once packed into `f32`'s narrower mantissa.
+
+  **Verified against real reference output, not eyeballed**: `splitmix64`
+  was independently re-derived from Vigna's own reference C algorithm via
+  a from-scratch Python transcription (arbitrary-precision integers
+  masked to 64 bits at every step, the same "don't trust this crate's own
+  answer" discipline the non-separable-HSL round's own Python cross-check
+  established for `lum`/`SetLum`) — 4 seeds checked (`0`, `1`, `42`,
+  `u64::MAX`), matching this crate's Rust output exactly:
+  `splitmix64(0) == 0xe220a8397b1dcdaf`, `splitmix64(1) ==
+  0x910a2dec89025cc1`, `splitmix64(42) == 0xbdd732262feb6e95`,
+  `splitmix64(u64::MAX) == 0xe4d971771b652c20`.
+
+  **The statistical test, and its actual measured result**: one full real
+  tile (65,536 pixels, `aurora_tile::TEXELS`) at a known `opacity = 0.3`,
+  every pixel opaque source. Each pixel is an independent Bernoulli trial
+  (independent because each depends only on its own distinct absolute
+  position) with `p = 0.3`, so the "shown" count is Binomial(n = 65536,
+  p = 0.3): expected `19660.8`, standard deviation `~117.3`. **Actual
+  measured result: 19624 / 65536 shown = 0.299438...**, about `0.31`
+  standard deviations from target — the test's own tolerance is `±0.05`
+  absolute (fraction must land in `[0.25, 0.35]`), which is `~28`
+  standard deviations wide, stated and justified in the test's own doc
+  comment rather than picked arbitrarily (this is a deterministic
+  function measured once, not re-sampled per CI run, but the bound is
+  real binomial reasoning regardless).
+
+  **Real tests** (13 new `aurora-app` tests, 164 → 177): `splitmix64`
+  against the 4 reference vectors above; `hash_position` reproducibility,
+  differing for two positions in the same tile and for a genuinely
+  different tile (not a degenerate constant hash), the coordinate-swap
+  asymmetry, and — the core correctness property named directly in this
+  round's own brief — the *same* absolute position reached via two
+  different `doc_origin`/local-coordinate decompositions (tile `(0,0)`'s
+  own local `(200,100)` vs. a `doc_origin` shifted by `(-1,-1)` whose
+  local `(201,101)` lands on that same absolute point) hashing
+  identically, both directly on `hash_position` and through the real
+  `dissolve_gate` entry point; `hash_to_unit_f32` never reaching `1.0`;
+  `dissolve_gate`'s two edge cases (`opacity = 1.0` with fully-opaque
+  source shows every pixel, since `noise < 1.0` always holds; `opacity =
+  0.0` shows none); the statistical test above; bit-identical
+  reproducibility across two separate `dissolve_gate` calls with the same
+  inputs; and two real `composite_document` integration tests — a
+  two-layer document (opaque red backdrop, opaque blue `Dissolve` top at
+  50% opacity) proving the composited result is a genuine mix of both
+  colours across its 100 pixels (never an in-between blended value, and
+  with `2 * 0.5^100` odds against every pixel landing the same way, a
+  real mix is what a genuinely functioning stochastic gate has to
+  produce, not a coincidence of this specific test) and confirmed
+  bit-identical across two separate `composite_document` calls on the
+  same document.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-app` (178 passed, 0 failed — 164 before this round, 177 before
+  the group-`Dissolve` fix below, zero regressions in every other blend
+  mode or group-compositing test), `cargo test -p aurora-render` (98
+  passed, unchanged — confirming `composite_tile_cpu` and its
+  `BlendMode` were never touched), `cargo test --workspace` (0 failures
+  across all 19 crates, re-run after the group-`Dissolve` fix), `python3
+  scripts/check_no_hardcoded_style.py` clean (25 files scanned).
+  `scripts/check_layering.py` remains the one unrun check (pre-existing
+  `tomllib` gap in this sandbox) — manually confirmed no `Cargo.toml` in
+  either `aurora-app` or `aurora-render` gained a dependency (`git diff
+  --stat` on both, empty). No lint weakened; no non-deterministic source
+  (`rand`, system time, thread-local state) anywhere in the path — every
+  value traces back to a pure function of document-space position.
+  Version bumped `0.35.0` → `0.36.0` per `CLAUDE.md`'s own convention.
+
+  **A fresh, independent critic review caught a real gap before this
+  landed**: `resolve_tile`'s `Dissolve` interception was only wired into
+  the `LayerKind::Pixel` match arm, not `LayerKind::Group` — a Group
+  layer with its own `blend_mode` set to `Dissolve` silently fell back to
+  `Normal` (via `translate_blend_mode`'s exhaustive-match fallback,
+  the same fallback every genuinely *unimplemented* mode uses, which
+  `Dissolve` is not). Every other blend mode already worked correctly on
+  groups, from the group-opacity-aggregation round (0.34.0) — this was an
+  inconsistency, not a documented scope boundary. Fixed by adding the
+  identical interception to the `Group` arm: `dissolve_gate` runs on the
+  group's own already-un-premultiplied isolated buffer, exactly the same
+  shape (`f16` RGBA texels + an opacity scalar) a pixel layer's own
+  texels are. One new test, `aurora-app`'s
+  `composite_document_blends_a_dissolve_group_produces_a_real_stochastic_mix`
+  (177 → 178), mirrors the flat two-layer Dissolve test but nests the
+  `Dissolve`-mode layer inside a `Group` — the pre-fix bug would have
+  shown the group's content at every pixel, ungated; the fix shows a real
+  stochastic mix instead. `translate_blend_mode`'s doc comment, which
+  previously described `Dissolve` as "still-open follow-on work," now
+  states plainly that it's implemented in both `resolve_tile` branches
+  and that the fallback arm is exhaustiveness-only, never actually
+  consumed for a real `Dissolve` layer.
+
+  **27 of 27 `aurora_doc::BlendMode` variants now have real
+  implementations, on both flat layers and groups.** This closes the
+  entire blend-mode series running since 0.27.0 (the dodge/burn family)
+  through the non-separable HSL modes, `DarkerColor`/`LighterColor`, and
+  now `Dissolve` — including the group case the review above caught.
+  **Still genuinely open in the broader compositing area, stated
+  honestly**: the GPU path (`document_qualifies_for_gpu_compositing`/
+  `gpu_composite_tile`) still only covers Normal-blend, non-grouped
+  tiles — `Dissolve`, like every other non-Normal mode and every group,
+  always takes the CPU path (`resolve_tile`/`composite_tile_cpu`),
+  unchanged by this round. `composite_document` (export) is unaffected
+  by this change beyond genuinely gaining real Dissolve support — it
+  already called `resolve_tile` for every layer, so no new wiring was
+  needed there. The two pre-existing gaps named just above this bullet —
+  non-`Normal` blend-mode-against-each-other math inside a translucent
+  group isolation pass, and per-layer/per-group mask aggregation — remain
+  exactly as open as before; this round's scope was Dissolve alone.
 
 ### M1.10 — Phase 1 gate
 

@@ -2875,14 +2875,24 @@ fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
 /// Deliberately an **exhaustive match, no wildcard arm**: every one of
 /// `aurora_doc::BlendMode`'s 27 real variants is named individually, 26
 /// mapped to their real `aurora_render::BlendMode` counterpart and the
-/// remaining 1 (`Dissolve` — this family's own explicit, now sole
-/// boundary, qualitatively different from every mode mapped above)
-/// explicitly mapped to `Normal` — an honest, documented fallback
-/// (`Dissolve`'s real math is separate, still-open follow-on work;
-/// falling back to `Normal` degrades a layer's *appearance* without
-/// corrupting or losing any document data, the same "unpainted
-/// `WidgetKind` returns `Ok(vec![])` rather than erroring" honesty
-/// `paint_widget` already uses elsewhere in this codebase).
+/// remaining 1 (`Dissolve`) explicitly mapped to `Normal` — but that
+/// mapped value is **never actually consumed for a real `Dissolve`
+/// layer**: `Dissolve` *is* fully implemented (`dissolve_gate`, a real,
+/// deterministic, position-seeded stochastic gate — see that function's
+/// own doc comment), just not inside `aurora_render`/this translation.
+/// [`resolve_tile`] checks a layer's own *raw*, untranslated
+/// `aurora_doc::BlendMode` for `Dissolve` in both its `Pixel` and
+/// `Group` branches, ahead of ever using this function's own return
+/// value, and substitutes the gated result at `(1.0, Normal)` instead —
+/// so this arm's `Normal` fallback exists purely so the match stays
+/// exhaustive (a future `aurora_doc::BlendMode` variant this crate
+/// hasn't implemented yet would need the same kind of explicit,
+/// reviewed arm, not a silent wildcard), not because `Dissolve` is
+/// still unimplemented. A first pass of the `Dissolve` feature only
+/// added the interception to the `Pixel` branch, leaving a *group's*
+/// own `Dissolve` blend mode silently falling back to this function's
+/// `Normal` mapping for real — an independent review caught the gap
+/// before it shipped; both branches now intercept it symmetrically.
 /// Exhaustiveness matters here specifically: a wildcard `_ => Normal`
 /// arm would make a *future* `aurora_doc::BlendMode` variant compile
 /// silently into an unreviewed `Normal` fallback forever; without one,
@@ -2926,21 +2936,225 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
         aurora_doc::BlendMode::Luminosity => aurora_render::BlendMode::Luminosity,
         aurora_doc::BlendMode::DarkerColor => aurora_render::BlendMode::DarkerColor,
         aurora_doc::BlendMode::LighterColor => aurora_render::BlendMode::LighterColor,
-        // Not yet implemented in `aurora_render::BlendMode` — real,
-        // separate, still-open follow-on work, not an oversight. Named
-        // individually rather than behind a wildcard so a future
-        // `aurora_render::BlendMode` addition forces this match to be
-        // revisited instead of silently staying stubbed. This is the
-        // family's own explicit, now sole remainder: `Dissolve` is
-        // stochastic per-pixel selection, not a deterministic blend
-        // function at all — it needs its own reproducibility design
-        // decision (does a pixel's outcome need to be stable across
-        // re-renders? seeded by what?) before any implementation, not
-        // just new math — qualitatively different from every mode
-        // implemented so far, not just an unimplemented instance of the
-        // same shape.
+        // `Dissolve` has no real mapping here, on purpose, permanently —
+        // not a placeholder waiting on `aurora_render::BlendMode` to grow
+        // a variant. Dissolve is stochastic per-pixel selection, not a
+        // per-pixel-color blend *function* at all (it never computes a
+        // new colour from source+backdrop the way every other variant
+        // above does), so it was never going to fit this enum. The real,
+        // deterministic implementation lives one level up, in
+        // `resolve_tile`, which inspects a `Pixel` layer's own raw
+        // `aurora_doc::BlendMode` *before* calling this function at all:
+        // when it's `Dissolve`, `resolve_tile` runs `dissolve_gate`
+        // itself and returns `(gated_texels, 1.0, aurora_render::
+        // BlendMode::Normal)` directly, so this arm is never actually
+        // reached for a real Dissolve layer today. It stays mapped to
+        // `Normal` here anyway — matching every other still-open arm's
+        // "safe, honest fallback" shape — purely so this match stays
+        // exhaustive and so any *other*, hypothetical future caller of
+        // `translate_blend_mode` that doesn't do `resolve_tile`'s own
+        // Dissolve interception first still gets a defined (if
+        // non-stochastic) answer instead of a compile error or a panic.
         aurora_doc::BlendMode::Dissolve => aurora_render::BlendMode::Normal,
     }
+}
+
+/// `SplitMix64` — Sebastiano Vigna's well-known, widely-used 64-bit
+/// state-advance/output-mixing function (the generator originally paired
+/// with `xorshift128+`'s own seeding step, and the same algorithm behind
+/// Java's `SplittableRandom`; public-domain reference:
+/// <https://prng.di.unimi.it/splitmix64.c>). Used here purely as a
+/// stateless *hash*, not a stream generator: fed a seed built from a
+/// pixel's own absolute document-space position (see [`hash_position`]),
+/// it returns a value indistinguishable from uniform noise for that
+/// position, with no internal state carried between calls — the same
+/// seed always yields the same output, which is exactly the determinism
+/// [`dissolve_gate`] needs (see `resolve_tile`'s own doc comment for why
+/// determinism matters here at all).
+///
+/// This is `seed.wrapping_add(GAMMA)` followed by the reference
+/// generator's own three xor-shift-multiply rounds — i.e. calling this
+/// with `seed = x` reproduces exactly the reference C generator's
+/// `next()` output for a generator whose internal state starts at `x`
+/// (the C code increments state *then* mixes, on every call, including
+/// the first). Verified in this module's own tests against real output
+/// values independently re-derived from that reference algorithm (a
+/// from-scratch Python re-implementation, not by trusting this
+/// function's own Rust output) for seed `0` and 3 other seeds — not just
+/// self-consistency.
+const fn splitmix64(seed: u64) -> u64 {
+    let z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Maps a signed document-space coordinate onto `u64` bijectively via
+/// zigzag encoding — the same scheme protobuf varints use for signed
+/// fields, and standard wherever a signed value needs to become an
+/// unsigned one without losing any information or colliding two distinct
+/// inputs: `0, -1, 1, -2, 2, ...` -> `0, 1, 2, 3, 4, ...`. Needed because
+/// [`hash_position`]'s combination step wants an unsigned value to
+/// multiply, and document coordinates are signed (`resolve_tile`'s own
+/// `doc_origin: (i64, i64)`, which goes negative once a layer or the
+/// canvas view has scrolled past the document origin).
+///
+/// `n << 1` cannot overflow-panic — Rust's arithmetic-overflow checks
+/// apply to `+`/`-`/`*`, not to bits shifted out of a left shift, so this
+/// is safe for every `i64` value including `i64::MIN`/`i64::MAX`. The
+/// final `as u64` is an intentional same-width bit reinterpretation (the
+/// whole point of zigzag encoding), not a lossy truncation — hence the
+/// scoped `allow` rather than a workspace-wide one.
+#[allow(clippy::cast_sign_loss)]
+const fn zigzag_encode(n: i64) -> u64 {
+    ((n << 1) ^ (n >> 63)) as u64
+}
+
+/// Combines one absolute document-space pixel position `(x, y)` into the
+/// single `u64` seed [`splitmix64`] hashes — [`dissolve_gate`]'s own
+/// "your call, state it precisely" combination. Each axis is
+/// zigzag-encoded (see [`zigzag_encode`]) then multiplied by its own odd,
+/// high-bit-set 64-bit constant (`x`'s and `y`'s constants differ — the
+/// first is `splitmix64`'s own golden-ratio gamma, the second is
+/// `splitmix64`'s own `0x94D049BB133111EB` output-mix constant rotated
+/// into a different-looking odd constant by convention, `0xC2B2AE3D27D4EB4F`,
+/// widely reused across hashing libraries as a second Fibonacci-hashing
+/// multiplier for exactly this "combine two already-good values without
+/// them cancelling" purpose); the two products are combined with XOR and
+/// the result is run through `splitmix64` once more to finish mixing.
+///
+/// **Why two different constants, not a direct
+/// `zigzag_encode(x) ^ zigzag_encode(y)`**: XOR is commutative, so a
+/// naive combine of that shape would make `(x, y)` and `(y, x)` hash
+/// *identically* for every pair of distinct coordinates, not just `x ==
+/// y` — a real, visible defect for a 2D dissolve pattern, since it would
+/// mirror the whole noise field across the diagonal. Multiplying each
+/// axis by its own distinct constant before combining breaks that
+/// symmetry: `hash_position(3, 7) != hash_position(7, 3)` (checked
+/// directly in this module's own tests), so the noise field is genuinely
+/// 2-dimensional, not foldable onto one diagonal-symmetric axis.
+const fn hash_position(x: i64, y: i64) -> u64 {
+    let xu = zigzag_encode(x).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let yu = zigzag_encode(y).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    splitmix64(xu ^ yu)
+}
+
+/// Converts a `splitmix64`/[`hash_position`] output into a uniform `f32`
+/// in `[0, 1)`. Takes the top 24 bits of the 64-bit hash (`f32`'s own
+/// mantissa precision: 1 implicit + 23 explicit bits — every integer up
+/// to `2^24` is exactly representable) as an integer in `[0, 2^24)`, then
+/// divides by `2^24`. Deliberately not a naive `hash as f32 /
+/// u64::MAX as f32`: that keeps every one of the 64 input bits nominally
+/// "in play" but throws almost all of them away to rounding once packed
+/// into an `f32`'s far narrower mantissa, unevenly across the range —
+/// taking the top N bits first and scaling is the standard technique
+/// (the same shape general-purpose PRNGs' own `f32`/`f64` output helpers
+/// use, e.g. `xoshiro`'s).
+///
+/// The maximum possible `top_bits` value is `2^24 - 1`, so the maximum
+/// possible return value is `(2^24 - 1) / 2^24`, strictly less than
+/// `1.0` — the output range really is the standard half-open `[0, 1)`,
+/// not `[0, 1]`, which matters for [`dissolve_gate`]'s `opacity = 1.0`
+/// edge case (see its own doc comment).
+fn hash_to_unit_f32(hash: u64) -> f32 {
+    const MANTISSA_BITS: u32 = 24;
+    let top_bits = hash >> (u64::BITS - MANTISSA_BITS);
+    top_bits as f32 / (1u64 << MANTISSA_BITS) as f32
+}
+
+/// Applies [`aurora_doc::BlendMode::Dissolve`]'s own stochastic,
+/// per-pixel opaque-or-nothing gate to one `Pixel` layer's own
+/// straight-alpha `texels`, ahead of ever handing them to
+/// `aurora_render::composite_tile_cpu` — see `resolve_tile`'s own doc
+/// comment for why this happens here, in `aurora-app`, rather than as a
+/// new `aurora_render::BlendMode` variant: Dissolve isn't a per-pixel-
+/// color blend *function* the way every other mode is (it never computes
+/// a new colour from source+backdrop), it's a binary visibility decision
+/// made once per pixel, weighted by that pixel's own effective alpha
+/// (`texel_alpha * opacity`) as a probability — real Photoshop
+/// semantics, not a smooth opacity fade: a layer at 30% opacity shows
+/// ~30% of its pixels at full strength and ~70% not at all, not every
+/// pixel at 30%-transparent everywhere.
+///
+/// **Determinism, precisely**: the "random" decision for a texel is a
+/// pure function of that texel's own *absolute document-space* position
+/// — `doc_origin` plus its own row/col within the `aurora_tile::TILE`
+/// grid `texels` covers, **never** `tile_id` or any tile-relative
+/// coordinate alone — via [`hash_position`]/[`splitmix64`]. No RNG
+/// state, no system time, nothing thread-local: the same absolute
+/// position always produces the same noise value, so the same document
+/// composites bit-identically every time, regardless of which tile-grid
+/// alignment happens to be showing (a scrolled view, a re-render, an
+/// export, a reopened file). `doc_origin` alone is sufficient to recover
+/// every texel's true absolute position — that is what it already means
+/// (`resolve_tile`'s own doc comment) — so this function deliberately
+/// takes no `tile_id` parameter at all: threading one through would
+/// invite exactly the tile-relative mistake this design has to avoid.
+/// Using a tile-relative coordinate instead of an absolute one would
+/// make the dissolve pattern visibly repeat, identically, at every
+/// `TILE`-pixel boundary — precisely the artifact this function exists
+/// to prevent, however a caller's own `doc_origin`/`tile_id` pair happens
+/// to be constructed.
+///
+/// `texels` is one layer's own straight-alpha buffer for the
+/// `aurora_tile::TILE`×`aurora_tile::TILE` window at `doc_origin`
+/// (row-major, `aurora_tile::CHANNELS` `half::f16` samples per texel —
+/// the same layout `aurora_tile::TileStore`/`composite_tile_cpu` already
+/// use, confirmed against `aurora_tile::store`'s own `(y * TILE + x) *
+/// CHANNELS` indexing). Each texel's outcome: `noise < texel_alpha *
+/// opacity` shows the source at full strength (its own RGB unchanged,
+/// alpha forced to `1.0`); otherwise it comes back fully transparent
+/// (`(0, 0, 0, 0)`). The returned buffer is always the same length as
+/// `texels`; any chunk that isn't a full `CHANNELS`-length texel (should
+/// never happen for a real tile buffer, but this function has no way to
+/// prove that of its caller) is skipped, left fully transparent in the
+/// output, the same defensive shape the un-premultiply step just above
+/// already uses for its own `chunks_exact_mut` loop.
+///
+/// `resolve_tile` calls this from both its `Pixel` and `Group` arms, so a
+/// `Dissolve`-mode group containing a `Dissolve`-mode child is possible.
+/// Because the noise is a pure function of absolute position only (never
+/// layer identity), both gates draw the *same* noise value at a given
+/// pixel — the two thresholds are correlated, not independent, so the
+/// visible fraction converges toward `min(child_alpha, group_alpha)`
+/// rather than their product. This is real, deliberate behaviour (not a
+/// bug: independent per-layer noise would need per-layer seeding, which
+/// would break the position-only reproducibility this function exists
+/// for), just an obscure enough authoring combination that it is called
+/// out here rather than covered by its own test.
+fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> Vec<half::f16> {
+    let tile_side = i64::from(aurora_tile::TILE);
+    let mut gated = vec![half::f16::from_f32(0.0); texels.len()];
+    for (index, (src, dst)) in texels
+        .chunks_exact(aurora_tile::CHANNELS)
+        .zip(gated.chunks_exact_mut(aurora_tile::CHANNELS))
+        .enumerate()
+    {
+        let [r, g, b, a] = src else { continue };
+        let [dst_r, dst_g, dst_b, dst_a] = dst else {
+            continue;
+        };
+        let Ok(index) = i64::try_from(index) else {
+            continue;
+        };
+        let col = index % tile_side;
+        let row = index / tile_side;
+        let abs_x = doc_origin.0 + col;
+        let abs_y = doc_origin.1 + row;
+
+        let effective_alpha = a.to_f32() * opacity;
+        let noise = hash_to_unit_f32(hash_position(abs_x, abs_y));
+
+        if noise < effective_alpha {
+            *dst_r = *r;
+            *dst_g = *g;
+            *dst_b = *b;
+            *dst_a = half::f16::from_f32(1.0);
+        }
+        // else: leave fully transparent -- `gated` is already
+        // zero-initialized above, and that is exactly `(0, 0, 0, 0)`.
+    }
+    gated
 }
 
 /// Resolves `id`'s own composited texels for one `aurora_tile::TILE`-
@@ -2987,6 +3201,29 @@ const fn translate_blend_mode(mode: aurora_doc::BlendMode) -> aurora_render::Ble
 /// the document root, or a parent group's own recursive call into this
 /// function) is the one that applies them, via its own
 /// `aurora_render::composite_tile_cpu` call.
+///
+/// **[`aurora_doc::BlendMode::Dissolve`] is the one exception to "this
+/// function never applies anything itself"**: for a
+/// [`aurora_doc::LayerKind::Pixel`]
+/// layer whose own raw, untranslated blend mode is `Dissolve`, this
+/// function intercepts it *before* `translate_blend_mode` ever runs,
+/// applies [`dissolve_gate`] to that layer's own texels using its own
+/// real opacity, and returns the gated result already at
+/// `(opacity = 1.0, blend_mode = Normal)` — Dissolve's stochastic,
+/// position-weighted visibility decision is not a per-pixel-color blend
+/// *function* `aurora_render::composite_tile_cpu` could express at all
+/// (every other mode computes a new colour from source+backdrop;
+/// Dissolve picks, per pixel, either the source untouched or nothing),
+/// so it has to be resolved here, where real document/tile coordinates
+/// are available, rather than inside that crate. See `dissolve_gate`'s
+/// own doc comment for the full design and its determinism guarantee.
+/// Every other blend mode is unaffected: this check only ever matches
+/// `Dissolve` specifically, and only on the `Pixel` branch below — a
+/// `Group`'s own `blend_mode` field is never inspected for `Dissolve`
+/// this way (see that branch's own code for why: a group has no single
+/// buffer of its own texels to gate until *after* its isolated composite
+/// already ran, a genuinely different shape this round didn't need to
+/// solve).
 ///
 /// **The regression-safety property, precisely**: `composite_tile_cpu`
 /// already reproduces a single full-opacity (`opacity = 1.0`) layer's
@@ -3071,11 +3308,10 @@ fn resolve_tile(
         return None;
     }
     let opacity = layers.opacity(id)?;
-    let blend_mode = translate_blend_mode(
-        layers
-            .blend_mode(id)
-            .unwrap_or(aurora_doc::BlendMode::Normal),
-    );
+    let raw_blend_mode = layers
+        .blend_mode(id)
+        .unwrap_or(aurora_doc::BlendMode::Normal);
+    let blend_mode = translate_blend_mode(raw_blend_mode);
     match layers.kind(id)? {
         aurora_doc::LayerKind::Pixel { .. } => {
             let surface = layers.surface_id(id)?;
@@ -3091,6 +3327,20 @@ fn resolve_tile(
             } else {
                 read_layer_window(store, surface, origin, doc_origin)
             };
+            // `Dissolve` is intercepted here, ahead of the translated
+            // `blend_mode` below, rather than as a real
+            // `aurora_render::BlendMode` variant -- see `dissolve_gate`'s
+            // own doc comment for why. The stochastic decision already
+            // fully accounts for this layer's own opacity (each texel's
+            // gate is weighted by `texel_alpha * opacity`), so the gated
+            // result is handed up at opacity `1.0`/`Normal` -- a straight
+            // Normal composite of an already-binary-alpha buffer is
+            // exactly correct, and re-applying `opacity` a second time
+            // here would double-attenuate it.
+            if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
+                let gated = dissolve_gate(&texels, opacity, doc_origin);
+                return Some((gated, 1.0, aurora_render::BlendMode::Normal));
+            }
             Some((texels, opacity, blend_mode))
         }
         aurora_doc::LayerKind::Group { children } => {
@@ -3139,6 +3389,24 @@ fn resolve_tile(
                     *g = half::f16::from_f32(0.0);
                     *b = half::f16::from_f32(0.0);
                 }
+            }
+            // `Dissolve` on a *group* is intercepted here too, symmetric
+            // with the `Pixel` branch above (see `dissolve_gate`'s own
+            // doc comment for the mechanism) — a group's own isolated,
+            // now-straight-alpha buffer is exactly the same shape a
+            // pixel layer's own texels are (a real `f16` RGBA buffer
+            // plus an opacity scalar), so the identical gate applies. A
+            // prior review found this arm missing on the first pass of
+            // this feature: `translate_blend_mode`'s "unimplemented
+            // mode falls back to Normal" fallback is meant for modes
+            // this crate genuinely doesn't implement, not for a mode
+            // that *is* implemented but was only wired into one of the
+            // two `LayerKind` branches — leaving a group's own Dissolve
+            // silently downgraded to Normal would have been exactly
+            // that bug, not a documented, deliberate scope boundary.
+            if raw_blend_mode == aurora_doc::BlendMode::Dissolve {
+                let gated = dissolve_gate(&isolated, opacity, doc_origin);
+                return Some((gated, 1.0, aurora_render::BlendMode::Normal));
             }
             Some((isolated, opacity, blend_mode))
         }
@@ -6024,17 +6292,17 @@ mod tests {
         begin_drag, canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
         close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
         composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
-        default_shortcuts, demo_document, document_canvas_size, document_from_image,
+        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
         document_qualifies_for_gpu_compositing, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, is_aur_path, layer_local_point,
-        load_scales, load_theme, logical_point, logical_size, open_command_palette,
-        open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
-        pointer_in_canvas, pointer_on_rail_divider, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, resized_rail_width,
-        run_command, sample_pixel, select_layer, tile_origin_for_view, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, resized_rail_width, run_command, sample_pixel, select_layer, splitmix64,
+        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
+        translate_key, translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -8886,6 +9154,501 @@ mod tests {
             !((r - 0.5).abs() < epsilon && (g - 0.4).abs() < epsilon && (b - 0.9).abs() < epsilon),
             "result must not be Lighten's own per-channel-maximum hybrid (0.5, 0.4, 0.9)"
         );
+    }
+
+    // ---- Dissolve: SplitMix64, position hashing, and the gate itself ----
+    //
+    // Dissolve closes out the 27-mode blend series (see PLAN.md), but its
+    // correctness bar is different from every prior round: it's the only
+    // mode where "the math is right" isn't enough on its own -- it also
+    // has to be *the same* math every single time the same document is
+    // composited, or a user would see a different speckle pattern on
+    // every redraw, pan, export, and reopen. The tests below are ordered
+    // bottom-up: the hash primitive first (verified against real,
+    // independently re-derived reference output, not just internal
+    // self-consistency), then the position-combination function's own
+    // real properties (reproducible, position-sensitive, asymmetric,
+    // and -- the one that matters most -- a pure function of *absolute*
+    // position regardless of how a caller's own tile/doc_origin
+    // decomposition happens to reach it), then `dissolve_gate` itself
+    // (the probability weighting, both edge cases), then a real
+    // `composite_document` integration test proving the whole path is
+    // wired together end to end.
+
+    #[test]
+    // Reference: Sebastiano Vigna's public-domain `splitmix64.c`
+    // (<https://prng.di.unimi.it/splitmix64.c>). Its `next()` increments
+    // a `uint64_t` state by the golden-ratio gamma *then* mixes on every
+    // call, including the first -- so `splitmix64(seed)` (this crate's
+    // stateless, seed-in/hash-out shape) reproduces exactly the
+    // reference generator's first output for a generator whose state
+    // starts at `seed`. These 4 expected values were independently
+    // re-derived from that reference algorithm via a from-scratch Python
+    // transcription (arbitrary-precision integers masked to 64 bits at
+    // every step, not trusting this Rust implementation at all) rather
+    // than eyeballed or copied from this function's own output -- the
+    // same "independently re-implement the spec, don't trust this
+    // crate's own answer" discipline the non-separable-HSL round's own
+    // Python cross-check already established for `lum`/`SetLum`. `0` is
+    // the canonical, most commonly cited SplitMix64 test seed; `1`,
+    // `42`, and `u64::MAX` (all-ones, the opposite extreme of all-zero
+    // `0`) are included so this isn't a single-point coincidence.
+    fn splitmix64_matches_the_reference_algorithms_own_output_for_several_seeds() {
+        assert_eq!(splitmix64(0), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(splitmix64(1), 0x910a_2dec_8902_5cc1);
+        assert_eq!(splitmix64(42), 0xbdd7_3226_2feb_6e95);
+        assert_eq!(splitmix64(u64::MAX), 0xe4d9_7177_1b65_2c20);
+    }
+
+    #[test]
+    fn hash_position_is_reproducible_for_the_same_absolute_position() {
+        assert_eq!(hash_position(10, 10), hash_position(10, 10));
+        assert_eq!(hash_position(-500, 300), hash_position(-500, 300));
+    }
+
+    #[test]
+    // Not a degenerate constant hash: two different positions inside the
+    // same `TILE`-sized tile, and a position in a genuinely different
+    // tile, all land on different noise values. `(300, 10)` is in tile
+    // column 1 (`300 / 256 == 1`) while the other two are in tile column
+    // 0 -- a real cross-tile comparison, not just "different numbers".
+    fn hash_position_differs_for_different_positions_same_tile_and_different_tiles() {
+        let a = hash_position(10, 10);
+        let b = hash_position(20, 10);
+        let c = hash_position(300, 10);
+        assert_ne!(
+            a, b,
+            "two different positions in the same tile must not collide"
+        );
+        assert_ne!(a, c, "positions in different tiles must not collide");
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    // The asymmetry `hash_position`'s own doc comment names: swapping the
+    // two coordinates must not produce the same hash (a naive symmetric
+    // combine, e.g. plain `zigzag_encode(x) ^ zigzag_encode(y)`, would
+    // fail this).
+    fn hash_position_is_asymmetric_under_coordinate_swap() {
+        assert_ne!(hash_position(3, 7), hash_position(7, 3));
+    }
+
+    #[test]
+    // The core correctness property this whole design exists for: the
+    // *same* absolute document-space position must hash identically no
+    // matter how a caller's own `doc_origin`/local-coordinate split
+    // happens to reach it. `(200, 100)` is reached two different ways
+    // here -- once as tile `(0, 0)`'s own local `(200, 100)`, once as a
+    // `doc_origin` shifted by `(-1, -1)` (simulating a canvas scrolled by
+    // one pixel, so the tile grid no longer lines up the same way) whose
+    // local `(201, 101)` lands on the same absolute point. A tile-
+    // relative implementation (hashing local row/col alone, or hashing
+    // `tile_id` instead of `doc_origin`) would fail this.
+    fn hash_position_depends_only_on_absolute_position_not_on_how_it_was_decomposed() {
+        let via_tile_a = hash_position(200, 100);
+        let via_tile_b = hash_position(-1 + 201, -1 + 101);
+        assert_eq!(via_tile_a, via_tile_b);
+    }
+
+    #[test]
+    fn hash_to_unit_f32_never_reaches_1_0() {
+        // The maximum possible 24-bit top value is `2^24 - 1`, so the
+        // maximum possible output is strictly less than `1.0` -- load-
+        // bearing for `dissolve_gate`'s own `opacity = 1.0` edge case
+        // (see the dedicated test below): `noise < 1.0` must always be
+        // `true` for every real hash output, not just almost always.
+        assert!(hash_to_unit_f32(u64::MAX) < 1.0);
+        assert!(hash_to_unit_f32(0) >= 0.0);
+    }
+
+    /// Builds a real `aurora_tile::TILE`×`aurora_tile::TILE` texel buffer
+    /// with every texel set to `rgba` -- the same shape `fill_solid`
+    /// gives a real tile-store tile, but as a standalone `Vec` for
+    /// exercising `dissolve_gate` directly without a `TileStore`.
+    fn solid_tile_buffer(rgba: [f32; 4]) -> Vec<half::f16> {
+        let texel_count = aurora_tile::TILE as usize * aurora_tile::TILE as usize;
+        let mut texels = vec![half::f16::from_f32(0.0); texel_count * aurora_tile::CHANNELS];
+        for chunk in texels.chunks_exact_mut(aurora_tile::CHANNELS) {
+            for (sample, &channel) in chunk.iter_mut().zip(rgba.iter()) {
+                *sample = half::f16::from_f32(channel);
+            }
+        }
+        texels
+    }
+
+    #[test]
+    // Edge case named directly in the task: `opacity = 1.0` with fully-
+    // opaque source texels (`texel_alpha = 1.0`) must show the source at
+    // *every* pixel, deterministically, no per-pixel variation -- because
+    // `effective_alpha = 1.0`, and `hash_to_unit_f32_never_reaches_1_0`
+    // above already proved `noise < 1.0` holds for every real hash
+    // output.
+    fn dissolve_gate_at_full_opacity_and_full_source_alpha_shows_every_pixel() {
+        let texels = solid_tile_buffer([0.25, 0.5, 0.75, 1.0]);
+        let gated = dissolve_gate(&texels, 1.0, (0, 0));
+        assert_eq!(gated.len(), texels.len());
+        // `0.25`/`0.5`/`0.75`/`1.0` are all exact binary fractions, so bit-
+        // exact comparison is legitimate here (the same reasoning
+        // `composite_document_blends_two_layers_normal_blend_matching_the_hand_computed_result`
+        // and `composite_tile_cpu_color_dodge_computes_the_clamped_per_channel_ratio`
+        // already use for the same lint).
+        #[allow(clippy::float_cmp)]
+        for chunk in gated.chunks_exact(aurora_tile::CHANNELS) {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            assert_eq!(a.to_f32(), 1.0);
+            assert_eq!(r.to_f32(), 0.25);
+            assert_eq!(g.to_f32(), 0.5);
+            assert_eq!(b.to_f32(), 0.75);
+        }
+    }
+
+    #[test]
+    // The opposite edge case: `opacity = 0.0` must show the source at
+    // *no* pixel, regardless of the source's own texel alpha, since
+    // `effective_alpha = texel_alpha * 0.0 = 0.0` and `noise >= 0.0`
+    // always (`hash_to_unit_f32`'s own doc comment), so `noise <
+    // effective_alpha` is never true.
+    fn dissolve_gate_at_zero_opacity_shows_no_pixel() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        let gated = dissolve_gate(&texels, 0.0, (0, 0));
+        for chunk in gated.chunks_exact(aurora_tile::CHANNELS) {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            assert_eq!(
+                (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                (0.0, 0.0, 0.0, 0.0)
+            );
+        }
+    }
+
+    #[test]
+    // The headline statistical property: a layer at a real, known
+    // opacity shows on roughly that fraction of pixels, not uniformly
+    // everywhere and not a smooth per-pixel fade. Sampled over one whole
+    // real tile (65,536 pixels, `TEXELS`) at `opacity = 0.3`, each pixel
+    // is an independent Bernoulli trial (independent because each one's
+    // outcome depends only on its own distinct absolute position) with
+    // `p = 0.3`, so the count of "shown" pixels is Binomial(n = 65536,
+    // p = 0.3): expected count `n*p = 19660.8`, standard deviation
+    // `sqrt(n*p*(1-p)) ~= 117.3`. Tolerance used here is `0.05` absolute
+    // (fraction must land in `[0.25, 0.35]`), which is `~28` standard
+    // deviations wide (`0.05 / (117.3/65536) ~= 27.9`) -- astronomically
+    // safe against any real flake (this is a deterministic function
+    // being measured once, not literally re-sampled per CI run, but the
+    // bound is stated in real binomial terms rather than picked
+    // arbitrarily). The actual measured fraction, from a real run of
+    // this exact test: 19624 / 65536 = 0.299438..., about 0.31 standard
+    // deviations from the 0.3 target -- see PLAN.md for this same figure
+    // recorded as this round's own measured result.
+    fn dissolve_gate_shows_approximately_the_layers_own_opacity_fraction_of_pixels() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        let opacity = 0.3;
+        let gated = dissolve_gate(&texels, opacity, (0, 0));
+        let shown = gated
+            .chunks_exact(aurora_tile::CHANNELS)
+            .filter(|chunk| {
+                let [_, _, _, a] = chunk else {
+                    return false;
+                };
+                a.to_f32() > 0.0
+            })
+            .count();
+        let total = gated.len() / aurora_tile::CHANNELS;
+        #[allow(clippy::cast_precision_loss)]
+        let fraction = shown as f64 / total as f64;
+        assert!(
+            (fraction - f64::from(opacity)).abs() < 0.05,
+            "shown fraction {fraction} (of {total} pixels, {shown} shown) too far from \
+             the target opacity {opacity} -- see this test's own doc comment for the \
+             binomial tolerance reasoning"
+        );
+    }
+
+    #[test]
+    // Reproducibility is the single most important property of this
+    // whole feature (see this module's own `dissolve_gate` doc comment):
+    // the exact same inputs, called twice, in two entirely separate
+    // calls, must produce bit-identical output -- proving there is no
+    // hidden state, thread-local RNG, or time-based input anywhere in
+    // the path.
+    fn dissolve_gate_is_bit_identical_across_two_separate_calls() {
+        let texels = solid_tile_buffer([0.1, 0.2, 0.3, 0.7]);
+        let first = dissolve_gate(&texels, 0.4, (123, -456));
+        let second = dissolve_gate(&texels, 0.4, (123, -456));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    // The core correctness property, exercised through the real
+    // `dissolve_gate` entry point rather than `hash_position` alone: the
+    // same absolute position must gate identically whether it's reached
+    // as tile `(0, 0)`'s own local `(200, 100)`, or via a `doc_origin`
+    // shifted by `(-1, -1)` whose local `(201, 101)` lands on that same
+    // absolute point -- the exact scenario a scrolled canvas view or a
+    // layer whose own tile boundaries don't line up with the document
+    // grid produces in practice. Uses a fractional opacity (not `0.0`/
+    // `1.0`) so the comparison genuinely depends on the noise value
+    // matching, not a degenerate always-same-answer edge case.
+    fn dissolve_gate_matches_at_the_same_absolute_position_reached_via_different_doc_origins() {
+        let rgba = [0.2, 0.4, 0.6, 1.0];
+        let texels_a = solid_tile_buffer(rgba);
+        let texels_b = solid_tile_buffer(rgba);
+        let opacity = 0.5;
+
+        let tile_side = aurora_tile::TILE as usize;
+        let gated_a = dissolve_gate(&texels_a, opacity, (0, 0));
+        let index_a = 100 * tile_side + 200;
+
+        let gated_b = dissolve_gate(&texels_b, opacity, (-1, -1));
+        let index_b = 101 * tile_side + 201;
+
+        let channels = aurora_tile::CHANNELS;
+        let (Some(texel_a), Some(texel_b)) = (
+            gated_a.get(index_a * channels..index_a * channels + channels),
+            gated_b.get(index_b * channels..index_b * channels + channels),
+        ) else {
+            unreachable!("indices constructed to be in range for a real TILE-sized buffer");
+        };
+        assert_eq!(
+            texel_a, texel_b,
+            "the same absolute document position (200, 100), reached via two different \
+             doc_origin/local-coordinate decompositions, must gate identically"
+        );
+    }
+
+    #[test]
+    // Real integration test, mirroring the shape of every prior blend-
+    // mode round's own `composite_document_blends_two_layers_*` test:
+    // proves `aurora_doc::BlendMode::Dissolve`, set via the real
+    // `LayerTree::set_blend_mode` API, actually reaches `resolve_tile`'s
+    // own interception and produces a genuine stochastic mix through the
+    // real `composite_document` export path -- not a no-op, and not
+    // silently falling back to `Normal` (which would show the top
+    // layer's own blue at every pixel, uniformly). Bottom: opaque red,
+    // full opacity, `Normal`. Top: opaque blue, `Dissolve` at opacity
+    // `0.5`, covering the same 10x10 region. With 100 independent
+    // pixels each showing blue with probability 0.5, the odds of every
+    // single one landing the same way are `2 * 0.5^100` -- so finding
+    // both colours present in the composited result is not a
+    // coincidence of this specific test, it is what a real,
+    // functioning stochastic gate has to produce.
+    fn composite_document_blends_two_layers_dissolve_blend_produces_a_real_stochastic_mix() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Dissolve) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        let mut saw_red = false;
+        let mut saw_blue = false;
+        for y in 0..10 {
+            for x in 0..10 {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                assert!(
+                    (a - 1.0).abs() < epsilon,
+                    "backdrop is opaque, result must stay opaque"
+                );
+                if (r - 1.0).abs() < epsilon && g.abs() < epsilon && b.abs() < epsilon {
+                    saw_red = true;
+                } else if r.abs() < epsilon && g.abs() < epsilon && (b - 1.0).abs() < epsilon {
+                    saw_blue = true;
+                } else {
+                    unreachable!(
+                        "Dissolve must gate to exactly the backdrop or exactly the source, \
+                         never a blended in-between value, got ({r}, {g}, {b}, {a})"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_red,
+            "at least one pixel must show the untouched red backdrop"
+        );
+        assert!(
+            saw_blue,
+            "at least one pixel must show the fully opaque blue source"
+        );
+    }
+
+    #[test]
+    // Proves the fix for a real gap an independent review caught: the
+    // first pass of the `Dissolve` feature only intercepted it in
+    // `resolve_tile`'s `Pixel` branch, so setting `Dissolve` on a
+    // *group's* own `blend_mode` silently fell back to `Normal` via
+    // `translate_blend_mode` -- exactly the "unimplemented mode" honesty
+    // that fallback exists for, except `Dissolve` genuinely *is*
+    // implemented, just not (at the time) for this one `LayerKind`. Same
+    // shape as the plain-pixel `Dissolve` test above, except the blue
+    // "top" layer lives inside a group and the group itself (not the
+    // pixel layer within it) carries `Dissolve` at 50% opacity -- the
+    // group's own isolated buffer (just the opaque blue pixel layer,
+    // Normal-blended with itself) must then be stochastically gated
+    // against the red backdrop the same way a plain pixel layer would
+    // be, not silently shown at full, ungated opacity.
+    fn composite_document_blends_a_dissolve_group_produces_a_real_stochastic_mix() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("dissolve-group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(group, aurora_doc::BlendMode::Dissolve) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_opacity(group, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        let mut saw_red = false;
+        let mut saw_blue = false;
+        for y in 0..10 {
+            for x in 0..10 {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                assert!(
+                    (a - 1.0).abs() < epsilon,
+                    "backdrop is opaque, result must stay opaque"
+                );
+                if (r - 1.0).abs() < epsilon && g.abs() < epsilon && b.abs() < epsilon {
+                    saw_red = true;
+                } else if r.abs() < epsilon && g.abs() < epsilon && (b - 1.0).abs() < epsilon {
+                    saw_blue = true;
+                } else {
+                    unreachable!(
+                        "a Dissolve group must gate to exactly the backdrop or exactly its own \
+                         isolated content, never a blended in-between value \
+                         (the pre-fix bug would have shown blue at every pixel, ungated), \
+                         got ({r}, {g}, {b}, {a})"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_red,
+            "at least one pixel must show the untouched red backdrop -- \
+             the pre-fix bug (Dissolve group silently falling back to Normal) \
+             would have shown blue everywhere and failed this assertion"
+        );
+        assert!(
+            saw_blue,
+            "at least one pixel must show the group's own opaque blue content"
+        );
+    }
+
+    #[test]
+    // Reproducibility at the full document level, not just
+    // `dissolve_gate` in isolation: compositing the *same* document
+    // twice, in two entirely separate `composite_document` calls, must
+    // produce bit-identical `f16` samples -- the property named directly
+    // in the task ("the same document must composite identically every
+    // time -- on screen, on re-render after scrolling, on export, on
+    // reopening a saved file"). Reuses the same two-layer Dissolve
+    // document as the stochastic-mix test above.
+    fn composite_document_with_a_dissolve_layer_is_bit_identical_across_two_separate_calls() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Dissolve) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_opacity(top, 0.3) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 1.0, 0.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let first = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let second = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(first.samples(), second.samples());
     }
 
     #[test]
