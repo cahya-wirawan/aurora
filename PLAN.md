@@ -338,7 +338,28 @@ Evidence: [spike/FINDINGS.md](spike/FINDINGS.md), `spike/vertical-slice/`
 - [x] Latency, frame, paging, and I/O measured
 - [ ] Run on Windows *(DX12 backend unvalidated)*
 - [x] Run on Linux — Vulkan/NVIDIA RTX 3090, 6 runs, 2026-07-26 — [spike/FINDINGS.md](spike/FINDINGS.md#second-platform-linux--vulkan-2026-07-26). Stroke latency and idle-frame budgets pass with more headroom than macOS; pan-while-painting is marginal (straddles the 16.7 ms budget across runs on this shared machine) rather than a clean pass — same architectural bottleneck as macOS (finding 1), not a new one
-- [ ] Re-run at the 300,000 px ceiling *(only 100,000 px tested)*
+- [x] Re-run at the 300,000 px ceiling — done 2026-08-12, same Linux/Vulkan/RTX
+  3090 machine as the run above. `spike/vertical-slice/src/main.rs`'s `DOC`
+  constant changed `(100_000, 100_000)` → `(300_000, 300_000)` — the real
+  PSB-matching ceiling (ADR 0002), not a stand-in — and left there, so the
+  slice now measures the actual ceiling by default. To isolate document
+  size as the only variable, the same binary was also run once more at the
+  old 100,000 px setting immediately beforehand as a same-day control.
+  **Result: no measurable difference.** Every latency budget's p50/p95/p99
+  moved by at most a few ms between the two runs (ordinary noise on this
+  shared, ~28-session machine, the same caveat the row above already
+  carries), and the paging counters — tiles created, evicted, page faults,
+  scratch bytes read/written — were **identical to the byte** across both
+  sizes. Confirms, rather than just assumes, what this file's own "Honest
+  limitations" section had flagged as plausible but untested: the sparse
+  tile store's cost is a function of the *tiles actually touched*, not the
+  document's nominal extent — a 720 GB document (300,000 × 300,000 px at
+  8 bytes/px) pages exactly as cheaply as the 80 GB one under the same
+  64 MB budget. One 83 ms stroke-latency outlier (against a 5–8 ms p50) is
+  reported honestly rather than excluded, but doesn't move p99 and has no
+  plausible document-size mechanism behind it — see [spike/FINDINGS.md
+  §"Third run"](spike/FINDINGS.md#third-run-the-300000-px-ceiling-2026-08-12)
+  for the full numbers and reasoning.
 
 ### 0.4 Accessibility and IME spike — **macOS verified (9/10); Windows/Linux unverified, risk accepted 2026-07-28 to unblock Phase 1**
 

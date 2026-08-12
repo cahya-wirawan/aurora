@@ -26,7 +26,10 @@ use tiles::TILE_BYTES;
 
 /// Deliberately smaller than the working set so paging is exercised, not avoided.
 const MEMORY_BUDGET: usize = 64 * 1024 * 1024;
-const DOC: (u32, u32) = (100_000, 100_000);
+/// PRD's own PSB-matching ceiling (ADR 0002) — the 100,000 px figure this
+/// constant held through the first two platform runs was deliberately
+/// smaller, per PLAN.md 0.3's own "only 100,000 px tested" caveat.
+const DOC: (u32, u32) = (300_000, 300_000);
 const BRUSH_RADIUS: f32 = 24.0;
 const BRUSH_SPACING: f32 = 0.15;
 const INK: [f32; 3] = [0.95, 0.62, 0.25];

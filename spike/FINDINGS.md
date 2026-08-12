@@ -150,7 +150,59 @@ run, and the noisier result argues for building the CI regression test
 (0.2) against a quieter reference machine than this one.
 
 This satisfies PLAN.md 0.3's "run on Linux (Vulkan backend unvalidated)."
-Windows (DX12) and the 300,000 px ceiling remain unmeasured.
+Windows (DX12) remains unmeasured; the 300,000 px ceiling is measured next.
+
+## Third run: the 300,000 px ceiling (2026-08-12)
+
+Same machine as the Linux/Vulkan run above (NVIDIA RTX 3090, driver
+560.35.03, Vulkan backend), same shared-dev-box caveat. `DOC` in
+`spike/vertical-slice/src/main.rs` changed from `(100_000, 100_000)` to
+`(300_000, 300_000)` — the actual PSB-matching ceiling ADR 0002 and
+invariant §7.3.1 name, not a stand-in for it. To isolate document size as
+the only variable, the *same* binary was also run once more at the old
+100,000 px setting immediately before, back to back, same day — a fresh
+control, not a comparison against the 2026-07-26 run above, which used an
+older build.
+
+| Measurement (p99) | Budget | 100,000 px (control) | 300,000 px | Verdict |
+|---|---|---|---|---|
+| Stroke latency | 10 ms | 5.28 ms | 7.98 ms (max 83.4 ms, one outlier) | Within, p99 unaffected by scale — see note below |
+| Idle frame | 16.7 ms | 4.39 ms | 4.42 ms | Within, identical |
+| Pan, normal drag | 16.7 ms | 16.83 ms | 17.07 ms | Over budget at both sizes, unchanged by scale |
+| Pan, fast fling | 16.7 ms | 22.92 ms | 20.01 ms | Over budget at both sizes, unchanged by scale |
+| Page-in pan | 16.7 ms | 6.39 ms | 10.59 ms | Within at both sizes |
+| Save/reload round-trip | — | bit-exact | bit-exact | Confirms §7.3.6b at the real ceiling |
+
+**Paging counters are identical, not just similar**: 665 tiles created, 930
+evicted, 393 page faults, 487.6 MB scratch-out / 206.0 MB scratch-in — the
+same figures at both document sizes, to the byte. This is expected, not a
+coincidence: the benchmark's pan/paint pattern touches the same *relative*
+tile coordinates regardless of `DOC`, and confirms the thing PLAN.md 0.3
+and this document's own "Honest limitations" section had flagged as
+plausible but untested — **the sparse tile store is genuinely indifferent
+to absolute document size**. Nothing in `tiles.rs`/`doc.rs` scales with
+`width × height` up front (checked directly, not inferred from the
+numbers matching: `Document::new` allocates only its two `TileStore`s,
+which are empty `HashMap`s until a tile is actually touched). A 720 GB
+document (300,000 × 300,000 px at 8 bytes/px) pages identically to an
+80 GB one under the same 64 MB budget.
+
+**The stroke-latency max (83.4 ms) is very likely scheduling noise, not a
+real regression**: p50/p95/p99 all move by under 3 ms between the two
+runs, consistent with ordinary variance on this shared, ~28-session
+machine (the same caveat the Linux section above already carries) — but
+one single sample spiking to 83 ms against a 5–8 ms p50 doesn't have an
+innocent explanation *within* this run alone, so it's reported rather
+than quietly excluded. A single outlier in 240 samples doesn't move
+`p99`, and does not on its own indicate document size is the cause, given
+every other statistic across all four measurement groups is either
+identical or within normal run-to-run noise. Worth watching if it
+recurs on a re-run, not treated as settled.
+
+This closes PLAN.md 0.3's "re-run at the 300,000 px ceiling" — the
+constant in `main.rs` is left at 300,000 px going forward, so the
+reproduce command above now measures the real ceiling by default, not a
+smaller stand-in for it.
 
 ## Honest limitations
 
@@ -161,7 +213,11 @@ Windows (DX12) and the 300,000 px ceiling remain unmeasured.
 - Single-threaded throughout; no attempt at overlapping I/O with rendering.
 - The brush is a circle with a falloff — no texture, no dual brush, no
   stabilization. A real brush engine does considerably more work per dab.
-- 100,000 px, not the 300,000 px ceiling of ADR 0002. Tile-count scaling beyond
-  this is untested, though the sparse store should be indifferent to it.
 - No text rendering anywhere, so nothing here speaks to the cost of the widget
   toolkit's text stack.
+- Document-size scaling (100,000 px vs. the 300,000 px ADR 0002 ceiling) is
+  now measured, but only on one platform (Linux/Vulkan) and one benchmark
+  pattern (a fixed pan/paint sequence touching a bounded set of tiles) —
+  see "Third run" above. It does not speak to whether a workload that
+  genuinely spans a much larger *visited* area (not just a larger nominal
+  canvas) behaves the same.
