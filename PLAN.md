@@ -8209,13 +8209,42 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**Rewritten 2026-08-12 — the previous version of this section was frozen
-at the M1.3/M1.4 transition (2026-07-29/30) and had not been touched
-since, despite M1.4 through M1.9 all reaching completion in the
-meantime.** See "Where we are" at the top of this file for the current
-milestone-level summary; this section is specifically about what to
-pick up next, kept short on purpose so it doesn't go stale the same way
-again.
+**Addendum 2026-08-12 (gauntlet-loop session, three rounds landed)**:
+three of the items this section's previous revision (below) named as
+"genuinely reachable from this machine right now" are now actually
+done, each built/critiqued/verified through the gauntlet-loop
+builder-then-fresh-critic process and landed as its own commit:
+M1.4's crash-recovery journal now re-triggers on every real live edit
+(completed Move, committed Brush/Eraser stroke, Undo/Redo from every
+route) rather than only once at startup, coalescing bursts through a
+new `AutosaveQueue` on `aurora_render::Executor`'s background thread
+so it can't violate §7.3.4 (0.41.0); M1.7's vector-first rendering
+tessellation tolerance is now DPI-scaled
+(`aurora_vector::tolerance_for_scale_factor`), closing the DPI half of
+"not yet scaled by DPI/zoom" — zoom stays explicitly deferred, no
+vector-rendered canvas consumer exists yet to need it (0.42.0); and a
+third, smaller gap found while re-reading `aurora-io` for reachable
+work — PNG export always embedding a full `iCCP` chunk even for plain
+sRGB images — is closed too, writing the lighter `sRGB` chunk via a
+new byte-exact `IccProfile::is_exactly_srgb` (0.43.0). M1.7's own
+gallery-coverage gap (per-theme/per-density goldens) is still open —
+it keeps needing a human bless step on real GPU hardware this session
+doesn't have, the same limit already named in bucket 1 below, so it
+wasn't picked up this round. M1.3's async-evaluation/progressive-
+rendering consumers turned out to be a materially bigger job than this
+section previously implied once actually scoped (wiring a real
+interaction-state signal and explicit-LOD shader sampling into
+`aurora-app`'s canvas draw path, which doesn't use progressive mip
+textures *at all* yet — confirmed by grep, not assumed) — closer to
+bucket 4 than a quick next slice; left open rather than started blind.
+
+**Previous revision, 2026-08-12 (earlier the same day)** — the
+version before this addendum was frozen at the M1.3/M1.4 transition
+(2026-07-29/30) and had not been touched since, despite M1.4 through
+M1.9 all reaching completion in the meantime. See "Where we are" at
+the top of this file for the current milestone-level summary; this
+section is specifically about what to pick up next, kept short on
+purpose so it doesn't go stale the same way again.
 
 **Not everything actionable from this machine is done — a fresh check
 of this file's own `[x]`/`[~]`/`[ ]` marks while updating this section
@@ -8225,11 +8254,10 @@ have every top-level item at `[x]`; M1.2 through M1.9 all retain real
 `[~]` items — see "Where we are" above for the per-section breakdown,
 and each section's own `### M1.N` heading below for the exact items.
 Some of those are genuinely reachable from this machine right now
-without new hardware or a design decision (e.g. M1.3's async-
-evaluation and progressive-rendering consumers, M1.4's crash-recovery
-disk persistence, M1.7's vector-first rendering and per-theme/density
-gallery coverage) — picking one of those is a reasonable next slice,
-scoped the same deliberate way every round this session was. What
+without new hardware or a design decision — picking one of those is a
+reasonable next slice, scoped the same deliberate way every round this
+session was (see the addendum above for which ones the *next* session
+actually found reachable vs. bigger than expected once scoped). What
 remains in M1.10 (the Phase 1 gate) and in the still-open Phase 0
 tail, plus the specific gaps that genuinely are hardware/design/
 tooling-gated, fall into one of four buckets:
