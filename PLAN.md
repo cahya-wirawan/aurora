@@ -5635,6 +5635,49 @@ structural design work.
   `.aur` reader/writer was built the same week (see the `.aur` bullet
   above) but autosave itself hasn't been switched over to it; that
   remains separate, still-open follow-on work.
+
+  **Addendum 2026-08-12**: the "no live editing loop yet to re-trigger
+  it from" gap above is closed — `App` now keeps a live
+  `aurora_render::Executor` and a new `AutosaveQueue` alongside
+  `history`/`pixel_history`, and a new `App::trigger_autosave` method
+  (`self.history.save_journal()` + `AutosaveQueue::enqueue`) is called
+  from every real, completed document-mutating site: a completed Move
+  (`App::finish_move`), a committed Brush/Eraser stroke
+  (`App::handle_pointer_released`), and Undo/Redo from every route that
+  can trigger it (the direct `Ctrl+Z`/`Ctrl+Shift+Z` shortcut, the
+  command palette, and the macOS menu — the latter two both funnel
+  through `App::run_undo_redo`, which the direct-shortcut path can't,
+  so `App::handle_key_event` re-resolves the same chord to know when to
+  trigger separately; see that method's own comment). This satisfies
+  §7.3.4 (the UI thread never blocks) without adding synchronous disk
+  I/O to the stroke-commit path the 9.1ms p99 budget (spike/FINDINGS.md)
+  can't spare: `AutosaveQueue` does the actual `std::fs::write` on
+  `Executor`'s background thread, and coalesces a fast burst of edits
+  (undo-spamming, a quick flurry of strokes) down to one eventual write
+  of the *freshest* journal, not one queued write per edit — see
+  `AutosaveQueue`'s own doc comment for the mechanism, and 4 new tests
+  proving a structural edit, a committed stroke, burst coalescing, and
+  non-blocking enqueue all land correctly. `App::open_file`/
+  `App::open_aur_file` deliberately keep their own direct, synchronous
+  `write_autosave` calls rather than switching to the queue — opening a
+  file isn't a latency-budgeted input path the way a stroke commit is,
+  and a document-replacement write only ever happens once, not in a
+  burst, so there's nothing for coalescing to buy there.
+
+  Still honestly open, unchanged by this addendum: no interactive
+  "Discard recovered document" choice, and the autosave file is still
+  plain `postcard` bytes, not a real `.aur` container — both remain
+  separate, still-open follow-on work, exactly as stated above. One new
+  gap this addendum's own design accepts rather than solves: a stroke
+  commit's `trigger_autosave` call re-serializes and re-queues
+  `history`'s journal, but that journal has no `LayerOp` for raw pixel
+  content (`PixelHistory`'s own doc comment) — a stroke's actual pixels
+  still aren't part of what a crash recovers, only whatever structural
+  state (layer creation, bounds, etc.) happens to be current when the
+  stroke commits. The tile store persisting pixels durably on its own,
+  separately from this journal, is what keeps that honest rather than a
+  silent data-loss risk, but recovering a pixel edit's own undo/redo
+  position after a crash is still not something this journal covers.
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
   mutator with an undo-recording version and kept its own undo/redo

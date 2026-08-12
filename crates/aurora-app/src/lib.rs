@@ -437,7 +437,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aurora_gpu::{GpuContext, GpuSurface};
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
@@ -868,11 +868,35 @@ fn replace_document(
 //
 // Still deliberately narrow: recovery is unconditional (there is no
 // "Recover Document" vs. "Discard" choice — the dialog just reports
-// what already happened), and autosave is written once at startup, not
-// on a repeating timer or after edits, since there is no live editing
-// loop yet to re-trigger it. A real `.aur` file (ADR 0009's ZIP
-// container, with a manifest and tile data) is separate follow-on work
-// — there's still nothing but the journal to put in one.
+// what already happened). A real `.aur` file (ADR 0009's ZIP container,
+// with a manifest and tile data) is separate follow-on work — there's
+// still nothing but the journal to put in one.
+//
+// **Re-triggered on live edits, off the calling thread, as of the
+// M1.9 addendum below**: the gap this section used to name here ("no
+// live editing loop yet to re-trigger it") closed once `App` started
+// keeping `history`/`pixel_history` alive and mutating them for real
+// (Undo/Redo, a completed Move, a committed Brush/Eraser stroke — see
+// `App::trigger_autosave`'s own call sites). Re-running [`write_autosave`]
+// itself on every such action would violate CLAUDE.md §7.3.4 (the UI
+// thread never blocks on rendering, extended here to input generally):
+// `history.save_journal()` postcard-serializes an ever-growing journal
+// and `write_autosave` then does a *synchronous* `std::fs::write` of it —
+// direct on the stroke-commit path, that's a growing, unbounded disk-I/O
+// cost stacked on top of a stroke-latency budget already measured at
+// 9.1 ms p99 against a 10 ms ceiling (spike/FINDINGS.md). So live
+// re-triggering goes through [`AutosaveQueue`] instead: the journal is
+// still serialized on the calling thread (cheap, CPU-bound `postcard`
+// encoding, not the I/O the invariant is actually about), but the actual
+// `std::fs::write` happens on `aurora_render::Executor`'s dedicated
+// background thread, and a fast flurry of edits (undo-spamming, a quick
+// brush flurry) coalesces down to one eventual write of the *freshest*
+// journal rather than one queued write per edit — see that type's own
+// doc comment for the coalescing mechanism. [`write_autosave`] itself is
+// unchanged and still used for the one-shot, pre-window-visible startup
+// write and the sail-through document-replacement writes in
+// `App::open_file`/`App::open_aur_file`, neither of which is on a
+// latency-budgeted input path.
 //
 // Both the marker and the autosave file live in `std::env::temp_dir()`
 // under fixed names — deliberately not a proper per-platform app-support
@@ -968,6 +992,151 @@ fn recover_document(path: &Path) -> Option<(aurora_doc::LayerTree, aurora_doc::H
         }
     };
     Some((layers, history))
+}
+
+/// The freshest-not-yet-written state behind [`AutosaveQueue`] — see
+/// that type's own doc comment for how [`AutosaveQueue::enqueue`] uses
+/// it to coalesce a burst of edits into one background write.
+#[derive(Default)]
+struct AutosaveQueueState {
+    /// The most recently serialized journal not yet on disk — `Some`
+    /// means a write is still owed. Each new [`AutosaveQueue::enqueue`]
+    /// call *overwrites* this rather than appending, which is the whole
+    /// coalescing mechanism: only the freshest state a caller ever asked
+    /// to save actually needs to land on disk.
+    pending: Option<Vec<u8>>,
+    /// Whether a background drain closure is currently alive and will
+    /// eventually notice `pending` — guards against
+    /// [`AutosaveQueue::enqueue`] spawning a second one while one is
+    /// already running.
+    draining: bool,
+}
+
+/// Rewrites [`App`]'s autosave journal after a live, document-mutating
+/// action (a completed Move, Undo/Redo, a committed Brush/Eraser stroke)
+/// without adding synchronous disk I/O to whichever call path just
+/// mutated `self.history`/`self.pixel_history` — see this module's own
+/// "crash recovery" section for why that matters (CLAUDE.md §7.3.4, and
+/// the measured 9.1 ms p99 stroke-latency budget in spike/FINDINGS.md).
+///
+/// [`Self::enqueue`] always overwrites `state.pending` with the latest
+/// bytes and only spawns a background drain closure
+/// (`aurora_render::Executor::submit`) if one isn't already running.
+/// That closure keeps taking whatever is in `pending` and writing it
+/// until it finds nothing left, so a burst of edits arriving while a
+/// write is already in flight collapses into exactly one more write
+/// after it finishes, not one queued write per edit — the "only the
+/// freshest write matters" coalescing this crate's own M1.9 PLAN.md
+/// bullet calls for, without a separate debounce timer.
+///
+/// `Clone`, deliberately: the shared `state` is an `Arc<Mutex<_>>`, so
+/// cloning this is just cloning that handle, not the queued bytes
+/// themselves — [`App`] only ever keeps one, but a test can clone it to
+/// observe `state` after handing the original to a queue-driving call.
+#[derive(Clone)]
+struct AutosaveQueue {
+    /// Always this queue's own fixed autosave path — the same one
+    /// [`write_autosave`]'s callers already pass around, just captured
+    /// once here instead of threaded through every call.
+    path: PathBuf,
+    state: Arc<Mutex<AutosaveQueueState>>,
+}
+
+impl AutosaveQueue {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            state: Arc::new(Mutex::new(AutosaveQueueState::default())),
+        }
+    }
+
+    /// Queues `bytes` (an already-serialized journal — see
+    /// [`App::trigger_autosave`]) to be written to this queue's own
+    /// path on `executor`'s background thread. Never blocks the
+    /// caller: the lock below is only ever held for a short, non-I/O
+    /// critical section (an `Option` swap and a `bool` check/set), and
+    /// [`aurora_render::Executor::submit`] itself doesn't block either.
+    fn enqueue(&self, executor: &mut aurora_render::Executor, bytes: Vec<u8>) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(err) => {
+                // A previous drain closure panicked mid-write and
+                // poisoned the lock -- the same "a panicking submitted
+                // task silently kills the background thread's loop"
+                // limitation `Executor`'s own doc comment already
+                // accepts, not new failure machinery this queue invents.
+                tracing::warn!(?err, "autosave queue lock poisoned; dropping this write");
+                return;
+            }
+        };
+        state.pending = Some(bytes);
+        if state.draining {
+            // A drain closure is already alive and will pick up these
+            // fresher bytes itself once it loops back around -- see the
+            // closure body below.
+            return;
+        }
+        state.draining = true;
+        // Dropped before `executor.submit` below so the background
+        // closure's own first lock attempt can't deadlock against this
+        // one.
+        drop(state);
+
+        let path = self.path.clone();
+        let state_handle = Arc::clone(&self.state);
+        executor.submit(move || {
+            loop {
+                let bytes = {
+                    let Ok(mut state) = state_handle.lock() else {
+                        return;
+                    };
+                    let Some(bytes) = state.pending.take() else {
+                        // Nothing arrived while the last write was in
+                        // flight -- this drain loop is done; the next
+                        // `enqueue` call will see `draining == false`
+                        // and start a fresh one.
+                        state.draining = false;
+                        return;
+                    };
+                    bytes
+                };
+                if let Err(err) = std::fs::write(&path, bytes) {
+                    tracing::warn!(?err, path = %path.display(), "failed to write the autosave journal");
+                }
+            }
+        });
+    }
+}
+
+/// Re-serializes `history`'s journal and re-queues it on `queue` — the
+/// live-editing counterpart to [`write_autosave`]'s one-shot write. A
+/// free function, deliberately, the same "pure logic, no `App`/window
+/// needed" shape every other free function in this crate's command-
+/// dispatch section already uses (see that section's own doc comment):
+/// [`App::trigger_autosave`] is its real, `self`-based caller, but
+/// keeping the actual work here lets a test exercise the exact same
+/// code path with a locally built [`aurora_render::Executor`]/
+/// [`AutosaveQueue`]/[`aurora_doc::History`] instead of a live `App`,
+/// which this sandbox has no window/`EventLoopProxy`/display server to
+/// construct (see the "Command dispatch" section's own doc comment for
+/// why that constraint already shapes every other testable function
+/// here). A serialization failure is logged, not fatal, the same
+/// discipline [`write_autosave`] already applies to its own
+/// `save_journal` call.
+fn queue_autosave(
+    executor: &mut aurora_render::Executor,
+    queue: &AutosaveQueue,
+    history: &aurora_doc::History,
+) {
+    match history.save_journal() {
+        Ok(bytes) => queue.enqueue(executor, bytes),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to serialize the autosave journal for a live edit"
+            );
+        }
+    }
 }
 
 // -- Persisted workspace layout (rail width, panel collapsed state) --
@@ -4775,6 +4944,18 @@ struct App {
     /// lifecycle boundary" discipline [`write_autosave`] already uses,
     /// not a reactive save on every resize/collapse.
     layout_path: Option<PathBuf>,
+    /// Runs [`AutosaveQueue`]'s background disk writes (and, in a fuller
+    /// build, real GPU render work — see that type's own doc comment) on
+    /// a dedicated thread away from every input handler in this crate.
+    /// Built once, in [`App::new`], alongside `autosave_queue` below.
+    executor: aurora_render::Executor,
+    /// Coalesces this session's live re-triggered autosaves — see
+    /// [`Self::trigger_autosave`] and [`AutosaveQueue`]'s own doc
+    /// comment. Always the same fixed path [`autosave_path`] returns;
+    /// `App::new`'s own one-shot startup [`write_autosave`] call and
+    /// this queue deliberately target the same file, since they're both
+    /// just different *triggers* for saving the same journal.
+    autosave_queue: AutosaveQueue,
     /// The window's current DPI scale factor (`Window::scale_factor`) —
     /// read once the real window exists (`resumed`) and kept current via
     /// `WindowEvent::ScaleFactorChanged`, e.g. when the window moves to a
@@ -5063,6 +5244,8 @@ impl App {
             crash_recovery_dialog,
             marker_path,
             layout_path,
+            executor: aurora_render::Executor::spawn(),
+            autosave_queue: AutosaveQueue::new(autosave_path.to_path_buf()),
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
@@ -5117,6 +5300,23 @@ impl App {
         adapter.update_if_active(|| tree.accessibility_update(focused));
     }
 
+    /// Re-serializes `self.history`'s journal and re-queues it on
+    /// `self.autosave_queue` — the live-editing half of this crate's
+    /// "crash recovery" section, called after every real, completed
+    /// document mutation (a completed Move, Undo/Redo, a committed
+    /// Brush/Eraser stroke; see each call site's own comment). Never
+    /// blocks the calling thread on disk I/O: `history.save_journal()`
+    /// is cheap, CPU-bound `postcard` encoding, and
+    /// [`AutosaveQueue::enqueue`] itself only ever does a short,
+    /// non-I/O critical section before handing the actual
+    /// `std::fs::write` to `self.executor`'s background thread — see
+    /// that method's own doc comment. A serialization failure is
+    /// logged, not fatal, the same discipline [`write_autosave`] already
+    /// applies to its own `save_journal` call.
+    fn trigger_autosave(&mut self) {
+        queue_autosave(&mut self.executor, &self.autosave_queue, &self.history);
+    }
+
     /// A real `winit::event::KeyEvent`'s full handling: ignores key-up
     /// (only a press should trigger a shortcut or type a character —
     /// otherwise every binding would fire twice), translates it into
@@ -5137,6 +5337,23 @@ impl App {
         let Some(key) = translate_key(&event.logical_key) else {
             return;
         };
+        // Mirrors `handle_key`'s own dispatch guard (dialog first, then
+        // palette, then a resolved shortcut) so this can tell, from out
+        // here, whether the call below is about to run Undo/Redo
+        // directly against `self.history`/`self.pixel_history` --
+        // `handle_key` itself has no way to report that back other than
+        // the narrower `ActivatedCommand` it already returns (which only
+        // covers the command-palette path, handled below). Computed
+        // *before* the call so it reflects the same
+        // `crash_recovery_dialog`/`command_palette` state `handle_key`
+        // itself is about to see.
+        let chord = KeyChord::new(self.modifiers, key);
+        let direct_shortcut_will_undo_redo = self.crash_recovery_dialog.is_none()
+            && self.command_palette.is_none()
+            && matches!(
+                self.shortcuts.resolve(chord),
+                Some(&(AppCommand::Undo | AppCommand::Redo))
+            );
         let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
@@ -5159,9 +5376,21 @@ impl App {
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
             Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
+            // `run_undo_redo` itself re-triggers the autosave -- see its
+            // own doc comment -- so nothing further is needed here for
+            // the command-palette/menu path.
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             None => {}
+        }
+        // The direct `Ctrl+Z`/`Ctrl+Shift+Z` path: `handle_key` already
+        // ran Undo/Redo against `self.history`/`self.pixel_history`
+        // above (it doesn't surface that as an `ActivatedCommand` the
+        // way the palette/menu path does), so re-trigger here instead --
+        // see `direct_shortcut_will_undo_redo`'s own comment for why
+        // this is computed separately from `picked`.
+        if direct_shortcut_will_undo_redo {
+            self.trigger_autosave();
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -5196,6 +5425,16 @@ impl App {
         // `CompositeCache`'s own documented "any edit invalidates
         // everything" scoping.
         self.composite_cache.bump();
+        // `command` is always `AppCommand::Undo`/`::Redo` here (this
+        // method's own doc comment) -- re-trigger the autosave
+        // unconditionally, same "safe to over-trigger, not safe to
+        // under-trigger" reasoning `App::trigger_autosave` itself
+        // documents. A no-op `undo`/`redo` (nothing left to undo/redo)
+        // just re-serializes and re-queues the same bytes already on
+        // disk -- harmless, and cheaper to accept than to thread
+        // `run_command`'s own success/failure back out through another
+        // parameter.
+        self.trigger_autosave();
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -5843,6 +6082,7 @@ impl App {
                     &mut self.history,
                     &mut self.pixel_history,
                 );
+                self.trigger_autosave();
             }
             Err(err) => tracing::warn!(?err, "failed to record the completed move"),
         }
@@ -5923,6 +6163,7 @@ impl App {
                         &mut self.history,
                         &mut self.pixel_history,
                     );
+                    self.trigger_autosave();
                 }
             }
             Some(Drag::Move {
@@ -6575,13 +6816,13 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivatedCommand, AppCommand, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_LAYERS,
-        COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
-        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
-        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
-        ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key, KeyChord, Modifiers,
-        NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind, UndoOrder,
-        activate_command, apply_mask_clip, apply_scroll_zoom, autosave_path,
+        ActivatedCommand, AppCommand, AutosaveQueue, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY,
+        COMMAND_CLOSE_LAYERS, COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE,
+        COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO,
+        COMMAND_TOGGLE_HISTORY, COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
+        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key,
+        KeyChord, Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
+        UndoKind, UndoOrder, activate_command, apply_mask_clip, apply_scroll_zoom, autosave_path,
         background_color_from_theme, begin_drag, canvas_area_physical_rect,
         canvas_area_physical_size, clear_session_marker, close_command_palette,
         close_crash_recovery_dialog, collect_widget_paints, composite_document,
@@ -6592,11 +6833,12 @@ mod tests {
         is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
         open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
         palette_commands, pointer_in_canvas, pointer_on_rail_divider,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, resized_rail_width, run_command, sample_pixel, select_layer, splitmix64,
-        tile_origin_for_view, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        previous_session_left_a_marker, queue_autosave, recomposite_visible_tiles,
+        recover_document, replace_document, resized_rail_width, run_command, sample_pixel,
+        select_layer, splitmix64, tile_origin_for_view, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -12362,6 +12604,231 @@ mod tests {
         assert_eq!(
             recovered_history.journal_descriptions(),
             original_descriptions
+        );
+    }
+
+    // -- Live re-triggered autosave (`AutosaveQueue`/`queue_autosave`) --
+    //
+    // `App::trigger_autosave`/`App::finish_move`/
+    // `App::handle_pointer_released`/`App::run_undo_redo` can't be
+    // exercised directly here -- `App::new` needs a real
+    // `EventLoopProxy`, which needs a real event loop, which this
+    // sandbox has none of (see this crate's own "Command dispatch"
+    // section doc comment for the same constraint on every other
+    // App-adjacent free function). `queue_autosave` is the free function
+    // both `App::trigger_autosave` and these tests call, so this
+    // exercises the exact same code path a live session would, just fed
+    // by a locally built `History`/`Executor`/`AutosaveQueue` instead of
+    // a live `App` -- the same substitution every other test in this
+    // module already makes for `run_command`/`handle_key`.
+
+    #[test]
+    fn queue_autosave_after_a_completed_move_lands_it_on_disk() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.postcard");
+        let mut executor = aurora_render::Executor::spawn();
+        let queue = AutosaveQueue::new(path.clone());
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Mirrors what `App::apply_move`/`App::finish_move` do together
+        // for a real completed drag: the live bounds change is applied
+        // directly to `layers` first, then journaled as one step once
+        // the gesture ends.
+        let moved = aurora_core::Rect {
+            x: 5,
+            y: 5,
+            ..bounds
+        };
+        if let Err(err) = layers.set_bounds(id, moved) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.record_bounds_change(&layers, id, bounds) {
+            unreachable!("{err:?}");
+        }
+
+        // The call `App::finish_move` itself makes, at the end of its
+        // own `Ok(())` branch.
+        queue_autosave(&mut executor, &queue, &history);
+        // Deterministic, not sleep-and-hope: blocks until the
+        // background drain closure this enqueue spawned has actually
+        // run and returned -- `Executor::join`'s own doc comment.
+        executor.join();
+
+        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
+            unreachable!("queue_autosave must have written a real, recoverable autosave");
+        };
+        assert_eq!(
+            recovered_history.journal_descriptions(),
+            history.journal_descriptions(),
+            "the recovered journal must reflect the completed move"
+        );
+    }
+
+    #[test]
+    fn queue_autosave_after_a_committed_stroke_still_writes_the_current_journal() {
+        // What "reflects the edit" honestly means for a stroke commit:
+        // `aurora_doc::History`'s own journal has no `LayerOp` for raw
+        // pixel content (`PixelHistory`'s own doc comment, `App`'s own
+        // `pixel_history` field doc) -- a stroke's actual pixels live
+        // only in the tile store, which persists separately from this
+        // journal. What this proves is that the Pixel-kind trigger path
+        // (`App::handle_pointer_released`) really does run the write
+        // pipeline end to end and lands whatever *is* in `history` right
+        // now (here, the layer this stroke painted onto) on disk -- not
+        // that the stroke's own pixels appear in the journal, which
+        // nothing in this crate claims.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.postcard");
+        let mut executor = aurora_render::Executor::spawn();
+        let queue = AutosaveQueue::new(path.clone());
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let (_dir, mut store) = real_tile_store();
+
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        // Mirrors `App::handle_pointer_released`'s
+        // `Drag::Brush`/`Drag::Eraser` branch: a real, non-empty
+        // `StrokeSnapshot` gets pushed onto `pixel_history` and, since
+        // that actually recorded something, into `undo_order` too.
+        let surface = aurora_tile::SurfaceId::from_raw(id.to_raw());
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let mut stroke = aurora_brush::StrokeSnapshot::new(surface);
+        if let Err(err) = stroke.record_touch(&mut store, tile) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            pixel_history.push(stroke),
+            "a real, touched stroke must record something"
+        );
+        undo_order.record(UndoKind::Pixel, &mut history, &mut pixel_history);
+
+        // The call `App::handle_pointer_released` itself makes, inside
+        // that same `if self.pixel_history.push(stroke)` branch.
+        queue_autosave(&mut executor, &queue, &history);
+        executor.join();
+
+        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
+            unreachable!("queue_autosave must have written a real, recoverable autosave");
+        };
+        assert_eq!(
+            recovered_history.journal_descriptions(),
+            history.journal_descriptions(),
+            "a stroke-commit trigger must still land the layer structure current at commit time"
+        );
+    }
+
+    #[test]
+    fn queue_autosave_burst_coalesces_to_the_freshest_state_on_disk() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.postcard");
+        let mut executor = aurora_render::Executor::spawn();
+        let queue = AutosaveQueue::new(path.clone());
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        // A rapid burst of ten real edits, each re-triggering the queue
+        // without waiting for the previous write to land first -- the
+        // same shape a fast flurry of undo-spamming or brush-stroke
+        // commits has from `AutosaveQueue`'s own point of view (see its
+        // doc comment). No `executor.join()` between iterations on
+        // purpose: coalescing is the property under test, not "each
+        // write happens to finish before the next edit."
+        for step in 0..10u8 {
+            let opacity = f32::from(step) / 10.0;
+            if let Err(err) = history.set_opacity(&mut layers, id, opacity) {
+                unreachable!("{err:?}");
+            }
+            queue_autosave(&mut executor, &queue, &history);
+        }
+        let final_descriptions = history.journal_descriptions();
+
+        executor.join();
+
+        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
+            unreachable!("queue_autosave must have written a real, recoverable autosave");
+        };
+        assert_eq!(
+            recovered_history.journal_descriptions(),
+            final_descriptions,
+            "coalescing must land the freshest state from the burst, not an earlier one"
+        );
+    }
+
+    #[test]
+    fn autosave_queue_enqueue_never_blocks_even_under_a_rapid_burst() {
+        // Mirrors `aurora_render::executor::tests::\
+        // submit_never_blocks_even_before_the_executor_drains`: proves
+        // the non-blocking half of `AutosaveQueue::enqueue`'s own
+        // contract directly, with synthetic bytes rather than a real
+        // `History`, so this measures the queue's own overhead
+        // (a mutex lock plus an `Option` swap) in isolation from
+        // `postcard` serialization cost.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.postcard");
+        let mut executor = aurora_render::Executor::spawn();
+        let queue = AutosaveQueue::new(path.clone());
+
+        let start = std::time::Instant::now();
+        for step in 0..200u32 {
+            queue.enqueue(&mut executor, vec![step.to_le_bytes()[0]; 64]);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "enqueue must return immediately regardless of how many writes are still in flight, \
+             not block the calling thread on disk I/O"
+        );
+
+        executor.join();
+        assert!(
+            path.exists(),
+            "the coalesced burst must still have produced a real file by the time join() returns"
         );
     }
 
