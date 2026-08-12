@@ -47,6 +47,34 @@ impl IccProfile {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ColorError> {
         self.inner.icc().map_err(ColorError::SerializeFailed)
     }
+
+    /// Whether this profile is *exactly* the built-in [`Self::srgb`]
+    /// profile — deliberately narrow: a byte-exact match of
+    /// [`Self::to_bytes`] output against `Self::srgb().to_bytes()`,
+    /// confirmed deterministic (two independent `Self::srgb()`
+    /// instances re-serialize to identical bytes — `lcms2`'s built-in
+    /// sRGB definition carries no per-instance timestamp/ID the way a
+    /// freshly-authored profile might), not any attempt at real
+    /// colorimetric equivalence between differently-encoded sRGB-ish
+    /// profiles. A file carrying some *other* sRGB-labeled ICC profile
+    /// with different bytes correctly returns `false` here — Aurora
+    /// can't cheaply prove that's colorimetrically identical, so it
+    /// gets full profile treatment rather than being silently
+    /// reclassified.
+    ///
+    /// Exists here rather than in a format crate (e.g. `aurora-io`)
+    /// because it's a colour-domain concept: any format with its own
+    /// "lightweight sRGB tag" convention (PNG's `sRGB` chunk today,
+    /// potentially others later) can reuse it without reaching back up
+    /// the crate layering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ColorError::SerializeFailed`] if either profile fails
+    /// to serialize via [`Self::to_bytes`].
+    pub fn is_exactly_srgb(&self) -> Result<bool, ColorError> {
+        Ok(self.to_bytes()? == Self::srgb().to_bytes()?)
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +141,29 @@ mod tests {
         assert!(!bytes.is_empty());
         if let Err(err) = IccProfile::from_bytes(&bytes) {
             unreachable!("{err:?}");
+        }
+    }
+
+    #[test]
+    fn is_exactly_srgb_is_true_for_the_built_in_srgb_profile() {
+        match IccProfile::srgb().is_exactly_srgb() {
+            Ok(is_srgb) => assert!(is_srgb, "the built-in sRGB profile must match itself"),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn is_exactly_srgb_is_false_for_a_real_different_profile() {
+        let profile = match IccProfile::from_bytes(ECI_RGBV2_ICC) {
+            Ok(profile) => profile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match profile.is_exactly_srgb() {
+            Ok(is_srgb) => assert!(
+                !is_srgb,
+                "a real, different embedded profile must not match sRGB"
+            ),
+            Err(err) => unreachable!("{err:?}"),
         }
     }
 }

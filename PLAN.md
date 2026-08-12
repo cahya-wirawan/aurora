@@ -6370,6 +6370,48 @@ structural design work.
   for PNG also remains open. `aurora-app` still has no colour-
   management UI or JPEG-quality UI to drive any of this with anything
   other than the sRGB/default-quality case in practice.
+
+  **Addendum, done 2026-08-12 — the "this profile is exactly sRGB"
+  detection named above as open, closed.** New
+  `aurora_color::IccProfile::is_exactly_srgb` (`crates/aurora-color/src/profile.rs`):
+  deliberately narrow — a byte-exact `to_bytes()` comparison against
+  `IccProfile::srgb()`, not real colorimetric equivalence between
+  differently-encoded sRGB-ish profiles, since `lcms2` gives this crate
+  no structural profile comparison to work with. Confirmed
+  deterministic first, by hand, before relying on it: two independent
+  `IccProfile::srgb()` instances re-serialize to identical 588-byte
+  output, so the comparison isn't chasing a moving target the way
+  re-encoding a *loaded* file's profile can (`to_bytes_round_trips_a_real_loaded_profile`'s
+  own long-standing comment already notes `lcms2` is free to embed a
+  fresh timestamp/profile ID on *that* path). Lives in `aurora-color`,
+  not `aurora-io`, since it's a colour-domain concept another format
+  crate (TIFF, JPEG) could reuse later without a new layering edge —
+  `aurora-io` already depends on `aurora-color`. PNG's `encoder_info`
+  (shared by `encode`/`encode_16`) now branches on it: exactly sRGB
+  writes `info.srgb = Some(SrgbRenderingIntent::Perceptual)` (this
+  crate's own default pick, not a colour-management policy decision)
+  and leaves `info.icc_profile` unset; anything else keeps the existing
+  full `iCCP` embedding unchanged. `decode` needed zero changes —
+  proved, not just argued: a real round-trip test encodes an
+  sRGB-tagged image, decodes those exact output bytes, and confirms the
+  decoded colour space's `to_bytes()` matches `IccProfile::srgb().to_bytes()`
+  exactly, exercising `decode`'s pre-existing "no `iCCP` chunk at all"
+  fallback path against a file this change actually produces. A
+  structural chunk-type scan (real 4-byte-length/4-byte-type walk, not
+  a substring search) confirms `encode`/`encode_16` emit a real `sRGB`
+  chunk marker and genuinely no `iCCP` marker for an sRGB image, the
+  reverse for the existing ECI RGBv2 non-sRGB fixture (still gets the
+  full `iCCP` chunk, byte-verified against an independent `png::Decoder`
+  read of the encoded output, not just presence), and that the two
+  chunks are never both set at once. 4 new tests (15 total in the PNG
+  module; 2 more in `aurora-color`, 29 total there). Full local gate
+  clean (`cargo
+  test --workspace` — `nextest` wasn't installed in this session,
+  `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`, `cargo fmt --all --check`); layering needed no change
+  (`aurora-io` → `aurora-color` already existed, confirmed via
+  `Cargo.toml` diffs since `scripts/check_layering.py` still can't run
+  in this sandbox — `tomllib` needs Python ≥3.11).
 - [x] **More format gaps: JPEG ICC, TIFF multi-page, TIFF compressed
   export** — done 2026-08-06, closing most of what the previous Format
   gaps bullet had just named as still open, in two committed steps.

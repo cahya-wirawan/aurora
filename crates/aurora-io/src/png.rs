@@ -30,13 +30,20 @@
 //!   [`aurora_color::IccProfile::srgb`] only when the file carries no
 //!   profile at all — PNG's own convention for an untagged file.
 //!   [`encode`]/[`encode_16`] embed `image.color_space()`'s own real
-//!   bytes unconditionally (`aurora_color::IccProfile::to_bytes`),
-//!   including the common case where that's just the built-in sRGB
-//!   profile — simple and always correct, at the cost of a few KB
-//!   this crate doesn't yet try to save by detecting "this profile is
-//!   exactly sRGB" and writing PNG's own lighter `sRGB` chunk instead;
-//!   real, separate follow-on work if file size ever becomes a real
-//!   concern here.
+//!   bytes (`aurora_color::IccProfile::to_bytes`) as a full `iCCP`
+//!   chunk — *except* when the colour space is detected as exactly the
+//!   built-in sRGB profile (added 2026-08-12,
+//!   `aurora_color::IccProfile::is_exactly_srgb`, a byte-exact
+//!   `to_bytes()` comparison against `IccProfile::srgb()`, deliberately
+//!   narrow — not real colorimetric equivalence between
+//!   differently-encoded sRGB-ish profiles), in which case PNG's own
+//!   lighter `sRGB` chunk (one byte) is written instead and `iCCP` is
+//!   omitted entirely; the two chunks are mutually exclusive per the
+//!   PNG spec, so exactly one is ever written. [`decode`] needed no
+//!   change for this: a file with no `iCCP` chunk already falls back to
+//!   [`aurora_color::IccProfile::srgb()`], which is exactly what a
+//!   file written with the new `sRGB` chunk looks like on the way back
+//!   in.
 
 use aurora_color::{IccProfile, dither_quantize, promote_u8, promote_u16, quantize_u16};
 use half::f16;
@@ -115,19 +122,37 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
 
 /// Builds the `png::Info` [`encode`]/[`encode_16`] both encode against:
 /// `width`/`height`/`color_type`/`bit_depth` for the real pixel data,
-/// plus `image.color_space()`'s own real bytes embedded as a real
-/// `iCCP` chunk (see this module's own doc comment for why
-/// unconditionally, including the common sRGB case).
+/// plus `image.color_space()`'s own colour tag. When the colour space
+/// is exactly the built-in sRGB profile
+/// (`IccProfile::is_exactly_srgb`), this writes PNG's lighter `sRGB`
+/// chunk (`info.srgb`, one byte) instead of embedding the full `iCCP`
+/// profile — a real detection of the case this module's own doc
+/// comment used to name as deferred. Any other profile, including a
+/// different file's own sRGB-labeled ICC profile that doesn't
+/// byte-match Aurora's built-in one, still gets the full `iCCP`
+/// treatment: `sRGB` and `iCCP` are mutually exclusive per the PNG
+/// spec, so exactly one of `info.srgb`/`info.icc_profile` is ever set,
+/// never both.
 ///
 /// # Errors
 ///
-/// Returns [`IoError::Color`] if `image.color_space().to_bytes()`
-/// fails.
+/// Returns [`IoError::Color`] if `image.color_space().to_bytes()` or
+/// `image.color_space().is_exactly_srgb()` fails.
 fn encoder_info(image: &Image, bit_depth: png::BitDepth) -> Result<png::Info<'static>, IoError> {
     let mut info = png::Info::with_size(image.width(), image.height());
     info.color_type = png::ColorType::Rgba;
     info.bit_depth = bit_depth;
-    info.icc_profile = Some(image.color_space().to_bytes()?.into());
+    if image.color_space().is_exactly_srgb()? {
+        // The lighter chunk: PNG's own convention for "this is exactly
+        // sRGB", one byte instead of a multi-KB embedded profile.
+        // `Perceptual` is the conventional default rendering intent
+        // most PNG encoders use for this chunk absent any more specific
+        // intent to preserve -- not a colour-management policy call,
+        // just this crate's own reasonable default.
+        info.srgb = Some(png::SrgbRenderingIntent::Perceptual);
+    } else {
+        info.icc_profile = Some(image.color_space().to_bytes()?.into());
+    }
     Ok(info)
 }
 
@@ -190,9 +215,50 @@ pub fn encode_16(image: &Image) -> Result<Vec<u8>, IoError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode};
+    use super::{decode, encode, encode_16};
     use aurora_color::{promote_u8, quantize_u8};
     use half::f16;
+
+    /// Walks a real PNG byte stream's own chunk structure (8-byte
+    /// signature, then repeated 4-byte length / 4-byte ASCII type /
+    /// `length` bytes of data / 4-byte CRC) and returns each chunk's
+    /// own 4-byte type tag paired with its data slice. A real,
+    /// structural scan — not a naive substring search that a
+    /// type-like byte sequence inside some unrelated chunk's data
+    /// could fool. Malformed input just yields a short/empty result
+    /// rather than panicking; a test asserting on the *presence* of a
+    /// specific chunk type still gets a real, meaningful failure.
+    fn chunk_entries(bytes: &[u8]) -> Vec<([u8; 4], &[u8])> {
+        let mut entries = Vec::new();
+        let Some(mut rest) = bytes.get(8..) else {
+            return entries;
+        };
+        while rest.len() >= 12 {
+            let Some(length_bytes) = rest.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+                break;
+            };
+            let length = u32::from_be_bytes(length_bytes) as usize;
+            let Some(chunk_type) = rest.get(4..8).and_then(|s| <[u8; 4]>::try_from(s).ok()) else {
+                break;
+            };
+            let Some(data) = length.checked_add(8).and_then(|end| rest.get(8..end)) else {
+                break;
+            };
+            entries.push((chunk_type, data));
+            let Some(chunk_total) = length.checked_add(12) else {
+                break;
+            };
+            let Some(next) = rest.get(chunk_total..) else {
+                break;
+            };
+            rest = next;
+        }
+        entries
+    }
+
+    fn chunk_types(bytes: &[u8]) -> Vec<[u8; 4]> {
+        chunk_entries(bytes).into_iter().map(|(t, _)| t).collect()
+    }
 
     /// Builds a real PNG file's bytes via the `png` crate's own
     /// encoder, independent of this module's own `encode` — an
@@ -547,6 +613,168 @@ mod tests {
             "16-bit export must preserve far more precision than 8-bit: \
              expected ~{value}, got {}",
             red.to_f32()
+        );
+    }
+
+    fn srgb_test_image() -> crate::Image {
+        match crate::Image::new(
+            1,
+            1,
+            aurora_color::IccProfile::srgb(),
+            vec![
+                f16::from_f32(0.25),
+                f16::from_f32(0.5),
+                f16::from_f32(0.75),
+                f16::from_f32(1.0),
+            ],
+        ) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_writes_the_lighter_srgb_chunk_instead_of_iccp_for_an_srgb_image() {
+        let bytes = match encode(&srgb_test_image()) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let types = chunk_types(&bytes);
+        assert!(
+            types.contains(b"sRGB"),
+            "expected a real sRGB chunk marker in the output, got chunk types: {types:?}"
+        );
+        assert!(
+            !types.contains(b"iCCP"),
+            "an sRGB image must not also carry a full iCCP chunk, got chunk types: {types:?}"
+        );
+
+        // Independent-reader cross-check via the `png` crate's own
+        // decoder directly, not this module's `decode` -- confirms
+        // `Info` itself, not just the raw type-tag scan above.
+        let decoder = png::Decoder::new(bytes.as_slice());
+        let reader = match decoder.read_info() {
+            Ok(reader) => reader,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            reader.info().srgb.is_some(),
+            "expected Info::srgb to be set"
+        );
+        assert!(
+            reader.info().icc_profile.is_none(),
+            "sRGB and iCCP are mutually exclusive -- both must never be set at once"
+        );
+    }
+
+    #[test]
+    fn encode_16_writes_the_lighter_srgb_chunk_instead_of_iccp_for_an_srgb_image() {
+        let bytes = match encode_16(&srgb_test_image()) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let types = chunk_types(&bytes);
+        assert!(
+            types.contains(b"sRGB"),
+            "expected a real sRGB chunk marker in the output, got chunk types: {types:?}"
+        );
+        assert!(
+            !types.contains(b"iCCP"),
+            "an sRGB image must not also carry a full iCCP chunk, got chunk types: {types:?}"
+        );
+    }
+
+    #[test]
+    fn encode_writes_a_real_iccp_chunk_with_the_images_own_bytes_for_a_non_srgb_profile() {
+        let profile = match aurora_color::IccProfile::from_bytes(ECI_RGBV2_ICC) {
+            Ok(profile) => profile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Captured before `profile` moves into `Image::new` below.
+        let expected_icc_bytes = match profile.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let image = match crate::Image::new(
+            1,
+            1,
+            profile,
+            vec![
+                f16::from_f32(0.0),
+                f16::from_f32(0.0),
+                f16::from_f32(0.0),
+                f16::from_f32(1.0),
+            ],
+        ) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let bytes = match encode(&image) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let types = chunk_types(&bytes);
+        assert!(
+            types.contains(b"iCCP"),
+            "a real, different profile must still get the full iCCP chunk, got: {types:?}"
+        );
+        assert!(
+            !types.contains(b"sRGB"),
+            "a non-sRGB profile must not incorrectly also get the lighter sRGB chunk, got: {types:?}"
+        );
+
+        // Independent-reader cross-check: the `png` crate's own decoder
+        // decompresses the real iCCP chunk payload back to the exact
+        // bytes this module fed the encoder -- proves "with the correct
+        // bytes", not just "some iCCP chunk exists".
+        let decoder = png::Decoder::new(bytes.as_slice());
+        let reader = match decoder.read_info() {
+            Ok(reader) => reader,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match &reader.info().icc_profile {
+            Some(icc_bytes) => assert_eq!(
+                icc_bytes.as_ref(),
+                expected_icc_bytes.as_slice(),
+                "the embedded iCCP payload must match the image's own serialized profile bytes exactly"
+            ),
+            None => unreachable!("expected a real iCCP chunk for a non-sRGB profile"),
+        }
+        assert!(
+            reader.info().srgb.is_none(),
+            "sRGB and iCCP are mutually exclusive -- both must never be set at once"
+        );
+    }
+
+    #[test]
+    fn encode_then_decode_round_trips_srgb_through_the_lighter_chunk_with_zero_decode_changes() {
+        let bytes = match encode(&srgb_test_image()) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Sanity that this test is actually exercising the new lighter-
+        // chunk path, not silently falling back to iCCP.
+        assert!(!chunk_types(&bytes).contains(b"iCCP"));
+        assert!(chunk_types(&bytes).contains(b"sRGB"));
+
+        let decoded = match decode(&bytes) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (Ok(decoded_bytes), Ok(srgb_bytes)) = (
+            decoded.color_space().to_bytes(),
+            aurora_color::IccProfile::srgb().to_bytes(),
+        ) else {
+            unreachable!("both are real, always-serializable profiles");
+        };
+        assert_eq!(
+            decoded_bytes, srgb_bytes,
+            "a PNG written with the lighter sRGB chunk must decode back to exactly sRGB, \
+             with zero decode-side special-casing required"
         );
     }
 }
