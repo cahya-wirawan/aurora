@@ -397,12 +397,12 @@
 //! of assuming `zoom() == 1.0`, so panning while zoomed picks the right
 //! tile too. **Scope, stated honestly**: the atlas's own uv offset is
 //! still only tile-granular (no sub-tile fractional scroll — see
-//! `tile_origin_for_view`'s own doc comment); the atlas is sized once at
-//! startup and does not resize with the window
-//! (`TileResidency`'s own documented limitation); rendering a lower mip
+//! `tile_origin_for_view`'s own doc comment); rendering a lower mip
 //! while zoomed out or panning (`spike/FINDINGS.md`'s own progressive-
 //! rendering finding), rotation, rulers, guides, grid, and snap all
-//! remain this bullet's own still-open remainder.
+//! remain this bullet's own still-open remainder. **Window resize is
+//! handled** (`apply_resize` calls `TileResidency::resize`, see that
+//! method's own doc comment) — no longer part of this remainder.
 //!
 //! **A real bug fixed, 2026-08-06**: real hardware (macOS) reported
 //! ~100% CPU at idle. `about_to_wait` was requesting a redraw
@@ -4789,12 +4789,12 @@ const ERASER_RADIUS: f32 = 24.0;
 // instead of assuming 100% zoom.
 //
 // Scope, stated honestly: the atlas's own uv offset is still only
-// tile-granular (no sub-tile fractional scroll); the atlas is sized once
-// at startup and does not resize with the window (`TileResidency`'s own
-// documented limitation); and rendering a lower mip while zoomed out or
-// panning (the progressive-rendering finding `spike/FINDINGS.md` names),
-// rotation, rulers, guides, grid, and snap are all still separately
-// open, exactly as the bullet's own name says.
+// tile-granular (no sub-tile fractional scroll); and rendering a lower
+// mip while zoomed out or panning (the progressive-rendering finding
+// `spike/FINDINGS.md` names), rotation, rulers, guides, grid, and snap
+// are all still separately open, exactly as the bullet's own name says.
+// Window resize is handled (`apply_resize` calls `TileResidency::resize`)
+// -- no longer part of this remainder.
 
 /// The canvas dock area's own on-screen rectangle, in physical pixels
 /// (`bounds`'s logical units scaled by `scale_factor`) — `(x, y, width,
@@ -6224,10 +6224,10 @@ impl App {
     }
 
     /// Recomputes the workspace layout for `physical_size`, then
-    /// reconfigures the presentation surface to match — layout is pure
-    /// geometry (no GPU needed) and stays current even before a
-    /// window/device exist, unlike the surface resize below, which does
-    /// need both.
+    /// reconfigures the presentation surface *and* the canvas atlas to
+    /// match — layout is pure geometry (no GPU needed) and stays current
+    /// even before a window/device exist, unlike the GPU resizes below,
+    /// which do need both.
     ///
     /// `physical_size` is converted to logical pixels via
     /// [`logical_size`]/`self.scale_factor` before it reaches
@@ -6237,9 +6237,20 @@ impl App {
     /// would make widgets balloon to the wrong on-screen size on any
     /// display where `scale_factor != 1.0` — exactly the class of bug
     /// PLAN.md M1.8's "per-monitor DPI and fractional scaling" bullet is
-    /// named for. The GPU surface itself still resizes to the real
-    /// physical size — a render target's pixel dimensions are never
-    /// logical.
+    /// named for. The GPU surface and the canvas atlas both still resize
+    /// to real physical sizes — a render target's (and a texture's own)
+    /// pixel dimensions are never logical.
+    ///
+    /// `self.residency`'s own resize uses [`canvas_area_physical_size`]
+    /// computed *after* `compute_layout` above, deliberately — the
+    /// canvas dock area's own bounds only reflect the new window size
+    /// once layout has re-run, so sizing the atlas from stale
+    /// pre-resize bounds here would leave it one resize behind. A
+    /// genuinely unknown canvas-area widget id (`canvas_area_physical_size`
+    /// returning `None`) is handled by simply skipping the atlas resize
+    /// this call — the same "never actually happens for
+    /// `workspace.canvas_area` in practice, but handle it honestly"
+    /// stance `resumed`'s own analogous call already takes.
     fn apply_resize(&mut self, physical_size: (u32, u32)) {
         let (width, height) = logical_size(physical_size, self.scale_factor);
         self.workspace.tree.compute_layout(width, height);
@@ -6248,6 +6259,12 @@ impl App {
             return;
         };
         surface.resize(gpu.device(), physical_size);
+
+        if let Some(residency) = self.residency.as_mut()
+            && let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor)
+        {
+            residency.resize(gpu.device(), gpu.queue(), canvas_size);
+        }
     }
 
     /// Clears the surface to the real theme background colour, then —

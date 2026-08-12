@@ -4071,16 +4071,53 @@ structural design work.
   tests (88 total).
 
   **Still open, exactly as the bullet's own name says**: rotation,
-  rulers, guides, grid, snap, and true "infinite" zoom (the atlas is
-  sized once at startup and does not resize with the window,
-  `TileResidency`'s own documented limitation; its own uv offset is
-  still only tile-granular, no sub-tile fractional scroll; and nothing
-  yet renders a lower mip while zoomed out or panning, the
-  progressive-rendering finding `spike/FINDINGS.md` names). Not
+  rulers, guides, grid, snap, and true "infinite" zoom (the atlas's own
+  uv offset is still only tile-granular, no sub-tile fractional scroll;
+  and nothing yet renders a lower mip while zoomed out or panning, the
+  progressive-rendering finding `spike/FINDINGS.md` names — window
+  resize itself is handled now, see the 2026-08-12 addendum below). Not
   real-hardware-verified — this sandbox has no display server, so
   nothing has shown this crate's own window with real content on an
   actual screen since M1.8's original human-verification pass, which
   predates this work.
+
+  **Window resize wired up, 2026-08-12** — closes the specific gap this
+  section used to name ("the atlas is sized once at startup and does
+  not resize with the window, `TileResidency`'s own documented
+  limitation"). `aurora_gpu::TileResidency` gained `resize(device,
+  queue, viewport_px)`: there's no in-place way to resize a
+  `wgpu::Texture`, so it rebuilds `texture`/`view`/`sampler`/
+  `uniform_buffer` via `Self::new`'s own construction logic
+  (`*self = Self::new(...)`), which also resets `slots` to empty —
+  every old slot coordinate was computed against the *old* grid and is
+  meaningless (even out of bounds) against the new one, so the next
+  `sync` call re-uploads every visible tile fresh rather than trusting
+  stale bookkeeping. The document-space `origin` carries over unchanged
+  (a resize changes how much of the document is visible, not which part
+  is being viewed); `zoom` doesn't (not stored between calls), which is
+  harmless since `aurora-app`'s `redraw` calls `set_origin` with the
+  live zoom every frame regardless. No-ops on a zero-sized request,
+  mirroring `GpuSurface::resize`'s own guard. `App::apply_resize` now
+  calls it with `canvas_area_physical_size` recomputed *after*
+  `compute_layout` (verified that ordering is correct, not assumed),
+  handling a `None` canvas-area lookup by skipping the atlas resize that
+  call rather than unwrapping. 6 new real-GPU tests (5 in
+  `aurora-gpu/src/residency.rs`'s own test module — dimension change,
+  stale-slot-occupancy correctness with a shrinking grid, the zero-size
+  no-op, and origin preservation — plus 1 pixel-readback test in
+  `residency_test.rs` proving a post-resize upload lands in the correct
+  slot of the new, bigger atlas, not just that the resize call didn't
+  panic). `App::apply_resize` itself has no direct unit test — same
+  "`ApplicationHandler` methods need a real window/event loop" category
+  `resumed`/`redraw` already fall into (`App::new` needs a real
+  `winit::event_loop::EventLoopProxy`, and `self.surface` needs a real
+  window target; nothing in this sandbox can construct either headlessly)
+  — but the pure logic it calls (`canvas_area_physical_size`) already had
+  its own dedicated coverage before this change, and `TileResidency::resize`
+  is now real-GPU-tested directly, as above. **Still explicitly out of
+  scope**: rotation, rulers, guides, grid, snap, true infinite zoom, and
+  sub-tile fractional pan — this addendum is window-resize only, nothing
+  else in the "still open" list above moved.
 
   Verified: `cargo fmt --all --check`, `cargo clippy --workspace
   --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D

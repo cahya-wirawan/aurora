@@ -48,9 +48,10 @@ pub struct SyncStats {
 /// real `aurora_tile::TileStore` API rather than the spike's own
 /// throwaway store.
 ///
-/// Deliberately does not handle window resize — recreating the atlas at
-/// a new size is separate, still-open M1.2 work (surface configuration
-/// and resize).
+/// Handles window resize via [`Self::resize`], which rebuilds the atlas
+/// texture at the new size and resets slot occupancy — see that
+/// method's own doc comment for exactly what carries over and what
+/// doesn't.
 pub struct TileResidency {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -196,6 +197,44 @@ impl TileResidency {
         self.write_uniform(queue, viewport_px, zoom);
     }
 
+    /// Rebuilds the atlas at a new `viewport_px` — the real fix for the
+    /// limitation this struct's own doc comment used to name. There is
+    /// no in-place way to resize a `wgpu::Texture`, so this reconstructs
+    /// `texture`/`view`/`sampler`/`uniform_buffer` via [`Self::new`]'s
+    /// own construction logic (`*self = Self::new(...)`) rather than
+    /// duplicating it, which also resets `slots` to empty exactly as a
+    /// freshly-constructed atlas starts. That reset matters for
+    /// correctness, not just tidiness: every slot coordinate in the old
+    /// `HashMap` was computed against the *old* `grid` (`tile index
+    /// modulo grid size`) and is meaningless — even out of bounds — for
+    /// the new one, so the next [`Self::sync`] call must re-upload every
+    /// visible tile fresh rather than trusting stale bookkeeping.
+    ///
+    /// The document-space `origin` (which tile is top-left) carries over
+    /// unchanged — a resize changes how much of the document is
+    /// visible, not *which* part is being viewed. `zoom` isn't carried
+    /// over (this method has no way to know the caller's current value,
+    /// and `TileResidency` doesn't store it between calls), so the
+    /// uniform is rewritten at `zoom = 1.0` same as [`Self::new`]; a
+    /// caller that cares about zoom being exactly right for the one
+    /// frame between a resize and its next [`Self::set_origin`] call
+    /// should pass its current zoom there too. `aurora-app`'s real usage
+    /// calls `set_origin` every frame before `sync` regardless, so both
+    /// `origin` and `zoom` are corrected before anything is drawn.
+    ///
+    /// No-ops on a zero-sized request (a minimized window can report
+    /// `0x0`), mirroring [`crate::GpuSurface::resize`]'s own guard
+    /// against calling into wgpu with an invalid size, which panics.
+    pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, viewport_px: (u32, u32)) {
+        if viewport_px.0 == 0 || viewport_px.1 == 0 {
+            return;
+        }
+        let origin = self.origin;
+        *self = Self::new(device, queue, viewport_px);
+        self.origin = origin;
+        self.write_uniform(queue, viewport_px, 1.0);
+    }
+
     fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32), zoom: f32) {
         let tex_w = (self.grid.0 * TILE) as f32;
         let tex_h = (self.grid.1 * TILE) as f32;
@@ -230,11 +269,13 @@ impl TileResidency {
     /// that order forward, one call at a time, converging to
     /// `remaining == 0` rather than starving any tile.
     ///
-    /// `force`: re-upload every visible slot unconditionally, for the
-    /// future resize case (not exercised by anything yet, since resize
-    /// itself is separate, still-open M1.2 work — the parameter exists
-    /// now because retrofitting it later is exactly what this bullet is
-    /// about avoiding).
+    /// `force`: re-upload every visible slot unconditionally. Still not
+    /// exercised by [`Self::resize`] — that method clears `slots`
+    /// directly (every slot already reads as non-resident against the
+    /// new, empty map, so the ordinary resident check already forces a
+    /// full re-upload on the next `sync` without needing this flag) —
+    /// so this remains without a real caller, kept for a future case
+    /// that wants a full re-sync without a slot-mapping change.
     ///
     /// `surface`: which of `store`'s surfaces this atlas is showing
     /// (ADR 0010 — `store` may hold many). This crate has no document
@@ -617,5 +658,120 @@ mod tests {
             }) => {}
             other => unreachable!("expected InvalidTileUpload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resize_changes_the_atlas_texture_dimensions() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        let before = residency.texture().size();
+        assert_eq!(before.width, 512, "grid (2,2) -> 512x512 atlas");
+        assert_eq!(before.height, 512);
+
+        residency.resize(context.device(), context.queue(), (512, 512));
+        let after = residency.texture().size();
+        assert_eq!(
+            residency.grid,
+            (3, 3),
+            "512.div_ceil(256) + 1 == 3 on both axes"
+        );
+        assert_eq!(after.width, 768, "grid (3,3) -> 768x768 atlas");
+        assert_eq!(after.height, 768);
+        assert_ne!(
+            (before.width, before.height),
+            (after.width, after.height),
+            "resize must actually change the real GPU texture's dimensions"
+        );
+    }
+
+    #[test]
+    fn resize_resets_slots_so_a_smaller_grid_does_not_leak_stale_occupancy() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store(64);
+
+        // 512x512 viewport -> grid (3, 3): slot (2, 2) is occupied.
+        let mut residency = TileResidency::new(context.device(), context.queue(), (512, 512));
+        assert_eq!(residency.grid, (3, 3));
+        for gy in 0..3 {
+            for gx in 0..3 {
+                paint(&mut store, TileId { x: gx, y: gy }, [1.0, 1.0, 0.0, 1.0]);
+            }
+        }
+        let first = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
+        assert_eq!(first.uploaded, 9, "first sync fills the whole 3x3 grid");
+        assert_eq!(residency.slots.len(), 9);
+
+        // Shrink to a 256x256 viewport -> grid (2, 2). Slot (2, 2) from
+        // the old grid is now out of bounds for the new one -- if
+        // `resize` didn't clear `slots`, that stale entry would simply
+        // sit unread (harmless) but any slot coordinate the old map
+        // shared with the new grid (e.g. (0, 0), (1, 0), ...) would
+        // wrongly read as still-resident and get skipped.
+        residency.resize(context.device(), context.queue(), (256, 256));
+        assert_eq!(residency.grid, (2, 2));
+        assert!(
+            residency.slots.is_empty(),
+            "resize must reset slot occupancy, not carry over old-grid coordinates"
+        );
+
+        // Nothing marked dirty since the paint above (tiles are clean in
+        // the store), but every visible slot must still upload because
+        // `slots` was reset -- proves the resident check isn't trusting
+        // stale bookkeeping across the resize.
+        let second = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
+        assert_eq!(
+            second.uploaded, 4,
+            "post-resize sync must re-upload every visible slot in the new (2,2) grid"
+        );
+        assert_eq!(second.errors, 0, "no panic, no wrong-tile-shown");
+    }
+
+    #[test]
+    fn resize_is_a_no_op_on_a_zero_sized_request() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        residency.set_origin(context.queue(), TileId { x: 3, y: 7 }, (256, 256), 1.0);
+        let before_size = residency.texture().size();
+        let before_grid = residency.grid;
+        let before_origin = residency.origin;
+
+        residency.resize(context.device(), context.queue(), (0, 256));
+        residency.resize(context.device(), context.queue(), (256, 0));
+        residency.resize(context.device(), context.queue(), (0, 0));
+
+        assert_eq!(
+            residency.texture().size(),
+            before_size,
+            "a zero-sized resize request must leave the real atlas texture untouched"
+        );
+        assert_eq!(residency.grid, before_grid);
+        assert_eq!(
+            residency.origin, before_origin,
+            "a no-op resize must not disturb existing origin/pan state either"
+        );
+    }
+
+    #[test]
+    fn resize_preserves_the_document_space_origin() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        residency.set_origin(context.queue(), TileId { x: 5, y: 9 }, (256, 256), 1.0);
+        assert_eq!(residency.origin(), TileId { x: 5, y: 9 });
+
+        residency.resize(context.device(), context.queue(), (512, 512));
+
+        assert_eq!(
+            residency.origin(),
+            TileId { x: 5, y: 9 },
+            "resize changes how much of the document is visible, not which part"
+        );
     }
 }
