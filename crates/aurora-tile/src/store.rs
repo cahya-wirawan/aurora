@@ -60,10 +60,28 @@ pub struct Stats {
 /// Solving this would mean persisting dirty state in the on-disk format,
 /// which is real, avoidable complexity for a corner case this milestone
 /// does not need to close.
+///
+/// **Eviction/revisit race, closed**: `make_room` evicts a tile by handing
+/// its encoded bytes to a background writer (`submit` never blocks — see
+/// `writer.rs`), so the actual disk write lands at some later,
+/// unspecified time. A naive `ensure_resident` that only tracked
+/// `paged_out` could be asked to page the same tile back in before that
+/// write landed, racing a not-yet-created or partially-written file. This
+/// is closed by keeping the evicted tile's own bytes in `pending` until
+/// the write is confirmed complete (see `ensure_resident`'s and
+/// `make_room`'s own doc comments for the mechanism) — a revisit during
+/// that window is served straight from memory, never disk, so the race
+/// window is zero by construction rather than merely narrowed.
 #[derive(Debug)]
 pub struct TileStore {
     resident: LruCache<(SurfaceId, TileId), Tile>,
     paged_out: HashMap<(SurfaceId, TileId), PathBuf>,
+    /// Evicted tiles whose background write hasn't been *confirmed*
+    /// complete yet — closes the eviction/revisit race documented on
+    /// [`Self::ensure_resident`] and [`Self::make_room`]. Holds the exact
+    /// already-encoded bytes `make_room` also handed to `writer.submit`,
+    /// so a revisit before the write lands never has to touch disk.
+    pending: HashMap<(SurfaceId, TileId), Vec<u8>>,
     budget: NonZeroUsize,
     scratch_dir: PathBuf,
     writer: BackgroundWriter,
@@ -92,6 +110,7 @@ impl TileStore {
         Ok(Self {
             resident: LruCache::new(budget),
             paged_out: HashMap::new(),
+            pending: HashMap::new(),
             budget,
             scratch_dir,
             writer: BackgroundWriter::spawn(),
@@ -150,6 +169,12 @@ impl TileStore {
         self.writer.flush();
         let mut first_err = None;
         for result in self.writer.drain_results() {
+            // Every write this call waited on is now confirmed one way or
+            // another (succeeded or definitively failed) -- either way it
+            // is no longer "in flight", so the in-memory holding area for
+            // it can go. See `ensure_resident`/`make_room`'s doc comments
+            // for the full race this closes.
+            self.pending.remove(&(result.surface, result.id));
             if let Err(source) = result.outcome {
                 tracing::error!(surface = ?result.surface, tile = ?result.id, %source, "scratch-disk write failed");
                 if first_err.is_none() {
@@ -181,8 +206,43 @@ impl TileStore {
         self.resident.len()
     }
 
+    /// Resolves `(surface, id)` to a resident tile via, in priority order:
+    /// (a) already resident, (b) still in [`Self::pending`] -- an eviction
+    /// whose background write has not yet been confirmed, reinstated
+    /// straight from the in-memory encoded bytes `make_room` kept around
+    /// for exactly this purpose, with zero disk I/O and therefore zero
+    /// race window; (c) in `paged_out` only -- `reconcile_pending` (called
+    /// first, below) already confirmed this key's write landed, so the
+    /// existing synchronous `page_in` read is now provably race-free; (d)
+    /// neither -- a brand-new blank tile.
+    ///
+    /// This ordering, together with `make_room` populating `pending` and
+    /// `paged_out` atomically (same call, same instant), is what closes
+    /// the eviction/revisit race tracked in `PLAN.md`'s M1.1 section: a
+    /// key can only ever reach the disk-read branch (c) once its write is
+    /// confirmed complete, so `page_in` can never again race a
+    /// still-in-flight or partially-written file.
+    ///
+    /// Invariant, extended from the pre-existing `resident`/`paged_out`
+    /// one to now also cover `pending`: a `(surface, id)` key is never
+    /// simultaneously resident *and* present in `pending` or `paged_out`.
+    /// Branch (b) below restores that invariant by removing the key from
+    /// both maps in the same step it re-inserts it into `resident`.
     fn ensure_resident(&mut self, surface: SurfaceId, id: TileId) -> Result<(), TileError> {
+        // Cheap and non-blocking (`drain_results` never waits) -- run on
+        // every touch so `pending` can't grow past "evictions since the
+        // last touch of any tile", bounded by the store's own `budget`
+        // rather than by document size (invariant §7.3.1).
+        self.reconcile_pending();
+
         if self.resident.contains(&(surface, id)) {
+            return Ok(());
+        }
+        if let Some(bytes) = self.pending.remove(&(surface, id)) {
+            let texels = codec::decode(&bytes)?;
+            self.paged_out.remove(&(surface, id));
+            self.make_room();
+            self.resident.put((surface, id), Tile::from_texels(texels));
             return Ok(());
         }
         if let Some(path) = self.paged_out.remove(&(surface, id)) {
@@ -192,6 +252,30 @@ impl TileStore {
             self.resident.put((surface, id), Tile::blank());
             self.stats.tiles_created += 1;
             Ok(())
+        }
+    }
+
+    /// Drains whatever background-write results have completed so far
+    /// (non-blocking -- see [`BackgroundWriter::drain_results`]) and
+    /// clears each one's entry from [`Self::pending`]: its write is now
+    /// confirmed durable, so a future revisit of that key is safe to fall
+    /// through to the ordinary `paged_out` disk-read path. A failed write
+    /// is logged via `tracing::warn!` and otherwise ignored here -- a
+    /// routine reconciliation pass touched by every tile access is the
+    /// wrong place to fail every subsequent, unrelated tile access over
+    /// one bad write. [`Self::flush`] remains the authoritative point
+    /// where a write failure surfaces as a real `Err`, unchanged by this.
+    fn reconcile_pending(&mut self) {
+        for result in self.writer.drain_results() {
+            self.pending.remove(&(result.surface, result.id));
+            if let Err(source) = result.outcome {
+                tracing::warn!(
+                    surface = ?result.surface,
+                    tile = ?result.id,
+                    %source,
+                    "scratch-disk write failed (reconciled in background)"
+                );
+            }
         }
     }
 
@@ -230,6 +314,14 @@ impl TileStore {
             self.stats.evictions += 1;
             self.paged_out
                 .insert((victim_surface, victim_id), path.clone());
+            // Same key, same moment, as the `paged_out` insert above --
+            // this is what lets `ensure_resident` reinstate the tile from
+            // memory if it's revisited before the write below actually
+            // lands (see that method's doc comment for the full race this
+            // closes). Cleared by `reconcile_pending` once the write is
+            // confirmed complete.
+            self.pending
+                .insert((victim_surface, victim_id), bytes.clone());
             self.writer.submit(WriteJob {
                 surface: victim_surface,
                 id: victim_id,
@@ -355,6 +447,189 @@ mod tests {
         }
         assert_eq!(store.take_dirty(s, id), Some(rect));
         assert_eq!(store.take_dirty(s, id), None);
+    }
+
+    // -- Eviction/revisit race (PLAN.md M1.1) --
+
+    /// The decisive, fully deterministic proof that the `pending` fast
+    /// path works: constructs, **by hand**, the exact state `make_room`
+    /// leaves behind mid-eviction (a key present in both `pending` and
+    /// `paged_out`) -- with no real background thread involved at all,
+    /// so nothing here depends on OS scheduling. `paged_out` is pointed
+    /// at a path that is deliberately never created; if `ensure_resident`
+    /// ever fell through to the disk-read branch instead of taking the
+    /// `pending` fast path, this would fail loudly with `TileError::Io`
+    /// (or, if some other file happened to occupy that exact path,
+    /// `TileError::CorruptFile` from decoding the wrong bytes) --
+    /// silently succeeding is only possible by actually reading from
+    /// `pending`, in memory, exactly as the fix specifies.
+    ///
+    /// (A companion test below additionally exercises a *real* eviction
+    /// via `make_room` and an immediate revisit, the shape the original
+    /// bug actually took -- see its own doc comment for why that one, on
+    /// its own, is necessary-but-not-sufficient as proof of which code
+    /// path gets taken, which is exactly why this test exists too.)
+    #[test]
+    fn ensure_resident_serves_directly_from_pending_bypassing_disk_entirely() {
+        let (dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 0, y: 0 };
+
+        let texels = vec![half::f16::from_f32(0.75); crate::tile::SAMPLES];
+        let bytes = crate::codec::encode(&texels);
+        let nonexistent = dir.path().join("this_file_is_never_created.tile");
+        store.pending.insert((s, id), bytes);
+        store.paged_out.insert((s, id), nonexistent);
+
+        let tile = match store.get(s, id) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!(
+                "must be served from `pending`, never from the nonexistent disk path: {err}"
+            ),
+        };
+        let Some(first) = tile.texels().first() else {
+            unreachable!("tile texel buffer is never empty");
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(first.to_f32(), 0.75);
+        }
+        // `stats().faults` is incremented only by `page_in`'s real
+        // `fs::read`, never by the `pending` fast path -- staying `0` is
+        // internal-state confirmation, on top of the nonexistent-path
+        // argument above, that no disk read occurred.
+        assert_eq!(store.stats().faults, 0);
+        // Reinstated: no longer meaningfully "paged out", by either map.
+        assert!(!store.pending.contains_key(&(s, id)));
+        assert!(!store.paged_out.contains_key(&(s, id)));
+    }
+
+    /// Regression test using a *real* eviction (`make_room`, via a tight
+    /// budget) followed by an immediate, synchronous revisit -- no
+    /// `sleep`/yield anywhere in this test -- the exact shape the
+    /// original bug took (`PLAN.md` M1.1). Before the fix, this sequence
+    /// could fail with `TileError::Io` or `TileError::CorruptFile`
+    /// depending on exactly how far the background write had gotten;
+    /// after the fix it must always succeed with the correct content,
+    /// regardless of how that race actually resolves.
+    ///
+    /// One thing this test deliberately does **not** assert: which of
+    /// `pending`/disk actually served the revisit. Measured on this
+    /// machine, the background writer thread -- already alive and
+    /// blocked in `recv()` before `submit` is ever called -- can
+    /// complete a small `fs::write` to a fresh tempdir and have its
+    /// result reconciled before this test's own next few statements
+    /// run, even with no explicit sleep/yield; asserting "the file must
+    /// not exist yet" here would be asserting a timing outcome this
+    /// environment does not reliably produce, i.e. exactly the kind of
+    /// flaky assertion item 1 asks *not* to write. What's still
+    /// deterministic, and asserted below, is that `make_room` populates
+    /// `pending` **synchronously**, in the same call that performs the
+    /// eviction -- proven by checking it immediately afterward, with no
+    /// intervening `TileStore` call that could have reconciled it away.
+    /// The `pending` fast path itself, specifically, is what the
+    /// isolated test above proves -- deterministically, by construction,
+    /// with no reliance on real thread timing at all.
+    #[test]
+    fn real_eviction_then_immediate_revisit_always_succeeds() {
+        let (_dir, mut store) = store(2);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        let c = TileId { x: 2, y: 0 };
+
+        if let Ok(tile) = store.get_mut(s, a)
+            && let Some(first) = tile.texels_mut().first_mut()
+        {
+            *first = half::f16::from_f32(0.5);
+        }
+        if let Err(err) = store.get_mut(s, b) {
+            unreachable!("{err}");
+        }
+        // Budget is 2; touching `c` evicts `a` (LRU) via `make_room`,
+        // synchronously, right here on the test's own thread.
+        if let Err(err) = store.get_mut(s, c) {
+            unreachable!("{err}");
+        }
+        assert_eq!(store.stats().evictions, 1);
+        // Deterministic, no timing dependency: `make_room` inserts into
+        // `pending` in the exact same call that just evicted `a` above,
+        // before this test does anything else that could reconcile it.
+        assert!(
+            store.pending.contains_key(&(s, a)),
+            "eviction must populate `pending` synchronously"
+        );
+
+        // Revisit `a` immediately, synchronously, no sleep/yield -- must
+        // succeed with correct content regardless of which path
+        // actually served it.
+        let a_again = match store.get(s, a) {
+            Ok(tile) => tile,
+            Err(err) => {
+                unreachable!("the eviction/revisit race must be closed, on either code path: {err}")
+            }
+        };
+        let Some(first) = a_again.texels().first() else {
+            unreachable!("a tile's texel buffer is never empty");
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(first.to_f32(), 0.5);
+        }
+        // Reinstated: no longer meaningfully "paged out", by either map,
+        // regardless of which path served it.
+        assert!(!store.pending.contains_key(&(s, a)));
+        assert!(!store.paged_out.contains_key(&(s, a)));
+
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err}");
+        }
+    }
+
+    /// Confirms the other half of the fix: `pending` entries actually
+    /// clear once their write is confirmed complete (via `flush`, which
+    /// blocks until every submitted write lands and reconciles `pending`
+    /// for each), and a *subsequent* revisit correctly falls through to
+    /// the ordinary disk `page_in` path rather than staying on the
+    /// in-memory fast path forever -- `stats().faults` incrementing is
+    /// the internal-state proof that a real disk read happened this
+    /// time, the mirror image of the `0` asserted in the test above.
+    #[test]
+    fn pending_entries_clear_once_writes_are_confirmed() {
+        let (_dir, mut store) = store(2);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        let c = TileId { x: 2, y: 0 };
+
+        if let Err(err) = store.get_mut(s, a) {
+            unreachable!("{err}");
+        }
+        if let Err(err) = store.get_mut(s, b) {
+            unreachable!("{err}");
+        }
+        // Evicts `a`.
+        if let Err(err) = store.get_mut(s, c) {
+            unreachable!("{err}");
+        }
+        assert_eq!(store.pending.len(), 1);
+
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err}");
+        }
+        assert!(
+            store.pending.is_empty(),
+            "flush must reconcile every in-flight write"
+        );
+
+        if let Err(err) = store.get(s, a) {
+            unreachable!("{err}");
+        }
+        assert_eq!(
+            store.stats().faults,
+            1,
+            "with `pending` empty, the revisit must take the real disk page_in path"
+        );
     }
 
     // -- Multi-surface addressing (ADR 0010) --

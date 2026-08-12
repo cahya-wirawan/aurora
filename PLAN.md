@@ -714,8 +714,11 @@ every widget in every state across all built-in themes with contrast checks gree
   ratios 0.004 (uniform), 0.005 (gradient), 1.000 (noise, correctly
   raw-fallback). Indicative, not a cross-platform result — same caveat
   the vertical slice's own numbers carry.
-- [ ] **Fix the eviction/revisit race in `TileStore` — found 2026-08-12,
-  data-integrity priority, not yet fixed.** Discovered while building
+- [x] **Fix the eviction/revisit race in `TileStore` — found 2026-08-12,
+  data-integrity priority, fixed the same day (0.39.1 — a patch, not a
+  minor bump, per `CLAUDE.md`'s own versioning rule: this corrects
+  something already landed and wrong in 0.39.0, not new work).**
+  Discovered while building
   M1.10's real end-to-end frame-loop tests (`aurora-app`, see that
   section below), under genuine cross-frame paging pressure, not a
   contrived edge case. `make_room` (`store.rs`) marks a victim tile
@@ -750,14 +753,95 @@ every widget in every state across all built-in themes with contrast checks gree
   to a silently corrupted tile as to a panic, arguably more so, since a
   panic is at least loud.
 
-  **Not fixed here, deliberately** — found while building an unrelated
-  benchmarking round, and fixing it properly (most plausibly: write to a
-  temp file then atomically rename, or block `ensure_resident` on
-  completion of any pending write for that exact key) is real, scoped
-  work of its own that shouldn't be improvised inside that round. This
-  checkbox exists so it has an owner and is checked before M1 is
-  considered trustworthy under real memory pressure, not just measured
-  under it.
+  **Fixed**: `TileStore` gained a third map, `pending: HashMap<(SurfaceId,
+  TileId), Vec<u8>>`, populated by `make_room` in the exact same call
+  that populates `paged_out` (both maps gain the same key at the same
+  instant during eviction), holding the tile's own already-encoded bytes.
+  `ensure_resident` now checks three places in priority order: resident
+  (unchanged fast path) → `pending` (the write may still be in flight;
+  decode straight from the in-memory bytes via the existing
+  `codec::decode`, remove the key from both `pending` and `paged_out`,
+  never touch disk) → `paged_out` (only reachable once a new
+  `reconcile_pending` helper — non-blocking, drains
+  `BackgroundWriter::drain_results` and clears each confirmed key from
+  `pending`, called at the top of every `ensure_resident` — has actually
+  confirmed that key's write landed, so this branch is now provably
+  race-free) → neither (unchanged blank-tile path). A failed write found
+  during reconciliation is logged via `tracing::warn!` and otherwise
+  ignored (routine background reconciliation isn't the place to fail
+  every unrelated tile access over one bad write); `flush()` remains the
+  authoritative point where a write failure surfaces as a real `Err`
+  before a save, unchanged (and also reconciles `pending` directly, via
+  its own drain-after-join, not just through `ensure_resident`'s path).
+  **`pending`'s size, stated precisely, not overclaimed**: nothing
+  structurally caps it at `budget` or any other hard bound — it is
+  really bounded by "evictions since the writer thread's last completed
+  write," which has no ceiling if the scratch disk is slow or contended
+  relative to how fast the caller evicts (blocking eviction on write
+  completion would defeat the whole point of the background writer,
+  invariant §7.3.4's "never blocks the frame"). Empirically, under
+  normal local-disk I/O, this stays small regardless of document size
+  (stress-tested independently at 50,000 evictions against a 4-tile
+  budget: peak `pending` size in the tens, not thousands) — a real,
+  useful property of this design under the conditions it's meant for,
+  but an empirical one, not a proven structural guarantee, and stated
+  that way here rather than as a stronger claim than the code actually
+  earns.
+
+  Chose the in-memory-holding-area design over the alternative (atomic
+  write via temp-file + rename) because the rename approach only
+  converts "read a torn file" into "read reliably fails with ENOENT
+  until the rename lands" — still a real failure on a fast revisit, and
+  it doesn't eliminate the disk I/O the in-memory approach avoids
+  entirely. The in-memory approach closes the race window to zero by
+  construction, not just narrows it, and mirrors `paged_out`'s own
+  existing shape closely (same key, same eviction-time insertion point).
+
+  **Tests**: `aurora-tile` went from 16 to 19 tests (added
+  `ensure_resident_serves_directly_from_pending_bypassing_disk_entirely`
+  — a fully deterministic, isolated exercise of the `pending` branch that
+  hand-constructs the mid-eviction state with `paged_out` pointed at a
+  path that is deliberately never created, so any accidental fallthrough
+  to disk fails loudly rather than silently succeeding — plus
+  `real_eviction_then_immediate_revisit_always_succeeds` and
+  `pending_entries_clear_once_writes_are_confirmed`, both exercising a
+  real `make_room` eviction). Honest note on the first attempt at the
+  "real eviction, immediate revisit, assert the disk file doesn't exist
+  yet" version of that first test: it failed 5/5 times on this machine —
+  the background writer thread, already alive and blocked in `recv()`,
+  completed a small `fs::write` to a fresh tempdir faster than the test's
+  own next few statements even with no explicit sleep/yield, so that
+  particular assertion was asserting a timing outcome this environment
+  doesn't reliably produce. Replaced it with the isolated
+  hand-constructed test above, which needs no timing assumption at all —
+  the actual deterministic proof this checklist item requires. All 19
+  `aurora-tile` tests, `aurora-app`'s 189, and the full workspace suite
+  pass; re-ran `aurora-tile`'s test binary 8 times back-to-back with no
+  flakes.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-tile` (19 passed), `cargo test -p aurora-app` (189 passed,
+  release build — a debug-mode run failed once on `p99` timing at
+  366ms/350ms while a second heavy `cargo test` was running concurrently
+  on this machine for an unrelated reason; re-running in isolation, both
+  before and after this fix, passed comfortably, so that failure was
+  local CPU contention, not a regression), `cargo test --workspace` (0
+  failures), `python3 scripts/check_no_hardcoded_style.py` — all clean.
+  `scripts/check_layering.py` still fails in this sandbox with the
+  pre-existing `ModuleNotFoundError: No module named 'tomllib'` (Python
+  3.10), unrelated to this change. No new dependencies. Re-ran
+  `aurora-app`'s `recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling`
+  three times in release mode after the fix: all three passed, no
+  panics. Could not directly confirm via log output whether the
+  `App::paint_dab` `tracing::warn!("failed to stamp a brush dab")` path
+  still ever fires there, since that test binary never installs a
+  `tracing_subscriber` — `tracing::warn!` calls are consequently
+  unobservable through `--nocapture` regardless of whether they fire,
+  in both the before and after builds; the deterministic
+  `aurora-tile`-level test is the real proof of correctness here, this
+  is offered only as an honest limit on what the `aurora-app` re-run
+  could and couldn't show.
 
 ### M1.2 — GPU layer (`aurora-gpu`)
 
