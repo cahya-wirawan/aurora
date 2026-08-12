@@ -7822,6 +7822,47 @@ severity choice.
   here re-checked *that* machine. Re-measuring both `aurora-app`
   frame-loop tests on confirmed real GPU hardware, whenever one becomes
   available, remains real, unstarted follow-on work.
+
+  **A second, more urgent correction: real GitHub Actions CI runs broke
+  on these exact tests, fixed the same day.** The 350ms/180ms budgets
+  above, calibrated against this dev sandbox's own local p99 (98.75ms /
+  54.10ms), were nowhere near generous enough for GitHub's actual CI
+  runner: a real push produced `p99 frame time 889.41ms exceeded the
+  generous 350ms CI-safety budget` (GPU-path test) and `p99 frame time
+  409.62ms exceeded the generous 180ms CI-safety budget` (CPU-fallback
+  test) — both real, hard test failures blocking CI, not noise. GitHub's
+  shared runner is evidently far slower and/or noisier than any sandbox
+  this was tuned against (plausibly also software-rendered, per this
+  entry's own hardware-attribution correction above, and likely under
+  real contention from concurrent jobs). Fixed by recalibrating both
+  budgets against the worst *CI* number actually observed, not the local
+  sandbox's own lower figure: GPU-path budget 350ms → 3000ms (~3.4x the
+  889ms CI p99), CPU-fallback budget 180ms → 1500ms (~3.7x the 409ms CI
+  p99) — the same "~3x worst observed p99" margin discipline as before,
+  just recalibrated against the environment that actually gates merges.
+  Also fixed in the same push: a `cargo doc --workspace -D warnings`
+  failure from the 0.38.0 round's own `composite_tile_cpu` doc comment
+  (`crates/aurora-render/src/composite.rs`), which used intra-doc-link
+  syntax (`` [`blend_rgb`] ``/`` [`blend_channel`] ``) for two private
+  functions — valid locally (this repo's own gate commands never ran
+  `cargo doc` against this specific lint) but rejected by CI's own
+  documentation job (`rustdoc::private_intra_doc_links`, denied via
+  `-D warnings`); changed to plain code spans (no link resolution
+  attempted), the correct fix for referencing a private item from public
+  documentation. Neither of these two bugs was caught before landing
+  because neither `cargo doc --workspace --no-deps -D warnings` nor a
+  real CI push was part of this session's own local verification gate
+  for any round that touched these files — a real process gap, not just
+  bad luck; every prior round in this session had only ever run `cargo
+  fmt`/`cargo clippy`/`cargo test`/`check_no_hardcoded_style.py` locally,
+  never the doc build, and never observed a real CI run's own numbers
+  before this. Verified this time: `RUSTDOCFLAGS="-D warnings" cargo doc
+  --workspace --no-deps --all-features` clean (was failing), `cargo fmt
+  --all --check`/`cargo clippy --workspace --all-targets --all-features
+  -- -D warnings`/`cargo test -p aurora-app`/`cargo test --workspace`
+  all clean, `python3 scripts/check_no_hardcoded_style.py` clean.
+  Version bumped as a patch (`CLAUDE.md`'s own convention — this
+  corrects something already landed and wrong, not new work).
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

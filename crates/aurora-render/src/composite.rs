@@ -597,7 +597,7 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// still-open follow-on work.
 ///
 /// **The accumulator's own backdrop colour, recovered before blending —
-/// not assumed straight-alpha as-is.** [`blend_rgb`]/[`blend_channel`]'s
+/// not assumed straight-alpha as-is.** `blend_rgb`/`blend_channel`'s
 /// own math (`Multiply`, `Screen`, the HSL family, ...) is only correct
 /// when the `Cb` (backdrop) colour it receives is a *true straight-alpha*
 /// colour. That is automatically true for every layer composited over an

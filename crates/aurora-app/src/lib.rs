@@ -12038,10 +12038,14 @@ mod tests {
     /// spike's own narrower panning-only figure) for the first time
     /// through `aurora-app`'s own real path, at a larger 800x600 viewport
     /// than the spike's panning figures used alone. The assertion below
-    /// uses 350 ms -- about 3.5x the measured p99 -- as the CI-safety
-    /// threshold: generous enough to absorb a slow, shared, three-OS CI
-    /// runner without flaking (the same reasoning this file's
-    /// `aurora-brush` sibling test,
+    /// uses 3000 ms -- roughly 3.4x the worst p99 (889ms) real GitHub
+    /// Actions CI runs actually produced (2026-08-12), not the ~99ms this
+    /// local sandbox measures -- as the CI-safety threshold. The original
+    /// 350ms figure (~3.5x this sandbox's own local p99) caused real CI
+    /// failures: GitHub's own runner turned out to be far slower/noisier
+    /// than any dev sandbox this was tuned against. Generous enough to
+    /// absorb a slow, shared, three-OS CI runner without flaking (the same
+    /// reasoning this file's `aurora-brush` sibling test,
     /// `stamp_dab_latency_stays_within_a_generous_ci_safe_budget`, and this
     /// crate's own GPU-gated latency tests already use), while still a
     /// real trip-wire against a multiples-worse algorithmic regression.
@@ -12099,10 +12103,16 @@ mod tests {
     /// (Linux) -- not cross-platform evidence.
     #[test]
     fn recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling() {
-        // Generous CI-safety margin: ~3.5x the 98.75ms p99 measured
-        // locally -- see this test's own doc comment for the reasoning
-        // and PLAN.md's M1.10 section for the real numbers this measured.
-        const BUDGET_MS: f64 = 350.0;
+        // Real GitHub Actions CI runs (2026-08-12) hit p99 up to 889ms --
+        // far past this local sandbox's own ~99ms figure and the 350ms
+        // budget calibrated against it, causing real CI failures. GitHub's
+        // runner is evidently far slower/noisier than the dev sandboxes
+        // this was originally tuned against (a shared runner, likely also
+        // software-rendered, under unpredictable contention) -- so the
+        // budget is now set with real headroom over the worst *CI* number
+        // actually observed, not the local one: ~3.4x 889ms. See PLAN.md's
+        // M1.10 section for the full account of this correction.
+        const BUDGET_MS: f64 = 3000.0;
 
         let Some(context) = real_gpu_context() else {
             return;
@@ -12209,15 +12219,20 @@ mod tests {
     /// than the CPU fallback itself being cheaper than the GPU path in
     /// general -- the two tests use different viewport sizes on purpose
     /// (see above) and are not a controlled GPU-vs-CPU comparison.
-    /// Budget below: 180 ms, about 3.3x this measured p99, the same
-    /// margin reasoning as the sibling test.
+    /// Budget below: 1500 ms, roughly 3.7x the worst p99 (409ms) real
+    /// GitHub Actions CI runs actually produced (2026-08-12) -- the
+    /// original 180ms figure (~3.3x this sandbox's own local p99) caused
+    /// real CI failures, the same correction as the sibling test above.
     #[test]
     fn recomposite_and_present_loop_exercises_the_cpu_fallback_path() {
-        // Generous CI-safety margin: ~3.3x the 54.10ms p99 measured
-        // locally -- see this test's own doc comment and the sibling
-        // GPU-path test's for the reasoning, and PLAN.md's M1.10 section
-        // for the real numbers this measured.
-        const BUDGET_MS: f64 = 180.0;
+        // Real GitHub Actions CI runs (2026-08-12) hit p99 up to 409ms --
+        // far past this local sandbox's own ~54ms figure and the 180ms
+        // budget calibrated against it, causing real CI failures. Same
+        // correction as the sibling GPU-path test above: budget now set
+        // with real headroom over the worst *CI* number actually observed
+        // (~3.7x 409ms), not the local sandbox's own, much lower figure.
+        // See PLAN.md's M1.10 section for the full account.
+        const BUDGET_MS: f64 = 1500.0;
 
         let Some(context) = real_gpu_context() else {
             return;
