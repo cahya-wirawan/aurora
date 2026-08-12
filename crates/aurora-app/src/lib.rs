@@ -3540,7 +3540,7 @@ fn resolve_tile(
 
 /// Whether every visible root-level layer in `layers` is a `Normal`-blend
 /// [`aurora_doc::LayerKind::Pixel`] layer — no groups, no other blend
-/// mode — the exact case [`gpu_composite_tile`] can correctly express via
+/// mode — the exact case [`begin_gpu_composite_tile`] can correctly express via
 /// `aurora_render::TileCompositor::composite_over_with_opacity`'s
 /// fixed-function alpha blend unit (opacity-scaled `Normal` "source-
 /// over," nothing else). A single disqualifying layer (a visible group,
@@ -3574,38 +3574,80 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
     })
 }
 
-/// Reads back the whole `aurora_tile::TILE`×`aurora_tile::TILE` `texture`
-/// as a real, [`aurora_tile::SAMPLES`]-length `Vec<half::f16>` — the
-/// real, non-test promotion of the map-then-poll-then-copy readback
-/// pattern `aurora-render`'s own test module already established for a
-/// single-texel readback (`composite.rs`'s own `read_first_texel`/
-/// `read_rgba8` test helpers), generalized here to every texel
-/// [`gpu_composite_tile`] needs to hand back in `composite_tile_cpu`'s
-/// own returned shape.
+/// Decodes a raw, mapped `Rgba16Float`, `TILE`×`TILE` readback buffer's
+/// own byte range into a real, [`aurora_tile::SAMPLES`]-length
+/// `Vec<half::f16>` — the shared decode step [`finish_tile_readback`]
+/// (the batched path) needs, factored out once so the batching restructure
+/// below has exactly one place that turns raw mapped bytes into samples,
+/// rather than duplicating the loop.
 ///
-/// `texture` must be `Rgba16Float`, `TILE`×`TILE`, with `COPY_SRC` usage.
-/// Blocks the calling thread until the submitted copy and the readback
-/// map both complete (`Device::poll(PollType::Wait)`) — the same
-/// synchronous readback every real-GPU test in this workspace already
-/// uses; acceptable here because this runs once per qualifying composite
-/// tile per redraw (a canvas operation, not the render loop's own
-/// present-this-frame path), not per frame unconditionally.
+/// `None` if `data` doesn't decode to exactly [`aurora_tile::SAMPLES`]
+/// `f16`s (a malformed/short readback) — logged, not a panic, for the
+/// same "a live user session can hit a real, if rare, GPU condition a
+/// test never will" reason [`finish_tile_readback`]'s own doc comment
+/// gives.
+fn decode_f16_samples(data: &[u8]) -> Option<Vec<half::f16>> {
+    let mut out = Vec::with_capacity(aurora_tile::SAMPLES);
+    for bytes in data.chunks_exact(2) {
+        let Ok(pair) = <[u8; 2]>::try_from(bytes) else {
+            continue;
+        };
+        out.push(half::f16::from_le_bytes(pair));
+    }
+    if out.len() == aurora_tile::SAMPLES {
+        Some(out)
+    } else {
+        tracing::warn!(
+            len = out.len(),
+            expected = aurora_tile::SAMPLES,
+            "GPU composite readback returned an unexpected sample count; falling back to CPU"
+        );
+        None
+    }
+}
+
+/// One composite tile's GPU readback, issued
+/// (`copy_texture_to_buffer` + `queue.submit` + `slice.map_async`) but
+/// not yet resolved — the "phase 1" unit [`begin_tile_readback`]
+/// produces and [`finish_tile_readback`] consumes, once a single
+/// per-frame `device.poll` has driven every pending tile's `map_async`
+/// callback to completion. See [`recomposite_visible_tiles`]'s own doc
+/// comment for the full three-phase shape (issue every tile's GPU work →
+/// one poll for the whole frame → drain every tile's result) this exists
+/// to support, and why batching the poll this way is the actual fix for
+/// the N-blocking-polls-per-frame problem it replaces.
 ///
-/// `None` if the map genuinely fails (e.g. a lost device) — logged, not
-/// a panic: unlike this crate's own test helpers, which can safely
-/// `unreachable!` a map failure because the test just wrote the buffer
-/// itself moments earlier under fully controlled conditions, this runs
-/// against a real user's live session, where a device loss is a real,
-/// if rare, possible event, not a logic bug. [`gpu_composite_tile`]
-/// propagates a `None` here as its own `None`, which routes the caller
-/// back to the CPU path for that one tile — the same "one bad tile
-/// shouldn't abort the rest" discipline [`resolve_tile`]'s own callers
-/// already use for a failed [`aurora_tile::TileStore::get`].
-fn read_tile_f16(
+/// Owns the `wgpu::Buffer` itself, not a `wgpu::BufferSlice` borrowed
+/// from it: a slice can't outlive this struct's own trip through a `Vec`
+/// between phase 1 and phase 3, but `wgpu`'s own mapping API is designed
+/// for exactly this "submit now, resolve later" shape — a fresh
+/// `.slice(..)` call in [`finish_tile_readback`], after the buffer's own
+/// map has already resolved, is cheap and needs no unsafe code or
+/// lifetime trickery to make the borrow checker happy.
+struct PendingGpuReadback {
+    tile_id: aurora_tile::TileId,
+    buffer: wgpu::Buffer,
+    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+/// Issues the GPU→CPU readback for one already-composited destination
+/// `texture` — `copy_texture_to_buffer`, `queue.submit`, and
+/// `slice.map_async` — without blocking on any of it: deliberately no
+/// `device.poll` call here at all, unlike this function's own
+/// single-tile-at-a-time predecessor. This is phase 1's own per-tile
+/// unit of work; [`recomposite_visible_tiles`] calls this once per
+/// GPU-qualifying tile, collects every [`PendingGpuReadback`] it
+/// returns into a `Vec`, then polls **once** for the whole batch before
+/// resolving any of them via [`finish_tile_readback`].
+///
+/// `texture` must be `Rgba16Float`, `TILE`×`TILE`, with `COPY_SRC` usage,
+/// matching [`begin_gpu_composite_tile`]'s own destination texture.
+fn begin_tile_readback(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
-) -> Option<Vec<half::f16>> {
+    tile_id: aurora_tile::TileId,
+) -> PendingGpuReadback {
     let bytes_per_row = aurora_tile::TILE * 8; // Rgba16Float, already 256-byte aligned.
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gpu-composite-readback"),
@@ -3639,48 +3681,68 @@ fn read_tile_f16(
     );
     queue.submit(std::iter::once(encoder.finish()));
 
-    let slice = readback.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    let _ = device.poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    });
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+    PendingGpuReadback {
+        tile_id,
+        buffer: readback,
+        rx,
+    }
+}
+
+/// Resolves one [`PendingGpuReadback`] into its tile's own real,
+/// [`aurora_tile::SAMPLES`]-length `Vec<half::f16>` — phase 3's own
+/// per-tile unit of work, called only *after*
+/// [`recomposite_visible_tiles`]'s single per-frame `device.poll` has
+/// already driven every pending tile's `map_async` callback to
+/// completion, so `rx.recv()` below returns immediately rather than
+/// blocking: the callback has already run by the time this is called,
+/// it's just delivering a result that's been sitting in the channel
+/// since phase 2's poll resolved it.
+///
+/// `None` if the map genuinely failed (e.g. a lost device) — logged,
+/// not a panic: unlike this crate's own test helpers, which can safely
+/// `unreachable!` a map failure because the test just wrote the buffer
+/// itself moments earlier under fully controlled conditions, this runs
+/// against a real user's live session, where a device loss is a real,
+/// if rare, possible event, not a logic bug. [`recomposite_visible_tiles`]
+/// routes a `None` here back to the CPU path for that one tile — the
+/// same "one bad tile shouldn't abort the rest" discipline
+/// [`resolve_tile`]'s own callers already use for a failed
+/// [`aurora_tile::TileStore::get`].
+fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
+    let PendingGpuReadback {
+        tile_id,
+        buffer,
+        rx,
+    } = pending;
     match rx.recv() {
         Ok(Ok(())) => {}
         other => {
             tracing::warn!(
                 ?other,
+                ?tile_id,
                 "GPU composite readback map failed; falling back to CPU"
             );
             return None;
         }
     }
+    let slice = buffer.slice(..);
     let Ok(data) = slice.get_mapped_range() else {
-        tracing::warn!("GPU composite readback reported success but the range is unavailable");
+        tracing::warn!(
+            ?tile_id,
+            "GPU composite readback reported success but the range is unavailable"
+        );
         return None;
     };
-    let mut out = Vec::with_capacity(aurora_tile::SAMPLES);
-    for bytes in data.chunks_exact(2) {
-        let Ok(pair) = <[u8; 2]>::try_from(bytes) else {
-            continue;
-        };
-        out.push(half::f16::from_le_bytes(pair));
-    }
+    let decoded = decode_f16_samples(&data);
     drop(data);
-    readback.unmap();
-    if out.len() == aurora_tile::SAMPLES {
-        Some(out)
-    } else {
-        tracing::warn!(
-            len = out.len(),
-            expected = aurora_tile::SAMPLES,
-            "GPU composite readback returned an unexpected sample count; falling back to CPU"
-        );
-        None
-    }
+    buffer.unmap();
+    decoded
 }
 
 /// GPU-accelerated compositing for one visible composite tile, for the
@@ -3707,27 +3769,43 @@ fn read_tile_f16(
 /// `aurora_render::TileCompositor::composite_over_with_opacity` blends it
 /// onto one shared destination texture (`RENDER_ATTACHMENT | COPY_SRC`,
 /// cleared to fully transparent black first, since `composite_over_with_opacity`
-/// always uses `LoadOp::Load`). The destination is then read back
-/// ([`read_tile_f16`]) into a real `Vec<half::f16>`, [`aurora_tile::SAMPLES`]
-/// long — the exact same shape `composite_tile_cpu` returns, so this is a
-/// drop-in alternative for a tile that qualifies.
+/// always uses `LoadOp::Load`).
 ///
-/// **Scope, stated honestly**: this itself is a GPU → CPU (readback) →
-/// GPU (`residency.sync`'s own later upload) round trip, not a direct
-/// GPU-to-atlas write — eliminating that round trip is separate,
-/// still-open follow-on work; see [`recomposite_visible_tiles`]'s own doc
-/// comment for the full picture. Export (`composite_document`) is
-/// untouched by this — it stays CPU-only, a one-shot operation where this
-/// isn't latency-critical the way the live canvas is.
+/// **Issues the readback, does not wait for it**: the destination texture's
+/// GPU→CPU copy is *started* via [`begin_tile_readback`] — which itself
+/// issues `copy_texture_to_buffer` + `queue.submit` + `slice.map_async`
+/// with no `device.poll` call — and this function returns the resulting
+/// [`PendingGpuReadback`] unresolved. This is the "phase 1" half of the
+/// batched shape [`recomposite_visible_tiles`]'s own doc comment
+/// describes: every visible tile's GPU work (this function, once per
+/// qualifying tile) is issued before that caller polls even once, so one
+/// `device.poll(PollType::Wait)` per **frame** resolves every tile's
+/// pending map together, not one blocking wait per tile the way this
+/// function's own predecessor (`gpu_composite_tile`, which called the
+/// now-renamed `read_tile_f16` and blocked on it immediately) used to.
+///
+/// **Scope, stated honestly**: the CPU readback this issues still lands
+/// back in `store`'s composite tile and gets re-uploaded to the atlas by
+/// `residency.sync` later — this is still a GPU → CPU (readback) → GPU
+/// round trip, not a direct GPU-to-atlas write. Batching the poll (this
+/// change) reduces the number of blocking synchronization barriers per
+/// frame; it does not remove the round trip itself — eliminating that is
+/// separate, still-open follow-on work; see
+/// [`recomposite_visible_tiles`]'s own doc comment for the full picture.
+/// Export (`composite_document`) is untouched by this — it stays
+/// CPU-only, a one-shot operation where this isn't latency-critical the
+/// way the live canvas is.
 ///
 /// `None` if there are no visible root-level layers at all (an empty
 /// composite tile — cheaper handled by the CPU path's own "empty
 /// `layers` → transparent black" default than by a real, empty GPU round
-/// trip) or if the real GPU work itself fails ([`read_tile_f16`]'s own
-/// `None`) — either way, the caller falls back to the CPU path for this
-/// one tile, the same "one bad tile shouldn't abort the rest" discipline
-/// [`resolve_tile`]'s own callers already use.
-fn gpu_composite_tile(
+/// trip) — the caller falls back to the CPU path for this one tile
+/// immediately, without anything to batch, the same "one bad tile
+/// shouldn't abort the rest" discipline [`resolve_tile`]'s own callers
+/// already use. A real GPU-side failure (a lost device, a bad map) can no
+/// longer be detected here — resolving the map is [`finish_tile_readback`]'s
+/// job now, in phase 3, once this function has already returned.
+fn begin_gpu_composite_tile(
     gpu: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
     layers: &aurora_doc::LayerTree,
@@ -3735,7 +3813,7 @@ fn gpu_composite_tile(
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
-) -> Option<Vec<half::f16>> {
+) -> Option<PendingGpuReadback> {
     let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::new();
     for &id in layers.roots().iter().rev() {
         if let Some((texels, opacity, _blend_mode)) =
@@ -3830,7 +3908,7 @@ fn gpu_composite_tile(
         compositor.composite_over_with_opacity(gpu, &dst_view, &src_view, *opacity);
     }
 
-    read_tile_f16(device, queue, &dst_texture)
+    Some(begin_tile_readback(device, queue, &dst_texture, tile_id))
 }
 
 /// Recomposites every tile in `residency`'s own currently-visible grid
@@ -3869,10 +3947,15 @@ fn gpu_composite_tile(
 /// 4-mode non-separable HSL family (`Hue`/`Saturation`/`Color`/
 /// `Luminosity`), and the 2-mode whole-colour-selection family
 /// (`DarkerColor`/`LighterColor`) composite with their own real math;
-/// the one remaining `aurora_doc::BlendMode` variant (`Dissolve` —
-/// this family's own explicit, now sole boundary) still silently falls
-/// back to `Normal` at that same translation boundary — a real,
-/// separate, still-open gap, not silently glossed over. A group's own
+/// the one remaining `aurora_doc::BlendMode` variant (`Dissolve` — this
+/// family's own explicit, now sole boundary at `translate_blend_mode`)
+/// is fully implemented too, the same as every other blend mode — just
+/// not inside that translation function: `resolve_tile` checks a
+/// layer's own raw `aurora_doc::BlendMode` for `Dissolve` ahead of ever
+/// calling `translate_blend_mode`, and substitutes `dissolve_gate`'s own
+/// real, deterministic, position-seeded stochastic result instead (see
+/// `dissolve_gate`'s and `translate_blend_mode`'s own doc comments for
+/// the full mechanism). A group's own
 /// `opacity`/`blend_mode` **are** now aggregated into its children's
 /// effective compositing — [`resolve_tile`]'s own doc comment has the
 /// real isolated-compositing semantic (every group isolates, always;
@@ -3898,13 +3981,13 @@ fn gpu_composite_tile(
 /// [`document_qualifies_for_gpu_compositing`] confirms the whole document
 /// is GPU-tractable (every visible root-level layer a `Normal`-blend
 /// [`aurora_doc::LayerKind::Pixel`] layer, no groups), each tile is
-/// composited via [`gpu_composite_tile`] —
+/// composited via [`begin_gpu_composite_tile`]/[`finish_tile_readback`] —
 /// `aurora_render::TileCompositor::composite_over_with_opacity`'s real
 /// fixed-function blend unit, not the CPU loop — closing the exact gap
 /// `spike/FINDINGS.md`'s own ~20ms "merging whole tiles" finding named as
 /// the reason `aurora_render::TileCompositor` exists at all. A tile whose
 /// document doesn't qualify, or whose own GPU work fails
-/// ([`gpu_composite_tile`]'s own `None`), or when `gpu`/`compositor`
+/// ([`finish_tile_readback`]'s own `None`), or when `gpu`/`compositor`
 /// aren't available at all (`None`, e.g. no GPU device this session)
 /// falls straight back to the exact same CPU path
 /// (`resolve_tile`/`composite_tile_cpu`) this function always used before
@@ -3914,18 +3997,46 @@ fn gpu_composite_tile(
 /// full WGSL port of all 26 blend formulas, or per-group isolated GPU
 /// passes — separate, much bigger follow-on work), and export
 /// (`composite_document`, a one-shot operation, not latency-critical the
-/// way the live canvas is). **Also still open**: this GPU path is itself
-/// a GPU → CPU (readback) → GPU (`residency.sync`'s own later upload)
-/// round trip, not a direct GPU-to-atlas write — eliminating that is
-/// separate, further follow-on work, not attempted here. True per-tile
-/// dirty tracking across layers (recomposite only the tile(s) an edit
-/// actually touched) also remains separate, still-open follow-on work
-/// regardless of which path composites a given tile.
+/// way the live canvas is).
+///
+/// **Batched in three phases, one blocking wait per frame instead of one
+/// per tile**: this used to call a single `gpu_composite_tile` helper per
+/// tile that issued its GPU work *and* immediately blocked on
+/// `device.poll(PollType::Wait)` to read it back, before moving on to the
+/// next tile — for an 800×600 viewport's own 5×4 = 20-tile grid
+/// (`aurora_gpu::TileResidency::new`'s own sizing), that meant 20 separate
+/// blocking driver synchronization barriers in one frame, each with fixed
+/// per-call overhead (context switches, queue flushes) regardless of how
+/// much GPU work was actually pending. This function now issues every
+/// GPU-qualifying tile's compositing work up front
+/// ([`begin_gpu_composite_tile`], which submits its copy and starts
+/// `map_async` but never polls), collects the resulting
+/// [`PendingGpuReadback`]s into a `Vec`, calls `device.poll(PollType::
+/// Wait)` **exactly once** for the whole batch, then drains every
+/// pending tile's result ([`finish_tile_readback`], whose own `rx.recv()`
+/// now returns immediately since the single poll above already resolved
+/// it). A tile that doesn't qualify for the GPU path at all — a
+/// disqualified document, no GPU/compositor this session, or a tile with
+/// no visible layers of its own — is composited via the CPU path
+/// immediately, inline in the same first pass, since the CPU path never
+/// blocks on the GPU and so has nothing to batch; only genuinely
+/// GPU-issued tiles wait for the one shared poll. **What this changes and
+/// what it doesn't**: only the *synchronization* pattern — the number of
+/// blocking `device.poll` calls per frame — changed, from N-per-frame to
+/// 1-per-frame; the underlying data path is untouched: this GPU path is
+/// still a GPU → CPU (readback, into `store`'s composite tile) → GPU
+/// (`residency.sync`'s own later re-upload to the atlas) round trip, not
+/// a direct GPU-to-atlas write. Eliminating that round trip entirely is
+/// separate, still-open follow-on work, not attempted here — this change
+/// only batches the waits *within* the existing round trip. True
+/// per-tile dirty tracking across layers (recomposite only the tile(s)
+/// an edit actually touched) also remains separate, still-open follow-on
+/// work regardless of which path composites a given tile.
 ///
 /// A document with zero or one visible pixel layer (the common case so
 /// far) is unaffected in practice either way: `composite_tile_cpu`
 /// reproduces a single full-opacity layer's own texels exactly, and (once
-/// GPU-tractable) so does `gpu_composite_tile`.
+/// GPU-tractable) so does the batched GPU path.
 fn recomposite_visible_tiles(
     residency: &aurora_gpu::TileResidency,
     layers: &aurora_doc::LayerTree,
@@ -3955,18 +4066,66 @@ fn recomposite_visible_tiles(
         height: aurora_tile::TILE,
     };
     let tile_size = i64::from(aurora_tile::TILE);
+    let doc_origin_for = |tile_id: aurora_tile::TileId| {
+        (
+            reference_origin.0 + i64::from(tile_id.x) * tile_size,
+            reference_origin.1 + i64::from(tile_id.y) * tile_size,
+        )
+    };
+    // Writes one tile's already-composited texels into `store`'s
+    // reserved composite surface and, only on success, marks it current
+    // in `cache` -- matching this function's own pre-batching behaviour
+    // exactly: a `TileStore::get_mut` failure leaves the tile un-cached
+    // so a later redraw retries it, rather than silently marking a
+    // never-written tile "done".
+    let write_composited = |store: &mut aurora_tile::TileStore,
+                            cache: &mut CompositeCache,
+                            tile_id: aurora_tile::TileId,
+                            composited: &[half::f16]| {
+        let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
+            return;
+        };
+        dest.texels_mut().copy_from_slice(composited);
+        dest.mark_dirty(full_tile);
+        cache.mark_current(tile_id);
+    };
+    let composite_tile_cpu_path = |layers: &aurora_doc::LayerTree,
+                                   store: &mut aurora_tile::TileStore,
+                                   tile_id: aurora_tile::TileId,
+                                   doc_origin: (i64, i64)| {
+        let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
+            Vec::with_capacity(layers.roots().len());
+        for &id in layers.roots().iter().rev() {
+            if let Some(resolved) =
+                resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
+            {
+                layer_texels.push(resolved);
+            }
+        }
+        let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
+            .iter()
+            .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
+            .collect();
+        aurora_render::composite_tile_cpu(&refs)
+    };
+
+    // Phase 1: issue every GPU-qualifying, not-yet-current tile's GPU
+    // work (clear + per-layer blend + readback submit/map_async), with
+    // no blocking wait yet. A tile with nothing to batch -- the document
+    // doesn't qualify, `gpu`/`compositor` aren't available this session,
+    // or this specific tile has no visible layers at all -- is
+    // composited on the CPU path immediately, right here, since that
+    // path never blocks on the GPU.
+    let mut pending_gpu: Vec<PendingGpuReadback> = Vec::new();
     for tile_id in residency.visible_tiles() {
         if cache.is_current(tile_id) {
             continue;
         }
-        let doc_origin = (
-            reference_origin.0 + i64::from(tile_id.x) * tile_size,
-            reference_origin.1 + i64::from(tile_id.y) * tile_size,
-        );
+        let doc_origin = doc_origin_for(tile_id);
 
-        let gpu_result = if gpu_qualifies {
+        let issued = if gpu_qualifies {
             match (gpu, compositor.as_deref_mut()) {
-                (Some(gpu), Some(compositor)) => gpu_composite_tile(
+                (Some(gpu), Some(compositor)) => begin_gpu_composite_tile(
                     gpu,
                     compositor,
                     layers,
@@ -3981,30 +4140,39 @@ fn recomposite_visible_tiles(
             None
         };
 
-        let composited = if let Some(texels) = gpu_result {
+        if let Some(pending) = issued {
+            pending_gpu.push(pending);
+        } else {
+            let composited = composite_tile_cpu_path(layers, store, tile_id, doc_origin);
+            write_composited(store, cache, tile_id, &composited);
+        }
+    }
+
+    // Phase 2: one poll for the whole frame -- drives every pending
+    // tile's `map_async` callback to completion in a single blocking
+    // wait, instead of one blocking wait per tile.
+    if let (Some(gpu), false) = (gpu, pending_gpu.is_empty()) {
+        let _ = gpu.device().poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+    }
+
+    // Phase 3: drain every pending tile's result. `rx.recv()` inside
+    // `finish_tile_readback` returns immediately here, since phase 2's
+    // poll already resolved every pending map. A tile whose own GPU
+    // readback failed falls back to the CPU path for that one tile, the
+    // same "one bad tile shouldn't abort the rest" discipline this
+    // module uses throughout.
+    for pending in pending_gpu {
+        let tile_id = pending.tile_id;
+        let composited = if let Some(texels) = finish_tile_readback(pending) {
             texels
         } else {
-            let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
-                Vec::with_capacity(layers.roots().len());
-            for &id in layers.roots().iter().rev() {
-                if let Some(resolved) =
-                    resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
-                {
-                    layer_texels.push(resolved);
-                }
-            }
-            let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
-                .iter()
-                .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
-                .collect();
-            aurora_render::composite_tile_cpu(&refs)
+            let doc_origin = doc_origin_for(tile_id);
+            composite_tile_cpu_path(layers, store, tile_id, doc_origin)
         };
-        let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
-            continue;
-        };
-        dest.texels_mut().copy_from_slice(&composited);
-        dest.mark_dirty(full_tile);
-        cache.mark_current(tile_id);
+        write_composited(store, cache, tile_id, &composited);
     }
 }
 
@@ -4739,7 +4907,7 @@ struct App {
     /// The GPU-side multi-layer tile compositor
     /// (`aurora_render::TileCompositor`) `recomposite_visible_tiles`
     /// uses for the qualifying-tile fast path
-    /// (`document_qualifies_for_gpu_compositing`/`gpu_composite_tile`) —
+    /// (`document_qualifies_for_gpu_compositing`/`begin_gpu_composite_tile`) —
     /// built alongside `residency`/`canvas_pipeline` (same "needs a real
     /// device" constraint), `None` under the same conditions, in which
     /// case `recomposite_visible_tiles` falls straight back to its own
@@ -11428,6 +11596,138 @@ mod tests {
         assert_eq!(gpu_result, (0.375, 0.375, 0.25, 1.0));
     }
 
+    /// The batched-poll restructuring's own correctness proof: the
+    /// sibling test above (`..._gpu_and_cpu_paths_agree_on_a_real_multi_
+    /// layer_document`) uses a 256×256 viewport over a 10×10-px layer, so
+    /// only its single `(0, 0)` tile ever has real layer content — every
+    /// other visible tile in its 2×2 grid has none, so
+    /// `begin_gpu_composite_tile` returns `None` for them and they never
+    /// reach `pending_gpu` at all. That test alone would pass even if
+    /// phase 3's drain mixed up which decoded result belongs to which
+    /// tile (a real risk this restructuring introduces: `PendingGpuReadback`
+    /// now travels through a `Vec` between issue and resolve, so a bug
+    /// that dropped or misassigned a tile's own result partway through
+    /// would only show up with more than one tile genuinely in flight at
+    /// once). This test forces that: a single 512×512 `Normal`-blend
+    /// pixel layer spans exactly the four `(0, 0)`/`(1, 0)`/`(0, 1)`/
+    /// `(1, 1)` tiles, each filled with its own distinct solid colour, so
+    /// a 512×512 viewport's own 3×3 visible grid puts all four through
+    /// `begin_gpu_composite_tile` (real, non-empty GPU work) in the same
+    /// call to [`recomposite_visible_tiles`], all four batched into one
+    /// shared `pending_gpu` and resolved by the same single
+    /// `device.poll` — exactly the batching this round's fix introduces.
+    /// The remaining five visible tiles (row/column index 2) fall
+    /// entirely outside the 512×512 layer bounds, so they still exercise
+    /// the immediate-CPU-fallback branch of phase 1 (no visible layers to
+    /// batch) in the same call, confirming the two branches coexist
+    /// correctly.
+    ///
+    /// Each of the four populated tiles is checked against its own
+    /// distinct expected colour (not just "some tile has some colour"),
+    /// which is exactly what would catch a tile-identity mixup a less
+    /// specific assertion would miss. The CPU path (GPU/compositor both
+    /// `None`, forcing the exact same fallback
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_real_
+    /// multi_layer_document` already uses) is run second, against a
+    /// fresh cache, and checked to agree with the GPU path on all four
+    /// tiles too.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_batches_multiple_real_tiles_in_one_call_without_mixing_them_up()
+     {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        };
+        let layer_id = match layers.add_pixel_layer("canvas", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(layer_id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a single Normal-blend, full-bounds pixel layer must qualify for the GPU path"
+        );
+
+        // Four distinct, opaque solid colours, one per tile -- a mixup
+        // between any two of these would be visible in the assertions
+        // below, unlike four identical fills.
+        let expected: [(aurora_tile::TileId, [f32; 4]); 4] = [
+            (aurora_tile::TileId { x: 0, y: 0 }, [1.0, 0.0, 0.0, 1.0]),
+            (aurora_tile::TileId { x: 1, y: 0 }, [0.0, 1.0, 0.0, 1.0]),
+            (aurora_tile::TileId { x: 0, y: 1 }, [0.0, 0.0, 1.0, 1.0]),
+            (aurora_tile::TileId { x: 1, y: 1 }, [1.0, 1.0, 0.0, 1.0]),
+        ];
+        for (tile_id, rgba) in expected {
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (512, 512));
+
+        // Run 1: the real, batched GPU path.
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        for (tile_id, rgba) in expected {
+            let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+            let (Some(&r), Some(&g), Some(&b), Some(&a)) =
+                (rgba.first(), rgba.get(1), rgba.get(2), rgba.get(3))
+            else {
+                unreachable!("rgba always has four channels");
+            };
+            assert_eq!(
+                gpu_result,
+                (r, g, b, a),
+                "tile {tile_id:?} must composite to its own distinct colour, not another \
+                 tile's -- a mismatch here means phase 3's drain misassigned a batched \
+                 readback"
+            );
+        }
+
+        // Run 2: force the CPU path, same as the sibling multi-layer
+        // test, and confirm it agrees with the GPU path on every tile.
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        for (tile_id, rgba) in expected {
+            let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+            let (Some(&r), Some(&g), Some(&b), Some(&a)) =
+                (rgba.first(), rgba.get(1), rgba.get(2), rgba.get(3))
+            else {
+                unreachable!("rgba always has four channels");
+            };
+            assert_eq!(
+                cpu_result,
+                (r, g, b, a),
+                "the CPU fallback must agree with the batched GPU path on tile {tile_id:?}"
+            );
+        }
+    }
+
     /// The fallback's own correctness proof, not just that it was taken:
     /// a document with one `Multiply`-blend layer (a case the GPU path
     /// structurally cannot express — `composite_over_with_opacity`'s own
@@ -11717,13 +12017,18 @@ mod tests {
     /// **Compositing path taken: GPU.** The document is a single, visible,
     /// `Normal`-blend, full-bounds `Pixel` layer -- confirmed directly
     /// below via `document_qualifies_for_gpu_compositing`, not assumed --
-    /// so every tile recomposited here goes through `gpu_composite_tile`.
+    /// so every tile recomposited here goes through the batched GPU path
+    /// (`begin_gpu_composite_tile`/`finish_tile_readback`).
     /// The CPU fallback is exercised separately, by
     /// [`recomposite_and_present_loop_exercises_the_cpu_fallback_path`]
     /// below.
     ///
-    /// **Budget**: nominally 16.7 ms (60 FPS). **Measured locally (NVIDIA
-    /// RTX 3090, Vulkan, release build): mean 34.60 ms, p50 35.44 ms, p99
+    /// **Budget**: nominally 16.7 ms (60 FPS). **Measured locally (this
+    /// sandbox's real Vulkan adapter -- Mesa llvmpipe, software
+    /// rendering, confirmed via `GpuContext::adapter_info()`; an earlier
+    /// pass through this comment and PLAN.md mislabeled this "NVIDIA RTX
+    /// 3090," corrected once actually checked rather than assumed --
+    /// release build): mean 34.60 ms, p50 35.44 ms, p99
     /// 98.75 ms, max 98.75 ms (n=40) -- well over the 16.7 ms budget**,
     /// an honest, real finding, not a rounded-up pass: this is the exact
     /// "pan while painting" scenario `spike/FINDINGS.md`'s "Third run"
@@ -11788,7 +12093,9 @@ mod tests {
     /// same headless technique `spike/vertical-slice`'s own
     /// `headless_bench` already validated, never a real swapchain); no
     /// CPU-fallback path in *this* test (the sibling test below covers
-    /// that); and this is one GPU (NVIDIA RTX 3090, Vulkan), one platform
+    /// that); no real GPU hardware has been confirmed for this test at
+    /// all yet, only this sandbox's software Vulkan adapter (see the
+    /// budget paragraph above); and this is one adapter, one platform
     /// (Linux) -- not cross-platform evidence.
     #[test]
     fn recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling() {
@@ -11878,7 +12185,7 @@ mod tests {
     /// returns `false` here (the single root layer's own blend mode is
     /// `Multiply`, not `Normal`), so every tile in this loop goes through
     /// `resolve_tile`/`aurora_render::composite_tile_cpu`, not
-    /// `gpu_composite_tile`. Otherwise the same shape as
+    /// `begin_gpu_composite_tile`. Otherwise the same shape as
     /// [`recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling`]
     /// above (same 300,000px document, same tile-granular pan-while-paint
     /// pattern via [`measure_pan_and_paint_frames`]) -- deliberately
@@ -11888,8 +12195,11 @@ mod tests {
     /// second time. Same "generous CI-safe budget" reasoning and the same
     /// four NOT-covered caveats as the sibling test above apply here too.
     ///
-    /// **Measured locally (NVIDIA RTX 3090, Vulkan, release build): mean
-    /// 25.08 ms, p50 22.57 ms, p99 54.10 ms, max 54.10 ms (n=12) -- also
+    /// **Measured locally (this sandbox's real Vulkan adapter -- Mesa
+    /// llvmpipe, software rendering, not the "NVIDIA RTX 3090" this
+    /// comment originally and wrongly said, see the sibling test's own
+    /// budget paragraph above for how that was found -- release build):
+    /// mean 25.08 ms, p50 22.57 ms, p99 54.10 ms, max 54.10 ms (n=12) -- also
     /// over the 16.7 ms nominal budget**, reported honestly, not rounded
     /// up (the same figures recorded in PLAN.md's M1.10 section --
     /// reconciled to one canonical run rather than two separately-quoted

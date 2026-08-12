@@ -7547,6 +7547,142 @@ severity choice.
   storage, the same not-yet-made resource-management decision the
   mask-aggregation round already named.
 
+- [x] **Batch the GPU compositing readback into one `device.poll` per
+  frame, not one per tile — done 2026-08-12.** M1.10's own "60 FPS at
+  the Phase 0 document size" entry (below) measured
+  `recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling`
+  well over its 16.7 ms budget (mean 34.60 ms, p99 98.75 ms — labeled
+  "NVIDIA RTX 3090" at the time, corrected below to Mesa llvmpipe
+  software Vulkan, this sandbox's real adapter) and named the likely
+  cause without fixing it: `aurora-app`'s
+  `gpu_composite_tile` composited one visible tile, then called
+  `read_tile_f16`, which submitted its readback and **immediately**
+  called `device.poll(PollType::Wait)` — a real, blocking CPU↔GPU
+  synchronization barrier — before moving to the next tile. An 800×600
+  viewport's own 5×4 = 20-tile grid (`aurora_gpu::TileResidency::new`'s
+  own sizing) meant 20 separate blocking driver syncs per frame, each
+  with fixed per-call overhead (context switches, queue flushes)
+  regardless of how much GPU work was actually pending — the classic
+  poll-per-object anti-pattern, not batch-submit-then-poll-once.
+
+  **Fixed by splitting the GPU path into three phases** in
+  `recomposite_visible_tiles`. `gpu_composite_tile` is now
+  `begin_gpu_composite_tile`: it still does the same per-layer clear +
+  `composite_over_with_opacity` blend work, but its own readback step
+  (new `begin_tile_readback`) issues `copy_texture_to_buffer` +
+  `queue.submit` + `slice.map_async` and returns immediately — no
+  `device.poll` call inside it at all — handing back an unresolved
+  `PendingGpuReadback` (owns the `wgpu::Buffer`, the `TileId`, and the
+  `map_async` channel `Receiver`; deliberately not a borrowed
+  `BufferSlice`, which can't outlive the trip through a `Vec` the way an
+  owned `Buffer` can — `wgpu`'s own mapping API is designed for exactly
+  this "submit now, resolve later" shape). `recomposite_visible_tiles`
+  now runs three passes: **phase 1** issues every GPU-qualifying,
+  not-yet-current tile's work via `begin_gpu_composite_tile` and
+  collects every `PendingGpuReadback` into a `Vec` (a tile that doesn't
+  qualify — a disqualified document, no GPU/compositor this session, or
+  no visible layers in that specific tile — is composited on the CPU
+  path immediately, inline, since that path never blocks and so has
+  nothing to batch); **phase 2** calls `device.poll(PollType::Wait)`
+  **exactly once** for the whole batch; **phase 3** drains every pending
+  tile via new `finish_tile_readback` (`rx.recv()` now returns
+  immediately, since phase 2's single poll already resolved every
+  pending map), decoding via a `decode_f16_samples` helper factored out
+  of the old `read_tile_f16` so the byte→`f16` decode logic isn't
+  duplicated, then writing into `store`'s composite tile and marking the
+  cache current exactly as before. A tile whose own readback genuinely
+  fails still falls back to the CPU path for that one tile, the same
+  "one bad tile shouldn't abort the rest" discipline used throughout
+  this module. 1 new `aurora-app` test,
+  `recomposite_visible_tiles_gpu_path_batches_multiple_real_tiles_in_one_call_without_mixing_them_up`
+  — the existing multi-layer GPU/CPU-parity test's own 256×256 viewport
+  only ever has one tile with real layer content, so it wouldn't have
+  caught a phase-3 tile-identity mixup (a real risk once results travel
+  through a `Vec` between issue and resolve); the new test spans a
+  512×512 layer across exactly four tiles, each filled with its own
+  distinct solid colour, and checks each tile's post-batch result
+  individually against both the GPU and CPU paths (190 `aurora-app`
+  tests, was 189).
+
+  **Measured, honestly, with a real caveat this sandbox forces**: this
+  environment has no real GPU (`/dev/dri` doesn't exist, `nvidia-smi`
+  fails with `NVML: Unknown Error`), so `real_gpu_context()`-gated tests
+  would normally just skip. Mesa's `lvp_icd.x86_64.json` (llvmpipe/
+  lavapipe, a software Vulkan implementation) was used instead via
+  `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json` to get
+  real, non-skipped runs — a CPU software rasterizer, not real GPU
+  hardware. **This turns out to be exactly what M1.10's own "60 FPS"
+  entry below was *also* actually measured on**, once that entry's own
+  "NVIDIA RTX 3090" mislabeling (found and corrected the same day, see
+  that entry's own new closing paragraph) is accounted for — so the
+  "before" figures below are directly comparable to that entry's own
+  numbers (both same sandbox, same software adapter), not an unrelated
+  substitute. Run via `cargo test -p aurora-app --release --
+  recomposite_and_present_loop_measures_pan_while_painting --nocapture`.
+  Before this fix (3 runs, n=40 each): mean 33.88/33.96/35.01 ms, p50
+  35.35/35.54/35.62 ms, p99(=max) 101.04/100.17/121.63 ms. After (3
+  runs, same command): mean 41.12/42.07/43.31 ms, p50
+  39.62/40.57/40.89 ms, p99(=max) 86.61/87.55/89.66 ms. A control re-run
+  of the unmodified pre-fix code (`git stash`/`pop` on just this file,
+  rebuilding between), done immediately after the three "after" runs to
+  rule out machine drift or thermal effects, reproduced the original
+  baseline almost exactly (mean 34.03 ms, p50 35.58 ms, p99 100.24 ms)
+  — confirming the shift between before and after is attributable to
+  the code change, not noise.
+
+  **Honest verdict: mixed on this substitute hardware, not a clean
+  win.** p99/max improved roughly 11–29% (101–122 ms → 87–90 ms); mean/
+  p50 got measurably *worse*, roughly 16–24% (34–35 ms → 41–43 ms mean,
+  35–36 ms → 40–41 ms p50). Both before and after stay comfortably under
+  the benchmark's own 350 ms CI-safety budget either way, so nothing
+  here is a functional regression against that test's own assertion.
+  Plausible, unconfirmed explanation: lavapipe's `device.poll` isn't a
+  real hardware queue flush, it's the software rasterizer's own
+  CPU-bound rendering catching up — spreading 20 smaller polls across a
+  frame (old code) let that CPU work interleave with the rest of the
+  frame's CPU work (tile-store paging, brush stamping), while
+  concentrating it into one big poll (new code) may raise mean latency
+  while flattening the tail. This is a real, measured, honestly-reported
+  finding, not a confirmation of the fix's own hypothesis: the mechanism
+  this fix actually targets (fixed per-call *driver/hardware-queue*
+  overhead — context switches, queue flushes against real hardware) is
+  a different thing from lavapipe's CPU-bound software rendering, so
+  this sandbox's numbers should not be read as evidence either way for
+  real GPU hardware. **No round in this session has yet confirmed real
+  GPU hardware for any `aurora-app` frame-timing measurement** — see
+  M1.10's own hardware-attribution correction below for the full
+  account. Re-running this exact benchmark once real GPU hardware is
+  confirmed available, to settle whether batching actually helps there,
+  is separate, still-open follow-on work this round could not complete.
+
+  Verified: `cargo fmt --all --check` clean, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` clean, `cargo test -p
+  aurora-app` (190 passed, up from 189 — the one new test, zero
+  regressions; run with `VK_ICD_FILENAMES` set as above so the
+  GPU-gated tests actually run rather than skip in this sandbox),
+  `cargo test --workspace` (0 failures across all 19 crates), `python3
+  scripts/check_no_hardcoded_style.py` clean (25 files scanned). No new
+  dependencies. `scripts/check_layering.py` remains the one unrun check
+  (pre-existing `tomllib` gap in this sandbox, Python 3.10). Version
+  bumped `0.39.1` → `0.40.0` per `CLAUDE.md`'s own convention.
+
+  **Still genuinely open, stated honestly**: this fix batches the
+  *synchronization* only — the number of blocking `device.poll` calls
+  per frame, N-per-frame down to 1-per-frame — not the *data path*. The
+  GPU path is still a GPU → CPU (readback, into `store`'s composite
+  tile) → GPU (`residency.sync`'s own later re-upload to the atlas)
+  round trip, not a direct GPU-to-atlas write; eliminating that round
+  trip entirely remains separate, still-open follow-on work, exactly as
+  named in `gpu_composite_tile`'s original doc comment before this
+  round (now `begin_gpu_composite_tile`'s). True per-tile dirty tracking
+  across layers also remains open, unchanged by this round. And, newly:
+  whether this fix actually improves real-GPU-hardware latency as
+  hypothesized is **unconfirmed** by this round's own measurements —
+  this sandbox has no real GPU, and the software-rasterizer substitute
+  shows a mixed, not clearly positive, result for reasons that may be
+  specific to software rendering. Re-measuring on real hardware before
+  treating this as a settled performance win is the honest next step.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
@@ -7580,7 +7716,9 @@ severity choice.
   blocking `poll(Wait)` — mirroring the vertical slice's own "pan while
   painting" scenario, the one case `spike/FINDINGS.md`'s "Third run"
   already found marginal/over budget for panning alone. **Measured
-  (NVIDIA RTX 3090, Vulkan, release, n=40): mean 34.60 ms, p50 35.44 ms,
+  (release, n=40 — see this entry's own "hardware-attribution
+  correction" paragraph below for what GPU this actually ran on): mean
+  34.60 ms, p50 35.44 ms,
   p99 98.75 ms, max 98.75 ms — against the 16.7 ms (60 FPS) budget,
   roughly 5.9× over at p99.** A second, smaller sibling test,
   `recomposite_and_present_loop_exercises_the_cpu_fallback_path`
@@ -7636,8 +7774,8 @@ severity choice.
   **What these tests do NOT cover** (stated honestly): no real widget/UI
   paint alongside the canvas, no real `winit` event loop or window
   surface/present overhead (both target an offscreen texture, never a
-  real swapchain), and both ran on one GPU (NVIDIA RTX 3090, Vulkan), one
-  platform (Linux) — not cross-platform evidence. The checkbox above is
+  real swapchain), and both ran on one adapter, one platform (Linux) —
+  not cross-platform evidence. The checkbox above is
   checked because the measurement now exists and is real, not because
   60 FPS holds: at this document size and viewport, it currently does
   not, and that is the honest result this line was meant to capture.
@@ -7649,6 +7787,41 @@ severity choice.
   `scripts/check_layering.py` still fails in this sandbox with a
   pre-existing `ModuleNotFoundError: No module named 'tomllib'`
   (Python 3.10), unrelated to this change. No new dependencies.
+
+  **Hardware-attribution correction, added the same day as the
+  poll-batching round below, not a new measurement**: this entry
+  originally labeled every number above "NVIDIA RTX 3090, Vulkan."
+  That was wrong, and the evidence it was wrong was already sitting in
+  this very round's own independent critic review at the time — the
+  critic explicitly reported "This sandbox has no real GPU, only Mesa
+  llvmpipe (software Vulkan)... `real_gpu_context()` returned `Some`
+  anyway" (a genuine adapter is still found and used; `real_gpu_context()`
+  only distinguishes "no adapter at all" from "some adapter," never
+  software from hardware) — but that finding was not carried through
+  into this entry's own hardware label at the time, an honest process
+  miss caught only while working the following round, which needed to
+  measure on this same sandbox and checked `GpuContext::adapter_info()`
+  directly rather than assume: `AdapterInfo { name: "llvmpipe (LLVM
+  15.0.7, 256 bits)", device_type: Cpu, driver: "llvmpipe", backend:
+  Vulkan, .. }`. The timing numbers themselves are real, honestly
+  measured, and unaffected by this correction — only the hardware label
+  was wrong. Every "NVIDIA RTX 3090" reference in this entry and in
+  `aurora-app/src/lib.rs`'s own doc comments for these two tests should
+  be read as "this sandbox's available Vulkan adapter (Mesa llvmpipe,
+  software rendering) — not confirmed real GPU hardware." This does not
+  retroactively invalidate the "over budget" verdict (software rendering
+  has no obvious reason to make real hardware look artificially slow
+  here), but it does mean **no round in this session has yet measured
+  real-GPU-hardware frame timing for the live canvas path** — the
+  vertical slice spike's own much earlier "Second platform: Linux /
+  Vulkan (2026-07-26)" section is the one exception, which explicitly
+  confirmed `NVIDIA GeForce RTX 3090, driver 560.35.03` via
+  `adapter.get_info()` in its own write-up at the time, on what may or
+  may not be the same underlying machine as this later sandbox — a
+  question this correction doesn't resolve either way, since nothing
+  here re-checked *that* machine. Re-measuring both `aurora-app`
+  frame-loop tests on confirmed real GPU hardware, whenever one becomes
+  available, remains real, unstarted follow-on work.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
