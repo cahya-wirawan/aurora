@@ -595,6 +595,37 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// GPU-accelerated multi-layer compositing (reusing [`TileCompositor`]
 /// properly, with a real opacity/blend-mode-aware shader) is separate,
 /// still-open follow-on work.
+///
+/// **The accumulator's own backdrop colour, recovered before blending —
+/// not assumed straight-alpha as-is.** [`blend_rgb`]/[`blend_channel`]'s
+/// own math (`Multiply`, `Screen`, the HSL family, ...) is only correct
+/// when the `Cb` (backdrop) colour it receives is a *true straight-alpha*
+/// colour. That is automatically true for every layer composited over an
+/// already-*opaque* backdrop (`backdrop_alpha == 1.0`) — the case every
+/// test in this module exercises, since each seeds an opaque bottom layer
+/// first — because a straight colour and its premultiplied form are
+/// identical at `alpha = 1.0`. It is **not** true when the accumulator
+/// (`out`, here) is itself still translucent partway through this
+/// function's own loop: the running `dr`/`dg`/`db` at that point hold
+/// this function's own straight-alpha "over" accumulation, which is a
+/// *premultiplied* colour whenever the accumulated alpha is fractional
+/// (e.g. a lone 50%-opacity layer composited alone onto the starting
+/// fully-transparent `out` leaves `dr = 0.5` for a source whose own true
+/// colour is `1.0`, while `da` correctly holds `0.5`). A second layer
+/// then blending against that raw, still-premultiplied state via a
+/// non-`Normal` mode would hand `blend_rgb` the wrong `Cb`. So: before
+/// calling `blend_rgb`, the current backdrop colour is divided by
+/// `backdrop_alpha` to recover its true straight colour (guarded against
+/// `backdrop_alpha == 0.0`, where there is no meaningful colour to
+/// recover — `[0.0, 0.0, 0.0]` is used instead, the same guard shape
+/// `aurora-app`'s own `resolve_tile` already uses for its own, later,
+/// un-premultiply step). This changes nothing about the alpha
+/// accumulation or the final blended-RGB accumulation formulas below,
+/// both already correct — only `blend_rgb`'s own input. See
+/// `composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`
+/// for a worked example, and `aurora-app`'s own `resolve_tile` doc
+/// comment for how this closes the gap that function's group-isolation
+/// path used to leave open.
 #[must_use]
 pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
     let mut out = vec![f16::from_f32(0.0); SAMPLES];
@@ -610,9 +641,22 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
             let inverse = 1.0 - alpha;
             let backdrop_alpha = da.to_f32();
             let backdrop_inverse = 1.0 - backdrop_alpha;
+            // Recover the backdrop's true straight-alpha colour before
+            // handing it to `blend_rgb` as `Cb` -- see this function's
+            // own doc comment above for why the raw accumulator state
+            // isn't always already straight alpha.
+            let straight_backdrop = if backdrop_alpha > 0.0 {
+                [
+                    dr.to_f32() / backdrop_alpha,
+                    dg.to_f32() / backdrop_alpha,
+                    db.to_f32() / backdrop_alpha,
+                ]
+            } else {
+                [0.0, 0.0, 0.0]
+            };
             let [br, bg, bb] = blend_rgb(
                 mode,
-                [dr.to_f32(), dg.to_f32(), db.to_f32()],
+                straight_backdrop,
                 [sr.to_f32(), sg.to_f32(), sb.to_f32()],
             );
             let blended_r = backdrop_inverse * sr.to_f32() + backdrop_alpha * br;
@@ -1137,6 +1181,75 @@ mod tests {
             (&top, 1.0, BlendMode::Multiply),
         ]);
         assert_eq!(first_texel(&out), (0.25, 0.25, 0.25, 1.0));
+    }
+
+    #[test]
+    // Regression test for the bug named in `composite_tile_cpu`'s own doc
+    // comment ("The accumulator's own backdrop colour, recovered before
+    // blending") and, before this fix, in `aurora-app`'s `resolve_tile`
+    // doc comment and three `PLAN.md` M1.9 entries as "the non-`Normal`
+    // blend-mode-against-each-other math inside a translucent group
+    // isolation pass" -- genuinely open until now. Every other blend-mode
+    // test in this module (including the `Multiply` test just above)
+    // seeds an *opaque* bottom layer first, so `backdrop_alpha == 1.0`
+    // when the second layer's blend mode runs and the accumulator's raw
+    // state already equals its true straight colour -- this test is the
+    // one exception, seeding a *translucent* bottom layer instead, so the
+    // accumulator itself is still premultiplied when `Multiply` reacts to
+    // it.
+    //
+    // Layer 1 (bottom, `Normal`, opacity 0.5): straight colour
+    // (1.0, 0.5, 0.25). Composited onto the starting fully-transparent
+    // accumulator (backdrop_alpha = 0.0, so `blend_rgb` returns Cs
+    // unchanged): alpha = 1.0*0.5 = 0.5, dr = 0.5*1.0 = 0.5,
+    // dg = 0.5*0.5 = 0.25, db = 0.5*0.25 = 0.125, da = 0.5 -- a
+    // *premultiplied* accumulator, (0.5, 0.25, 0.125, 0.5). Its true
+    // straight-alpha colour, recovered by dividing by da = 0.5, is
+    // (1.0, 0.5, 0.25) -- exactly Layer 1's own source colour, as it must
+    // be (a lone layer's own colour is never altered by compositing over
+    // nothing).
+    //
+    // Layer 2 (top, `Multiply`, opacity 1.0, fully opaque): straight
+    // colour (0.5, 0.5, 0.75). `Multiply` is `Cb * Cs` per channel; with
+    // the *correct*, recovered Cb = (1.0, 0.5, 0.25):
+    // (1.0*0.5, 0.5*0.5, 0.25*0.75) = (0.5, 0.25, 0.1875). Layer 2 is
+    // fully opaque (alpha = 1.0, inverse = 0.0), so the general "over"
+    // formula collapses to
+    // `Co = (1 - backdrop_alpha)*Cs + backdrop_alpha*B(Cb,Cs)`:
+    //   R: 0.5*0.5   + 0.5*0.5    = 0.5
+    //   G: 0.5*0.5   + 0.5*0.25   = 0.375
+    //   B: 0.5*0.75  + 0.5*0.1875 = 0.46875
+    // da = alpha + da*inverse = 1.0 + 0.5*0.0 = 1.0. Correct result:
+    // (0.5, 0.375, 0.46875, 1.0).
+    //
+    // The pre-fix bug used the *raw*, still-premultiplied accumulator,
+    // (0.5, 0.25, 0.125), as Cb directly instead: `Multiply` gives
+    // (0.5*0.5, 0.25*0.5, 0.125*0.75) = (0.25, 0.125, 0.09375), and the
+    // same "over" collapse gives
+    //   R: 0.5*0.5  + 0.5*0.25    = 0.375
+    //   G: 0.5*0.5  + 0.5*0.125   = 0.3125
+    //   B: 0.5*0.75 + 0.5*0.09375 = 0.421875
+    // -- (0.375, 0.3125, 0.421875, 1.0), silently wrong in every channel.
+    fn composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator()
+     {
+        let bottom = solid_texels([1.0, 0.5, 0.25, 1.0]);
+        let top = solid_texels([0.5, 0.5, 0.75, 1.0]);
+        let out = composite_tile_cpu(&[
+            (&bottom, 0.5, BlendMode::Normal),
+            (&top, 1.0, BlendMode::Multiply),
+        ]);
+        assert_eq!(
+            first_texel(&out),
+            (0.5, 0.375, 0.46875, 1.0),
+            "Multiply against a still-translucent accumulator must use its true \
+             straight-alpha colour as Cb, not its raw premultiplied state"
+        );
+        assert_ne!(
+            first_texel(&out),
+            (0.375, 0.3125, 0.421_875, 1.0),
+            "this is the pre-fix value: Multiply run directly against the raw \
+             premultiplied accumulator instead of its recovered straight colour"
+        );
     }
 
     #[test]

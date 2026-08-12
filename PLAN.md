@@ -6905,21 +6905,23 @@ severity choice.
   flat, non-isolated composite of the same content gives, not the
   `(0.5, 0.5, 0.75, 1.0)` the pre-fix double-attenuation produced.
 
-  **A narrower gap genuinely remains, and the fix does not reach it**:
+  **A narrower gap remained when this round landed, closed 2026-08-12**:
   when a group's own children combine via a **non-`Normal` blend mode**
   against each other (e.g. one child `Multiply`d against another,
   within the same isolation pass), `composite_tile_cpu`'s own
-  `blend_channel`/`blend_rgb` math runs *during* accumulation against
-  whatever the accumulating buffer's backdrop value already is at that
+  `blend_channel`/`blend_rgb` math ran *during* accumulation against
+  whatever the accumulating buffer's backdrop value already was at that
   intermediate step, which partway through a still-translucent
-  accumulation is not yet a true straight colour. Un-premultiplying only
+  accumulation was not yet a true straight colour. Un-premultiplying only
   after the whole isolation pass finishes can't retroactively correct
   blend math that already ran mid-pass against a premultiplied
   intermediate — a deeper limitation of `composite_tile_cpu`'s own
-  accumulate-in-place design, not fixable from `resolve_tile` alone;
-  real, separate, still-open follow-on work (most plausibly: giving
-  `composite_tile_cpu` itself an un-premultiply step between layers, not
-  just at the end).
+  accumulate-in-place design, not fixable from `resolve_tile` alone. Now
+  fixed at its actual source: `composite_tile_cpu` itself recovers the
+  backdrop's true straight-alpha colour (dividing the running
+  accumulator's `r`/`g`/`b` by its own `a`, guarded against `a == 0.0`)
+  before ever handing it to `blend_rgb` as `Cb` — see the "Non-`Normal`
+  blend-mode math between group children" entry later in this section.
 
   A new regression test
   (`composite_document_un_premultiplies_a_groups_own_translucent_isolated_child`)
@@ -7179,8 +7181,10 @@ severity choice.
   already called `resolve_tile` for every layer, so no new wiring was
   needed there. The two pre-existing gaps named just above this bullet —
   non-`Normal` blend-mode-against-each-other math inside a translucent
-  group isolation pass, and per-layer/per-group mask aggregation — remain
-  exactly as open as before; this round's scope was Dissolve alone.
+  group isolation pass, and per-layer/per-group mask aggregation — were
+  both still open when this round landed; this round's own scope was
+  Dissolve alone. (Both closed later: mask aggregation in 0.37.0, the
+  translucent-isolation blend math below.)
 
 - [x] **Per-layer/per-group mask aggregation (rectangular clip only) —
   done 2026-08-12, closing the last gap named directly in the two rounds
@@ -7326,8 +7330,94 @@ severity choice.
   unchanged by this round — that restriction was never about masks.
   The non-`Normal` blend-mode-against-each-other math inside a
   translucent group isolation pass (named in the group-opacity-
-  aggregation round) remains exactly as open as before — this round's
-  scope was mask aggregation alone.
+  aggregation round) remained exactly as open as before this round —
+  this round's own scope was mask aggregation alone. (Closed
+  separately, below.)
+
+- [x] **Non-`Normal` blend-mode math between group children on a
+  translucent isolation buffer — done 2026-08-12.** The last of the
+  three real gaps named "still genuinely open" across the group-
+  opacity-aggregation (0.34.0), Dissolve (0.36.0), and mask-aggregation
+  (0.37.0) rounds. `aurora-render`'s `composite_tile_cpu` accumulates
+  layers bottom-to-top into a buffer starting fully transparent; its
+  `blend_channel`/`blend_rgb` math (`Multiply`, the HSL family, etc.)
+  is only correct when the `Cb` (backdrop) colour it receives is a true
+  straight-alpha colour. That's automatically true whenever a layer
+  composites over an already-*opaque* backdrop — every blend-mode test
+  in this file already seeds one, which is exactly why none of them
+  caught this — but false partway through a **group's own isolation
+  pass**, which starts from a fully transparent buffer: after a first
+  translucent child accumulates, the running `r`/`g`/`b` hold a
+  *premultiplied* colour (e.g. a lone 50%-opacity red layer alone on
+  transparent leaves `r = 0.5`, not its true straight `r = 1.0`), while
+  `a` correctly holds `0.5`. A second child then blending against that
+  raw state via a non-`Normal` mode handed `blend_rgb` the wrong `Cb`.
+  `resolve_tile`'s own existing un-premultiply step (0.34.0) only runs
+  once, after the whole isolation pass finishes, and can't retroactively
+  fix blend math that already ran mid-pass against a premultiplied
+  intermediate — exactly the boundary that round's own doc comment
+  named and left open.
+
+  **Fixed at its actual source**: `composite_tile_cpu` now recovers the
+  accumulator's true straight-alpha colour — dividing the running
+  `r`/`g`/`b` by its own `a`, guarded against `a == 0.0` the same way
+  `resolve_tile`'s own un-premultiply loop already is — before ever
+  handing it to `blend_rgb` as `Cb`. Nothing else about the function
+  changed: the alpha-accumulation formula and the final blended-RGB
+  "over" formula were both already correct; only `blend_rgb`'s own
+  input needed correcting. **Verified narrowly scoped, not just
+  claimed**: for any layer composited over an already-opaque backdrop
+  (`a == 1.0` — every existing blend-mode test's own shape), dividing
+  by `1.0` is a no-op, so this fix changes zero existing assertions;
+  `aurora-render`'s full suite confirms this (98 → 99, the one new
+  test, zero other tests needed a changed expectation).
+
+  1 new hand-computed `aurora-render` unit test
+  (`composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`):
+  a translucent (`opacity = 0.5`) `Normal` bottom layer, straight colour
+  `(1.0, 0.5, 0.25)`, composited alone onto transparent leaves the
+  accumulator premultiplied at `(0.5, 0.25, 0.125, 0.5)`; a fully
+  opaque `Multiply` top layer, straight colour `(0.5, 0.5, 0.75)`, must
+  react to the *recovered* backdrop `(1.0, 0.5, 0.25)`, giving
+  `(0.5, 0.375, 0.46875, 1.0)` — asserted directly, with an explicit
+  `assert_ne!` against the pre-fix wrong value `(0.375, 0.3125,
+  0.421_875, 1.0)` (what `Multiply` run against the raw premultiplied
+  accumulator would have given) so a regression back to the old
+  behaviour is caught, not just a missing improvement. 1 new end-to-end
+  `aurora-app` test
+  (`composite_document_blends_two_group_children_via_a_non_normal_blend_mode_against_a_translucent_backdrop`)
+  proves the same fix through a real `LayerTree`/`composite_document`
+  call — a real group with two children in exactly this shape,
+  hand-computed to the identical expected and pre-fix-wrong values,
+  confirming the fix reaches all the way through `resolve_tile`'s own
+  group-isolation path, not just `composite_tile_cpu` in isolation.
+
+  `resolve_tile`'s own doc comment (`aurora-app`) updated — the "Still
+  genuinely open, and this fix does not reach it" paragraph now
+  explains the fix and points to both new tests. The three PLAN.md
+  entries that named this gap (0.34.0, 0.36.0, 0.37.0, all above) are
+  updated to point here rather than repeat stale "still open" language.
+
+  Verified: `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test -p
+  aurora-render -p aurora-app` (99/187 passed, up from 98/186 — exactly
+  the two new tests, zero regressions), `cargo test --workspace` (0
+  failures across all 19 crates), `python3
+  scripts/check_no_hardcoded_style.py` clean (25 files scanned). No new
+  dependencies. `scripts/check_layering.py` remains the one unrun check
+  (pre-existing `tomllib` gap in this sandbox, Python 3.10). Version
+  bumped `0.37.0` → `0.38.0` per `CLAUDE.md`'s own convention.
+
+  **Still genuinely open, stated honestly**: this closes the third and
+  last of the three gaps named across the last three rounds, but two
+  separate, real limitations remain, neither touched by this round —
+  the GPU compositing fast path still only covers Normal-blend,
+  non-grouped tiles (this fix is CPU-path-only, since
+  `composite_tile_cpu` is a CPU function; the GPU path's own fixed-
+  function blend has no equivalent multi-layer accumulation to fix),
+  and real per-pixel/grayscale masking still needs real mask pixel
+  storage, the same not-yet-made resource-management decision the
+  mask-aggregation round already named.
 
 ### M1.10 — Phase 1 gate
 

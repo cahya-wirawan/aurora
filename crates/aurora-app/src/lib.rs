@@ -3358,21 +3358,31 @@ fn apply_mask_clip(
 /// `(0.5, 0.5, 1.0, 1.0)`, bit-for-bit what direct (non-isolated)
 /// compositing of the same content gives.
 ///
-/// **Still genuinely open, and this fix does not reach it**: when a
-/// group's own children combine via a **non-`Normal` blend mode**
-/// against each other (e.g. one child set to `Multiply` against another
-/// child, both inside the same isolation pass), `composite_tile_cpu`'s
-/// own `blend_channel`/`blend_rgb` math runs *during* accumulation,
-/// against whatever the accumulating buffer's `Cb` (backdrop) value
-/// already is at that intermediate step — which, partway through a
-/// still-translucent accumulation, is not yet a true straight colour.
-/// Un-premultiplying only after the whole isolation pass finishes (the
-/// fix above) cannot retroactively correct blend math that already ran
-/// mid-pass against a premultiplied intermediate. This is a deeper
-/// limitation of `composite_tile_cpu`'s own accumulate-in-place design,
-/// not something fixable from `resolve_tile` alone — real, still open,
-/// separate follow-on work (most plausibly: giving `composite_tile_cpu`
-/// itself an un-premultiply step between layers, not just at the end).
+/// **Now fixed at its actual source, one level below this function**:
+/// when a group's own children combine via a **non-`Normal` blend
+/// mode** against each other (e.g. one child set to `Multiply` against
+/// another child, both inside the same isolation pass),
+/// `composite_tile_cpu`'s own `blend_channel`/`blend_rgb` math runs
+/// *during* accumulation, against whatever the accumulating buffer's
+/// `Cb` (backdrop) value already is at that intermediate step — which,
+/// partway through a still-translucent accumulation, is not yet a true
+/// straight colour (the un-premultiply step above, which only runs once
+/// this function's own isolation pass has finished, cannot retroactively
+/// correct blend math that already ran mid-pass against a premultiplied
+/// intermediate — a deeper limitation of `composite_tile_cpu`'s own
+/// accumulate-in-place design, not something fixable from `resolve_tile`
+/// alone). `composite_tile_cpu` itself now recovers the backdrop's true
+/// straight-alpha colour — dividing the running accumulator's `r`/`g`/`b`
+/// by its own `a`, guarded against `a == 0.0` the same way the
+/// un-premultiply loop above already is — before ever handing it to
+/// `blend_rgb` as `Cb`, so every blend mode now reacts to the correct
+/// backdrop colour regardless of how translucent the accumulator is
+/// partway through a group's isolation pass. See `composite_tile_cpu`'s
+/// own doc comment and
+/// `composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`
+/// (`aurora-render`) for the mechanism and a worked example, and
+/// `composite_document_blends_two_group_children_via_a_non_normal_blend_mode_against_a_translucent_backdrop`
+/// below for this fix verified end to end through a real group.
 ///
 /// `None` if `id` doesn't exist, isn't visible, or (for a
 /// [`aurora_doc::LayerKind::Pixel`]) its tile fails to load — the same
@@ -10407,6 +10417,135 @@ mod tests {
                 result,
                 [0.0, 0.0, 1.0, 1.0],
                 "pure blue would mean the child used its own Normal mode instead of the group's Multiply"
+            );
+        }
+    }
+
+    #[test]
+    // End-to-end regression test for the gap `resolve_tile`'s own doc
+    // comment used to name as "still genuinely open, and this fix does
+    // not reach it" (now fixed — see that doc comment's current text):
+    // when a group's own children combine via a **non-`Normal` blend
+    // mode against each other** while the group's own isolation buffer
+    // is still translucent partway through, `composite_tile_cpu`'s
+    // `blend_rgb` used to see the raw, still-premultiplied accumulator
+    // as `Cb` instead of its true straight-alpha colour. This exercises
+    // that path through a real `LayerTree`/`composite_document` call,
+    // not just the `aurora-render`-level unit test
+    // (`composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`)
+    // that proves the same fix at the `composite_tile_cpu` level alone.
+    //
+    // `group` (left at its own default settings, opacity 1.0/`Normal`)
+    // contains two children: `bottom_child` (opacity 0.5, `Normal`,
+    // straight colour (1.0, 0.5, 0.25)) and, on top of it,
+    // `top_child` (opacity 1.0, fully opaque, `Multiply`, straight
+    // colour (0.5, 0.5, 0.75)). `background`, below `group` at the
+    // root, is opaque white -- irrelevant to the final result here,
+    // since `group`'s own isolated buffer ends up fully opaque
+    // (`bottom_child` alone already brings the accumulator's alpha to
+    // 0.5, and `top_child`'s own alpha is 1.0, so the accumulated alpha
+    // after both children is 1.0), so it fully occludes `background`
+    // once composited one level up.
+    //
+    // Hand-computed exactly as `composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`'s
+    // own doc comment (`aurora-render`) works out, since this is the
+    // same two-layer shape run through `resolve_tile`'s own group
+    // isolation: `bottom_child` alone onto the isolation buffer's
+    // starting fully-transparent state gives a *premultiplied*
+    // accumulator, (0.5, 0.25, 0.125, 0.5) -- true straight colour
+    // (1.0, 0.5, 0.25) at alpha 0.5. `top_child`'s `Multiply` against
+    // the *correct*, recovered backdrop gives
+    // (1.0*0.5, 0.5*0.5, 0.25*0.75) = (0.5, 0.25, 0.1875); since
+    // `top_child` is fully opaque the "over" formula collapses to
+    // `Co = (1-backdrop_alpha)*Cs + backdrop_alpha*B(Cb,Cs)`, giving
+    // (0.5, 0.375, 0.46875) at alpha 1.0. `group`'s own isolation
+    // buffer is already fully opaque, so the un-premultiply step above
+    // (dividing by alpha = 1.0) is a no-op, and `group`'s own default
+    // opacity 1.0/`Normal` reproduces that buffer exactly one level up,
+    // fully occluding `background`. Expected final pixel:
+    // (0.5, 0.375, 0.46875, 1.0).
+    //
+    // Before this fix, `Multiply` would have reacted to the *raw*,
+    // still-premultiplied accumulator, (0.5, 0.25, 0.125), instead:
+    // (0.5*0.5, 0.25*0.5, 0.125*0.75) = (0.25, 0.125, 0.09375), giving
+    // (0.375, 0.3125, 0.421875, 1.0) -- silently wrong in every
+    // channel, and explicitly asserted against below.
+    fn composite_document_blends_two_group_children_via_a_non_normal_blend_mode_against_a_translucent_backdrop()
+     {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // `add_pixel_layer` inserts as the new *topmost* child, so
+        // `bottom_child` (added first) ends up below `top_child` (added
+        // second) -- `children(group) == [top_child, bottom_child]`,
+        // which `resolve_tile`'s own `.rev()` turns into bottom-to-top
+        // order for `composite_tile_cpu`, exactly the shape this test's
+        // own hand-computation above assumes.
+        let bottom_child = match layers.add_pixel_layer("bottom_child", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top_child = match layers.add_pixel_layer("top_child", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(bottom_child, 0.5) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_blend_mode(top_child, aurora_doc::BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(layers.roots(), [group, background]);
+        let Some(children) = layers.children(group) else {
+            unreachable!("group was just created with two children");
+        };
+        assert_eq!(children, [top_child, bottom_child]);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [1.0, 1.0, 1.0, 1.0]),
+            (bottom_child, [1.0, 0.5, 0.25, 1.0]),
+            (top_child, [0.5, 0.5, 0.75, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            let result = image_pixel(&image, 0, 0);
+            assert_eq!(
+                result,
+                [0.5, 0.375, 0.46875, 1.0],
+                "Multiply between two group children must react to the true straight-alpha \
+                 backdrop colour, not the raw premultiplied accumulator, even while the \
+                 group's own isolation buffer is still translucent partway through"
+            );
+            assert_ne!(
+                result,
+                [0.375, 0.3125, 0.421_875, 1.0],
+                "this is the pre-fix value: Multiply run directly against the raw \
+                 premultiplied accumulator instead of its recovered straight colour"
             );
         }
     }
