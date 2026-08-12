@@ -7863,6 +7863,34 @@ severity choice.
   all clean, `python3 scripts/check_no_hardcoded_style.py` clean.
   Version bumped as a patch (`CLAUDE.md`'s own convention — this
   corrects something already landed and wrong, not new work).
+
+  **Confirmed on real GitHub Actions CI itself, not just locally**: the
+  push landing this fix (commit `5e46a81`) went fully green — `Format,
+  lint, layering`, `Licences and advisories`, `Docs`, and `Test` on all
+  three of `ubuntu-latest`/`macos-latest`/`windows-latest`. Pulled the
+  real per-platform numbers from the job logs directly (`gh api
+  repos/.../actions/jobs/<id>/logs`), not assumed from a green
+  checkmark alone: `macos-latest` genuinely ran both benchmarks (1.79s
+  and 9.94s wall time, not a trivial skip) and passed within the new
+  budgets; `windows-latest` likewise (1.18s and 6.93s); `ubuntu-latest`
+  passed too, but its own run this time found no adapter at all
+  (`real_gpu_context()` returned `None`, a valid, honest skip — both
+  tests completed in ~0.007s, consistent with an early return, not a
+  real measurement) — CI's own adapter availability is itself
+  apparently non-deterministic run to run, not just its performance.
+  The worst real numbers seen across every CI run so far, any platform:
+  GPU-path p99 1310.46 ms (`windows-latest`, an earlier failing run)
+  and 889.41 ms (`ubuntu-latest`, the run that originally broke this);
+  CPU-fallback p99 223.49 ms (`windows-latest`) and 409.62 ms
+  (`ubuntu-latest`) — all comfortably inside the new 3000 ms/1500 ms
+  budgets (2.3x and 3.4x margin over the worst GPU number, 6.7x and
+  3.7x over the worst CPU number, across the two platforms that have
+  actually failed so far). Not re-bumping the version for this
+  paragraph alone — no code changed, this only records real
+  confirmation of the fix already landed and versioned above, the same
+  "doc-only follow-up, no new patch" precedent this file's own history
+  already establishes (e.g. the plain "Correct PLAN.md" commit between
+  0.10.2 and 0.11.0, no version of its own).
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
