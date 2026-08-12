@@ -64,7 +64,7 @@
 use accesskit::Toggled;
 use aurora_core::Rect;
 use aurora_theme::{Scales, Theme};
-use aurora_vector::{DEFAULT_TOLERANCE, Mesh, Path, fill, rounded_rect, stroke};
+use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor};
 
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
@@ -91,14 +91,23 @@ pub type Paint = (Mesh, [f32; 4]);
 /// for an unselected row's own `Ok(vec![])`, not a new pattern invented
 /// here. `alpha` lets the caller fold in `state.disabled_opacity` too —
 /// a disabled control's outline should dim along with everything else
-/// about it, the same as its fill already does.
-fn control_outline(path: &Path, theme: &Theme, alpha: f32) -> Result<Option<Paint>, WidgetError> {
+/// about it, the same as its fill already does. `scale_factor` is the
+/// window's own DPI scale factor (`winit::window::Window::scale_factor`)
+/// — see [`aurora_vector::tolerance_for_scale_factor`] for why this
+/// stroke's tolerance depends on it.
+fn control_outline(
+    path: &Path,
+    theme: &Theme,
+    alpha: f32,
+    scale_factor: f32,
+) -> Result<Option<Paint>, WidgetError> {
     const CONTROL_BORDER_WIDTH: f32 = 1.0;
 
     if theme.border.control_opacity <= 0.0 {
         return Ok(None);
     }
-    let mesh = stroke(path, CONTROL_BORDER_WIDTH, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = stroke(path, CONTROL_BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
     let [r, g, b] = theme.border.control.to_srgb_f32();
     Ok(Some((
         mesh,
@@ -119,23 +128,36 @@ fn control_outline(path: &Path, theme: &Theme, alpha: f32) -> Result<Option<Pain
 /// `tree`, or [`WidgetError::Paint`] if tessellation itself fails (in
 /// practice unreachable for `rounded_rect`'s own output — see
 /// `WidgetError::Paint`'s own doc comment).
+///
+/// `scale_factor` is the window's own DPI scale factor
+/// (`winit::window::Window::scale_factor`, e.g. `2.0` on a Retina/HiDPI
+/// display) — threaded down into every fill/stroke call so tessellation
+/// tolerance tracks physical, not just logical, pixel density (see
+/// [`aurora_vector::tolerance_for_scale_factor`]). A headless caller
+/// with no real window (e.g. the component-gallery test harness) should
+/// pass `1.0`.
 pub fn paint_widget(
     tree: &WidgetTree<WidgetKind>,
     id: WidgetId,
     theme: &Theme,
     scales: &Scales,
+    scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     let bounds = tree.bounds(id).ok_or(WidgetError::UnknownWidget(id))?;
     let kind = tree.payload(id).ok_or(WidgetError::UnknownWidget(id))?;
     match kind {
-        WidgetKind::Button(state) => paint_button(state, bounds, theme, scales),
-        WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales),
-        WidgetKind::Slider(state) => paint_slider(state, bounds, theme, scales),
-        WidgetKind::TextField(state) => paint_text_field(state, bounds, theme, scales),
-        WidgetKind::CommandPalette(_) => paint_command_palette(bounds, theme, scales),
-        WidgetKind::ColorSwatch(state) => paint_color_swatch(*state, bounds, theme, scales),
-        WidgetKind::ListRow(state) => paint_list_row(*state, bounds, theme, scales),
-        WidgetKind::Panel => paint_panel(bounds, theme, scales),
+        WidgetKind::Button(state) => paint_button(state, bounds, theme, scales, scale_factor),
+        WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales, scale_factor),
+        WidgetKind::Slider(state) => paint_slider(state, bounds, theme, scales, scale_factor),
+        WidgetKind::TextField(state) => {
+            paint_text_field(state, bounds, theme, scales, scale_factor)
+        }
+        WidgetKind::CommandPalette(_) => paint_command_palette(bounds, theme, scales, scale_factor),
+        WidgetKind::ColorSwatch(state) => {
+            paint_color_swatch(*state, bounds, theme, scales, scale_factor)
+        }
+        WidgetKind::ListRow(state) => paint_list_row(*state, bounds, theme, scales, scale_factor),
+        WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -145,6 +167,7 @@ fn paint_button(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
+    scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
@@ -153,7 +176,8 @@ fn paint_button(
         bounds.height as f32,
         scales.radius.sm as f32,
     );
-    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
 
     // No hover flag exists on `ButtonState` yet (`widgets::button`'s own
     // doc comment), so only the two states it actually tracks are
@@ -171,7 +195,7 @@ fn paint_button(
         1.0
     };
     let mut paints = vec![(mesh, [r, g, b, alpha])];
-    if let Some(outline) = control_outline(&path, theme, alpha)? {
+    if let Some(outline) = control_outline(&path, theme, alpha, scale_factor)? {
         paints.push(outline);
     }
     Ok(paints)
@@ -182,6 +206,7 @@ fn paint_checkbox(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
+    scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
@@ -190,7 +215,8 @@ fn paint_checkbox(
         bounds.height as f32,
         scales.radius.sm as f32,
     );
-    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
 
     // `Toggled::True`/`Toggled::Mixed` share a colour -- see this
     // module's own doc comment for why (no check/dash glyph exists yet
@@ -206,7 +232,7 @@ fn paint_checkbox(
         1.0
     };
     let mut paints = vec![(mesh, [r, g, b, alpha])];
-    if let Some(outline) = control_outline(&path, theme, alpha)? {
+    if let Some(outline) = control_outline(&path, theme, alpha, scale_factor)? {
         paints.push(outline);
     }
     Ok(paints)
@@ -226,12 +252,14 @@ fn paint_slider(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
+    scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     let alpha = if state.disabled {
         theme.state.disabled_opacity
     } else {
         1.0
     };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
 
     let track_thickness = bounds.height as f32 * 0.3;
     let track_path = rounded_rect(
@@ -241,7 +269,7 @@ fn paint_slider(
         track_thickness,
         scales.radius.pill as f32,
     );
-    let track_mesh = fill(&track_path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let track_mesh = fill(&track_path, tolerance).map_err(WidgetError::Paint)?;
     let [r, g, b] = theme.surface.sunken.to_srgb_f32();
     let track = (track_mesh, [r, g, b, alpha]);
 
@@ -264,7 +292,7 @@ fn paint_slider(
         thumb_size,
         scales.radius.pill as f32,
     );
-    let thumb_mesh = fill(&thumb_path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let thumb_mesh = fill(&thumb_path, tolerance).map_err(WidgetError::Paint)?;
     let [r, g, b] = theme.accent.primary.to_srgb_f32();
     let thumb = (thumb_mesh, [r, g, b, alpha]);
 
@@ -272,7 +300,7 @@ fn paint_slider(
     // The thumb, not the track: the track is a groove, not itself a
     // focusable control -- the thumb is the actual interactive handle a
     // user grabs (this module's own doc comment / `control_outline`'s).
-    if let Some(outline) = control_outline(&thumb_path, theme, alpha)? {
+    if let Some(outline) = control_outline(&thumb_path, theme, alpha, scale_factor)? {
         paints.push(outline);
     }
     Ok(paints)
@@ -283,6 +311,7 @@ fn paint_text_field(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
+    scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
@@ -291,7 +320,8 @@ fn paint_text_field(
         bounds.height as f32,
         scales.radius.sm as f32,
     );
-    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
 
     // The same "recessed input control" token an unchecked Checkbox and
     // a Slider's own track already use -- `content`/`cursor`/
@@ -304,7 +334,7 @@ fn paint_text_field(
         1.0
     };
     let mut paints = vec![(mesh, [r, g, b, alpha])];
-    if let Some(outline) = control_outline(&path, theme, alpha)? {
+    if let Some(outline) = control_outline(&path, theme, alpha, scale_factor)? {
         paints.push(outline);
     }
     Ok(paints)
@@ -329,6 +359,7 @@ fn paint_command_palette(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
+    scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
@@ -337,10 +368,11 @@ fn paint_command_palette(
         bounds.height as f32,
         scales.radius.md as f32,
     );
-    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
     let [r, g, b] = theme.surface.raised.to_srgb_f32();
     let mut paints = vec![(mesh, [r, g, b, 1.0])];
-    if let Some(outline) = control_outline(&path, theme, 1.0)? {
+    if let Some(outline) = control_outline(&path, theme, 1.0, scale_factor)? {
         paints.push(outline);
     }
     Ok(paints)
@@ -361,6 +393,7 @@ fn paint_color_swatch(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
+    scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     let path = rounded_rect(
         bounds.x as f32,
@@ -369,7 +402,8 @@ fn paint_color_swatch(
         bounds.height as f32,
         scales.radius.sm as f32,
     );
-    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
     let [r, g, b] = state.color.to_srgb_f32();
     let alpha = if state.disabled {
         theme.state.disabled_opacity
@@ -377,7 +411,7 @@ fn paint_color_swatch(
         1.0
     };
     let mut paints = vec![(mesh, [r, g, b, alpha])];
-    if let Some(outline) = control_outline(&path, theme, alpha)? {
+    if let Some(outline) = control_outline(&path, theme, alpha, scale_factor)? {
         paints.push(outline);
     }
     Ok(paints)
@@ -398,6 +432,7 @@ fn paint_list_row(
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
+    scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     if !state.selected {
         return Ok(vec![]);
@@ -409,7 +444,8 @@ fn paint_list_row(
         bounds.height as f32,
         scales.radius.sm as f32,
     );
-    let mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
     let [r, g, b] = theme.accent.primary.to_srgb_f32();
     let alpha = if state.disabled {
         theme.state.disabled_opacity
@@ -463,7 +499,12 @@ fn paint_list_row(
 /// set_panel_collapsed`'s own `flex_grow: 0.0`), so an unconditional
 /// fill-plus-border here already reads as "nothing visible" without
 /// this function needing to know about collapse at all.
-fn paint_panel(bounds: Rect, theme: &Theme, scales: &Scales) -> Result<Vec<Paint>, WidgetError> {
+fn paint_panel(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
     const BORDER_WIDTH: f32 = 1.0;
 
     let path = rounded_rect(
@@ -473,10 +514,11 @@ fn paint_panel(bounds: Rect, theme: &Theme, scales: &Scales) -> Result<Vec<Paint
         bounds.height as f32,
         scales.radius.sm as f32,
     );
-    let fill_mesh = fill(&path, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
     let [fr, fg, fb] = theme.surface.panel.to_srgb_f32();
 
-    let border_mesh = stroke(&path, BORDER_WIDTH, DEFAULT_TOLERANCE).map_err(WidgetError::Paint)?;
+    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
     let [br, bg, bb] = theme.border.default.to_srgb_f32();
 
     Ok(vec![
@@ -568,8 +610,9 @@ mod tests {
         id: WidgetId,
         theme: &Theme,
         scales: &Scales,
+        scale_factor: f32,
     ) -> Paint {
-        let mut paints = match paint_widget(tree, id, theme, scales) {
+        let mut paints = match paint_widget(tree, id, theme, scales, scale_factor) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -603,7 +646,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (mesh, color) = single_paint(&tree, button, &theme, &scales);
+        let (mesh, color) = single_paint(&tree, button, &theme, &scales, 1.0);
         assert!(
             !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
             "an 80x32 button must tessellate to real geometry"
@@ -630,7 +673,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (_, color) = single_paint(&tree, button, &theme, &scales);
+        let (_, color) = single_paint(&tree, button, &theme, &scales, 1.0);
         let [r, g, b] = theme.accent.primary_active.to_srgb_f32();
         assert_eq!(color, [r, g, b, 1.0]);
     }
@@ -649,7 +692,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (_, color) = single_paint(&tree, button, &theme, &scales);
+        let (_, color) = single_paint(&tree, button, &theme, &scales, 1.0);
         assert_eq!(color[3], theme.state.disabled_opacity);
     }
 
@@ -675,7 +718,7 @@ mod tests {
         }
         let theme = high_contrast_theme();
 
-        let paints = match paint_widget(&tree, button, &theme, &scales) {
+        let paints = match paint_widget(&tree, button, &theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -713,7 +756,7 @@ mod tests {
         }
         let theme = high_contrast_theme();
 
-        let paints = match paint_widget(&tree, button, &theme, &scales) {
+        let paints = match paint_widget(&tree, button, &theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -762,7 +805,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (mesh, color) = single_paint(&tree, checkbox, &theme, &scales);
+        let (mesh, color) = single_paint(&tree, checkbox, &theme, &scales, 1.0);
         assert!(
             !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
             "a 20x20 checkbox must tessellate to real geometry"
@@ -789,7 +832,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (_, color) = single_paint(&tree, checkbox, &theme, &scales);
+        let (_, color) = single_paint(&tree, checkbox, &theme, &scales, 1.0);
         let [r, g, b] = theme.accent.primary.to_srgb_f32();
         assert_eq!(color, [r, g, b, 1.0]);
     }
@@ -809,7 +852,7 @@ mod tests {
         state.checked = Toggled::Mixed;
         let theme = dark_theme();
 
-        let (_, color) = single_paint(&tree, checkbox, &theme, &scales);
+        let (_, color) = single_paint(&tree, checkbox, &theme, &scales, 1.0);
         let [r, g, b] = theme.accent.primary.to_srgb_f32();
         assert_eq!(
             color,
@@ -832,7 +875,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (_, color) = single_paint(&tree, checkbox, &theme, &scales);
+        let (_, color) = single_paint(&tree, checkbox, &theme, &scales, 1.0);
         assert_eq!(color[3], theme.state.disabled_opacity);
     }
 
@@ -858,7 +901,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let mut paints = match paint_widget(&tree, slider, &theme, &scales) {
+        let mut paints = match paint_widget(&tree, slider, &theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -910,7 +953,7 @@ mod tests {
         let theme = dark_theme();
 
         let thumb_min_x = |tree: &WidgetTree<WidgetKind>| -> f32 {
-            let mut paints = match paint_widget(tree, slider, &theme, &scales) {
+            let mut paints = match paint_widget(tree, slider, &theme, &scales, 1.0) {
                 Ok(paints) => paints,
                 Err(err) => unreachable!("{err:?}"),
             };
@@ -948,7 +991,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let paints = match paint_widget(&tree, slider, &theme, &scales) {
+        let paints = match paint_widget(&tree, slider, &theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -980,7 +1023,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (mesh, color) = single_paint(&tree, field, &theme, &scales);
+        let (mesh, color) = single_paint(&tree, field, &theme, &scales, 1.0);
         assert!(
             !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
             "a 160x28 text field must tessellate to real geometry"
@@ -1007,7 +1050,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (_, color) = single_paint(&tree, field, &theme, &scales);
+        let (_, color) = single_paint(&tree, field, &theme, &scales, 1.0);
         assert_eq!(color[3], theme.state.disabled_opacity);
     }
 
@@ -1034,7 +1077,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (mesh, color) = single_paint(&tree, palette, &theme, &scales);
+        let (mesh, color) = single_paint(&tree, palette, &theme, &scales, 1.0);
         assert!(
             !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
             "a 320x240 command palette must tessellate to real geometry"
@@ -1077,7 +1120,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (mesh, color) = single_paint(&tree, row, &theme, &scales);
+        let (mesh, color) = single_paint(&tree, row, &theme, &scales, 1.0);
         assert!(
             !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
             "a 200x24 selected row must tessellate to real geometry"
@@ -1115,7 +1158,7 @@ mod tests {
         };
         let theme = dark_theme();
 
-        let paints = match paint_widget(&tree, second_row, &theme, &scales) {
+        let paints = match paint_widget(&tree, second_row, &theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -1155,7 +1198,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (_, color) = single_paint(&tree, row, &theme, &scales);
+        let (_, color) = single_paint(&tree, row, &theme, &scales, 1.0);
         assert_eq!(
             color[3], theme.state.disabled_opacity,
             "a disabled, selected row still dims like every other disabled widget's paint"
@@ -1189,7 +1232,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (mesh, paint_color) = single_paint(&tree, swatch, &theme, &scales);
+        let (mesh, paint_color) = single_paint(&tree, swatch, &theme, &scales, 1.0);
         assert!(
             !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
             "a 32x32 color swatch must tessellate to real geometry"
@@ -1221,7 +1264,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let (_, paint_color) = single_paint(&tree, swatch, &theme, &scales);
+        let (_, paint_color) = single_paint(&tree, swatch, &theme, &scales, 1.0);
         let [r, g, b] = color.to_srgb_f32();
         assert_eq!(
             paint_color,
@@ -1257,7 +1300,7 @@ mod tests {
         }
         let theme = dark_theme();
 
-        let mut paints = match paint_widget(&tree, panel, &theme, &scales) {
+        let mut paints = match paint_widget(&tree, panel, &theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -1291,7 +1334,7 @@ mod tests {
         let (tree, root) = new_tree(taffy::Style::default());
         let theme = dark_theme();
         let scales = scales();
-        let paints = match paint_widget(&tree, root, &theme, &scales) {
+        let paints = match paint_widget(&tree, root, &theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -1309,7 +1352,7 @@ mod tests {
         // Same bogus-id precedent `tree`'s own tests use
         // (`accesskit::NodeId(999)`) -- never inserted into this tree.
         let bogus = accesskit::NodeId(999);
-        let result = paint_widget(&tree, bogus, &theme, &scales);
+        let result = paint_widget(&tree, bogus, &theme, &scales, 1.0);
         assert!(
             result.is_err(),
             "an id that was never inserted must not resolve"

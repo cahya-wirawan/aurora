@@ -1083,8 +1083,12 @@ fn collect_gallery_paints(
     queue: &wgpu::Queue,
 ) -> Vec<(GpuMesh, [f32; 4])> {
     let mut widget_paints = Vec::new();
+    // `1.0`: this harness renders to a headless offscreen target with no
+    // real window to derive a DPI scale factor from, so `1.0` (no
+    // scaling) is the honest, correct choice -- not a stand-in for a
+    // real value this test harness is missing.
     for id in tree.paint_order() {
-        if let Ok(paints) = paint_widget(tree, id, theme, scales) {
+        if let Ok(paints) = paint_widget(tree, id, theme, scales, 1.0) {
             for (mesh, color) in paints {
                 let gpu_mesh = GpuMesh::upload(device, queue, &mesh);
                 widget_paints.push((gpu_mesh, color));

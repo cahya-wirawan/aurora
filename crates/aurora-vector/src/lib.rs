@@ -32,9 +32,12 @@
 //! other half of this crate's own name) are a substantially harder,
 //! separate computational-geometry problem (`lyon` itself doesn't
 //! include them) and are not attempted here at all yet. Tessellation
-//! tolerance is a fixed default ([`DEFAULT_TOLERANCE`]), not yet scaled
-//! by DPI/zoom — a real, separate follow-on once a real caller needs
-//! that tradeoff made for real.
+//! tolerance defaults to [`DEFAULT_TOLERANCE`] but is now, as of
+//! 2026-08-12, scaled by DPI via [`tolerance_for_scale_factor`] — see
+//! its own doc comment for the derivation. Zoom-aware tolerance remains
+//! deliberately deferred: `aurora-vector` is currently only consumed by
+//! `aurora-widgets` for UI chrome, which isn't rendered at variable
+//! zoom, so there is still no real caller to make that tradeoff for.
 
 mod error;
 mod mesh;
@@ -43,7 +46,7 @@ mod point;
 mod shapes;
 
 pub use error::VectorError;
-pub use mesh::{DEFAULT_TOLERANCE, Mesh, fill, stroke};
+pub use mesh::{DEFAULT_TOLERANCE, Mesh, fill, stroke, tolerance_for_scale_factor};
 pub use path::{Path, PathBuilder};
 pub use point::Point;
 pub use shapes::rounded_rect;

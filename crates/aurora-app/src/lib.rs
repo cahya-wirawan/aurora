@@ -6284,8 +6284,13 @@ impl App {
 
                 // Built before the render pass below, not inside it --
                 // see `collect_widget_paints`'s own doc comment for why.
-                let widget_paints =
-                    collect_widget_paints(&self.workspace.tree, &self.theme, &self.scales, gpu);
+                let widget_paints = collect_widget_paints(
+                    &self.workspace.tree,
+                    &self.theme,
+                    &self.scales,
+                    gpu,
+                    self.scale_factor,
+                );
 
                 // Sync before drawing, so this frame shows the latest
                 // painted pixels rather than lagging one frame behind.
@@ -6408,15 +6413,18 @@ impl App {
 /// linearized ([`linearize_paint_color`]) here, once, rather than by
 /// [`draw_widget_paints`] on every draw call.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 fn collect_widget_paints(
     tree: &WidgetTree<WidgetKind>,
     theme: &Theme,
     scales: &Scales,
     gpu: &GpuContext,
+    scale_factor: f64,
 ) -> Vec<(GpuMesh, [f32; 4])> {
+    let scale_factor = scale_factor as f32;
     let mut widget_paints = Vec::new();
     for id in tree.paint_order() {
-        match paint_widget(tree, id, theme, scales) {
+        match paint_widget(tree, id, theme, scales, scale_factor) {
             Ok(paints) => {
                 for (mesh, color) in paints {
                     let gpu_mesh = GpuMesh::upload(gpu.device(), gpu.queue(), &mesh);
@@ -9086,7 +9094,7 @@ mod tests {
             unreachable!("{err:?}");
         }
 
-        let paints = collect_widget_paints(&tree, &theme, &scales, &context);
+        let paints = collect_widget_paints(&tree, &theme, &scales, &context, 1.0);
         assert_eq!(
             paints.len(),
             1,

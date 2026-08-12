@@ -2151,8 +2151,53 @@ check licenses` clean with the new `toml` dependency.
   operations (union/intersection/difference — the other half of this
   crate's own name) are a substantially harder, separate computational-
   geometry problem `lyon` itself doesn't include, and aren't attempted
-  at all yet. Tessellation tolerance is a fixed default
-  (`aurora_vector::DEFAULT_TOLERANCE`), not yet scaled by DPI/zoom.
+  at all yet.
+
+  **Tessellation tolerance is now DPI-aware, done 2026-08-12** — closes
+  half of the "not yet scaled by DPI/zoom" gap this bullet used to note.
+  New `aurora_vector::tolerance_for_scale_factor(scale_factor: f32) ->
+  f32` (`crates/aurora-vector/src/mesh.rs`) returns
+  `DEFAULT_TOLERANCE / scale_factor`, falling back to `DEFAULT_TOLERANCE`
+  itself (an effective `scale_factor` of `1.0`) for `<= 0.0`/non-finite
+  input — the same fallback idiom `aurora-app`'s own `logical_size`/
+  `logical_point` already use for the identical class of value `winit`
+  should never actually report. The derivation: `tolerance` is a
+  distance in the *logical*-path space a widget's `Path` is built in,
+  but the goal is a constant deviation in *physical* pixels — one
+  logical pixel covers `scale_factor` physical pixels, so a logical
+  tolerance of `DEFAULT_TOLERANCE / scale_factor` keeps the *physical*
+  tolerance (`logical_tolerance * scale_factor`) pinned at
+  `DEFAULT_TOLERANCE` regardless of DPI, instead of a HiDPI window
+  silently tessellating twice as coarse relative to its own real pixel
+  grid. Verified with real geometry, not just a changed number: filling
+  the same `rounded_rect` (a real radius, not a plain rect — a plain
+  rect has no curve for tolerance to affect) at `scale_factor = 1.0`
+  produces fewer vertices than at `2.0`, which produces fewer than
+  `4.0` — asserted directly in `mesh.rs`'s own tests, along with the
+  same property for `stroke` and explicit degenerate-input coverage
+  (`0.0`, negative, `NaN`, `+/-infinity` all fall back to
+  `DEFAULT_TOLERANCE`, finite and positive).
+
+  Threaded all the way to the real call sites: `aurora-widgets::paint`'s
+  `paint_widget` and its ~9 internal `paint_*` helpers
+  (`paint_button`/`paint_checkbox`/`paint_slider`/`paint_text_field`/
+  `paint_command_palette`/`paint_color_swatch`/`paint_list_row`/
+  `paint_panel`/`control_outline`) now take `scale_factor: f32` and
+  resolve tolerance from it instead of the bare `DEFAULT_TOLERANCE`
+  constant. `aurora-app`'s `collect_widget_paints` passes its own real,
+  live `self.scale_factor` (`Window::scale_factor`, kept current via
+  `WindowEvent::ScaleFactorChanged`); `aurora-widgets/tests/gallery.rs`'s
+  `collect_gallery_paints` passes `1.0` — the honest choice for a
+  headless offscreen render target with no real window to derive a
+  scale factor from, not a stand-in for a missing real value.
+
+  **Zoom remains explicitly deferred, not silently dropped**: the other
+  half of "DPI/zoom" this bullet originally named. Zoom would matter for
+  vector content rendered on the canvas at variable zoom levels, but no
+  such consumer exists yet — `aurora-vector` is still only consumed by
+  `aurora-widgets` for UI chrome (buttons, checkboxes, panels, ...),
+  none of which is ever zoomed. Real, separate follow-on once a real
+  zoomed vector consumer exists to make that tradeoff for.
 - [x] **GPU path renderer (`aurora-widgets`)** — done 2026-08-06, the
   direct continuation of the `aurora-vector` bullet above: PRD §8's own
   "custom GPU path renderer" half, the piece that actually uploads a
