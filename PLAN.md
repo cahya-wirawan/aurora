@@ -7182,6 +7182,153 @@ severity choice.
   group isolation pass, and per-layer/per-group mask aggregation — remain
   exactly as open as before; this round's scope was Dissolve alone.
 
+- [x] **Per-layer/per-group mask aggregation (rectangular clip only) —
+  done 2026-08-12, closing the last gap named directly in the two rounds
+  above** (group-opacity/blend-mode aggregation's own "Still genuinely
+  open" note, and the Dissolve round's closing paragraph, both named
+  "per-layer/per-group mask aggregation" as real, separate, unimplemented
+  work). `aurora_doc::LayerMask` has been fully wired into the document
+  model — `LayerTree::mask`/`add_mask`/`remove_mask`/
+  `set_mask_enabled`/`set_mask_inverted`, all tested — since well before
+  this round, but was never aggregated into compositing: a layer or
+  group with a mask attached composited exactly as if the mask didn't
+  exist. That is the gap this closes.
+
+  **Scope, fixed by what `LayerMask` itself actually carries**:
+  `LayerMask` deliberately has no real pixel/grayscale storage yet — its
+  own doc comment names the same open one-`TileStore`-per-layer-vs-
+  shared resource-management question `LayerKind::Pixel`'s own `bounds`
+  field already flags, not yet decided. It only carries `bounds` (a
+  document-space `aurora_core::Rect`), `enabled`, and `inverted`. So the
+  only honest thing to build was a **rectangular clip**: pixels inside
+  `mask.bounds` show (or are hidden, if `inverted`), pixels outside are
+  hidden (or show, if `inverted`), and a disabled mask has zero effect.
+  This is **not** real grayscale masking — no feathering, no soft edges,
+  no partial coverage, a pixel is either fully shown or fully hidden.
+  Real per-pixel masking needs real mask pixel storage, which is
+  separate, still-open, not-yet-decided work, named honestly below.
+
+  **Design, following the Dissolve round's own precedent exactly**: one
+  new pure `aurora_core::Rect::contains_point(x, y) -> bool`
+  (`geometry.rs`), matching the crate's existing half-open convention
+  (`x` in `[self.x, self.right())`, `y` in `[self.y, self.bottom())`,
+  the same boundary `intersects` already establishes) — a general-
+  purpose geometry primitive with zero Aurora-specific concepts in it,
+  the same reason `intersects`/`union` already live at that layer. One
+  new `aurora-app` function, `apply_mask_clip(texels, mask, doc_origin)
+  -> Vec<half::f16>`, placed beside `dissolve_gate` and built the same
+  way: for each texel, recover its absolute document position from
+  `doc_origin` + its own row/col within the `aurora_tile::TILE` grid
+  (the exact conversion `dissolve_gate` already does — copied, not
+  reinvented), test it against `mask.bounds` via `contains_point`, XOR
+  with `mask.inverted`, and either pass the texel through unchanged or
+  zero all four channels — the same `(0, 0, 0, 0)` "hidden" convention
+  `dissolve_gate` uses. Unlike `dissolve_gate`, a shown texel keeps its
+  own real alpha rather than being forced to `1.0` — there's no
+  stochastic decision here to fold in, this is a hard visibility test.
+
+  **Wired into `resolve_tile`'s both branches**, in both cases *ahead
+  of* the existing `Dissolve` interception: for `Pixel`, right after
+  reading `texels`; for `Group`, right after the existing un-premultiply
+  step, clipping the group's own isolated buffer as a single unit — the
+  same "group's own opacity/blend mode apply one level up, to the
+  isolated result, not per-child" precedent the group-opacity-
+  aggregation round already established, applied identically to mask.
+  The ordering matters and is now the real behaviour: the mask restricts
+  *which* pixels are even in play first, and whatever blend mode (`
+  Dissolve` included) only ever acts within what the mask left visible —
+  a masked-out pixel never gets a chance to win `Dissolve`'s own
+  stochastic gate, because it never reaches `dissolve_gate` with nonzero
+  alpha. Both call sites check `layers.mask(id)` and only clip when
+  `Some(mask)` and `mask.enabled` — a disabled mask, or no mask at all,
+  is a complete no-op, same as before this round.
+
+  **Doc comments updated, not just code**: `resolve_tile`'s own doc
+  comment gained a new paragraph (mirroring its existing `Dissolve`
+  paragraph) stating the mask-clip addition, its call-site ordering, and
+  the rectangular-only scope boundary. `aurora-doc`'s
+  `LayerTree::paint_order` doc comment — which previously said
+  opacity/blend-mode aggregation "now exists" via `resolve_tile` while
+  leaving mask described as still unaggregated — now says mask
+  aggregation exists too, via the same mechanism, with the same
+  rectangular-clip caveat spelled out inline. `aurora-doc` production
+  code itself is untouched (`tree.rs`'s own doc comment is the only
+  change in that crate) — `LayerMask`/`LayerTree` were already fully
+  wired before this round; only real compositing was missing.
+
+  **Real tests, not just compiling.** `aurora-core` (17 → 21, 4 new):
+  `Rect::contains_point` — a point strictly inside, the left/top edges
+  (inside) vs. the right/bottom edges (outside, the half-open
+  convention), a point outside bounds entirely, and the degenerate
+  `is_empty()` case (an empty rect contains nothing, even a point that
+  would otherwise land exactly on its own degenerate `x == right()`
+  boundary). `aurora-app` (178 → 186, 8 new): `apply_mask_clip` unit
+  tests — a texel inside bounds passes through with its own real alpha
+  unchanged (not forced to `1.0`, unlike `dissolve_gate`); a texel
+  outside bounds is zeroed; `inverted` flips both cases; and, mirroring
+  `dissolve_gate`'s own
+  `dissolve_gate_matches_at_the_same_absolute_position_reached_via_different_doc_origins`
+  test, the same absolute position reached via two different
+  `doc_origin`/local-coordinate decompositions (tile `(0,0)`'s own local
+  `(200,100)` vs. a `doc_origin` shifted by `(-1,-1)` whose local
+  `(201,101)` lands on that same absolute point) clips identically —
+  `mask.bounds` is document-absolute, so this matters here exactly as
+  much as it does for Dissolve's own noise. Four real
+  `composite_document` integration tests, each hand-verified pixel-by-
+  pixel over a real 10×10 document: (1) a masked `Pixel` layer (opaque
+  blue, full coverage) with a mask covering its left half over an opaque
+  red backdrop — left half shows blue, right half shows red through, a
+  hard edge at `x = 5`, not a blend; (2) the identical shape but the
+  mask lives on a *group* wrapping the blue child instead of the pixel
+  layer directly, proving the group's own mask clips its whole isolated
+  composite as one unit; (3) the same masked-`Pixel` setup with
+  `set_mask_enabled(id, false)` — asserts blue now covers the *entire*
+  document, proving a disabled mask is a real no-op, not silently still
+  applied; (4) the same masked-`Pixel` setup with
+  `set_mask_inverted(id, true)` — asserts the *complementary* region
+  (right half blue, left half red), the exact mirror image of test (1).
+
+  Verified: `cargo fmt --all --check` clean, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` clean (one real finding
+  fixed along the way: `clippy::collapsible_if` on the `Group` arm's
+  mask-check, rewritten as a single `if let ... && mask.enabled` per
+  clippy's own suggestion), `cargo test -p aurora-core -p aurora-doc -p
+  aurora-app` all green (21 + 108 + 186 passed, 0 failed), `cargo test
+  --workspace` green across all 19 crates (0 failures), `python3
+  scripts/check_no_hardcoded_style.py` clean (25 files scanned).
+  `scripts/check_layering.py` remains the one unrun check (pre-existing
+  `tomllib` gap in this sandbox, Python 3.10, no 3.11+ — not something
+  this round fixes or works around). No new dependencies; no `aurora-*`
+  crate gained a new dependency edge (confirmed via `git diff --stat` on
+  every touched `Cargo.toml` — only the root workspace version changed).
+  No lint weakened; `apply_mask_clip`/`contains_point` both use the same
+  defensive `chunks_exact`/`else { continue }` and `#[must_use]`/doc-
+  comment idioms already established by `dissolve_gate` and
+  `intersects`/`union` respectively. Version bumped `0.36.0` → `0.37.0`
+  per `CLAUDE.md`'s own convention.
+
+  **Still genuinely open, stated honestly**: this is a rectangular clip,
+  not real grayscale masking — no feathering, no soft edges, no partial
+  per-pixel coverage. Real per-pixel/grayscale masking needs real mask
+  pixel storage, a separate, not-yet-made resource-management decision
+  (`LayerMask`'s own doc comment: one `TileStore` per layer vs. some
+  shared scheme, the same open question `LayerKind::Pixel`'s own
+  `bounds` field already flags) — this round deliberately did not invent
+  one as a side effect of wiring up aggregation. The GPU compositing path
+  (`document_qualifies_for_gpu_compositing`/`gpu_composite_tile`) needs no
+  changes to handle masks correctly: it doesn't check for a mask at all,
+  because `gpu_composite_tile` already resolves each root layer's texels
+  through `resolve_tile` — the same function this round's mask clip is
+  wired into — before ever handing them to the GPU's fixed-function
+  blend, so a masked, Normal-blend, ungrouped layer both qualifies for
+  and composites correctly on the GPU path. Non-Normal blend modes and
+  groups still force the CPU path (`resolve_tile`/`composite_tile_cpu`),
+  unchanged by this round — that restriction was never about masks.
+  The non-`Normal` blend-mode-against-each-other math inside a
+  translucent group isolation pass (named in the group-opacity-
+  aggregation round) remains exactly as open as before — this round's
+  scope was mask aggregation alone.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG

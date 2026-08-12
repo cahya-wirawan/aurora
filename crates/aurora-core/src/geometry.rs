@@ -98,6 +98,20 @@ impl Rect {
         u64::from(self.width) * u64::from(self.height)
     }
 
+    /// Whether document-space point `(x, y)` lies inside this rectangle.
+    ///
+    /// Same half-open convention [`Self::right`]/[`Self::bottom`]/
+    /// [`Self::intersects`] already establish: `x` in
+    /// `[self.x, self.right())`, `y` in `[self.y, self.bottom())` — the
+    /// left/top edge is inside, the right/bottom edge is not (a `Rect`
+    /// with `x = 0, width = 10` spans columns `0..10`; column `10` is
+    /// outside it). An empty rectangle ([`Self::is_empty`]) contains no
+    /// point at all — it has no area to speak of.
+    #[must_use]
+    pub const fn contains_point(&self, x: i64, y: i64) -> bool {
+        !self.is_empty() && x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
+    }
+
     #[must_use]
     pub fn intersects(&self, other: &Self) -> bool {
         if self.is_empty() || other.is_empty() {
@@ -267,6 +281,75 @@ mod tests {
         };
         assert_eq!(a.union(&empty), a);
         assert_eq!(empty.union(&a), a);
+    }
+
+    #[test]
+    fn contains_point_true_for_a_point_strictly_inside() {
+        let r = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        assert!(r.contains_point(5, 5));
+    }
+
+    #[test]
+    fn contains_point_true_on_the_left_and_top_edges_false_on_the_right_and_bottom() {
+        // Half-open convention: [x, right) x [y, bottom) -- the same
+        // boundary `rect_touching_edges_do_not_intersect` already
+        // establishes for `intersects`.
+        let r = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        assert!(r.contains_point(0, 0), "left/top edge is inside");
+        assert!(r.contains_point(0, 5), "left edge, mid-height, is inside");
+        assert!(r.contains_point(5, 0), "top edge, mid-width, is inside");
+        assert!(
+            !r.contains_point(10, 5),
+            "right edge (x == right()) is outside"
+        );
+        assert!(
+            !r.contains_point(5, 10),
+            "bottom edge (y == bottom()) is outside"
+        );
+        assert!(
+            !r.contains_point(10, 10),
+            "bottom-right corner is outside on both axes"
+        );
+    }
+
+    #[test]
+    fn contains_point_false_for_a_point_outside_bounds() {
+        let r = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        assert!(!r.contains_point(-1, 5));
+        assert!(!r.contains_point(5, -1));
+        assert!(!r.contains_point(20, 20));
+    }
+
+    #[test]
+    fn contains_point_is_false_everywhere_for_an_empty_rect() {
+        let empty = Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        // An empty rect still has `right() == x` and `bottom() == y`, so
+        // without the explicit `is_empty()` guard the half-open test
+        // would already fail closed here -- this asserts that stays
+        // true, and also checks a point that would otherwise land
+        // exactly on the degenerate `x == right()` boundary.
+        assert!(!empty.contains_point(0, 0));
+        assert!(!empty.contains_point(0, 5));
     }
 
     #[test]

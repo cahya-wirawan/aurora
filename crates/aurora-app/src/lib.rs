@@ -3157,6 +3157,78 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
     gated
 }
 
+/// Clips one layer's own straight-alpha `texels` (the same
+/// `aurora_tile::TILE`×`aurora_tile::TILE`-window-at-`doc_origin` buffer
+/// shape [`dissolve_gate`] takes — row-major, `aurora_tile::CHANNELS`
+/// `half::f16` samples per texel) to `mask`'s own rectangular
+/// `mask.bounds`, which — like a [`aurora_doc::LayerKind::Pixel`]
+/// layer's own `bounds` — is already document-absolute, so each texel's
+/// absolute position is recovered the same way [`dissolve_gate`] already
+/// does: `doc_origin` plus its own row/col within the tile. A texel whose
+/// absolute position falls inside `mask.bounds`
+/// ([`aurora_core::Rect::contains_point`]) passes through unchanged;
+/// outside it, it comes back fully transparent (`(0, 0, 0, 0)`, the same
+/// "hidden" convention [`dissolve_gate`] uses). `mask.inverted` flips
+/// which side is shown — XOR'd against the containment test, mirroring
+/// the two toggles [`aurora_doc::LayerMask`] itself exposes
+/// (`LayerTree::set_mask_enabled`/`set_mask_inverted`).
+///
+/// **A rectangular clip — not real grayscale masking.**
+/// [`aurora_doc::LayerMask`] carries no per-pixel mask data yet (its own
+/// doc comment explains why: the same one-`TileStore`-per-layer-vs-
+/// shared resource-management question [`aurora_doc::LayerKind::Pixel`]'s
+/// own `bounds` field already flags, not yet decided), so there is
+/// nothing to sample per-pixel beyond the mask's own bounding rectangle —
+/// no feathering, no soft edges, no partial coverage. A texel is either
+/// fully shown or fully hidden; there is no in-between, and this function
+/// does not pretend otherwise.
+///
+/// Callers are responsible for checking `mask.enabled` themselves before
+/// calling this — a disabled mask should never reach here at all (see
+/// `resolve_tile`'s own call sites, which only call this when
+/// `mask.enabled` is true). Any chunk that isn't a full
+/// `CHANNELS`-length texel is skipped, left fully transparent in the
+/// output — the same defensive shape [`dissolve_gate`] and the
+/// un-premultiply loop in `resolve_tile`'s `Group` arm both already use.
+fn apply_mask_clip(
+    texels: &[half::f16],
+    mask: &aurora_doc::LayerMask,
+    doc_origin: (i64, i64),
+) -> Vec<half::f16> {
+    let tile_side = i64::from(aurora_tile::TILE);
+    let mut clipped = vec![half::f16::from_f32(0.0); texels.len()];
+    for (index, (src, dst)) in texels
+        .chunks_exact(aurora_tile::CHANNELS)
+        .zip(clipped.chunks_exact_mut(aurora_tile::CHANNELS))
+        .enumerate()
+    {
+        let [r, g, b, a] = src else { continue };
+        let [dst_r, dst_g, dst_b, dst_a] = dst else {
+            continue;
+        };
+        let Ok(index) = i64::try_from(index) else {
+            continue;
+        };
+        let col = index % tile_side;
+        let row = index / tile_side;
+        let abs_x = doc_origin.0 + col;
+        let abs_y = doc_origin.1 + row;
+
+        let inside = mask.bounds.contains_point(abs_x, abs_y);
+        let shown = inside != mask.inverted;
+
+        if shown {
+            *dst_r = *r;
+            *dst_g = *g;
+            *dst_b = *b;
+            *dst_a = *a;
+        }
+        // else: leave fully transparent -- `clipped` is already
+        // zero-initialized above, and that is exactly `(0, 0, 0, 0)`.
+    }
+    clipped
+}
+
 /// Resolves `id`'s own composited texels for one `aurora_tile::TILE`-
 /// sized window at document-space `doc_origin` (`tile_id`'s own meaning
 /// once converted out of `reference_origin`'s frame — see
@@ -3224,6 +3296,26 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
 /// buffer of its own texels to gate until *after* its isolated composite
 /// already ran, a genuinely different shape this round didn't need to
 /// solve).
+///
+/// **[`aurora_doc::LayerMask`] aggregation, the other real gap this
+/// function used to leave open**: both branches below now check
+/// `layers.mask(id)` and, when a mask is present and `mask.enabled`,
+/// clip that branch's own texels through [`apply_mask_clip`] before
+/// anything else touches them — for `Pixel`, right after reading
+/// `texels`, ahead of the `Dissolve` interception above; for `Group`,
+/// right after the un-premultiply step below, on the group's own
+/// isolated buffer as a single unit, ahead of that branch's own
+/// `Dissolve` interception. That ordering matters: the mask restricts
+/// *which* pixels are even in play first, and `Dissolve` (or any other
+/// blend mode) only ever acts within whatever the mask left visible — a
+/// masked-out pixel never gets a chance to win the stochastic gate,
+/// because it never reaches `dissolve_gate` with nonzero alpha. A
+/// disabled mask (`mask.enabled == false`) is skipped entirely, same as
+/// having no mask at all. **Rectangular clip only, stated the same way
+/// [`apply_mask_clip`]'s own doc comment states it**: `LayerMask` has no
+/// per-pixel mask data yet, so this is a hard inside/outside test against
+/// `mask.bounds`, not real grayscale masking — no feathering, no soft
+/// edges.
 ///
 /// **The regression-safety property, precisely**: `composite_tile_cpu`
 /// already reproduces a single full-opacity (`opacity = 1.0`) layer's
@@ -3327,6 +3419,16 @@ fn resolve_tile(
             } else {
                 read_layer_window(store, surface, origin, doc_origin)
             };
+            // Mask clip runs first, ahead of `Dissolve` below: it
+            // restricts which pixels are even in play before any blend
+            // mode acts on what's left. See `resolve_tile`'s own doc
+            // comment for the full ordering rationale and
+            // `apply_mask_clip`'s own doc comment for the rectangular-
+            // clip-only scope boundary.
+            let texels = match layers.mask(id) {
+                Some(mask) if mask.enabled => apply_mask_clip(&texels, mask, doc_origin),
+                _ => texels,
+            };
             // `Dissolve` is intercepted here, ahead of the translated
             // `blend_mode` below, rather than as a real
             // `aurora_render::BlendMode` variant -- see `dissolve_gate`'s
@@ -3389,6 +3491,19 @@ fn resolve_tile(
                     *g = half::f16::from_f32(0.0);
                     *b = half::f16::from_f32(0.0);
                 }
+            }
+            // A group's own mask clips its *whole* isolated composite as
+            // one unit, ahead of `Dissolve` below -- the same "group's
+            // own opacity/blend mode apply one level up, to the isolated
+            // result, not per-child" precedent this function's own doc
+            // comment already establishes for opacity/blend mode, applied
+            // identically here. See `resolve_tile`'s own doc comment for
+            // the full ordering rationale and `apply_mask_clip`'s own doc
+            // comment for the rectangular-clip-only scope boundary.
+            if let Some(mask) = layers.mask(id)
+                && mask.enabled
+            {
+                isolated = apply_mask_clip(&isolated, mask, doc_origin);
             }
             // `Dissolve` on a *group* is intercepted here too, symmetric
             // with the `Pixel` branch above (see `dissolve_gate`'s own
@@ -6288,11 +6403,12 @@ mod tests {
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key, KeyChord, Modifiers,
         NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind, UndoOrder,
-        activate_command, apply_scroll_zoom, autosave_path, background_color_from_theme,
-        begin_drag, canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
-        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
-        composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
-        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        activate_command, apply_mask_clip, apply_scroll_zoom, autosave_path,
+        background_color_from_theme, begin_drag, canvas_area_physical_rect,
+        canvas_area_physical_size, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, collect_widget_paints, composite_document,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message, default_shortcuts,
+        demo_document, dissolve_gate, document_canvas_size, document_from_image,
         document_qualifies_for_gpu_compositing, handle_dialog_key, handle_dialog_pointer,
         handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
         is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
@@ -9419,6 +9535,136 @@ mod tests {
         );
     }
 
+    fn rect_mask(x: i64, y: i64, width: u32, height: u32) -> aurora_doc::LayerMask {
+        aurora_doc::LayerMask {
+            bounds: aurora_core::Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            enabled: true,
+            inverted: false,
+        }
+    }
+
+    #[test]
+    // A texel whose absolute position lands inside `mask.bounds` passes
+    // through unchanged -- exactly its own source colour and alpha, not
+    // forced to any particular value the way `dissolve_gate`'s own
+    // "shown" branch forces alpha to `1.0`.
+    fn apply_mask_clip_passes_through_a_texel_inside_the_mask_bounds() {
+        let texels = solid_tile_buffer([0.25, 0.5, 0.75, 0.6]);
+        let mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+        let clipped = apply_mask_clip(&texels, &mask, (0, 0));
+        assert_eq!(clipped, texels);
+    }
+
+    #[test]
+    // A texel outside `mask.bounds` comes back fully transparent -- the
+    // same `(0, 0, 0, 0)` "hidden" convention `dissolve_gate` uses.
+    fn apply_mask_clip_zeroes_a_texel_outside_the_mask_bounds() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        // Bounds cover none of doc-space (0, 0)..(TILE, TILE) -- entirely
+        // to the right of the tile this buffer covers.
+        let mask = rect_mask(
+            i64::from(aurora_tile::TILE),
+            0,
+            aurora_tile::TILE,
+            aurora_tile::TILE,
+        );
+        let clipped = apply_mask_clip(&texels, &mask, (0, 0));
+        for chunk in clipped.chunks_exact(aurora_tile::CHANNELS) {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            assert_eq!(
+                (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                (0.0, 0.0, 0.0, 0.0)
+            );
+        }
+    }
+
+    #[test]
+    // `inverted` flips both of the above cases: what was shown becomes
+    // hidden and vice versa.
+    fn apply_mask_clip_inverted_flips_shown_and_hidden() {
+        let texels = solid_tile_buffer([0.1, 0.2, 0.3, 1.0]);
+
+        let mut inside_mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+        inside_mask.inverted = true;
+        let clipped_inside = apply_mask_clip(&texels, &inside_mask, (0, 0));
+        for chunk in clipped_inside.chunks_exact(aurora_tile::CHANNELS) {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            assert_eq!(
+                (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                (0.0, 0.0, 0.0, 0.0),
+                "inverting a mask that would otherwise show this texel must hide it"
+            );
+        }
+
+        let mut outside_mask = rect_mask(
+            i64::from(aurora_tile::TILE),
+            0,
+            aurora_tile::TILE,
+            aurora_tile::TILE,
+        );
+        outside_mask.inverted = true;
+        let clipped_outside = apply_mask_clip(&texels, &outside_mask, (0, 0));
+        assert_eq!(
+            clipped_outside, texels,
+            "inverting a mask that would otherwise hide this texel must show it unchanged"
+        );
+    }
+
+    #[test]
+    // The same absolute-position correctness `dissolve_gate`'s own
+    // `dissolve_gate_matches_at_the_same_absolute_position_reached_via_different_doc_origins`
+    // proves matters here too: `mask.bounds` is document-absolute, so a
+    // texel at the same real position must clip identically whichever
+    // `doc_origin`/local-coordinate split reaches it -- tile `(0, 0)`'s
+    // own local `(200, 100)` vs. a `doc_origin` shifted by `(-1, -1)`
+    // whose local `(201, 101)` lands on that same absolute point.
+    fn apply_mask_clip_matches_at_the_same_absolute_position_reached_via_different_doc_origins() {
+        let rgba = [0.2, 0.4, 0.6, 1.0];
+        let texels_a = solid_tile_buffer(rgba);
+        let texels_b = solid_tile_buffer(rgba);
+        // Bounds cover absolute (200, 100) but not much else nearby --
+        // a small rect straddling that one point.
+        let mask = rect_mask(195, 95, 10, 10);
+
+        let tile_side = aurora_tile::TILE as usize;
+        let clipped_a = apply_mask_clip(&texels_a, &mask, (0, 0));
+        let index_a = 100 * tile_side + 200;
+
+        let clipped_b = apply_mask_clip(&texels_b, &mask, (-1, -1));
+        let index_b = 101 * tile_side + 201;
+
+        let channels = aurora_tile::CHANNELS;
+        let (Some(texel_a), Some(texel_b)) = (
+            clipped_a.get(index_a * channels..index_a * channels + channels),
+            clipped_b.get(index_b * channels..index_b * channels + channels),
+        ) else {
+            unreachable!("indices constructed to be in range for a real TILE-sized buffer");
+        };
+        assert_eq!(
+            texel_a, texel_b,
+            "the same absolute document position (200, 100), reached via two different \
+             doc_origin/local-coordinate decompositions, must clip identically"
+        );
+        // And both must actually be shown (inside the mask's own
+        // bounds), not just equal to each other by both being zeroed.
+        let [_, _, _, a] = texel_a else {
+            unreachable!("CHANNELS-sized chunk always destructures to 4 elements");
+        };
+        assert!(
+            a.to_f32() > 0.0,
+            "absolute (200, 100) is inside mask.bounds and must be shown"
+        );
+    }
+
     #[test]
     // Real integration test, mirroring the shape of every prior blend-
     // mode round's own `composite_document_blends_two_layers_*` test:
@@ -10263,6 +10509,315 @@ mod tests {
                 "two levels of nested, non-default-opacity groups must both actually apply, \
                  with each level's own isolated buffer correctly un-premultiplied"
             );
+        }
+    }
+
+    #[test]
+    // Real integration test for `LayerMask` aggregation on a plain
+    // `Pixel` layer, mirroring the shape of every prior aggregation
+    // round's own `composite_document_*` test. `top` is opaque blue,
+    // covering the full 10x10 document, with a real mask
+    // (`LayerTree::add_mask`, the same API the Layers panel would use)
+    // covering only its left half (x in [0, 5)). `bottom` is opaque red,
+    // full coverage, no mask. Expected: left half shows `top`'s own
+    // blue (inside the mask), right half shows `bottom`'s red through
+    // (outside the mask, `top` contributes nothing there) -- a hard
+    // edge at x = 5, not a blend, since this is a rectangular clip, not
+    // real grayscale masking.
+    fn composite_document_clips_a_masked_pixel_layer_to_its_mask_bounds() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mask_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 10,
+        };
+        if let Err(err) = layers.add_mask(top, mask_bounds) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        #[allow(clippy::needless_range_loop)]
+        for y in 0..10 {
+            for x in 0..10 {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                assert!(
+                    (a - 1.0).abs() < epsilon,
+                    "backdrop is opaque, must stay opaque"
+                );
+                if x < 5 {
+                    assert!(
+                        r.abs() < epsilon && g.abs() < epsilon && (b - 1.0).abs() < epsilon,
+                        "inside the mask (x={x}) must show top's own blue, got ({r}, {g}, {b}, {a})"
+                    );
+                } else {
+                    assert!(
+                        (r - 1.0).abs() < epsilon && g.abs() < epsilon && b.abs() < epsilon,
+                        "outside the mask (x={x}) must show bottom's red through, \
+                         got ({r}, {g}, {b}, {a})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    // Same shape as the masked-`Pixel` test above, but the mask lives on
+    // the *group* itself, clipping its whole isolated composite as one
+    // unit -- the same "group's own opacity/blend mode apply one level
+    // up, to the isolated result" precedent
+    // `composite_document_applies_a_groups_own_opacity_to_its_isolated_children`
+    // already established, now proven for mask too. `child` (inside
+    // `group`) is opaque blue, full coverage; `group` itself carries the
+    // left-half mask, left at its own default opacity/`Normal`.
+    // `background` is opaque red, full coverage, no mask.
+    fn composite_document_clips_a_masked_groups_whole_isolated_content() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match layers.add_pixel_layer("child", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mask_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 10,
+        };
+        if let Err(err) = layers.add_mask(group, mask_bounds) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(layers.roots(), [group, background]);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [1.0, 0.0, 0.0, 1.0]),
+            (child, [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        #[allow(clippy::needless_range_loop)]
+        for y in 0..10 {
+            for x in 0..10 {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                assert!(
+                    (a - 1.0).abs() < epsilon,
+                    "backdrop is opaque, must stay opaque"
+                );
+                if x < 5 {
+                    assert!(
+                        r.abs() < epsilon && g.abs() < epsilon && (b - 1.0).abs() < epsilon,
+                        "inside the group's own mask (x={x}) must show the group's own blue \
+                         content, got ({r}, {g}, {b}, {a})"
+                    );
+                } else {
+                    assert!(
+                        (r - 1.0).abs() < epsilon && g.abs() < epsilon && b.abs() < epsilon,
+                        "outside the group's own mask (x={x}) must show background's red \
+                         through, got ({r}, {g}, {b}, {a})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    // A disabled mask must have zero compositing effect -- falls back to
+    // exactly the fully unmasked result, `add_mask` itself only ever
+    // creates an *enabled* mask (`LayerTree::add_mask`'s own doc
+    // comment), so this exercises `set_mask_enabled(id, false)` reaching
+    // all the way through `resolve_tile`'s own `mask.enabled` check.
+    // Same setup as `composite_document_clips_a_masked_pixel_layer_to_its_mask_bounds`
+    // (mask covering only the left half), but disabled -- `top`'s own
+    // blue must now cover the *entire* document, same as if it had no
+    // mask at all.
+    fn composite_document_ignores_a_disabled_mask() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mask_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 10,
+        };
+        if let Err(err) = layers.add_mask(top, mask_bounds) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_mask_enabled(top, false) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        for y in 0..10 {
+            for x in 0..10 {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                assert!(
+                    r.abs() < epsilon && g.abs() < epsilon && (b - 1.0).abs() < epsilon,
+                    "a disabled mask must have zero effect -- top's own blue must cover the \
+                     whole document, same as having no mask at all, got ({r}, {g}, {b}, {a}) \
+                     at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    // `inverted` on the same mask shows exactly the complementary
+    // region: the same setup as
+    // `composite_document_clips_a_masked_pixel_layer_to_its_mask_bounds`
+    // (left-half mask on `top`), but inverted -- now the *right* half
+    // shows `top`'s own blue and the *left* half shows `bottom`'s red
+    // through, the exact mirror image of the non-inverted result.
+    fn composite_document_inverting_a_mask_shows_the_complementary_region() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mask_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 10,
+        };
+        if let Err(err) = layers.add_mask(top, mask_bounds) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_mask_inverted(top, true) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        #[allow(clippy::needless_range_loop)]
+        for y in 0..10 {
+            for x in 0..10 {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                assert!(
+                    (a - 1.0).abs() < epsilon,
+                    "backdrop is opaque, must stay opaque"
+                );
+                if x < 5 {
+                    assert!(
+                        (r - 1.0).abs() < epsilon && g.abs() < epsilon && b.abs() < epsilon,
+                        "inverted: outside-turned-shown region (x={x}) is now the left half, \
+                         which is now *excluded* by the inverted mask, so bottom's red must \
+                         show through, got ({r}, {g}, {b}, {a})"
+                    );
+                } else {
+                    assert!(
+                        r.abs() < epsilon && g.abs() < epsilon && (b - 1.0).abs() < epsilon,
+                        "inverted: the right half is now *included* by the inverted mask, so \
+                         top's own blue must show, got ({r}, {g}, {b}, {a})"
+                    );
+                }
+            }
         }
     }
 
