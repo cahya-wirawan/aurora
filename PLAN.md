@@ -4260,6 +4260,90 @@ structural design work.
   nextest run --workspace` (or `cargo test --workspace`) all clean; no
   new dependencies, no new `aurora-*` edges (`aurora-gpu`/`aurora-app`
   `Cargo.toml` diffs empty, `scripts/layering.json` untouched).
+
+  **Panning right/down froze the render while painting kept moving —
+  fixed 2026-08-13 (0.47.1, patch, a bug fix per CLAUDE.md's own
+  Versioning rule).** Cahya reported it directly, real hardware: pan
+  right or down from the default view and the canvas image stops
+  moving entirely, then painting lands offset from the cursor. Root
+  cause, found by reading the code, not guessed: panning right/down
+  from the default view makes the true document-space position at the
+  canvas area's own top-left corner go *negative* — conceptually
+  Photoshop's gray pasteboard around the canvas, the area before the
+  document's own origin. `aurora_gpu::TileResidency`'s tile addressing
+  (`aurora_tile::TileId`) uses unsigned `u32` fields, so there is no
+  way to represent "tile -1"; `TileResidency::set_origin` already
+  clamped `doc_origin` to `0` for exactly this reason (see the sub-tile
+  addendum just above), which pinned the *rendered* view at document
+  `(0, 0)` forever once panned past that edge. But
+  `aurora_ui::CanvasView::to_document` — used directly for
+  pointer-to-document conversion when painting
+  (`App::handle_pointer_moved`, dab/`Eyedropper`/`Marquee` handling) —
+  was not clamped anywhere, so it kept computing the true, unbounded,
+  increasingly negative position. Render and paint silently diverged
+  from that point on.
+
+  Decision made with Cahya: properly supporting true infinite/unbounded
+  pasteboard panning into negative document space would need signed
+  tile addressing threaded through the whole compositing pipeline
+  (`TileResidency::sync`/`visible_tiles`, `recomposite_visible_tiles`)
+  — a substantially bigger architecture change, deliberately deferred,
+  not attempted here. Instead: clamp panning itself, so the view can
+  never scroll past the document's own top-left edge in the first
+  place. `aurora_ui::CanvasView` gained `clamp_pan_to_minimum(min_doc)`
+  — per-axis, adjusts `pan` so `to_document((0, 0))` never falls below
+  `min_doc` — derived directly from `to_document`'s own formula (`pan
+  <= -min_doc * zoom` is the bound; already-in-bounds axes are left
+  untouched), with 5 new direct unit tests in `canvas_view.rs`
+  (boundary pinning, no-op when in bounds, a non-zero `min_doc` for a
+  moved layer, independent per-axis clamping, and zoom interaction).
+  Wired into all three real call sites that can move `CanvasView`'s own
+  pan in `aurora-app`: `continue_drag`'s `Drag::Pan` branch,
+  `apply_scroll_zoom` (scroll-wheel zoom), and
+  `handle_zoom_tool_click` (Zoom-tool click) — each now takes the
+  active layer's own document-space origin (`active_layer_origin`, the
+  same value `canvas_local_origin` already uses) and calls
+  `clamp_pan_to_minimum` with it after the existing `pan_by`/`zoom_at`
+  call, so render and paint permanently read the same, already-bounded
+  view instead of two different notions of "where the pointer is."
+  Every real call site (`handle_pointer_moved`, `handle_mouse_wheel`,
+  the Zoom-tool branch of `handle_pointer_pressed`) and every existing
+  test of the three functions updated for the new signature; 4 new
+  `aurora-app` tests directly proving the fix — panning/scrolling/
+  clicking-to-zoom past the boundary keeps `canvas_local_origin` (what
+  `redraw` feeds `TileResidency::set_origin`) and `view.to_document`
+  (what painting uses) in agreement, plus the moved-layer case clamping
+  to that layer's own origin, not always `(0, 0)`.
+
+  Deliberately **not** touched: any upper bound on panning (left/up, or
+  into large positive document coordinates, already works correctly —
+  `TileId`'s `u32` fields have no problem there); `TileResidency`,
+  `canvas_local_origin`, or `effective_residency_zoom` themselves (this
+  fix is purely about bounding `CanvasView`'s own pan upstream of all
+  of them); rotation/rulers/guides/grid/snap/true-infinite-zoom
+  (already-deferred, unrelated scope).
+
+  **Known follow-on gap, not fixed here**: switching the active layer
+  does not re-clamp the view. If a pan is sitting right at one layer's
+  own boundary and the user then activates a different layer whose own
+  origin sits elsewhere, the view can end up briefly showing/painting
+  past *that* layer's edge until the next pan/zoom gesture re-triggers
+  the clamp. Related but separately scoped from the bug Cahya reported
+  (which was about panning itself, not layer switching) — noted here
+  as explicitly deferred, not silently missed.
+
+  Verified: `cargo fmt --all --check`, `python3
+  scripts/check_no_hardcoded_style.py`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS="-D
+  warnings" cargo doc --workspace --no-deps --all-features`, `cargo
+  test --workspace` (`nextest` not available in this sandbox) — all
+  clean, 0 failures. `python3 scripts/check_layering.py` could not run
+  in this sandbox (`ModuleNotFoundError: No module named 'tomllib'`,
+  pre-existing sandbox limitation, not a real failure); manually
+  confirmed via `git diff` that `crates/aurora-ui/Cargo.toml`,
+  `crates/aurora-app/Cargo.toml`, `scripts/layering.json`, and
+  `crates/aurora-gpu/` are all untouched, so no dependency-graph edge
+  changed. No new dependencies.
 - [~] **Layers, history, tool-options panels** — first slice done
   2026-08-03, `crates/aurora-ui/src/layers_panel.rs` (new — Layers only;
   History and tool-options panels remain separate, still-open work).

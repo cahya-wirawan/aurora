@@ -2876,12 +2876,27 @@ fn begin_drag(
 /// update (it carries no state — see [`Drag`]'s own doc comment) and
 /// always returns an empty `Vec` too; the caller samples directly at
 /// `canvas_point` itself (`App::sample_eyedropper`).
+///
+/// `min_doc` is the active layer's own document-space origin
+/// (`active_layer_origin`) — after `Drag::Pan`'s own `pan_by` call,
+/// this clamps the view (`CanvasView::clamp_pan_to_minimum`) so it can
+/// never scroll past that edge. Without this, panning right/down kept
+/// moving `view`'s pan arbitrarily far, making `to_document` (used both
+/// here, for `Marquee`/`Brush`/`Eraser`/`Move`, and by the caller for
+/// `Eyedropper`) report a true, unbounded — eventually negative —
+/// document position, while the renderer (`canvas_local_origin` /
+/// `aurora_gpu::TileResidency::set_origin`) silently pinned the
+/// *drawn* view at the document's own top-left tile forever, since
+/// `aurora_tile::TileId`'s unsigned fields have no way to represent a
+/// negative tile. Paint and render then silently disagreed. Clamping
+/// here keeps both reading the same, already-bounded `view` instead.
 #[must_use]
 fn continue_drag(
     drag: &mut Drag,
     canvas_point: (f32, f32),
     view: &mut aurora_ui::CanvasView,
     selection: &mut aurora_doc::SelectionSet,
+    min_doc: (f32, f32),
 ) -> Vec<(f32, f32)> {
     match drag {
         Drag::Pan { last_screen } => {
@@ -2890,6 +2905,7 @@ fn continue_drag(
                 canvas_point.1 - last_screen.1,
             );
             view.pan_by(delta);
+            view.clamp_pan_to_minimum(min_doc);
             *last_screen = canvas_point;
             Vec::new()
         }
@@ -2977,14 +2993,23 @@ fn zoom_steps_for_scroll(delta: winit::event::MouseScrollDelta) -> f32 {
 /// response to one `WindowEvent::MouseWheel` — the "scroll to zoom"
 /// gesture that works regardless of which tool is active, matching
 /// every professional raster editor's own convention.
+///
+/// `min_doc` is the active layer's own document-space origin
+/// (`active_layer_origin`), passed to `CanvasView::clamp_pan_to_minimum`
+/// after `zoom_at` — `zoom_at` recomputes `pan` from scratch to keep
+/// `anchor` fixed, and that new `pan` can land past the document's own
+/// top-left edge just as easily as a plain `pan_by` can (see
+/// `continue_drag`'s own doc comment for why that must never happen).
 fn apply_scroll_zoom(
     view: &mut aurora_ui::CanvasView,
     anchor: (f32, f32),
     delta: winit::event::MouseScrollDelta,
+    min_doc: (f32, f32),
 ) {
     let steps = zoom_steps_for_scroll(delta);
     let factor = ZOOM_WHEEL_BASE.powf(steps);
     view.zoom_at(anchor, view.zoom() * factor);
+    view.clamp_pan_to_minimum(min_doc);
 }
 
 /// How much one Zoom-tool click zooms in (or, with `Alt` held, out) —
@@ -2996,10 +3021,17 @@ const ZOOM_CLICK_FACTOR: f32 = 2.0;
 /// held — Photoshop's own Zoom-tool convention (`Alt`+click to zoom
 /// out), distinct from [`apply_scroll_zoom`], which works with any tool
 /// active.
+///
+/// `min_doc` is the active layer's own document-space origin
+/// (`active_layer_origin`) — same reasoning as `apply_scroll_zoom`'s own
+/// doc comment: `zoom_at` recomputes `pan` to keep `canvas_point` fixed
+/// on screen, and that new `pan` needs the same post-hoc
+/// `clamp_pan_to_minimum` call to stay within the document's own edge.
 fn handle_zoom_tool_click(
     view: &mut aurora_ui::CanvasView,
     canvas_point: (f32, f32),
     modifiers: Modifiers,
+    min_doc: (f32, f32),
 ) {
     let factor = if modifiers.alt {
         1.0 / ZOOM_CLICK_FACTOR
@@ -3007,6 +3039,7 @@ fn handle_zoom_tool_click(
         ZOOM_CLICK_FACTOR
     };
     view.zoom_at(canvas_point, view.zoom() * factor);
+    view.clamp_pan_to_minimum(min_doc);
 }
 
 // -- Brush painting, eraser, and layer selection: a live document, a
@@ -5957,6 +5990,7 @@ impl App {
                 canvas_point,
                 &mut self.canvas_view,
                 &mut self.selection,
+                active_layer_origin(&self.layers, self.active_layer),
             );
             for doc_point in dabs {
                 if erasing {
@@ -6059,7 +6093,12 @@ impl App {
         };
 
         if self.tool == aurora_ui::Tool::Zoom && button == PointerButton::Primary {
-            handle_zoom_tool_click(&mut self.canvas_view, canvas_point, self.modifiers);
+            handle_zoom_tool_click(
+                &mut self.canvas_view,
+                canvas_point,
+                self.modifiers,
+                active_layer_origin(&self.layers, self.active_layer),
+            );
             return;
         }
         self.drag = begin_drag(
@@ -6343,7 +6382,12 @@ impl App {
         let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
             return;
         };
-        apply_scroll_zoom(&mut self.canvas_view, canvas_point, delta);
+        apply_scroll_zoom(
+            &mut self.canvas_view,
+            canvas_point,
+            delta,
+            active_layer_origin(&self.layers, self.active_layer),
+        );
     }
 
     /// Routes one native menu activation to [`activate_command`] — the
@@ -14596,12 +14640,25 @@ mod tests {
     #[test]
     fn continue_drag_pan_moves_the_view_by_the_delta_since_the_last_point() {
         let mut view = CanvasView::new();
+        // Pre-panned left/up, away from the document's own top-left
+        // edge -- a fresh `CanvasView::new()` already sits exactly at
+        // that boundary (`to_document((0, 0)) == (0, 0)`), so a
+        // rightward/downward delta from there would immediately hit
+        // `clamp_pan_to_minimum` and this test would no longer be
+        // exercising plain delta application, which is what it's for.
+        view.pan_by((-50.0, -50.0));
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Pan {
             last_screen: (10.0, 10.0),
         };
-        let dabs = continue_drag(&mut drag, (15.0, 8.0), &mut view, &mut selection);
-        assert_eq!(view.pan(), (5.0, -2.0));
+        let dabs = continue_drag(
+            &mut drag,
+            (15.0, 8.0),
+            &mut view,
+            &mut selection,
+            (0.0, 0.0),
+        );
+        assert_eq!(view.pan(), (-45.0, -52.0));
         match drag {
             Drag::Pan { last_screen } => assert_eq!(
                 last_screen,
@@ -14620,7 +14677,13 @@ mod tests {
         let mut drag = Drag::Marquee {
             start_doc: (10.0, 10.0),
         };
-        let dabs = continue_drag(&mut drag, (30.0, 25.0), &mut view, &mut selection);
+        let dabs = continue_drag(
+            &mut drag,
+            (30.0, 25.0),
+            &mut view,
+            &mut selection,
+            (0.0, 0.0),
+        );
         let Some(active) = selection.active() else {
             unreachable!("must select something");
         };
@@ -14632,7 +14695,13 @@ mod tests {
 
         // A second move further extends the same drag -- the selection
         // must track the *current* rect, not just the first one.
-        let _ = continue_drag(&mut drag, (50.0, 5.0), &mut view, &mut selection);
+        let _ = continue_drag(
+            &mut drag,
+            (50.0, 5.0),
+            &mut view,
+            &mut selection,
+            (0.0, 0.0),
+        );
         let Some(active) = selection.active() else {
             unreachable!("must still be selected");
         };
@@ -14652,7 +14721,13 @@ mod tests {
         // lands dabs at 6 and 12 (the segment's own start, 0, is not
         // re-emitted -- it was already painted by whatever started the
         // drag or the previous event).
-        let dabs = continue_drag(&mut drag, (12.0, 0.0), &mut view, &mut selection);
+        let dabs = continue_drag(
+            &mut drag,
+            (12.0, 0.0),
+            &mut view,
+            &mut selection,
+            (0.0, 0.0),
+        );
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
         match drag {
             Drag::Brush {
@@ -14677,7 +14752,7 @@ mod tests {
             carry: 0.0,
             stroke: None,
         };
-        let first = continue_drag(&mut drag, (3.0, 0.0), &mut view, &mut selection);
+        let first = continue_drag(&mut drag, (3.0, 0.0), &mut view, &mut selection, (0.0, 0.0));
         // Segment shorter than one step (6): no new dab yet, but the 3
         // units already travelled must carry forward, not reset to 0 --
         // the exact bug a fresh `dabs_along_path` call each event would
@@ -14694,7 +14769,7 @@ mod tests {
         // so exactly one dab lands (at the 6-unit mark, i.e. 3 units
         // into *this* segment) -- proving the carry from the first,
         // sub-step event was not lost.
-        let second = continue_drag(&mut drag, (7.0, 0.0), &mut view, &mut selection);
+        let second = continue_drag(&mut drag, (7.0, 0.0), &mut view, &mut selection, (0.0, 0.0));
         assert_eq!(second, vec![(6.0, 0.0)]);
     }
 
@@ -14710,7 +14785,13 @@ mod tests {
         // Same radius/spacing as Brush (ERASER_RADIUS == BRUSH_RADIUS ==
         // 24, DEFAULT_SPACING 0.25 -> step 6), so the same dab positions
         // land for the same segment.
-        let dabs = continue_drag(&mut drag, (12.0, 0.0), &mut view, &mut selection);
+        let dabs = continue_drag(
+            &mut drag,
+            (12.0, 0.0),
+            &mut view,
+            &mut selection,
+            (0.0, 0.0),
+        );
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
         match drag {
             Drag::Eraser {
@@ -14742,7 +14823,13 @@ mod tests {
             start_bounds,
             current_bounds: start_bounds,
         };
-        let dabs = continue_drag(&mut drag, (15.0, -8.0), &mut view, &mut selection);
+        let dabs = continue_drag(
+            &mut drag,
+            (15.0, -8.0),
+            &mut view,
+            &mut selection,
+            (0.0, 0.0),
+        );
         assert_eq!(dabs, Vec::new(), "Move must never produce dabs to paint");
         let Drag::Move { current_bounds, .. } = drag else {
             unreachable!("still a Move drag");
@@ -14764,7 +14851,13 @@ mod tests {
         let mut view = CanvasView::new();
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Eyedropper;
-        let dabs = continue_drag(&mut drag, (15.0, -8.0), &mut view, &mut selection);
+        let dabs = continue_drag(
+            &mut drag,
+            (15.0, -8.0),
+            &mut view,
+            &mut selection,
+            (0.0, 0.0),
+        );
         assert_eq!(
             dabs,
             Vec::new(),
@@ -14783,6 +14876,7 @@ mod tests {
             &mut view,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+            (0.0, 0.0),
         );
         assert!(view.zoom() > 1.0, "zoom was {}", view.zoom());
     }
@@ -14794,6 +14888,7 @@ mod tests {
             &mut view,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, -1.0),
+            (0.0, 0.0),
         );
         assert!(view.zoom() < 1.0, "zoom was {}", view.zoom());
     }
@@ -14805,7 +14900,7 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn handle_zoom_tool_click_zooms_in_without_alt() {
         let mut view = CanvasView::new();
-        handle_zoom_tool_click(&mut view, (50.0, 50.0), Modifiers::none());
+        handle_zoom_tool_click(&mut view, (50.0, 50.0), Modifiers::none(), (0.0, 0.0));
         assert_eq!(view.zoom(), 2.0);
     }
 
@@ -14819,7 +14914,116 @@ mod tests {
             alt: true,
             ..Modifiers::none()
         };
-        handle_zoom_tool_click(&mut view, (50.0, 50.0), alt_held);
+        handle_zoom_tool_click(&mut view, (50.0, 50.0), alt_held, (0.0, 0.0));
         assert_eq!(view.zoom(), 0.5);
+    }
+
+    // -- Proof that the real reported bug (panning right/down froze the
+    // -- rendered canvas while painting silently kept tracking the true,
+    // -- unbounded position) is fixed: `continue_drag`/`apply_scroll_zoom`/
+    // -- `handle_zoom_tool_click` all now clamp `view`'s own pan via
+    // -- `CanvasView::clamp_pan_to_minimum`, so `canvas_local_origin`
+    // -- (what `App::redraw` feeds `aurora_gpu::TileResidency::set_origin`,
+    // -- i.e. what actually gets rendered) and `view.to_document` (what
+    // -- painting/`Eyedropper`/`Marquee` use to place a point) are
+    // -- guaranteed to read the same, already-bounded `pan` -- never two
+    // -- different, silently-diverged notions of "where the pointer is
+    // -- in document space" again.
+
+    #[test]
+    fn continue_drag_pan_past_the_document_edge_keeps_render_and_paint_in_agreement() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Pan {
+            last_screen: (0.0, 0.0),
+        };
+        // Drag far past what would have been the old unclamped-negative
+        // boundary -- right/down, the exact direction Cahya reported.
+        let _ = continue_drag(
+            &mut drag,
+            (5_000.0, 5_000.0),
+            &mut view,
+            &mut selection,
+            (0.0, 0.0),
+        );
+        // Render: the continuous position `redraw` feeds
+        // `TileResidency::set_origin` must stay pinned at the document's
+        // own origin, not just silently stop advancing while something
+        // else keeps moving.
+        assert_eq!(canvas_local_origin(&view, (0.0, 0.0)), (0.0, 0.0));
+        // Paint: the canvas area's own top-left corner must report the
+        // *same* document position the render is showing -- (0.0, 0.0),
+        // not the large negative value it would have reported before
+        // this fix, which is what made painting land away from the
+        // cursor once the render had frozen.
+        assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn continue_drag_pan_clamps_to_a_moved_layers_own_origin_not_always_zero() {
+        // A layer moved to document (300, 300)
+        // (`aurora_doc::LayerTree::set_bounds`) must clamp panning to
+        // *its* own top-left corner -- the same boundary
+        // `canvas_local_origin`'s own `layer_origin` parameter already
+        // uses elsewhere for this purpose.
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Pan {
+            last_screen: (0.0, 0.0),
+        };
+        let _ = continue_drag(
+            &mut drag,
+            (5_000.0, 5_000.0),
+            &mut view,
+            &mut selection,
+            (300.0, 300.0),
+        );
+        assert_eq!(canvas_local_origin(&view, (300.0, 300.0)), (0.0, 0.0));
+        assert_eq!(view.to_document((0.0, 0.0)), (300.0, 300.0));
+    }
+
+    #[test]
+    // `to_document((0, 0))` after the clamp is `-0.0 / zoom`, which is
+    // exactly `0.0` whatever `zoom` itself landed on -- exact equality
+    // is correct here, not a float rounding risk.
+    #[allow(clippy::float_cmp)]
+    fn apply_scroll_zoom_never_scrolls_the_view_past_the_document_edge() {
+        // Scroll-wheel zoom recomputes `pan` from scratch to keep the
+        // anchor fixed on screen -- zooming *out* while anchored away
+        // from the top-left corner pushes `pan` the same direction a
+        // drag-pan does, so it needs the same clamp. Anchoring at (100,
+        // 100) and zooming out (negative scroll) is exactly that case:
+        // without the clamp, `to_document((0, 0))` would land at
+        // (-100, -100) or worse.
+        let mut view = CanvasView::new();
+        apply_scroll_zoom(
+            &mut view,
+            (100.0, 100.0),
+            winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
+            (0.0, 0.0),
+        );
+        assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
+    }
+
+    #[test]
+    // Same reasoning as
+    // `apply_scroll_zoom_never_scrolls_the_view_past_the_document_edge`
+    // above -- exact equality is correct.
+    #[allow(clippy::float_cmp)]
+    fn handle_zoom_tool_click_never_scrolls_the_view_past_the_document_edge() {
+        // The Zoom tool's own click-to-zoom-out gesture (`Alt`+click)
+        // goes through the same `zoom_at` recomputation as scroll-wheel
+        // zoom, so it needs the same clamp -- clicking to zoom out
+        // anchored at (100, 100) from a fresh view would otherwise land
+        // `to_document((0, 0))` at (-100, -100) (see this function's own
+        // derivation in `CanvasView::clamp_pan_to_minimum`'s doc
+        // comment).
+        let mut view = CanvasView::new();
+        let alt_held = Modifiers {
+            alt: true,
+            ..Modifiers::none()
+        };
+        handle_zoom_tool_click(&mut view, (100.0, 100.0), alt_held, (0.0, 0.0));
+        assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
     }
 }

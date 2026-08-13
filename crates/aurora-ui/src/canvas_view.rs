@@ -97,6 +97,51 @@ impl CanvasView {
             screen_anchor.1 - doc_anchor.1 * new_zoom,
         );
     }
+
+    /// Clamps `pan` (per axis, independently) so that
+    /// `self.to_document((0.0, 0.0))` — the document-space point that
+    /// currently renders at the canvas area's own top-left corner —
+    /// never falls below `min_doc` on either axis.
+    ///
+    /// This is the fix for a real reported bug, not a hypothetical one:
+    /// `aurora_tile::TileId` addresses tiles with unsigned `u32` fields,
+    /// so there is no way to represent "tile -1" — a document-space
+    /// position left of/above a layer's own origin. Before this method
+    /// existed, nothing stopped `pan_by`/`zoom_at` from scrolling the
+    /// view past that boundary: `aurora_gpu::TileResidency::set_origin`
+    /// silently clamped the *render* at the document's own top-left tile
+    /// forever, while `to_document` (used directly for pointer-to-
+    /// document conversion when painting) kept computing the true,
+    /// unbounded — and increasingly negative — position. Render and
+    /// paint then silently disagreed for the rest of the session. Rather
+    /// than threading signed tile addressing through the whole
+    /// compositing pipeline to support true negative-space panning (a
+    /// substantially bigger change, deliberately deferred), this clamps
+    /// panning itself at the source: the view simply cannot scroll past
+    /// the boundary in the first place, so every downstream consumer —
+    /// render and paint alike — reads the same, already-bounded `pan`
+    /// and can never diverge again.
+    ///
+    /// Derivation: `to_document((0, 0)) = (-pan.0 / zoom, -pan.1 /
+    /// zoom)`. Requiring the x component `>= min_doc.0` gives `pan.0 <=
+    /// -min_doc.0 * zoom`; symmetrically for y. So each axis of `pan` is
+    /// clamped to at most `-min_doc * zoom` — the exact value that makes
+    /// `to_document((0, 0))` land precisely on `min_doc` — and left
+    /// untouched when it's already within that bound (panning right/
+    /// down is the only direction that can violate it, since it's what
+    /// *increases* `pan`, matching `to_screen(doc) = doc * zoom + pan`
+    /// and `pan_by`'s own "dragging right/down moves the view right/
+    /// down" convention).
+    pub fn clamp_pan_to_minimum(&mut self, min_doc: (f32, f32)) {
+        let max_pan_x = -min_doc.0 * self.zoom;
+        if self.pan.0 > max_pan_x {
+            self.pan.0 = max_pan_x;
+        }
+        let max_pan_y = -min_doc.1 * self.zoom;
+        if self.pan.1 > max_pan_y {
+            self.pan.1 = max_pan_y;
+        }
+    }
 }
 
 impl Default for CanvasView {
@@ -199,5 +244,100 @@ mod tests {
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 8.0);
         assert_eq!(view.pan(), (0.0, 0.0));
+    }
+
+    #[test]
+    // `to_document((0, 0))` after the clamp is `-max_pan_x / zoom` where
+    // `max_pan_x` was itself computed as `-min_doc.0 * zoom` -- an exact
+    // round trip through one multiply and one divide at zoom 1.0, not
+    // accumulated float error -- exact equality is correct.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_minimum_pins_the_boundary_exactly_when_panned_past_it() {
+        // Panning right/down by 500px would put document (0, 0) at
+        // screen (500, 500), i.e. `to_document((0, 0))` would report the
+        // true, negative (-500, -500) -- the exact real bug this method
+        // exists to prevent. Clamping must land `to_document((0, 0))`
+        // exactly on `min_doc`, not just somewhere no-longer-negative.
+        let mut view = CanvasView::new();
+        view.pan_by((500.0, 500.0));
+        view.clamp_pan_to_minimum((0.0, 0.0));
+        assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
+    }
+
+    #[test]
+    // `pan` is asserted unchanged (still the exact value `pan_by` set,
+    // untouched by the clamp) -- exact equality is correct, not a float
+    // rounding risk.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_minimum_leaves_pan_untouched_when_already_within_bounds() {
+        // Panning left/up (negative delta) only ever moves
+        // `to_document((0, 0))` further *into* positive document space,
+        // away from the boundary -- never past it -- so the clamp must
+        // be a complete no-op here.
+        let mut view = CanvasView::new();
+        view.pan_by((-40.0, -40.0));
+        let before = view.pan();
+        view.clamp_pan_to_minimum((0.0, 0.0));
+        assert_eq!(view.pan(), before);
+    }
+
+    #[test]
+    // Same reasoning as
+    // `clamp_pan_to_minimum_pins_the_boundary_exactly_when_panned_past_it`
+    // above -- an exact round trip, not accumulated float error.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_minimum_uses_a_non_zero_boundary_for_a_moved_layer() {
+        // A layer moved away from the document's own origin (e.g. to
+        // (300, 300) via `aurora_doc::LayerTree::set_bounds`) must clamp
+        // panning to *its* own top-left corner, not always (0, 0).
+        let mut view = CanvasView::new();
+        view.pan_by((900.0, 900.0));
+        view.clamp_pan_to_minimum((300.0, 300.0));
+        assert_eq!(view.to_document((0.0, 0.0)), (300.0, 300.0));
+    }
+
+    #[test]
+    // Same reasoning as the other `clamp_pan_to_minimum_*` tests above
+    // -- both assertions are exact round trips / unchanged values, not
+    // accumulated float error.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_minimum_clamps_each_axis_independently() {
+        // x is panned past the boundary, y is not -- only x should move.
+        let mut view = CanvasView::new();
+        view.pan_by((500.0, -40.0));
+        let y_before = view.pan().1;
+        view.clamp_pan_to_minimum((0.0, 0.0));
+        assert_eq!(view.to_document((0.0, 0.0)).0, 0.0);
+        assert_eq!(
+            view.pan().1,
+            y_before,
+            "the in-bounds axis must be left untouched"
+        );
+    }
+
+    #[test]
+    // Same reasoning as the other `clamp_pan_to_minimum_*` tests above
+    // -- exact round trips through one multiply and one divide, not
+    // accumulated float error.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_minimum_accounts_for_zoom() {
+        // At 4x zoom, `to_document` divides by zoom, so the same 500px
+        // pan corresponds to a different document-space position than
+        // at 1x -- the clamp must account for the view's current zoom,
+        // not just its pan.
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 4.0);
+        view.pan_by((500.0, 500.0));
+        view.clamp_pan_to_minimum((0.0, 0.0));
+        assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
+
+        // A partially-out-of-bounds case at the same zoom: the boundary
+        // in document space is fixed, but `pan`'s own value that
+        // achieves it scales with zoom.
+        let mut view2 = CanvasView::new();
+        view2.zoom_at((0.0, 0.0), 4.0);
+        view2.pan_by((900.0, 900.0));
+        view2.clamp_pan_to_minimum((100.0, 100.0));
+        assert_eq!(view2.to_document((0.0, 0.0)), (100.0, 100.0));
     }
 }
