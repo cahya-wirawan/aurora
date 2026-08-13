@@ -4930,6 +4930,50 @@ fn canvas_area_physical_size(
     ))
 }
 
+/// Converts [`aurora_ui::CanvasView::zoom`]'s own logical-pixel zoom
+/// into the *effective* zoom `redraw`'s real
+/// [`aurora_gpu::TileResidency::set_origin`] call site must pass
+/// alongside a **physical**-pixel viewport
+/// ([`canvas_area_physical_size`]).
+///
+/// `CanvasView`'s own documented contract (`DEFAULT_ZOOM = 1.0` means
+/// "one document pixel occupies exactly one *logical* screen pixel")
+/// is expressed entirely in logical pixels — `to_document`/`to_screen`
+/// both honour it correctly. But `TileResidency::write_uniform`
+/// computes `uv_scale` from a raw `viewport_px / zoom` with no concept
+/// of logical vs. physical; it just does the arithmetic on whatever
+/// numbers it is given (correctly, on its own terms — this function
+/// exists so `redraw` gives it consistent ones, not because that crate
+/// has a bug). Feeding it a **physical** `viewport_px` alongside a
+/// **logical**-semantics `zoom`, uncorrected, silently doubles the
+/// document-pixel count a `scale_factor != 1.0` display's own physical
+/// viewport spans versus what `CanvasView`'s contract promises —
+/// compressing everything rendered toward the atlas origin (visually:
+/// paint landing up-and-left of the cursor, worse the farther from the
+/// canvas's own top-left corner, exactly the shape of a real bug report
+/// on Retina hardware, root-caused here rather than guessed).
+///
+/// Multiplying by `scale_factor` restores the identity `redraw` needs:
+/// `physical_viewport / (zoom * scale_factor) == logical_viewport /
+/// zoom`, since `physical_viewport == logical_viewport * scale_factor`
+/// by definition (`winit`'s own physical/logical distinction,
+/// `logical_size`/`logical_point`'s own doc comments). Mirrors those
+/// two functions' own degenerate-`scale_factor` fallback exactly, for
+/// the same reason: a non-finite, zero, or negative `scale_factor` is a
+/// value `winit` should never actually report, so this falls back to
+/// `1.0` (no scaling) rather than propagating NaN/zero/negative into
+/// the GPU uniform.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn effective_residency_zoom(canvas_zoom: f32, scale_factor: f64) -> f32 {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    canvas_zoom * scale_factor as f32
+}
+
 /// The active pixel layer's own *surface-local* tile currently at the
 /// canvas area's own top-left corner, given `view`'s own pan *and
 /// zoom*, and `layer_origin` ([`active_layer_origin`] — the active
@@ -6429,7 +6473,7 @@ impl App {
                                 active_layer_origin(&self.layers, self.active_layer),
                             ),
                             canvas_size,
-                            self.canvas_view.zoom(),
+                            effective_residency_zoom(self.canvas_view.zoom(), self.scale_factor),
                         );
                     }
                     if let Some(store) = self.tile_store.as_mut() {
@@ -6960,11 +7004,11 @@ mod tests {
         close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
         composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
         default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, is_aur_path, layer_local_point, load_scales, load_theme,
+        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
+        open_tile_store, palette_commands, pointer_in_canvas, pointer_on_rail_divider,
         previous_session_left_a_marker, queue_autosave, recomposite_visible_tiles,
         recover_document, replace_document, resized_rail_width, run_command, sample_pixel,
         select_layer, splitmix64, tile_origin_for_view, tile_store_scratch_dir,
@@ -9313,6 +9357,249 @@ mod tests {
             unreachable!("a real tile always has at least one full texel");
         };
         (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32())
+    }
+
+    /// Renders `residency` through `canvas`/`pipeline` into a
+    /// `viewport`-sized offscreen target and reads back one pixel — this
+    /// crate's own real render+readback flow (the same shape
+    /// `aurora-gpu`'s own `render_test::render_and_sample_pixel` uses,
+    /// duplicated here rather than shared since that helper is private
+    /// to that crate's own test binary and this crate's tests are a
+    /// separate binary).
+    #[allow(clippy::too_many_arguments)]
+    fn render_and_sample_pixel(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        canvas: &mut aurora_gpu::CanvasPipeline,
+        residency: &aurora_gpu::TileResidency,
+        viewport: (u32, u32),
+        sample: (u32, u32),
+    ) -> [u8; 4] {
+        let bind_group = canvas.bind_group(device, residency);
+        let pipeline = canvas.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("effective-zoom-target"),
+            size: wgpu::Extent3d {
+                width: viewport.0,
+                height: viewport.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("effective-zoom-render"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("effective-zoom-canvas"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let bytes_per_row = viewport.0 * 4;
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effective-zoom-readback"),
+            size: u64::from(bytes_per_row) * u64::from(viewport.1),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(viewport.1),
+                },
+            },
+            wgpu::Extent3d {
+                width: viewport.0,
+                height: viewport.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let Ok(Ok(())) = rx.recv() else {
+            unreachable!("map_async must complete once the device has been polled to idle");
+        };
+        let Ok(data) = slice.get_mapped_range() else {
+            unreachable!("the buffer was just confirmed mapped successfully above");
+        };
+        let (sx, sy) = sample;
+        let offset = (sy as usize) * (bytes_per_row as usize) + (sx as usize) * 4;
+        let Some(pixel) = data.get(offset..offset + 4) else {
+            unreachable!("sample is well within the readback buffer's own bounds");
+        };
+        let result = match pixel {
+            &[r, g, b, a] => [r, g, b, a],
+            _ => unreachable!("sliced exactly 4 bytes"),
+        };
+        drop(data);
+        readback_buffer.unmap();
+        result
+    }
+
+    #[test]
+    /// The real, end-to-end proof of this crate's own Retina/HiDPI fix
+    /// (`effective_residency_zoom`, used at `redraw`'s one real
+    /// `residency.set_origin` call site): not just that the arithmetic
+    /// works out on paper, but that feeding the *effective* zoom into a
+    /// real `aurora_gpu::TileResidency`/`CanvasPipeline` render actually
+    /// samples the pixels `aurora_ui::CanvasView`'s own "one document
+    /// pixel = one logical pixel" contract promises, where the raw,
+    /// unscaled `CanvasView::zoom()` alone does not.
+    ///
+    /// Simulates a real Retina window: a notional logical canvas of
+    /// 256x256 (one tile) with `scale_factor = 2.0`, so the real
+    /// physical viewport `redraw` actually builds
+    /// (`canvas_area_physical_size`) is 512x512 — exactly the scenario
+    /// from Cahya's real bug report on real Retina macOS hardware, not a
+    /// synthetic zoom level. Two adjacent, differently-coloured tiles
+    /// (green at `(0, 0)`, red at `(1, 0)`), the same "sample near the
+    /// right edge" technique `aurora-gpu`'s own
+    /// `canvas_pipeline_reflects_zoom_by_magnifying_the_atlas` uses.
+    ///
+    /// At the *raw*, unscaled `canvas_view.zoom()` (1.0) fed directly
+    /// into `set_origin` alongside the 512x512 physical viewport — the
+    /// bug, before this fix — `uv_scale` spans both tiles across the
+    /// viewport (twice the document content `CanvasView`'s own logical
+    /// contract promises for that physical size), so the sample point
+    /// lands in the *red* tile. At the *effective* zoom
+    /// (`effective_residency_zoom(1.0, 2.0) == 2.0`) — the fix —
+    /// `uv_scale` halves, showing only the single green tile's own
+    /// document-pixel extent stretched across the same physical
+    /// viewport, exactly matching what a real 256x256-logical Retina
+    /// canvas at 100% zoom should show, so the same sample point lands
+    /// back in *green*. This is the exact assertion that would flip if
+    /// `redraw` regressed to passing `self.canvas_view.zoom()` directly
+    /// instead of `effective_residency_zoom(...)`.
+    #[allow(clippy::too_many_lines)]
+    fn effective_residency_zoom_fixes_the_real_retina_sampling_bug() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+        let (_dir, mut store) = real_tile_store();
+        let surface = composite_surface_id();
+
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 1, y: 0 },
+            [1.0, 0.0, 0.0, 1.0],
+        );
+
+        // The real physical viewport `canvas_area_physical_size` would
+        // compute for a 256x256 logical canvas at a real Retina
+        // `scale_factor` of 2.0.
+        let physical_viewport = (512, 512);
+        let mut residency = aurora_gpu::TileResidency::new(device, queue, physical_viewport);
+        let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+        assert_eq!(stats.errors, 0);
+
+        let mut canvas_pipeline = aurora_gpu::CanvasPipeline::new(device);
+
+        // `CanvasView::new()` is the exact real type `redraw` reads
+        // `self.canvas_view.zoom()` from — 100% zoom, matching the bug
+        // report (the offset was present at any zoom, but 100% is the
+        // simplest real case).
+        let canvas_view = aurora_ui::CanvasView::new();
+        let scale_factor = 2.0_f64;
+
+        let sample = (480, 128);
+
+        // The bug: the raw, unscaled zoom fed directly into
+        // `set_origin` alongside a physical-pixel viewport.
+        residency.set_origin(
+            queue,
+            aurora_tile::TileId { x: 0, y: 0 },
+            physical_viewport,
+            canvas_view.zoom(),
+        );
+        let with_raw_zoom = render_and_sample_pixel(
+            device,
+            queue,
+            &mut canvas_pipeline,
+            &residency,
+            physical_viewport,
+            sample,
+        );
+        assert_eq!(
+            with_raw_zoom,
+            [255, 0, 0, 255],
+            "the pre-fix bug: an uncorrected physical viewport with a raw \
+             logical zoom shows twice the document content, so this sample \
+             point falls into the red tile instead of the green one"
+        );
+
+        // The fix: `effective_residency_zoom` folds `scale_factor` in.
+        residency.set_origin(
+            queue,
+            aurora_tile::TileId { x: 0, y: 0 },
+            physical_viewport,
+            effective_residency_zoom(canvas_view.zoom(), scale_factor),
+        );
+        let with_effective_zoom = render_and_sample_pixel(
+            device,
+            queue,
+            &mut canvas_pipeline,
+            &residency,
+            physical_viewport,
+            sample,
+        );
+        assert_eq!(
+            with_effective_zoom,
+            [0, 255, 0, 255],
+            "the fix: correcting for scale_factor must show exactly the \
+             document-pixel extent CanvasView's own logical-pixel contract \
+             promises, landing this same sample point back in the green tile"
+        );
     }
 
     #[test]
@@ -13876,6 +14163,73 @@ mod tests {
     fn logical_point_falls_back_to_one_for_a_non_positive_scale_factor() {
         assert_eq!(logical_point((50.0, 25.0), 0.0), (50.0, 25.0));
         assert_eq!(logical_point((50.0, 25.0), -1.0), (50.0, 25.0));
+    }
+
+    // -- Retina/HiDPI `redraw` fix: effective residency zoom --
+    //
+    // A real bug report on real Retina macOS hardware (`scale_factor`
+    // ~2.0): painting landed up-and-left of the cursor, worse the
+    // farther from the canvas's own top-left corner. Root cause:
+    // `redraw`'s one real `residency.set_origin` call site fed
+    // `aurora_gpu::TileResidency` a **physical**-pixel viewport
+    // (`canvas_area_physical_size`) alongside `CanvasView::zoom`'s own
+    // **logical**-pixel-semantics zoom, uncorrected -- so a
+    // `scale_factor != 1.0` display rendered at half the intended
+    // magnification. `effective_residency_zoom` is the fix's whole
+    // arithmetic; these tests are its headless proof, mirroring
+    // `logical_size`/`logical_point`'s own tests immediately above for
+    // the identity/scaling/fallback shape.
+
+    #[test]
+    // Exact-literal comparisons of plain multiplication by powers of two
+    // (no accumulated float noise) -- same reasoning this crate's other
+    // float_cmp allows already document (e.g.
+    // `load_background_color_resolves_a_real_linear_token`, just above).
+    #[allow(clippy::float_cmp)]
+    fn effective_residency_zoom_is_unchanged_at_a_scale_factor_of_one() {
+        // Every prior test/sandbox run, lacking a real Retina display,
+        // only ever exercised `scale_factor == 1.0` -- this case must
+        // stay exactly as it was: effective zoom equals the raw canvas
+        // zoom, unscaled.
+        assert_eq!(effective_residency_zoom(1.0, 1.0), 1.0);
+        assert_eq!(effective_residency_zoom(2.5, 1.0), 2.5);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn effective_residency_zoom_scales_by_a_real_retina_factor() {
+        // The real reported scenario: a Retina `scale_factor` of 2.0 at
+        // 100% canvas zoom must double the zoom actually handed to
+        // `TileResidency::set_origin`, so a physical-pixel viewport
+        // resolves to the same document-pixel count `CanvasView`'s own
+        // logical-pixel contract promises.
+        assert_eq!(effective_residency_zoom(1.0, 2.0), 2.0);
+        assert_eq!(effective_residency_zoom(1.5, 2.0), 3.0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn effective_residency_zoom_falls_back_to_one_for_a_non_positive_scale_factor() {
+        assert_eq!(effective_residency_zoom(1.0, 0.0), 1.0);
+        assert_eq!(effective_residency_zoom(1.0, -2.0), 1.0);
+        // A non-1.0 `canvas_zoom` here proves the fallback actually
+        // multiplies by `1.0` (i.e. leaves `canvas_zoom` unchanged),
+        // not that it hardcodes a return of `1.0` regardless of input —
+        // `logical_size_falls_back_to_one_for_a_non_positive_scale_factor`'s
+        // own non-trivial-input idiom, applied here too.
+        assert_eq!(effective_residency_zoom(2.5, 0.0), 2.5);
+        assert_eq!(effective_residency_zoom(2.5, -2.0), 2.5);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn effective_residency_zoom_falls_back_to_one_for_a_non_finite_scale_factor() {
+        assert_eq!(effective_residency_zoom(1.0, f64::NAN), 1.0);
+        assert_eq!(effective_residency_zoom(1.0, f64::INFINITY), 1.0);
+        // Same non-trivial-`canvas_zoom` proof as the non-positive case
+        // above.
+        assert_eq!(effective_residency_zoom(2.5, f64::NAN), 2.5);
+        assert_eq!(effective_residency_zoom(2.5, f64::INFINITY), 2.5);
     }
 
     fn laid_out_workspace() -> aurora_ui::Workspace {

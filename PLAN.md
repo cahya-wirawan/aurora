@@ -4146,6 +4146,50 @@ structural design work.
   only by actually running the app" category `resumed`/`redraw`
   themselves already fall into); the existing 121 `aurora-app` tests
   all still pass unchanged. Full workspace CI clean.
+
+  **Real-hardware-run on a Retina MacBook, 2026-08-13 — a real DPI-scale
+  bug found and fixed**: Cahya reported painting landing visibly
+  up-and-left of the cursor, zero offset at the canvas's own top-left
+  corner, growing the farther the cursor moved away from it. Root
+  cause, traced precisely rather than guessed: `redraw`'s one real
+  `residency.set_origin` call site fed `aurora_gpu::TileResidency` a
+  **physical**-pixel viewport (`canvas_area_physical_size`, already ×
+  `scale_factor`) alongside `canvas_view.zoom()`'s own **logical**-pixel-
+  semantics zoom, uncorrected — so on a `scale_factor ≈ 2.0` Retina
+  display, `uv_scale` covered twice the document-pixel extent
+  `CanvasView`'s own "one document pixel = one logical pixel" contract
+  promises, compressing everything rendered toward the atlas origin.
+  Painting itself always landed at the mathematically correct document
+  point (`to_document`, unaffected — it works entirely in `CanvasView`'s
+  own logical space); only what got *drawn* was wrong. Fixed with a new
+  pure `effective_residency_zoom(canvas_zoom, scale_factor)` —
+  `canvas_zoom * scale_factor`, with the same non-finite/non-positive
+  `scale_factor` → `1.0` fallback `logical_size`/`logical_point` already
+  use — called at that one real call site in place of the raw
+  `canvas_view.zoom()`; `tile_origin_for_view` needed no change, since
+  it only ever reads `view.to_document`, already-correct logical-space
+  arithmetic that was never actually implicated. `aurora-gpu`'s own
+  `canvas_pipeline_reflects_zoom_by_magnifying_the_atlas` test never
+  caught this, honestly: it proves `TileResidency::set_origin`'s raw
+  `viewport_px`/`zoom` arithmetic correctly and completely on its own
+  terms — that crate has no concept of logical vs. physical pixels at
+  all, by design (DPI scaling is `aurora-app`/`aurora-widgets`
+  territory per `CLAUDE.md`). The bug was one layer up, in what
+  `aurora-app` chose to pass into that contract — untested at any
+  non-1.0 `scale_factor` until now, since neither this sandbox nor any
+  prior human-verification pass had ever run on a real DPI-scaled
+  display. 4 new headless `aurora-app` unit tests for
+  `effective_residency_zoom` (identity at `scale_factor = 1.0`; exact
+  scaling at a real `2.0`; non-finite/non-positive fallback, mirroring
+  `logical_point`'s own tests) plus one new real-GPU pixel-readback
+  test, `effective_residency_zoom_fixes_the_real_retina_sampling_bug`
+  — the same two-adjacent-differently-coloured-tiles technique
+  `canvas_pipeline_reflects_zoom_by_magnifying_the_atlas` uses, this
+  time against a 512×512 physical viewport standing in for a 256×256
+  logical Retina canvas: the same fixed sample point shows the *red*
+  tile with the raw, uncorrected zoom (the pre-fix bug) and the
+  *green* tile with the effective zoom (the fix). `aurora-gpu` itself
+  untouched — the fix and both new tests live entirely in `aurora-app`.
 - [~] **Layers, history, tool-options panels** — first slice done
   2026-08-03, `crates/aurora-ui/src/layers_panel.rs` (new — Layers only;
   History and tool-options panels remain separate, still-open work).
