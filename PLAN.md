@@ -6330,6 +6330,65 @@ structural design work.
   the real fix `spike/FINDINGS.md`'s own ~20ms "merging whole tiles"
   measurement still calls for once real multi-layer documents are
   actually being painted on, not just panned across.
+
+  **Addendum, 2026-08-13 — the brush/eraser half of this closed for
+  real, motivated by the first live-hardware report this gap ever
+  got.** Cahya ran `cargo run -p aurora-app --release` on real macOS
+  hardware (a Radeon Pro 5300M) and reported the Brush tool "very slow"
+  while actively painting — the first live human confirmation of this
+  exact gap, distinct from (and stronger than) `spike/FINDINGS.md`'s
+  own synthetic, software-Vulkan, no-real-GPU measurement above. Root
+  cause matched this bullet's own analysis exactly: `App::paint_dab`/
+  `App::erase_dab` called `CompositeCache::bump()` — the whole-cache
+  invalidation — after *every single dab*, so a normal-sized window's
+  worth of visible tiles (dozens) got fully recomposited on every dab
+  of a drag, not just the one or two tiles the dab actually touched.
+
+  Fixed the brush/eraser half specifically: new `CompositeCache::invalidate`
+  removes just one `TileId` from the current set, the single-tile
+  counterpart to `bump`. `paint_dab`/`erase_dab` now compute
+  `aurora_brush::touched_tiles(local, RADIUS)` once (previously
+  computed only inside the pixel-undo snapshot branch, now hoisted out
+  unconditionally) and invalidate exactly those tiles instead of
+  bumping the whole cache. This does **not** revive the
+  `TileStore`-dirty-flag approach this bullet already rejected above —
+  that approach's flaw was a *query-time* race (a dirty flag on an
+  evicted, not-yet-redrawn tile silently stops being reported). This
+  fix invalidates *synchronously*, at the dab call site, from data
+  `paint_dab`/`erase_dab` already compute for the undo-snapshot path —
+  no dependency on tile residency or eviction timing at all, so that
+  race has no way to occur here. Every other `bump()` call site
+  (`apply_move`, undo/redo dispatch, document open/replace, active-
+  layer switch) is untouched and stays a full bump — each is either a
+  genuine whole-grid change (a live Move or an active-layer switch
+  shifts `reference_origin` itself, changing every tile's own meaning)
+  or low-frequency enough that coarse invalidation was never the cost
+  driver. 4 new `aurora-app` tests covering: a single-tile dab
+  invalidates only its own tile and leaves the rest of a 4-tile visible
+  grid current; the invalidated tile is genuinely recomputed (not
+  skipped) and reflects the dab's own new paint, while an untouched
+  tile's existing composited content survives unchanged; a
+  corner-straddling dab invalidates all four tiles it actually spans;
+  and a 20-dab same-tile stroke still leaves exactly one tile needing
+  recompute afterward, not twenty.
+
+  **Honestly still unfixed by this addendum**: GPU-side compositing —
+  checked fresh rather than assumed stale, and this line *is* now
+  outdated — `aurora_render::TileCompositor` is wired into `aurora-app`
+  as of the GPU-accelerated compositing work landed earlier in this
+  same session (`recomposite_visible_tiles`'s own GPU-qualifying path,
+  `begin_gpu_composite_tile`, batched to one `device.poll` per frame —
+  see the "Batch GPU tile-composite readback into one poll per frame"
+  entry). What remains genuinely open: this addendum only shrinks *how
+  many* tiles get recomposited per dab, not the cost of recompositing
+  one — the actual per-tile blend math and any upload-bandwidth cost
+  during painting are exactly as expensive as before. A stroke whose
+  dabs span many tiles at once (a fast, wide drag, or a corner-
+  straddling brush near a large radius) still recomposites all of
+  them, same as any other real edit to that many tiles. No new
+  human-hardware measurement of stroke latency was taken as part of
+  this addendum — the original report was qualitative ("very slow"),
+  not a number to compare against.
 - [x] **Document-level canvas size and real ICC round-trip** — done
   2026-08-06, closing two gaps the `.aur` format bullet named the same
   day it landed, in two committed steps.

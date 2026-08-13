@@ -4425,24 +4425,32 @@ fn recomposite_visible_tiles(
 /// back over already-composited, unedited territory is a real cache
 /// hit, not just an idle redraw with nothing to do.
 ///
-/// [`Self::bump`] is the one invalidation primitive, called by every
-/// `aurora-app` operation that could change what a given `TileId` now
-/// composites to: a brush/eraser dab, a live Move, Undo/Redo, opening
-/// or replacing the active document, and selecting a different active
-/// layer (which changes the reference origin every `TileId` is measured
-/// from).
+/// [`Self::bump`] is the coarse invalidation primitive, called by every
+/// `aurora-app` operation whose effect on "what a given `TileId` now
+/// composites to" isn't confined to a known, small set of tiles: a live
+/// Move, Undo/Redo, opening or replacing the active document, and
+/// selecting a different active layer (which changes the reference
+/// origin every `TileId` is measured from, shifting every tile's own
+/// meaning at once). [`Self::invalidate`] is the precise counterpart: a
+/// brush/eraser dab (`App::paint_dab`/`App::erase_dab`) knows exactly
+/// which tiles it touched (`aurora_brush::touched_tiles`, in the same
+/// document-space-relative-to-the-active-layer's-own-origin frame
+/// `reference_origin` already uses — see those functions' own call
+/// sites) and invalidates only those, since a full bump on every dab of
+/// a stroke would mean recompositing the *entire* visible grid on every
+/// dab rather than just the tile(s) the dab actually changed.
 ///
-/// **Coarse, stated honestly**: one bump invalidates every currently
-/// cached tile at once, not just the one(s) the triggering edit actually
-/// touched — true per-tile dirty tracking across layers is separate,
-/// still-open follow-on work. `aurora_tile::TileStore`'s own per-tile
-/// dirty flags (`Tile::mark_dirty`/`TileStore::take_dirty`) are
-/// deliberately *not* reused for finer-grained invalidation here: they
-/// only track resident tiles, so a tile dirtied by an edit and then
-/// evicted before a redraw ever consumes its flag would silently stop
-/// being reported dirty at all — a real correctness risk (a stale
-/// composite shown as current) this coarser, explicitly-triggered design
-/// avoids entirely.
+/// **Bump itself stays coarse, stated honestly**: it invalidates every
+/// currently cached tile at once, not just the one(s) the triggering
+/// edit actually touched. `aurora_tile::TileStore`'s own per-tile dirty
+/// flags (`Tile::mark_dirty`/`TileStore::take_dirty`) are deliberately
+/// *not* reused for either kind of invalidation here: they only track
+/// resident tiles, so a tile dirtied by an edit and then evicted before
+/// a redraw ever consumes its flag would silently stop being reported
+/// dirty at all — a real correctness risk (a stale composite shown as
+/// current) both `bump` and `invalidate` avoid by acting synchronously,
+/// from data the caller already has in hand, rather than by querying
+/// tile-store state later.
 ///
 /// `current` only ever grows within a session between bumps — a tile
 /// computed once is never individually evicted, even once panned away
@@ -4466,6 +4474,16 @@ impl CompositeCache {
     #[must_use]
     fn is_current(&self, id: aurora_tile::TileId) -> bool {
         self.current.contains(&id)
+    }
+
+    /// Invalidates just `id`, leaving every other cached tile untouched —
+    /// the single-tile analog of [`Self::bump`], for a caller that knows
+    /// precisely which tile(s) an edit actually touched (a brush/eraser
+    /// dab, via `aurora_brush::touched_tiles`) rather than needing to
+    /// distrust the whole cache. Safe to call with an `id` that isn't
+    /// currently cached at all — `HashSet::remove` is a no-op then.
+    fn invalidate(&mut self, id: aurora_tile::TileId) {
+        self.current.remove(&id);
     }
 
     /// Records that `id` now holds current composited content.
@@ -6057,12 +6075,13 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
+        let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
         if let Some(Drag::Brush {
             stroke: Some(stroke),
             ..
         }) = self.drag.as_mut()
         {
-            for tile in aurora_brush::touched_tiles(local, BRUSH_RADIUS) {
+            for &tile in &touched {
                 if let Err(err) = stroke.record_touch(store, tile) {
                     tracing::warn!(?err, ?tile, "failed to capture a pixel-undo snapshot");
                 }
@@ -6073,7 +6092,9 @@ impl App {
         {
             tracing::warn!(?err, "failed to stamp a brush dab");
         }
-        self.composite_cache.bump();
+        for tile in touched {
+            self.composite_cache.invalidate(tile);
+        }
     }
 
     /// Erases one dab at `doc_point` (document space) from the active
@@ -6096,12 +6117,13 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
+        let touched = aurora_brush::touched_tiles(local, ERASER_RADIUS);
         if let Some(Drag::Eraser {
             stroke: Some(stroke),
             ..
         }) = self.drag.as_mut()
         {
-            for tile in aurora_brush::touched_tiles(local, ERASER_RADIUS) {
+            for &tile in &touched {
                 if let Err(err) = stroke.record_touch(store, tile) {
                     tracing::warn!(?err, ?tile, "failed to capture a pixel-undo snapshot");
                 }
@@ -6110,7 +6132,9 @@ impl App {
         if let Err(err) = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS) {
             tracing::warn!(?err, "failed to erase a dab");
         }
-        self.composite_cache.bump();
+        for tile in touched {
+            self.composite_cache.invalidate(tile);
+        }
     }
 
     /// Applies `bounds` to `layer_id` directly in the live document
@@ -11916,6 +11940,315 @@ mod tests {
             read_first_texel(&mut store, composite_surface_id(), tile_id),
             (1.0, 0.0, 0.0, 1.0),
             "bump must force a real recompute, overwriting the poked value"
+        );
+    }
+
+    // -- `CompositeCache::invalidate`: the per-tile counterpart to `bump`
+    // that `App::paint_dab`/`App::erase_dab` now use instead of a full
+    // `bump()` on every dab. `App` itself can't be constructed headlessly
+    // (it needs a real `winit` window), so these tests replicate the
+    // exact sequence those two methods run -- `aurora_brush::touched_tiles`
+    // computed once, `aurora_brush::stamp_dab`, then `cache.invalidate`
+    // per touched tile -- directly against a real `TileStore` and a real
+    // `CompositeCache`, the same technique `measure_pan_and_paint_frames`
+    // above already uses to exercise `App::redraw`'s own frame loop
+    // without a real `App`.
+
+    /// Everything [`multi_tile_grid_with_all_four_tiles_current`] hands
+    /// back to each test below: the real GPU context and scratch dir
+    /// (kept alive for the test's own duration), the live store/layer
+    /// tree/layer id/surface id the dab tests paint into, and the
+    /// residency/cache pair `recomposite_visible_tiles` already
+    /// populated with all four visible tiles marked current.
+    type MultiTileGridFixture = (
+        GpuTestContext,
+        tempfile::TempDir,
+        aurora_tile::TileStore,
+        aurora_doc::LayerTree,
+        aurora_doc::LayerId,
+        aurora_tile::SurfaceId,
+        aurora_gpu::TileResidency,
+        CompositeCache,
+    );
+
+    /// Sets up a real GPU context, a real `TileStore`, one pixel layer
+    /// at document origin `(0, 0)` sized to exactly cover a 2x2 visible
+    /// tile grid, and a `TileResidency`/`CompositeCache` whose first
+    /// `recomposite_visible_tiles` call marks all four visible tiles
+    /// `(0, 0)`, `(1, 0)`, `(0, 1)`, `(1, 1)` current -- the common
+    /// starting point every test below needs. Returns `None` if no real
+    /// GPU adapter is available (the same inconclusive-skip case
+    /// `real_gpu_context` itself already handles).
+    fn multi_tile_grid_with_all_four_tiles_current() -> Option<MultiTileGridFixture> {
+        let context = real_gpu_context()?;
+        let (dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 512,
+            height: 512,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(id),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        for tile in [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+            aurora_tile::TileId { x: 1, y: 1 },
+        ] {
+            assert!(
+                cache.is_current(tile),
+                "setup: the first recomposite must mark every visible tile current"
+            );
+        }
+
+        Some((context, dir, store, layers, id, surface, residency, cache))
+    }
+
+    #[test]
+    fn a_dab_confined_to_one_tile_invalidates_only_that_tile() {
+        let Some((_context, _dir, mut store, _layers, _id, surface, _residency, mut cache)) =
+            multi_tile_grid_with_all_four_tiles_current()
+        else {
+            return;
+        };
+
+        // Well inside tile (0, 0) -- `min`/`max` stay in [26, 74], nowhere
+        // near the tile-256 boundary -- so this dab touches exactly one
+        // tile, the same shape most dabs of a real stroke have.
+        let local = (50.0, 50.0);
+        let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
+        assert_eq!(
+            touched,
+            vec![aurora_tile::TileId { x: 0, y: 0 }],
+            "setup: this dab must touch exactly tile (0, 0)"
+        );
+        if let Err(err) =
+            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
+        {
+            unreachable!("{err:?}");
+        }
+        for tile in touched {
+            cache.invalidate(tile);
+        }
+
+        assert!(
+            !cache.is_current(aurora_tile::TileId { x: 0, y: 0 }),
+            "the touched tile must need recompute"
+        );
+        for tile in [
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+            aurora_tile::TileId { x: 1, y: 1 },
+        ] {
+            assert!(
+                cache.is_current(tile),
+                "a tile the dab never touched must not be invalidated -- \
+                 this is the actual performance claim: a full bump() would \
+                 fail this assertion for every one of these three"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dab_confined_to_one_tile_forces_a_real_recompute_there_and_leaves_other_tiles_alone() {
+        let Some((context, _dir, mut store, layers, id, surface, residency, mut cache)) =
+            multi_tile_grid_with_all_four_tiles_current()
+        else {
+            return;
+        };
+
+        let local = (50.0, 50.0);
+        let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
+        if let Err(err) =
+            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
+        {
+            unreachable!("{err:?}");
+        }
+        for &tile in &touched {
+            cache.invalidate(tile);
+        }
+
+        // Poke garbage into both the touched tile's own composite surface
+        // and an untouched tile's -- content only a fresh recompute (for
+        // the touched tile) or a genuine skip (for the untouched tile)
+        // could ever explain, the same technique
+        // `recomposite_visible_tiles_skips_an_already_current_tile` above
+        // already uses.
+        let touched_tile = aurora_tile::TileId { x: 0, y: 0 };
+        let untouched_tile = aurora_tile::TileId { x: 1, y: 1 };
+        fill_solid(
+            &mut store,
+            composite_surface_id(),
+            touched_tile,
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        fill_solid(
+            &mut store,
+            composite_surface_id(),
+            untouched_tile,
+            [0.0, 1.0, 0.0, 1.0],
+        );
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(id),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        // The touched tile: its own first texel (0, 0) is nowhere near
+        // the dab (centered at (50, 50), radius 24 -- distance ~70 from
+        // the tile's own origin), so a real recompute must leave it
+        // transparent, not the poked green -- proof the tile was
+        // genuinely recomputed rather than skipped as still-cached.
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), touched_tile),
+            (0.0, 0.0, 0.0, 0.0),
+            "the invalidated tile must be genuinely recomputed, not skipped"
+        );
+        // And the dab's own new paint really is visible in the fresh
+        // composite, sampled at its own center where alpha peaks at 1.0.
+        let Some([r, g, b, a]) = sample_pixel(&mut store, composite_surface_id(), local) else {
+            unreachable!("(50, 50) is a valid in-bounds composite sample");
+        };
+        assert!(a > 0.9, "the dab's own center must be near-opaque: {a}");
+        // Not an exact-value check -- the falloff/compositing math isn't
+        // this test's own concern, and is already covered by
+        // `stamp_dab`'s and `composite_tile_cpu`'s own tests -- just that
+        // this is unmistakably the dab's own warm colour (real red,
+        // negligible green) rather than the poked garbage green (0, 1, 0).
+        assert!(
+            r > 0.5 && g < 0.3,
+            "the composite must show the dab's real colour, not the poked green: ({r}, {g}, {b}, {a})"
+        );
+
+        // The untouched tile: no invalidation ever touched it, so it must
+        // still be exactly the poked garbage -- recomputing it too would
+        // be the whole bug this fix targets.
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), untouched_tile),
+            (0.0, 1.0, 0.0, 1.0),
+            "a tile the dab never touched must retain its existing composited content unchanged"
+        );
+    }
+
+    #[test]
+    fn a_dab_straddling_a_tile_corner_invalidates_every_tile_it_touches() {
+        let Some((_context, _dir, mut store, _layers, _id, surface, _residency, mut cache)) =
+            multi_tile_grid_with_all_four_tiles_current()
+        else {
+            return;
+        };
+
+        // Centered exactly on the shared corner of all four visible
+        // tiles: [232, 280) in both axes straddles the 256 boundary, so
+        // `stamp_dab`'s own documented "up to four tiles near a corner"
+        // case applies here for real.
+        let local = (256.0, 256.0);
+        let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
+        let touched_set: std::collections::HashSet<_> = touched.iter().copied().collect();
+        assert_eq!(
+            touched_set,
+            std::collections::HashSet::from([
+                aurora_tile::TileId { x: 0, y: 0 },
+                aurora_tile::TileId { x: 1, y: 0 },
+                aurora_tile::TileId { x: 0, y: 1 },
+                aurora_tile::TileId { x: 1, y: 1 },
+            ]),
+            "setup: a corner dab must touch all four visible tiles"
+        );
+        if let Err(err) =
+            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
+        {
+            unreachable!("{err:?}");
+        }
+        for tile in touched {
+            cache.invalidate(tile);
+        }
+
+        for tile in touched_set {
+            assert!(
+                !cache.is_current(tile),
+                "every tile the corner dab actually touched must be invalidated: {tile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_stroke_of_dabs_in_one_tile_invalidates_a_bounded_number_of_tiles() {
+        let Some((_context, _dir, mut store, _layers, _id, surface, _residency, mut cache)) =
+            multi_tile_grid_with_all_four_tiles_current()
+        else {
+            return;
+        };
+
+        // 20 dabs, all landing in tile (0, 0) -- the common shape of a
+        // slow-drag stroke, where most successive dabs land in the same
+        // or an adjacent tile. If this fix worked, the number of tiles
+        // needing recompute afterward is bounded by what the stroke
+        // actually touched (one tile here), not by how many dabs were
+        // stamped -- the reported bug's exact shape, where every single
+        // dab used to invalidate the *entire* visible grid.
+        for step in 0_u8..20 {
+            let local = (40.0 + f32::from(step), 40.0 + f32::from(step));
+            let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
+            assert_eq!(
+                touched,
+                vec![aurora_tile::TileId { x: 0, y: 0 }],
+                "setup: every dab in this stroke must stay within tile (0, 0)"
+            );
+            if let Err(err) =
+                aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
+            {
+                unreachable!("{err:?}");
+            }
+            for tile in touched {
+                cache.invalidate(tile);
+            }
+        }
+
+        let still_current = [
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+            aurora_tile::TileId { x: 1, y: 1 },
+        ]
+        .into_iter()
+        .filter(|&tile| cache.is_current(tile))
+        .count();
+        assert_eq!(
+            still_current, 3,
+            "20 dabs confined to one tile must still leave the other three tiles current -- \
+             the number of tiles needing recompute must not scale with dab count"
+        );
+        assert!(
+            !cache.is_current(aurora_tile::TileId { x: 0, y: 0 }),
+            "the one tile the whole stroke actually touched must need recompute"
         );
     }
 
