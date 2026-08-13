@@ -8318,6 +8318,32 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-08-13 (gauntlet-loop session continued, two more rounds
+landed)**: two further items closed the same way as the three below —
+built, independently critic-reviewed cold (no visibility into the
+builder's own reasoning), and landed as their own commits.
+`aurora_gpu::TileResidency` now handles a real window resize
+(`TileResidency::resize`, rebuilding the atlas at the new size and
+provably resetting stale slot occupancy rather than letting it leak
+into the new grid), closing the exact gap the Canvas bullet's own
+"Still open" paragraph named — rotation/rulers/guides/grid/snap/
+sub-tile fractional pan/true-infinite-zoom remain untouched, as scoped
+(0.44.0). `aurora-ui`'s `Workspace::properties` panel — real since
+M1.8's original docking skeleton but never populated — now shows real
+content via a new, generic `populate_properties_panel` (label/value
+pairs the caller supplies; `aurora-ui` itself carries zero Brush/
+Eraser-specific knowledge): `aurora-app`'s `tool_options` surfaces the
+real `BRUSH_RADIUS`/`ERASER_RADIUS` constants for those two tools and
+an honest empty panel for every other tool, which has no real
+per-tool data anywhere in this codebase yet (0.45.0). One candidate
+this round's initial scan flagged as "reachable" (unifying pixel and
+structural undo into one chronological stack) turned out already done
+— `UndoOrder` (this file's own "Pixel-edit undo" bullet already names
+it, "closed the same week — see the Unified undo/redo bullet below")
+already interleaves both backing stores correctly; re-confirmed by
+reading `UndoOrder`/`run_command` directly before ruling it out, not
+just trusting a stale PLAN.md cross-reference.
+
 **Addendum 2026-08-12 (gauntlet-loop session, three rounds landed)**:
 three of the items this section's previous revision (below) named as
 "genuinely reachable from this machine right now" are now actually
