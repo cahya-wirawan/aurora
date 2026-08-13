@@ -10,7 +10,7 @@
 
 use crate::test_support::real_context;
 use crate::{CanvasPipeline, TileResidency};
-use aurora_tile::{SurfaceId, TileId, TileStore};
+use aurora_tile::{SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 use std::num::NonZeroUsize;
 
@@ -376,7 +376,7 @@ fn canvas_pipeline_reflects_zoom_by_magnifying_the_atlas() {
     // so screen x=480/512 maps into atlas x ~ 720, past the 512 boundary
     // between tile 0 and tile 1).
     let sample = (480, 128);
-    residency.set_origin(queue, TileId { x: 0, y: 0 }, viewport, 1.0);
+    residency.set_origin(queue, (0.0, 0.0), viewport, 1.0);
     let at_100_percent =
         render_and_sample_pixel(device, queue, &mut canvas, &residency, viewport, sample);
     assert_eq!(
@@ -389,7 +389,7 @@ fn canvas_pipeline_reflects_zoom_by_magnifying_the_atlas() {
     // the atlas's own first 256 (of 768) texels stretched across the
     // full 512px target, so screen x=480 maps into atlas x ~ 360, still
     // inside tile 0 (green), not tile 1.
-    residency.set_origin(queue, TileId { x: 0, y: 0 }, viewport, 2.0);
+    residency.set_origin(queue, (0.0, 0.0), viewport, 2.0);
     let at_200_percent =
         render_and_sample_pixel(device, queue, &mut canvas, &residency, viewport, sample);
     assert_eq!(
@@ -397,5 +397,205 @@ fn canvas_pipeline_reflects_zoom_by_magnifying_the_atlas() {
         [0, 255, 0, 255],
         "at 200% zoom the same screen point must now show the green tile -- \
          zoom must actually magnify, not just accept the argument"
+    );
+}
+
+/// The money test for the sub-tile fractional-scroll fix (real symptoms
+/// Cahya reported interactively: painted content landing offset from the
+/// cursor after zoom/pan, and panning under one tile not visibly moving
+/// anything). Same two-adjacent-tiles setup as
+/// [`canvas_pipeline_reflects_zoom_by_magnifying_the_atlas`] above, but
+/// exercising `set_origin`'s own fractional axis instead of `zoom`: a
+/// `doc_origin` of exactly half a tile (128 of 256px) must shift the
+/// rendered tile boundary by exactly that many screen pixels, not snap to
+/// the nearest whole-tile boundary (the pre-fix behaviour, equivalent to
+/// `doc_origin (0, 0)` regardless of the fractional part).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn canvas_pipeline_reflects_a_sub_tile_fractional_pan() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 0, y: 0 },
+        [0.0, 1.0, 0.0, 1.0],
+    );
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 1, y: 0 },
+        [1.0, 0.0, 0.0, 1.0],
+    );
+
+    let viewport = (512, 256);
+    let mut residency = TileResidency::new(device, queue, viewport);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.uploaded, 6, "a 3x2 slot grid");
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+
+    // At `doc_origin (0, 0)`, screen x=200 samples atlas x=200 -- inside
+    // tile 0 (green, atlas [0, 256)).
+    let sample = (200, 128);
+    residency.set_origin(queue, (0.0, 0.0), viewport, 1.0);
+    let unshifted =
+        render_and_sample_pixel(device, queue, &mut canvas, &residency, viewport, sample);
+    assert_eq!(
+        unshifted,
+        [0, 255, 0, 255],
+        "baseline: screen x=200 with no pan must show the green tile"
+    );
+
+    // `doc_origin` shifted by exactly half a tile (128px, deliberately
+    // *not* a whole-tile multiple): the same screen x=200 now samples
+    // atlas x = 128 + 200 = 328 -- past the 256 tile boundary, inside
+    // tile 1 (red). A floor-to-tile implementation (the pre-fix bug)
+    // would discard the 128px fractional remainder entirely and render
+    // as if `doc_origin` were still `(0, 0)`, leaving this sample green.
+    let half_tile = TILE as f32 / 2.0;
+    residency.set_origin(queue, (half_tile, 0.0), viewport, 1.0);
+    let shifted = render_and_sample_pixel(device, queue, &mut canvas, &residency, viewport, sample);
+    assert_eq!(
+        shifted,
+        [255, 0, 0, 255],
+        "a half-tile doc_origin must shift the rendered content by exactly \
+         that many pixels, landing this sample in the red tile -- not \
+         silently snapped back to the nearest whole tile boundary"
+    );
+}
+
+/// The regression backstop: a `doc_origin` that's an exact multiple of
+/// `TILE` (so `sub_tile` works out to `(0.0, 0.0)`) must render bit-
+/// identically to the old, `TileId`-typed `set_origin` API -- proving the
+/// refactor didn't perturb the already-correct whole-tile case, only
+/// added real behaviour for the fractional one.
+/// [`canvas_pipeline_reflects_zoom_by_magnifying_the_atlas`] above already
+/// covers `doc_origin (0, 0)` (trivially a multiple of `TILE`); this
+/// covers a *non-zero* whole-tile shift, the case
+/// `residency.rs`'s own `toroidal_addressing_uploads_only_the_newly_exposed_column`
+/// test exercises for upload bookkeeping but nothing GPU-renders.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn canvas_pipeline_with_a_whole_tile_doc_origin_matches_the_pre_refactor_tileid_behaviour() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 0, y: 0 },
+        [0.0, 1.0, 0.0, 1.0],
+    );
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 1, y: 0 },
+        [1.0, 0.0, 0.0, 1.0],
+    );
+
+    let viewport = (512, 256);
+    let mut residency = TileResidency::new(device, queue, viewport);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.uploaded, 6, "a 3x2 slot grid");
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+
+    // `doc_origin (TILE, 0)` -- one whole tile of pan, zero sub-tile
+    // remainder -- must behave exactly like the old `TileId { x: 1, y: 0
+    // }` `set_origin` call would have: tile 1's own content (red) now
+    // starts at the canvas's own top-left corner.
+    residency.set_origin(queue, (TILE as f32, 0.0), viewport, 1.0);
+    let sample = (10, 128);
+    let pixel = render_and_sample_pixel(device, queue, &mut canvas, &residency, viewport, sample);
+    assert_eq!(
+        pixel,
+        [255, 0, 0, 255],
+        "a whole-tile doc_origin must show tile 1's own colour starting at \
+         the canvas's own top-left corner, matching the pre-refactor \
+         TileId-typed API exactly"
+    );
+}
+
+/// Mirrors the actual reported bug shape: a pan smaller than one full
+/// `TILE` (50 of 256px) must produce a *visible* rendering change, not
+/// nothing -- the "painting doesn't move while panning" symptom
+/// specifically (as opposed to
+/// [`canvas_pipeline_reflects_a_sub_tile_fractional_pan`] above, which
+/// proves the shift is *exactly* right; this proves a small, realistic
+/// drag increment isn't silently swallowed the way the pre-fix
+/// floor-to-tile implementation swallowed anything under one `TILE`).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn canvas_pipeline_a_small_sub_tile_pan_visibly_moves_the_content() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 0, y: 0 },
+        [0.0, 1.0, 0.0, 1.0],
+    );
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 1, y: 0 },
+        [1.0, 0.0, 0.0, 1.0],
+    );
+
+    let viewport = (512, 256);
+    let mut residency = TileResidency::new(device, queue, viewport);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.uploaded, 6, "a 3x2 slot grid");
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+
+    // Sample just inside the green tile, close enough to the tile
+    // boundary (atlas x=256) that a 50px pan crosses it: at doc_origin
+    // (0, 0), screen x=230 samples atlas x=230 (green); a 50px pan moves
+    // that same screen point to atlas x=280 (red).
+    let sample = (230, 128);
+    residency.set_origin(queue, (0.0, 0.0), viewport, 1.0);
+    let before = render_and_sample_pixel(device, queue, &mut canvas, &residency, viewport, sample);
+    assert_eq!(
+        before,
+        [0, 255, 0, 255],
+        "baseline must show the green tile"
+    );
+
+    let pan_step_px = 50.0;
+    residency.set_origin(queue, (pan_step_px, 0.0), viewport, 1.0);
+    let after = render_and_sample_pixel(device, queue, &mut canvas, &residency, viewport, sample);
+    assert_eq!(
+        after,
+        [255, 0, 0, 255],
+        "a 50px pan (well under one 256px TILE) must actually move the \
+         rendered content -- the pre-fix bug reported interactively as \
+         \"panning doesn't move anything until a large drag, then jumps\""
+    );
+    assert_ne!(
+        before, after,
+        "a sub-tile pan must visibly change the rendered pixel, not leave \
+         it snapped to the pre-pan tile boundary"
     );
 }

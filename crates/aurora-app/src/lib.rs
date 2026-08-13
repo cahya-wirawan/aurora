@@ -193,7 +193,7 @@
 //! the active layer's own bounds at drag-start and shifts them by the
 //! pointer's own travelled delta each move event, applied via
 //! `App::apply_move`. Making a moved layer actually *render* in its new
-//! place needed one more real fix: `tile_origin_for_view` used to
+//! place needed one more real fix: `canvas_local_origin` used to
 //! assume the active layer always sat at document `(0, 0)` (true of
 //! every layer built until Move existed) — it now subtracts the active
 //! layer's own bounds offset before converting a document-space point
@@ -393,16 +393,21 @@
 //! `canvas_view.zoom()` into `aurora_gpu::TileResidency::set_origin`,
 //! which shrinks/grows the atlas's own sampled `uv_scale` by that
 //! factor (shader-side scaling — no bigger upload, no mip selection);
-//! `tile_origin_for_view` goes through `CanvasView::to_document` instead
+//! `canvas_local_origin` goes through `CanvasView::to_document` instead
 //! of assuming `zoom() == 1.0`, so panning while zoomed picks the right
-//! tile too. **Scope, stated honestly**: the atlas's own uv offset is
-//! still only tile-granular (no sub-tile fractional scroll — see
-//! `tile_origin_for_view`'s own doc comment); rendering a lower mip
-//! while zoomed out or panning (`spike/FINDINGS.md`'s own progressive-
-//! rendering finding), rotation, rulers, guides, grid, and snap all
-//! remain this bullet's own still-open remainder. **Window resize is
-//! handled** (`apply_resize` calls `TileResidency::resize`, see that
-//! method's own doc comment) — no longer part of this remainder.
+//! tile too. **Sub-tile fractional scroll fixed 2026-08-13**: the
+//! atlas's own uv offset used to be floored to a whole tile before
+//! `set_origin` ever saw it (visible as painted content landing offset
+//! from the cursor after any zoom/pan, and panning under one tile not
+//! moving anything); `TileResidency::set_origin` now takes the
+//! continuous position directly and folds the fractional remainder into
+//! the sampled UV offset itself. **Scope, stated honestly**: rendering a
+//! lower mip while zoomed out or panning (`spike/FINDINGS.md`'s own
+//! progressive-rendering finding), rotation, rulers, guides, grid, snap,
+//! and true infinite zoom all remain this bullet's own still-open
+//! remainder. **Window resize is handled** (`apply_resize` calls
+//! `TileResidency::resize`, see that method's own doc comment) — no
+//! longer part of this remainder.
 //!
 //! **A real bug fixed, 2026-08-06**: real hardware (macOS) reported
 //! ~100% CPU at idle. `about_to_wait` was requesting a redraw
@@ -3021,7 +3026,7 @@ fn handle_zoom_tool_click(
 // (`aurora_ui::layers_panel`, `aurora_widgets::WidgetTree::hit_test`)
 // changes it, live. Move's own drag-to-reposition logic (`Drag::Move`,
 // `App::apply_move`) followed once `aurora_doc::LayerTree::set_bounds`
-// gave it somewhere real to land, and `tile_origin_for_view` learned to
+// gave it somewhere real to land, and `canvas_local_origin` learned to
 // read the active layer's own bounds offset so a moved layer actually
 // renders in its new place, not just in the document model. Undo-as-
 // you-drag remains separate, still-open follow-on work.
@@ -3058,7 +3063,7 @@ fn active_pixel_layer(
 /// The active layer's own document-space origin (`bounds.x`/`bounds.y`,
 /// as `f32`), or `(0.0, 0.0)` if there's no active layer or it isn't a
 /// pixel layer — the same absent-precondition honesty
-/// [`active_pixel_layer`] already uses. What [`tile_origin_for_view`]
+/// [`active_pixel_layer`] already uses. What [`canvas_local_origin`]
 /// needs to convert a document-space point into the active layer's own
 /// surface-local space, now that a layer can actually sit somewhere
 /// other than the document's own origin (`aurora_doc::LayerTree::set_bounds`,
@@ -4163,7 +4168,7 @@ fn begin_gpu_composite_tile(
 ///
 /// **Per-layer origins, handled for real**: the atlas's own visible
 /// grid is anchored to `active_layer`'s own document-space origin
-/// (`tile_origin_for_view`'s own doc comment) — for a layer that
+/// (`canvas_local_origin`'s own doc comment) — for a layer that
 /// shares that exact origin, its own `TileId` space already lines up,
 /// so its tile is read directly; for one that doesn't (a document with
 /// two layers at different `bounds`, e.g. after a Move), a document-
@@ -4286,7 +4291,7 @@ fn recomposite_visible_tiles(
     mut compositor: Option<&mut aurora_render::TileCompositor>,
 ) {
     // The tile grid `residency.visible_tiles()` walks is anchored to the
-    // *active* layer's own origin (`tile_origin_for_view`'s own doc
+    // *active* layer's own origin (`canvas_local_origin`'s own doc
     // comment) — every other layer's own document-space tile boundaries
     // only line up with it by coincidence, so this is the one origin
     // every `tile_id` below needs converting back out of.
@@ -4805,8 +4810,8 @@ fn layer_local_point(bounds: aurora_core::Rect, doc_point: (f32, f32)) -> (f32, 
 /// needs to pick a real, already-painted colour. `None` for a negative
 /// coordinate (`TileId`'s own fields are unsigned, so there is no tile
 /// there — the same "outside the surface" case
-/// [`tile_origin_for_view`]'s own doc comment names) or if paging the
-/// touched tile in fails.
+/// [`aurora_gpu::TileResidency::set_origin`]'s own doc comment names) or
+/// if paging the touched tile in fails.
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 // x/y/r/g/b/a are the clearest names for "one pixel coordinate, one
@@ -4873,16 +4878,28 @@ const ERASER_RADIUS: f32 = 24.0;
 // `redraw` passes `canvas_view.zoom()` into `TileResidency::set_origin`,
 // which now scales the atlas's own sampled `uv_scale` by it (shader-side
 // magnification -- no bigger upload, no mip selection), and
-// `tile_origin_for_view` picks the right tile via `CanvasView::to_document`
-// instead of assuming 100% zoom.
+// `canvas_local_origin` picks the right document position via
+// `CanvasView::to_document` instead of assuming 100% zoom.
 //
-// Scope, stated honestly: the atlas's own uv offset is still only
-// tile-granular (no sub-tile fractional scroll); and rendering a lower
-// mip while zoomed out or panning (the progressive-rendering finding
-// `spike/FINDINGS.md` names), rotation, rulers, guides, grid, and snap
-// are all still separately open, exactly as the bullet's own name says.
-// Window resize is handled (`apply_resize` calls `TileResidency::resize`)
-// -- no longer part of this remainder.
+// **Sub-tile fractional scroll, fixed 2026-08-13**: `canvas_local_origin`
+// used to floor its own result to a whole `TileId` before `set_origin`
+// ever saw it, discarding any fractional remainder within that tile --
+// invisible at the default view (zoom 100%, no pan) since document (0,0)
+// happens to be tile-aligned, but real and visible on any actual zoom or
+// pan: painted content landed offset from the cursor, and panning by less
+// than one tile didn't visibly move anything. `TileResidency::set_origin`
+// now takes the continuous `(f32, f32)` position directly, floors it
+// itself for the whole-tile `TileId` its own slot addressing needs, and
+// separately stores the fractional remainder (`sub_tile`), which
+// `write_uniform` folds into the atlas's own sampled UV offset. See
+// `aurora_gpu::residency`'s own doc comment for the mechanism.
+//
+// Scope, stated honestly: rendering a lower mip while zoomed out or
+// panning (the progressive-rendering finding `spike/FINDINGS.md` names),
+// rotation, rulers, guides, grid, snap, and true infinite zoom are all
+// still separately open, exactly as the bullet's own name says. Window
+// resize is handled (`apply_resize` calls `TileResidency::resize`) -- no
+// longer part of this remainder.
 
 /// The canvas dock area's own on-screen rectangle, in physical pixels
 /// (`bounds`'s logical units scaled by `scale_factor`) — `(x, y, width,
@@ -4974,12 +4991,13 @@ fn effective_residency_zoom(canvas_zoom: f32, scale_factor: f64) -> f32 {
     canvas_zoom * scale_factor as f32
 }
 
-/// The active pixel layer's own *surface-local* tile currently at the
-/// canvas area's own top-left corner, given `view`'s own pan *and
-/// zoom*, and `layer_origin` ([`active_layer_origin`] — the active
-/// layer's own document-space `(bounds.x, bounds.y)`, `(0.0, 0.0)` if
-/// there isn't one) — the [`aurora_tile::TileId`] this maps to is where
-/// [`aurora_gpu::TileResidency::set_origin`] should point the atlas.
+/// The active pixel layer's own *surface-local, continuous* document
+/// position currently at the canvas area's own top-left corner, given
+/// `view`'s own pan *and* zoom, and `layer_origin` ([`active_layer_origin`]
+/// — the active layer's own document-space `(bounds.x, bounds.y)`,
+/// `(0.0, 0.0)` if there isn't one) — what
+/// [`aurora_gpu::TileResidency::set_origin`] now takes directly (its own
+/// second parameter, since the sub-tile fractional-scroll fix below).
 ///
 /// Goes through [`aurora_ui::CanvasView::to_document`] rather than
 /// dividing `view.pan()` by [`aurora_tile::TILE`] directly, so a
@@ -4987,44 +5005,30 @@ fn effective_residency_zoom(canvas_zoom: f32, scale_factor: f64) -> f32 {
 /// `view.zoom()`) — real zoom-aware panning, not the "assumes
 /// `view.zoom() == 1.0`" approximation this function used before
 /// [`aurora_gpu::TileResidency::set_origin`] gained real scale support.
-/// Subtracting `layer_origin` from that document-space point before
-/// dividing into tiles is what makes a *moved* layer
-/// (`aurora_doc::LayerTree::set_bounds`) actually render in its new
-/// place, not just update the document model: `aurora_tile::TileStore`
-/// addresses a surface from its own local `(0, 0)`, not the document's
-/// (the same conversion `layer_local_point` already does for
-/// painting), and every layer built before the Move tool existed
-/// happened to sit at document `(0, 0)`, so this function never needed
-/// to make the distinction until now.
+/// Subtracting `layer_origin` from that document-space point is what
+/// makes a *moved* layer (`aurora_doc::LayerTree::set_bounds`) actually
+/// render in its new place, not just update the document model:
+/// `aurora_tile::TileStore` addresses a surface from its own local
+/// `(0, 0)`, not the document's (the same conversion `layer_local_point`
+/// already does for painting), and every layer built before the Move
+/// tool existed happened to sit at document `(0, 0)`, so this function
+/// never needed to make the distinction until now.
 ///
-/// Still only tile-*granular*, though: the atlas's own uv offset always
-/// starts at a whole tile's own top-left corner, so any sub-tile
-/// fractional scroll within that tile isn't reflected — a real fix
-/// needs a fractional uv offset alongside `TileResidency`'s existing
-/// zoom-scaled `uv_scale`, separate follow-on work this bullet's own
-/// "infinite zoom" remainder still names. Negative surface-local
-/// coordinates (panning above/left of the layer's own origin, or a
-/// layer moved so its origin is right of/below the canvas area's own
-/// top-left corner) clamp to `0` — `TileId`'s own fields are unsigned,
-/// so there is no tile to point to there; a real fix needs either
-/// signed tile coordinates or a document-relative origin convention,
-/// not invented here.
+/// Deliberately returns the **unfloored, possibly-negative** local
+/// point, not a [`aurora_tile::TileId`] — flooring to a whole tile and
+/// clamping negative coordinates to `0` are now
+/// [`aurora_gpu::TileResidency::set_origin`]'s own job (it needs the
+/// whole-tile value for its own slot-addressing bookkeeping and the
+/// fractional remainder within that tile for sub-tile-accurate
+/// rendering; a caller pre-flooring here would throw the remainder away
+/// before `set_origin` ever saw it — exactly the bug this function used
+/// to have). Named `canvas_local_origin` rather than the old
+/// `tile_origin_for_view`, since "tile origin" no longer describes what
+/// this returns.
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn tile_origin_for_view(
-    view: &aurora_ui::CanvasView,
-    layer_origin: (f32, f32),
-) -> aurora_tile::TileId {
+fn canvas_local_origin(view: &aurora_ui::CanvasView, layer_origin: (f32, f32)) -> (f32, f32) {
     let (doc_x, doc_y) = view.to_document((0.0, 0.0));
-    let (local_x, local_y) = (doc_x - layer_origin.0, doc_y - layer_origin.1);
-    #[allow(clippy::cast_precision_loss)]
-    let tile_size = aurora_tile::TILE as f32;
-    let x = (local_x / tile_size).floor().max(0.0);
-    let y = (local_y / tile_size).floor().max(0.0);
-    aurora_tile::TileId {
-        x: x as u32,
-        y: y as u32,
-    }
+    (doc_x - layer_origin.0, doc_y - layer_origin.1)
 }
 
 /// Owns the window, GPU device/surface, and accessibility adapter for
@@ -6468,7 +6472,7 @@ impl App {
                     {
                         residency.set_origin(
                             gpu.queue(),
-                            tile_origin_for_view(
+                            canvas_local_origin(
                                 &self.canvas_view,
                                 active_layer_origin(&self.layers, self.active_layer),
                             ),
@@ -7000,21 +7004,21 @@ mod tests {
         FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PointerButton,
         RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind, UndoOrder, activate_command,
         apply_mask_clip, apply_scroll_zoom, autosave_path, background_color_from_theme, begin_drag,
-        canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
-        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
-        composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
-        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, is_aur_path, layer_local_point, load_scales, load_theme,
-        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
-        open_tile_store, palette_commands, pointer_in_canvas, pointer_on_rail_divider,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin,
+        clear_session_marker, close_command_palette, close_crash_recovery_dialog,
+        collect_widget_paints, composite_document, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, handle_dialog_key, handle_dialog_pointer, handle_key,
+        handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path,
+        layer_local_point, load_scales, load_theme, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
         previous_session_left_a_marker, queue_autosave, recomposite_visible_tiles,
         recover_document, replace_document, resized_rail_width, run_command, sample_pixel,
-        select_layer, splitmix64, tile_origin_for_view, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -9556,12 +9560,7 @@ mod tests {
 
         // The bug: the raw, unscaled zoom fed directly into
         // `set_origin` alongside a physical-pixel viewport.
-        residency.set_origin(
-            queue,
-            aurora_tile::TileId { x: 0, y: 0 },
-            physical_viewport,
-            canvas_view.zoom(),
-        );
+        residency.set_origin(queue, (0.0, 0.0), physical_viewport, canvas_view.zoom());
         let with_raw_zoom = render_and_sample_pixel(
             device,
             queue,
@@ -9581,7 +9580,7 @@ mod tests {
         // The fix: `effective_residency_zoom` folds `scale_factor` in.
         residency.set_origin(
             queue,
-            aurora_tile::TileId { x: 0, y: 0 },
+            (0.0, 0.0),
             physical_viewport,
             effective_residency_zoom(canvas_view.zoom(), scale_factor),
         );
@@ -13037,15 +13036,8 @@ mod tests {
             let y = start.1 + step * pan_step_px.1;
             let t0 = std::time::Instant::now();
 
-            residency.set_origin(
-                queue,
-                aurora_tile::TileId {
-                    x: x / aurora_tile::TILE,
-                    y: y / aurora_tile::TILE,
-                },
-                viewport,
-                1.0,
-            );
+            #[allow(clippy::cast_precision_loss)]
+            residency.set_origin(queue, (x as f32, y as f32), viewport, 1.0);
 
             // A `TileError` here (observed in practice under this
             // helper's own tight `real_tile_store()` budget: a page-in
@@ -13170,10 +13162,13 @@ mod tests {
     /// `spike/FINDINGS.md`'s "Third run" section found normal-drag panning
     /// (16.83 ms p99 at both 100,000px and 300,000px) already marginal
     /// against the 16.7 ms budget even before painting is added on top.
-    /// Panning here is tile-granular (whole `aurora_tile::TILE` steps),
-    /// matching `tile_origin_for_view`'s own real, current limitation (see
-    /// its own doc comment) rather than inventing sub-tile scroll for this
-    /// test alone.
+    /// Panning here steps by raw pixels (200, 120 px/frame, not rounded
+    /// to whole `aurora_tile::TILE` boundaries) and lands sub-tile-accurate
+    /// now that `TileResidency::set_origin` carries the fractional
+    /// remainder through to the sampled UV offset — this benchmark's own
+    /// timing isn't sensitive to that (it measures frame cost, not visual
+    /// correctness), but it exercises the real, now-fixed path rather
+    /// than the old floored one.
     ///
     /// **Real path exercised, per frame, end to end**: see
     /// [`measure_pan_and_paint_frames`]'s own doc comment.
@@ -14352,82 +14347,77 @@ mod tests {
     }
 
     #[test]
-    fn tile_origin_for_view_is_zero_zero_with_no_pan() {
+    fn canvas_local_origin_is_zero_zero_with_no_pan() {
         let view = CanvasView::new();
-        assert_eq!(
-            tile_origin_for_view(&view, (0.0, 0.0)),
-            aurora_tile::TileId { x: 0, y: 0 }
-        );
+        assert_eq!(canvas_local_origin(&view, (0.0, 0.0)), (0.0, 0.0));
     }
 
     #[test]
-    fn tile_origin_for_view_follows_a_positive_pan() {
+    fn canvas_local_origin_follows_a_positive_pan() {
         // Panning the view so document (0, 0) renders 300 logical px to
         // the right/down of the canvas area's own top-left corner means
-        // the tile now at that corner is one tile up and to the left of
-        // the document's own origin tile... but since tile coordinates
-        // are unsigned, this must clamp to (0, 0), not go negative.
+        // the point now at that corner is document (-300, -300) -- a
+        // real, negative surface-local position. Previously this
+        // function floored *and* clamped its own result to `TileId {0,
+        // 0}` before returning, silently discarding that this position
+        // is actually off the top-left of the document by a full 300px;
+        // clamping is now `TileResidency::set_origin`'s own job, so this
+        // continuous function returns the true (negative) value.
         let mut view = CanvasView::new();
         view.pan_by((300.0, 300.0));
-        assert_eq!(
-            tile_origin_for_view(&view, (0.0, 0.0)),
-            aurora_tile::TileId { x: 0, y: 0 }
-        );
+        assert_eq!(canvas_local_origin(&view, (0.0, 0.0)), (-300.0, -300.0));
     }
 
     #[test]
-    fn tile_origin_for_view_follows_a_negative_pan() {
-        // Panning left/up by more than one tile's worth (256px) means
-        // the canvas area's own top-left corner now shows document
-        // pixels *past* one whole tile -- origin must advance to (1, 1).
+    fn canvas_local_origin_follows_a_negative_pan() {
+        // Panning left/up by 300px (more than one tile's worth, 256px)
+        // means the canvas area's own top-left corner now shows document
+        // (300, 300) -- a genuinely sub-tile-fractional position (300 is
+        // not a multiple of 256). The old, floored version of this
+        // function returned `TileId { x: 1, y: 1 }` here, which was only
+        // the *whole-tile* part of the true answer -- the 44px
+        // remainder within that tile was silently discarded, exactly the
+        // bug this round fixes. The continuous function returns the true
+        // (300.0, 300.0); `TileResidency::set_origin` is now the one that
+        // splits this into `TileId { 1, 1 }` plus `sub_tile (44.0, 44.0)`.
         let mut view = CanvasView::new();
         view.pan_by((-300.0, -300.0));
-        assert_eq!(
-            tile_origin_for_view(&view, (0.0, 0.0)),
-            aurora_tile::TileId { x: 1, y: 1 }
-        );
+        assert_eq!(canvas_local_origin(&view, (0.0, 0.0)), (300.0, 300.0));
     }
 
     #[test]
-    fn tile_origin_for_view_accounts_for_zoom_not_just_pan() {
+    fn canvas_local_origin_accounts_for_zoom_not_just_pan() {
         // The same 600px pan means a different document-space top-left
         // depending on zoom (`to_document` divides by `zoom`) -- at 2x
-        // zoom, 600 screen px is only 300 document px, landing in tile
-        // (1, 1), not the (2, 2) a zoom-blind computation (dividing pan
-        // by `TILE` directly, as this function used to) would give.
+        // zoom, 600 screen px is only 300 document px. Same fractional
+        // point as `canvas_local_origin_follows_a_negative_pan` above
+        // (300.0, 300.0), not the whole-tile-only (1, 1) the old floored
+        // version returned -- another real fractional case this fix
+        // corrects, not just a coincidentally-exact one.
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 2.0);
         view.pan_by((-600.0, -600.0));
-        assert_eq!(
-            tile_origin_for_view(&view, (0.0, 0.0)),
-            aurora_tile::TileId { x: 1, y: 1 }
-        );
+        assert_eq!(canvas_local_origin(&view, (0.0, 0.0)), (300.0, 300.0));
     }
 
     #[test]
-    fn tile_origin_for_view_accounts_for_a_moved_layers_own_origin() {
+    fn canvas_local_origin_accounts_for_a_moved_layers_own_origin() {
         // No pan/zoom at all, but the active layer itself sits at
         // document (300, 300) -- the canvas area's own top-left corner
         // (document (0, 0)) is now *before* the layer even starts, in
-        // surface-local space (-300, -300), which clamps to tile (0, 0)
-        // the same way a pan past the document's own edge already does.
+        // surface-local space (-300, -300) -- the true negative value,
+        // not the old version's clamped-to-`TileId{0,0}` result.
         let view = CanvasView::new();
-        assert_eq!(
-            tile_origin_for_view(&view, (300.0, 300.0)),
-            aurora_tile::TileId { x: 0, y: 0 }
-        );
+        assert_eq!(canvas_local_origin(&view, (300.0, 300.0)), (-300.0, -300.0));
 
         // A layer at (300, 300), *plus* enough pan to put document
-        // (600, 600) at the canvas area's own top-left corner: surface-
-        // local (600 - 300, 600 - 300) = (300, 300), landing in tile
-        // (1, 1) -- proving the layer's own origin and the view's own
-        // pan combine, neither alone.
+        // (600, 600) at the canvas area's own top-left corner:
+        // surface-local (600 - 300, 600 - 300) = (300, 300) -- proving
+        // the layer's own origin and the view's own pan combine, neither
+        // alone.
         let mut panned = CanvasView::new();
         panned.pan_by((-600.0, -600.0));
-        assert_eq!(
-            tile_origin_for_view(&panned, (300.0, 300.0)),
-            aurora_tile::TileId { x: 1, y: 1 }
-        );
+        assert_eq!(canvas_local_origin(&panned, (300.0, 300.0)), (300.0, 300.0));
     }
 
     #[test]

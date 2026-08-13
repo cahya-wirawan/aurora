@@ -61,8 +61,20 @@ pub struct TileResidency {
     grid: (u32, u32),
     /// Which tile currently occupies each modulo-addressed slot.
     slots: HashMap<(u32, u32), TileId>,
-    /// Top-left visible tile.
+    /// Top-left visible tile — the whole-tile part of the last
+    /// [`Self::set_origin`] call's `doc_origin`, still exactly what
+    /// [`Self::sync`]/[`Self::visible_tiles`]/slot addressing need for
+    /// atlas upload bookkeeping.
     origin: TileId,
+    /// The fractional remainder of the last [`Self::set_origin`] call's
+    /// `doc_origin` within `origin`'s own tile, `[0, TILE)` on each axis
+    /// (`doc_origin - origin * TILE`) — what makes the atlas's own
+    /// sampled UV offset sub-tile-accurate instead of snapping to the
+    /// nearest tile boundary (the bug this field exists to fix: painted
+    /// content landing offset from the cursor after any zoom/pan, and
+    /// panning under one tile not visibly moving anything). Folded into
+    /// [`Self::write_uniform`]'s `scroll` alongside `origin * TILE`.
+    sub_tile: (f32, f32),
 }
 
 impl TileResidency {
@@ -121,6 +133,7 @@ impl TileResidency {
             grid,
             slots: HashMap::new(),
             origin: TileId { x: 0, y: 0 },
+            sub_tile: (0.0, 0.0),
         };
         residency.write_uniform(queue, viewport_px, 1.0);
         residency
@@ -171,9 +184,27 @@ impl TileResidency {
         })
     }
 
-    /// Call when the visible top-left tile changes (panning) or `zoom`
-    /// itself changes. Updates the UV uniform immediately; the texture
-    /// itself is only touched by the next [`Self::sync`].
+    /// Call when the visible top-left document position changes (panning
+    /// or zooming) or `zoom` itself changes. Updates the UV uniform
+    /// immediately; the texture itself is only touched by the next
+    /// [`Self::sync`].
+    ///
+    /// `doc_origin`: the exact, continuous document-local position (e.g.
+    /// `aurora_app`'s own `canvas_local_origin`) that should render at
+    /// the canvas's own top-left corner — **not** pre-floored to a whole
+    /// tile by the caller. Clamped to non-negative here (`TileId`'s own
+    /// fields are unsigned, so a negative document position has no tile
+    /// to point to — the same "outside the surface" case this atlas has
+    /// always clamped, now made explicit at this one boundary instead of
+    /// happening inside every caller). Split into `origin` (the
+    /// whole-tile part, via floor-division by [`TILE`] — still exactly
+    /// what [`Self::sync`]/[`Self::visible_tiles`]/slot addressing need)
+    /// and `sub_tile` (the fractional remainder within that tile,
+    /// `[0, TILE)` on each axis) — both private fields, folded into the
+    /// atlas's own sampled UV offset by this type's own internal
+    /// uniform-buffer write, so the rendered content lands at the true
+    /// fractional position instead of snapping to the nearest tile
+    /// boundary.
     ///
     /// `zoom`: document pixels per logical screen pixel, matching
     /// `aurora_ui::CanvasView::zoom`'s own convention (`1.0` = 100%,
@@ -189,10 +220,21 @@ impl TileResidency {
     pub fn set_origin(
         &mut self,
         queue: &wgpu::Queue,
-        origin: TileId,
+        doc_origin: (f32, f32),
         viewport_px: (u32, u32),
         zoom: f32,
     ) {
+        let (x, y) = (doc_origin.0.max(0.0), doc_origin.1.max(0.0));
+        let tile_size = TILE as f32;
+        #[allow(clippy::cast_sign_loss)]
+        let origin = TileId {
+            x: (x / tile_size).floor() as u32,
+            y: (y / tile_size).floor() as u32,
+        };
+        self.sub_tile = (
+            x - (origin.x as f32) * tile_size,
+            y - (origin.y as f32) * tile_size,
+        );
         self.origin = origin;
         self.write_uniform(queue, viewport_px, zoom);
     }
@@ -238,12 +280,29 @@ impl TileResidency {
     fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32), zoom: f32) {
         let tex_w = (self.grid.0 * TILE) as f32;
         let tex_h = (self.grid.1 * TILE) as f32;
-        // Absolute scroll (origin in pixels), wrapped by the repeat
-        // sampler -- slot addressing is toroidal, so the texture is a
-        // sliding window over the document, exactly as in the spike.
-        let scroll = (self.origin.x * TILE, self.origin.y * TILE);
-        let u = (scroll.0 % (self.grid.0 * TILE)) as f32 / tex_w;
-        let v = (scroll.1 % (self.grid.1 * TILE)) as f32 / tex_h;
+        // Absolute scroll (origin in texels, now a genuinely fractional
+        // position -- `origin * TILE` plus the sub-tile remainder), then
+        // wrapped into [0, tex_w)/[0, tex_h) for the repeat sampler --
+        // slot addressing is toroidal, so the texture is a sliding
+        // window over the document, exactly as in the spike, just with
+        // sub-tile precision now instead of snapping to a tile boundary.
+        //
+        // `rem_euclid` rather than a plain `%`: `set_origin` clamps its
+        // input to non-negative before computing `origin`/`sub_tile`, so
+        // `scroll` itself can never be negative here in practice -- but
+        // `rem_euclid` costs nothing extra for an already-non-negative
+        // input and stays correct if that upstream invariant ever
+        // changes, rather than silently reintroducing a negative-modulo
+        // bug (`%`'s sign follows the dividend in Rust, so a plain `%` on
+        // a hypothetical future negative `scroll` would return a
+        // negative remainder, wrapping the sample into the wrong texel
+        // entirely) -- the safer default this comment says explicitly.
+        let scroll = (
+            (self.origin.x * TILE) as f32 + self.sub_tile.0,
+            (self.origin.y * TILE) as f32 + self.sub_tile.1,
+        );
+        let u = scroll.0.rem_euclid(tex_w) / tex_w;
+        let v = scroll.1.rem_euclid(tex_h) / tex_h;
         let uv_scale = [
             viewport_px.0 as f32 / zoom / tex_w,
             viewport_px.1 as f32 / zoom / tex_h,
@@ -461,7 +520,7 @@ impl std::fmt::Debug for TileResidency {
 mod tests {
     use super::{TILE_BYTES, TileResidency};
     use crate::test_support::{real_context, real_tile_store};
-    use aurora_tile::{SurfaceId, TileId};
+    use aurora_tile::{SurfaceId, TILE, TileId};
     use half::f16;
 
     /// The one surface every test in this module addresses — nothing
@@ -522,7 +581,16 @@ mod tests {
             return;
         };
         let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
-        residency.set_origin(context.queue(), TileId { x: 5, y: 3 }, (256, 256), 1.0);
+        // A whole-tile-multiple `doc_origin` (5 * TILE, 3 * TILE) --
+        // zero sub-tile remainder, so this must behave identically to the
+        // old `TileId`-typed `set_origin` (this test's own regression
+        // backstop that the refactor didn't change whole-tile behaviour).
+        residency.set_origin(
+            context.queue(),
+            (5.0 * TILE as f32, 3.0 * TILE as f32),
+            (256, 256),
+            1.0,
+        );
         let tiles: Vec<TileId> = residency.visible_tiles().collect();
         assert_eq!(
             tiles,
@@ -575,7 +643,7 @@ mod tests {
         // column so it has real content to upload.
         paint(&mut store, TileId { x: 2, y: 0 }, [0.0, 1.0, 0.0, 1.0]);
         paint(&mut store, TileId { x: 2, y: 1 }, [0.0, 1.0, 0.0, 1.0]);
-        residency.set_origin(context.queue(), TileId { x: 1, y: 0 }, viewport, 1.0);
+        residency.set_origin(context.queue(), (TILE as f32, 0.0), viewport, 1.0);
         let third = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
         assert_eq!(
             third.uploaded, 2,
@@ -736,7 +804,12 @@ mod tests {
             return;
         };
         let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
-        residency.set_origin(context.queue(), TileId { x: 3, y: 7 }, (256, 256), 1.0);
+        residency.set_origin(
+            context.queue(),
+            (3.0 * TILE as f32, 7.0 * TILE as f32),
+            (256, 256),
+            1.0,
+        );
         let before_size = residency.texture().size();
         let before_grid = residency.grid;
         let before_origin = residency.origin;
@@ -763,7 +836,12 @@ mod tests {
             return;
         };
         let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
-        residency.set_origin(context.queue(), TileId { x: 5, y: 9 }, (256, 256), 1.0);
+        residency.set_origin(
+            context.queue(),
+            (5.0 * TILE as f32, 9.0 * TILE as f32),
+            (256, 256),
+            1.0,
+        );
         assert_eq!(residency.origin(), TileId { x: 5, y: 9 });
 
         residency.resize(context.device(), context.queue(), (512, 512));
