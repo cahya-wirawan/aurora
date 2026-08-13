@@ -210,6 +210,25 @@
 //! module's "brush painting"/"layer selection" sections for the full
 //! reasoning.
 //!
+//! **Eyedropper corrected to sample the composite, 2026-08-13**: the
+//! paragraph above described the eyedropper's *original* behaviour, and
+//! it was wrong — it read one texel straight out of the *active layer's
+//! own* tile store surface, so a different, non-active visible layer
+//! sitting above it (any opacity/blend mode), or an active layer that
+//! was simply transparent at the clicked point, made it pick up the
+//! wrong colour: not what the user was actually looking at and clicking
+//! on. `App::sample_eyedropper` now reads `composite_surface_id()`
+//! instead — the same reserved surface `App::redraw`'s own
+//! `recomposite_visible_tiles` keeps current with the real, merged,
+//! bottom-to-top blended document every frame — via the same
+//! document-space -> surface-local conversion, since
+//! `recomposite_visible_tiles`'s own `reference_origin` and
+//! `active_layer_origin` share the identical active-layer-bounds-or-
+//! `(0, 0)` fallback. That shared fallback also means the eyedropper no
+//! longer requires an active layer at all: with none selected, it now
+//! samples the merged document directly at `doc_point`, matching
+//! `Drag::Eyedropper` itself, which never had that precondition.
+//!
 //! **Undo/Redo** (PLAN.md's Undo/Redo bullet): `App` now keeps a live
 //! `history: aurora_doc::History` alongside `layers` (previously built
 //! once in `App::new`, used only to populate the History panel and
@@ -2790,8 +2809,10 @@ enum Drag {
 ///
 /// `Brush`/`Eraser`/`Eyedropper` start unconditionally on a primary
 /// click, regardless of whether there's actually anywhere to
-/// paint/erase/sample (a live store, an active layer) — that check
-/// happens where the real pixel work does
+/// paint/erase/sample (a live store, and — for `Brush`/`Eraser` only —
+/// an active pixel layer; `Eyedropper` samples the composited document
+/// and needs no active layer at all) — that check happens where the
+/// real pixel work does
 /// (`App::paint_dab`/`App::erase_dab`/`App::sample_eyedropper`),
 /// keeping this function pure and not needing to know about either.
 /// `Move` is the one drag that *does* need to know up front —
@@ -4875,6 +4896,30 @@ fn sample_pixel(
     Some([r, g, b, a])
 }
 
+/// The pure core of [`App::sample_eyedropper`], factored out so it's
+/// testable without a real `App` (which needs a live window/GPU surface
+/// to construct at all): converts `doc_point` (document space) into
+/// [`composite_surface_id`]'s own local space using `origin`
+/// (`doc_point` minus `origin`, the same subtraction
+/// [`layer_local_point`] does against a layer's own `bounds` — here
+/// against [`active_layer_origin`]'s return instead, since the composite
+/// surface is anchored to that same reference point, not any one
+/// layer's own surface), then reads the already-composited RGB back via
+/// [`sample_pixel`]. `None` — "nothing to pick" — for a fully
+/// transparent texel (no visible layer painted there) exactly as before,
+/// and for the same out-of-bounds/paging-failure cases [`sample_pixel`]
+/// itself already returns `None` for.
+#[must_use]
+fn eyedropper_sample(
+    store: &mut aurora_tile::TileStore,
+    origin: (f32, f32),
+    doc_point: (f32, f32),
+) -> Option<[f32; 3]> {
+    let local = (doc_point.0 - origin.0, doc_point.1 - origin.1);
+    let [r, g, b, a] = sample_pixel(store, composite_surface_id(), local)?;
+    (a > 0.0).then_some([r, g, b])
+}
+
 /// The Brush tool's fixed radius — a real default, not a placeholder,
 /// but not a considered one either: there is no brush options UI yet
 /// (size picker, real engine, Phase 2 per PLAN.md's own "(real engine
@@ -6282,38 +6327,59 @@ impl App {
         }
     }
 
-    /// Samples the active layer's own pixel at `doc_point` (document
-    /// space) and, if it's actually painted (alpha `> 0.0`), sets it as
-    /// the new [`Self::current_colour`] — what the Eyedropper tool does
-    /// on a click or while dragging. A fully transparent texel (never
-    /// painted, or painted then erased down to nothing — `Self::erase_dab`
-    /// leaves RGB untouched even at zero alpha) is treated as "nothing
-    /// to pick," not a valid sample, the same way a real image editor's
-    /// eyedropper has nothing meaningful to pick from empty canvas. A
-    /// silent no-op if there's no live store, no active layer, that
-    /// layer isn't a pixel layer, or `doc_point` falls outside the
-    /// surface entirely — the same absent-precondition honesty
-    /// [`Self::paint_dab`] already uses.
+    /// Samples the live, **composited** document at `doc_point` (document
+    /// space) — every visible layer, in its own real blend order and
+    /// opacity, exactly what's on screen — and, if the sampled texel is
+    /// actually painted (alpha `> 0.0`), sets it as the new
+    /// [`Self::current_colour`] — what the Eyedropper tool does on a
+    /// click or while dragging. Reads [`composite_surface_id`] rather
+    /// than the active layer's own surface: `App::redraw`'s own
+    /// [`recomposite_visible_tiles`] call keeps that reserved surface's
+    /// tiles current with the merged document every frame (both its GPU
+    /// and CPU paths write there via `write_composited`), so this is the
+    /// same content the user is actually looking at — a different,
+    /// non-active visible layer sitting above the active one (any
+    /// opacity/blend mode), or an active layer that's simply transparent
+    /// at that point, used to make the old active-layer-only sample
+    /// wrong. A fully transparent texel (no visible layer painted there)
+    /// is treated as "nothing to pick," not a valid sample, the same way
+    /// a real image editor's eyedropper has nothing meaningful to pick
+    /// from empty canvas.
+    ///
+    /// The document-space -> composite-surface-local conversion uses
+    /// [`active_layer_origin`], **not** a `None`-returns-early guard on
+    /// [`Self::active_layer`]: [`recomposite_visible_tiles`]'s own
+    /// `reference_origin` (the document-space point composite `TileId
+    /// (0, 0)` corresponds to) is exactly the active layer's own
+    /// `bounds.(x, y)`, falling back to `(0, 0)` — the document's own
+    /// origin — with no active layer selected or a group active
+    /// ([`active_pixel_layer`]'s own contract, which both functions
+    /// share); `active_layer_origin` already implements that identical
+    /// fallback. So with no active layer, `doc_point` needs no
+    /// subtraction at all and this still samples the merged document
+    /// correctly at its own coordinates — the more honest reading of
+    /// "sample what's on screen," which doesn't stop being true just
+    /// because nothing happens to be selected in the Layers panel (and
+    /// matches `Drag::Eyedropper` itself, which `begin_drag` already
+    /// starts unconditionally with no active-pixel-layer precondition —
+    /// see that function's own doc comment). A silent no-op only if
+    /// there's no live store, or `doc_point` falls outside the
+    /// composited surface entirely — the same absent-precondition
+    /// honesty [`Self::paint_dab`] already uses.
+    ///
+    /// The actual sampling is [`eyedropper_sample`], a free function
+    /// taking the store, origin, and point directly rather than `&mut
+    /// self` — this method only supplies those three from live `App`
+    /// state, which needs a real window/GPU surface to construct at all
+    /// and so can't be built directly in a unit test; `eyedropper_sample`
+    /// can, and that's what this crate's own tests exercise.
     fn sample_eyedropper(&mut self, doc_point: (f32, f32)) {
-        let Some(layer_id) = self.active_layer else {
-            return;
-        };
-        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
-        else {
-            return;
-        };
-        let Some(surface) = self.layers.surface_id(layer_id) else {
-            return;
-        };
         let Some(store) = self.tile_store.as_mut() else {
             return;
         };
-        let local = layer_local_point(bounds, doc_point);
-        let Some([r, g, b, a]) = sample_pixel(store, surface, local) else {
-            return;
-        };
-        if a > 0.0 {
-            self.current_colour = [r, g, b];
+        let origin = active_layer_origin(&self.layers, self.active_layer);
+        if let Some(colour) = eyedropper_sample(store, origin, doc_point) {
+            self.current_colour = colour;
         }
     }
 
@@ -7047,22 +7113,23 @@ mod tests {
         CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, ERASER_RADIUS,
         FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PointerButton,
         RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind, UndoOrder, activate_command,
-        apply_mask_clip, apply_scroll_zoom, autosave_path, background_color_from_theme, begin_drag,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin,
-        clear_session_marker, close_command_palette, close_crash_recovery_dialog,
-        collect_widget_paints, composite_document, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, handle_dialog_key, handle_dialog_pointer, handle_key,
-        handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path,
-        layer_local_point, load_scales, load_theme, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
-        previous_session_left_a_marker, queue_autosave, recomposite_visible_tiles,
-        recover_document, replace_document, resized_rail_width, run_command, sample_pixel,
-        select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        active_layer_origin, apply_mask_clip, apply_scroll_zoom, autosave_path,
+        background_color_from_theme, begin_drag, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, clear_session_marker,
+        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
+        composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
+        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eyedropper_sample,
+        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
+        handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path, layer_local_point,
+        load_scales, load_theme, logical_point, logical_size, open_command_palette,
+        open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
+        pointer_in_canvas, pointer_on_rail_divider, previous_session_left_a_marker, queue_autosave,
+        recomposite_visible_tiles, recover_document, replace_document, resized_rail_width,
+        run_command, sample_pixel, select_layer, splitmix64, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -9845,6 +9912,226 @@ mod tests {
                 [1.0, 0.0, 0.0, 1.0],
                 "outside shifted's own bounds, only bottom's opaque red should show"
             );
+        }
+    }
+
+    /// The actual regression proof for "Eyedropper only samples the
+    /// active layer, not the merged document" (PLAN.md's Basic-tools
+    /// bullet): a non-active, visible `top` layer sits above the active
+    /// `bottom` layer with its own real 50% opacity, so the two real,
+    /// different colours blend to a third, distinct one
+    /// (`recomposite_visible_tiles_blends_visible_layers_bottom_to_top_and_skips_hidden_ones`'s
+    /// own exact combo: opaque red under 50%-opacity opaque blue ->
+    /// `(0.5, 0.0, 0.5, 1.0)`). The old, pre-fix implementation read
+    /// `bottom`'s own surface directly and would have returned its plain
+    /// opaque red -- this asserts [`eyedropper_sample`] returns the real
+    /// composited purple instead, proven against `bottom`'s own surface
+    /// sampled directly as the sanity check for what the bug used to
+    /// return.
+    #[test]
+    fn eyedropper_sample_reads_the_composited_colour_not_the_active_layers_own() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let Some(bottom_surface) = layers.surface_id(bottom) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(&mut store, bottom_surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+        let Some(top_surface) = layers.surface_id(top) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(&mut store, top_surface, tile_id, [0.0, 0.0, 1.0, 1.0]);
+
+        // Sanity check: `bottom`'s own surface, sampled directly, really
+        // is plain opaque red -- exactly what the old, pre-fix
+        // `sample_eyedropper` would have picked, and the wrong answer.
+        let bottoms_own = sample_pixel(&mut store, bottom_surface, (5.0, 5.0)).unwrap_or([-1.0; 4]);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(bottoms_own, [1.0, 0.0, 0.0, 1.0]);
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        // `bottom` is the active layer; `top`, non-active but visible,
+        // sits above it in real stacking order with its own real 50%
+        // opacity -- the exact scenario the old code got wrong.
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(bottom),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        let origin = active_layer_origin(&layers, Some(bottom));
+        let sampled = eyedropper_sample(&mut store, origin, (5.0, 5.0));
+        assert_eq!(
+            sampled,
+            Some([0.5, 0.0, 0.5]),
+            "must pick up the real composited blend (opaque red bottom under 50%-opacity \
+             opaque blue top), not bottom's own opaque red"
+        );
+    }
+
+    /// The other half of "the active layer, not the merged document":
+    /// here `active` (the active layer) is never painted at all --
+    /// fully transparent everywhere -- while a non-active, visible layer
+    /// above it has real opaque content at the same point. The old
+    /// code's `alpha > 0.0` guard, checked against `active`'s own
+    /// surface, would have found nothing to pick at all; the composited
+    /// surface has the real visible colour.
+    #[test]
+    fn eyedropper_sample_reads_the_composited_colour_when_the_active_layer_itself_is_transparent_there()
+     {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let active = match layers.add_pixel_layer("active", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let visible_above = match layers.add_pixel_layer("visible-above", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(above_surface) = layers.surface_id(visible_above) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        fill_solid(&mut store, above_surface, tile_id, [0.0, 1.0, 0.0, 1.0]);
+
+        // Sanity check: `active`'s own surface really is transparent at
+        // this point -- never painted at all.
+        let Some(active_surface) = layers.surface_id(active) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let actives_own = sample_pixel(&mut store, active_surface, (5.0, 5.0)).unwrap_or([-1.0; 4]);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(actives_own, [0.0, 0.0, 0.0, 0.0]);
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(active),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        let origin = active_layer_origin(&layers, Some(active));
+        let sampled = eyedropper_sample(&mut store, origin, (5.0, 5.0));
+        assert_eq!(
+            sampled,
+            Some([0.0, 1.0, 0.0]),
+            "must pick up the visible layer above, not report nothing just because the \
+             active layer itself is transparent here"
+        );
+    }
+
+    /// The no-active-layer design decision this fix made: with no
+    /// active layer selected at all, [`active_layer_origin`]'s own
+    /// fallback is `(0.0, 0.0)` -- the document's own origin, not any
+    /// layer's -- so [`eyedropper_sample`] must sample the merged
+    /// document directly at `doc_point`, with no subtraction. `only`'s
+    /// own bounds are deliberately *not* at the document origin (`(40,
+    /// 40)`, mirroring
+    /// `recomposite_visible_tiles_blends_a_layer_at_a_different_origin_than_the_active_layer`'s
+    /// own offset): if this incorrectly subtracted `only`'s own bounds
+    /// instead of using the document's origin, it would sample the wrong
+    /// composite location and this would fail.
+    #[test]
+    fn eyedropper_sample_reads_the_merged_document_with_no_active_layer_selected() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 40,
+            y: 40,
+            width: 10,
+            height: 10,
+        };
+        let only = match layers.add_pixel_layer("only", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(only) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        // Exact powers of two (unlike e.g. 0.2/0.4/0.6), so the `f16`
+        // round trip through the tile store is bit-exact and this can
+        // assert equality against the same literals written, not an
+        // approximation.
+        fill_solid(&mut store, surface, tile_id, [0.25, 0.5, 0.75, 1.0]);
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        // No active layer at all -- `reference_origin` (and
+        // `active_layer_origin`, below) both fall back to the document's
+        // own origin, `(0, 0)`.
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        let origin = active_layer_origin(&layers, None);
+        assert_eq!(origin, (0.0, 0.0));
+        let sampled = eyedropper_sample(&mut store, origin, (45.0, 45.0));
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(sampled, Some([0.25, 0.5, 0.75]));
         }
     }
 

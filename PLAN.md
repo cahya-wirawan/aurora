@@ -5489,6 +5489,67 @@ structural design work.
   `aurora-*` dependency edges (`aurora-app` already depended on both
   `aurora-ui` and `aurora-doc`); `scripts/check_layering.py` remains
   the one unrun check (`python3` still absent from this sandbox).
+
+  **"Eyedropper only samples the active layer" closed, 2026-08-13**:
+  `App::sample_eyedropper` now reads [`composite_surface_id`] — the
+  reserved surface `App::redraw`'s own `recomposite_visible_tiles`
+  keeps current with the real, merged, bottom-to-top-blended document
+  every frame (both its GPU and CPU paths write there via
+  `write_composited`) — instead of the active layer's own surface, so
+  a different, non-active visible layer sitting above the active one
+  (any opacity/blend mode), or an active layer that's simply
+  transparent at the clicked point, no longer picks up the wrong
+  colour. Verified, not assumed, that the coordinate frame still lines
+  up: `recomposite_visible_tiles`'s own `reference_origin` and
+  `active_layer_origin` both resolve to the active layer's own
+  `bounds.(x, y)`, falling back to `(0, 0)` — the document's own
+  origin — through the identical `active_pixel_layer` contract, so
+  `doc_point` minus `active_layer_origin`'s return is the correct
+  composite-surface-local point in every case, including no active
+  layer at all. That fallback also settled a real design question the
+  gap's own wording didn't answer: whether the Eyedropper should work
+  with no active layer selected. Decided yes — `active_layer_origin`
+  already treats "no active layer" as "document origin `(0, 0)`," so
+  requiring an active layer to sample would have been an arbitrary
+  restriction the composite surface itself doesn't need, and it would
+  have contradicted `Drag::Eyedropper` itself, which `begin_drag`
+  already starts unconditionally with no active-pixel-layer
+  precondition. The sampling core was factored out of the `&mut self`
+  method into a new pure free function, `eyedropper_sample(store,
+  origin, doc_point) -> Option<[f32; 3]>`, precisely so it's
+  unit-testable without a live window/GPU-backed `App` (which cannot
+  be constructed directly in this sandbox's tests) — `App::sample_eyedropper`
+  is now a thin wrapper supplying the three arguments from live state.
+  3 new `aurora-app` tests, each driving a real two-pixel-layer
+  document through the same real `recomposite_visible_tiles` GPU/CPU
+  path the existing composite tests already use: one proves the
+  composited colour wins over the active layer's own different colour
+  (opaque red bottom under a real 50%-opacity opaque blue top ->
+  purple, not bottom's own red), one proves it wins when the active
+  layer is fully transparent at the point (a real visible layer above
+  it supplies the colour instead of "nothing to pick"), and one proves
+  the no-active-layer fallback samples the merged document directly at
+  a layer whose own bounds are deliberately *not* at the document
+  origin (so an accidental bounds-subtraction regression would fail
+  it). `layer_local_point`/`sample_pixel` themselves are unchanged, so
+  every pre-existing test of either is unaffected. Version 0.48.0 — a
+  named, scoped follow-on gap closed, the same category as this
+  session's other "close a named still-open gap" work, so a minor
+  bump per this file's own versioning rule, not a patch.
+
+  Verified again for this change: `cargo fmt --all --check`, `python3
+  scripts/check_no_hardcoded_style.py`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo nextest run
+  --workspace`, and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
+  --no-deps --all-features` — all clean. `python3
+  scripts/check_layering.py` still fails in this sandbox with
+  `ModuleNotFoundError: No module named 'tomllib'` — the same
+  pre-existing sandbox limitation named elsewhere in this file, not a
+  new issue; manually confirmed via a `Cargo.toml` diff that no new
+  dependency edge was added instead. No `aurora-app/Cargo.toml` diff,
+  no `scripts/layering.json` touch — this was purely which surface
+  `sample_eyedropper` reads from and the coordinate math around that,
+  not the compositing pipeline itself.
 - [~] **Basic brush and eraser (real engine is Phase 2)** — first slice
   done 2026-08-06: `aurora-brush`'s first real code (was a placeholder).
   `dabs_along_path` turns a path of pointer positions into evenly
