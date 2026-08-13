@@ -64,10 +64,10 @@ its ten top-level items is still `[~]`, despite substantial, real,
 human-verified-on-macOS functionality underneath each one (docking,
 command palette, native menu, DPI handling, crash-recovery UI) —
 each retains genuinely unbuilt scope (Windows/Linux hardware
-verification; rotation/rulers/guides/grid/snap/true-infinite-zoom/
-atlas-resize) that a first glance at the shell's own visible
-functionality would miss. See each section below for its own exact
-open items — this paragraph is a pointer, not a substitute for them.
+verification; rotation/rulers/guides/grid/snap/true-infinite-zoom)
+that a first glance at the shell's own visible functionality would
+miss. See each section below for its own exact open items — this
+paragraph is a pointer, not a substitute for them.
 
 This session specifically (six landed rounds, 0.37.0–0.40.1) grew
 M1.9's own compositing engine substantially: all 27
@@ -79,14 +79,46 @@ project's first real, live-app-level end-to-end frame-timing
 measurement (found genuinely over the 60 FPS budget — an honest,
 unresolved finding, not smoothed over to land a checkbox).
 
+**Addendum, 2026-08-12/13 — the first real, live human interactive
+session on real hardware, not just automated checks, and what it
+actually found.** Seven more gauntlet-loop rounds landed (0.41.0–
+0.47.1): live-triggered autosave, DPI-scaled tessellation, a lighter
+PNG sRGB chunk, `TileResidency` window resize, the Properties panel,
+and — the real payoff of this stretch — **Cahya running the live app
+interactively on a real Retina MacBook for the first time**, which
+found four real, previously-invisible bugs no amount of automated
+testing in this sandbox (no display, no real GPU, no DPI-scaled
+screen) could have caught: painting was very slow during an active
+stroke (fixed — `CompositeCache` now invalidates only the tile(s) a
+dab actually touched, not the whole visible grid); paint landed
+visibly offset from the cursor on the Retina display specifically
+(fixed — a physical/logical pixel conflation in what `aurora-app` fed
+`TileResidency`'s zoom); the same offset reappeared after any zoom or
+pan even at 1x DPI, and small pans didn't visibly move the canvas at
+all (fixed — the atlas's own uv offset was floored to a whole tile,
+discarding the fractional remainder within it); and panning right or
+down from the default view froze the render while painting kept
+tracking the real, unbounded position (fixed — pan itself is now
+clamped to the document's own top-left edge, a deliberate scope
+choice over the much larger work true infinite pasteboard panning
+would need). **All four confirmed fixed by Cahya on the same real
+hardware that found them**, not just by this sandbox's own software-
+Vulkan test suite. Every fix went through the same builder-then-
+independent-critic process the rest of this session's rounds did; see
+each fix's own dated addendum in the relevant M1.N section below for
+the full technical account. 982 tests pass workspace-wide as of
+0.47.1 (was 934 at the start of this addendum's stretch).
+
 **M1.10, the Phase 1 gate itself,
 is what's actually open now**: two items need hardware unavailable
 here (accessibility/IME audits, all three platforms), one is measured
 but not yet passing and can't be re-verified without real GPU hardware
-(60 FPS), and one needs a real design-owner decision before it's
-actionable (which remaining named gallery component to build next).
-See M1.10 below, and the "Next action" section at the end of this
-file, for what that means concretely.
+(60 FPS — unretested by this addendum's fixes, which improved *how
+much* gets recomposited per edit, not the underlying per-tile cost),
+and one needs a real design-owner decision before it's actionable
+(which remaining named gallery component to build next). See M1.10
+below, and the "Next action" section at the end of this file, for what
+that means concretely.
 
 | Area | State |
 |---|---|
