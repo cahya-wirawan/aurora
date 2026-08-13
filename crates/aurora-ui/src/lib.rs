@@ -12,11 +12,15 @@
 //! real interactivity landed so far. See each module's own doc comment
 //! for exactly what's built and what's deliberately still open
 //! (drag-to-redock, floating, persisted layouts, the menubar/toolbar/
-//! status bar). [`layers_panel::populate_layers_panel`] and
-//! [`history_panel::populate_history_panel`] are the "Layers, history,
-//! tool-options panels" bullet's own first slice — real content from a
-//! real `aurora_doc::LayerTree`/`History`; tool-options panels remain
-//! separate, still open.
+//! status bar). [`layers_panel::populate_layers_panel`],
+//! [`history_panel::populate_history_panel`], and
+//! [`properties_panel::populate_properties_panel`] are the "Layers,
+//! history, tool-options panels" bullet's three slices — real content
+//! from a real `aurora_doc::LayerTree`/`History`, and (for Properties) a
+//! generic label/value row list `aurora-app` populates from whichever
+//! real per-tool parameters it actually has (see
+//! [`properties_panel`]'s own doc comment for why this crate carries no
+//! tool-specific knowledge itself).
 //!
 //! [`canvas_view::CanvasView`] and [`tool`] are PLAN.md M1.9's "basic
 //! tools" bullet: the pan/zoom coordinate transform and the tool
@@ -29,6 +33,7 @@ pub mod canvas_view;
 pub mod history_panel;
 pub mod layers_panel;
 pub mod panel;
+pub mod properties_panel;
 pub mod tool;
 pub mod workspace;
 
@@ -39,5 +44,6 @@ pub use panel::{
     PanelHandle, clear_panel_body, close_panel, insert_panel, panel_is_collapsed,
     set_panel_collapsed,
 };
+pub use properties_panel::populate_properties_panel;
 pub use tool::Tool;
 pub use workspace::{Workspace, build_workspace, rail_width, set_rail_width};

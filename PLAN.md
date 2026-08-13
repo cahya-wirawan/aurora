@@ -4246,6 +4246,78 @@ structural design work.
   reproduction (closer to the spike's own proven shape) to isolate
   whether nesting depth specifically is the trigger — real, scoped
   follow-up work, not something to keep guessing at inline.
+
+  **Tool-options panel done too, 2026-08-12** — closes the one piece of
+  this bullet's own title left open since 2026-08-03: the Properties
+  panel (`Workspace::properties`, wired into focus/toggling/persisted
+  collapsed-state since the docking skeleton landed, but never given
+  body content). New `crates/aurora-ui/src/properties_panel.rs`,
+  `populate_properties_panel(tree, panel, tool: Tool, options: &[(&str,
+  String)])` — mirrors `populate_history_panel`'s own flat shape exactly
+  (`Role::List` body, one `Role::ListItem` row per entry, no icon, no
+  drawn pixels), labeling the body `"Properties: {tool.label()}"` and
+  each row `"{label}: {value}"`. Deliberately generic: this module knows
+  nothing about `BRUSH_RADIUS`/`ERASER_RADIUS` or any other tool-specific
+  constant — `aurora-ui` has no dependency on `aurora-app` (and couldn't
+  reach them even if it wanted to, `scripts/layering.json` unchanged), so
+  the label/value pairs are entirely the caller's data, matching
+  `crate::tool`'s own "generic mechanism, caller owns behaviour" split. 3
+  new tests (47 total in `aurora-ui`, was 44): one row per option in
+  order, an empty-but-labeled list for a tool with no options, and the
+  usual unknown-panel-body rejection.
+
+  Wired into `aurora-app` at both real trigger points: initial
+  population (`App::new`, alongside the existing inline
+  `populate_layers_panel`/`populate_history_panel` calls) seeds the
+  panel from `aurora_ui::Tool::default()` (`MarqueeSelect`) — which has
+  no real options, so the panel legitimately starts empty, confirmed by
+  running the actual code path, not assumed; and a new
+  `refresh_properties_panel` (mirrors `refresh_history_panel`'s exact
+  `clear_panel_body` + `populate_*` shape, warnings logged via
+  `tracing::warn!`, never a panic) called from the
+  `AppCommand::SelectTool` arm of `run_command`, so switching tools
+  actually updates what Properties shows. `replace_document` (the
+  Layers/History "replace the current document" helper `open_file`/
+  `open_aur_file` both already used) gained a `tool: aurora_ui::Tool`
+  parameter and now reseeds Properties too, from the caller's own
+  current tool (`self.tool`) — opening a different document doesn't
+  change which tool is selected, so it shouldn't reset Properties back
+  to empty either. New `tool_options(tool) -> Vec<(&'static str,
+  String)>` is the one place `BRUSH_RADIUS`/`ERASER_RADIUS` become
+  visible options (`[("Radius", format!("{BRUSH_RADIUS}px"))]` and the
+  `ERASER_RADIUS` equivalent) — every other tool (`Move`,
+  `MarqueeSelect`, `Zoom`, `Pan`, `Eyedropper`) has no real backing
+  parameter anywhere in this crate yet, so it gets `vec![]`, an honest
+  empty panel rather than an invented row.
+
+  4 new `aurora-app` tests (198 total, was 194) target exactly the
+  failure mode most likely for this shape of change: switching to
+  `Tool::Brush` populates a real `"Radius: 24px"` row; switching to
+  `Tool::Eraser` does the same with its own radius; switching to
+  `Tool::Move` leaves zero rows (an honest empty state, not a
+  placeholder); and — the one given real scrutiny, per this task's own
+  instruction that a missing `clear_panel_body` before repopulating is
+  the likely bug — a dedicated test drives Brush → Move → Eraser through
+  real `run_command` calls and asserts the row count at each step (1,
+  then 0, then 1 again), which would have caught a forgotten
+  `clear_panel_body` either as a stale row surviving into Move's
+  supposedly-empty panel, or as an accumulated count once Eraser was
+  selected; it passed on the first real run, not by inspection alone.
+  Verified: `cargo fmt --all --check` clean, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` clean (no lint weakened,
+  no `unwrap`/`expect`/`panic`/`indexing_slicing`), `cargo test
+  --workspace` clean (0 failures across every crate — `cargo nextest`
+  isn't installed in this sandbox), `python3
+  scripts/check_no_hardcoded_style.py` clean, `git diff --stat` on
+  `crates/aurora-ui/Cargo.toml`/`crates/aurora-app/Cargo.toml`/
+  `scripts/layering.json` empty (no new dependency edge, no layering
+  change). `python3 scripts/check_layering.py` still can't run in this
+  sandbox (`ModuleNotFoundError: No module named 'tomllib'`, the same
+  pre-existing gap noted elsewhere in this file) — checked by hand
+  instead via the `Cargo.toml` diffs above. No new `WidgetKind`, no
+  pixel rendering, no gallery coverage added — same explicit scope
+  boundary `history_panel.rs`/`layers_panel.rs` already draw, and
+  neither of those has gallery coverage either.
 - [~] **Command palette, keyboard shortcuts** — first slice done
   2026-08-04. Two new generic mechanisms in `aurora-widgets`, following
   the same "abstract steps, not `winit` types — translating real

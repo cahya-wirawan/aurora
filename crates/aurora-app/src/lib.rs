@@ -809,32 +809,40 @@ fn verify_aur(path: &Path) -> bool {
     }
 }
 
-/// Clears and repopulates `workspace`'s Layers/History panels for a
-/// freshly opened `layers`/`history` — the real "replace the current
-/// document" step [`App::open_file`] needs, shared by both routes that
-/// reach it: a single-image import ([`document_from_image`], always
-/// exactly one new pixel layer) and a real, possibly multi-layer `.aur`
-/// open (`aurora_io::read_aur`). Returns the new `WidgetId -> LayerId`
-/// map (`aurora_ui::populate_layers_panel`'s own return value) and
-/// which layer should become the new active one — `layers`' own
-/// topmost pixel layer ([`topmost_pixel_layer`]; for a freshly
-/// imported single-layer document this is trivially the layer that was
-/// just created) — for the caller to assign onto its own fields
-/// alongside `layers`/`history` themselves (kept by the caller, not
-/// threaded through here, since this function only needs to read them).
+/// Clears and repopulates `workspace`'s Layers/History/Properties panels
+/// for a freshly opened `layers`/`history` — the real "replace the
+/// current document" step [`App::open_file`] needs, shared by both
+/// routes that reach it: a single-image import ([`document_from_image`],
+/// always exactly one new pixel layer) and a real, possibly multi-layer
+/// `.aur` open (`aurora_io::read_aur`). Returns the new
+/// `WidgetId -> LayerId` map (`aurora_ui::populate_layers_panel`'s own
+/// return value) and which layer should become the new active one —
+/// `layers`' own topmost pixel layer ([`topmost_pixel_layer`]; for a
+/// freshly imported single-layer document this is trivially the layer
+/// that was just created) — for the caller to assign onto its own
+/// fields alongside `layers`/`history` themselves (kept by the caller,
+/// not threaded through here, since this function only needs to read
+/// them).
+///
+/// `tool` reseeds the Properties panel with `tool`'s own current
+/// options ([`tool_options`]) — opening a different document doesn't
+/// change which tool is selected, so the caller's own current
+/// `self.tool` is what this should show, not [`aurora_ui::Tool::
+/// default`].
 ///
 /// # Errors
 ///
 /// Propagates [`aurora_widgets::WidgetError`] if clearing or
-/// repopulating either panel fails — structurally unreachable in
-/// practice (`workspace` is always a real `aurora_ui::build_workspace`
-/// with real panel bodies), but this function doesn't itself know that,
-/// so it reports rather than assumes.
+/// repopulating any panel fails — structurally unreachable in practice
+/// (`workspace` is always a real `aurora_ui::build_workspace` with real
+/// panel bodies), but this function doesn't itself know that, so it
+/// reports rather than assumes.
 fn replace_document(
     workspace: &mut aurora_ui::Workspace,
     scales: &Scales,
     layers: &aurora_doc::LayerTree,
     history: &aurora_doc::History,
+    tool: aurora_ui::Tool,
 ) -> Result<
     (
         HashMap<WidgetId, aurora_doc::LayerId>,
@@ -847,6 +855,14 @@ fn replace_document(
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
     aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body)?;
     aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, history)?;
+    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.properties.body)?;
+    let options = tool_options(tool);
+    aurora_ui::populate_properties_panel(
+        &mut workspace.tree,
+        workspace.properties,
+        tool,
+        &options,
+    )?;
     Ok((layer_rows, topmost_pixel_layer(layers)))
 }
 
@@ -2150,7 +2166,10 @@ fn run_command(
             focus.focus_previous(&mut workspace.tree);
         }
         AppCommand::ToggleCommandPalette => toggle_command_palette(workspace, focus, palette),
-        AppCommand::SelectTool(selected) => *tool = selected,
+        AppCommand::SelectTool(selected) => {
+            *tool = selected;
+            refresh_properties_panel(workspace, selected);
+        }
         AppCommand::Undo => match undo_order.undo.last().copied() {
             Some(UndoKind::Structural) => match history.undo(layers) {
                 Ok(_) => {
@@ -2225,6 +2244,57 @@ fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_
         aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, history)
     {
         tracing::warn!(?err, "failed to repopulate the History panel");
+    }
+}
+
+/// The real, non-hardcoded label/value pairs [`aurora_ui::
+/// populate_properties_panel`] shows for `tool` — this crate's own
+/// per-tool parameters, not `aurora-ui`'s (that crate carries no
+/// Brush/Eraser-specific knowledge at all, see
+/// `aurora_ui::properties_panel`'s own doc comment). Only [`Tool::Brush`]
+/// and [`Tool::Eraser`] have a real parameter today ([`BRUSH_RADIUS`]/
+/// [`ERASER_RADIUS`]); every other tool (`Move`, `MarqueeSelect`, `Zoom`,
+/// `Pan`, `Eyedropper`) has no real backing data anywhere in this crate
+/// yet, so it gets an honest empty list rather than an invented option —
+/// the same "nothing to show" pattern the command palette already uses
+/// for an unselected row.
+#[allow(clippy::match_same_arms)]
+fn tool_options(tool: aurora_ui::Tool) -> Vec<(&'static str, String)> {
+    match tool {
+        aurora_ui::Tool::Brush => vec![("Radius", format!("{BRUSH_RADIUS}px"))],
+        aurora_ui::Tool::Eraser => vec![("Radius", format!("{ERASER_RADIUS}px"))],
+        aurora_ui::Tool::Move
+        | aurora_ui::Tool::MarqueeSelect
+        | aurora_ui::Tool::Zoom
+        | aurora_ui::Tool::Pan
+        | aurora_ui::Tool::Eyedropper => vec![],
+    }
+}
+
+/// Clears and repopulates the Properties panel for `tool` — the same
+/// `clear_panel_body` + `populate_*` pattern [`refresh_history_panel`]
+/// already uses, just for the Properties panel and [`tool_options`]
+/// instead of a `History` journal. [`AppCommand::SelectTool`]'s own
+/// refresh step: clearing first matters here specifically, since without
+/// it switching from a tool with real options (Brush) to one without
+/// (Move) would leave the previous tool's stale rows sitting in the
+/// panel instead of a real empty state.
+fn refresh_properties_panel(workspace: &mut aurora_ui::Workspace, tool: aurora_ui::Tool) {
+    if let Err(err) = aurora_ui::clear_panel_body(&mut workspace.tree, workspace.properties.body) {
+        tracing::warn!(
+            ?err,
+            "failed to clear the Properties panel before refreshing it"
+        );
+        return;
+    }
+    let options = tool_options(tool);
+    if let Err(err) = aurora_ui::populate_properties_panel(
+        &mut workspace.tree,
+        workspace.properties,
+        tool,
+        &options,
+    ) {
+        tracing::warn!(?err, "failed to repopulate the Properties panel");
     }
 }
 
@@ -5204,6 +5274,19 @@ impl App {
         {
             unreachable!("workspace.history was just built by build_workspace above: {err:?}");
         }
+        // Seeded from the tool this session actually starts with
+        // (`aurora_ui::Tool::default()`, `MarqueeSelect` — see
+        // `Self::tool`'s own field assignment below), which has no real
+        // options yet, so the Properties panel legitimately starts
+        // empty here, not populated with a placeholder.
+        if let Err(err) = aurora_ui::populate_properties_panel(
+            &mut workspace.tree,
+            workspace.properties,
+            aurora_ui::Tool::default(),
+            &tool_options(aurora_ui::Tool::default()),
+        ) {
+            unreachable!("workspace.properties was just built by build_workspace above: {err:?}");
+        }
         // Written unconditionally, whether this session opened the demo
         // document or a recovered one -- either way, it's the current
         // document, and is what the *next* run should recover to if this
@@ -5481,7 +5564,7 @@ impl App {
             }
         };
         let (layer_rows, active_layer) =
-            match replace_document(&mut self.workspace, &scales, &layers, &history) {
+            match replace_document(&mut self.workspace, &scales, &layers, &history, self.tool) {
                 Ok(result) => result,
                 Err(err) => {
                     tracing::error!(
@@ -5571,7 +5654,7 @@ impl App {
             }
         };
         let (layer_rows, active_layer) =
-            match replace_document(&mut self.workspace, &scales, &layers, &history) {
+            match replace_document(&mut self.workspace, &scales, &layers, &history, self.tool) {
                 Ok(result) => result,
                 Err(err) => {
                     tracing::error!(
@@ -6845,14 +6928,14 @@ mod tests {
         COMMAND_CLOSE_LAYERS, COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE,
         COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO,
         COMMAND_TOGGLE_HISTORY, COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
-        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, FileDialogAccess, Key,
-        KeyChord, Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
-        UndoKind, UndoOrder, activate_command, apply_mask_clip, apply_scroll_zoom, autosave_path,
-        background_color_from_theme, begin_drag, canvas_area_physical_rect,
-        canvas_area_physical_size, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, collect_widget_paints, composite_document,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, ERASER_RADIUS,
+        FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PointerButton,
+        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind, UndoOrder, activate_command,
+        apply_mask_clip, apply_scroll_zoom, autosave_path, background_color_from_theme, begin_drag,
+        canvas_area_physical_rect, canvas_area_physical_size, clear_session_marker,
+        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
+        composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
+        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
         document_qualifies_for_gpu_compositing, handle_dialog_key, handle_dialog_pointer,
         handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
         is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
@@ -7240,11 +7323,16 @@ mod tests {
 
         let image = fake_image(8, 8);
         let (new_layers, new_history, new_layer_id) = document_from_image("photo", &image);
-        let (layer_rows, active_layer) =
-            match replace_document(&mut workspace, &scales, &new_layers, &new_history) {
-                Ok(result) => result,
-                Err(err) => unreachable!("{err:?}"),
-            };
+        let (layer_rows, active_layer) = match replace_document(
+            &mut workspace,
+            &scales,
+            &new_layers,
+            &new_history,
+            aurora_ui::Tool::default(),
+        ) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
 
         assert_eq!(
             workspace
@@ -7641,6 +7729,195 @@ mod tests {
             AppCommand::SelectTool(Tool::Pan),
         );
         assert_eq!(tool, Tool::Pan);
+    }
+
+    #[test]
+    fn run_command_select_tool_to_brush_populates_a_real_radius_row() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::SelectTool(Tool::Brush),
+        );
+
+        let Some(rows) = workspace.tree.children(workspace.properties.body) else {
+            unreachable!("just refreshed");
+        };
+        assert_eq!(rows.len(), 1);
+        let Some(&row) = rows.first() else {
+            unreachable!("just asserted len() == 1");
+        };
+        let Some(accessibility) = workspace.tree.accessibility(row) else {
+            unreachable!("just inserted");
+        };
+        let expected = format!("Radius: {BRUSH_RADIUS}px");
+        assert_eq!(accessibility.label(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn run_command_select_tool_to_eraser_populates_a_real_radius_row() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::SelectTool(Tool::Eraser),
+        );
+
+        let Some(rows) = workspace.tree.children(workspace.properties.body) else {
+            unreachable!("just refreshed");
+        };
+        assert_eq!(rows.len(), 1);
+        let Some(&row) = rows.first() else {
+            unreachable!("just asserted len() == 1");
+        };
+        let Some(accessibility) = workspace.tree.accessibility(row) else {
+            unreachable!("just inserted");
+        };
+        let expected = format!("Radius: {ERASER_RADIUS}px");
+        assert_eq!(accessibility.label(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn run_command_select_tool_to_move_leaves_the_properties_panel_empty() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::SelectTool(Tool::Move),
+        );
+
+        assert_eq!(
+            workspace.tree.children(workspace.properties.body),
+            Some([].as_slice()),
+            "Move has no real backing parameter yet -- an honest empty panel, not an invented row"
+        );
+    }
+
+    /// The most likely place for a real bug: forgetting to
+    /// `clear_panel_body` before repopulating would leave a previous
+    /// tool's rows sitting alongside (or instead of clearing away for) the
+    /// newly selected tool's own rows. Exercises both directions: a
+    /// tool with real options (Brush) followed by one with none (Move)
+    /// must really empty the panel, not leave Brush's row behind; and
+    /// switching between two tools that both have real options (Move,
+    /// then Eraser) must land on exactly the new tool's own row count,
+    /// not an accumulated total.
+    #[test]
+    fn run_command_select_tool_clears_stale_rows_from_the_previous_tool() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::SelectTool(Tool::Brush),
+        );
+        assert_eq!(
+            workspace
+                .tree
+                .children(workspace.properties.body)
+                .map(<[_]>::len),
+            Some(1),
+            "Brush must seed its own Radius row first"
+        );
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::SelectTool(Tool::Move),
+        );
+        assert_eq!(
+            workspace.tree.children(workspace.properties.body),
+            Some([].as_slice()),
+            "switching to a tool with no real options must really empty the panel, not leave \
+             the previous tool's row behind"
+        );
+
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::SelectTool(Tool::Eraser),
+        );
+        assert_eq!(
+            workspace
+                .tree
+                .children(workspace.properties.body)
+                .map(<[_]>::len),
+            Some(1),
+            "switching tools repeatedly must not accumulate rows from earlier tools"
+        );
     }
 
     #[test]
