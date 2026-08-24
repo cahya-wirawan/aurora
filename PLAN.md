@@ -7104,7 +7104,7 @@ structural design work.
     `aurora-app`, so none of the refusals added here can be reached by
     a user yet.
 
-- [ ] **`resolve_tile`'s peak memory is `O(siblings × depth)`, not
+- [x] **`resolve_tile`'s peak memory is `O(siblings × depth)`, not
     bounded by depth at all** — found by review 2026-08-24, reachable
     through completely ordinary usage, no malformed tree involved. The
     `LayerKind::Group` arm collects one full tile buffer (512 KiB at
@@ -7122,6 +7122,301 @@ structural design work.
     change. Sized but not scheduled; it is a real gap in the "nothing
     assumes a document fits in memory" invariant (§7.3.1) for wide
     documents, and it is not bounded by anything today.
+
+    **Fixed 2026-08-24 (0.51.0) — accumulate-in-place.** The new
+    primitive is `aurora_render::composite_layer_into(out: &mut [f16],
+    texels: &[f16], opacity: f32, mode: BlendMode)` in
+    `crates/aurora-render/src/composite.rs`, alongside
+    `aurora_render::transparent_tile()` (the fully-transparent starting
+    buffer, factored out so both paths agree on what "empty" means).
+    This was **pure code motion, not a math change**:
+    `composite_tile_cpu`'s own per-layer loop body was moved
+    character-for-character into the new function, and
+    `composite_tile_cpu` is now literally `transparent_tile()` plus one
+    `composite_layer_into` call per layer, in order — its public
+    signature and every existing caller are unchanged. The property
+    that makes the split safe is that the loop body carried **no state
+    across iterations except the accumulator itself**: `alpha`,
+    `inverse`, `backdrop_alpha` and the recovered straight backdrop are
+    all recomputed per texel from `dst`/`src`/`opacity`/`mode`. So
+    folding N layers via N calls is bit-identical to one batch call over
+    the same N layers in the same order.
+
+    **What that rests on — corrected 2026-08-24 after review.** The
+    first version of this entry cited the in-tree test
+    `composite_layer_into_folded_one_at_a_time_matches_the_batch_composite`
+    as having "asserted directly, not assumed" that property. That
+    citation was wrong, and the test is a **tautology**: since
+    `composite_tile_cpu` is now itself *defined* as `transparent_tile()`
+    plus one `composite_layer_into` call per layer, both sides of that
+    assertion are literally the same three calls on the same data, and
+    it cannot fail regardless of whether the underlying math is right.
+    It is kept, relabelled as what it is — a smoke test that fails if a
+    future edit reintroduces a bespoke per-layer loop into
+    `composite_tile_cpu` and lets it drift — and is no longer cited as
+    proof anywhere (its own comment, this entry, and the `Group`-arm
+    comment in `aurora-app` all said "load-bearing"; all three are
+    corrected). The real evidence is two things:
+
+    1. **A structural argument, verified by reading the code.**
+       `composite_layer_into`'s loop body reads no state whatsoever
+       beyond `dst`, `src`, `opacity` and `mode` — so there is nothing a
+       single batch call could carry across layers that N separate calls
+       could not, *by construction*. Two independent reviewers read the
+       loop and confirmed this, as did the revision pass.
+    2. **A real differential test against the actual pre-fix code.**
+       Review built a harness comparing the working tree against an
+       untouched copy of the pre-fix implementation across 1,170 cases —
+       all 26 blend modes, varying layer counts, and edge-case values
+       including `NaN`, infinities, subnormals and out-of-gamut
+       channels — and found **zero** semantic mismatches. That harness
+       was a review artefact and is not in the tree (it needs two
+       copies of the crate to exist at once); what *is* in the tree, as
+       the non-vacuous in-tree assertion, is
+       `composite_layer_into_folded_matches_hand_computed_golden_values`
+       (`aurora-render`), which pins a three-layer
+       `Normal`/`Multiply`/`Screen` fold — deliberately over a still-
+       translucent accumulator, the one shape that reads non-trivial
+       state back out of it — to values derived **by hand from the
+       documented formula**, asserting each of the three intermediate
+       stages exactly. Every value is `f16`-exact, so it compares with
+       no epsilon and nothing rounds across folds.
+
+    The `Group` arm's new shape: one `let mut isolated =
+    aurora_render::transparent_tile()` before the loop, then
+    `composite_layer_into(&mut isolated, &child, …)` inside the `if let
+    Some(…) = resolve_tile(…)` body. **Drop timing is the whole point** —
+    each child's `Vec<f16>` is bound inside the loop body and dropped at
+    the end of its own iteration, so at most one child buffer plus the
+    accumulator is alive per nesting level. **Fold order is unchanged**
+    (`children.iter().rev()`, bottom-to-top), and everything downstream
+    of the fold — the un-premultiply loop, the mask clip, the `Dissolve`
+    interception, the returned tuple — is byte-identical and still runs
+    strictly *after* all children are folded in, which is what it has
+    always required. The depth guard and the per-tile `CompositeBudget`
+    checks (`is_exhausted`, `charge_node`, `depth.saturating_add(1)`)
+    from 0.49.2/0.50.0 are untouched.
+
+    The same collect-then-composite pattern was fixed at the two other
+    sites that had it, both at *root* level (no group needed to trigger
+    them): `recomposite_visible_tiles`' own `composite_tile_cpu_path`
+    closure, and `composite_document`'s export path — the latter always
+    runs on the CPU regardless of GPU availability. Both now fold into a
+    `transparent_tile()` accumulator the same way. Fixing one and not
+    the other would have read as an oversight.
+
+    **The new bound is `O(depth)`, not `O(1)` — this is not "constant
+    memory".** Peak is `depth + 1` tile buffers, bounded by
+    `MAX_LAYER_TREE_DEPTH`: 257 × 512 KiB ≈ **128.5 MiB**, for a
+    document nested twenty-five times deeper than any that exists. That
+    constant is a backstop chosen for traversal sanity, not a memory
+    budget; its doc comment in `crates/aurora-doc/src/tree.rs` is
+    updated to say exactly this rather than leaving its 0.49.2 "does not
+    bound the allocation" wording stale.
+
+    **Corrected 2026-08-24 after review: this figure was briefly stated
+    as ~256 MiB (`2 × depth` buffers), and that was wrong.** The
+    reasoning behind it — "every nesting level holds an accumulator
+    *and* a transient child buffer simultaneously" — does not match the
+    control flow. Re-derived from `crates/aurora-app/src/lib.rs`'s own
+    `Group` arm: each frame allocates exactly one accumulator, and the
+    child's buffer is bound only *after* the recursive call for it
+    returns, then dropped at the end of that loop iteration before the
+    next child recurses. So while the recursion is descending, every
+    ancestor frame holds one buffer and no second one; the frame just
+    returned into is the only one ever holding two at once, and the
+    second of those is the callee's own accumulator *moved*, not a
+    copy. Hence `depth + 1`, not `2 × depth`. (The same holds for the
+    `apply_mask_clip`/`dissolve_gate` temporaries, which also put
+    exactly one frame in the two-buffer state.) The original plan's
+    ~128 MiB estimate was the closer one.
+
+    **Measured, not asserted.** New test
+    `composite_document_composites_two_thousand_sibling_layers_in_one_group`
+    (`aurora-app`): one group holding 2,000 ordinary sibling pixel
+    layers on a 10 × 10 px document, two of them filled (bottom-most
+    opaque blue, top-most opaque green at layer opacity 0.5) and the
+    other 1,998 left untouched — `TileStore::get` returns a real, full
+    blank tile for an untouched surface, so all 2,000 512 KiB buffers
+    are genuinely materialised and folded, while an `alpha = 0` source
+    is an exact identity in the blend. Hand-computed expectation
+    `(0.0, 0.5, 0.5, 1.0)`, asserted exactly. Peak RSS of that single
+    test, measured via `getrusage(RUSAGE_CHILDREN).ru_maxrss` around the
+    test binary (this box has no `/usr/bin/time`), same binary, same
+    machine, before and after the change:
+
+    | Siblings | Before | After |
+    |---|---|---|
+    | 500 | 264.7 MiB | 15.8 MiB |
+    | 1,000 | 515.0 MiB | 16.2 MiB |
+    | 2,000 | **1015.5 MiB** | **16.4 MiB** |
+
+    Before: clean linear growth in sibling count, confirming the
+    diagnosis above (~0.5 MiB per sibling, exactly one tile buffer).
+    After: flat — the 0.6 MiB drift across a 4× sibling range is the
+    tree/store bookkeeping for 4× as many layers, not per-sibling tile
+    buffers. Note the test passes against the *unmodified* `resolve_tile`
+    too: it is a correctness test that happens to exercise the memory
+    shape, which is what makes it a usable before/after probe rather
+    than a fix-shaped tautology.
+
+    **The two root-level fold sites are covered too — added 2026-08-24
+    after review.** The test above exercises only `resolve_tile`'s
+    `Group` arm; the other two sites had their pixel correctness covered
+    by existing tests but not their memory shape. New test
+    `composite_document_composites_five_hundred_root_level_sibling_layers`
+    (`aurora-app`) is the no-group version: 500 ordinary root-level
+    pixel layers, no group anywhere, straight through
+    `composite_document`. Hand-computed expectation
+    `(0.0, 0.5, 0.5, 1.0)`, asserted exactly. Same measurement method as
+    the table above, same binary, this test alone, with the export loop
+    reverted to its collect-all-first form and then with the fold in
+    place:
+
+    | Root layers | Before | After |
+    |---|---|---|
+    | 500 | ~264 MiB (264.3 built, 264.2 re-verified) | ~15 MiB (15.1 built, 15.3 re-verified) |
+
+    The sub-megabyte spread between the two independent runs is RSS
+    measurement noise, not a regression signal — the two-orders-of-
+    magnitude drop is the load-bearing number.
+
+    500 rather than 2,000 deliberately: the separation is already
+    unmistakable, and a second 2,000-layer test would pay a second time
+    for 2,000 real scratch-tile writes on every CI platform (the group
+    test alone runs ~7 s in debug against a 16-tile-budget store). The
+    2,000 figure is kept where it matches the scenario actually
+    measured. `recomposite_visible_tiles`' own CPU path is **not**
+    separately memory-tested — it is the on-screen path and is hard to
+    drive headlessly — but it and the export loop now share one
+    function, `composite_roots_into_tile`, extracted in the same review
+    pass to remove the near-identical five-line fold that had been
+    written out twice (and had to be fixed twice); the export test
+    therefore exercises the same code both paths run.
+
+    **Also in this change, from the same review pass.**
+    `composite_layer_into`'s doc comment had absorbed the *entire*
+    family-level comment `composite_tile_cpu` used to carry (the
+    blend-mode scope inventory, the `Dissolve` boundary, the
+    CPU-vs-GPU rationale, the `TileCompositor` lineage), leaving the
+    function most callers actually reach for under-documented; that
+    material is back on `composite_tile_cpu`, and
+    `composite_layer_into` keeps only its own per-call contract.
+    `composite_roots_into_tile` (`aurora-app`) was extracted to hold the
+    one copy of the root-level fold that had been written out twice.
+
+    **Verified 2026-08-24 (0.51.0), re-verified after the revision
+    pass.** `cargo fmt --all --check`,
+    `python3 scripts/check_layering.py`,
+    `python3 scripts/check_no_hardcoded_style.py`,
+    `cargo check --workspace --locked`,
+    `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+    all clean; `cargo test --workspace` — **1064 passed, 0 failed**
+    (1060 before this work: the two tests the first pass added, plus the
+    hand-computed golden test and the root-level many-layer test the
+    revision pass added); `cargo test --workspace --doc` and
+    `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps
+    --all-features` clean. `cargo deny check all` is **not verified** —
+    that tool is not installed in this sandbox, as in every prior round.
+    Every pre-existing `Group`-arm regression test passes **unmodified,
+    with no assertion value edited** — the diff touches no `assert*`
+    line in any existing test.
+
+    **No GPU-hardware or interactive verification**, per CLAUDE.md: this
+    is the CPU compositing path only, exercised headlessly. Nothing here
+    has been run in a live session on real hardware, and none of it
+    changes the still-open 60 FPS finding — this reduces peak *memory*,
+    not per-tile cost.
+- [ ] **`begin_gpu_composite_tile` has the same collect-all-siblings
+    shape the CPU path just lost** — named 2026-08-24, when
+    `resolve_tile`'s own version was fixed (0.51.0), and deliberately
+    left open. It collects one buffer per visible root-level layer
+    before its upload/composite loop, reachable specifically when the
+    document qualifies for GPU compositing (flat, groupless, all-
+    `Normal`) — plausibly the *more* common shape for a many-layer
+    document, so this is not a smaller problem than the one just fixed.
+    Not fixed here. **Correction, from an independent judgment pass**: an
+    earlier draft of this bullet overstated the code obstacle — the
+    `dst_texture` accumulator already exists and is already cleared
+    before the loop, and each iteration already builds its own
+    `src_texture` and calls `composite_over_with_opacity` immediately, so
+    merging the resolve loop into the upload loop is close to the same
+    code motion the CPU side got, not a real batch/readback
+    restructuring; only the `layer_texels.is_empty()` early-return needs
+    rework. The real, honest blocker is that **there is no real GPU in
+    this sandbox to verify such a change against** (CLAUDE.md: a green
+    headless run is not evidence about GPU behaviour) — that alone is
+    reason enough to defer it, without overstating the code-side
+    difficulty too. Sized, not scheduled.
+- [ ] **Every saved file with translucent pixels has premultiplied
+    alpha where straight alpha belongs — the un-premultiply step runs
+    only inside a group** — found 2026-08-24 by the review of the
+    0.51.0 memory fix, **not caused by it** (it reproduces identically
+    on the pre-fix code), and disclosed here rather than fixed because
+    it is a separate, separately-sized piece of work with its own
+    correctness question. `resolve_tile`'s `Group` arm converts its
+    isolated accumulator back to straight alpha before handing it up
+    (`crates/aurora-app/src/lib.rs`, the loop immediately after the
+    child fold — the one whose comment begins "Un-premultiply"). The two
+    *top-level* compositing sites do not: both
+    `recomposite_visible_tiles`' CPU path and `composite_document`'s
+    export loop now go through `composite_roots_into_tile`
+    (`crates/aurora-app/src/lib.rs`, defined just above
+    `document_qualifies_for_gpu_composite`), which returns the raw
+    accumulator, and neither caller un-premultiplies it before
+    `write_composited` / before copying it into the exported
+    `aurora_io::Image`.
+
+    **Reproduction**: export a document whose only layer is one opaque
+    white pixel layer at layer opacity 0.5. `composite_layer_into` onto
+    a transparent start gives `(0.5, 0.5, 0.5, 0.5)`; the correct
+    straight-alpha value is `(1.0, 1.0, 1.0, 0.5)`. That premultiplied
+    value is what lands in the saved PNG/TIFF/`.aur`. Nothing malformed
+    is involved — any document with translucency, saved, is wrong today,
+    and it is silent. This is the failure class CLAUDE.md names as the
+    worst this project can have ("silently degrading a professional's
+    file"), so it should be scheduled ahead of most open items here.
+
+    Not folded into the memory-fix item above because it is neither
+    caused by nor fixed by it, and not patched in this pass because the
+    un-premultiply step's exact placement — before or after the mask
+    clip, and how it interacts with export colour-space handling and
+    with `aurora-io`'s own expectations about what `Image::samples()`
+    holds — deserves its own review rather than a line bolted onto a
+    memory change. Note also that the fix has exactly one place to land
+    now that both paths share `composite_roots_into_tile`; a matching
+    regression test on both paths is part of the work, and the existing
+    `composite_document_*` tests all happen to end fully opaque, which
+    is why none of them caught it.
+- [ ] **A corrupted scratch-disk tile can reach a real `panic` via
+    `copy_from_slice`** — found 2026-08-24 by the same review, also
+    **pre-existing** (it reproduces on the pre-fix code) and also
+    disclosed rather than fixed here. `aurora_tile::codec`'s decode path
+    (`crates/aurora-tile/src/codec.rs`, `decode` → `from_raw_bytes`)
+    checks that a decoded payload is a whole number of `f16` samples and
+    that a compressed payload's declared size is within
+    `MAX_DECOMPRESSED_BYTES` — an **upper** bound only. It never checks
+    that the decoded length actually *equals* `aurora_tile::SAMPLES`. A
+    short tile therefore decodes successfully, and
+    `write_composited`'s `dest.texels_mut().copy_from_slice(composited)`
+    (`crates/aurora-app/src/lib.rs`, inside `recomposite_visible_tiles`)
+    panics on the length mismatch — precisely what the workspace's
+    `unwrap`/`expect`/`panic`/`indexing_slicing` deny policy exists to
+    prevent, in a program holding unsaved work.
+
+    Likelihood is lower than the item above: it needs real scratch-disk
+    corruption — a crash mid-write, a full disk, or another process
+    writing into the scratch directory — not ordinary use. The fix
+    belongs in `aurora-tile`'s own decode validation (reject a decoded
+    length that isn't `SAMPLES`, with a `TileError::CorruptFile`), which
+    is why it is not being patched from `aurora-app` here. Related, and
+    part of the same fix: `aurora_render::composite_layer_into` zips its
+    two slices, so a short buffer that *doesn't* reach a
+    `copy_from_slice` instead silently composites only part of the tile.
+    Its doc comment was corrected in 0.51.0 to describe that as an
+    unreported gap — the first version of that comment framed the zip as
+    a safety property ("nothing is written past either buffer's own
+    end"), which is true but misleading about what actually happens.
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
   mutator with an undo-recording version and kept its own undo/redo

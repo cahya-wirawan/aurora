@@ -3820,10 +3820,22 @@ impl CompositeBudget {
 /// [`aurora_doc::LayerTree::paint_order`] — a nested group's own
 /// contents stay scoped to their own immediate parent's compositing
 /// pass rather than unpacking into a grandparent's), bottom-to-top,
-/// each recursively resolved by this same function, into a fresh
-/// buffer starting fully transparent via the same
-/// `aurora_render::composite_tile_cpu` this function's own caller uses
-/// one level up. A child that is itself a group is resolved by
+/// each recursively resolved by this same function and folded, one at
+/// a time, into a single running buffer that starts fully transparent
+/// (`aurora_render::transparent_tile`) via
+/// `aurora_render::composite_layer_into` — the same per-layer primitive
+/// this function's own caller folds *this* result into one level up.
+/// Folding in place rather than collecting every child's own full
+/// 512 KiB tile buffer first is what keeps a group's peak memory
+/// proportional to the tree's *depth* instead of to one group's sibling
+/// count; it is bit-identical to the batch
+/// `aurora_render::composite_tile_cpu` call it replaces, because that
+/// primitive's own loop body reads no state beyond the accumulator, the
+/// source, the opacity and the mode — so N folds and one batch call are
+/// the same computation by construction (see the `Group` arm's own
+/// comment below, and `composite_layer_into`'s doc comment, for what
+/// does and does not count as evidence for that). A child that is
+/// itself a group is resolved by
 /// recursing into this branch again, so nesting falls out for free (up
 /// to the two bounds below — every tree `aurora-doc` will accept stays
 /// inside both, so no well-formed document is affected).
@@ -3897,7 +3909,7 @@ impl CompositeBudget {
 /// unapplied** — the caller (whichever level actually contains `id`:
 /// the document root, or a parent group's own recursive call into this
 /// function) is the one that applies them, via its own
-/// `aurora_render::composite_tile_cpu` call.
+/// `aurora_render::composite_layer_into` call.
 ///
 /// **[`aurora_doc::BlendMode::Dissolve`] is the one exception to "this
 /// function never applies anything itself"**: for a
@@ -3969,7 +3981,7 @@ impl CompositeBudget {
 /// `(0.0, 0.0, 1.0, 1.0)` at reduced alpha. Handing that premultiplied
 /// buffer back up as if it were straight-alpha texels — what every
 /// other branch of this function actually returns, and what the
-/// caller's own `composite_tile_cpu` call one level up actually expects
+/// caller's own `composite_layer_into` call one level up actually expects
 /// — would double-attenuate the colour on the next pass. **Fixed**: the
 /// code below this doc comment un-premultiplies the isolated buffer
 /// (dividing `r`/`g`/`b` by `a`, guarded against `a == 0.0`) before
@@ -4130,7 +4142,33 @@ fn resolve_tile(
             Some((texels, opacity, blend_mode))
         }
         aurora_doc::LayerKind::Group { children } => {
-            let mut child_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> = Vec::new();
+            // Folded in place, one child at a time, rather than collected
+            // into a `Vec` of every child's own full tile buffer for a
+            // single batch `aurora_render::composite_tile_cpu` call: each
+            // child's `Vec<f16>` (512 KiB, `aurora_tile::SAMPLES` `f16`s)
+            // is dropped at the end of its own loop iteration, before the
+            // next child recurses. Peak memory is therefore bounded by
+            // the layer tree's *depth*, not by any one group's sibling
+            // count -- it is not constant, just no longer proportional to
+            // how many layers a user happened to put in one group. See
+            // `aurora_doc::MAX_LAYER_TREE_DEPTH`'s own doc comment for
+            // why the bound is `depth + 1` buffers rather than `2 *
+            // depth`: only the frame just returned into ever holds an
+            // accumulator and a child buffer at the same time.
+            //
+            // Bit-identical to the batch `composite_tile_cpu` call it
+            // replaces **by construction**, not by test:
+            // `composite_layer_into`'s loop body reads no state beyond
+            // `dst`/`src`/`opacity`/`mode`, so there is nothing a batch
+            // call could carry across layers that N separate calls
+            // could not. (The `aurora-render` test named
+            // `composite_layer_into_folded_one_at_a_time_matches_the_batch_composite`
+            // used to be cited here as proof of that; it is not one --
+            // `composite_tile_cpu` is now defined as this same fold, so
+            // both of its sides are the same calls. The math itself is
+            // pinned by
+            // `composite_layer_into_folded_matches_hand_computed_golden_values`.)
+            let mut isolated = aurora_render::transparent_tile();
             for &child_id in children.iter().rev() {
                 // Stop as soon as the budget is spent rather than still
                 // making one no-op `resolve_tile` call per remaining
@@ -4158,15 +4196,16 @@ fn resolve_tile(
                     depth.saturating_add(1),
                     budget,
                 ) {
-                    child_texels.push(resolved);
+                    let (child, child_opacity, child_blend_mode) = resolved;
+                    aurora_render::composite_layer_into(
+                        &mut isolated,
+                        &child,
+                        child_opacity,
+                        child_blend_mode,
+                    );
                 }
             }
-            let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = child_texels
-                .iter()
-                .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
-                .collect();
-            let mut isolated = aurora_render::composite_tile_cpu(&refs);
-            // Un-premultiply: `composite_tile_cpu` accumulates straight-
+            // Un-premultiply: `composite_layer_into` accumulates straight-
             // alpha "over" math onto a starting-*transparent* destination,
             // which yields a *premultiplied* result whenever the
             // accumulated alpha ends up fractional (see this function's
@@ -4174,8 +4213,9 @@ fn resolve_tile(
             // child alone on transparent gives `(0, 0, 0.5, 0.5)`, not the
             // straight `(0, 0, 1.0, 0.5)`). Every other branch of this
             // function returns true straight-alpha texels, and the
-            // caller's own `composite_tile_cpu` call one level up expects
-            // straight-alpha inputs too -- so divide `r`/`g`/`b` by `a`
+            // caller's own `composite_layer_into` call one level up
+            // expects straight-alpha inputs too -- so divide `r`/`g`/`b`
+            // by `a`
             // here to convert this group's own isolated buffer back to
             // straight alpha before handing it back as `id`'s own
             // pseudo-layer texels. Guarded against `a == 0.0` (fully
@@ -4228,6 +4268,71 @@ fn resolve_tile(
             Some((isolated, opacity, blend_mode))
         }
     }
+}
+
+/// Composites one tile of `layers`' **root level** on the CPU: every
+/// root layer resolved by [`resolve_tile`] in paint order (bottom-to-top
+/// — [`aurora_doc::LayerTree::roots`] is newest-first) and folded, one
+/// at a time, into a single running accumulator.
+///
+/// Extracted because the two callers that need it —
+/// [`recomposite_visible_tiles`]' own CPU path and
+/// [`composite_document`]'s export loop — had the identical loop written
+/// out twice, and 0.51.0's fold-in-place change had to be made in both
+/// places independently (a third copy, over a *group's* children rather
+/// than the document's roots, stays inline in [`resolve_tile`]'s own
+/// `Group` arm: it also has the depth increment, the per-child budget
+/// exhaustion break, and the un-premultiply/mask/`Dissolve` tail, so
+/// unifying it here would take more than it gave). Keeping one copy also
+/// means the still-open premultiplied-alpha gap named in PLAN.md — the
+/// un-premultiply step that runs in the `Group` arm and is missing from
+/// both of these paths — has exactly one place to be fixed.
+///
+/// The accumulator starts fully transparent
+/// (`aurora_render::transparent_tile`) and each resolved child buffer is
+/// dropped at the end of its own iteration, so peak memory here is one
+/// tile buffer plus whatever the recursion below it holds, rather than
+/// one full [`aurora_tile::SAMPLES`]-length buffer per root layer —
+/// see `composite_document_composites_five_hundred_root_level_sibling_layers`
+/// for the regression test, and `MAX_LAYER_TREE_DEPTH`'s own doc comment
+/// in `aurora-doc` for what does still bound it.
+///
+/// **Returns premultiplied-alpha texels whenever the accumulated alpha
+/// ends up fractional**, exactly as `aurora_render::composite_layer_into`
+/// does onto a transparent start. `resolve_tile`'s `Group` arm converts
+/// that back to straight alpha before handing a group's buffer up a
+/// level; neither caller of *this* function does, which is the gap
+/// PLAN.md records as open, not a property to rely on.
+///
+/// Charging the tile against `budget` (`CompositeBudget::next_tile`) is
+/// the caller's job, kept at the call site where the per-tile loop
+/// itself is visible. `1` is the depth passed to [`resolve_tile`], the
+/// same depth `aurora-doc`'s own validator starts its budget at for a
+/// root-level layer.
+fn composite_roots_into_tile(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    budget: &mut CompositeBudget,
+) -> Vec<half::f16> {
+    let mut composited = aurora_render::transparent_tile();
+    for &id in layers.roots().iter().rev() {
+        if let Some((texels, opacity, blend_mode)) = resolve_tile(
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            1,
+            budget,
+        ) {
+            aurora_render::composite_layer_into(&mut composited, &texels, opacity, blend_mode);
+        }
+    }
+    composited
 }
 
 /// Whether every visible root-level layer in `layers` is a `Normal`-blend
@@ -4807,29 +4912,7 @@ fn recomposite_visible_tiles(
                                    doc_origin: (i64, i64),
                                    budget: &mut CompositeBudget| {
         budget.next_tile(layers);
-        let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
-            Vec::with_capacity(layers.roots().len());
-        for &id in layers.roots().iter().rev() {
-            // `1`: a root-level layer, the same depth `aurora-doc`'s
-            // own validator starts its budget at.
-            if let Some(resolved) = resolve_tile(
-                id,
-                layers,
-                store,
-                tile_id,
-                doc_origin,
-                reference_origin,
-                1,
-                budget,
-            ) {
-                layer_texels.push(resolved);
-            }
-        }
-        let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
-            .iter()
-            .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
-            .collect();
-        aurora_render::composite_tile_cpu(&refs)
+        composite_roots_into_tile(layers, store, tile_id, doc_origin, reference_origin, budget)
     };
 
     // Phase 1: issue every GPU-qualifying, not-yet-current tile's GPU
@@ -5188,29 +5271,17 @@ fn composite_document(
                 );
 
                 budget.next_tile(layers);
-                let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
-                    Vec::with_capacity(layers.roots().len());
-                for &id in layers.roots().iter().rev() {
-                    // `1`: a root-level layer, the same depth
-                    // `aurora-doc`'s own validator starts its budget at.
-                    if let Some(resolved) = resolve_tile(
-                        id,
-                        layers,
-                        store,
-                        tile_id,
-                        doc_origin,
-                        (0, 0),
-                        1,
-                        &mut budget,
-                    ) {
-                        layer_texels.push(resolved);
-                    }
-                }
-                let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
-                    .iter()
-                    .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
-                    .collect();
-                let composited = aurora_render::composite_tile_cpu(&refs);
+                // `(0, 0)` as the reference origin: an export always
+                // measures from the document's own origin, unlike the
+                // on-screen path, which measures from the viewport.
+                let composited = composite_roots_into_tile(
+                    layers,
+                    store,
+                    tile_id,
+                    doc_origin,
+                    (0, 0),
+                    &mut budget,
+                );
 
                 let origin_x = tx * tile_size;
                 let origin_y = ty * tile_size;
@@ -12396,6 +12467,227 @@ mod tests {
             );
         }
     }
+    /// How many ordinary sibling pixel layers the many-sibling group
+    /// test below puts inside one group — the exact count PLAN.md's own
+    /// diagnosis measured at ~1 GB RSS before `resolve_tile` folded its
+    /// children in one at a time instead of collecting every sibling's
+    /// full tile buffer first.
+    const SIBLINGS: usize = 2_000;
+
+    /// How many ordinary *root-level* pixel layers the no-group version
+    /// of that test below uses. Deliberately a quarter of `SIBLINGS`:
+    /// this one covers a second, separate pair of fold sites
+    /// (`recomposite_visible_tiles`' CPU path and `composite_document`'s
+    /// export loop, which had the identical collect-all-first shape and
+    /// now share `composite_roots_into_tile`), and 500 is already an
+    /// unmistakable separation — the same binary, this test alone,
+    /// measured at **~264 MiB** peak RSS with the export loop reverted
+    /// to its collect-all-first form and **~15 MiB** with the fold in
+    /// place, independently across two separate reviewers' runs (264.3 /
+    /// 15.1, then 264.2 / 15.3 on re-verification) — the exact figure
+    /// moves by a fraction of a megabyte between runs (RSS measurement
+    /// noise, not a regression signal), the two-orders-of-magnitude drop
+    /// does not — without paying a second time for 2,000 real scratch-tile
+    /// writes on every CI platform. The 2,000 figure is kept for the
+    /// group test alone, where it matches the scenario PLAN.md actually
+    /// measured.
+    const ROOT_SIBLINGS: usize = 500;
+
+    #[test]
+    // The regression test for the *other* two fold sites: no group is
+    // involved at all. `resolve_tile`'s `Group` arm was not the only
+    // place that collected one full `aurora_tile::SAMPLES`-length `f16`
+    // buffer (512 KiB) per contributor before a single batch composite —
+    // `recomposite_visible_tiles`' own CPU closure and
+    // `composite_document`'s export loop both did it over
+    // `layers.roots()`, so a flat document with no groups at all reached
+    // the same peak-memory shape. Review 2026-08-24 noted the original
+    // memory test exercised only the `Group` arm; this one goes through
+    // `composite_document` directly, which is the export path and always
+    // runs on the CPU whatever the GPU situation is.
+    //
+    // Same construction and same reasoning as the group test below: only
+    // the bottom-most and top-most of the `ROOT_SIBLINGS` layers are
+    // filled, and the untouched ones still materialise a real, full,
+    // blank tile through `TileStore::get`, so all `ROOT_SIBLINGS`
+    // buffers are genuinely resolved and folded while contributing
+    // nothing (an `alpha = 0` source is an exact identity in
+    // `aurora_render::composite_layer_into`).
+    //
+    // Hand-computed: roots fold bottom-to-top (`roots().iter().rev()`,
+    // and `roots()` is newest-first, so the first-added layer is
+    // bottom-most). Opaque blue lands first over the transparent start
+    // and reproduces itself exactly; the 498 blank layers are exact
+    // no-ops; opaque green at layer opacity 0.5 folds last over an
+    // opaque blue backdrop, where straight-alpha "over" reduces to
+    // `alpha*src + (1-alpha)*dst`: r = 0.5*0 + 0.5*0 = 0.0,
+    // g = 0.5*1 + 0.5*0 = 0.5, b = 0.5*0 + 0.5*1 = 0.5,
+    // a = 0.5 + 1*0.5 = 1.0 -> (0.0, 0.5, 0.5, 1.0). The accumulator
+    // ends fully opaque, so premultiplied and straight alpha coincide
+    // and the missing un-premultiply step on this path (see PLAN.md's
+    // own 2026-08-24 disclosure) does not affect this expectation.
+    fn composite_document_composites_five_hundred_root_level_sibling_layers() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let mut roots = Vec::with_capacity(ROOT_SIBLINGS);
+        for i in 0..ROOT_SIBLINGS {
+            let id = match layers.add_pixel_layer(format!("root {i}"), bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            roots.push(id);
+        }
+        let (Some(&bottom), Some(&top)) = (roots.first(), roots.last()) else {
+            unreachable!("ROOT_SIBLINGS is a non-zero constant");
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+        // Nothing but the root layers themselves, and `CompositeBudget`
+        // is seeded to exactly `layers.len()` with no slack — so a
+        // future edit that changes this fixture's shape fails here
+        // loudly rather than silently truncating the walk partway.
+        assert_eq!(layers.len(), ROOT_SIBLINGS);
+        assert_eq!(layers.roots().len(), ROOT_SIBLINGS);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [0.0, 0.0, 1.0, 1.0]), (top, [0.0, 1.0, 0.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [0.0, 0.5, 0.5, 1.0],
+                "{ROOT_SIBLINGS} root-level sibling layers, no group involved, must still \
+                 composite to the exact hand-computed blend of the two filled ones"
+            );
+        }
+    }
+
+    #[test]
+    // The direct regression test for `resolve_tile`'s own peak-memory
+    // shape: one group holding `SIBLINGS` ordinary pixel-layer children,
+    // on a trivial 10x10 document. Before the fold-in-place fix, the
+    // `Group` arm collected one full `aurora_tile::SAMPLES`-length `f16`
+    // buffer (512 KiB) per child before compositing them all in a single
+    // batch call, so peak memory scaled with sibling count rather than
+    // with nesting depth — reachable by nothing more exotic than adding
+    // a lot of layers.
+    //
+    // This is a *correctness* test that happens to exercise that shape:
+    // it passes against the pre-fix code too (the fix is bit-identical
+    // code motion, not a behaviour change), and what it guards is that
+    // folding children in one at a time still produces the exact same
+    // pixel. Only two of the `SIBLINGS` children are filled; the rest
+    // are left untouched, which is deliberate — `TileStore::get` returns
+    // a real, full, blank tile for an untouched surface, so all
+    // `SIBLINGS` real buffers are genuinely materialised and folded,
+    // while an `alpha = 0` source is an exact identity in
+    // `aurora_render::composite_layer_into` (`alpha = 0` makes
+    // `inverse = 1`, so every channel writes back its own current value
+    // and the alpha accumulation is `0 + da * 1`) and contributes
+    // nothing to the expected value.
+    //
+    // Hand-computed, following `resolve_tile`'s own isolate-then-apply
+    // semantic (same style as
+    // `composite_document_applies_a_groups_own_opacity_to_its_isolated_children`):
+    // children fold bottom-up, so the first-added child (opaque blue)
+    // lands first, reproducing itself exactly over the transparent
+    // start; the 1,998 blank children are exact no-ops; the last-added
+    // child (opaque green at layer opacity 0.5) folds last over an
+    // opaque blue backdrop, and straight-alpha "over" an opaque backdrop
+    // reduces to `alpha*src + (1-alpha)*dst` per channel:
+    // r = 0.5*0 + 0.5*0 = 0.0, g = 0.5*1 + 0.5*0 = 0.5,
+    // b = 0.5*0 + 0.5*1 = 0.5, a = 0.5 + 1*0.5 = 1.0 -> the group's own
+    // isolated buffer is (0.0, 0.5, 0.5, 1.0). It is already opaque, so
+    // the un-premultiply step is the identity, and the group's own
+    // documented defaults (opacity 1.0, `Normal`) composite that fully
+    // opaque buffer over the opaque red background unchanged.
+    fn composite_document_composites_two_thousand_sibling_layers_in_one_group() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // `group` is added after `background`, so it sits above it.
+        assert_eq!(layers.roots(), [group, background]);
+
+        let mut children = Vec::with_capacity(SIBLINGS);
+        for i in 0..SIBLINGS {
+            let child = match layers.add_pixel_layer(format!("child {i}"), bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            children.push(child);
+        }
+        let (Some(&bottom), Some(&top)) = (children.first(), children.last()) else {
+            unreachable!("SIBLINGS is a non-zero constant");
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+        // Every layer this document has: the background, the group, and
+        // its children. `CompositeBudget` is seeded to exactly
+        // `layers.len()` nodes with no slack, so a future edit that
+        // changes the fixture's shape must fail here loudly rather than
+        // silently truncating the walk partway through the siblings.
+        assert_eq!(layers.len(), SIBLINGS + 2);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [1.0, 0.0, 0.0, 1.0]),
+            (bottom, [0.0, 0.0, 1.0, 1.0]),
+            (top, [0.0, 1.0, 0.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [0.0, 0.5, 0.5, 1.0],
+                "a group with {SIBLINGS} ordinary sibling children must still composite to \
+                 the exact hand-computed blend of the two filled ones"
+            );
+        }
+    }
+
     /// Builds `layers` into: an opaque white full-coverage background
     /// pixel layer at root level, plus a chain of `groups` nested groups
     /// (the outermost at root level, i.e. depth 1, so the innermost sits

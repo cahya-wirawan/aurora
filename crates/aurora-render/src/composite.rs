@@ -516,23 +516,16 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
     }
 }
 
-/// Composites `layers` (bottom-to-top; each entry is one tile's own full
-/// [`aurora_tile::SAMPLES`]-length `f16` texel buffer, that layer's own
-/// opacity, and that layer's own [`BlendMode`]) via straight-alpha
-/// compositing generalized to a per-blend-mode source colour — the
-/// CPU-side sibling of [`TileCompositor::composite_over`]'s own GPU
-/// shader math, needed because the actual orchestration this crate
-/// can't do itself (walking a real `aurora_doc::LayerTree` to decide
-/// *which* layers, in what order, at what opacity and blend mode)
-/// can't live here: `aurora-render` and `aurora-doc` are sibling crates
-/// in PRD §7.2's layering (neither depends on the other), so
-/// `aurora-app`, which depends on both, is where that walk actually
-/// happens (`translate_blend_mode` converts a real
-/// `aurora_doc::BlendMode` into this crate's own [`BlendMode`] at that
-/// boundary) — this is the pure per-tile math it calls once it has
-/// real layer data in hand, exactly what this module's own
-/// [`TileCompositor`] doc comment already anticipated ("the primitive
-/// real layer compositing will call once that model exists").
+/// Folds exactly one layer into `out`, a running accumulator, **in
+/// place** — the per-layer step [`composite_tile_cpu`] runs once per
+/// layer, exposed as its own primitive so that a caller which resolves
+/// its layers one at a time (`aurora-app`'s own `resolve_tile`, walking
+/// a real `aurora_doc::LayerTree` group) can drop each layer's buffer
+/// before resolving the next, instead of holding one full
+/// [`aurora_tile::SAMPLES`]-length buffer per sibling alive at once.
+/// `out` is the already-accumulated backdrop (bottom), `texels` is one
+/// tile's own full `f16` texel buffer being composited over it, with
+/// that layer's own `opacity` and [`BlendMode`].
 ///
 /// Per texel, per RGB channel: `Co = (1-as)*Cb + as*[(1-ab)*Cs +
 /// ab*B(Cb,Cs)]`, where `Cb`/`Cs` are the backdrop/source channel,
@@ -547,18 +540,163 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// blend mode, and with an opacity factor the fixed-function blend unit
 /// has no way to express.
 ///
-/// A `texels` slice whose length isn't a multiple of [`CHANNELS`] has
-/// its trailing partial texel silently dropped (`chunks_exact`) rather
-/// than erroring or panicking — real callers always pass a genuine
-/// `Tile::texels()` slice, exactly [`aurora_tile::SAMPLES`] long, so
-/// this only matters for a malformed, never-real input, and dropping a
-/// few trailing samples is a safer failure than indexing past the
-/// shorter buffer.
+/// No state whatsoever carries from one call to the next except `out`
+/// itself: every intermediate above (`alpha`, `inverse`,
+/// `backdrop_alpha`, the recovered straight backdrop) is recomputed
+/// per-texel from `out`, `texels`, `opacity`, and `mode`. That is what
+/// makes folding N layers via N calls identical to one
+/// [`composite_tile_cpu`] call over the same N layers in the same
+/// order — **by construction**, not by test: the loop below reads no
+/// state at all beyond `dst`, `src`, `opacity` and `mode`, so there is
+/// nothing a batch call could carry across layers that N separate calls
+/// could not. What pins the math itself is
+/// `composite_layer_into_folded_matches_hand_computed_golden_values`,
+/// which fixes a three-layer fold to values derived by hand from the
+/// formula above rather than from any call this module makes.
 ///
-/// Returns a fresh, [`aurora_tile::SAMPLES`]-length buffer starting from
-/// fully transparent black — an empty `layers` composites to that,
-/// exactly matching what a document with no visible pixel layers should
-/// show.
+/// `composite_layer_into_folded_one_at_a_time_matches_the_batch_composite`
+/// is a consistency smoke test, **not** evidence of either: since
+/// [`composite_tile_cpu`] is now *defined* as this fold, both sides of
+/// that assertion are literally the same sequence of calls on the same
+/// data, and it cannot fail while that definition holds. Its only real
+/// job is to fail loudly if some future edit reintroduces a bespoke
+/// per-layer loop into [`composite_tile_cpu`] that drifts from this one.
+///
+/// **Length mismatches are silently swallowed, and that is a gap, not a
+/// guarantee.** A `texels` (or `out`) slice whose length isn't a
+/// multiple of [`CHANNELS`] has its trailing partial texel dropped
+/// (`chunks_exact`), and because the two slices are *zipped*, a length
+/// mismatch between them composites only the shorter one's worth of
+/// texels. Neither case can index or write past either buffer's own
+/// end — but do not read that as a deliberate safety property. The
+/// honest statement is that this function drops content with no error
+/// and no way for a caller to notice. It is *not* purely hypothetical:
+/// `aurora_tile::codec`'s own decode path validates only an **upper**
+/// bound on a scratch-disk tile's decoded length, never that it equals
+/// [`aurora_tile::SAMPLES`], so a truncated or corrupted scratch file
+/// can reach a caller as a short slice. Closing that belongs in
+/// `aurora-tile`'s own decode validation, not here; it is recorded as
+/// separate open work in PLAN.md's M1.8 notes, and named here only so
+/// this zip is not mistaken for the thing that makes it safe.
+///
+/// **Scope**: [`BlendMode`] covers 26 of `aurora_doc::BlendMode`'s
+/// real 27 variants. The inventory, the `Dissolve` boundary, and why
+/// this is a CPU implementation at all are on [`composite_tile_cpu`]'s
+/// own doc comment, which is this family's entry point.
+///
+/// **The accumulator's own backdrop colour, recovered before blending —
+/// not assumed straight-alpha as-is.** `blend_rgb`/`blend_channel`'s
+/// own math (`Multiply`, `Screen`, the HSL family, ...) is only correct
+/// when the `Cb` (backdrop) colour it receives is a *true straight-alpha*
+/// colour. That is automatically true for every layer composited over an
+/// already-*opaque* backdrop (`backdrop_alpha == 1.0`) — the case every
+/// test in this module exercises, since each seeds an opaque bottom layer
+/// first — because a straight colour and its premultiplied form are
+/// identical at `alpha = 1.0`. It is **not** true when the accumulator
+/// (`out`, here) is itself still translucent partway through a
+/// multi-layer accumulation: the running `dr`/`dg`/`db` at that point
+/// hold this function's own straight-alpha "over" accumulation, which is
+/// a *premultiplied* colour whenever the accumulated alpha is fractional
+/// (e.g. a lone 50%-opacity layer composited alone onto a starting
+/// fully-transparent `out` leaves `dr = 0.5` for a source whose own true
+/// colour is `1.0`, while `da` correctly holds `0.5`). A second layer
+/// then blending against that raw, still-premultiplied state via a
+/// non-`Normal` mode would hand `blend_rgb` the wrong `Cb`. So: before
+/// calling `blend_rgb`, the current backdrop colour is divided by
+/// `backdrop_alpha` to recover its true straight colour (guarded against
+/// `backdrop_alpha == 0.0`, where there is no meaningful colour to
+/// recover — `[0.0, 0.0, 0.0]` is used instead, the same guard shape
+/// `aurora-app`'s own `resolve_tile` already uses for its own, later,
+/// un-premultiply step). This changes nothing about the alpha
+/// accumulation or the final blended-RGB accumulation formulas below,
+/// both already correct — only `blend_rgb`'s own input. See
+/// `composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`
+/// for a worked example, and `aurora-app`'s own `resolve_tile` doc
+/// comment for how this closes the gap that function's group-isolation
+/// path used to leave open.
+pub fn composite_layer_into(out: &mut [f16], texels: &[f16], opacity: f32, mode: BlendMode) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    for (dst, src) in out
+        .chunks_exact_mut(CHANNELS)
+        .zip(texels.chunks_exact(CHANNELS))
+    {
+        let [dr, dg, db, da] = dst else { continue };
+        let [sr, sg, sb, sa] = src else { continue };
+        let alpha = sa.to_f32() * opacity;
+        let inverse = 1.0 - alpha;
+        let backdrop_alpha = da.to_f32();
+        let backdrop_inverse = 1.0 - backdrop_alpha;
+        // Recover the backdrop's true straight-alpha colour before
+        // handing it to `blend_rgb` as `Cb` -- see this function's
+        // own doc comment above for why the raw accumulator state
+        // isn't always already straight alpha.
+        let straight_backdrop = if backdrop_alpha > 0.0 {
+            [
+                dr.to_f32() / backdrop_alpha,
+                dg.to_f32() / backdrop_alpha,
+                db.to_f32() / backdrop_alpha,
+            ]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+        let [br, bg, bb] = blend_rgb(
+            mode,
+            straight_backdrop,
+            [sr.to_f32(), sg.to_f32(), sb.to_f32()],
+        );
+        let blended_r = backdrop_inverse * sr.to_f32() + backdrop_alpha * br;
+        let blended_g = backdrop_inverse * sg.to_f32() + backdrop_alpha * bg;
+        let blended_b = backdrop_inverse * sb.to_f32() + backdrop_alpha * bb;
+        *dr = f16::from_f32(inverse * dr.to_f32() + alpha * blended_r);
+        *dg = f16::from_f32(inverse * dg.to_f32() + alpha * blended_g);
+        *db = f16::from_f32(inverse * db.to_f32() + alpha * blended_b);
+        *da = f16::from_f32(alpha + da.to_f32() * inverse);
+    }
+}
+
+/// A fresh, [`aurora_tile::SAMPLES`]-length `f16` buffer of fully
+/// transparent black — the starting state every accumulation begins
+/// from, whether it's [`composite_tile_cpu`]'s own or a caller folding
+/// its layers in one at a time via [`composite_layer_into`]. Factored
+/// out so those two paths cannot drift apart on what "empty" means:
+/// a document (or group) with no visible pixel layers composites to
+/// exactly this.
+#[must_use]
+pub fn transparent_tile() -> Vec<f16> {
+    vec![f16::from_f32(0.0); SAMPLES]
+}
+
+/// Composites `layers` (bottom-to-top; each entry is one tile's own full
+/// [`aurora_tile::SAMPLES`]-length `f16` texel buffer, that layer's own
+/// opacity, and that layer's own [`BlendMode`]) into one tile.
+///
+/// The entry point to this crate's CPU compositing family, and a thin
+/// orchestration over the two primitives that hold the actual
+/// behaviour: it starts from [`transparent_tile`]'s own fully
+/// transparent black buffer and makes one [`composite_layer_into`] call
+/// per layer, in the given order. The per-texel formula and the
+/// backdrop-colour-recovery rule live on [`composite_layer_into`]'s own
+/// doc comment — read that one for what a single layer actually
+/// computes. What the whole family is *for*, and where its edges are,
+/// is here.
+///
+/// Straight-alpha *inputs*, generalized to a per-blend-mode source
+/// colour — the CPU-side sibling of [`TileCompositor::composite_over`]'s
+/// own GPU shader math, needed because the actual orchestration this
+/// crate can't do itself (walking a real `aurora_doc::LayerTree` to
+/// decide *which* layers, in what order, at what opacity and blend
+/// mode) can't live here: `aurora-render` and `aurora-doc` are sibling
+/// crates in PRD §7.2's layering (neither depends on the other), so
+/// `aurora-app`, which depends on both, is where that walk actually
+/// happens (`translate_blend_mode` converts a real
+/// `aurora_doc::BlendMode` into this crate's own [`BlendMode`] at that
+/// boundary) — this family is the pure per-tile math it calls once it
+/// has real layer data in hand, exactly what this module's own
+/// [`TileCompositor`] doc comment already anticipated ("the primitive
+/// real layer compositing will call once that model exists"). It
+/// reaches that math through [`composite_layer_into`] rather than
+/// through this batch form, one layer at a time, for the memory reason
+/// at the bottom of this comment.
 ///
 /// **Scope, stated honestly**: [`BlendMode`] implements 26 of
 /// `aurora_doc::BlendMode`'s real 27 variants — `Normal`, the
@@ -596,77 +734,21 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// properly, with a real opacity/blend-mode-aware shader) is separate,
 /// still-open follow-on work.
 ///
-/// **The accumulator's own backdrop colour, recovered before blending —
-/// not assumed straight-alpha as-is.** `blend_rgb`/`blend_channel`'s
-/// own math (`Multiply`, `Screen`, the HSL family, ...) is only correct
-/// when the `Cb` (backdrop) colour it receives is a *true straight-alpha*
-/// colour. That is automatically true for every layer composited over an
-/// already-*opaque* backdrop (`backdrop_alpha == 1.0`) — the case every
-/// test in this module exercises, since each seeds an opaque bottom layer
-/// first — because a straight colour and its premultiplied form are
-/// identical at `alpha = 1.0`. It is **not** true when the accumulator
-/// (`out`, here) is itself still translucent partway through this
-/// function's own loop: the running `dr`/`dg`/`db` at that point hold
-/// this function's own straight-alpha "over" accumulation, which is a
-/// *premultiplied* colour whenever the accumulated alpha is fractional
-/// (e.g. a lone 50%-opacity layer composited alone onto the starting
-/// fully-transparent `out` leaves `dr = 0.5` for a source whose own true
-/// colour is `1.0`, while `da` correctly holds `0.5`). A second layer
-/// then blending against that raw, still-premultiplied state via a
-/// non-`Normal` mode would hand `blend_rgb` the wrong `Cb`. So: before
-/// calling `blend_rgb`, the current backdrop colour is divided by
-/// `backdrop_alpha` to recover its true straight colour (guarded against
-/// `backdrop_alpha == 0.0`, where there is no meaningful colour to
-/// recover — `[0.0, 0.0, 0.0]` is used instead, the same guard shape
-/// `aurora-app`'s own `resolve_tile` already uses for its own, later,
-/// un-premultiply step). This changes nothing about the alpha
-/// accumulation or the final blended-RGB accumulation formulas below,
-/// both already correct — only `blend_rgb`'s own input. See
-/// `composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`
-/// for a worked example, and `aurora-app`'s own `resolve_tile` doc
-/// comment for how this closes the gap that function's group-isolation
-/// path used to leave open.
+/// Returns a fresh, [`aurora_tile::SAMPLES`]-length buffer; an empty
+/// `layers` composites to fully transparent black, exactly matching
+/// what a document with no visible pixel layers should show.
+///
+/// Peak memory here is proportional to the number of `layers` the
+/// *caller* is holding buffers for, which is why `aurora-app`'s own
+/// `resolve_tile` calls [`composite_layer_into`] directly rather than
+/// collecting every sibling's buffer to pass here in one batch. This
+/// batch form stays for callers that genuinely have all their slices in
+/// hand already (and for the tests in this module).
 #[must_use]
 pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
-    let mut out = vec![f16::from_f32(0.0); SAMPLES];
+    let mut out = transparent_tile();
     for &(texels, opacity, mode) in layers {
-        let opacity = opacity.clamp(0.0, 1.0);
-        for (dst, src) in out
-            .chunks_exact_mut(CHANNELS)
-            .zip(texels.chunks_exact(CHANNELS))
-        {
-            let [dr, dg, db, da] = dst else { continue };
-            let [sr, sg, sb, sa] = src else { continue };
-            let alpha = sa.to_f32() * opacity;
-            let inverse = 1.0 - alpha;
-            let backdrop_alpha = da.to_f32();
-            let backdrop_inverse = 1.0 - backdrop_alpha;
-            // Recover the backdrop's true straight-alpha colour before
-            // handing it to `blend_rgb` as `Cb` -- see this function's
-            // own doc comment above for why the raw accumulator state
-            // isn't always already straight alpha.
-            let straight_backdrop = if backdrop_alpha > 0.0 {
-                [
-                    dr.to_f32() / backdrop_alpha,
-                    dg.to_f32() / backdrop_alpha,
-                    db.to_f32() / backdrop_alpha,
-                ]
-            } else {
-                [0.0, 0.0, 0.0]
-            };
-            let [br, bg, bb] = blend_rgb(
-                mode,
-                straight_backdrop,
-                [sr.to_f32(), sg.to_f32(), sb.to_f32()],
-            );
-            let blended_r = backdrop_inverse * sr.to_f32() + backdrop_alpha * br;
-            let blended_g = backdrop_inverse * sg.to_f32() + backdrop_alpha * bg;
-            let blended_b = backdrop_inverse * sb.to_f32() + backdrop_alpha * bb;
-            *dr = f16::from_f32(inverse * dr.to_f32() + alpha * blended_r);
-            *dg = f16::from_f32(inverse * dg.to_f32() + alpha * blended_g);
-            *db = f16::from_f32(inverse * db.to_f32() + alpha * blended_b);
-            *da = f16::from_f32(alpha + da.to_f32() * inverse);
-        }
+        composite_layer_into(&mut out, texels, opacity, mode);
     }
     out
 }
@@ -1030,8 +1112,8 @@ impl std::fmt::Debug for TileCompositor {
 mod tests {
     use super::{
         BlendMode, TileCompositor, blend_channel, blend_color, blend_darker_color, blend_hue,
-        blend_lighter_color, blend_luminosity, blend_saturation, clip_color, composite_tile_cpu,
-        lum, sat, set_lum, set_sat, soft_light_d,
+        blend_lighter_color, blend_luminosity, blend_saturation, clip_color, composite_layer_into,
+        composite_tile_cpu, lum, sat, set_lum, set_sat, soft_light_d, transparent_tile,
     };
     use crate::test_support::real_context;
     use aurora_tile::{SAMPLES, TILE};
@@ -1249,6 +1331,134 @@ mod tests {
             (0.375, 0.3125, 0.421_875, 1.0),
             "this is the pre-fix value: Multiply run directly against the raw \
              premultiplied accumulator instead of its recovered straight colour"
+        );
+    }
+
+    #[test]
+    // A consistency smoke test, and deliberately *not* a proof of
+    // anything. `composite_tile_cpu` is now literally defined as
+    // `transparent_tile()` plus one `composite_layer_into` call per
+    // layer, so both sides of the assertion below are the same three
+    // calls on the same data: this test cannot fail while that
+    // definition holds, no matter what the underlying math does. An
+    // earlier version of this comment called it "the load-bearing
+    // proof" that the split was pure code motion, which was a
+    // tautology -- review 2026-08-24 caught it, and the assertion that
+    // actually pins the math is
+    // `composite_layer_into_folded_matches_hand_computed_golden_values`
+    // below.
+    //
+    // What it is still worth keeping for: it fails loudly if some
+    // future edit reintroduces a bespoke per-layer loop into
+    // `composite_tile_cpu` -- exactly the shape this change removed --
+    // and lets it drift from the fold. `f16` is `PartialEq`, so this is
+    // an exact whole-buffer comparison with no epsilon.
+    fn composite_layer_into_folded_one_at_a_time_matches_the_batch_composite() {
+        let bottom = solid_texels([1.0, 0.5, 0.25, 1.0]);
+        let middle = solid_texels([0.5, 0.5, 0.75, 1.0]);
+        let top = solid_texels([0.25, 0.75, 1.0, 0.5]);
+        let batched = composite_tile_cpu(&[
+            (&bottom, 0.5, BlendMode::Normal),
+            (&middle, 1.0, BlendMode::Multiply),
+            (&top, 0.75, BlendMode::Screen),
+        ]);
+
+        let mut folded = transparent_tile();
+        composite_layer_into(&mut folded, &bottom, 0.5, BlendMode::Normal);
+        composite_layer_into(&mut folded, &middle, 1.0, BlendMode::Multiply);
+        composite_layer_into(&mut folded, &top, 0.75, BlendMode::Screen);
+
+        assert_eq!(
+            folded, batched,
+            "folding one layer at a time must be bit-identical to the batch composite \
+             over the same layers in the same order"
+        );
+    }
+
+    #[test]
+    // The real, non-vacuous assertion that folding layers in one at a
+    // time computes the documented formula: a fixed three-layer stack
+    // pinned to expected values derived **by hand from
+    // `composite_layer_into`'s own doc comment**, not from any call this
+    // module makes. Nothing here reads back from `composite_tile_cpu`,
+    // so unlike the smoke test above this one fails if the per-layer
+    // math is wrong, whatever the two functions' relationship to each
+    // other happens to be.
+    //
+    // Every value below is exactly representable in `f16` (each is a
+    // dyadic rational with at most ten mantissa bits), so each stage's
+    // stored result is exact and no rounding accumulates across the
+    // three folds -- the same reasoning
+    // `composite_tile_cpu_a_single_layer_at_full_opacity_reproduces_it_over_transparent`
+    // already documents for its own exact-literal comparison.
+    //
+    // Fold 1 -- bottom (1.0, 0.5, 0.25, 1.0), opacity 0.5, `Normal`,
+    // over the fully transparent start. `as = 1.0 * 0.5 = 0.5`,
+    // `ab = 0.0` so `blend_rgb` contributes nothing and the bracket
+    // collapses to `Cs`:
+    //   R: 0.5*0.0 + 0.5*1.0  = 0.5
+    //   G: 0.5*0.0 + 0.5*0.5  = 0.25
+    //   B: 0.5*0.0 + 0.5*0.25 = 0.125
+    //   A: 0.5 + 0.0*0.5      = 0.5
+    // -> (0.5, 0.25, 0.125, 0.5), a *premultiplied* accumulator.
+    //
+    // Fold 2 -- middle (0.5, 0.5, 0.75, 1.0), opacity 1.0, `Multiply`.
+    // `as = 1.0`, `ab = 0.5`. Backdrop recovered by dividing by `ab`:
+    // (1.0, 0.5, 0.25). `Multiply` is `Cb*Cs`:
+    // (0.5, 0.25, 0.1875). With `as = 1.0` the outer mix keeps only the
+    // bracket, `(1-ab)*Cs + ab*B`:
+    //   R: 0.5*0.5  + 0.5*0.5    = 0.5
+    //   G: 0.5*0.5  + 0.5*0.25   = 0.375
+    //   B: 0.5*0.75 + 0.5*0.1875 = 0.46875
+    //   A: 1.0 + 0.5*0.0         = 1.0
+    // -> (0.5, 0.375, 0.46875, 1.0).
+    //
+    // Fold 3 -- top (0.25, 0.75, 1.0, 0.5), opacity 0.75, `Screen`.
+    // `as = 0.5 * 0.75 = 0.375`, `ab = 1.0`, so the backdrop is already
+    // straight and the bracket keeps only `B`. `Screen` is
+    // `Cb + Cs - Cb*Cs`:
+    //   R: 0.5     + 0.25 - 0.125     = 0.625
+    //   G: 0.375   + 0.75 - 0.28125   = 0.84375
+    //   B: 0.46875 + 1.0  - 0.46875   = 1.0
+    // then `Co = (1-as)*Cb + as*B`:
+    //   R: 0.625*0.5     + 0.375*0.625   = 0.546875
+    //   G: 0.625*0.375   + 0.375*0.84375 = 0.55078125
+    //   B: 0.625*0.46875 + 0.375*1.0     = 0.66796875
+    //   A: 0.375 + 1.0*0.625             = 1.0
+    fn composite_layer_into_folded_matches_hand_computed_golden_values() {
+        let bottom = solid_texels([1.0, 0.5, 0.25, 1.0]);
+        let middle = solid_texels([0.5, 0.5, 0.75, 1.0]);
+        let top = solid_texels([0.25, 0.75, 1.0, 0.5]);
+
+        let mut folded = transparent_tile();
+        assert_eq!(
+            first_texel(&folded),
+            (0.0, 0.0, 0.0, 0.0),
+            "an accumulation starts from fully transparent black"
+        );
+
+        composite_layer_into(&mut folded, &bottom, 0.5, BlendMode::Normal);
+        assert_eq!(
+            first_texel(&folded),
+            (0.5, 0.25, 0.125, 0.5),
+            "fold 1: a half-opacity Normal layer over transparent leaves a \
+             premultiplied accumulator"
+        );
+
+        composite_layer_into(&mut folded, &middle, 1.0, BlendMode::Multiply);
+        assert_eq!(
+            first_texel(&folded),
+            (0.5, 0.375, 0.46875, 1.0),
+            "fold 2: Multiply must run against the *recovered* straight backdrop \
+             (1.0, 0.5, 0.25), not the raw premultiplied (0.5, 0.25, 0.125)"
+        );
+
+        composite_layer_into(&mut folded, &top, 0.75, BlendMode::Screen);
+        assert_eq!(
+            first_texel(&folded),
+            (0.546_875, 0.550_781_25, 0.667_968_75, 1.0),
+            "fold 3: Screen over the now-opaque accumulator, at an effective \
+             alpha of 0.5 * 0.75 = 0.375"
         );
     }
 

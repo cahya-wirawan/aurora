@@ -32,6 +32,12 @@
 //! changes, translating that real document blend mode into this crate's
 //! own narrower [`BlendMode`] at the boundary; a real GPU-accelerated
 //! version is separate, still-open follow-on work (PLAN.md M1.9).
+//! [`composite_layer_into`] is the per-layer step that whole family of
+//! math actually lives in, exposed on its own so a caller resolving its
+//! layers one at a time can fold each into a running accumulator (from
+//! [`transparent_tile`]) and drop it before resolving the next, rather
+//! than holding one full-tile buffer per sibling alive at once;
+//! [`composite_tile_cpu`] is the batch form over the same primitive.
 //!
 //! Progressive rendering (finding
 //! #3's "render a lower-resolution mip while panning fast, refining when
@@ -53,7 +59,9 @@ mod schedule;
 #[cfg(test)]
 mod test_support;
 
-pub use composite::{BlendMode, TileCompositor, composite_tile_cpu};
+pub use composite::{
+    BlendMode, TileCompositor, composite_layer_into, composite_tile_cpu, transparent_tile,
+};
 pub use executor::{Executor, TaskId};
 pub use mip::{MipLevel, downsample};
 pub use preview::{PreviewError, upload_preview};
