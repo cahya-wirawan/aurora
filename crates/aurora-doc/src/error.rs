@@ -69,16 +69,39 @@ pub enum DocError {
     /// valid, `postcard`-encoded journal.
     #[error("failed to deserialize the crash-recovery journal: {0}")]
     JournalDeserialization(String),
-    /// A deserialized [`crate::LayerTree`] nests groups deeper than
+    /// A [`crate::LayerTree`] nests groups deeper than
     /// [`crate::MAX_LAYER_TREE_DEPTH`] — see that constant's own doc
     /// comment for why a bound exists at all.
-    #[error("layer tree nests {depth} levels deep, past this reader's own {max}-level limit")]
+    ///
+    /// Returned from both ends of that bound, so that "a tree this
+    /// crate's API will build" and "a tree its validators accept" stay
+    /// the same set: by the live-edit producers
+    /// [`crate::LayerTree::add_pixel_layer`],
+    /// [`crate::LayerTree::add_group`] and
+    /// [`crate::LayerTree::reparent`], which refuse an edit that would
+    /// nest past the bound, *and* by the deserialize-time validator
+    /// (and the history journal's own subtree splice), which refuses
+    /// bytes already nested past it. The same pairing
+    /// [`Self::OpacityOutOfRange`] already has.
+    ///
+    /// `depth` is the depth the refused layer — or, for
+    /// [`crate::LayerTree::reparent`], the deepest node of the moved
+    /// subtree — would have landed at.
+    #[error("layer tree nests {depth} levels deep, past the {max}-level limit")]
     LayerTreeTooDeep { depth: usize, max: usize },
-    /// A deserialized [`crate::LayerTree`] reaches the same layer twice
-    /// while walking down from its roots — a group that (directly or
-    /// through a chain of groups) contains itself, or the same layer
-    /// listed as a child of two different parents. Neither is a tree,
-    /// and every traversal in this crate assumes one.
+    /// A layer tree reaches the same layer twice while walking down
+    /// from its roots — a group that (directly or through a chain of
+    /// groups) contains itself, or the same layer listed as a child of
+    /// two different parents. Neither is a tree, and every traversal in
+    /// this crate assumes one. Returned by the deserialize-time
+    /// validator for a manifest already in this shape, *and* by
+    /// [`crate::LayerTree::reparent`]'s own internal subtree-height walk
+    /// when the subtree being moved is already in this shape — reachable
+    /// there only through a hand-built tree or the `test-support`
+    /// escape hatch, never through this crate's own public API or any
+    /// file it will read, since nothing else can construct one. The
+    /// same "both a read-time and an edit-time source" pairing
+    /// [`Self::LayerTreeTooDeep`] already has, and for the same reason.
     #[error(
         "layer {0:?} is reachable more than once from the layer tree's roots: a cycle, or the same layer listed under two parents"
     )]

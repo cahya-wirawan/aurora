@@ -8,9 +8,20 @@ use aurora_core::{IdGenerator, Rect};
 use crate::error::DocError;
 use crate::layer::{BlendMode, Layer, LayerEntry, LayerId, LayerKind, LayerLock, LayerMask};
 
-/// The deepest group nesting a [`LayerTree`] deserialized from bytes may
-/// declare — see [`LayerTree`]'s own `Deserialize` notes for the whole
+/// The deepest group nesting a [`LayerTree`] may reach, however it was
+/// built — see [`LayerTree`]'s own `Deserialize` notes for the whole
 /// rationale.
+///
+/// Enforced at both ends, so the set of trees this crate's API will
+/// build and the set its validators accept are the same set: this
+/// module's own `validate_shape` refuses bytes (and a spliced subtree)
+/// already nested past it, and
+/// [`LayerTree::add_pixel_layer`]/[`LayerTree::add_group`]/
+/// [`LayerTree::reparent`] refuse a live edit that would nest past it.
+/// The producer half was missing until 0.50.0, which meant ordinary
+/// editing could grow a document that no `.aur` save could ever
+/// round-trip — `aurora-io` verifies a write by reopening, and the read
+/// side runs that same validator.
 ///
 /// The number is deliberately far above any real document and far below
 /// anything that strains a traversal: Photoshop's own UI has never let a
@@ -477,10 +488,23 @@ impl LayerTree {
     ///
     /// Returns [`DocError::UnknownLayer`] if `parent` is `Some` and
     /// doesn't exist, or [`DocError::NotAGroup`] if `parent` names a
-    /// pixel layer. Also returns [`DocError::LayerIdCollision`] if the
-    /// id generated for the new layer is somehow already in use — see
-    /// that variant for why it is returned rather than asserted away.
-    /// Nothing is added when any of these happens.
+    /// pixel layer. Returns [`DocError::LayerTreeTooDeep`] if the new
+    /// layer would land deeper than [`MAX_LAYER_TREE_DEPTH`] — a
+    /// document nested past that bound cannot be saved at all (see that
+    /// constant), so the nest is refused rather than allowed and then
+    /// discovered at save time. Also returns
+    /// [`DocError::LayerIdCollision`] if the id generated for the new
+    /// layer is somehow already in use — see that variant for why it is
+    /// returned rather than asserted away.
+    ///
+    /// Nothing is added when any of these happens. No id is consumed
+    /// either — with one exception that cannot be otherwise:
+    /// [`DocError::LayerIdCollision`] is discovered *by* generating the
+    /// id, so the counter has already moved by the time the collision is
+    /// seen, and is deliberately not rewound. A generator that never
+    /// reissues an id is the property `validate_id_allocator` leans
+    /// on; rewinding it to keep this sentence unqualified would trade a
+    /// real invariant for a tidier doc comment.
     pub fn add_pixel_layer(
         &mut self,
         name: impl Into<String>,
@@ -510,6 +534,42 @@ impl LayerTree {
         )
     }
 
+    /// Whether `parent` names something a new child may hang under:
+    /// `None` (a new root) always may; `Some(id)` must exist and must be
+    /// a group.
+    ///
+    /// One implementation, called from both [`Self::insert`] and
+    /// [`Self::insert_unchecked`], rather than the two hand-written
+    /// copies those two used to carry. Both callers read the same
+    /// unmutated state, so the copies could not disagree today — but
+    /// keeping them in step was a standing obligation with nothing
+    /// enforcing it, which is the shape of drift this module argues
+    /// against elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `parent` is `Some` and names
+    /// nothing; [`DocError::NotAGroup`] if it names a pixel layer.
+    fn validate_parent(&self, parent: Option<LayerId>) -> Result<(), DocError> {
+        let Some(parent_id) = parent else {
+            return Ok(());
+        };
+        match self.layers.get(&parent_id) {
+            None => Err(DocError::UnknownLayer(parent_id)),
+            Some(entry) if !entry.kind.is_group() => Err(DocError::NotAGroup(parent_id)),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// [`Self::add_pixel_layer`]/[`Self::add_group`]'s shared body: the
+    /// depth guard, then [`Self::insert_unchecked`] for the insert
+    /// itself.
+    ///
+    /// The guard lives here rather than inside `insert_unchecked` so
+    /// that the two halves are separable -- `insert_unchecked` is what
+    /// the `test-support` escape hatch reuses to build the deliberately
+    /// over-deep tree `aurora-app`'s own `resolve_tile` bound is
+    /// defence against.
     fn insert(
         &mut self,
         name: String,
@@ -519,15 +579,58 @@ impl LayerTree {
         // Validate `parent` before touching `self.layers` at all, so a
         // failed call adds nothing -- same "all or nothing" discipline
         // `aurora_graph::RenderGraph::add_node` uses for its own inputs.
-        if let Some(parent_id) = parent {
-            match self.layers.get(&parent_id) {
-                None => return Err(DocError::UnknownLayer(parent_id)),
-                Some(entry) if !entry.kind.is_group() => {
-                    return Err(DocError::NotAGroup(parent_id));
-                }
-                Some(_) => {}
-            }
+        //
+        // Ordered *before* the depth check on purpose: a caller naming a
+        // parent that does not exist, or that is not a group, should
+        // hear about that rather than about a depth computed from an
+        // entry this method could not even find.
+        self.validate_parent(parent)?;
+
+        // A root sits at depth 1, so a child of `parent` sits one below
+        // whatever depth `parent` itself does -- the same seeding
+        // `restore` uses for a spliced subtree, and the same `1` that
+        // `validate` passes `validate_shape` for a root. Checked before
+        // `next_id`, so a refused insert does not even consume an id:
+        // an id burnt here would still be invisible in `layers` but
+        // would move the generator, and "a failed call changes nothing"
+        // is easier to keep true than to keep qualified.
+        let depth = parent.map_or(1, |id| self.depth_of(id).saturating_add(1));
+        if depth > MAX_LAYER_TREE_DEPTH {
+            return Err(DocError::LayerTreeTooDeep {
+                depth,
+                max: MAX_LAYER_TREE_DEPTH,
+            });
         }
+
+        self.insert_unchecked(name, parent, kind)
+    }
+
+    /// [`Self::insert`] without the depth guard -- every other guard
+    /// (parent exists, parent is a group, the generated id is unused)
+    /// still applies.
+    ///
+    /// Split out only so [`Self::insert`] and the `test-support`
+    /// `insert_pixel_ignoring_the_depth_limit` can share one body;
+    /// nothing else calls it, and nothing else should. Deliberately
+    /// *not* an intra-doc link: the item it names only exists when the
+    /// `test-support` feature is on, so a link here is an unresolved
+    /// one without `--all-features` — measured, and it does fail
+    /// `RUSTDOCFLAGS=-D warnings cargo doc -p aurora-doc --no-deps
+    /// --document-private-items`. A plain `cargo doc --no-deps` does
+    /// not notice, only because this method is private and its docs go
+    /// unrendered; that is not a guarantee worth depending on.
+    fn insert_unchecked(
+        &mut self,
+        name: String,
+        parent: Option<LayerId>,
+        kind: LayerKind,
+    ) -> Result<LayerId, DocError> {
+        // The same "all or nothing" parent validation `insert` already
+        // ran. Re-run rather than assumed, because this is also the
+        // entry point the `test-support` hatch uses directly -- and it
+        // is the *same* call, not a second hand-written copy that would
+        // have to be kept in step with the first.
+        self.validate_parent(parent)?;
 
         let id = self.ids.next_id();
         // The displaced value is checked, not discarded: a plain
@@ -563,6 +666,67 @@ impl LayerTree {
         };
         siblings.insert(0, id);
         Ok(id)
+    }
+
+    /// [`Self::add_pixel_layer`] with the [`MAX_LAYER_TREE_DEPTH`]
+    /// guard skipped — a **test-only** escape hatch, behind this crate's
+    /// `test-support` feature.
+    ///
+    /// Precisely what "behind a feature" buys, since the isolation is
+    /// the whole justification for this existing at all: this method is
+    /// absent from `cargo build --workspace` and from
+    /// `cargo doc --workspace --no-deps` with no extra flags. It is
+    /// *present* whenever `--all-features` is passed (which this
+    /// project's own clippy and rustdoc gate commands both do) and
+    /// whenever dev-targets are built (`cargo test`, `cargo nextest`,
+    /// `--all-targets`), because `aurora-app`'s `[dev-dependencies]`
+    /// turns the feature on. The guarantee is "not in a shipped build",
+    /// not "not in any build".
+    ///
+    /// It exists for exactly one caller: `aurora-app`'s own
+    /// `composite_document_drops_the_branch_that_nests_one_level_past_the_maximum_tree_depth`,
+    /// whose whole subject is a tree nested one level *past* the bound.
+    /// That fixture used to be built with ordinary `add_group` calls,
+    /// because nothing stopped it; now that the producers refuse, the
+    /// only honest way to keep testing `resolve_tile`'s own independent
+    /// depth guard against a genuinely over-deep tree is to build one
+    /// deliberately. Removing the fixture instead would delete the test
+    /// that proves the guard works.
+    ///
+    /// Every other guard still applies: `parent` must exist, must be a
+    /// group, and the generated id must be unused. Only the depth check
+    /// is skipped.
+    ///
+    /// It builds a [`LayerKind::Pixel`] and nothing else, on purpose.
+    /// An earlier draft took an arbitrary [`LayerKind`], which let it
+    /// construct far more than an over-deep tree — a
+    /// `LayerKind::Group { children }` naming ids that already live
+    /// elsewhere rebuilds exactly the two-parent and cycle shapes three
+    /// rounds of hardening exist to prevent, and made the sentence
+    /// above ("only the depth check is skipped") false. Its one caller
+    /// only ever passed `LayerKind::Pixel`, so the narrower signature
+    /// costs nothing and makes that sentence true.
+    ///
+    /// A tree built with this **cannot be saved**: `.aur`'s write path
+    /// verifies by reopening, and the read side's own `validate_shape`
+    /// refuses anything past [`MAX_LAYER_TREE_DEPTH`]. That is the whole
+    /// reason the guard exists, and the reason this is not a `pub`
+    /// production API.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`], [`DocError::NotAGroup`] and
+    /// [`DocError::LayerIdCollision`], exactly as
+    /// [`Self::add_pixel_layer`] returns them — but never
+    /// [`DocError::LayerTreeTooDeep`].
+    #[cfg(feature = "test-support")]
+    pub fn insert_pixel_ignoring_the_depth_limit(
+        &mut self,
+        name: impl Into<String>,
+        bounds: Rect,
+        parent: Option<LayerId>,
+    ) -> Result<LayerId, DocError> {
+        self.insert_unchecked(name.into(), parent, LayerKind::Pixel { bounds })
     }
 
     /// Removes `id` from the tree. If `id` is a group, every descendant
@@ -784,6 +948,45 @@ impl LayerTree {
     /// names a pixel layer, or [`DocError::CycleDetected`] if
     /// `new_parent` is `id` itself or one of `id`'s own descendants.
     ///
+    /// Returns [`DocError::LayerTreeTooDeep`] if the move would push any
+    /// part of the moved subtree past [`MAX_LAYER_TREE_DEPTH`] — a
+    /// document nested past that bound cannot be saved at all (see that
+    /// constant), so the move is refused rather than allowed and then
+    /// discovered at save time. The reported `depth` is where the moved
+    /// subtree's *deepest descendant* would land, not where `id` itself
+    /// would: moving a three-level group under a parent at depth 255
+    /// is refused even though `id` alone would fit.
+    ///
+    /// That downward walk is skipped entirely when `new_parent` is no
+    /// deeper than `id`'s current parent — every same-level reorder and
+    /// every move *toward* the root, which is most of what a
+    /// drag-and-drop reorder actually does. Such a move lands every node
+    /// of the moved subtree at a depth no greater than the one it
+    /// already had, so it cannot be the thing that breaks the bound.
+    /// This is a cost change, not a contract change, for any tree this
+    /// type's own API can build — measured independently three times
+    /// (build, revision, and re-verification passes), each on a legal
+    /// 40,000-layer group: 5.8-8.8 ms for the full walk before this
+    /// change, 250 ns-3 µs after; the multi-order-of-magnitude
+    /// improvement held every time, the exact figure did not, so it's
+    /// reported as a range rather than a single falsely-precise number.
+    /// Its one visible edge is
+    /// on a tree that is *already* malformed or already over-deep —
+    /// constructible only through the `test-support` hatch or a
+    /// hand-built struct literal — where a non-deepening move is now
+    /// performed rather than refused. That is the better answer anyway:
+    /// moving such a subtree shallower is what un-nesting looks like,
+    /// and refusing it traps the state instead of letting the caller
+    /// out of it.
+    ///
+    /// Returns [`DocError::MalformedLayerTree`] if that downward walk
+    /// reaches the same layer twice — a group inside itself, or one
+    /// layer listed as a child of two groups within the moved subtree.
+    /// Not reachable from any deserialized or API-built tree (both are
+    /// held to the deserialize-time validator's "each layer reached at
+    /// most once" rule); returned rather than asserted for the same reason the
+    /// `InconsistentLayerParent` case below is.
+    ///
     /// Also returns [`DocError::UnknownLayer`]/[`DocError::NotAGroup`]
     /// naming `id`'s *current* parent, or
     /// [`DocError::InconsistentLayerParent`] naming `id` itself, if the
@@ -826,6 +1029,38 @@ impl LayerTree {
             }
         }
 
+        // Both halves of the depth question, now that the destination is
+        // known good: how deep `new_parent` sits, plus how tall the
+        // moved subtree is. The `- 1` is load-bearing -- `id` itself
+        // occupies `new_depth`, not one below it, so a single leaf
+        // (height 1) moving under a parent at depth 255 lands at 256 and
+        // is legal. Placed before the first mutation below, so a refused
+        // move leaves both sibling lists and `id`'s own `parent` field
+        // exactly as they were.
+        let new_depth = new_parent.map_or(1, |p| self.depth_of(p).saturating_add(1));
+        // ...but only when the move could deepen anything. Every node of
+        // the moved subtree sits at `depth_of(id) + its level - 1` now
+        // and would sit at `new_depth + its level - 1` after, so
+        // `new_depth <= depth_of(id)` means every one of them lands no
+        // deeper than it already is and the bound cannot newly break.
+        // `depth_of` is an upward walk of one chain; `subtree_height` is
+        // a downward walk of the whole moved subtree, so skipping it
+        // turns the common drag-and-drop cases (reorder among siblings,
+        // drag out to a shallower group) from O(moved subtree) into
+        // O(depth). See this method's own doc comment for the one edge
+        // this changes.
+        if new_depth > self.depth_of(id) {
+            let deepest = new_depth
+                .saturating_add(self.subtree_height(id)?)
+                .saturating_sub(1);
+            if deepest > MAX_LAYER_TREE_DEPTH {
+                return Err(DocError::LayerTreeTooDeep {
+                    depth: deepest,
+                    max: MAX_LAYER_TREE_DEPTH,
+                });
+            }
+        }
+
         // Everything about the *destination* is validated. The source is
         // not: `old_parent` is whatever `id`'s own entry records, and on
         // a tree that never went through `validate_shape` that can name
@@ -855,8 +1090,9 @@ impl LayerTree {
         // point: `old_parent` is *recorded data* that untrusted bytes
         // can lie about, while `new_parent` and `id` were each read and
         // checked a few lines above with no intervening mutation that
-        // could invalidate them (`retain` only drops an id from a `Vec`;
-        // it removes no entry and changes no `LayerKind`). They are also
+        // could invalidate them (the removal just above drops one id
+        // from `old_siblings` via `Vec::remove`; it removes no `layers`
+        // entry and changes no `LayerKind`). They are also
         // now past the first mutation, so turning them into `?` would
         // trade an impossible abort for a reachable half-applied move --
         // `id` detached from its old parent and attached to nothing.
@@ -930,6 +1166,81 @@ impl LayerTree {
             }
         }
         depth
+    }
+
+    /// How many levels `id`'s own subtree occupies, counting `id` itself
+    /// as `1` — [`Self::reparent`]'s depth guard for the moved half.
+    /// A leaf is `1`; a group holding one leaf is `2`.
+    ///
+    /// [`Self::depth_of`] answers the other half (how deep the
+    /// *destination* sits); the two together say where the moved
+    /// subtree's deepest node would land.
+    ///
+    /// Iterative, with an explicit stack, for the same reason
+    /// [`validate_shape`] and [`Self::capture_subtree`] are: a downward
+    /// walk here can be handed a tree restored from an untrusted
+    /// journal, and recursion on a deep or cyclic one is a process
+    /// abort under `panic = "abort"`, not a catchable error. A `visited`
+    /// set expands each id at most once, so the total work is bounded by
+    /// `layers.len()` even on a tree where the same child is listed
+    /// under two parents (which would otherwise fan out exponentially).
+    ///
+    /// Two conventions borrowed from this file's neighbours. A child id
+    /// that names nothing is skipped rather than asserted away, exactly
+    /// as [`Self::capture_subtree`] and [`validate_shape`]'s own walk
+    /// loop do. And reaching the same id twice is
+    /// [`DocError::MalformedLayerTree`] — the same variant
+    /// [`validate_shape`] returns for the same shape, so
+    /// [`Self::reparent`] refuses with the *reason* rather than
+    /// reporting a malformed tree as merely "very deep", which is what
+    /// an earlier draft's saturating `MAX_LAYER_TREE_DEPTH + 1` did.
+    /// Such a tree is malformed and no move on it is safe to perform.
+    ///
+    /// Precisely what that catches, since the ideal is stronger than the
+    /// code: `visited` is per call and covers only the subtree this walk
+    /// actually descends, so it sees a cycle within that subtree, and a
+    /// child listed twice within it — but *not* a layer shared between
+    /// two sibling subtrees neither of which is being walked. That
+    /// broader rule is [`validate_shape`]'s, enforced once at
+    /// deserialization time over the whole tree; this is the local
+    /// check that keeps *this* walk finite.
+    ///
+    /// The `Ok` answer saturates at `MAX_LAYER_TREE_DEPTH + 1` rather
+    /// than counting a subtree already taller than the bound exactly.
+    /// Only the refusal is load-bearing there, and the walk stops as
+    /// soon as the outcome is settled.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::MalformedLayerTree`], naming the layer reached twice.
+    fn subtree_height(&self, id: LayerId) -> Result<usize, DocError> {
+        let refuse = MAX_LAYER_TREE_DEPTH.saturating_add(1);
+        let mut visited: HashSet<LayerId> = HashSet::new();
+        let mut stack: Vec<(LayerId, usize)> = vec![(id, 1)];
+        let mut height: usize = 1;
+
+        while let Some((current, level)) = stack.pop() {
+            if !visited.insert(current) {
+                return Err(DocError::MalformedLayerTree(current));
+            }
+            height = height.max(level);
+            // Already past the bound: no deeper level can change what
+            // the caller does with the answer, so stop walking.
+            if height > MAX_LAYER_TREE_DEPTH {
+                return Ok(refuse);
+            }
+            let Some(entry) = self.layers.get(&current) else {
+                continue;
+            };
+            let LayerKind::Group { children } = &entry.kind else {
+                continue;
+            };
+            for &child in children {
+                stack.push((child, level.saturating_add(1)));
+            }
+        }
+
+        Ok(height)
     }
 
     /// Holds this whole tree to exactly the bar
@@ -1795,6 +2106,539 @@ mod tests {
         assert_eq!(tree.children(group), Some([child].as_slice()));
         assert_eq!(tree.parent(child), Some(group));
         assert_eq!(tree.roots(), [group], "child must not also be a root");
+    }
+
+    // --- the depth bound, enforced on the producer side too ----------
+
+    /// Asserts `tree` is one both this crate's own validator and a real
+    /// `postcard` round trip accept — the two bars a document has to
+    /// clear to be saveable at all. Used after every step of the tests
+    /// below, so that "the API built it" and "`validate_shape` accepts
+    /// it" are checked to be the same set at each boundary rather than
+    /// only at the end.
+    fn assert_round_trips(tree: &LayerTree) {
+        if let Err(err) = tree.validate() {
+            unreachable!("a tree the public API built must validate: {err:?}");
+        }
+        let bytes = match postcard::to_allocvec(tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("encoding must succeed: {err:?}"),
+        };
+        if let Err(err) = postcard::from_bytes::<LayerTree>(&bytes) {
+            unreachable!("a tree the public API built must round-trip: {err}");
+        }
+    }
+
+    /// A root-level chain of `height` nested groups. Returns every id,
+    /// outermost first, so a caller can name any level of it.
+    fn group_chain(tree: &mut LayerTree, height: usize, label: &str) -> Vec<super::LayerId> {
+        let mut ids = Vec::with_capacity(height);
+        let mut parent = None;
+        for level in 0..height {
+            let id = match tree.add_group(format!("{label}-{level}"), parent) {
+                Ok(id) => id,
+                Err(err) => unreachable!("building a legal chain must succeed: {err:?}"),
+            };
+            ids.push(id);
+            parent = Some(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn adding_a_layer_past_the_depth_limit_is_refused_and_changes_nothing() {
+        let mut tree = LayerTree::new();
+        let chain = group_chain(&mut tree, super::MAX_LAYER_TREE_DEPTH, "g");
+        let Some(&deepest) = chain.last() else {
+            unreachable!("the chain is not empty");
+        };
+
+        // The legal side first: `deepest` sits at exactly
+        // `MAX_LAYER_TREE_DEPTH`, so the whole chain was accepted.
+        assert_eq!(tree.len(), super::MAX_LAYER_TREE_DEPTH);
+        assert_round_trips(&tree);
+
+        let before = tree.len();
+        let before_children = tree.children(deepest).map(<[_]>::to_vec);
+        for outcome in [
+            tree.add_pixel_layer("one too deep", bounds(), Some(deepest)),
+            tree.add_group("one too deep", Some(deepest)),
+        ] {
+            match outcome {
+                Err(DocError::LayerTreeTooDeep { depth, max }) => {
+                    assert_eq!(depth, super::MAX_LAYER_TREE_DEPTH + 1);
+                    assert_eq!(max, super::MAX_LAYER_TREE_DEPTH);
+                }
+                other => unreachable!("expected LayerTreeTooDeep, got {other:?}"),
+            }
+        }
+        assert_eq!(tree.len(), before, "a refused add must add nothing");
+        assert_eq!(
+            tree.children(deepest).map(<[_]>::to_vec),
+            before_children,
+            "the intended parent's children must be untouched"
+        );
+        assert_round_trips(&tree);
+
+        // And the boundary is the right side of the fence: one level up
+        // still takes a child, landing it at exactly the maximum.
+        let Some(&one_above) = chain.get(super::MAX_LAYER_TREE_DEPTH - 2) else {
+            unreachable!("the chain has at least two levels");
+        };
+        if let Err(err) = tree.add_pixel_layer("exactly at the limit", bounds(), Some(one_above)) {
+            unreachable!("a child landing at exactly the limit must be accepted: {err:?}");
+        }
+        assert_round_trips(&tree);
+    }
+
+    #[test]
+    fn reparenting_a_subtree_past_the_depth_limit_is_refused_and_changes_nothing() {
+        // Two root chains: `a` 128 tall, `b` 128 tall. Moving `b`'s root
+        // under `a`'s deepest group lands `b`'s deepest node at
+        // 128 + 128 = 256 -- exactly the limit.
+        let mut tree = LayerTree::new();
+        let a = group_chain(&mut tree, 128, "a");
+        let b = group_chain(&mut tree, 128, "b");
+        let (Some(&a_deepest), Some(&b_root)) = (a.last(), b.first()) else {
+            unreachable!("both chains are non-empty");
+        };
+        if let Err(err) = tree.reparent(b_root, Some(a_deepest), 0) {
+            unreachable!("a move landing exactly at the limit must succeed: {err:?}");
+        }
+        assert_round_trips(&tree);
+
+        // One taller, and the same move is refused -- and note what
+        // trips it: `b_root` itself would land at 129, comfortably
+        // legal. It is the moved subtree's own *height* that pushes its
+        // deepest descendant past the bound, which is the whole reason
+        // `subtree_height` exists.
+        let mut tree = LayerTree::new();
+        let a = group_chain(&mut tree, 128, "a");
+        let b = group_chain(&mut tree, 129, "b");
+        let (Some(&a_deepest), Some(&b_root)) = (a.last(), b.first()) else {
+            unreachable!("both chains are non-empty");
+        };
+        let old_roots = tree.roots().to_vec();
+        let old_children = tree.children(a_deepest).map(<[_]>::to_vec);
+        let old_parent = tree.parent(b_root);
+        match tree.reparent(b_root, Some(a_deepest), 0) {
+            Err(DocError::LayerTreeTooDeep { depth, max }) => {
+                assert_eq!(depth, super::MAX_LAYER_TREE_DEPTH + 1);
+                assert_eq!(max, super::MAX_LAYER_TREE_DEPTH);
+            }
+            other => unreachable!("expected LayerTreeTooDeep, got {other:?}"),
+        }
+        assert_eq!(
+            tree.roots(),
+            old_roots.as_slice(),
+            "a refused reparent must leave the old sibling list alone"
+        );
+        assert!(
+            old_roots.contains(&b_root),
+            "the moved layer was a root and must still be listed as one"
+        );
+        assert_eq!(
+            tree.children(a_deepest).map(<[_]>::to_vec),
+            old_children,
+            "a refused reparent must not attach anything to the destination"
+        );
+        assert_eq!(
+            tree.parent(b_root),
+            old_parent,
+            "a refused reparent must leave the moved entry's own parent alone"
+        );
+        assert_round_trips(&tree);
+
+        // A leaf, moved to the deepest legal spot and then one past it:
+        // the single-node case of the same bound (`subtree_height` of a
+        // leaf is 1, so it lands exactly where its new parent's depth
+        // plus one says).
+        let mut tree = LayerTree::new();
+        let chain = group_chain(&mut tree, super::MAX_LAYER_TREE_DEPTH, "c");
+        let leaf = match tree.add_pixel_layer("leaf", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (Some(&deepest), Some(&one_above)) =
+            (chain.last(), chain.get(super::MAX_LAYER_TREE_DEPTH - 2))
+        else {
+            unreachable!("the chain has at least two levels");
+        };
+        match tree.reparent(leaf, Some(deepest), 0) {
+            Err(DocError::LayerTreeTooDeep { depth, max }) => {
+                assert_eq!(depth, super::MAX_LAYER_TREE_DEPTH + 1);
+                assert_eq!(max, super::MAX_LAYER_TREE_DEPTH);
+            }
+            other => unreachable!("expected LayerTreeTooDeep, got {other:?}"),
+        }
+        if let Err(err) = tree.reparent(leaf, Some(one_above), 0) {
+            unreachable!("a leaf landing at exactly the limit must move: {err:?}");
+        }
+        assert_round_trips(&tree);
+    }
+
+    #[test]
+    // The whole point of 0.50.0, stated as one property: every tree the
+    // public API is willing to build is one `validate_shape` is willing
+    // to accept -- which is what makes it saveable, since `.aur`'s write
+    // path verifies by reopening through exactly that validator.
+    // Deterministic and table-driven; no randomness, so a failure is
+    // always reproducible.
+    //
+    // Deliberately one test rather than five: the property is about the
+    // *sequence* -- each step round-trips against the state the previous
+    // ones left, which is exactly what a set of independent tests would
+    // stop checking. Same precedent as `history.rs`'s own long
+    // scenario test.
+    #[allow(clippy::too_many_lines)]
+    fn every_tree_the_public_api_will_build_is_one_validate_shape_accepts() {
+        // 1. Pure-`insert` chains, at the interesting depths.
+        for &height in &[1_usize, 2, 3, 255, super::MAX_LAYER_TREE_DEPTH] {
+            let mut tree = LayerTree::new();
+            let mut parent = None;
+            for level in 0..height {
+                parent = match tree.add_group(format!("g{level}"), parent) {
+                    Ok(id) => Some(id),
+                    Err(err) => unreachable!("depth {} must be legal: {err:?}", level + 1),
+                };
+                assert_round_trips(&tree);
+            }
+            assert_eq!(tree.len(), height);
+        }
+
+        // 2. The refusal boundary, and that a refused call is inert --
+        // including the id generator, which is why the encoded bytes are
+        // compared before and after.
+        let mut tree = LayerTree::new();
+        let chain = group_chain(&mut tree, super::MAX_LAYER_TREE_DEPTH, "g");
+        let Some(&deepest) = chain.last() else {
+            unreachable!("the chain is not empty");
+        };
+        let before = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let roots_before = tree.roots().to_vec();
+        match tree.add_group("past it", Some(deepest)) {
+            Err(DocError::LayerTreeTooDeep { depth, max }) => {
+                assert_eq!(depth, super::MAX_LAYER_TREE_DEPTH + 1);
+                assert_eq!(max, super::MAX_LAYER_TREE_DEPTH);
+            }
+            other => unreachable!("expected LayerTreeTooDeep, got {other:?}"),
+        }
+        assert_eq!(tree.len(), super::MAX_LAYER_TREE_DEPTH);
+        assert_eq!(tree.roots(), roots_before.as_slice());
+        assert_eq!(tree.children(deepest), Some(&[][..]));
+        let after = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            before, after,
+            "a refused add must not even move the id generator"
+        );
+        assert_round_trips(&tree);
+
+        // 3. `reparent` landing a whole subtree exactly at the limit.
+        let mut tree = LayerTree::new();
+        let a = group_chain(&mut tree, 128, "a");
+        let b = group_chain(&mut tree, 128, "b");
+        let (Some(&a_deepest), Some(&b_root)) = (a.last(), b.first()) else {
+            unreachable!("both chains are non-empty");
+        };
+        if let Err(err) = tree.reparent(b_root, Some(a_deepest), 0) {
+            unreachable!("256 is legal, so this move must succeed: {err:?}");
+        }
+        assert_round_trips(&tree);
+
+        // 4. One past it, refused, with nothing moved.
+        let mut tree = LayerTree::new();
+        let a = group_chain(&mut tree, 128, "a");
+        let b = group_chain(&mut tree, 129, "b");
+        let (Some(&a_deepest), Some(&b_root)) = (a.last(), b.first()) else {
+            unreachable!("both chains are non-empty");
+        };
+        match tree.reparent(b_root, Some(a_deepest), 0) {
+            Err(DocError::LayerTreeTooDeep { depth, .. }) => {
+                assert_eq!(depth, super::MAX_LAYER_TREE_DEPTH + 1);
+            }
+            other => unreachable!("expected LayerTreeTooDeep, got {other:?}"),
+        }
+        assert!(tree.roots().contains(&b_root));
+        assert_eq!(tree.children(a_deepest), Some(&[][..]));
+        assert_eq!(tree.parent(b_root), None);
+        assert_round_trips(&tree);
+
+        // 5. A mixed sequence: remove an interior group (which frees the
+        // depth its subtree occupied), re-add into the freed room, and
+        // move a leaf sideways between two parents at equal depth.
+        let mut tree = LayerTree::new();
+        let chain = group_chain(&mut tree, super::MAX_LAYER_TREE_DEPTH, "m");
+        let Some(&interior) = chain.get(200) else {
+            unreachable!("the chain is 256 long");
+        };
+        let Some(&above_interior) = chain.get(199) else {
+            unreachable!("the chain is 256 long");
+        };
+        if let Err(err) = tree.remove(interior) {
+            unreachable!("removing an interior group must succeed: {err:?}");
+        }
+        assert_eq!(tree.len(), 200);
+        assert_round_trips(&tree);
+
+        // `above_interior` sits at depth 200, so a fresh chain of 56
+        // groups under it lands the last one at exactly 256 again.
+        let mut parent = Some(above_interior);
+        for level in 0..56 {
+            parent = match tree.add_group(format!("re{level}"), parent) {
+                Ok(id) => Some(id),
+                Err(err) => unreachable!("re-adding into the freed depth: {err:?}"),
+            };
+            assert_round_trips(&tree);
+        }
+
+        // Two siblings at equal depth, and a leaf moved between them:
+        // the depth guard must not object to a move that changes no
+        // depth at all.
+        let left = match tree.add_group("left", Some(above_interior)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let right = match tree.add_group("right", Some(above_interior)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let leaf = match tree.add_pixel_layer("leaf", bounds(), Some(left)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.reparent(leaf, Some(right), 0) {
+            unreachable!("a sideways move at equal depth must succeed: {err:?}");
+        }
+        assert_eq!(tree.parent(leaf), Some(right));
+        assert_round_trips(&tree);
+    }
+
+    /// `reparent`'s depth guard written out with the short-circuit
+    /// removed -- the reference implementation the optimised one is
+    /// compared against below.
+    fn depth_guard_without_the_short_circuit(
+        tree: &LayerTree,
+        id: super::LayerId,
+        new_parent: Option<super::LayerId>,
+    ) -> Result<(), DocError> {
+        let new_depth = new_parent.map_or(1, |p| tree.depth_of(p).saturating_add(1));
+        let deepest = new_depth
+            .saturating_add(tree.subtree_height(id)?)
+            .saturating_sub(1);
+        if deepest > super::MAX_LAYER_TREE_DEPTH {
+            return Err(DocError::LayerTreeTooDeep {
+                depth: deepest,
+                max: super::MAX_LAYER_TREE_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
+    #[test]
+    // `reparent` skips `subtree_height`'s whole downward walk when the
+    // destination is no deeper than where `id` already sits. That is a
+    // real performance change (5.8-8.8 ms to move a legal 40,000-layer
+    // group before, 250 ns-3 us after, across three independent
+    // measurements) and must not be a behaviour change, so every
+    // case here runs the move for real and cross-checks it against the
+    // un-short-circuited guard above. Covers all three directions a
+    // real drag-and-drop produces: deeper, shallower, and sideways.
+    fn the_reparent_depth_short_circuit_agrees_with_the_full_walk() {
+        // (left height, right height, which one moves under which, the
+        // outcome the depth rule should reach).
+        let cases: [(usize, usize, bool, bool); 6] = [
+            // b (128 tall) under a's deepest (depth 128) -> 256, legal.
+            (128, 128, true, true),
+            // b one taller -> 257, refused.
+            (128, 129, true, false),
+            // a's *deepest* group moved under b's root: a big move
+            // towards the root, which the short-circuit takes.
+            (128, 129, false, true),
+            // The same, from a chain that is itself at the limit.
+            (super::MAX_LAYER_TREE_DEPTH, 1, false, true),
+            // A single-group chain moved under a chain at the limit:
+            // lands at 257, refused.
+            (super::MAX_LAYER_TREE_DEPTH, 1, true, false),
+            // Both short, nothing near the bound.
+            (2, 2, true, true),
+        ];
+        for (a_height, b_height, move_b_root_under_a, expect_ok) in cases {
+            let mut tree = LayerTree::new();
+            let a = group_chain(&mut tree, a_height, "a");
+            let b = group_chain(&mut tree, b_height, "b");
+            let (Some(&a_deepest), Some(&b_root)) = (a.last(), b.first()) else {
+                unreachable!("both chains are non-empty");
+            };
+            let (moved, destination) = if move_b_root_under_a {
+                (b_root, a_deepest)
+            } else {
+                (a_deepest, b_root)
+            };
+            let reference = depth_guard_without_the_short_circuit(&tree, moved, Some(destination));
+            let actual = tree.reparent(moved, Some(destination), 0);
+            match (&reference, &actual) {
+                (Ok(()), Ok(())) => assert!(
+                    expect_ok,
+                    "case ({a_height}, {b_height}, {move_b_root_under_a}) was expected to be refused"
+                ),
+                (
+                    Err(DocError::LayerTreeTooDeep { depth, max }),
+                    Err(DocError::LayerTreeTooDeep {
+                        depth: got_depth,
+                        max: got_max,
+                    }),
+                ) => {
+                    assert!(
+                        !expect_ok,
+                        "case ({a_height}, {b_height}, {move_b_root_under_a}) was expected to be allowed"
+                    );
+                    assert_eq!(depth, got_depth, "the reported depth must match too");
+                    assert_eq!(max, got_max);
+                }
+                (reference, actual) => unreachable!(
+                    "short-circuit disagreed with the full walk on case \
+                     ({a_height}, {b_height}, {move_b_root_under_a}): \
+                     full walk said {reference:?}, reparent said {actual:?}"
+                ),
+            }
+            if actual.is_ok() {
+                assert_round_trips(&tree);
+            }
+        }
+    }
+
+    // --- `subtree_height`'s malformed-tree escape paths ---------------
+    //
+    // Neither shape below is reachable from any file `aurora-io` will
+    // read or any live edit: `validate_shape` refuses both at
+    // deserialization time, and no method on `LayerTree` can build
+    // either. They are constructed here the way this file's other
+    // hardening tests construct their trees -- by hand, straight into
+    // the private struct -- because "unreachable today" is an argument,
+    // and the point of these is that the walk survives being wrong
+    // anyway.
+
+    #[test]
+    fn reparenting_a_group_that_lists_the_same_child_twice_is_refused() {
+        // `into` is an empty root group; `shared` is listed twice by
+        // `holder`, so a downward walk of `holder` reaches it twice.
+        let holder = super::LayerId::from_raw(0);
+        let shared = super::LayerId::from_raw(1);
+        let into = super::LayerId::from_raw(2);
+        let mut layers = HashMap::new();
+        layers.insert(holder, group_entry("holder", None, vec![shared, shared]));
+        layers.insert(shared, pixel_entry("shared", Some(holder)));
+        layers.insert(into, group_entry("into", None, Vec::new()));
+        let mut tree = LayerTree {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![holder, into],
+        };
+
+        // `into` sits at depth 1, so this move lands `holder` at 2 --
+        // deeper than the 1 it has now, which is what makes the guard
+        // actually walk rather than short-circuit.
+        match tree.reparent(holder, Some(into), 0) {
+            Err(DocError::MalformedLayerTree(id)) => assert_eq!(id, shared),
+            other => unreachable!("expected MalformedLayerTree, got {other:?}"),
+        }
+        // Refused before the first mutation, like every other refusal here.
+        assert_eq!(tree.roots(), &[holder, into][..]);
+        assert_eq!(tree.children(into), Some(&[][..]));
+        assert_eq!(tree.parent(holder), None);
+    }
+
+    #[test]
+    fn reparenting_within_a_children_cycle_returns_rather_than_hanging() {
+        // `a`'s children name `b`, `b`'s name `a`: a cycle in the
+        // *downward* direction, which `is_descendant`'s upward walk
+        // cannot see. Only `subtree_height`'s own `visited` set stops
+        // this, and the guarantee is that it stops -- an unbounded walk
+        // here is a hang, and a recursive one a process abort under
+        // `panic = "abort"`.
+        let a = super::LayerId::from_raw(0);
+        let b = super::LayerId::from_raw(1);
+        let into = super::LayerId::from_raw(2);
+        let mut layers = HashMap::new();
+        layers.insert(a, group_entry("a", None, vec![b]));
+        layers.insert(b, group_entry("b", Some(a), vec![a]));
+        layers.insert(into, group_entry("into", None, Vec::new()));
+        let mut tree = LayerTree {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![a, into],
+        };
+
+        let started = std::time::Instant::now();
+        let result = tree.reparent(a, Some(into), 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a children cycle must not make reparent run away"
+        );
+        match result {
+            Err(DocError::MalformedLayerTree(id)) => assert_eq!(id, a),
+            other => unreachable!("expected MalformedLayerTree, got {other:?}"),
+        }
+        assert_eq!(tree.parent(a), None);
+    }
+
+    #[test]
+    fn a_non_deepening_move_of_an_already_malformed_subtree_succeeds_without_worsening_it() {
+        // The short-circuit's one disclosed behaviour change, pinned by
+        // a real test rather than left as a claim in a doc comment.
+        // `holder` starts nested one level under `container` (depth 2)
+        // and is malformed the same way as
+        // `reparenting_a_group_that_lists_the_same_child_twice_is_refused`
+        // above; `target` is a separate root. Moving `holder` from
+        // `container` to `target` lands it at the same depth (2) it
+        // already had -- `new_depth &lt;= depth_of(id)`, so the walk that
+        // would notice the duplicate child is skipped.
+        let container = super::LayerId::from_raw(0);
+        let holder = super::LayerId::from_raw(1);
+        let shared = super::LayerId::from_raw(2);
+        let target = super::LayerId::from_raw(3);
+        let mut layers = HashMap::new();
+        layers.insert(container, group_entry("container", None, vec![holder]));
+        layers.insert(
+            holder,
+            group_entry("holder", Some(container), vec![shared, shared]),
+        );
+        layers.insert(shared, pixel_entry("shared", Some(holder)));
+        layers.insert(target, group_entry("target", None, Vec::new()));
+        let mut tree = LayerTree {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![container, target],
+        };
+        let holder_depth_before = tree.depth_of(holder);
+        assert_eq!(
+            holder_depth_before, 2,
+            "holder starts one level under container"
+        );
+        let holder_children_before = tree.children(holder).map(<[_]>::to_vec);
+
+        match tree.reparent(holder, Some(target), 0) {
+            Ok(()) => {}
+            other => unreachable!("expected Ok(()), got {other:?}"),
+        }
+
+        // The point of this test: the malformation is exactly what it
+        // was before, not worse, and `holder` landed no deeper than it
+        // already sat. A move that *would* deepen this same subtree
+        // still walks and still refuses --
+        // `reparenting_a_group_that_lists_the_same_child_twice_is_refused`
+        // already proves that half.
+        assert_eq!(tree.depth_of(holder), holder_depth_before);
+        assert_eq!(
+            tree.children(holder).map(<[_]>::to_vec),
+            holder_children_before
+        );
     }
 
     #[test]

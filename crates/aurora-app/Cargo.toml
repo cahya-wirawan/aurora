@@ -71,6 +71,21 @@ muda = { workspace = true }
 objc2-app-kit = { workspace = true }
 
 [dev-dependencies]
+# The same `aurora-doc` already in `[dependencies]` above, with its
+# `test-support` feature on -- Cargo allows a package in both positions
+# with different feature sets, and a dev-dependency's features only
+# reach the graph when dev-targets are actually built: `cargo test`,
+# `cargo nextest run`, `cargo clippy --all-targets`, `cargo build
+# --all-targets`. Not in a plain `cargo build`/`cargo check`, which is
+# what `verify.yml`'s default-feature step exists to keep true. Note
+# `--all-features` turns it on by itself, independently of this line.
+# Needed by exactly one fixture:
+# `nested_group_chain_over_a_white_background`, which builds the
+# deliberately over-deep tree that
+# `composite_document_drops_the_branch_that_nests_one_level_past_the_maximum_tree_depth`
+# is about -- see
+# `aurora_doc::LayerTree::insert_pixel_ignoring_the_depth_limit`.
+aurora-doc = { workspace = true, features = ["test-support"] }
 accesskit = { workspace = true }
 tempfile = { workspace = true }
 # Test-only: the autosave file is a real `.aur` ZIP container now

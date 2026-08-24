@@ -65,9 +65,19 @@ The full CI gate locally, in the order CI runs it:
 ```sh
 cargo fmt --all --check && python3 scripts/check_layering.py \
   && python3 scripts/check_no_hardcoded_style.py \
+  && cargo check --workspace --locked \
   && cargo clippy --workspace --all-targets --all-features -- -D warnings \
   && cargo nextest run --workspace
 ```
+
+`cargo check --workspace --locked` looks redundant next to the two lines under
+it and is not. Every other compile step in the gate passes `--all-targets`
+and/or `--all-features`, so none of them build the plain configuration Aurora
+ships. `aurora-doc`'s `test-support` feature (this workspace's first Cargo
+feature) gates a test-only escape hatch, and a non-test `pub fn` in a shipping
+crate calling it was measured to pass `cargo build --workspace --all-targets`
+*and* `cargo check --workspace --all-features` while failing only a flagless
+build. That step is what makes such a leak fail the gate.
 
 Neither design script is in CI, and `design/tokens.css` is a review aid for the
 HTML mockups and gallery — Aurora itself never uses CSS. The TOML files under

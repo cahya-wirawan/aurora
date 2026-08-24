@@ -1261,7 +1261,18 @@ every widget in every state across all built-in themes with contrast checks gree
   the end (a UI drop target's forgiving behaviour) rather than erroring,
   and rejects a cycle (`new_parent` is `id` itself or one of its own
   descendants) by walking `id`'s ancestor chain, which is bounded by tree
-  depth rather than scanning `id`'s whole subtree. `remove` cascades: 
+  depth rather than scanning `id`'s whole subtree. **Open when layer
+  drag-reordering actually ships in the UI (noted 2026-08-24 so it is
+  not discovered fresh then): `reparent` can now refuse a drop.** As of
+  0.50.0 it returns `DocError::LayerTreeTooDeep` for a move that would
+  nest past `MAX_LAYER_TREE_DEPTH`, and
+  `DocError::MalformedLayerTree`/`InconsistentLayerParent` for a tree
+  that should not exist. Nothing in `aurora-app` calls `reparent` today,
+  so nothing surfaces those yet — but a drag that silently snaps back
+  with no explanation is a bad interaction, and deciding what the user
+  sees (an inline message, a rejected drop cursor, a toast) is UI scope
+  that belongs with the drag feature, not with the guard. `remove`
+  cascades: 
   deleting a group deletes its contents, matching every mainstream
   editor's actual plain-delete behaviour (no implicit flatten-up-a-level).
   Every mutating method validates before mutating anything, so a failed
@@ -6881,7 +6892,8 @@ structural design work.
   - No interactive "Discard recovered document" choice.
 
   **Three small follow-ups from the judge that closed this round out
-  (2026-08-24), none blocking, none fixed here:**
+  (2026-08-24), none blocking. The first two are still open; the third
+  was closed in 0.50.0 — see its own bullet below:**
 
   - **`LayerTree::validate()` doesn't call `validate_opacities`** —
     `tree.rs` runs shape + allocator only there, while its own doc
@@ -6905,49 +6917,193 @@ structural design work.
     consistency nit in the belt-and-braces layer, not a gap with a
     trigger.
   - **No depth bound on live tree growth** — `add_group`/`reparent`
-    never check against `MAX_LAYER_TREE_DEPTH`, so that constant's own
-    doc comment (claiming it bounds `resolve_tile`'s per-level stack use)
-    holds for a deserialized or restored tree but not for one nested
-    purely through the API. Not input-reachable — a human would have to
-    deliberately nest 256+ groups by hand — so not the same class of
-    risk as the rest of this section, but named so `MAX_LAYER_TREE_DEPTH`'s
-    doc comment isn't read as a stronger guarantee than it is. Still
-    open as stated, but **the consequence is partly contained**: as of
-    0.49.2 `resolve_tile` bounds its own recursion (above), so an
-    API-grown over-deep tree loses its deepest branch from the composite
-    instead of overflowing the stack. `add_group`/`reparent` themselves
-    still do not check depth.
+    never checked against `MAX_LAYER_TREE_DEPTH`, so that constant held
+    for a deserialized or restored tree but not for one nested purely
+    through the API. Not input-reachable — a human would have to
+    deliberately nest 256+ groups by hand — but named so
+    `MAX_LAYER_TREE_DEPTH`'s doc comment wasn't read as a stronger
+    guarantee than it was. 0.49.2 partly contained the consequence:
+    `resolve_tile` bounds its own recursion (above), so an API-grown
+    over-deep tree loses its deepest branch from the composite instead
+    of overflowing the stack.
 
-    **Not contained: such a document can never be saved.** Traced by
-    review 2026-08-24. `aurora-io`'s `.aur` write path verifies by
-    reopening, and the read side runs `validate_shape`, which rejects a
-    >256-deep tree — so the write-to-temp / verify / swap never
-    completes and the user is told the save failed, every time, with no
-    way back other than manually un-nesting. "Unsaved work that cannot
-    be saved" is the failure class CLAUDE.md calls the worst this
-    project can have, so this is recorded as a real gap rather than a
-    theoretical one. What keeps it off the critical list today is
-    reachability: nothing in `aurora-app` calls `reparent`
-    (`grep -rn "\.reparent(" crates/aurora-app/src` is still empty),
-    and reaching it through `add_group` alone means a human deliberately
-    creating 256 nested groups by hand. It becomes ordinary-usage
-    reachable the moment layer drag-reordering ships.
+    **What 0.49.2 did not contain: such a document could never be
+    saved.** Traced by review 2026-08-24. `aurora-io`'s `.aur` write
+    path verifies by reopening, and the read side runs `validate_shape`,
+    which rejects a >256-deep tree — so the write-to-temp / verify /
+    swap never completed and the user was told the save failed, every
+    time, with no way back other than manually un-nesting. "Unsaved work
+    that cannot be saved" is the failure class CLAUDE.md calls the worst
+    this project can have. What kept it off the critical list was
+    reachability alone: nothing in `aurora-app` calls `reparent`, and
+    reaching it through `add_group` meant a human deliberately creating
+    256 nested groups by hand — ordinary-usage reachable the moment
+    layer drag-reordering ships.
 
-    **Deliberately deferred out of 0.49.2, not overlooked.** The fix
-    belongs in `aurora-doc`'s producer side, not in the `aurora-app`
-    guard this version is about, and it is not the one-liner it looks
-    like: `insert` could check `depth_of(parent) + 1` with the helper
-    0.49.1 already added, but `reparent` needs the moved subtree's own
-    *height* as well (a downward walk that does not exist yet), both
-    would newly return `DocError::LayerTreeTooDeep` from methods whose
-    contracts and callers assume they cannot, and the save-side
-    behaviour needs its own decision (refuse the nest, or warn at save
-    time) rather than falling out of the depth check. It would also
-    invalidate the two end-to-end tests above, which construct their
-    over-deep fixture through `add_group` precisely because nothing
-    stops them — so producer fix and consumer tests have to land
-    together, with a new way to build that fixture. Whoever picks this
-    up: it is a step of its own, and this paragraph is the brief.
+    **Closed 2026-08-24 (0.50.0), on the producer side.**
+    `add_pixel_layer`/`add_group` (through their shared private
+    `insert`) and `reparent` now check depth and return
+    `DocError::LayerTreeTooDeep` — the same variant `validate_shape` and
+    `restore` already returned, broadened rather than duplicated, the
+    way `OpacityOutOfRange` already serves both a live-edit producer and
+    a deserialize-time validator. "A tree the API will build" and "a
+    tree `validate_shape` accepts" are now the same set, asserted
+    directly by
+    `every_tree_the_public_api_will_build_is_one_validate_shape_accepts`
+    in `crates/aurora-doc/src/tree.rs`. **The "can never be saved"
+    consequence is gone because the state is no longer constructible**,
+    not because the save path changed — `aurora-io` is untouched.
+
+    The open decision this item recorded — *refuse the nest, or warn at
+    save time* — was resolved as **refuse**: it is the only option that
+    keeps every reachable document saveable, and it tells the user at
+    the moment they can still act on it rather than at save time, with
+    work already at stake.
+
+    Mechanics. `insert`'s check is `depth_of(parent) + 1`, after the
+    existing `UnknownLayer`/`NotAGroup` parent checks (error priority
+    unchanged) and before `next_id()`, so a refused add does not even
+    move the id generator — pinned by comparing encoded bytes before and
+    after. `reparent` also needed the moved subtree's own *height*,
+    which is the new private `subtree_height`: an iterative,
+    `HashSet`-bounded downward walk, never recursive, returning
+    `DocError::MalformedLayerTree` on a repeat visit so a cyclic or
+    two-parent tree makes `reparent` refuse *with the structural
+    reason* — an earlier draft saturated at `MAX_LAYER_TREE_DEPTH + 1`
+    instead, which refused correctly but reported a malformed tree as
+    merely "very deep". Both checks sit before the first mutation, so a
+    refused edit changes nothing.
+
+    `reparent` skips that downward walk entirely when
+    `new_parent`'s depth is no greater than `id`'s current depth: every
+    node of the moved subtree then lands no deeper than it already sits,
+    so the bound cannot newly break. That covers every same-level
+    reorder and every move toward the root — most of what a real
+    drag-and-drop does — and turns them from O(moved subtree) back into
+    O(depth). Measured independently three times (build, revision, and
+    re-verification passes) on a legal 40,000-layer group: 5.8-8.8 ms
+    for a deepening move (the full walk) against 250 ns-3 µs for the
+    same subtree moved back to the root — the multi-order-of-magnitude
+    win held every run, the exact figure didn't, so it's reported as a
+    range rather than one falsely-precise number.
+    `the_reparent_depth_short_circuit_agrees_with_the_full_walk`
+    cross-checks six cases against the guard written out without the
+    short-circuit, comparing the reported `depth` too, so this stays a
+    cost change rather than a behaviour change.
+
+    **The one behaviour this short-circuit does change, disclosed
+    rather than buried**: on a tree that is *already* malformed or
+    already over-deep — constructible only through the `test-support`
+    hatch or a hand-built struct literal, never from a file or a live
+    edit — a non-deepening move is now performed rather than refused,
+    because the walk that would have noticed is skipped. That is
+    arguably the better answer (moving such a subtree shallower is what
+    un-nesting looks like, and refusing it traps the state), but it is a
+    difference, and it is stated in `reparent`'s own doc comment too.
+
+    The two end-to-end `aurora-app` tests above had to land in the same
+    commit, as this item predicted: their shared fixture built its
+    over-deep tree through `add_group` precisely because nothing stopped
+    it. It now builds only its one over-deep level through
+    `aurora_doc::LayerTree::insert_pixel_ignoring_the_depth_limit`,
+    behind `aurora-doc`'s new `test-support` Cargo feature — **this
+    workspace's first Cargo feature** — enabled only from
+    `aurora-app`'s `[dev-dependencies]`. Stated precisely, because the
+    first draft of this paragraph and of the Cargo.toml comments
+    overclaimed it: the hatch is absent from `cargo build --workspace`,
+    `cargo check --workspace` and `cargo doc --workspace --no-deps`
+    (i.e. from everything that produces a shipped binary), and
+    *present* under `--all-features` (which this project's own clippy
+    and rustdoc gate commands both pass) and whenever dev-targets are
+    built. The guarantee is "not in a shipped build", not "not in any
+    build". The signature is also narrower than it first was: it
+    constructs a `LayerKind::Pixel` from the `bounds` it is given rather
+    than accepting an arbitrary `LayerKind`, so the "only the depth
+    check is skipped" claim in its own doc comment is true — the earlier
+    version could take `LayerKind::Group { children }` naming live ids
+    and rebuild the two-parent and cycle shapes three prior rounds of
+    hardening exist to prevent. The 256-deep test still goes end to end
+    through the real guarded API; the 257-deep test still builds a
+    genuinely over-deep tree, still asserts `postcard` rejects it, and
+    still asserts the white background survives `composite_document`.
+
+    **A gate gap this change surfaced, and closed (0.50.0).** Adding
+    the workspace's first Cargo feature exposed the fact that *no* CI
+    job built the configuration Aurora actually ships: every compile
+    step in `.github/workflows/verify.yml` passed `--all-targets`
+    and/or `--all-features`. Demonstrated, not argued — a non-test
+    `pub fn` in `aurora-io` calling the `test-support` escape hatch
+    passed `cargo build --workspace --all-targets` *and*
+    `cargo check --workspace --all-features`, and was caught only by a
+    plain, flagless build, which nothing ran. So a test-only symbol
+    leaking into shipping code would have gone green across the whole
+    gate. `verify.yml`'s `lint` job now runs
+    `cargo check --workspace --locked` (`check` rather than `build`:
+    the leak is an unresolved path, caught at type-check time, and
+    `check` is the cheap half; `--locked` additionally keeps
+    `Cargo.lock` honest), and CLAUDE.md's documented local gate
+    sequence gained the same line with the reason attached. Verified by
+    mutation, the way this session's other checks have been: the leak
+    was reintroduced, the new step failed, the leak was removed, the
+    step passed.
+
+    **Verified 2026-08-24 (0.50.0).** `cargo fmt --all --check`,
+    `python3 scripts/check_layering.py`,
+    `python3 scripts/check_no_hardcoded_style.py`,
+    `cargo check --workspace --locked` (the new step),
+    `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+    all clean; `cargo test --workspace` — **1060 passed, 0 failed**
+    (post-revision *and* post-judgment — see the delta paragraph just
+    below for the full breakdown; an earlier draft of this line
+    recorded the pre-revision 1056 figure, corrected here so the two
+    paragraphs agree); `cargo test --workspace --doc` and
+    `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps
+    --all-features` clean. `cargo deny check all` **not run** — still
+    not installed in this environment, as in the two rounds before
+    this one.
+
+    **The test-count delta, stated correctly.** An earlier draft of
+    this bullet reported "1056, up from 1050" and so claimed +6. The
+    last committed baseline was **1053**, not 1050, so this round adds
+    **+3**: the three new `#[test]` functions in
+    `crates/aurora-doc/src/tree.rs`
+    (`every_tree_the_public_api_will_build_is_one_validate_shape_accepts`,
+    `adding_a_layer_past_the_depth_limit_is_refused_and_changes_nothing`,
+    `reparenting_a_subtree_past_the_depth_limit_is_refused_and_changes_nothing`).
+    The revision round that followed added three more —
+    `the_reparent_depth_short_circuit_agrees_with_the_full_walk`,
+    `reparenting_a_group_that_lists_the_same_child_twice_is_refused`,
+    and `reparenting_within_a_children_cycle_returns_rather_than_hanging`,
+    the last two covering `subtree_height`'s malformed-tree escape
+    paths, which had no test outside a reviewer's scratch copy — for
+    **1059** total. The judgment pass that followed found five small,
+    non-blocking gaps rather than a fourth correctness bug — a stale
+    performance figure (three independent measurement runs disagreed
+    on the exact number, all agreeing on the order-of-magnitude win;
+    reworded as a range instead of one falsely-precise figure, both in
+    this file and in `tree.rs`'s own doc comments), a comment on
+    `reparent`'s retained `unreachable!`s still describing `retain`
+    after that mechanism was replaced with `position`+`remove`
+    earlier in the same round, `DocError::MalformedLayerTree`'s doc
+    comment not yet naming `reparent` as a second source the way
+    `LayerTreeTooDeep`'s already does, this file's own "Verified" line
+    still quoting the pre-revision count, and — the one with any real
+    weight — the short-circuit's disclosed non-deepening-on-an-
+    already-malformed-tree behaviour having no test of its own, only a
+    doc comment's word for it. All five fixed directly rather than
+    through another full review round, since none were correctness
+    bugs and each was a one- or two-location change: one new test,
+    `a_non_deepening_move_of_an_already_malformed_subtree_succeeds_without_worsening_it`,
+    for **1060** total.
+
+    **No GPU-hardware or interactive verification.** Everything in this
+    bullet is headless logic — a tree data structure and its
+    validators. Nothing here has been exercised in a live session on
+    real hardware, and per CLAUDE.md a green test run is not evidence
+    about canvas or UI behaviour. `reparent` still has no caller in
+    `aurora-app`, so none of the refusals added here can be reached by
+    a user yet.
+
 - [ ] **`resolve_tile`'s peak memory is `O(siblings × depth)`, not
     bounded by depth at all** — found by review 2026-08-24, reachable
     through completely ordinary usage, no malformed tree involved. The

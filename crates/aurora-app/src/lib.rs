@@ -12431,7 +12431,23 @@ mod tests {
                 Err(err) => unreachable!("{err:?}"),
             };
         }
-        let deepest = match layers.add_pixel_layer("deepest", bounds, parent) {
+        // For every legal `groups` the innermost pixel layer lands at
+        // `groups + 1 <= MAX_LAYER_TREE_DEPTH`, so the real, guarded API
+        // builds it. Only the over-deep caller below asks for a layer at
+        // `MAX_LAYER_TREE_DEPTH + 1`, which `add_pixel_layer` now
+        // rightly refuses (0.50.0) -- that one branch goes through
+        // `aurora-doc`'s `test-support` escape hatch instead, which is
+        // the only way left to build the genuinely over-deep tree
+        // `resolve_tile`'s own independent depth guard is defence
+        // against. The group chain itself stays on the real API in both
+        // cases: even at `groups == MAX_LAYER_TREE_DEPTH` every group
+        // lands at depth <= 256.
+        let deepest_result = if groups < aurora_doc::MAX_LAYER_TREE_DEPTH {
+            layers.add_pixel_layer("deepest", bounds, parent)
+        } else {
+            layers.insert_pixel_ignoring_the_depth_limit("deepest", bounds, parent)
+        };
+        let deepest = match deepest_result {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };

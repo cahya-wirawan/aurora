@@ -12,6 +12,31 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Gates one test-only escape hatch,
+# `LayerTree::insert_pixel_ignoring_the_depth_limit`. Nothing in this
+# workspace declares it as a normal dependency feature; the only crate
+# that turns it on is `aurora-app`, from its `[dev-dependencies]`, for
+# one over-deep-tree fixture.
+#
+# Stated precisely, because "off in every normal build" overclaims it:
+#
+#   off  -- `cargo build --workspace`, `cargo build -p aurora-app`,
+#           `cargo check --workspace`, `cargo doc --workspace
+#           --no-deps`; i.e. every path that produces a shipped binary.
+#           `cargo check --workspace --locked` is a CI gate step
+#           (`.github/workflows/verify.yml`) specifically so a
+#           test-only symbol leaking into non-test code fails the build
+#           rather than passing every other job.
+#   ON   -- anything passing `--all-features` (this project's own
+#           clippy and rustdoc gate commands both do), and anything
+#           building dev-targets: `cargo test`, `cargo nextest run`,
+#           `cargo clippy --all-targets`, `cargo build --all-targets`.
+#
+# So the guarantee is "absent from a shipped build", not "absent from
+# any build CI runs".
+test-support = []
+
 [dependencies]
 aurora-core = { workspace = true }
 aurora-tile = { workspace = true }
