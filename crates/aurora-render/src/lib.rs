@@ -61,6 +61,7 @@ mod test_support;
 
 pub use composite::{
     BlendMode, TileCompositor, composite_layer_into, composite_tile_cpu, transparent_tile,
+    un_premultiply_in_place,
 };
 pub use executor::{Executor, TaskId};
 pub use mip::{MipLevel, downsample};

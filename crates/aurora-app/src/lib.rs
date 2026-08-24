@@ -3583,8 +3583,10 @@ fn hash_to_unit_f32(hash: u64) -> f32 {
 /// `texels`; any chunk that isn't a full `CHANNELS`-length texel (should
 /// never happen for a real tile buffer, but this function has no way to
 /// prove that of its caller) is skipped, left fully transparent in the
-/// output, the same defensive shape the un-premultiply step just above
-/// already uses for its own `chunks_exact_mut` loop.
+/// output, the same defensive shape
+/// `aurora_render::un_premultiply_in_place` (the un-premultiply step
+/// `resolve_tile`'s `Group` arm calls) already uses for its own
+/// `chunks_exact_mut` loop.
 ///
 /// `resolve_tile` calls this from both its `Pixel` and `Group` arms, so a
 /// `Dissolve`-mode group containing a `Dissolve`-mode child is possible.
@@ -3663,8 +3665,9 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
 /// `resolve_tile`'s own call sites, which only call this when
 /// `mask.enabled` is true). Any chunk that isn't a full
 /// `CHANNELS`-length texel is skipped, left fully transparent in the
-/// output — the same defensive shape [`dissolve_gate`] and the
-/// un-premultiply loop in `resolve_tile`'s `Group` arm both already use.
+/// output — the same defensive shape [`dissolve_gate`] and
+/// `aurora_render::un_premultiply_in_place` (the un-premultiply step
+/// `resolve_tile`'s `Group` arm calls) both already use.
 fn apply_mask_clip(
     texels: &[half::f16],
     mask: &aurora_doc::LayerMask,
@@ -4010,8 +4013,8 @@ impl CompositeBudget {
 /// accumulate-in-place design, not something fixable from `resolve_tile`
 /// alone). `composite_tile_cpu` itself now recovers the backdrop's true
 /// straight-alpha colour — dividing the running accumulator's `r`/`g`/`b`
-/// by its own `a`, guarded against `a == 0.0` the same way the
-/// un-premultiply loop above already is — before ever handing it to
+/// by its own `a`, guarded against `a == 0.0` the same way
+/// `aurora_render::un_premultiply_in_place` already is — before ever handing it to
 /// `blend_rgb` as `Cb`, so every blend mode now reacts to the correct
 /// backdrop colour regardless of how translucent the accumulator is
 /// partway through a group's isolation pass. See `composite_tile_cpu`'s
@@ -4221,19 +4224,17 @@ fn resolve_tile(
             // pseudo-layer texels. Guarded against `a == 0.0` (fully
             // transparent texels have no meaningful colour to recover;
             // leave them at `0.0` rather than dividing by zero).
-            for texel in isolated.chunks_exact_mut(aurora_tile::CHANNELS) {
-                let [r, g, b, a] = texel else { continue };
-                let alpha = a.to_f32();
-                if alpha > 0.0 {
-                    *r = half::f16::from_f32(r.to_f32() / alpha);
-                    *g = half::f16::from_f32(g.to_f32() / alpha);
-                    *b = half::f16::from_f32(b.to_f32() / alpha);
-                } else {
-                    *r = half::f16::from_f32(0.0);
-                    *g = half::f16::from_f32(0.0);
-                    *b = half::f16::from_f32(0.0);
-                }
-            }
+            //
+            // The loop itself lives in
+            // `aurora_render::un_premultiply_in_place` — this arm was
+            // the only place it existed until `composite_roots_into_tile`
+            // and the GPU compositing path's own readback
+            // (`finish_tile_readback`) were found to be missing the
+            // identical step; see that function's own doc comment for
+            // the invariant (straighten exactly once, at the top of an
+            // accumulation, never inside `composite_layer_into`'s own
+            // fold).
+            aurora_render::un_premultiply_in_place(&mut isolated);
             // A group's own mask clips its *whole* isolated composite as
             // one unit, ahead of `Dissolve` below -- the same "group's
             // own opacity/blend mode apply one level up, to the isolated
@@ -4284,9 +4285,10 @@ fn resolve_tile(
 /// `Group` arm: it also has the depth increment, the per-child budget
 /// exhaustion break, and the un-premultiply/mask/`Dissolve` tail, so
 /// unifying it here would take more than it gave). Keeping one copy also
-/// means the still-open premultiplied-alpha gap named in PLAN.md — the
-/// un-premultiply step that runs in the `Group` arm and is missing from
-/// both of these paths — has exactly one place to be fixed.
+/// meant the premultiplied-alpha gap PLAN.md tracked — the un-premultiply
+/// step that ran in the `Group` arm and was missing from both of these
+/// paths — had exactly one place to be fixed, which is where 0.52.0
+/// fixed it (below).
 ///
 /// The accumulator starts fully transparent
 /// (`aurora_render::transparent_tile`) and each resolved child buffer is
@@ -4297,12 +4299,29 @@ fn resolve_tile(
 /// for the regression test, and `MAX_LAYER_TREE_DEPTH`'s own doc comment
 /// in `aurora-doc` for what does still bound it.
 ///
-/// **Returns premultiplied-alpha texels whenever the accumulated alpha
-/// ends up fractional**, exactly as `aurora_render::composite_layer_into`
-/// does onto a transparent start. `resolve_tile`'s `Group` arm converts
-/// that back to straight alpha before handing a group's buffer up a
-/// level; neither caller of *this* function does, which is the gap
-/// PLAN.md records as open, not a property to rely on.
+/// **Returns straight-alpha texels.** The fold itself
+/// (`aurora_render::composite_layer_into` onto a transparent start)
+/// leaves a *premultiplied* result whenever the accumulated alpha ends
+/// up fractional — a lone opaque-white root layer at 50% opacity folds
+/// to `(0.5, 0.5, 0.5, 0.5)` — so this function runs
+/// `aurora_render::un_premultiply_in_place` on the finished accumulator
+/// before returning it, recovering the true `(1.0, 1.0, 1.0, 0.5)`. That
+/// is the same step `resolve_tile`'s `Group` arm has always run on a
+/// group's isolated buffer, and it was missing here (and from the GPU
+/// compositing path, which now reaches the identical call through
+/// [`finish_tile_readback`]) until 0.52.0: every exported
+/// PNG/TIFF/`.aur` file with translucent content, and every eyedropper
+/// read of a translucent pixel, carried premultiplied values. See
+/// `composite_document_un_premultiplies_a_translucent_root_level_layer`
+/// for the regression test and
+/// `aurora_render::un_premultiply_in_place`'s own doc comment for why
+/// the straightening belongs here, at the top of the accumulation,
+/// rather than inside the per-layer fold.
+///
+/// Placement is last, on the finished root accumulator: unlike
+/// `resolve_tile`'s `Group` arm there is no mask-clip or `Dissolve`
+/// tail to order against here (both are per-layer, inside
+/// `resolve_tile`), so there is nothing after this step.
 ///
 /// Charging the tile against `budget` (`CompositeBudget::next_tile`) is
 /// the caller's job, kept at the call site where the per-tile loop
@@ -4332,6 +4351,11 @@ fn composite_roots_into_tile(
             aurora_render::composite_layer_into(&mut composited, &texels, opacity, blend_mode);
         }
     }
+    // The accumulator has stopped being an accumulator and is now this
+    // tile's finished composite, handed to callers (export, the
+    // eyedropper, the canvas atlas) that all expect straight alpha --
+    // see this function's own doc comment above.
+    aurora_render::un_premultiply_in_place(&mut composited);
     composited
 }
 
@@ -4511,6 +4535,33 @@ fn begin_tile_readback(
 /// same "one bad tile shouldn't abort the rest" discipline
 /// [`resolve_tile`]'s own callers already use for a failed
 /// [`aurora_tile::TileStore::get`].
+///
+/// **Straightens the decoded samples** (`aurora_render::un_premultiply_in_place`)
+/// before returning them, and this is the single place the GPU
+/// compositing path's premultiplied → straight conversion happens.
+/// [`begin_gpu_composite_tile`]'s render target holds *premultiplied*
+/// alpha once its fold is done — the fixed-function `AlphaBlending` unit
+/// accumulating onto a cleared, fully transparent target leaves exactly
+/// the state `aurora_render::composite_layer_into` leaves on the CPU
+/// side (a lone opaque-white layer at 50% opacity gives
+/// `(0.5, 0.5, 0.5, 0.5)`, not the straight `(1.0, 1.0, 1.0, 0.5)`) —
+/// and that is `composite_over_with_opacity`'s own correct, unchanged
+/// contract, not something to fix on the GPU. The buffer stops being an
+/// accumulator and becomes a finished tile exactly here, at the decode,
+/// which is where the same "straighten exactly once, at the top of an
+/// accumulation" rule [`composite_roots_into_tile`] and `resolve_tile`'s
+/// `Group` arm already follow puts the step.
+///
+/// Doing it on the CPU, on the `Vec<half::f16>` the readback already
+/// produces, rather than as an extra GPU render pass, is deliberate and
+/// was 0.52.0's second shape: the first ran a WGSL sibling of that loop
+/// into a *second* per-tile `Rgba16Float` texture (a texture cannot be
+/// sampled and rendered to in one pass), which cost a per-tile
+/// allocation and an extra queue submission on a path already measured
+/// well over its frame budget, and — measured — the two implementations
+/// did not agree at very small alphas. One implementation, called from
+/// both paths, makes them agree by construction; see
+/// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document`.
 fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
     let PendingGpuReadback {
         tile_id,
@@ -4539,7 +4590,15 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
     let decoded = decode_f16_samples(&data);
     drop(data);
     buffer.unmap();
-    decoded
+    // Straighten once, here: what came back is the GPU fold's finished
+    // *premultiplied* accumulator, and everything downstream of this
+    // point -- the tile store, export, the eyedropper, the canvas atlas
+    // -- is straight alpha. See this function's own doc comment above
+    // for why this is the CPU's job on both paths.
+    decoded.map(|mut texels| {
+        aurora_render::un_premultiply_in_place(&mut texels);
+        texels
+    })
 }
 
 /// GPU-accelerated compositing for one visible composite tile, for the
@@ -4565,8 +4624,28 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// (`TEXTURE_BINDING | COPY_DST`), then
 /// `aurora_render::TileCompositor::composite_over_with_opacity` blends it
 /// onto one shared destination texture (`RENDER_ATTACHMENT | COPY_SRC`,
-/// cleared to fully transparent black first, since `composite_over_with_opacity`
-/// always uses `LoadOp::Load`).
+/// cleared to fully transparent black first, since
+/// `composite_over_with_opacity` always uses `LoadOp::Load`).
+///
+/// **Leaves a premultiplied accumulator behind, on purpose**: once the
+/// fold is done that shared destination holds *premultiplied* alpha —
+/// the fixed-function `AlphaBlending` unit accumulating onto a cleared,
+/// fully transparent target leaves exactly the state
+/// `aurora_render::composite_layer_into` leaves on the CPU side (a lone
+/// opaque-white layer at 50% opacity gives `(0.5, 0.5, 0.5, 0.5)`, not
+/// the straight `(1.0, 1.0, 1.0, 0.5)`), which is
+/// `composite_over_with_opacity`'s own correct and unchanged contract.
+/// Converting that back to the straight alpha the tile store and
+/// everything downstream of it expect is
+/// [`finish_tile_readback`]'s job, on the CPU, on the `Vec<half::f16>`
+/// its readback decode already produces — one
+/// `aurora_render::un_premultiply_in_place` call shared with
+/// [`composite_roots_into_tile`], so the GPU and CPU paths cannot
+/// disagree about that division by construction (see
+/// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document`).
+/// Before 0.52.0 neither top-level path ran this step at all, so every
+/// translucent composite tile — and so every export and every eyedropper
+/// read — carried premultiplied values.
 ///
 /// **Issues the readback, does not wait for it**: the destination texture's
 /// GPU→CPU copy is *started* via [`begin_tile_readback`] — which itself
@@ -4651,6 +4730,9 @@ fn begin_gpu_composite_tile(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
+        // `RENDER_ATTACHMENT` for the per-layer blend passes, `COPY_SRC`
+        // for the readback below -- nothing samples this texture, so it
+        // needs no `TEXTURE_BINDING`.
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
@@ -4719,6 +4801,17 @@ fn begin_gpu_composite_tile(
         compositor.composite_over_with_opacity(gpu, &dst_view, &src_view, *opacity);
     }
 
+    // `dst_texture` now holds this tile's finished composite in
+    // *premultiplied* alpha -- the fixed-function `AlphaBlending` fold
+    // onto a cleared, fully transparent target leaves exactly the state
+    // `aurora_render::composite_layer_into` leaves on the CPU side (a
+    // lone opaque-white layer at 50% opacity gives (0.5, 0.5, 0.5, 0.5),
+    // not the straight (1.0, 1.0, 1.0, 0.5)). That is left as it is:
+    // `finish_tile_readback` straightens the decoded samples on the CPU,
+    // in the one shared `aurora_render::un_premultiply_in_place` the CPU
+    // path also goes through, rather than this function spending a
+    // second per-tile texture and an extra queue submission on a GPU
+    // pass to do the same division a different way.
     Some(begin_tile_readback(device, queue, &dst_texture, tile_id))
 }
 
@@ -7001,6 +7094,22 @@ impl App {
     /// ([`collect_widget_paints`]/[`draw_widget_paints`]) on top —
     /// canvas and UI in the same pass, the same frame, invariant §7.3.8
     /// (they never become separate surfaces composited together).
+    ///
+    /// **Straight alpha, all the way to the shader**: what
+    /// [`recomposite_visible_tiles`] leaves in the composite surface,
+    /// what `TileResidency::sync` uploads to the atlas (a plain `f16`
+    /// texel copy, no alpha conversion of its own), and what
+    /// `aurora-gpu`'s own `fs_canvas` samples are all straight-alpha
+    /// texels — `fs_canvas` is the single place in the codebase that
+    /// converts, multiplying by alpha as it blends the canvas over its
+    /// checkerboard. Before 0.52.0 that was not true and two bugs
+    /// cancelled here: the compositing entry points left premultiplied
+    /// texels behind and `fs_canvas` used the matching premultiplied
+    /// "over" formula, so the screen looked approximately right while
+    /// every export and every eyedropper read carried the wrong colour.
+    /// Both halves were fixed together; see
+    /// `composite_roots_into_tile`'s own doc comment and that shader's
+    /// own comment.
     // One linear per-frame flow (build widget paints, sync the canvas
     // atlas, one shared render pass drawing both) -- splitting further
     // would just relocate lines across more functions without reducing
@@ -12159,6 +12268,178 @@ mod tests {
     }
 
     #[test]
+    // The root-level sibling of the group test above, and AC-1's own
+    // regression test: the identical un-premultiply step that arm has
+    // always run was missing from `composite_roots_into_tile`, the
+    // shared root-level fold that both `composite_document` (export)
+    // and `recomposite_visible_tiles`' own CPU path go through.
+    //
+    // Fixture: one opaque-white pixel layer at layer opacity 0.5,
+    // root-level, over nothing (an otherwise empty document, so the
+    // accumulator it folds onto is `transparent_tile`'s own fully
+    // transparent black -- exactly the case that makes the fold's
+    // premultiplied-out contract visible).
+    //
+    // Hand-computed, straight-alpha "over" onto transparent black:
+    // `as = src_a * opacity = 1.0 * 0.5 = 0.5`, so each colour channel
+    // is `0.5*0.0 + 0.5*1.0 = 0.5` and alpha is `0.5 + 0.0*0.5 = 0.5`
+    // -- a premultiplied `(0.5, 0.5, 0.5, 0.5)`. Straightened, that is
+    // `(1.0, 1.0, 1.0, 0.5)`: the layer really is opaque white, shown at
+    // half opacity, and the colour channels must say so.
+    //
+    // This is the value that reaches an exported PNG/TIFF/`.aur` file
+    // and the eyedropper, so the pre-fix `(0.5, 0.5, 0.5, 0.5)` was a
+    // real, user-visible wrong colour in every export with translucent
+    // content -- asserted against explicitly below so this test would
+    // have failed before the fix rather than merely not covering it.
+    //
+    // Fully headless: no GPU adapter needed, unlike the
+    // `recomposite_visible_tiles` sibling below.
+    fn composite_document_un_premultiplies_a_translucent_root_level_layer() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let layer = match layers.add_pixel_layer("translucent", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(layer, 0.5) {
+            unreachable!("{err:?}");
+        }
+        let Some(surface) = layers.surface_id(layer) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [1.0, 1.0, 1.0, 1.0],
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            let result = image_pixel(&image, 0, 0);
+            assert_eq!(
+                result,
+                [1.0, 1.0, 1.0, 0.5],
+                "an opaque-white layer at 50% opacity is straight-alpha white at half alpha"
+            );
+            assert_ne!(
+                result,
+                [0.5, 0.5, 0.5, 0.5],
+                "the premultiplied value the root-level fold leaves behind -- what every \
+                 export of translucent content carried before 0.52.0"
+            );
+        }
+    }
+
+    #[test]
+    // Both levels of straightening in one fixture -- the case neither of
+    // the two tests above covers, because each exercises only one of
+    // them: `resolve_tile`'s `Group` arm straightens a group's isolated
+    // buffer, `composite_roots_into_tile` straightens the finished root
+    // accumulator, and only a document that ends fractional at *both*
+    // levels can tell a double-straighten (or a straighten at the wrong
+    // level) from correct behaviour.
+    //
+    // Fixture: one group at opacity 0.5, holding a single opaque-blue
+    // (0, 0, 1, 1) child pixel layer, as the document's only root-level
+    // layer, over nothing (a transparent background).
+    //
+    // Hand-computed, level by level:
+    //   * the group's isolated buffer: one full-opacity `Normal` child
+    //     folded onto transparent black reproduces the child exactly, so
+    //     the accumulator is (0, 0, 1, 1) -- already opaque, so the
+    //     `Group` arm's own straightening divides by one and is an exact
+    //     identity here, leaving (0, 0, 1, 1).
+    //   * folded into the root at the group's own opacity 0.5, onto
+    //     transparent black: `as = 1.0 * 0.5 = 0.5`, so
+    //     b = 0.5*0 + 0.5*1 = 0.5 and a = 0.5 + 0*0.5 = 0.5 -- a
+    //     premultiplied root accumulator of (0, 0, 0.5, 0.5).
+    //   * `composite_roots_into_tile`'s own straightening: 0.5 / 0.5 =
+    //     1.0, giving the finished (0, 0, 1.0, 0.5).
+    //
+    // The two wrong answers are asserted against by name, because each
+    // is a distinguishable failure signature: (0, 0, 2.0, 0.5) is what a
+    // *double* straighten produces (the group's buffer divided by the
+    // root's 0.5 alpha as well as its own), and (0, 0, 0.5, 0.5) is what
+    // a *missing* root-level straighten produces -- the premultiplied
+    // value the fold leaves behind.
+    fn composite_document_straightens_a_fractional_group_and_a_fractional_root_fold_exactly_once() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match layers.add_pixel_layer("child", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(group, 0.5) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            layers.roots(),
+            [group],
+            "the group must be the document's only root-level layer, so the root fold ends \
+             at the group's own fractional alpha rather than on top of an opaque backdrop"
+        );
+
+        let Some(surface) = layers.surface_id(child) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            let result = image_pixel(&image, 0, 0);
+            assert_eq!(
+                result,
+                [0.0, 0.0, 1.0, 0.5],
+                "an opaque-blue child in a 50%-opacity group is straight-alpha pure blue at \
+                 half alpha"
+            );
+            assert_ne!(
+                result,
+                [0.0, 0.0, 2.0, 0.5],
+                "a blue channel above 1.0 would mean the buffer was straightened twice"
+            );
+            assert_ne!(
+                result,
+                [0.0, 0.0, 0.5, 0.5],
+                "the premultiplied value would mean the root-level straightening is missing"
+            );
+        }
+    }
+
+    #[test]
     // The blend-mode counterpart to
     // `composite_document_applies_a_groups_own_opacity_to_its_isolated_children`:
     // `group` (opacity 1.0, `Multiply`) contains one opaque pure-blue
@@ -12523,9 +12804,13 @@ mod tests {
     // `alpha*src + (1-alpha)*dst`: r = 0.5*0 + 0.5*0 = 0.0,
     // g = 0.5*1 + 0.5*0 = 0.5, b = 0.5*0 + 0.5*1 = 0.5,
     // a = 0.5 + 1*0.5 = 1.0 -> (0.0, 0.5, 0.5, 1.0). The accumulator
-    // ends fully opaque, so premultiplied and straight alpha coincide
-    // and the missing un-premultiply step on this path (see PLAN.md's
-    // own 2026-08-24 disclosure) does not affect this expectation.
+    // ends fully opaque, so `composite_roots_into_tile`'s own
+    // un-premultiply step (0.52.0) divides by one and is an exact
+    // identity here -- which is why this expectation is unchanged across
+    // that fix, and equally why an opaque-only fixture like this one
+    // could never have caught the gap it closed. The fractional-alpha
+    // sibling that does catch it is
+    // `composite_document_un_premultiplies_a_translucent_root_level_layer`.
     fn composite_document_composites_five_hundred_root_level_sibling_layers() {
         let (_dir, mut store) = real_tile_store();
         let mut layers = aurora_doc::LayerTree::new();
@@ -12616,7 +12901,9 @@ mod tests {
     // r = 0.5*0 + 0.5*0 = 0.0, g = 0.5*1 + 0.5*0 = 0.5,
     // b = 0.5*0 + 0.5*1 = 0.5, a = 0.5 + 1*0.5 = 1.0 -> the group's own
     // isolated buffer is (0.0, 0.5, 0.5, 1.0). It is already opaque, so
-    // the un-premultiply step is the identity, and the group's own
+    // both un-premultiply steps it passes through (the `Group` arm's own
+    // and, one level up, `composite_roots_into_tile`'s) are the
+    // identity, and the group's own
     // documented defaults (opacity 1.0, `Normal`) composite that fully
     // opaque buffer over the opaque red background unchanged.
     fn composite_document_composites_two_thousand_sibling_layers_in_one_group() {
@@ -14235,6 +14522,213 @@ mod tests {
         //     b = 0.75*0.0 + 0.25*1.0 = 0.25,
         //     a = 0.25 + 1.0*0.75 = 1.0 -> (0.375, 0.375, 0.25, 1.0).
         assert_eq!(gpu_result, (0.375, 0.375, 0.25, 1.0));
+    }
+
+    /// AC-2's own regression test: the same fixture as
+    /// `composite_document_un_premultiplies_a_translucent_root_level_layer`
+    /// (one opaque-white root-level pixel layer at layer opacity 0.5,
+    /// over nothing), but reaching `composite_roots_into_tile` through
+    /// the *live canvas* entry point rather than the export one — the
+    /// two callers that shared the missing un-premultiply step. The
+    /// expected value and its hand-computation are identical; see that
+    /// test's own comment.
+    ///
+    /// **Honest note about the harness**: this exercises the CPU
+    /// compositing fallback (`gpu`/`compositor` both `None`, the same
+    /// technique
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_real_multi_layer_document`
+    /// already uses for its second run), yet it still needs a real
+    /// `aurora_gpu::TileResidency` — and therefore a real `GpuContext` —
+    /// because `recomposite_visible_tiles` takes the residency to learn
+    /// which tiles are visible. That is a harness constraint of this
+    /// entry point's signature, not evidence about the CPU math, and it
+    /// means this test self-skips where no adapter exists. The
+    /// always-headless proof of the same math is the `composite_document`
+    /// sibling above.
+    #[test]
+    fn recomposite_visible_tiles_un_premultiplies_a_translucent_root_level_layer() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let layer = match layers.add_pixel_layer("translucent", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(layer, 0.5) {
+            unreachable!("{err:?}");
+        }
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let Some(surface) = layers.surface_id(layer) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(&mut store, surface, tile_id, [1.0, 1.0, 1.0, 1.0]);
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency, &layers, None, &mut store, &mut cache, None, None,
+        );
+
+        let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+        assert_eq!(
+            result,
+            (1.0, 1.0, 1.0, 0.5),
+            "the live canvas composite must hold straight alpha, the same as an export"
+        );
+        assert_ne!(
+            result,
+            (0.5, 0.5, 0.5, 0.5),
+            "the premultiplied value the root-level fold leaves behind -- what the composite \
+             surface (and so the eyedropper) carried before 0.52.0"
+        );
+    }
+
+    /// AC-4's own sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_real_multi_layer_document`,
+    /// which stays deliberately unchanged: that test's fixture ends at
+    /// `alpha = 1.0`, where un-premultiplying divides by one and is an
+    /// exact identity on both paths — which is precisely why it kept
+    /// passing across 0.52.0 (real evidence of no regression) *and* why
+    /// it could never have caught the bug in the first place. This one
+    /// ends at a **fractional** final alpha, where the straightening
+    /// step 0.52.0 added is the only thing that can make the two paths
+    /// agree.
+    ///
+    /// Both paths reach that step through the *same* implementation:
+    /// `aurora_render::un_premultiply_in_place`, called by
+    /// `composite_roots_into_tile` on the CPU path and by
+    /// `finish_tile_readback` on the GPU path's readback decode. So this
+    /// test proves the two paths' *compositing* agrees; it can no longer
+    /// diverge on the division itself, which is by construction now
+    /// rather than by two implementations happening to match. (0.52.0's
+    /// first shape did run a separate WGSL division as an extra GPU
+    /// pass, and that pair was measured not to agree at very small
+    /// alphas.)
+    ///
+    /// Fixture: two root-level `Normal`-blend pixel layers, both filled
+    /// opaque red `(1, 0, 0, 1)`, both at layer opacity 0.5, no groups
+    /// (so the whole document is GPU-tractable — asserted below, so a
+    /// future change that silently routed this to the CPU would fail
+    /// loudly rather than pass vacuously).
+    ///
+    /// Hand-computed, bottom to top, straight-alpha "over"
+    /// (`Co = (1-as)*Cb + as*Cs`, `Ca = as + Cb.a*(1-as)`,
+    /// `as = src_a * opacity`), onto a transparent start:
+    ///   bottom: `as = 0.5`, `r = 0.5*0 + 0.5*1 = 0.5`,
+    ///     `a = 0.5 + 0*0.5 = 0.5` -> premultiplied `(0.5, 0, 0, 0.5)`.
+    ///   top: `as = 0.5`, `r = 0.5*0.5 + 0.5*1 = 0.75`,
+    ///     `a = 0.5 + 0.5*0.5 = 0.75` -> premultiplied `(0.75, 0, 0, 0.75)`.
+    /// Straightened: `0.75 / 0.75 = 1.0`, so the finished tile is
+    /// `(1.0, 0.0, 0.0, 0.75)` — two half-opacity opaque-red layers stack
+    /// to three-quarters-opaque *fully saturated* red, which is what an
+    /// export and the eyedropper must report.
+    ///
+    /// **Exact equality, not a tolerance**, on both paths and between
+    /// them: every value here (0.5, 0.25, 0.75, 1.0) is an exact binary
+    /// fraction, so the ~2.5-ULP latitude Vulkan permits an `f32`
+    /// multiply-add cannot move the GPU fold's result off the CPU's, and
+    /// the one division (`0.75 / 0.75`) is the same CPU code on both
+    /// paths. If this ever does diverge, that is a finding to report,
+    /// not a reason to loosen the assertion.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for id in [bottom, top] {
+            if let Err(err) = layers.set_opacity(id, 0.5) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for id in [bottom, top] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "two Normal-blend, non-grouped pixel layers must qualify for the GPU path -- \
+             otherwise this test would compare the CPU path against itself"
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        // Run 1: the real GPU path.
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        // Run 2: the CPU fallback, forced by passing no GPU/compositor.
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        assert_eq!(
+            gpu_result, cpu_result,
+            "the GPU and CPU paths must agree on a fractional-final-alpha document too, not \
+             only on the fully-opaque one the sibling test covers"
+        );
+        for (result, path) in [(gpu_result, "GPU"), (cpu_result, "CPU")] {
+            assert_eq!(
+                result,
+                (1.0, 0.0, 0.0, 0.75),
+                "{path} path: two half-opacity opaque-red layers straighten to fully \
+                 saturated red at 0.75 alpha"
+            );
+            assert_ne!(
+                result,
+                (0.75, 0.0, 0.0, 0.75),
+                "{path} path: the premultiplied value both paths produced before 0.52.0"
+            );
+        }
     }
 
     /// The batched-poll restructuring's own correctness proof: the

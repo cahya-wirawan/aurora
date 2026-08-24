@@ -7348,7 +7348,7 @@ structural design work.
     headless run is not evidence about GPU behaviour) — that alone is
     reason enough to defer it, without overstating the code-side
     difficulty too. Sized, not scheduled.
-- [ ] **Every saved file with translucent pixels has premultiplied
+- [x] **Every saved file with translucent pixels has premultiplied
     alpha where straight alpha belongs — the un-premultiply step runs
     only inside a group** — found 2026-08-24 by the review of the
     0.51.0 memory fix, **not caused by it** (it reproduces identically
@@ -7388,6 +7388,322 @@ structural design work.
     regression test on both paths is part of the work, and the existing
     `composite_document_*` tests all happen to end fully opaque, which
     is why none of them caught it.
+
+    **Fixed 2026-08-24 (0.52.0) — straightened at all three layers, in
+    one atomic change.** The fix landed as one unit spanning the CPU
+    compositing path, the GPU compositing path, and the canvas *display*
+    shader, because splitting it would have shipped a real regression at
+    every intermediate point (see the discovered finding below).
+
+    1. **One shared CPU primitive.**
+       `aurora_render::un_premultiply_in_place(&mut [f16])`
+       (`crates/aurora-render/src/composite.rs`, beside
+       `transparent_tile`) is `resolve_tile`'s existing `Group`-arm loop
+       moved verbatim — same `chunks_exact_mut(CHANNELS)` shape, same
+       `let [r, g, b, a] = texel else { continue }` destructuring (so no
+       `unwrap`/`expect`/indexing), same `alpha > 0.0` guard zeroing the
+       colour of a fully transparent texel. Pure code motion, no math
+       change, the same discipline the previous round's
+       `composite_layer_into` extraction used. Its doc comment records
+       the invariant the whole fix rests on: **the low-level accumulation
+       primitives deliberately keep their premultiplied-out contract** —
+       `composite_layer_into` reads its own accumulator back mid-fold and
+       *depends* on it being premultiplied (the backdrop-recovery step
+       from 0.50.x divides by alpha to recover `Cb`), so straightening
+       inside the fold would be a double division. Straightening happens
+       exactly once, at the *top* of an accumulation, when a buffer stops
+       being an internal accumulator and becomes a finished result.
+       `composite_tile_cpu`'s and `composite_layer_into`'s own output
+       contracts are unchanged, and
+       `composite_tile_cpu_applies_layer_opacity_on_top_of_the_texels_own_alpha`
+       still asserts `(0.5, 0.5, 0.5, 0.5)` completely unchanged — that
+       test staying green is the check that the fix landed at the right
+       layer.
+
+    2. **The two CPU call sites.** `resolve_tile`'s `Group` arm now calls
+       the primitive instead of inlining the loop (behaviour-identical;
+       every existing `Group`-arm test passing unchanged is the
+       regression check for the extraction), and
+       `composite_roots_into_tile` calls it on the finished root
+       accumulator immediately before returning. Placement there is
+       unambiguous: unlike the `Group` arm there is no mask-clip or
+       `Dissolve` tail to order against (both are per-layer, inside
+       `resolve_tile`), which resolves the open placement question this
+       item raised as a reason to defer. Its doc comment, which used to
+       describe returning premultiplied texels as "the gap PLAN.md
+       records as open", now describes the fixed behaviour.
+
+    3. **The GPU path, straightened once, on the CPU, at its readback.**
+       `begin_gpu_composite_tile`'s render target is left exactly as
+       `composite_over_with_opacity`'s fixed-function `AlphaBlending`
+       fold leaves it — a *premultiplied* accumulator, which is that
+       method's own correct and unchanged contract — and
+       `finish_tile_readback` calls the same shared
+       `aurora_render::un_premultiply_in_place` on the `Vec<half::f16>`
+       its readback decode already produces, before handing it back.
+       That is the exact same "straighten when a buffer stops being an
+       accumulator and becomes a finished result" moment as the two CPU
+       call sites above; it just happens to be the decode rather than the
+       end of a fold. `begin_gpu_composite_tile` and
+       `composite_over`/`composite_over_with_opacity` needed no change
+       beyond the deleted step, and `dst_texture` keeps its original
+       `RENDER_ATTACHMENT | COPY_SRC` usage.
+
+       **This replaced a first shape that did the division on the GPU**,
+       and the replacement is the substantive change of the 0.52.0
+       revision round rather than a simplification for its own sake. That
+       first shape added an `fs_un_premultiply` WGSL entry point, a
+       `TileCompositor::un_premultiply_into` render pass, a second
+       per-tile `Rgba16Float` texture (a texture cannot be sampled and
+       used as a render attachment in one pass) and an extra queue
+       submission — all on a compositing path already measured at ~5.9×
+       over its 16.7 ms frame budget ("Measured, not assumed" in
+       CLAUDE.md) — and, worse, it meant the *same division existed
+       twice*, once in a CPU loop and once in WGSL. Review measured those
+       two implementations disagreeing at very small alphas (the GPU's
+       fixed-function `Rgba16Float` target saturates at `65504.0` where
+       the CPU loop overflowed to `inf`), which directly contradicted the
+       doc comments claiming the two paths land on identical pixels. One
+       implementation, called from both paths, makes them agree **by
+       construction** rather than by argument, and costs the GPU path
+       nothing. The WGSL entry point, the render-pass method, and its two
+       GPU tests were all deleted.
+
+    4. **The division saturates instead of overflowing.**
+       `un_premultiply_in_place` guards `alpha > 0.0`, which admits an
+       alpha down to `f16`'s smallest subnormal (~`5.96e-8`). Dividing a
+       large-but-finite colour channel by an alpha that small overflows
+       `f16`'s ~`65504` ceiling, and `f16::from_f32` turns the
+       overflowing `f32` into `inf` — which then travels silently into an
+       exported PNG/TIFF, the eyedropper, and the canvas atlas as corrupt
+       data rather than failing loudly. Review reproduced this end to end
+       (three root-level pixel layers each filled `[65504, 65504, 65504,
+       5e-5]` compositing to `inf` and exporting "successfully"). It
+       needs HDR or deliberately crafted content — ordinary SDR painting
+       never approaches it — but it is a real silent-corruption path, so
+       each channel's quotient is now clamped to `±65504.0` before the
+       `f16` conversion (`straighten_channel`). That is also what the GPU
+       already did for the same inputs, since a fixed-function
+       `Rgba16Float` render target saturates rather than overflowing, so
+       the clamp makes the CPU match measured hardware behaviour rather
+       than inventing a third one.
+
+       Related, recorded on the same doc comment rather than "fixed"
+       because it is intrinsic and not a defect: **straightening a
+       near-transparent texel stored in `f16` is inherently lossy.**
+       `f16`'s quantization step near zero is *absolute* (~`5.96e-8`), so
+       a premultiplied colour stored at, say, `alpha = 1e-6` has already
+       lost most of its significant bits before the division sees it, and
+       dividing by that alpha amplifies the residual into large
+       *relative* colour error — below roughly `alpha = 3e-6` the
+       recovered colour is indicative only. Worth knowing when debugging
+       a surprising eyedropper or export value on a nearly invisible
+       pixel; the surprise is upstream, in what `f16` could represent at
+       all.
+
+    **Discovered finding: `canvas.wgsl` was the other half of the bug,
+    and the two cancelled on screen.** `aurora-gpu`'s display shader
+    `fs_canvas` ended in `c.rgb + bg * (1.0 - c.a)` — the *premultiplied*
+    "over" formula. `TileResidency::sync` uploads store texels to the
+    atlas with no alpha conversion at all (a plain `to_le_bytes` copy of
+    the `f16` texels — confirmed by reading it before any code changed),
+    so the shader was consuming exactly the premultiplied texels the
+    broken compositing paths produced. **The live canvas was therefore
+    accidentally approximately correct**, which is a large part of why
+    this survived so long: the bug was invisible in the one place a human
+    looks, and silent everywhere it mattered (export, eyedropper).
+    Fixing the compositing paths alone would have converted an
+    accidentally-correct display into a visibly wrong one — translucent
+    content rendering too bright and clipping to white. So `fs_canvas`
+    now ends in the straight-alpha `c.rgb * c.a + bg * (1.0 - c.a)`, with
+    a comment stating that the atlas holds straight alpha (the tile
+    store's universal convention) and that this is the one place in the
+    codebase it is converted for display. This is why the change is
+    atomic rather than three commits.
+
+    **New tests.**
+    - `aurora-render`: four headless unit tests on the primitive
+      (fractional alpha straightens, `alpha == 1.0` is an identity,
+      `alpha == 0.0` zeroes the colour, and — from the revision round —
+      `un_premultiply_in_place_saturates_rather_than_overflowing_at_a_tiny_alpha`,
+      which feeds `[65504, 65504, 65504, 5e-5]` and asserts the result is
+      *finite* and equal to the clamped `65504.0` rather than the true,
+      unrepresentable ~`1.3e9` quotient. **Confirmed to actually catch
+      it**: temporarily removing the clamp makes it fail with
+      `got (inf, inf, inf, …)`, and the clamp was restored immediately
+      after. No GPU tests on the primitive, because after the revision
+      there is no GPU implementation of it to test.
+    - `aurora-app`: `composite_document_un_premultiplies_a_translucent_root_level_layer`
+      (AC-1, fully headless, no adapter needed) asserts the reproduction
+      case in this item's own text — one opaque-white layer at 50%
+      opacity exports as `(1.0, 1.0, 1.0, 0.5)` — with an explicit
+      `assert_ne!` against the old `(0.5, 0.5, 0.5, 0.5)`, so it would
+      have failed before the fix rather than merely not covering it.
+      `recomposite_visible_tiles_un_premultiplies_a_translucent_root_level_layer`
+      (AC-2) asserts the same value through the live-canvas entry point
+      on its CPU-only fallback; it still needs a real `GpuContext`
+      because `recomposite_visible_tiles` takes a `TileResidency` to
+      learn which tiles are visible — a harness constraint of that
+      signature, not evidence about the CPU math, and its own doc comment
+      says so.
+    - `aurora-app`: `composite_document_straightens_a_fractional_group_and_a_fractional_root_fold_exactly_once`
+      (added in the revision round) closes a real coverage gap review
+      found: every other test exercises group-level straightening or
+      root-level straightening, never both in one document, so neither a
+      double-straighten nor a straighten at the wrong level could show
+      up. A 50%-opacity group holding one opaque-blue child, as the only
+      root-level layer over nothing, ends fractional at both levels: the
+      group's isolated buffer straightens as an identity to
+      `(0, 0, 1, 1)`, the root fold makes it a premultiplied
+      `(0, 0, 0.5, 0.5)`, and the root-level straightening gives
+      `(0, 0, 1.0, 0.5)`. Both wrong answers are asserted against by
+      name — `(0, 0, 2.0, 0.5)` for a double straighten, `(0, 0, 0.5,
+      0.5)` for a missing one — so either failure mode is
+      distinguishable from the assertion message alone. Fully headless.
+    - `aurora-app`: `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document`
+      (AC-4) is a new sibling of the existing agreement test, which stays
+      **completely unchanged**: that test's fixture ends at `alpha = 1.0`
+      where straightening divides by one and is an exact identity on both
+      paths, so its continuing to pass is real regression evidence — and
+      equally why it could never have caught the bug. The new one uses
+      two root-level `Normal` pixel layers, both opaque red, both at
+      opacity 0.5, folding to a premultiplied `(0.75, 0, 0, 0.75)` and
+      straightening to `(1.0, 0.0, 0.0, 0.75)`. It asserts that value on
+      both the GPU-forced and CPU-forced runs, asserts the two runs are
+      equal to each other, `assert_ne!`s against the old premultiplied
+      value on both, and asserts
+      `document_qualifies_for_gpu_compositing` first so a future change
+      that silently routed it to CPU fails loudly instead of passing
+      vacuously. **The two paths agree exactly, with no epsilon** — the
+      fixture was chosen so the only division is `0.75 / 0.75`, whose
+      exact quotient is representable, and real (software) hardware
+      confirmed it rather than the plan's contingency being needed.
+    - `aurora-gpu`: `canvas_pipeline_blends_a_translucent_tile_against_the_checkerboard`
+      is the test for "steps 1–3 landed but the shader was forgotten,"
+      the single most likely failure mode. A `(1.0, 1.0, 1.0, 0.5)` tile
+      must render to ~158/255 at the sampled centre pixel (straight-alpha
+      white over the checkerboard's own `0.24` square), not the clipped
+      255 the premultiplied formula gives. **Confirmed to actually
+      catch it**: temporarily restoring the old shader line makes it fail
+      with `got 255`, and the line was restored immediately after.
+
+    **Deferred scope, named rather than dropped.**
+    - ~~`begin_gpu_composite_tile` allocates a second `Rgba16Float`
+      texture per tile per frame~~ — **resolved inside this round**, by
+      the revision that moved the un-premultiply to the CPU readback
+      decode (point 3 above). The first shape did add a per-tile
+      `straight_texture` (512 KiB at `TILE`×`TILE`, ~10 MiB per
+      recomposite for a 20-tile grid) plus an extra queue submission; the
+      shipped shape adds neither, and `begin_gpu_composite_tile`'s GPU
+      work is byte-for-byte what it was before 0.52.0. This is left here
+      rather than deleted because the reasoning — an extra pass on a path
+      already ~5.9× over budget is not free, and a second implementation
+      of a division is not free either — is the reasoning that produced
+      the shipped design.
+    - The existing open item on **eliminating the GPU → CPU → GPU
+      readback round trip** is untouched by this round. The GPU path
+      still composites, copies to a mapped buffer, decodes and straightens
+      on the CPU into `store`'s composite tile, and lets `residency.sync`
+      re-upload it. This round added one `un_premultiply_in_place` call
+      to the CPU-side decode that already happened; it did nothing to
+      remove the round trip itself.
+    - **Group children combining via a non-`Normal` blend mode against
+      each other mid-isolation** remains the narrower open gap
+      `resolve_tile`'s own doc comment describes. Unrelated to this fix
+      and untouched by it.
+
+    **Verification honesty (this is correctness-class evidence only).**
+    Every GPU-backed test above ran under **Mesa llvmpipe software
+    Vulkan** in this sandbox — there is no real GPU here. That is
+    adequate for the question this round actually asks, which is
+    arithmetic ("does `0.75 / 0.75` come back as `1.0` through a real
+    `wgpu` pipeline"), and inadequate for anything else: it is **not**
+    evidence about real-GPU timing or driver-specific numerical
+    behaviour, and it says nothing about interactive feel. Per CLAUDE.md's own standing lesson,
+    a green run here is not evidence that canvas work is correct.
+    Specifically: **the `canvas.wgsl` display change has only been
+    checked by offscreen pixel readback — no human has looked at a real
+    window on real hardware with translucent content on the canvas.**
+    That check is still owed, and it is the one part of this round where
+    a wrong result would be immediately obvious to a person and is not
+    obvious from any test.
+- [ ] **Atlas filtering may produce dark halos at translucent edges when
+    zoomed out — needs real-hardware verification.** Raised 2026-08-24 by
+    the 0.52.0 review, independently derived by two reviewers by hand
+    computation, and **unconfirmed** — recorded as a plausible risk, not
+    as a known defect. `crates/aurora-gpu/src/residency.rs`'s canvas
+    atlas sampler uses `min_filter: Linear`, and linear filtering is only
+    mathematically correct on *premultiplied* data. Since 0.52.0 the
+    atlas holds **straight** alpha (that is the whole point of the fix
+    above), so at a translucent or anti-aliased edge under minification
+    (zoom below 100%) the hardware blends RGB independently of alpha: a
+    50/50 blend of an opaque texel and a fully transparent one yields
+    half the correct colour weight, roughly half as bright as correct.
+    `un_premultiply_in_place` forcing a fully transparent texel's RGB to
+    exactly `0.0` makes it worse, since the transparent side contributes
+    black rather than the neighbouring colour.
+
+    **Why it is unconfirmed**: neither reviewer could produce a
+    reproducing screenshot. llvmpipe — this sandbox's only Vulkan backend
+    — did not visibly engage its linear minification filter at the zoom
+    levels tried, and the separate pre-existing bug in the item below
+    blocked testing at zoom 0.5 specifically. So this needs **a human
+    looking at a real window on real GPU hardware**, with translucent,
+    soft or anti-aliased content, at several zoom levels below 100%.
+
+    Two candidate fixes, for whoever picks this up:
+    (i) set `min_filter: Nearest` on the atlas sampler — a one-line,
+    safe change that loses filtering smoothness while zoomed out, and is
+    the right answer if the halo is confirmed and a fix is wanted
+    quickly; or (ii) keep the canvas *atlas* premultiplied while keeping
+    the tile *store* straight — revert `canvas.wgsl`'s `fs_canvas` to its
+    pre-0.52.0 `c.rgb + bg * (1.0 - c.a)` and have `TileResidency::sync`
+    premultiply texels as it uploads them, i.e. move the
+    straight↔premultiplied boundary from "the display shader, at draw
+    time" to "residency.sync, at atlas-upload time". (ii) is more
+    invasive but resolves the risk with certainty rather than by avoiding
+    the geometry that triggers it, and it keeps export, the eyedropper,
+    and `.aur` round-tripping on straight alpha either way. Deliberately
+    **not** attempted in the 0.52.0 revision round: it is separate work
+    of its own size, and doing it blind on unconfirmed evidence, with no
+    real GPU to check it against, is exactly the mistake CLAUDE.md's own
+    "lesson from the last round" warns about.
+- [ ] **GPU-backed tests self-skip silently instead of failing when no
+    adapter is present — a systemic CI gap.** Not introduced by 0.52.0,
+    but newly and sharply highlighted by it. Review demonstrated that
+    reverting either half of the premultiplied-alpha fix — the GPU
+    compositing half, or the `canvas.wgsl` display half — makes exactly
+    **one** test fail each, and both of those tests are gated behind
+    `real_gpu_context()` (respectively `real_context()`) returning
+    `Some`. On a CI runner with no real adapter, both halves of that fix
+    are therefore completely unprotected: the suite goes green while
+    printing `SKIPPED`. This is CLAUDE.md's own documented lesson from
+    the last round, now with a concrete measurement behind it.
+
+    The fix is infrastructure spanning the whole test suite, not part of
+    any one feature: CI should *assert that GPU-gated tests actually
+    ran* — failing the job rather than skipping silently — on any runner
+    that is supposed to have a real adapter, most likely via an
+    environment variable the runner sets (`AURORA_REQUIRE_GPU=1`) that
+    turns the self-skip into a hard failure, so the "no adapter" escape
+    hatch stays available on a dev box and is impossible on a runner
+    where a green run is being treated as evidence. Untouched by the
+    0.52.0 round on purpose.
+- [ ] **At zoom 0.5 the live canvas renders pure checkerboard, with all
+    tile content invisible across the whole viewport.** Found 2026-08-24
+    during the 0.52.0 review; **pre-existing and unrelated to that fix**,
+    confirmed by pixel readback reproducing it identically with either
+    the pre-0.52.0 or the post-0.52.0 `fs_canvas` formula in place. Zoom
+    1.0, 0.99 and 0.75 all render correctly; 0.5 does not. Most likely an
+    LOD/mip-selection problem rather than a blend problem — the atlas
+    sampler pairs `min_filter: Linear` with `mipmap_filter: Nearest` on a
+    texture whose mip levels may never be populated for the composite
+    surface, so a minification factor that crosses into mip 1 would
+    sample an empty level. Not blocking, not part of the premultiplied
+    fix, and deliberately not fixed in that round — recorded here as its
+    own real bug so it is not lost. It also blocked one of the halo
+    item's own verification attempts above, so the two are worth picking
+    up in that order.
 - [ ] **A corrupted scratch-disk tile can reach a real `panic` via
     `copy_from_slice`** — found 2026-08-24 by the same review, also
     **pre-existing** (it reproduces on the pre-fix code) and also
@@ -9961,6 +10277,36 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-08-24 (0.52.0) — the premultiplied-alpha correctness bug
+is fixed, and it turned out to span three layers, not two.** The item
+under M1.9 ("Every saved file with translucent pixels has premultiplied
+alpha where straight alpha belongs") is closed: `composite_roots_into_tile`
+(CPU) and the GPU compositing path now both straighten their finished
+accumulator, through **one** shared
+`aurora_render::un_premultiply_in_place` primitive — the GPU path
+reaching it in `finish_tile_readback`, on the `Vec<half::f16>` its
+readback decode already produces, so the two paths cannot disagree about
+that division by construction. (The first shape of this fix ran a second,
+WGSL implementation as an extra GPU render pass into an extra per-tile
+texture; review measured the two implementations disagreeing at very
+small alphas, and the revision round deleted the GPU one.)
+**The finding worth carrying forward** is the third layer: `aurora-gpu`'s
+own `fs_canvas` display shader was written against the *premultiplied*
+"over" formula, so the two bugs cancelled and the live canvas was
+accidentally approximately correct while every export and every
+eyedropper read was wrong. Fixing the compositing paths alone would have
+turned a silent bug into a visible one, which is why all three landed
+together in one commit. Read that item's "Fixed 2026-08-24 (0.52.0)"
+block for the full account, including the still-untouched GPU→CPU
+readback round trip, the three new open items the review round opened
+rather than dropped (a possible dark-halo artefact from linear-filtering
+the now-straight-alpha atlas, CI's silent self-skipping of GPU-gated
+tests, and a pre-existing zoom-0.5 rendering bug found along the way),
+and an explicit statement of what the verification does and does not
+cover — everything GPU-backed ran
+under Mesa llvmpipe software Vulkan, and the display-shader change has
+never been looked at by a human on a real window.
 
 **Addendum 2026-08-13 (gauntlet-loop session continued, two more rounds
 landed)**: two further items closed the same way as the three below —

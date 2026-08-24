@@ -666,6 +666,106 @@ pub fn transparent_tile() -> Vec<f16> {
     vec![f16::from_f32(0.0); SAMPLES]
 }
 
+/// The largest finite value an `f16` can hold, as `f32` — the clamp
+/// [`un_premultiply_in_place`]'s division saturates to, so a very small
+/// alpha can never turn a finite colour channel into `inf`.
+const F16_MAX: f32 = 65504.0;
+
+/// One channel of [`un_premultiply_in_place`]'s division, saturated to
+/// the finite `f16` range rather than allowed to overflow to `inf` —
+/// see that function's own doc comment for why the clamp is load-bearing
+/// and not cosmetic.
+fn straighten_channel(channel: f16, alpha: f32) -> f16 {
+    f16::from_f32((channel.to_f32() / alpha).clamp(-F16_MAX, F16_MAX))
+}
+
+/// Converts an accumulator buffer's texels from premultiplied alpha back
+/// to straight alpha in place: each texel's `r`/`g`/`b` divided by its
+/// own `a`, guarded against `a == 0.0` (a fully transparent texel has no
+/// meaningful colour to recover, so its colour channels are zeroed
+/// rather than divided by zero) and clamped to the finite `f16` range.
+///
+/// **Why the clamp, on top of the `a == 0.0` guard.** `f16`'s smallest
+/// positive subnormal is ~`5.96e-8`, and a tile buffer can legitimately
+/// hold an alpha that small. Dividing a large-but-finite colour channel
+/// by it overflows `f16`'s ~`65504` ceiling, and an unclamped
+/// `f16::from_f32` turns the overflowing `f32` into `inf` — which then
+/// travels silently into an exported PNG/TIFF, the eyedropper, and the
+/// canvas atlas as corrupt data rather than failing loudly. Each
+/// quotient is therefore saturated to `±65504.0` before the conversion.
+/// That is also what the GPU already did for the same inputs, since a
+/// fixed-function `Rgba16Float` render target saturates rather than
+/// overflowing, so this matches measured hardware behaviour rather than
+/// inventing a third one.
+///
+/// **The design invariant this exists to make explicit.** The low-level
+/// accumulation primitives in this module — [`composite_layer_into`] and
+/// its batch form [`composite_tile_cpu`] — deliberately **keep** their
+/// premultiplied-out contract. Folding straight-alpha "over" math onto a
+/// starting-*transparent* destination leaves a premultiplied result
+/// whenever the accumulated alpha ends up fractional (a lone
+/// `opacity = 0.5` opaque-white layer alone on transparent gives
+/// `(0.5, 0.5, 0.5, 0.5)`, not the straight `(1.0, 1.0, 1.0, 0.5)`), and
+/// that is not an accident to be fixed there: the fold math itself reads
+/// its own accumulator back mid-fold and *depends* on it being
+/// premultiplied — see [`composite_layer_into`]'s backdrop-recovery
+/// step, which divides the running accumulator by its own alpha to
+/// recover the true `Cb` it hands `blend_rgb`. Straightening the
+/// accumulator in place after every layer would make that recovery a
+/// double division.
+///
+/// So straightening happens exactly **once**, at the *top* of an
+/// accumulation — at the moment a buffer stops being an internal
+/// accumulator and becomes a finished result handed to something that
+/// expects straight alpha (a caller one level up whose own
+/// `composite_layer_into` call takes straight-alpha inputs, an exported
+/// PNG/TIFF/`.aur` file, the eyedropper, or the tile store the canvas
+/// atlas uploads from). `aurora-app` calls it at exactly three such
+/// points, **all three on the CPU**: `resolve_tile`'s `Group` arm (a
+/// group's isolated buffer becoming a pseudo-layer),
+/// `composite_roots_into_tile` (the finished root-level composite), and
+/// `finish_tile_readback` (the GPU compositing path's own readback
+/// decode — the GPU leaves a premultiplied accumulator in its render
+/// target, exactly as [`TileCompositor::composite_over`]'s own contract says it
+/// should, and the CPU straightens the decoded samples once as they stop
+/// being that accumulator and become a finished tile). Doing it in one
+/// implementation rather than two means the CPU and GPU compositing
+/// paths cannot disagree about the division *by construction* — 0.52.0's
+/// first shape ran a separate WGSL sibling of this loop as an extra
+/// render pass, and the two implementations were measured to disagree at
+/// very small alphas (the GPU's fixed-function target saturated where
+/// this loop overflowed to `inf`).
+///
+/// **Straightening a near-transparent texel is intrinsically lossy**, and
+/// that is a property of `f16` storage rather than a bug in the
+/// division: `f16`'s quantization step near zero is *absolute*
+/// (~`5.96e-8`), so a premultiplied colour stored at, say, `alpha = 1e-6`
+/// has already lost most of its significant bits before this function
+/// sees it, and dividing by that alpha amplifies the residual error by
+/// `1/alpha`. Below roughly `alpha = 3e-6` the recovered colour should be
+/// treated as indicative only. Worth knowing when an eyedropper reading
+/// or an exported value on a nearly invisible pixel looks surprising —
+/// the surprise is upstream, in what `f16` could represent at all.
+///
+/// Texels are processed in [`aurora_tile::CHANNELS`]-wide chunks; a
+/// trailing partial chunk (which a correctly sized
+/// [`aurora_tile::SAMPLES`]-length buffer never has) is left untouched.
+pub fn un_premultiply_in_place(texels: &mut [f16]) {
+    for texel in texels.chunks_exact_mut(CHANNELS) {
+        let [r, g, b, a] = texel else { continue };
+        let alpha = a.to_f32();
+        if alpha > 0.0 {
+            *r = straighten_channel(*r, alpha);
+            *g = straighten_channel(*g, alpha);
+            *b = straighten_channel(*b, alpha);
+        } else {
+            *r = f16::from_f32(0.0);
+            *g = f16::from_f32(0.0);
+            *b = f16::from_f32(0.0);
+        }
+    }
+}
+
 /// Composites `layers` (bottom-to-top; each entry is one tile's own full
 /// [`aurora_tile::SAMPLES`]-length `f16` texel buffer, that layer's own
 /// opacity, and that layer's own [`BlendMode`]) into one tile.
@@ -1114,6 +1214,7 @@ mod tests {
         BlendMode, TileCompositor, blend_channel, blend_color, blend_darker_color, blend_hue,
         blend_lighter_color, blend_luminosity, blend_saturation, clip_color, composite_layer_into,
         composite_tile_cpu, lum, sat, set_lum, set_sat, soft_light_d, transparent_tile,
+        un_premultiply_in_place,
     };
     use crate::test_support::real_context;
     use aurora_tile::{SAMPLES, TILE};
@@ -1138,6 +1239,81 @@ mod tests {
             unreachable!("a SAMPLES-length buffer has at least one texel");
         };
         (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32())
+    }
+
+    /// The real point of `un_premultiply_in_place`: a fractional-alpha
+    /// accumulator holds premultiplied colour, and straightening it
+    /// recovers the true colour. `(0.5, 0.5, 0.5, 0.5)` is exactly what
+    /// `composite_tile_cpu` leaves for a lone opaque-white layer at 50%
+    /// opacity (see
+    /// `composite_tile_cpu_applies_layer_opacity_on_top_of_the_texels_own_alpha`,
+    /// which asserts that value and must keep doing so — this function
+    /// is the *caller's* step, not a change to that contract).
+    #[test]
+    fn un_premultiply_in_place_straightens_a_fractional_alpha_texel() {
+        let mut texels = solid_texels([0.5, 0.5, 0.5, 0.5]);
+        un_premultiply_in_place(&mut texels);
+        assert_eq!(first_texel(&texels), (1.0, 1.0, 1.0, 0.5));
+    }
+
+    /// At `a == 1.0` the division is by one, so this is an identity
+    /// operation — which is exactly why every existing fully-opaque
+    /// fixture in this workspace stays bit-identical across this change,
+    /// and why an opaque-only test can never catch the premultiplied-
+    /// alpha gap this function closes.
+    #[test]
+    fn un_premultiply_in_place_leaves_a_fully_opaque_texel_unchanged() {
+        let mut texels = solid_texels([0.25, 0.5, 0.75, 1.0]);
+        un_premultiply_in_place(&mut texels);
+        assert_eq!(first_texel(&texels), (0.25, 0.5, 0.75, 1.0));
+    }
+
+    /// The divide-by-zero guard: a fully transparent texel has no
+    /// meaningful colour to recover, so its colour channels are zeroed
+    /// rather than producing `inf`/`NaN`.
+    #[test]
+    fn un_premultiply_in_place_zeroes_the_colour_of_a_fully_transparent_texel() {
+        let mut texels = solid_texels([0.4, 0.6, 0.8, 0.0]);
+        un_premultiply_in_place(&mut texels);
+        assert_eq!(first_texel(&texels), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    /// The *other* divide-by-alpha hazard, and the one the `a == 0.0`
+    /// guard above does not cover: an alpha that is nonzero but far
+    /// smaller than the colour channels it divides.
+    ///
+    /// `f16`'s smallest positive subnormal is ~`5.96e-8`, so a
+    /// premultiplied texel can legitimately hold an alpha of `5e-5`
+    /// alongside a colour channel at `f16`'s own `65504.0` ceiling (HDR
+    /// or crafted content; ordinary SDR painting never gets there).
+    /// The exact quotient is then ~`1.3e9`, roughly twenty thousand
+    /// times what an `f16` can represent, and an unclamped
+    /// `f16::from_f32` turns it into `inf` — which then travels silently
+    /// into an exported PNG/TIFF, the eyedropper, and the canvas atlas
+    /// as corrupt data rather than failing loudly.
+    ///
+    /// The assertion is therefore two-part: the result must be *finite*,
+    /// and it must be the saturated `65504.0` rather than the true (and
+    /// unrepresentable) mathematical quotient. Saturating is also what
+    /// the GPU already did for the same inputs — a fixed-function
+    /// `Rgba16Float` render target saturates rather than overflowing —
+    /// so this makes the CPU agree with the hardware rather than
+    /// inventing a third behaviour.
+    #[test]
+    fn un_premultiply_in_place_saturates_rather_than_overflowing_at_a_tiny_alpha() {
+        let mut texels = solid_texels([65504.0, 65504.0, 65504.0, 5e-5]);
+        un_premultiply_in_place(&mut texels);
+        let (r, g, b, a) = first_texel(&texels);
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite(),
+            "straightening must never produce an infinity: got ({r}, {g}, {b}, {a})"
+        );
+        assert_eq!(
+            (r, g, b),
+            (65504.0, 65504.0, 65504.0),
+            "the quotient is ~1.3e9, far outside f16's range, so it must clamp to f16::MAX"
+        );
+        assert!(a > 0.0, "the alpha channel itself is left untouched");
     }
 
     #[test]

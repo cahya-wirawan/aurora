@@ -326,6 +326,89 @@ fn render_and_sample_pixel(
     result
 }
 
+/// The test that catches "the compositing paths were straightened but
+/// `fs_canvas` was left on the premultiplied formula" — the single most
+/// likely way 0.52.0's three-layer premultiplied-alpha fix could have
+/// gone wrong.
+///
+/// Until 0.52.0 two bugs cancelled out on screen: `aurora-app`'s
+/// top-level compositing entry points left the composite surface in
+/// *premultiplied* alpha, and this shader's own final line was the
+/// premultiplied "over" formula (`c.rgb + bg * (1 - c.a)`), so the live
+/// canvas looked approximately right while every export and every
+/// eyedropper read carried the wrong colour. Straightening the
+/// compositing paths without also fixing the shader would have made
+/// translucent content render *too bright* — here, clipping to a fully
+/// saturated 255 — so this test pins the shader half specifically.
+///
+/// Fixture: a solid 50%-alpha white tile, `(1.0, 1.0, 1.0, 0.5)` in
+/// straight alpha, which is exactly what `composite_roots_into_tile` now
+/// produces for one opaque-white layer at 50% opacity. Expected at the
+/// sampled centre pixel: the straight-alpha "over" of white onto the
+/// checkerboard's own lighter square (`check = 0.24`, since
+/// `floor(128.5 / 8) = 16` on both axes and `(16 + 16) % 2 == 0`):
+/// `1.0 * 0.5 + 0.24 * 0.5 = 0.62`, i.e. `round(0.62 * 255) = 158` in
+/// the `Rgba8Unorm` render target. The pre-fix formula would give
+/// `1.0 + 0.24 * 0.5 = 1.12`, clamped to `255` — asserted against
+/// explicitly below.
+///
+/// A tolerance of 1 (out of 255), not exact equality: unlike the
+/// fully-opaque fixtures the tests around this one use, `0.24` is not an
+/// exact binary fraction, so the last unit of the 8-bit quantization is
+/// genuinely at the mercy of the driver's own rounding. The two
+/// candidate values here differ by ~97 units, so a tolerance of 1
+/// discriminates them with enormous margin.
+#[test]
+fn canvas_pipeline_blends_a_translucent_tile_against_the_checkerboard() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 0, y: 0 },
+        [1.0, 1.0, 1.0, 0.5],
+    );
+
+    let mut residency = TileResidency::new(device, queue, VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+    let pixel = render_and_sample_pixel(
+        device,
+        queue,
+        &mut canvas,
+        &residency,
+        VIEWPORT,
+        (VIEWPORT.0 / 2, VIEWPORT.1 / 2),
+    );
+
+    let [r, g, b, a] = pixel;
+    // 0.5 * 1.0 + 0.5 * 0.24 = 0.62 -> 158/255.
+    let expected = 158_i32;
+    for (channel, label) in [(r, "red"), (g, "green"), (b, "blue")] {
+        let delta = i32::from(channel) - expected;
+        assert!(
+            delta.abs() <= 1,
+            "{label} channel: expected ~{expected} (straight-alpha white over the 0.24 \
+             checkerboard square), got {channel}"
+        );
+        assert!(
+            channel < 250,
+            "{label} channel clipped to {channel}: fs_canvas is still using the \
+             premultiplied \"over\" formula, which now double-counts alpha and renders \
+             translucent content far too bright"
+        );
+    }
+    assert_eq!(a, 255, "the canvas shader always writes an opaque result");
+}
+
 #[test]
 /// The real, visible proof of PLAN.md M1.9's "make zoom visible" work:
 /// `TileResidency::set_origin`'s new `zoom` parameter must actually
