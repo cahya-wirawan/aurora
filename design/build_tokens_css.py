@@ -54,20 +54,26 @@ def main():
     ]
 
     # --- semantic color tokens, resolved through the theme to the palette ---
+    # A colour group can also carry a plain scalar alongside its palette
+    # references -- `border.control_opacity` is one (0.0 in every theme but the
+    # two High Contrast ones, see tokens/vocabulary.md). Those are emitted
+    # as-is; only strings are palette references to resolve.
     for group in ("surface", "text", "icon", "border", "accent"):
         for name, ref in theme[group].items():
             var = css_var_name(f"{group}-{name}")
-            lines.append(f"  {var}: {resolve_color(ref, palette)};")
+            value = resolve_color(ref, palette) if isinstance(ref, str) else ref
+            lines.append(f"  {var}: {value};")
 
     for name, val in theme["state"].items():
         if isinstance(val, dict):
             color = resolve_color(val["color"], palette)
             lines.append(f"  {css_var_name(f'state-{name}-color')}: {color};")
             lines.append(f"  {css_var_name(f'state-{name}-alpha')}: {val['alpha']};")
-        elif name == "disabled_opacity":
-            lines.append(f"  {css_var_name('state-disabled-opacity')}: {val};")
         else:
-            lines.append(f"  {css_var_name(f'state-{name}')}: {resolve_color(val, palette)};")
+            # Same rule as the colour groups above: `state.disabled_opacity` is
+            # a scalar, everything else here is a palette reference.
+            value = resolve_color(val, palette) if isinstance(val, str) else val
+            lines.append(f"  {css_var_name(f'state-{name}')}: {value};")
 
     lines.append("")
 

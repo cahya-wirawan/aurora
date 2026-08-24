@@ -5,9 +5,9 @@
 :root {
   --surface-canvas: #141414;
   --surface-app: #1a1a1b;
-  --surface-panel: #212124;
-  --surface-raised: #28282c;
-  --surface-overlay: #313136;
+  --surface-panel: #28282c;
+  --surface-raised: #313136;
+  --surface-overlay: #404048;
   --surface-sunken: #141414;
   --text-primary: #f5f5f6;
   --text-secondary: #c1c1c7;
@@ -18,8 +18,10 @@
   --icon-disabled: #7a7a83;
   --icon-on-accent: #141414;
   --border-default: #404048;
-  --border-strong: #6e6e76;
+  --border-strong: #7a7a83;
   --border-focus: #78acff;
+  --border-control: #7a7a83;
+  --border-control-opacity: 0.0;
   --accent-primary: #78acff;
   --accent-primary-hover: #a4c8ff;
   --accent-primary-active: #5b9bff;
