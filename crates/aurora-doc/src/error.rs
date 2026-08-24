@@ -69,4 +69,18 @@ pub enum DocError {
     /// valid, `postcard`-encoded journal.
     #[error("failed to deserialize the crash-recovery journal: {0}")]
     JournalDeserialization(String),
+    /// A deserialized [`crate::LayerTree`] nests groups deeper than
+    /// [`crate::MAX_LAYER_TREE_DEPTH`] — see that constant's own doc
+    /// comment for why a bound exists at all.
+    #[error("layer tree nests {depth} levels deep, past this reader's own {max}-level limit")]
+    LayerTreeTooDeep { depth: usize, max: usize },
+    /// A deserialized [`crate::LayerTree`] reaches the same layer twice
+    /// while walking down from its roots — a group that (directly or
+    /// through a chain of groups) contains itself, or the same layer
+    /// listed as a child of two different parents. Neither is a tree,
+    /// and every traversal in this crate assumes one.
+    #[error(
+        "layer {0:?} is reachable more than once from the layer tree's roots: a cycle, or the same layer listed under two parents"
+    )]
+    MalformedLayerTree(LayerId),
 }

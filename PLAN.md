@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-08-02**.
+Last updated: **2026-08-24**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -1448,6 +1448,17 @@ every widget in every state across all built-in themes with contrast checks gree
   fmt --all --check` clean, `cargo clippy -p aurora-doc --all-targets
   --all-features -- -D warnings` clean, `cargo test -p aurora-doc` —
   78/78 passed.
+
+  **Addendum 2026-08-24 (0.49.0)**: the "writing the journal to disk"
+  half was closed on 2026-08-06 (`History::save_journal`/`load_journal`,
+  ADR 0009 — see M1.9's "Autosave and recovery" bullet), and as of
+  0.49.0 `aurora-app` no longer persists the bare journal at all: its
+  autosave file is a real `.aur` container, so what survives a crash is
+  the manifest's own `LayerTree`, this journal, the document's canvas
+  size, **and** the real painted tiles. This bullet's own in-memory
+  `replay` remains exactly as described above and is still what
+  `read_aur` reconstructs a `History` from; nothing here was revised, it
+  simply has a durable home now.
 
   **`journal_descriptions` added 2026-08-04**, 1 more test (79 total) —
   a real, minimal public accessor exposing one human-readable, one-line
@@ -5300,7 +5311,14 @@ structural design work.
   decision `spike/raw-icc/FINDINGS.md` already warned against once. So
   the dialog is honest about it: its one action is "Continue," not
   "Recover Document" — real crash *detection*, not (yet) real crash
-  *recovery*. `handle_key`'s routing gained a dialog tier ahead of the
+  *recovery*. **Addendum 2026-08-24 (0.49.0)**: "restore any actual
+  document state" stopped being true on 2026-08-06 (M1.9's "Autosave and
+  recovery" bullet gave this dialog a real journal to recover from), and
+  as of 0.49.0 recovery restores real painted pixels and the real canvas
+  size too, from a real `.aur` container. The dialog's single "Continue"
+  action is still accurate and unchanged — recovery remains unconditional
+  and automatic, with the message reporting which happened; what changed
+  is how much it actually recovers. `handle_key`'s routing gained a dialog tier ahead of the
   command palette (a modal alert takes priority over everything else,
   including the palette — checked directly by a test opening both and
   confirming `Escape` closes only the dialog). 11 new `aurora-app`
@@ -5718,7 +5736,13 @@ structural design work.
   gap: the crash-recovery journal (`History::replay`, M1.4) had no
   on-disk encoding to persist to, and `aurora-app`'s own crash-recovery
   marker (M1.8) explicitly deferred real document recovery for the
-  same reason.
+  same reason. **Addendum 2026-08-24 (0.49.0)**: the reader/writer this
+  bullet called "separate, still-open follow-on work" has since been
+  built (see the "`.aur` reader/writer" work under M1.9), and
+  `aurora-app`'s crash-recovery autosave is now itself a real `.aur`
+  container rather than the bare journal — so "the crash-recovery
+  journal itself, finally somewhere real to go" below is now literally
+  what autosave does, not just what the format was designed to allow.
 
   **Decision**: `.aur` is a ZIP archive (the `zip` crate, trimmed to
   `STORE`/`DEFLATE` — no encryption/`bzip2`/`lzma`/`zstd`/`ppmd`, none
@@ -6123,6 +6147,245 @@ structural design work.
   separately from this journal, is what keeps that honest rather than a
   silent data-loss risk, but recovering a pixel edit's own undo/redo
   position after a crash is still not something this journal covers.
+
+  **Addendum 2026-08-24 (0.49.0) — the autosave file is a real `.aur`
+  container now, and live re-triggering was taken back out.** This
+  closes the "still plain `postcard` bytes, not a real `.aur` container"
+  gap named twice above, and with it the pixel-loss gap the 2026-08-12
+  addendum accepted in its own last paragraph: `write_autosave` now
+  builds the file with `aurora_io::write_aur` (mimetype sentinel,
+  `postcard` manifest carrying the whole `LayerTree` **and** the
+  document's own canvas size, the history journal, and one ZIP entry per
+  non-blank tile) and `recover_document` reads it back with
+  `aurora_io::read_aur` straight into the live `aurora_tile::TileStore`.
+  So a crash now recovers **real painted pixels** and the real canvas
+  size, where before it recovered only structural `LayerOp`s and lost
+  100% of a user's unsaved painting. `App::new` opens the tile store
+  *before* recovery (recovered tiles need somewhere live to land) and
+  seeds `App::canvas_size` from the recovered manifest instead of
+  re-deriving it from the topmost layer. The file name changed with the
+  format: `aurora-autosave.postcard` → `aurora-autosave.aur`. The write
+  streams straight into a per-write **unique** temp file and is
+  `rename`d into place, so a crash *during* an autosave can't destroy
+  the previous complete one and two writers can never share one temp
+  name.
+
+  **The cadence change, stated as plainly as the gap it closes — and
+  revised after review.** The 2026-08-12 addendum's "fires on every
+  real, completed document mutation" is **no longer true**. Building a
+  container is not the cheap `postcard` encode a journal was:
+  `write_aur` walks every pixel layer's whole tile grid and calls
+  `TileStore::get` on each in-bounds tile, which can page tiles in from
+  the scratch disk and evict others from the LRU, and `TileStore` is
+  owned outright by `App` on the UI thread (making it shareable is the
+  parked `TileStore`-threading redesign, not something to do as a side
+  effect here). That cost is **large and measured, not hypothetical**:
+  autosaving `demo_document` (three pixel layers over a 4000x3000
+  canvas, so 576 `TileStore::get` calls against a 256-tile budget) took
+  **687 ms** on this Linux dev box, writing a 528-byte file —
+  essentially all of it blank-tile allocation and LRU eviction, not I/O
+  of real content.
+
+  This round first tried to keep live re-triggering and *rate-gate* it
+  (8 edits or 5 s, whichever came first). **Independent review rejected
+  that, and it was removed rather than defended**: a gate bounds how
+  *often* a 687 ms stall happens, not whether one ever lands on a
+  stroke-commit path measured at 9.1 ms p99 against a 10 ms budget, and
+  the LRU eviction a full grid walk causes degrades the *following*
+  strokes too (the walk pushes out exactly the tiles being painted on).
+  So autosave now happens **only at lifecycle boundaries**: a fresh
+  session's startup document (`App::new`, and skipped outright when
+  recovery just succeeded — the file already holds that document, so
+  rewriting it would burn a full grid walk on the pre-window startup
+  path for byte-identical output) and each document replacement
+  (`App::open_file`/`App::open_aur_file`). `App::trigger_autosave`,
+  `AutosaveQueue`, `queue_autosave` and the rate-gate constants are all
+  gone; nothing called them any more. §7.3.4 is **not** claimed to be
+  "upheld exactly as before" — an earlier draft of this addendum said
+  that and it was wrong: the queued write really did keep `std::fs::write`
+  off the calling thread, but the container build in front of it never
+  was off it, so a rate-gated live trigger was still a UI-thread stall.
+  Removing the trigger is what restores §7.3.4 on the input path.
+
+  **Consequence, honestly, in both directions**: a crash now loses every
+  edit made since the last lifecycle boundary — painted pixels *and*
+  structural changes. Against 0.48.1 that is better in one direction (a
+  recovered document has its real pixels, which it never did before) and
+  worse in another (0.48.1 re-saved structure on every edit, cheaply,
+  because structure was all it saved). This is narrower than what this
+  round's own plan intended, and it is not a clean win — calling it one
+  would be dishonest. The real fix is the same either way and is
+  separate, still-open work: an incremental, dirty-tile-only autosave,
+  or a tile store readable from a background thread.
+
+  **Two hardening fixes in `aurora-io` came out of the same review**,
+  and they apply to *every* `.aur` read, not just autosave — including
+  `App::open_aur_file`, i.e. any `.aur` file a user was sent.
+  `aur::read` now rejects a manifest declaring layer bounds past
+  `aurora_core::MAX_DOCUMENT_EXTENT` before deriving a tile grid from
+  them (a crafted 376-byte file claiming `u32::MAX` bounds otherwise
+  loops ~2.8e14 times — on the pre-window startup path it is
+  indistinguishable from a hung launch), and reads every entry through a
+  per-entry size cap (a tile entry can hold at most one tile's worth of
+  f16 RGBA samples; 4 KB of DEFLATE-compressed zeros otherwise expanded
+  to 4 GiB of RSS). Both reject with an `IoError`; neither panics.
+
+  **A second hardening pass, after a second independent review of the
+  hardened code.** The first pass fixed real holes and did not find all
+  of them. Four more were raised against the same untrusted-input path;
+  all four were checked against the code (two of them by running a
+  crafted input, not by reading), and all four were real:
+
+  - **Unbounded recursion over a `LayerTree` that nothing validated —
+    the worst of the four, and the one the first pass's own hardening
+    surfaced.** `LayerTree` derived `Deserialize` with no structural
+    check, so a manifest could declare a `LayerKind::Group` whose
+    `children` list names the group itself. Every downward walk in the
+    project then recursed forever on it. **Measured, not argued**: a
+    hand-crafted **226-byte** `.aur` file killed the process with `fatal
+    runtime error: stack overflow, aborting` (exit 134, core dumped) —
+    on the pre-window startup path the first pass had just hardened
+    against a *hang*. A stack overflow is not a catchable panic, so it
+    is strictly worse than the DoS that round fixed. Fixed at the root:
+    `LayerTree` now deserializes through `#[serde(try_from)]`, which
+    walks the tree iteratively before any caller sees it and rejects a
+    layer reachable twice (a cycle, or one layer listed under two
+    parents) or nesting past the new `aurora_doc::MAX_LAYER_TREE_DEPTH`
+    (256 — roughly twenty-five times Photoshop's own ten-level group
+    nesting, and low enough to bound `resolve_tile`'s ~½ MB-per-level
+    recursion). The wire format is unchanged, so every existing `.aur`
+    file still opens. Belt and braces on top, because a compositing
+    path with no way to return an error must not be able to abort:
+    `LayerTree::paint_order`, `LayerTree::capture_subtree`,
+    `LayerTree::is_descendant` and `aur`'s own pixel-layer walk are all
+    iterative and visit-budgeted now, so a cyclic tree that somehow
+    reached them yields a wrong picture rather than a dead process.
+  - **The per-layer bounds check did not bound the *total*.** Layer
+    *count* has no ceiling — this project promises unlimited layers —
+    and a `LayerEntry` costs tens of bytes on the wire, so a manifest
+    well under the 64 MiB metadata cap could stack many individually
+    legal ceiling-sized layers and multiply the tile scan out again.
+    `aur::read` now charges each layer's grid against a whole-document
+    budget (`MAX_TOTAL_TILES_PER_DOCUMENT`, deliberately set at exactly
+    *one* layer at the documented ceiling) before walking it.
+  - **`canvas_width`/`canvas_height` were handed back unchecked** while
+    layer bounds were not — and `App` puts that value straight into
+    `canvas_size`, from which `composite_document` allocates
+    `width * height * 4` samples. Now checked against
+    `MAX_DOCUMENT_EXTENT` in `aur::read`, at the same layer the existing
+    protection already lives.
+  - **The tile-entry byte cap did not reach the lz4 frame inside it.**
+    `lz4_flex::decompress_size_prepended` takes its output length from a
+    four-byte prefix *inside* the compressed frame and allocates that
+    much up front (0.11.6, `block::decompress`:
+    `vec![0; min_uncompressed_size]`), independent of how small the
+    compressed blob is. **Measured against lz4_flex 0.11.6**: a 26-byte
+    input claiming `3_000_000_000` moved the probe process's `VmSize`
+    from 3.3 MB to 2.93 GB in 7 µs and still returned `Ok`.
+    `aurora_tile::codec::decode` now checks that prefix against one
+    tile's own real maximum output before handing the bytes over.
+
+  Each has its own regression test, sized to be fast and safe: the
+  depth test sits one level past the limit rather than deep enough to
+  really overflow a stack, and the allocation tests assert on the
+  rejection rather than trying to allocate anything.
+
+  **Named honestly, not fixed here**: `postcard`'s error type discards a
+  `Display` message from a `try_from` conversion (it is a no-alloc
+  format), so a rejected tree surfaces to the user as the same generic
+  "failed to deserialize the .aur manifest" any other corruption gives
+  — the *reason* is pinned down by tests against the validator itself
+  rather than by the message. And `composite_document` still allocates
+  the whole canvas at once, so exporting a document at the full
+  300,000 × 300,000 ceiling would ask for ~720 GB; that is now bounded
+  by a real, documented limit rather than by `u32::MAX`, and it takes a
+  deliberate Save action rather than merely opening a file, but it is
+  not solved.
+
+  **Known limitations left in place, named rather than fixed**: the
+  autosave still lives at a fixed name in `std::env::temp_dir()` and now
+  holds real pixel content — the file is created `0o600` on Unix and
+  deleted on clean shutdown, but Windows ACLs and the directory choice
+  itself want the same move to a per-user app-support directory that
+  `marker_path` wants, which is separate work. And the session marker is
+  written before the tile store is known to have opened, so a session
+  that runs without a store still looks like a crash to the next launch
+  (which then recovers an older autosave); harmless in practice —
+  recovery is validated and falls back — but not fixed here.
+
+  **Verified 2026-08-24**: `cargo fmt --all --check`,
+  `python3 scripts/check_layering.py`,
+  `python3 scripts/check_no_hardcoded_style.py`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  all clean; `cargo test --workspace` — 1004 passed, 0 failed
+  (`aurora-app` 217, `aurora-io` 63, `aurora-doc` 115, `aurora-tile` 21,
+  including seven `aur::read` hardening tests, eight new `LayerTree`
+  structural-validation and traversal-termination tests, two new tile
+  codec tests, and five autosave tests); `cargo test --workspace
+  --doc` and `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps
+  --all-features` clean. `cargo deny check all` **not run** — not
+  installed in this environment. No GPU-hardware or interactive
+  verification: everything here is file I/O and headless logic, but
+  nothing in this bullet has been exercised in a live session on real
+  hardware.
+
+  **A third independent read of the hardened code (2026-08-24, same
+  round) found three more gaps — none reachable from a live code path
+  today, so none blocked this round, but named here rather than left
+  for someone to rediscover:**
+
+  - **`validate_shape` checks `roots`/`children` but never
+    `LayerEntry::parent`.** Three `unreachable!()` sites —
+    `LayerTree::remove_capturing` (two) and `LayerTree::reparent`
+    (one) — assume a layer's recorded `parent` agrees with whatever
+    group's `children` list actually names it, and nothing checks that
+    for a tree built from a manifest. A crafted manifest (a layer in
+    `roots` also carrying `parent: Some(g)`; a `parent` pointing at an
+    id that isn't a real group; a literal orphan) reaches one of the
+    three. Under this workspace's `panic = "abort"` release profile
+    that is a process abort, not a catchable error — the same failure
+    class this round spent two hardening passes closing elsewhere, left
+    open here. Not reachable yet because nothing in `aurora-app` calls
+    `remove`/`reparent` on a document — the Layers panel has no
+    delete/re-nest action wired up. **Must close before either does.**
+    Fix: extend `validate_shape` to check `parent` consistency the same
+    way it already checks reachability; the three `unreachable!()`
+    sites become provably unreachable again once it does. (Also: while
+    it exists, consider `unreachable = "deny"` in the workspace's
+    clippy table, `Cargo.toml:197-200` — under `panic = "abort"` it's
+    indistinguishable from the `panic!` already denied there, and this
+    is exactly the kind of place deserialized input defeats the
+    assumption it relies on.)
+  - **`History::replay()` rebuilds a `LayerTree` from a journal without
+    running it through `validate_shape` at all.** The `.aur` container's
+    `history` entry is exactly as untrusted as its `manifest` entry —
+    both are attacker-reachable bytes inside the same file this round
+    hardened — but only the manifest path goes through the new
+    validator; `history.rs`'s own `Restore` op inserts a deserialized
+    `LayerEntry` straight into the tree. `aurora-app`'s `resolve_tile`
+    is genuinely recursive, so a crafted journal could reach the same
+    class of bug the manifest path just got fixed for. Not reachable
+    yet — nothing outside `history.rs`'s own tests calls `.replay()` —
+    but it defeats the stated point of validating "once" rather than
+    "in every traversal" (`tree.rs`'s own doc comment). Fix: run
+    `validate_shape` (or equivalent) on the tree `replay()` produces, or
+    document plainly that `replay()` must never be called on a
+    `History` built from `load_journal` until it does.
+  - **`Rect.x`/`Rect.y` (`i64`) are unchecked where `width`/`height`
+    now are.** `tile_grid` bounds a layer's extent but not its origin;
+    `read_layer_window` and `Rect::right`/`bottom` do plain
+    add/subtract on it. An extreme `x`/`y` (e.g. near `i64::MIN`)
+    overflows — wraps to a wrong picture in release, panics in debug.
+    Lower severity (wrong output or a debug panic, not an abort or
+    unbounded resource use), and largely pre-existing rather than new
+    this round. Fix: bound `x`/`y` in `tile_grid` the same way
+    `width`/`height` already are, or use checked/saturating arithmetic
+    in the two call sites named above; either way, `aur.rs`'s own
+    comment claiming "layer bounds are checked" should say *extent*,
+    not *bounds*, until it's true.
+
+  Still open, unchanged: no interactive "Discard recovered document"
+  choice.
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
   mutator with an undo-recording version and kept its own undo/redo

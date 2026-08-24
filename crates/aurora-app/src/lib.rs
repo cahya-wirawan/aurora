@@ -152,17 +152,38 @@
 //! Document recovery is now real, not just detected: `aurora-doc`'s
 //! `History::save_journal`/`load_journal` (ADR 0009) give this crate an
 //! on-disk journal encoding to write and read, so `App::new` writes the
-//! current document's journal to a second small file
-//! (`std::env::temp_dir()` again) every startup, and — if a previous
-//! run's marker is there *and* that autosave file parses and replays —
-//! opens with the recovered document instead of the fake demo one.
+//! current document to a second file (`std::env::temp_dir()` again) at
+//! startup, and — if a previous run's marker is there *and* that
+//! autosave file parses — opens with the recovered document instead of
+//! the fake demo one (in which case there is nothing to write back:
+//! the file already holds exactly that document).
+//!
+//! **That autosave file is a real `.aur` container now**, not the raw
+//! `postcard` journal it started as: `write_autosave` builds it with
+//! `aurora_io::write_aur` (mimetype sentinel, manifest carrying the
+//! whole `LayerTree` and the document's own canvas size, the history
+//! journal, and one entry per non-blank tile) and `recover_document`
+//! reads it back with `aurora_io::read_aur` straight into the live
+//! `aurora_tile::TileStore`. So a crash now recovers real painted
+//! pixels and the real canvas size, where before it recovered only
+//! structural `LayerOp`s and lost every painted pixel.
+//!
 //! **Scope, stated honestly**: still just one dialog action ("Continue"
 //! — its message changes depending on whether recovery actually
 //! happened), because recovery itself is unconditional and automatic
-//! rather than a user choice, and autosave is written once at startup,
-//! not on a repeating timer or after edits, since there is no live
-//! editing loop yet to re-trigger it from. See this module's own "crash
-//! recovery" section for the full reasoning.
+//! rather than a user choice. And autosave now happens **only at
+//! lifecycle boundaries** — a fresh session's startup document, and
+//! each document replacement (`App::open_file`/`App::open_aur_file`).
+//! Live per-edit re-triggering was removed in 0.49.0: building a `.aur`
+//! container walks the whole tile grid, which measured 687 ms on a
+//! modest document and has to run on the thread that owns the tile
+//! store (the UI thread), so re-triggering it from stroke commit —
+//! even rate-gated — was a real violation of §7.3.4 against a
+//! 10 ms brush budget. A crash therefore recovers the document as of
+//! the last such boundary, with its real pixels; mid-session edits
+//! since then are not autosaved at all. See this module's own "crash
+//! recovery" section for the full reasoning and what would lift the
+//! restriction.
 //!
 //! **Basic tools, brush painting, and eraser** (PLAN.md M1.9): this
 //! crate's first pointer input at all
@@ -461,7 +482,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aurora_gpu::{GpuContext, GpuSurface};
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
@@ -775,9 +796,9 @@ fn is_aur_path(path: &Path) -> bool {
 /// `layers`' own topmost pixel layer's `bounds` (`(width, height)`), or
 /// `(0, 0)` if there isn't one — the *fallback* [`App::canvas_size`] is
 /// seeded from when nothing else names a real, independent canvas size
-/// for a document (a freshly built [`demo_document`], or one recovered
-/// from an autosave, whose journal has no canvas-size concept of its
-/// own). Once a document is live, `App::canvas_size` is the real source
+/// for a document (a freshly built [`demo_document`]; a recovered
+/// autosave no longer needs it, since its `.aur` manifest carries a
+/// real one). Once a document is live, `App::canvas_size` is the real source
 /// of truth — this is deliberately *not* called again on every save;
 /// see that field's own doc comment for the bug re-deriving it used to
 /// cause.
@@ -900,47 +921,85 @@ fn replace_document(
 // PLAN.md M1.9's "autosave and recovery" bullet closes that gap: ADR
 // 0009 picked `postcard` for `.aur`'s manifest/history encoding, and
 // `History::save_journal`/`load_journal` now use it. So this section now
-// does two things: writes the current document's journal to a small
-// autosave file every startup ([`write_autosave`]), and — if a previous
-// run's marker is present — tries to read that file back and replay it
+// does two things: writes this session's own document to an autosave
+// file at startup ([`write_autosave`], skipped when recovery just
+// succeeded — see [`startup_document`]), and — if a previous run's
+// marker is present — tries to read that file back
 // ([`recover_document`]), falling back to the fake demo document if
 // there's nothing to recover or it doesn't parse.
 //
 // Still deliberately narrow: recovery is unconditional (there is no
 // "Recover Document" vs. "Discard" choice — the dialog just reports
-// what already happened). A real `.aur` file (ADR 0009's ZIP container,
-// with a manifest and tile data) is separate follow-on work — there's
-// still nothing but the journal to put in one.
+// what already happened).
 //
-// **Re-triggered on live edits, off the calling thread, as of the
-// M1.9 addendum below**: the gap this section used to name here ("no
-// live editing loop yet to re-trigger it") closed once `App` started
-// keeping `history`/`pixel_history` alive and mutating them for real
-// (Undo/Redo, a completed Move, a committed Brush/Eraser stroke — see
-// `App::trigger_autosave`'s own call sites). Re-running [`write_autosave`]
-// itself on every such action would violate CLAUDE.md §7.3.4 (the UI
-// thread never blocks on rendering, extended here to input generally):
-// `history.save_journal()` postcard-serializes an ever-growing journal
-// and `write_autosave` then does a *synchronous* `std::fs::write` of it —
-// direct on the stroke-commit path, that's a growing, unbounded disk-I/O
-// cost stacked on top of a stroke-latency budget already measured at
-// 9.1 ms p99 against a 10 ms ceiling (spike/FINDINGS.md). So live
-// re-triggering goes through [`AutosaveQueue`] instead: the journal is
-// still serialized on the calling thread (cheap, CPU-bound `postcard`
-// encoding, not the I/O the invariant is actually about), but the actual
-// `std::fs::write` happens on `aurora_render::Executor`'s dedicated
-// background thread, and a fast flurry of edits (undo-spamming, a quick
-// brush flurry) coalesces down to one eventual write of the *freshest*
-// journal rather than one queued write per edit — see that type's own
-// doc comment for the coalescing mechanism. [`write_autosave`] itself is
-// unchanged and still used for the one-shot, pre-window-visible startup
-// write and the sail-through document-replacement writes in
-// `App::open_file`/`App::open_aur_file`, neither of which is on a
-// latency-budgeted input path.
+// **The autosave file is a real `.aur` container now** (ADR 0009's ZIP
+// archive: `mimetype` sentinel, `postcard` manifest carrying the whole
+// `LayerTree` *and* the document's own canvas size, the history
+// journal, and one entry per non-blank tile) — written by
+// [`write_autosave`] through `aurora_io::write_aur` and read back by
+// [`recover_document`] through `aurora_io::read_aur`, straight into the
+// live `aurora_tile::TileStore`. Before this, the autosave was raw
+// `postcard` journal bytes: a `LayerOp` sequence and nothing else, so a
+// crash recovered a document's *structure* (layers, bounds, opacity,
+// blend modes) and lost 100% of its actual painted pixels, since
+// nothing in the journal has ever described pixel content
+// (`aurora_brush::PixelHistory`'s own doc comment). Recovery now
+// restores the real painted tiles and the real canvas size too.
+//
+// **Written at lifecycle boundaries only, and that is a deliberate
+// scope reduction.** Between 0.41.0 and 0.48.1 this crate re-triggered
+// the autosave after every committed edit (`App::trigger_autosave`),
+// which was affordable while the file held nothing but a `postcard`
+// journal: encoding it was pure, cheap CPU, and the write itself went
+// to a background thread. Making the file a real `.aur` container
+// changed that completely. `aurora_io::write_aur` walks every pixel
+// layer's own tile grid and calls `TileStore::get` on each in-bounds
+// tile, which can page a tile in from the scratch disk *and* evict
+// another to stay inside the store's budget — real I/O and real LRU
+// churn against the live document's own store, measured at **687 ms**
+// for a 4000x3000, three-layer document on this dev box, and unbounded
+// at the 300,000 x 300,000 px ceiling (§7.3.1). That work cannot be
+// moved off the calling thread: `TileStore` is owned outright by `App`
+// and every tile-touching call site in this crate runs on the UI
+// thread. Making it shareable is the separate, parked
+// `TileStore`-threading redesign (PLAN.md's own "Next action"), not
+// something to do as a side effect here.
+//
+// Rate-gating the trigger was tried first and rejected on review: a
+// gate bounds *how often* a 687 ms stall happens, not whether one ever
+// lands on a stroke-commit path measured at 9.1 ms p99 against a 10 ms
+// budget (spike/FINDINGS.md), and the eviction it causes degrades the
+// *next* strokes too, since a full grid walk pushes exactly the tiles
+// the user is painting on out of the LRU. So the live trigger is gone
+// entirely. `write_autosave` is called at real lifecycle boundaries and
+// nowhere else: a fresh session's startup document (`App::new`, skipped
+// when recovery just succeeded — the file already holds that document)
+// and each document replacement (`App::open_file`/`App::open_aur_file`).
+//
+// **The named limitation, stated plainly**: a crash loses every edit
+// made since the last boundary — every painted pixel *and* every
+// structural change. Against 0.48.1 this is better in one direction
+// (a recovered document now has its real pixels, which it never did
+// before) and worse in another (0.48.1 re-saved structure on every
+// edit, cheaply, because structure was all it saved). Calling it a
+// clean win would be dishonest. What would lift it is the same
+// still-open work either way: an incremental, dirty-tile-only autosave,
+// or a tile store readable from a background thread.
 //
 // Both the marker and the autosave file live in `std::env::temp_dir()`
 // under fixed names — deliberately not a proper per-platform app-support
-// directory (no `directories`-style crate is a dependency yet).
+// directory, a pre-existing choice from when both files held only
+// structure. **That is now a real, if narrow, confidentiality
+// limitation, and it is only half-fixed**: since 0.49.0 the autosave
+// holds the user's actual painted pixels at a predictable path in a
+// world-readable directory. The file itself is created `0o600` on Unix
+// ([`create_autosave_temp`]) and deleted on a clean shutdown
+// ([`remove_autosave`]), which closes the read side there; Windows ACLs
+// are *not* addressed, and neither is the directory choice itself. The
+// real fix for both is the same move to a per-user app-support
+// directory (`directories::ProjectDirs`, already a dependency for
+// [`layout_path`]), which is separate, still-open work rather than
+// something to fold into this change.
 
 /// Where this run's own "I'm still running" marker lives.
 fn marker_path() -> PathBuf {
@@ -978,204 +1037,316 @@ fn clear_session_marker(path: &Path) {
     }
 }
 
-/// Where this run's own autosave journal lives — analogous to
+/// Where this run's own autosave document lives — analogous to
 /// [`marker_path`], and for the same reason not a proper per-platform
-/// app-support directory yet.
+/// app-support directory yet. A real `.aur` container (ADR 0009), not
+/// the raw `postcard` journal this used to be — see this section's own
+/// doc comment.
 fn autosave_path() -> PathBuf {
-    std::env::temp_dir().join("aurora-autosave.postcard")
+    std::env::temp_dir().join("aurora-autosave.aur")
 }
 
-/// Writes `history`'s journal to `path` — call once, early, the same
-/// "errors are logged, not fatal" shape [`write_session_marker`] already
-/// uses: failing to autosave must never stop the application starting.
-fn write_autosave(path: &Path, history: &aurora_doc::History) {
-    match history.save_journal() {
-        Ok(bytes) => {
-            if let Err(err) = std::fs::write(path, bytes) {
-                tracing::warn!(?err, path = %path.display(), "failed to write the autosave journal");
-            }
-        }
+/// Writes a complete `.aur` autosave container to `path` — `layers`,
+/// `history`, `canvas_size`, and every non-blank tile currently in
+/// `store` (`aurora_io::write_aur`). Call at a real lifecycle boundary
+/// (startup with a fresh demo document, a document replacement), and
+/// **only** there: this walks every pixel layer's own tile grid and can
+/// page tiles in from the scratch disk, evicting others from `store`'s
+/// LRU to stay inside its budget — measured at 687 ms for a 4000x3000,
+/// three-layer document on this dev box, and unbounded at the
+/// 300,000 px document ceiling. See this section's own doc comment for
+/// why that measurement is exactly what took the live per-edit
+/// re-trigger back out.
+///
+/// Streamed straight into the temp `File` rather than built in memory
+/// first: `aurora_io::write_aur` is generic over `W: Write + Seek`
+/// precisely so a caller need not hold a whole document's compressed
+/// pixel payload as a `Vec<u8>`, which at the documented ceiling is
+/// exactly the "assumes a document fits in memory" that CLAUDE.md
+/// §7.3.1 forbids.
+///
+/// Written to a **unique** sibling temp path and `rename`d into place,
+/// so a crash *during* an autosave can't leave a half-written container
+/// where the previous, complete one used to be — the same
+/// write-to-temp-then-swap discipline [`write_verified`]/
+/// [`App::save_aur_file`] already apply to a user's real file.
+/// (`std::fs::rename` replaces an existing destination file on Windows
+/// as well as on Unix — `MOVEFILE_REPLACE_EXISTING` — so the swap is
+/// the same one operation on every platform this ships to.)
+/// Deliberately *not* verified by reopening the way an explicit "Save
+/// As" is ([`verify_aur`]): that roughly doubles a cost this path is
+/// already trying to keep off the user's way, and is the right trade
+/// for a file the user asked for, not for a background autosave.
+///
+/// Errors are logged, never fatal — the same shape
+/// [`write_session_marker`] already uses: failing to autosave must
+/// never stop the application starting or interrupt an edit.
+fn write_autosave(
+    path: &Path,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    store: &mut aurora_tile::TileStore,
+) {
+    let temp_path = autosave_temp_path(path);
+    let Some(mut file) = create_autosave_temp(&temp_path) else {
+        return;
+    };
+    // `profile: None`, the same reason [`App::save_aur_file`] already
+    // passes it: no colour-management UI exists to have set a document
+    // profile in the first place, so there is nothing real to embed.
+    if let Err(err) = aurora_io::write_aur(&mut file, layers, history, canvas_size, None, store) {
+        tracing::warn!(?err, path = %temp_path.display(), "failed to write the autosave container");
+        drop(file);
+        remove_autosave_temp(&temp_path);
+        return;
+    }
+    // Before the rename, not after: a `rename` of a file whose contents
+    // are still only in the page cache is exactly how a power loss
+    // leaves a correctly named, empty autosave in place of the real one.
+    if let Err(err) = file.sync_all() {
+        tracing::warn!(?err, path = %temp_path.display(), "failed to flush the autosave container");
+        drop(file);
+        remove_autosave_temp(&temp_path);
+        return;
+    }
+    drop(file);
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        tracing::warn!(?err, path = %path.display(), "failed to swap the autosave container into place");
+        remove_autosave_temp(&temp_path);
+    }
+}
+
+/// A temp path beside `path`, unique per process **and** per call —
+/// `<name>.<pid>.<n>.tmp`.
+///
+/// Not cosmetic: a single fixed `.tmp` name is shared state between
+/// every writer that exists, and two writers landing on it interleave
+/// their bytes and destroy the crash-recovery file with no crash
+/// involved. Two Aurora processes are enough on their own (both use the
+/// same fixed [`autosave_path`]), and any future concurrent writer
+/// inside one process would be too — cheaper to make impossible here
+/// than to re-derive the argument every time a call site moves.
+fn autosave_temp_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("aurora-autosave.aur"),
+        std::ffi::OsStr::to_os_string,
+    );
+    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Creates `temp_path` for a fresh autosave write, owner-only where the
+/// platform lets this crate say so. `None` (logged) if it can't be
+/// created — including because it already exists, which
+/// [`autosave_temp_path`]'s own uniqueness makes a real signal rather
+/// than an expected collision.
+///
+/// **The permissions matter here.** Both this file and the autosave it
+/// becomes live in `std::env::temp_dir()`, a world-readable directory
+/// on a shared Unix machine, at a predictable name — and since 0.49.0
+/// they hold the document's real painted pixels, not just its layer
+/// structure. `0o600` closes the read side of that on Unix. Windows
+/// ACLs are *not* addressed here: `OpenOptions` has no portable
+/// equivalent, and the real fix for both is the same one — moving this
+/// file out of the temp directory into a proper per-user app-support
+/// directory, the pre-existing pattern [`marker_path`] shares and
+/// separate, still-open work.
+fn create_autosave_temp(temp_path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(temp_path) {
+        Ok(file) => Some(file),
         Err(err) => {
-            tracing::warn!(?err, "failed to serialize the autosave journal");
+            tracing::warn!(?err, path = %temp_path.display(), "failed to create the autosave temp file");
+            None
         }
     }
 }
 
-/// Reads and replays the autosave journal at `path`, if one is present
-/// and usable. Returns `None` — not an error — for anything that keeps
-/// this from producing a usable document (no file, unreadable bytes, a
-/// journal `postcard` can't parse, or a journal that fails to replay):
-/// a missing or corrupt autosave means falling back to
-/// [`demo_document`], not failing to start.
-fn recover_document(path: &Path) -> Option<(aurora_doc::LayerTree, aurora_doc::History)> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+/// Removes a leftover autosave temp file after a failed write/rename —
+/// a missing one is not an error (the write may never have created it),
+/// and any other failure is logged rather than propagated, since this
+/// is already the cleanup path of something that failed.
+fn remove_autosave_temp(temp_path: &Path) {
+    if let Err(err) = std::fs::remove_file(temp_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %temp_path.display(), "failed to remove the autosave temp file");
+    }
+}
+
+/// Deletes this session's own autosave container on a clean shutdown —
+/// the same lifecycle point [`clear_session_marker`] runs at, and for
+/// the same reason: once this run has ended cleanly there is nothing
+/// left to recover, and leaving a file full of the user's real pixels
+/// sitting at a predictable path in a shared temp directory is a
+/// confidentiality cost with no remaining benefit. A missing file is
+/// not an error; any other failure is logged, never fatal.
+fn remove_autosave(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %path.display(), "failed to remove this session's autosave");
+    }
+}
+
+/// Reads the `.aur` autosave container at `path`, if one is present and
+/// usable, writing its tiles straight into `store` and returning the
+/// restored `LayerTree`/`History` plus the document's own real canvas
+/// size. Returns `None` — not an error — for anything that keeps this
+/// from producing a usable document (no file, unreadable bytes, a
+/// truncated or corrupt ZIP, a missing manifest/history entry, an
+/// unsupported manifest version, or a tile entry that won't decode): a
+/// missing or corrupt autosave means falling back to [`demo_document`],
+/// not failing to start.
+///
+/// **Startup-only, in practice.** The one caller is [`App::new`], before
+/// any painting has happened, so writing recovered tiles directly into
+/// the live store can't clobber pixels the user is working on. Calling
+/// this mid-session would need more thought than just a fresh call site
+/// — the recovered surfaces would overwrite whatever those same
+/// `SurfaceId`s currently hold.
+fn recover_document(
+    path: &Path,
+    store: &mut aurora_tile::TileStore,
+) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(err) => {
             if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(?err, path = %path.display(), "failed to read the autosave journal");
+                tracing::warn!(?err, path = %path.display(), "failed to open the autosave container");
             }
             return None;
         }
     };
-    let history = match aurora_doc::History::load_journal(&bytes) {
-        Ok(history) => history,
+    // The profile (4th element) is discarded for the same honest reason
+    // `App::open_aur_file` discards its own: nothing in this crate yet
+    // tracks a "current document profile" to restore it into, because no
+    // colour-management UI exists to have set one -- and an autosave this
+    // crate wrote always carries `None` anyway ([`write_autosave`]).
+    match aurora_io::read_aur(file, store) {
+        Ok((layers, history, canvas_size, _profile)) => Some((layers, history, canvas_size)),
         Err(err) => {
-            tracing::warn!(?err, "failed to deserialize the autosave journal");
-            return None;
-        }
-    };
-    let layers = match history.replay() {
-        Ok(layers) => layers,
-        Err(err) => {
-            tracing::warn!(?err, "failed to replay the recovered autosave journal");
-            return None;
-        }
-    };
-    Some((layers, history))
-}
-
-/// The freshest-not-yet-written state behind [`AutosaveQueue`] — see
-/// that type's own doc comment for how [`AutosaveQueue::enqueue`] uses
-/// it to coalesce a burst of edits into one background write.
-#[derive(Default)]
-struct AutosaveQueueState {
-    /// The most recently serialized journal not yet on disk — `Some`
-    /// means a write is still owed. Each new [`AutosaveQueue::enqueue`]
-    /// call *overwrites* this rather than appending, which is the whole
-    /// coalescing mechanism: only the freshest state a caller ever asked
-    /// to save actually needs to land on disk.
-    pending: Option<Vec<u8>>,
-    /// Whether a background drain closure is currently alive and will
-    /// eventually notice `pending` — guards against
-    /// [`AutosaveQueue::enqueue`] spawning a second one while one is
-    /// already running.
-    draining: bool,
-}
-
-/// Rewrites [`App`]'s autosave journal after a live, document-mutating
-/// action (a completed Move, Undo/Redo, a committed Brush/Eraser stroke)
-/// without adding synchronous disk I/O to whichever call path just
-/// mutated `self.history`/`self.pixel_history` — see this module's own
-/// "crash recovery" section for why that matters (CLAUDE.md §7.3.4, and
-/// the measured 9.1 ms p99 stroke-latency budget in spike/FINDINGS.md).
-///
-/// [`Self::enqueue`] always overwrites `state.pending` with the latest
-/// bytes and only spawns a background drain closure
-/// (`aurora_render::Executor::submit`) if one isn't already running.
-/// That closure keeps taking whatever is in `pending` and writing it
-/// until it finds nothing left, so a burst of edits arriving while a
-/// write is already in flight collapses into exactly one more write
-/// after it finishes, not one queued write per edit — the "only the
-/// freshest write matters" coalescing this crate's own M1.9 PLAN.md
-/// bullet calls for, without a separate debounce timer.
-///
-/// `Clone`, deliberately: the shared `state` is an `Arc<Mutex<_>>`, so
-/// cloning this is just cloning that handle, not the queued bytes
-/// themselves — [`App`] only ever keeps one, but a test can clone it to
-/// observe `state` after handing the original to a queue-driving call.
-#[derive(Clone)]
-struct AutosaveQueue {
-    /// Always this queue's own fixed autosave path — the same one
-    /// [`write_autosave`]'s callers already pass around, just captured
-    /// once here instead of threaded through every call.
-    path: PathBuf,
-    state: Arc<Mutex<AutosaveQueueState>>,
-}
-
-impl AutosaveQueue {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            state: Arc::new(Mutex::new(AutosaveQueueState::default())),
+            tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
+            None
         }
     }
+}
 
-    /// Queues `bytes` (an already-serialized journal — see
-    /// [`App::trigger_autosave`]) to be written to this queue's own
-    /// path on `executor`'s background thread. Never blocks the
-    /// caller: the lock below is only ever held for a short, non-I/O
-    /// critical section (an `Option` swap and a `bool` check/set), and
-    /// [`aurora_render::Executor::submit`] itself doesn't block either.
-    fn enqueue(&self, executor: &mut aurora_render::Executor, bytes: Vec<u8>) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(err) => {
-                // A previous drain closure panicked mid-write and
-                // poisoned the lock -- the same "a panicking submitted
-                // task silently kills the background thread's loop"
-                // limitation `Executor`'s own doc comment already
-                // accepts, not new failure machinery this queue invents.
-                tracing::warn!(?err, "autosave queue lock poisoned; dropping this write");
-                return;
-            }
+/// What [`App::new`] starts this session with — see
+/// [`startup_document`], which is the only thing that builds one.
+struct StartupDocument {
+    layers: aurora_doc::LayerTree,
+    history: aurora_doc::History,
+    /// The recovered document's own real canvas size (its `.aur`
+    /// manifest carries one), or [`document_canvas_size`]'s fallback for
+    /// a [`demo_document`], which has none of its own.
+    canvas_size: (u32, u32),
+    /// Whether this really came from an autosave — what the
+    /// crash-recovery dialog's own message reports
+    /// ([`crash_recovery_dialog_message`]).
+    was_recovered: bool,
+}
+
+/// Resolves the document [`App::new`] opens with: a crash-recovered one
+/// if the previous run left a marker behind *and* its autosave container
+/// reads back ([`recover_document`]), otherwise [`demo_document`].
+/// A *fresh* document is written straight back out as this session's
+/// own autosave ([`write_autosave`]), so the next run has something
+/// real to recover to; a *recovered* one is not, since the file it came
+/// from already holds exactly those bytes.
+///
+/// A clean shutdown never needs its own autosave read back, and skipping
+/// the attempt means an autosave file left over from a much older,
+/// already-recovered-from crash can't resurface later — hence
+/// `had_previous_marker` gating the read.
+///
+/// `store_slot` empty (no live tile store — painting is already
+/// disabled for the session, see [`open_tile_store`]) skips both
+/// halves, logged: there would be nowhere to put recovered pixels and
+/// nothing real to put in a container, and a structure-only autosave is
+/// exactly what this path stopped writing. It is taken as
+/// `&mut Option<_>` rather than `Option<&mut _>` so a *failed* recovery
+/// can replace the store outright — see the reopen below for why that
+/// matters.
+fn startup_document(
+    had_previous_marker: bool,
+    autosave_path: &Path,
+    store_slot: &mut Option<aurora_tile::TileStore>,
+) -> StartupDocument {
+    let fresh = || {
+        let (layers, history) = demo_document();
+        let canvas_size = document_canvas_size(&layers);
+        (layers, history, canvas_size)
+    };
+    if store_slot.is_none() {
+        tracing::warn!("no live tile store; skipping crash recovery and this session's autosave");
+        let (layers, history, canvas_size) = fresh();
+        return StartupDocument {
+            layers,
+            history,
+            canvas_size,
+            was_recovered: false,
         };
-        state.pending = Some(bytes);
-        if state.draining {
-            // A drain closure is already alive and will pick up these
-            // fresher bytes itself once it loops back around -- see the
-            // closure body below.
-            return;
-        }
-        state.draining = true;
-        // Dropped before `executor.submit` below so the background
-        // closure's own first lock attempt can't deadlock against this
-        // one.
-        drop(state);
-
-        let path = self.path.clone();
-        let state_handle = Arc::clone(&self.state);
-        executor.submit(move || {
-            loop {
-                let bytes = {
-                    let Ok(mut state) = state_handle.lock() else {
-                        return;
-                    };
-                    let Some(bytes) = state.pending.take() else {
-                        // Nothing arrived while the last write was in
-                        // flight -- this drain loop is done; the next
-                        // `enqueue` call will see `draining == false`
-                        // and start a fresh one.
-                        state.draining = false;
-                        return;
-                    };
-                    bytes
-                };
-                if let Err(err) = std::fs::write(&path, bytes) {
-                    tracing::warn!(?err, path = %path.display(), "failed to write the autosave journal");
-                }
-            }
-        });
     }
-}
-
-/// Re-serializes `history`'s journal and re-queues it on `queue` — the
-/// live-editing counterpart to [`write_autosave`]'s one-shot write. A
-/// free function, deliberately, the same "pure logic, no `App`/window
-/// needed" shape every other free function in this crate's command-
-/// dispatch section already uses (see that section's own doc comment):
-/// [`App::trigger_autosave`] is its real, `self`-based caller, but
-/// keeping the actual work here lets a test exercise the exact same
-/// code path with a locally built [`aurora_render::Executor`]/
-/// [`AutosaveQueue`]/[`aurora_doc::History`] instead of a live `App`,
-/// which this sandbox has no window/`EventLoopProxy`/display server to
-/// construct (see the "Command dispatch" section's own doc comment for
-/// why that constraint already shapes every other testable function
-/// here). A serialization failure is logged, not fatal, the same
-/// discipline [`write_autosave`] already applies to its own
-/// `save_journal` call.
-fn queue_autosave(
-    executor: &mut aurora_render::Executor,
-    queue: &AutosaveQueue,
-    history: &aurora_doc::History,
-) {
-    match history.save_journal() {
-        Ok(bytes) => queue.enqueue(executor, bytes),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "failed to serialize the autosave journal for a live edit"
-            );
-        }
+    let recovered = match (had_previous_marker, store_slot.as_mut()) {
+        (true, Some(store)) => recover_document(autosave_path, store),
+        _ => None,
+    };
+    if let Some((layers, history, canvas_size)) = recovered {
+        // Nothing written back out: the file on disk *is* this
+        // document, read back a few lines ago and not touched since.
+        // Rewriting it here would be a full container rebuild (see
+        // [`write_autosave`]'s own measured cost) for a byte-identical
+        // result, on the pre-window startup path, against a <3 s startup
+        // budget (PRD §6). The fresh-document case below still writes,
+        // because there the file either doesn't exist or describes some
+        // older session's document. Even that one could move off the
+        // pre-window path in later work if startup measurement ever says
+        // it needs to; it isn't turned into a background task now on
+        // speculation.
+        return StartupDocument {
+            layers,
+            history,
+            canvas_size,
+            was_recovered: true,
+        };
+    }
+    if had_previous_marker {
+        // A recovery attempt that failed can still have committed real
+        // pixels: `aurora_io::read_aur` writes each tile into the store
+        // as it goes, so a container whose central directory is intact
+        // but whose *last* tile entry is corrupt leaves earlier
+        // surfaces already populated before it returns `Err`. Those are
+        // the same `SurfaceId`s [`demo_document`]'s own fresh layers are
+        // about to claim, so keeping the store would show the user
+        // fragments of the document that failed to recover, painted
+        // into a document that has nothing to do with it. A fresh store
+        // starts with no resident and no paged-out tiles, which is the
+        // whole fix; if reopening itself fails, the session simply
+        // continues without painting, exactly as
+        // [`open_tile_store`]'s own `None` already means.
+        *store_slot = open_tile_store();
+    }
+    let (layers, history, canvas_size) = fresh();
+    if let Some(store) = store_slot.as_mut() {
+        write_autosave(autosave_path, &layers, &history, canvas_size, store);
+    } else {
+        tracing::warn!("no live tile store; skipping this session's autosave");
+    }
+    StartupDocument {
+        layers,
+        history,
+        canvas_size,
+        was_recovered: false,
     }
 }
 
@@ -5154,22 +5325,11 @@ struct App {
     /// preferences aren't being persisted this run," not an error.
     /// Applied once, at construction ([`load_workspace_layout`]); saved
     /// once, on a clean shutdown ([`save_workspace_layout`],
-    /// `WindowEvent::CloseRequested`) — the same "write once, at a real
-    /// lifecycle boundary" discipline [`write_autosave`] already uses,
-    /// not a reactive save on every resize/collapse.
+    /// `WindowEvent::CloseRequested`) — the same "write at a real
+    /// lifecycle boundary" discipline [`write_autosave`]'s own direct
+    /// callers already use, not a reactive save on every
+    /// resize/collapse.
     layout_path: Option<PathBuf>,
-    /// Runs [`AutosaveQueue`]'s background disk writes (and, in a fuller
-    /// build, real GPU render work — see that type's own doc comment) on
-    /// a dedicated thread away from every input handler in this crate.
-    /// Built once, in [`App::new`], alongside `autosave_queue` below.
-    executor: aurora_render::Executor,
-    /// Coalesces this session's live re-triggered autosaves — see
-    /// [`Self::trigger_autosave`] and [`AutosaveQueue`]'s own doc
-    /// comment. Always the same fixed path [`autosave_path`] returns;
-    /// `App::new`'s own one-shot startup [`write_autosave`] call and
-    /// this queue deliberately target the same file, since they're both
-    /// just different *triggers* for saving the same journal.
-    autosave_queue: AutosaveQueue,
     /// The window's current DPI scale factor (`Window::scale_factor`) —
     /// read once the real window exists (`resumed`) and kept current via
     /// `WindowEvent::ScaleFactorChanged`, e.g. when the window moves to a
@@ -5212,13 +5372,15 @@ struct App {
     /// deleted or resized) — a real editor's canvas can be larger,
     /// smaller, or offset from any single layer it contains. Set once
     /// from [`document_canvas_size`] for a document built without a
-    /// real, independent canvas size of its own ([`demo_document`], a
-    /// recovered autosave — the crash-recovery journal doesn't persist
-    /// one either, a real, honest, separate limitation from the `.aur`
-    /// case below), from a decoded image's own real dimensions
+    /// real, independent canvas size of its own ([`demo_document`] —
+    /// a recovered autosave used to be in that same boat, since the
+    /// raw crash-recovery journal persisted no canvas size, but the
+    /// autosave file is a real `.aur` container now and its manifest
+    /// carries one), from a decoded image's own real dimensions
     /// ([`Self::open_file`]), or from a `.aur` file's own manifest
     /// (`aurora_io::read_aur`'s own third return value,
-    /// [`Self::open_aur_file`]) — the one case this was actually wrong
+    /// [`Self::open_aur_file`] and [`recover_document`]) — the one case
+    /// this was actually wrong
     /// before: re-saving a `.aur` file whose real canvas size differed
     /// from its topmost layer's own bounds used to silently shrink (or
     /// grow) the canvas to match that layer instead of preserving it.
@@ -5392,16 +5554,16 @@ impl App {
         if let Some(layout_path) = layout_path.as_deref() {
             load_workspace_layout(layout_path, &mut workspace);
         }
-        // Only even try reading an autosave if the previous run left a
-        // marker behind -- a clean shutdown never needs its own autosave
-        // read back, and skipping the attempt means an autosave file left
-        // over from a much older, already-recovered-from crash can't
-        // resurface later.
-        let recovered = had_previous_marker
-            .then(|| recover_document(autosave_path))
-            .flatten();
-        let was_recovered = recovered.is_some();
-        let (layers, history) = recovered.unwrap_or_else(demo_document);
+        // Opened *before* recovery, not after: `recover_document` writes
+        // the autosave's own tiles straight into a live store, so the
+        // store has to exist first.
+        let mut tile_store = open_tile_store();
+        let StartupDocument {
+            layers,
+            history,
+            canvas_size,
+            was_recovered,
+        } = startup_document(had_previous_marker, autosave_path, &mut tile_store);
         let layer_rows = match aurora_ui::populate_layers_panel(
             &mut workspace.tree,
             workspace.layers,
@@ -5431,19 +5593,7 @@ impl App {
         ) {
             unreachable!("workspace.properties was just built by build_workspace above: {err:?}");
         }
-        // Written unconditionally, whether this session opened the demo
-        // document or a recovered one -- either way, it's the current
-        // document, and is what the *next* run should recover to if this
-        // one doesn't shut down cleanly.
-        write_autosave(autosave_path, &history);
         let active_layer = topmost_pixel_layer(&layers);
-        // Neither `demo_document` nor a recovered autosave carries a
-        // real, independent canvas size (the crash-recovery journal is
-        // just a `LayerOp` sequence, see `Self::canvas_size`'s own doc
-        // comment) -- derived from the topmost layer here, the same
-        // fallback `document_canvas_size` has always been.
-        let canvas_size = document_canvas_size(&layers);
-        let tile_store = open_tile_store();
 
         let mut focus = FocusManager::default();
         let mut crash_recovery_dialog = None;
@@ -5471,8 +5621,6 @@ impl App {
             crash_recovery_dialog,
             marker_path,
             layout_path,
-            executor: aurora_render::Executor::spawn(),
-            autosave_queue: AutosaveQueue::new(autosave_path.to_path_buf()),
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
@@ -5527,23 +5675,6 @@ impl App {
         adapter.update_if_active(|| tree.accessibility_update(focused));
     }
 
-    /// Re-serializes `self.history`'s journal and re-queues it on
-    /// `self.autosave_queue` — the live-editing half of this crate's
-    /// "crash recovery" section, called after every real, completed
-    /// document mutation (a completed Move, Undo/Redo, a committed
-    /// Brush/Eraser stroke; see each call site's own comment). Never
-    /// blocks the calling thread on disk I/O: `history.save_journal()`
-    /// is cheap, CPU-bound `postcard` encoding, and
-    /// [`AutosaveQueue::enqueue`] itself only ever does a short,
-    /// non-I/O critical section before handing the actual
-    /// `std::fs::write` to `self.executor`'s background thread — see
-    /// that method's own doc comment. A serialization failure is
-    /// logged, not fatal, the same discipline [`write_autosave`] already
-    /// applies to its own `save_journal` call.
-    fn trigger_autosave(&mut self) {
-        queue_autosave(&mut self.executor, &self.autosave_queue, &self.history);
-    }
-
     /// A real `winit::event::KeyEvent`'s full handling: ignores key-up
     /// (only a press should trigger a shortcut or type a character —
     /// otherwise every binding would fire twice), translates it into
@@ -5564,23 +5695,6 @@ impl App {
         let Some(key) = translate_key(&event.logical_key) else {
             return;
         };
-        // Mirrors `handle_key`'s own dispatch guard (dialog first, then
-        // palette, then a resolved shortcut) so this can tell, from out
-        // here, whether the call below is about to run Undo/Redo
-        // directly against `self.history`/`self.pixel_history` --
-        // `handle_key` itself has no way to report that back other than
-        // the narrower `ActivatedCommand` it already returns (which only
-        // covers the command-palette path, handled below). Computed
-        // *before* the call so it reflects the same
-        // `crash_recovery_dialog`/`command_palette` state `handle_key`
-        // itself is about to see.
-        let chord = KeyChord::new(self.modifiers, key);
-        let direct_shortcut_will_undo_redo = self.crash_recovery_dialog.is_none()
-            && self.command_palette.is_none()
-            && matches!(
-                self.shortcuts.resolve(chord),
-                Some(&(AppCommand::Undo | AppCommand::Redo))
-            );
         let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
@@ -5603,21 +5717,9 @@ impl App {
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
             Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
-            // `run_undo_redo` itself re-triggers the autosave -- see its
-            // own doc comment -- so nothing further is needed here for
-            // the command-palette/menu path.
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             None => {}
-        }
-        // The direct `Ctrl+Z`/`Ctrl+Shift+Z` path: `handle_key` already
-        // ran Undo/Redo against `self.history`/`self.pixel_history`
-        // above (it doesn't surface that as an `ActivatedCommand` the
-        // way the palette/menu path does), so re-trigger here instead --
-        // see `direct_shortcut_will_undo_redo`'s own comment for why
-        // this is computed separately from `picked`.
-        if direct_shortcut_will_undo_redo {
-            self.trigger_autosave();
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -5652,16 +5754,6 @@ impl App {
         // `CompositeCache`'s own documented "any edit invalidates
         // everything" scoping.
         self.composite_cache.bump();
-        // `command` is always `AppCommand::Undo`/`::Redo` here (this
-        // method's own doc comment) -- re-trigger the autosave
-        // unconditionally, same "safe to over-trigger, not safe to
-        // under-trigger" reasoning `App::trigger_autosave` itself
-        // documents. A no-op `undo`/`redo` (nothing left to undo/redo)
-        // just re-serializes and re-queues the same bytes already on
-        // disk -- harmless, and cheaper to accept than to thread
-        // `run_command`'s own success/failure back out through another
-        // parameter.
-        self.trigger_autosave();
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -5719,22 +5811,29 @@ impl App {
                 }
             };
 
-        if let Some(store) = self.tile_store.as_mut()
-            && let Some(surface) = layers.surface_id(layer_id)
-            && let Err(err) = aurora_io::write_into_store(&image, store, surface)
-        {
-            tracing::warn!(
-                ?err,
-                "failed to write the opened image's pixels into the tile store"
-            );
-        }
-        write_autosave(&autosave_path(), &history);
-
-        self.layers = layers;
         // The image's own real, decoded dimensions -- known exactly
         // here, rather than derived back out of the one layer just
         // built from it (`document_canvas_size`'s own fallback role).
-        self.canvas_size = (image.width(), image.height());
+        let canvas_size = (image.width(), image.height());
+        if let Some(store) = self.tile_store.as_mut() {
+            if let Some(surface) = layers.surface_id(layer_id)
+                && let Err(err) = aurora_io::write_into_store(&image, store, surface)
+            {
+                tracing::warn!(
+                    ?err,
+                    "failed to write the opened image's pixels into the tile store"
+                );
+            }
+            // After the pixels land in the store, not before: the
+            // autosave container carries this document's real tiles now,
+            // so writing it first would persist an empty one.
+            write_autosave(&autosave_path(), &layers, &history, canvas_size, store);
+        } else {
+            tracing::warn!("no live tile store; skipping the opened document's autosave");
+        }
+
+        self.layers = layers;
+        self.canvas_size = canvas_size;
         self.history = history;
         // A freshly opened document has no relationship to the previous
         // one's own undo state either -- `self.history` above is a
@@ -5808,7 +5907,15 @@ impl App {
                     return;
                 }
             };
-        write_autosave(&autosave_path(), &history);
+        // Re-borrowed rather than reusing the `store` binding above:
+        // that borrow of `self.tile_store` has to end before
+        // `replace_document`'s own `&mut self.workspace` above, and
+        // `read_aur` has already populated the store by now, so the
+        // container this writes carries the opened document's real
+        // tiles.
+        if let Some(store) = self.tile_store.as_mut() {
+            write_autosave(&autosave_path(), &layers, &history, canvas_size, store);
+        }
 
         self.layers = layers;
         // The file's own real, saved canvas size -- restored directly,
@@ -6321,7 +6428,6 @@ impl App {
                     &mut self.history,
                     &mut self.pixel_history,
                 );
-                self.trigger_autosave();
             }
             Err(err) => tracing::warn!(?err, "failed to record the completed move"),
         }
@@ -6423,7 +6529,6 @@ impl App {
                         &mut self.history,
                         &mut self.pixel_history,
                     );
-                    self.trigger_autosave();
                 }
             }
             Some(Drag::Move {
@@ -6910,6 +7015,11 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 // doc comment for why this is the one point this crate
                 // writes it).
                 clear_session_marker(&self.marker_path);
+                // Nothing left to recover once this run has ended
+                // cleanly, and the file holds real pixel content at a
+                // predictable path in a shared temp directory -- see
+                // [`remove_autosave`]'s own doc comment.
+                remove_autosave(&autosave_path());
                 if let Some(layout_path) = self.layout_path.as_deref() {
                     save_workspace_layout(layout_path, &self.workspace);
                 }
@@ -7106,15 +7216,14 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivatedCommand, AppCommand, AutosaveQueue, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY,
-        COMMAND_CLOSE_LAYERS, COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE,
-        COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO,
-        COMMAND_TOGGLE_HISTORY, COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
-        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, ERASER_RADIUS,
-        FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind, UndoOrder, activate_command,
-        active_layer_origin, apply_mask_clip, apply_scroll_zoom, autosave_path,
-        background_color_from_theme, begin_drag, canvas_area_physical_rect,
+        ActivatedCommand, AppCommand, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_LAYERS,
+        COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
+        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
+        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
+        ClipboardAccess, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess, Key, KeyChord,
+        Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind,
+        UndoOrder, activate_command, active_layer_origin, apply_mask_clip, apply_scroll_zoom,
+        autosave_path, background_color_from_theme, begin_drag, canvas_area_physical_rect,
         canvas_area_physical_size, canvas_local_origin, clear_session_marker,
         close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
         composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
@@ -7124,7 +7233,7 @@ mod tests {
         handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path, layer_local_point,
         load_scales, load_theme, logical_point, logical_size, open_command_palette,
         open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
-        pointer_in_canvas, pointer_on_rail_divider, previous_session_left_a_marker, queue_autosave,
+        pointer_in_canvas, pointer_on_rail_divider, previous_session_left_a_marker,
         recomposite_visible_tiles, recover_document, replace_document, resized_rail_width,
         run_command, sample_pixel, select_layer, splitmix64, tile_store_scratch_dir,
         toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
@@ -13812,271 +13921,427 @@ mod tests {
         assert_eq!(sample_pixel(&mut store, surface, (5.0, -1.0)), None);
     }
 
+    /// A deliberately tiny one-pixel-layer document for the autosave
+    /// tests — a single 10x10 layer is one tile, where
+    /// [`demo_document`]'s own 4000x3000 canvas is 192 tiles *per
+    /// layer*, all of which `aurora_io::write_aur` would page into (and
+    /// evict out of) the store on every single write. Small on purpose,
+    /// not by accident: these tests are about the autosave path, not
+    /// about tile paging throughput.
+    fn small_autosave_document() -> (
+        aurora_doc::LayerTree,
+        aurora_doc::History,
+        aurora_doc::LayerId,
+    ) {
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "Background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (layers, history, id)
+    }
+
+    /// Paints one genuinely non-zero texel into `id`'s own surface —
+    /// the whole point of the `.aur`-based autosave, and the thing an
+    /// all-blank test document could never prove, since
+    /// `aurora_io::write_aur` skips every all-zero tile. Returns the
+    /// `(surface, texel index, value)` a recovery assertion can check.
+    fn paint_one_texel(
+        store: &mut aurora_tile::TileStore,
+        layers: &aurora_doc::LayerTree,
+        id: aurora_doc::LayerId,
+    ) -> (aurora_tile::SurfaceId, usize, f32) {
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("id was built as a pixel layer");
+        };
+        let tile = match store.get_mut(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Index 3 is texel (0, 0)'s own alpha channel -- a real,
+        // non-default value, so the tile is genuinely not all-zero.
+        let Some(sample) = tile.texels_mut().get_mut(3) else {
+            unreachable!("index 3 is in bounds for a full tile");
+        };
+        *sample = half::f16::from_f32(0.75);
+        (surface, 3, 0.75)
+    }
+
     #[test]
     fn recovering_a_missing_autosave_returns_none() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        assert!(recover_document(&path).is_none());
+        let (_store_dir, mut store) = real_tile_store();
+        let path = dir.path().join("aurora-autosave.aur");
+        assert!(recover_document(&path, &mut store).is_none());
     }
 
     #[test]
     fn recovering_garbage_bytes_returns_none() {
+        // Garbage now fails at the *ZIP* layer (`ZipArchive::new` can't
+        // find a central directory), not at `postcard` journal parsing
+        // the way it did when the autosave was raw journal bytes -- a
+        // different `aurora_io::IoError` variant reaching the same
+        // "fall back to `demo_document`, don't fail to start" answer.
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        if let Err(err) = std::fs::write(&path, b"not a postcard journal") {
+        let (_store_dir, mut store) = real_tile_store();
+        let path = dir.path().join("aurora-autosave.aur");
+        if let Err(err) = std::fs::write(&path, b"not a .aur container") {
             unreachable!("{err}");
         }
-        assert!(recover_document(&path).is_none());
+        assert!(recover_document(&path, &mut store).is_none());
     }
 
     #[test]
-    fn writing_then_recovering_an_autosave_round_trips_the_same_journal_descriptions() {
+    fn recovering_a_truncated_autosave_container_returns_none() {
+        // A crash *during* a write is the realistic way an autosave
+        // file goes bad, and a half-written ZIP has no readable central
+        // directory. Must still be a silent fall back to
+        // `demo_document`, not a panic or a failed start.
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let (_layers, history) = demo_document();
-        let original_descriptions = history.journal_descriptions();
+        let (_store_dir, mut store) = real_tile_store();
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        let _painted = paint_one_texel(&mut store, &layers, id);
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
 
-        write_autosave(&path, &history);
-        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
-            unreachable!("just wrote a real autosave");
+        let full_len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(err) => unreachable!("{err}"),
         };
+        assert!(full_len > 0, "the autosave must have written real bytes");
+        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err}"),
+        };
+        if let Err(err) = file.set_len(full_len / 2) {
+            unreachable!("{err}");
+        }
+        drop(file);
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        assert!(
+            recover_document(&path, &mut fresh_store).is_none(),
+            "a truncated container must fall back, not panic or half-recover"
+        );
+    }
+
+    #[test]
+    fn write_autosave_produces_a_real_aur_container_with_its_own_archive_entries() {
+        // Asserts the container's *actual* ZIP structure (ADR 0009),
+        // independent of `aurora_io::read_aur` -- so this test would
+        // still catch the autosave path silently going back to writing
+        // raw journal bytes even if the reader were changed to match.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (_store_dir, mut store) = real_tile_store();
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        let _painted = paint_one_texel(&mut store, &layers, id);
+
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("the autosave was just written: {err}"),
+        };
+        let mut archive = match zip::ZipArchive::new(file) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("the autosave must be a real ZIP container: {err}"),
+        };
+        let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        for entry in ["mimetype", "manifest", "history"] {
+            assert!(
+                names.iter().any(|name| name == entry),
+                "the autosave container must hold a `{entry}` entry; found {names:?}"
+            );
+        }
+        // The whole point of the format change: a real painted texel
+        // (`paint_one_texel` above) must appear as a real tile entry.
+        // Without this the test would still pass on a container that
+        // persisted structure only -- exactly the pre-0.49.0 behaviour
+        // this path exists to replace.
+        assert!(
+            names.iter().any(|name| name.starts_with("tiles/")),
+            "a painted document's autosave must hold at least one tile entry; found {names:?}"
+        );
+
+        let mut mimetype = match archive.by_name("mimetype") {
+            Ok(entry) => entry,
+            Err(err) => unreachable!("just asserted the entry exists: {err}"),
+        };
+        assert_eq!(
+            mimetype.compression(),
+            zip::CompressionMethod::Stored,
+            "the mimetype sentinel must be stored uncompressed so a magic-byte sniff can find it"
+        );
+        let mut contents = String::new();
+        if let Err(err) = std::io::Read::read_to_string(&mut mimetype, &mut contents) {
+            unreachable!("{err}");
+        }
+        assert_eq!(contents, "application/vnd.aurora.document");
+        drop(mimetype);
+
+        for entry in ["manifest", "history"] {
+            let mut bytes = Vec::new();
+            let mut read = match archive.by_name(entry) {
+                Ok(read) => read,
+                Err(err) => unreachable!("just asserted the entry exists: {err}"),
+            };
+            if let Err(err) = std::io::Read::read_to_end(&mut read, &mut bytes) {
+                unreachable!("{err}");
+            }
+            assert!(
+                !bytes.is_empty(),
+                "the `{entry}` entry must hold real, non-empty encoded bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn writing_then_recovering_an_autosave_restores_real_painted_pixels_and_canvas_size() {
+        // The gap this whole path exists to close: before the autosave
+        // was a real `.aur` container it held structural `LayerOp`s
+        // only, so a crash lost every painted pixel. A *fresh* store in
+        // a *fresh* scratch directory below is what makes this a real
+        // recovery test rather than the original store happening to
+        // still hold the tile.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        let original_descriptions = history.journal_descriptions();
+        let (surface, index, painted) = {
+            let (_store_dir, mut store) = real_tile_store();
+            let painted = paint_one_texel(&mut store, &layers, id);
+            // A canvas size deliberately unequal to the layer's own
+            // 10x10 bounds, so this proves the manifest's own value came
+            // back rather than `document_canvas_size` re-deriving it.
+            write_autosave(&path, &layers, &history, (37, 21), &mut store);
+            painted
+        };
+        drop(layers);
+        drop(history);
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let Some((recovered_layers, recovered_history, canvas_size)) =
+            recover_document(&path, &mut fresh_store)
+        else {
+            unreachable!("just wrote a real autosave container");
+        };
+        assert_eq!(canvas_size, (37, 21), "the manifest's own canvas size");
         assert_eq!(
             recovered_history.journal_descriptions(),
             original_descriptions
         );
-    }
+        assert_eq!(recovered_layers.name(id), Some("Background"));
 
-    // -- Live re-triggered autosave (`AutosaveQueue`/`queue_autosave`) --
-    //
-    // `App::trigger_autosave`/`App::finish_move`/
-    // `App::handle_pointer_released`/`App::run_undo_redo` can't be
-    // exercised directly here -- `App::new` needs a real
-    // `EventLoopProxy`, which needs a real event loop, which this
-    // sandbox has none of (see this crate's own "Command dispatch"
-    // section doc comment for the same constraint on every other
-    // App-adjacent free function). `queue_autosave` is the free function
-    // both `App::trigger_autosave` and these tests call, so this
-    // exercises the exact same code path a live session would, just fed
-    // by a locally built `History`/`Executor`/`AutosaveQueue` instead of
-    // a live `App` -- the same substitution every other test in this
-    // module already makes for `run_command`/`handle_key`.
-
-    #[test]
-    fn queue_autosave_after_a_completed_move_lands_it_on_disk() {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err}"),
-        };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let mut executor = aurora_render::Executor::spawn();
-        let queue = AutosaveQueue::new(path.clone());
-
-        let mut layers = aurora_doc::LayerTree::new();
-        let mut history = aurora_doc::History::new();
-        let bounds = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 10,
-        };
-        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
-            Ok(id) => id,
+        let tile = match fresh_store.get(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
             Err(err) => unreachable!("{err:?}"),
         };
-        // Mirrors what `App::apply_move`/`App::finish_move` do together
-        // for a real completed drag: the live bounds change is applied
-        // directly to `layers` first, then journaled as one step once
-        // the gesture ends.
-        let moved = aurora_core::Rect {
-            x: 5,
-            y: 5,
-            ..bounds
+        let Some(&sample) = tile.texels().get(index) else {
+            unreachable!("index is in bounds for a full tile");
         };
-        if let Err(err) = layers.set_bounds(id, moved) {
-            unreachable!("{err:?}");
-        }
-        if let Err(err) = history.record_bounds_change(&layers, id, bounds) {
-            unreachable!("{err:?}");
-        }
-
-        // The call `App::finish_move` itself makes, at the end of its
-        // own `Ok(())` branch.
-        queue_autosave(&mut executor, &queue, &history);
-        // Deterministic, not sleep-and-hope: blocks until the
-        // background drain closure this enqueue spawned has actually
-        // run and returned -- `Executor::join`'s own doc comment.
-        executor.join();
-
-        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
-            unreachable!("queue_autosave must have written a real, recoverable autosave");
-        };
-        assert_eq!(
-            recovered_history.journal_descriptions(),
-            history.journal_descriptions(),
-            "the recovered journal must reflect the completed move"
-        );
-    }
-
-    #[test]
-    fn queue_autosave_after_a_committed_stroke_still_writes_the_current_journal() {
-        // What "reflects the edit" honestly means for a stroke commit:
-        // `aurora_doc::History`'s own journal has no `LayerOp` for raw
-        // pixel content (`PixelHistory`'s own doc comment, `App`'s own
-        // `pixel_history` field doc) -- a stroke's actual pixels live
-        // only in the tile store, which persists separately from this
-        // journal. What this proves is that the Pixel-kind trigger path
-        // (`App::handle_pointer_released`) really does run the write
-        // pipeline end to end and lands whatever *is* in `history` right
-        // now (here, the layer this stroke painted onto) on disk -- not
-        // that the stroke's own pixels appear in the journal, which
-        // nothing in this crate claims.
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err}"),
-        };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let mut executor = aurora_render::Executor::spawn();
-        let queue = AutosaveQueue::new(path.clone());
-
-        let mut layers = aurora_doc::LayerTree::new();
-        let mut history = aurora_doc::History::new();
-        let mut pixel_history = aurora_brush::PixelHistory::new();
-        let mut undo_order = UndoOrder::default();
-        let (_dir, mut store) = real_tile_store();
-
-        let bounds = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 10,
-        };
-        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-
-        // Mirrors `App::handle_pointer_released`'s
-        // `Drag::Brush`/`Drag::Eraser` branch: a real, non-empty
-        // `StrokeSnapshot` gets pushed onto `pixel_history` and, since
-        // that actually recorded something, into `undo_order` too.
-        let surface = aurora_tile::SurfaceId::from_raw(id.to_raw());
-        let tile = aurora_tile::TileId { x: 0, y: 0 };
-        let mut stroke = aurora_brush::StrokeSnapshot::new(surface);
-        if let Err(err) = stroke.record_touch(&mut store, tile) {
-            unreachable!("{err:?}");
-        }
         assert!(
-            pixel_history.push(stroke),
-            "a real, touched stroke must record something"
-        );
-        undo_order.record(UndoKind::Pixel, &mut history, &mut pixel_history);
-
-        // The call `App::handle_pointer_released` itself makes, inside
-        // that same `if self.pixel_history.push(stroke)` branch.
-        queue_autosave(&mut executor, &queue, &history);
-        executor.join();
-
-        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
-            unreachable!("queue_autosave must have written a real, recoverable autosave");
-        };
-        assert_eq!(
-            recovered_history.journal_descriptions(),
-            history.journal_descriptions(),
-            "a stroke-commit trigger must still land the layer structure current at commit time"
+            (sample.to_f32() - painted).abs() < f32::EPSILON,
+            "the recovered store must hold the painted texel, not a blank tile"
         );
     }
 
     #[test]
-    fn queue_autosave_burst_coalesces_to_the_freshest_state_on_disk() {
+    fn write_autosave_uses_a_unique_temp_path_and_leaves_none_behind() {
+        // Two writes in a row must never reuse one fixed `.tmp` name:
+        // that name is shared state between every writer that exists
+        // (two Aurora processes are enough), and two writers on it
+        // interleave their bytes into the crash-recovery file. Also
+        // asserts the successful path cleans up after itself -- the
+        // temp file is renamed, not left as litter.
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let mut executor = aurora_render::Executor::spawn();
-        let queue = AutosaveQueue::new(path.clone());
-
-        let mut layers = aurora_doc::LayerTree::new();
-        let mut history = aurora_doc::History::new();
-        let bounds = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 10,
-        };
-        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-
-        // A rapid burst of ten real edits, each re-triggering the queue
-        // without waiting for the previous write to land first -- the
-        // same shape a fast flurry of undo-spamming or brush-stroke
-        // commits has from `AutosaveQueue`'s own point of view (see its
-        // doc comment). No `executor.join()` between iterations on
-        // purpose: coalescing is the property under test, not "each
-        // write happens to finish before the next edit."
-        for step in 0..10u8 {
-            let opacity = f32::from(step) / 10.0;
-            if let Err(err) = history.set_opacity(&mut layers, id, opacity) {
-                unreachable!("{err:?}");
-            }
-            queue_autosave(&mut executor, &queue, &history);
-        }
-        let final_descriptions = history.journal_descriptions();
-
-        executor.join();
-
-        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
-            unreachable!("queue_autosave must have written a real, recoverable autosave");
-        };
-        assert_eq!(
-            recovered_history.journal_descriptions(),
-            final_descriptions,
-            "coalescing must land the freshest state from the burst, not an earlier one"
+        let path = dir.path().join("aurora-autosave.aur");
+        let first = super::autosave_temp_path(&path);
+        let second = super::autosave_temp_path(&path);
+        assert_ne!(
+            first, second,
+            "each write must claim its own temp path, not share one fixed name"
         );
-    }
+        assert_eq!(first.parent(), path.parent(), "the temp file is a sibling");
 
-    #[test]
-    fn autosave_queue_enqueue_never_blocks_even_under_a_rapid_burst() {
-        // Mirrors `aurora_render::executor::tests::\
-        // submit_never_blocks_even_before_the_executor_drains`: proves
-        // the non-blocking half of `AutosaveQueue::enqueue`'s own
-        // contract directly, with synthetic bytes rather than a real
-        // `History`, so this measures the queue's own overhead
-        // (a mutex lock plus an `Option` swap) in isolation from
-        // `postcard` serialization cost.
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
+        let (_store_dir, mut store) = real_tile_store();
+        let (layers, history, id) = small_autosave_document();
+        let _painted = paint_one_texel(&mut store, &layers, id);
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+
+        let leftovers: Vec<String> = match std::fs::read_dir(dir.path()) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| {
+                    std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext == "tmp")
+                })
+                .collect(),
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let mut executor = aurora_render::Executor::spawn();
-        let queue = AutosaveQueue::new(path.clone());
-
-        let start = std::time::Instant::now();
-        for step in 0..200u32 {
-            queue.enqueue(&mut executor, vec![step.to_le_bytes()[0]; 64]);
-        }
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "enqueue must return immediately regardless of how many writes are still in flight, \
-             not block the calling thread on disk I/O"
+            leftovers.is_empty(),
+            "a successful autosave must rename its temp file away, not leave it: {leftovers:?}"
         );
+        assert!(path.exists(), "the autosave itself must be in place");
+    }
 
-        executor.join();
+    #[cfg(unix)]
+    #[test]
+    fn write_autosave_creates_an_owner_only_file() {
+        // The autosave lives at a predictable name in a world-readable
+        // temp directory and now holds the document's real pixels, not
+        // just its layer structure -- so the file's own mode is the
+        // only thing keeping another local user from reading it. (The
+        // directory itself, and Windows ACLs, are the separate
+        // app-support-directory move `create_autosave_temp` names.)
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (_store_dir, mut store) = real_tile_store();
+        let (layers, history, _id) = small_autosave_document();
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mode = match std::fs::metadata(&path) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert_eq!(mode, 0o600, "the autosave must be owner-only");
+    }
+
+    #[test]
+    fn startup_document_leaves_a_recovered_autosave_untouched() {
+        // The startup write is skipped when recovery succeeded: the
+        // file already *is* this document, so rebuilding the container
+        // would be a full tile-grid walk (measured in hundreds of ms)
+        // on the pre-window path for a byte-identical result. Compares
+        // the real bytes, not a timestamp, so it can't pass by
+        // coincidence of clock granularity.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        {
+            let (_store_dir, mut store) = real_tile_store();
+            let _painted = paint_one_texel(&mut store, &layers, id);
+            write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        }
+        let before = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err}"),
+        };
+
+        let (_fresh_dir, fresh_store) = real_tile_store();
+        let mut slot = Some(fresh_store);
+        let startup = super::startup_document(true, &path, &mut slot);
+        assert!(
+            startup.was_recovered,
+            "the container just written must read back"
+        );
+        let after = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert_eq!(
+            before, after,
+            "a successful recovery must not rewrite the file it just read"
+        );
+    }
+
+    #[test]
+    fn startup_document_writes_a_fresh_documents_autosave() {
+        // The other half: with nothing to recover, the session's own
+        // document does get written out, so the *next* run has
+        // something real to recover to.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (_store_dir, store) = real_tile_store();
+        let mut slot = Some(store);
+        let startup = super::startup_document(false, &path, &mut slot);
+        assert!(!startup.was_recovered);
         assert!(
             path.exists(),
-            "the coalesced burst must still have produced a real file by the time join() returns"
+            "a fresh session must leave a recoverable autosave behind"
+        );
+    }
+
+    #[test]
+    fn startup_document_reopens_the_store_after_a_failed_recovery() {
+        // A recovery attempt that fails part-way can leave real pixels
+        // committed to surfaces the fallback document is about to
+        // reuse. The store is replaced rather than reused, so those
+        // fragments can't show up painted into a document they have
+        // nothing to do with.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        if let Err(err) = std::fs::write(&path, b"not a .aur container") {
+            unreachable!("{err}");
+        }
+        let (_store_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        {
+            let tile = match store.get_mut(surface, tile_id) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(sample) = tile.texels_mut().get_mut(0) else {
+                unreachable!("index is in bounds for a full tile");
+            };
+            *sample = half::f16::from_f32(0.5);
+        }
+        let mut slot = Some(store);
+        let startup = super::startup_document(true, &path, &mut slot);
+        assert!(!startup.was_recovered, "garbage must not read back");
+        let Some(store) = slot.as_mut() else {
+            unreachable!("reopening a real scratch directory must succeed here");
+        };
+        let tile = match store.get(surface, tile_id) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            tile.texels().iter().all(|sample| sample.to_f32() == 0.0),
+            "the fallback document must start from a blank store, not one holding \
+             fragments of a document that failed to recover"
         );
     }
 

@@ -25,4 +25,4 @@ pub use error::DocError;
 pub use history::History;
 pub use layer::{BlendMode, Layer, LayerId, LayerKind, LayerLock, LayerMask};
 pub use selection::{Selection, SelectionSet};
-pub use tree::LayerTree;
+pub use tree::{LayerTree, MAX_LAYER_TREE_DEPTH};

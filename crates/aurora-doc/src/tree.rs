@@ -1,12 +1,26 @@
 //! The layer tree itself: identity, nesting, and ordering. PLAN.md M1.4's
 //! first deliverable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aurora_core::{IdGenerator, Rect};
 
 use crate::error::DocError;
 use crate::layer::{BlendMode, Layer, LayerEntry, LayerId, LayerKind, LayerLock, LayerMask};
+
+/// The deepest group nesting a [`LayerTree`] deserialized from bytes may
+/// declare — see [`LayerTree`]'s own `Deserialize` notes for the whole
+/// rationale.
+///
+/// The number is deliberately far above any real document and far below
+/// anything that strains a traversal: Photoshop's own UI has never let a
+/// user nest groups more than ten deep, so 256 is roughly twenty-five
+/// times past the deepest document anyone actually has. It also bounds
+/// the one traversal in this project that allocates per level —
+/// `aurora-app`'s own recursive `resolve_tile`, which holds about half a
+/// megabyte of tile buffer per group level — to a few hundred megabytes
+/// rather than an unbounded amount.
+pub const MAX_LAYER_TREE_DEPTH: usize = 256;
 
 /// A layer (and, if it was a group, its whole subtree) detached from a
 /// [`LayerTree`] by [`LayerTree::remove_capturing`], with enough recorded
@@ -66,12 +80,112 @@ pub(crate) struct RemovedSubtree {
 /// round-trip so a reloaded document keeps allocating fresh, non-
 /// colliding `LayerId`s rather than restarting the counter from `0`.
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "LayerTreeRepr")]
 pub struct LayerTree {
     ids: IdGenerator<Layer>,
     layers: HashMap<LayerId, LayerEntry>,
     /// Root-level layers. See this type's own doc comment for the
     /// ordering convention.
     roots: Vec<LayerId>,
+}
+
+/// [`LayerTree`]'s own on-the-wire shape — field-for-field identical to
+/// it, so `postcard`'s positional encoding is unchanged and every `.aur`
+/// file this project has ever written keeps loading (ADR 0009's own
+/// backward-compatibility policy).
+///
+/// It exists so that `LayerTree`'s derived `Deserialize` can go through
+/// [`LayerTree::try_from`] and **validate the tree's shape before any
+/// caller ever traverses it** (`#[serde(try_from = "LayerTreeRepr")]`).
+/// Without that step, a `LayerTree`'s `Deserialize` was purely
+/// structural: nothing stopped a hand-crafted manifest from declaring a
+/// [`LayerKind::Group`] whose `children` list names the group itself.
+/// Every downward walk in this project (this crate's own
+/// [`LayerTree::paint_order`], `aurora_io::aur`'s own pixel-layer scan,
+/// `aurora-app`'s own `resolve_tile`) then recurses forever on it — and
+/// a stack overflow is not a catchable `Err` but a process abort, on a
+/// path `aurora-app` runs *before it has a window* (crash-recovery
+/// autosave) and again whenever a user opens a `.aur` file they were
+/// sent. A 226-byte crafted file was enough to abort the process, so
+/// this is validated here, once, rather than defended against
+/// separately in every traversal.
+#[derive(serde::Deserialize)]
+struct LayerTreeRepr {
+    ids: IdGenerator<Layer>,
+    layers: HashMap<LayerId, LayerEntry>,
+    roots: Vec<LayerId>,
+}
+
+impl TryFrom<LayerTreeRepr> for LayerTree {
+    type Error = DocError;
+
+    fn try_from(repr: LayerTreeRepr) -> Result<Self, Self::Error> {
+        let LayerTreeRepr { ids, layers, roots } = repr;
+        validate_shape(&layers, &roots)?;
+        Ok(Self { ids, layers, roots })
+    }
+}
+
+/// Walks `roots` downward through `layers`, rejecting anything that
+/// isn't a real tree — see [`LayerTreeRepr`] for why this runs at
+/// deserialization time.
+///
+/// Iterative on an explicit stack, never recursive: the whole point is
+/// to survive input designed to blow the call stack, so the validator
+/// itself must not be the thing that overflows. Two rules:
+///
+/// - **Each layer is reached at most once.** A second visit means either
+///   a cycle (a group inside itself) or the same layer listed under two
+///   parents; neither is a tree, and both make a downward walk either
+///   loop forever or duplicate work exponentially.
+/// - **Nesting stays within [`MAX_LAYER_TREE_DEPTH`].**
+///
+/// An id that names nothing in `layers` is skipped rather than rejected
+/// — that is exactly what every traversal here already does with a
+/// dangling reference (`kind` returns `None`), so rejecting it would
+/// newly refuse files this reader used to open. Skipping it also keeps
+/// the explicit stack bounded by `layers.len()`: only ids that really
+/// exist are ever pushed, and each is pushed at most once.
+fn validate_shape(
+    layers: &HashMap<LayerId, LayerEntry>,
+    roots: &[LayerId],
+) -> Result<(), DocError> {
+    let mut seen: HashSet<LayerId> = HashSet::with_capacity(layers.len());
+    let mut stack: Vec<(LayerId, usize)> = Vec::new();
+
+    for &id in roots {
+        if layers.contains_key(&id) {
+            if !seen.insert(id) {
+                return Err(DocError::MalformedLayerTree(id));
+            }
+            stack.push((id, 1));
+        }
+    }
+
+    while let Some((id, depth)) = stack.pop() {
+        if depth > MAX_LAYER_TREE_DEPTH {
+            return Err(DocError::LayerTreeTooDeep {
+                depth,
+                max: MAX_LAYER_TREE_DEPTH,
+            });
+        }
+        let Some(entry) = layers.get(&id) else {
+            continue;
+        };
+        let LayerKind::Group { children } = &entry.kind else {
+            continue;
+        };
+        for &child in children {
+            if !layers.contains_key(&child) {
+                continue;
+            }
+            if !seen.insert(child) {
+                return Err(DocError::MalformedLayerTree(child));
+            }
+            stack.push((child, depth.saturating_add(1)));
+        }
+    }
+    Ok(())
 }
 
 impl LayerTree {
@@ -210,17 +324,26 @@ impl LayerTree {
     /// descendant's own recorded `parent`/(for a group) `children` fields
     /// are already exactly what's needed to reconstruct the subtree, so
     /// no separate tree shape needs to be recorded alongside the entries.
+    ///
+    /// Iterative on an explicit stack rather than recursive, and it
+    /// *skips* an id that names nothing instead of treating that as
+    /// unreachable: a `LayerTree` deserialized from an untrusted
+    /// `.aur` file's own history journal (`RemovedSubtree` carries whole
+    /// `LayerEntry` values, and `crate::History::undo` replays them back
+    /// into the live tree) can name the same child twice, and a walk
+    /// that panicked or recursed on that would turn a malformed file
+    /// into a crash. The visit order is unchanged: root first, then each
+    /// child's own subtree in stored order.
     fn capture_subtree(&mut self, id: LayerId, out: &mut Vec<(LayerId, LayerEntry)>) {
-        let Some(entry) = self.layers.remove(&id) else {
-            unreachable!("a group's recorded children must exist in the tree by construction");
-        };
-        let children = match &entry.kind {
-            LayerKind::Group { children } => children.clone(),
-            LayerKind::Pixel { .. } => Vec::new(),
-        };
-        out.push((id, entry));
-        for child in children {
-            self.capture_subtree(child, out);
+        let mut stack = vec![id];
+        while let Some(id) = stack.pop() {
+            let Some(entry) = self.layers.remove(&id) else {
+                continue;
+            };
+            if let LayerKind::Group { children } = &entry.kind {
+                stack.extend(children.iter().rev().copied());
+            }
+            out.push((id, entry));
         }
     }
 
@@ -347,14 +470,26 @@ impl LayerTree {
     /// (which could be large), since the answer only needs one path, not
     /// an exhaustive search.
     fn is_descendant(&self, descendant: LayerId, ancestor: LayerId) -> bool {
-        let Some(entry) = self.layers.get(&descendant) else {
-            return false;
-        };
-        match entry.parent {
-            Some(parent) if parent == ancestor => true,
-            Some(parent) => self.is_descendant(parent, ancestor),
-            None => false,
+        // A plain loop, bounded by the tree's own layer count. A tree
+        // built through this type's own API always terminates at a root,
+        // but one restored from an untrusted `.aur` file's history
+        // journal can have a parent chain that loops -- and unbounded
+        // recursion on that is a process abort, not an error. Running out
+        // of budget means the chain cycles, so answer "yes, a
+        // descendant": that is the direction that makes `reparent`
+        // *refuse* the move rather than perform one on a broken tree.
+        let mut current = descendant;
+        for _ in 0..self.layers.len() {
+            let Some(entry) = self.layers.get(&current) else {
+                return false;
+            };
+            match entry.parent {
+                Some(parent) if parent == ancestor => return true,
+                Some(parent) => current = parent,
+                None => return false,
+            }
         }
+        true
     }
 
     /// The sibling list `parent` names: [`Self::roots`] if `None`, or a
@@ -732,31 +867,40 @@ impl LayerTree {
     #[must_use]
     pub fn paint_order(&self) -> Vec<LayerId> {
         let mut out = Vec::new();
-        self.paint_order_into(&self.roots, &mut out);
-        out
-    }
-
-    /// [`Self::paint_order`]'s own recursive worker: walks `siblings`
-    /// (a sibling list in its stored top-to-bottom order — either
-    /// [`Self::roots`] or a group's own [`Self::children`]) bottom-to-top,
-    /// appending each visible [`LayerKind::Pixel`] directly to `out` and
-    /// recursing into each visible [`LayerKind::Group`]'s own children.
-    /// An invisible layer, pixel or group, is skipped — for a group,
-    /// that skips its whole subtree without recursing into it at all,
-    /// which is what makes ancestor visibility gate transitively rather
-    /// than needing a separately tracked "is some ancestor hidden"
-    /// flag.
-    fn paint_order_into(&self, siblings: &[LayerId], out: &mut Vec<LayerId>) {
-        for &id in siblings.iter().rev() {
+        // An explicit stack, not recursion. Popping visits siblings
+        // last-to-first and dives into a group's own children before
+        // continuing with the siblings beneath it -- the exact order the
+        // recursive walk this replaced produced, and the order the
+        // `paint_order_*` tests below pin down.
+        //
+        // `budget` bounds the walk at one visit per layer the tree
+        // actually holds, which is all a real tree ever needs. It only
+        // ever runs out on a malformed tree (a group nested inside
+        // itself), which `LayerTree`'s own `Deserialize` already rejects
+        // -- but `paint_order` returns a plain `Vec` with no way to
+        // report an error, and this is a compositing path, so a
+        // belt-and-braces bound here is what keeps "the tree is somehow
+        // cyclic" a wrong picture rather than a stack overflow that
+        // aborts the process.
+        let mut stack: Vec<LayerId> = self.roots.clone();
+        let mut budget = self.layers.len();
+        while let Some(id) = stack.pop() {
+            // Also covers an id naming nothing at all (`visible` is
+            // `None` then), exactly as the recursive walk did.
             if self.visible(id) != Some(true) {
                 continue;
             }
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
             match self.kind(id) {
                 Some(LayerKind::Pixel { .. }) => out.push(id),
-                Some(LayerKind::Group { children }) => self.paint_order_into(children, out),
+                Some(LayerKind::Group { children }) => stack.extend(children.iter().copied()),
                 None => {}
             }
         }
+        out
     }
 }
 
@@ -781,6 +925,7 @@ mod tests {
     use crate::DocError;
     use crate::layer::{BlendMode, Layer, LayerKind, LayerLock, LayerMask};
     use aurora_core::{Id, Rect};
+    use std::collections::HashMap;
 
     fn bounds() -> Rect {
         Rect {
@@ -1886,5 +2031,246 @@ mod tests {
     #[test]
     fn layer_marker_type_is_exported() {
         let _id: Id<Layer> = Id::from_raw(0);
+    }
+
+    // --- structural validation of a tree deserialized from bytes ------
+    //
+    // A `.aur` file's manifest is a `postcard`-encoded `LayerTree` from
+    // an untrusted source, and until this round nothing checked that the
+    // bytes described a tree at all. These tests hand-craft the ones a
+    // writer would never produce.
+
+    /// Field-for-field identical to `super::LayerTreeRepr`, so its own
+    /// `postcard` bytes decode as a `LayerTree` -- the only way to build
+    /// a structurally impossible tree, since every path through this
+    /// type's own API refuses to make one.
+    #[derive(serde::Serialize)]
+    struct TreeReprForTest {
+        ids: aurora_core::IdGenerator<Layer>,
+        layers: HashMap<super::LayerId, super::LayerEntry>,
+        roots: Vec<super::LayerId>,
+    }
+
+    fn group_entry(
+        name: &str,
+        parent: Option<super::LayerId>,
+        children: Vec<super::LayerId>,
+    ) -> super::LayerEntry {
+        super::LayerEntry::new(name.to_owned(), parent, LayerKind::Group { children })
+    }
+
+    fn decode_tree(repr: &TreeReprForTest) -> Result<LayerTree, String> {
+        let bytes = match postcard::to_allocvec(repr) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        postcard::from_bytes::<LayerTree>(&bytes).map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn deserializing_a_group_that_contains_itself_is_rejected_not_a_stack_overflow() {
+        // The whole reason this validation exists. Before it, a 226-byte
+        // crafted `.aur` file carrying exactly this tree aborted the
+        // process with `fatal runtime error: stack overflow` (exit 134,
+        // core dumped) on `aurora-io`'s own read path -- measured, not
+        // assumed. A stack overflow is not a catchable panic, so no
+        // amount of error handling downstream could have contained it;
+        // the tree has to be refused before anything walks it.
+        let root = super::LayerId::from_raw(0);
+        let mut layers = HashMap::new();
+        layers.insert(root, group_entry("cycle", None, vec![root]));
+        let repr = TreeReprForTest {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![root],
+        };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a group listing itself as its own child must be refused"
+        );
+        // `postcard`'s own error type discards a `Display` message from a
+        // `try_from` conversion (it is a no-alloc format, so every custom
+        // Serde error collapses to one variant) -- so the reason is
+        // pinned down here, against the validator itself, rather than
+        // against the deserialized message.
+        match super::validate_shape(&repr.layers, &repr.roots) {
+            Err(DocError::MalformedLayerTree(id)) => assert_eq!(id, root),
+            other => unreachable!("expected MalformedLayerTree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserializing_a_tree_listing_one_layer_under_two_parents_is_rejected() {
+        // Not a cycle, but not a tree either: the shared layer gets
+        // walked (and composited, and saved) twice.
+        let a = super::LayerId::from_raw(0);
+        let b = super::LayerId::from_raw(1);
+        let shared = super::LayerId::from_raw(2);
+        let mut layers = HashMap::new();
+        layers.insert(a, group_entry("a", None, vec![shared]));
+        layers.insert(b, group_entry("b", None, vec![shared]));
+        layers.insert(
+            shared,
+            super::LayerEntry::new(
+                "shared".to_owned(),
+                Some(a),
+                LayerKind::Pixel { bounds: bounds() },
+            ),
+        );
+        let repr = TreeReprForTest {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![a, b],
+        };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "the same layer under two parents must be refused"
+        );
+    }
+
+    /// A chain of `depth` groups, each the sole child of the one above.
+    fn nested_chain(depth: usize) -> TreeReprForTest {
+        let mut layers = HashMap::new();
+        for level in 0..depth {
+            let id = super::LayerId::from_raw(level as u64);
+            let children = if level + 1 < depth {
+                vec![super::LayerId::from_raw(level as u64 + 1)]
+            } else {
+                Vec::new()
+            };
+            let parent = level
+                .checked_sub(1)
+                .map(|above| super::LayerId::from_raw(above as u64));
+            layers.insert(id, group_entry("g", parent, children));
+        }
+        TreeReprForTest {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![super::LayerId::from_raw(0)],
+        }
+    }
+
+    #[test]
+    fn deserializing_a_tree_nested_past_the_depth_limit_is_rejected() {
+        // Deliberately one level past the limit rather than deep enough
+        // to really overflow a call stack: this must be a fast,
+        // deterministic test, not one that risks taking the test runner
+        // down with it.
+        let repr = nested_chain(super::MAX_LAYER_TREE_DEPTH + 1);
+        assert!(
+            decode_tree(&repr).is_err(),
+            "nesting past the depth limit must be refused"
+        );
+        // See the cycle test above for why the reason is checked against
+        // the validator rather than the deserializer's own message.
+        match super::validate_shape(&repr.layers, &repr.roots) {
+            Err(DocError::LayerTreeTooDeep { depth, max }) => {
+                assert_eq!(depth, super::MAX_LAYER_TREE_DEPTH + 1);
+                assert_eq!(max, super::MAX_LAYER_TREE_DEPTH);
+            }
+            other => unreachable!("expected LayerTreeTooDeep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserializing_a_tree_nested_exactly_at_the_depth_limit_still_works() {
+        // The other side of the same check: the limit is documented,
+        // legal scope, so it must not be what gets rejected.
+        let repr = nested_chain(super::MAX_LAYER_TREE_DEPTH);
+        if let Err(message) = decode_tree(&repr) {
+            unreachable!("nesting exactly at the limit must still load: {message}");
+        }
+    }
+
+    #[test]
+    fn deserializing_a_real_tree_round_trips_unchanged() {
+        // The validation must not have changed the wire format: a tree
+        // this type built itself still encodes and decodes to the same
+        // shape (ADR 0009's backward-compatibility policy).
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("Group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let inner = match tree.add_pixel_layer("Inner", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bytes = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let restored = match postcard::from_bytes::<LayerTree>(&bytes) {
+            Ok(restored) => restored,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(restored.roots(), &[group]);
+        assert_eq!(restored.children(group), Some([inner].as_slice()));
+        assert_eq!(restored.paint_order(), vec![inner]);
+    }
+
+    #[test]
+    fn paint_order_terminates_on_a_cyclic_tree_rather_than_recursing_forever() {
+        // Belt and braces: `Deserialize` already refuses a cyclic tree,
+        // so this shape can no longer arrive from a file. It is
+        // constructed by hand here (only possible from inside this
+        // module) because `paint_order` runs on the compositing path and
+        // returns a plain `Vec` with nowhere to report an error -- the
+        // guarantee worth pinning down is that it *returns*.
+        let root = super::LayerId::from_raw(0);
+        let leaf = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(root, group_entry("cycle", None, vec![leaf, root]));
+        layers.insert(
+            leaf,
+            super::LayerEntry::new(
+                "leaf".to_owned(),
+                Some(root),
+                LayerKind::Pixel { bounds: bounds() },
+            ),
+        );
+        let tree = LayerTree {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![root],
+        };
+        let started = std::time::Instant::now();
+        let order = tree.paint_order();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a cyclic tree must not make paint_order run away"
+        );
+        assert!(
+            order.len() <= tree.len(),
+            "paint_order must not emit more entries than the tree holds: {order:?}"
+        );
+    }
+
+    #[test]
+    fn reparent_terminates_on_a_cyclic_parent_chain() {
+        // `is_descendant` walks *upward* through `parent` links, which a
+        // tree restored from an untrusted history journal can make loop.
+        // As above, the guarantee is that it returns -- refusing the
+        // move, which is the safe direction on a broken tree.
+        let a = super::LayerId::from_raw(0);
+        let b = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(a, group_entry("a", Some(b), Vec::new()));
+        layers.insert(b, group_entry("b", Some(a), Vec::new()));
+        let mut tree = LayerTree {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        let result = tree.reparent(a, Some(b), 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a cyclic parent chain must not make reparent run away"
+        );
+        assert!(
+            result.is_err(),
+            "reparenting within a cyclic chain must be refused, not performed"
+        );
     }
 }

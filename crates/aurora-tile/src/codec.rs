@@ -31,6 +31,26 @@ const MAGIC: [u8; 4] = *b"ATIL";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 8;
 
+/// The largest decompressed payload [`decode`] will accept: exactly one
+/// `TILE * TILE` f16 RGBA tile ([`crate::SAMPLES`] samples, two bytes
+/// each). Nothing this module ever encodes is bigger.
+///
+/// This is a real check against untrusted input, not a tidiness one.
+/// `lz4_flex::decompress_size_prepended` takes the decompressed length
+/// from a four-byte little-endian prefix *inside the compressed frame*
+/// and allocates that much up front (0.11.6, `block::decompress`:
+/// `vec![0; min_uncompressed_size]`) before it has decoded a single
+/// byte. That prefix is attacker-controlled and completely independent
+/// of how large the compressed blob is, so it evades any cap applied to
+/// the *outer* container entry: measured here, a 26-byte input claiming
+/// `3_000_000_000` moved this process's `VmSize` from 3.3 MB to 2.93 GB
+/// in 7 µs, and still returned `Ok`. A `.aur` file's own tile entries
+/// are one such untrusted input, read on `aurora-app`'s pre-window
+/// startup path — and an allocation that big failing is an abort, not an
+/// error. Checking the prefix before handing it to `lz4_flex` is what
+/// keeps this bounded.
+const MAX_DECOMPRESSED_BYTES: u32 = (crate::SAMPLES as u32) * 2;
+
 /// Serializes tile samples to the on-disk format described above.
 #[must_use]
 pub fn encode(texels: &[f16]) -> Vec<u8> {
@@ -90,8 +110,27 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<f16>, TileError> {
 
     let raw = match flag {
         0 => payload.to_vec(),
-        1 => lz4_flex::decompress_size_prepended(payload)
-            .map_err(|err| TileError::CorruptFile(format!("lz4 decompress failed: {err}")))?,
+        1 => {
+            // See `MAX_DECOMPRESSED_BYTES`: the size prefix decides how
+            // much `lz4_flex` allocates, so it is checked here rather
+            // than trusted.
+            let Some(prefix) = payload.get(0..4) else {
+                return Err(TileError::CorruptFile(
+                    "compressed payload is shorter than its own size prefix".to_owned(),
+                ));
+            };
+            let declared = match <[u8; 4]>::try_from(prefix) {
+                Ok(bytes) => u32::from_le_bytes(bytes),
+                Err(_) => unreachable!("a 4-byte slice always converts to [u8; 4]"),
+            };
+            if declared > MAX_DECOMPRESSED_BYTES {
+                return Err(TileError::CorruptFile(format!(
+                    "compressed payload claims {declared} decompressed bytes, past one tile's own {MAX_DECOMPRESSED_BYTES}-byte maximum"
+                )));
+            }
+            lz4_flex::decompress_size_prepended(payload)
+                .map_err(|err| TileError::CorruptFile(format!("lz4 decompress failed: {err}")))?
+        }
         other => {
             return Err(TileError::CorruptFile(format!(
                 "unknown compression flag {other}"
@@ -177,5 +216,53 @@ mod tests {
     #[test]
     fn rejects_truncated_header() {
         assert!(decode(&[0, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn rejects_a_compressed_payload_claiming_more_than_one_tile_of_output() {
+        // The lz4 size prefix is inside the compressed frame, so it is
+        // free to claim any size at all regardless of how few bytes the
+        // frame really occupies -- and `decompress_size_prepended`
+        // allocates that claim before decoding anything. Verified
+        // against lz4_flex 0.11.6: a 26-byte input claiming 3 GB really
+        // does reserve 3 GB and then return `Ok`. A tile's own real
+        // maximum output is fixed and known, so anything past it is
+        // refused before `lz4_flex` is handed the bytes at all.
+        let texels = vec![f16::from_f32(0.25); 64];
+        let mut encoded = encode(&texels);
+        assert!(
+            encoded.get(5) == Some(&1),
+            "this test needs the compressed path; uniform data must take it"
+        );
+        // Patch the four-byte little-endian size prefix that follows the
+        // 8-byte header.
+        let Some(prefix) = encoded.get_mut(8..12) else {
+            unreachable!("a compressed payload always carries its own 4-byte size prefix");
+        };
+        prefix.copy_from_slice(&3_000_000_000u32.to_le_bytes());
+
+        match decode(&encoded) {
+            Err(crate::TileError::CorruptFile(message)) => {
+                assert!(
+                    message.contains("3000000000"),
+                    "the rejection must name the claimed size: {message}"
+                );
+            }
+            other => unreachable!("expected CorruptFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_a_compressed_payload_claiming_exactly_one_whole_tile() {
+        // The other side of the same check: a full tile is the largest
+        // legitimate payload there is, so it must not be what gets
+        // rejected.
+        let texels = vec![f16::from_f32(0.5); crate::SAMPLES];
+        let encoded = encode(&texels);
+        let decoded = match decode(&encoded) {
+            Ok(decoded) => decoded,
+            Err(err) => unreachable!("a full tile must still decode: {err}"),
+        };
+        assert_eq!(decoded.len(), crate::SAMPLES);
     }
 }

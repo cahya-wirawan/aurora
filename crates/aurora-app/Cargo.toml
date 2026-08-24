@@ -45,10 +45,12 @@ half = { workspace = true }
 taffy = { workspace = true }
 # The persisted workspace layout's own encoding -- the same
 # serde-derive-plus-`postcard` shape `aurora_doc::History::save_journal`/
-# `load_journal` already use for the autosave journal (`write_autosave`/
-# `recover_document`, this crate's own established pattern), reused
-# directly rather than hand-rolling a second, ad hoc binary format for
-# a payload this small.
+# `load_journal` and `.aur`'s own manifest (ADR 0009) already use,
+# reused directly rather than hand-rolling a second, ad hoc binary
+# format for a payload this small. This is now the *only* direct
+# `postcard` use in this crate: the autosave file itself is a real
+# `.aur` container (`write_autosave`/`recover_document`), which reaches
+# `postcard` through `aurora-io` rather than here.
 serde = { workspace = true }
 postcard = { workspace = true }
 # Where the layout preference lives -- see `layout_path`'s own doc
@@ -71,6 +73,13 @@ objc2-app-kit = { workspace = true }
 [dev-dependencies]
 accesskit = { workspace = true }
 tempfile = { workspace = true }
+# Test-only: the autosave file is a real `.aur` ZIP container now
+# (`write_autosave`), so a test can assert its actual archive entries
+# (`mimetype`/`manifest`/`history`) directly rather than only via
+# `aurora_io::read_aur`'s own round-trip. The same workspace `zip`
+# entry `aurora-io` itself already builds `.aur` files with -- not a
+# second, independently versioned copy.
+zip = { workspace = true }
 
 [[bin]]
 name = "aurora-app"

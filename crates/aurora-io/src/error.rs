@@ -101,4 +101,45 @@ pub enum IoError {
     /// file, or one truncated/corrupted past recovery.
     #[error(".aur file is missing its own required {0:?} entry")]
     MissingEntry(&'static str),
+    /// [`crate::aur::read`] found a ZIP entry that declares (or really
+    /// does decompress to) more bytes than that entry could legitimately
+    /// hold — a `.aur` file's own tile entries have a known, fixed
+    /// maximum size, and its manifest/history entries a generous but
+    /// finite one. Rejected rather than read, so a hostile or corrupt
+    /// container can't turn a few compressed kilobytes into gigabytes of
+    /// resident memory (the classic DEFLATE zip-bomb shape) on a path
+    /// that runs before the application even has a window.
+    #[error(".aur entry {name:?} holds {size} bytes, past this reader's own {cap}-byte cap")]
+    EntryTooLarge { name: String, size: u64, cap: u64 },
+    /// [`crate::aur::read`] found a manifest declaring a pixel layer
+    /// larger than [`aurora_core::MAX_DOCUMENT_EXTENT`], the documented
+    /// document ceiling (PRD §7.3.1 / ADR 0002). The tile-scan loop
+    /// derives its own iteration count straight from those bounds, so an
+    /// unchecked `u32::MAX` there is not a large read but an effectively
+    /// unbounded one — rejected up front instead.
+    #[error(".aur manifest declares a {width}x{height} layer, past the {max}px document ceiling")]
+    LayerBoundsTooLarge { width: u32, height: u32, max: u32 },
+    /// [`crate::aur::read`] found a manifest declaring a canvas larger
+    /// than [`aurora_core::MAX_DOCUMENT_EXTENT`] — the same document
+    /// ceiling [`IoError::LayerBoundsTooLarge`] enforces for a layer's
+    /// own bounds, applied to the document-level canvas size the
+    /// manifest carries alongside them. `aurora-app` puts that value
+    /// straight into its own live canvas size and later allocates
+    /// `width * height * 4` samples from it, so an unchecked
+    /// `u32::MAX` there is an allocation no machine can serve (and, on a
+    /// 32-bit target, an arithmetic overflow first).
+    #[error(".aur manifest declares a {width}x{height} canvas, past the {max}px document ceiling")]
+    CanvasTooLarge { width: u32, height: u32, max: u32 },
+    /// [`crate::aur::read`] found a manifest whose pixel layers add up
+    /// to more tiles than any real document has. Each layer's own bounds
+    /// are separately checked against the document ceiling
+    /// ([`IoError::LayerBoundsTooLarge`]), but *layer count* has no
+    /// ceiling of its own — this project promises unlimited layers — so
+    /// without this check a manifest could declare many ceiling-sized
+    /// layers, each individually legal, and multiply the tile scan out
+    /// to an effectively unbounded loop from a file only kilobytes long.
+    #[error(
+        ".aur manifest's layers add up to {total} tiles, past this reader's own {max}-tile budget"
+    )]
+    TooManyTiles { total: u64, max: u64 },
 }

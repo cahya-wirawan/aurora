@@ -35,6 +35,32 @@
 //! file bloat; a missing tile entry on read simply leaves that tile at
 //! the store's own default (blank), not an error.
 //!
+//! **Reading is hardened against a hostile or corrupt container**
+//! (2026-08-24). [`read`] runs on `aurora-app`'s own pre-window startup
+//! path (crash-recovery autosave) and on its ordinary "open the `.aur`
+//! file a user was sent" path, so neither an unfinishable loop nor an
+//! unbounded allocation is acceptable here: the manifest's declared
+//! layer bounds are checked against `aurora_core::MAX_DOCUMENT_EXTENT`
+//! before any tile grid is derived from them (`tile_grid`), and every
+//! entry is read through a per-entry size cap (`read_capped`) rather
+//! than a bare `read_to_end`. Both reject with an [`IoError`]; neither
+//! panics.
+//!
+//! **A second hardening pass** (also 2026-08-24) closed three more holes
+//! an independent review found in that same untrusted path: the
+//! per-layer bounds check said nothing about *how many* layers a
+//! manifest may declare, so the tile scan now also carries a
+//! whole-document budget (`MAX_TOTAL_TILES_PER_DOCUMENT`); the
+//! manifest's own `canvas_width`/`canvas_height` were handed back
+//! unchecked and became an allocation size downstream, so they now get
+//! the same document-ceiling check the layer bounds already got; and
+//! this module's pixel-layer walk was recursive over a `LayerTree` that
+//! nothing validated the shape of, so a manifest declaring a group
+//! inside itself aborted the process on a stack overflow. That last one
+//! is fixed at its root in `aurora_doc::LayerTree`'s own `Deserialize`
+//! (a tree from bytes is now checked for cycles and depth before any
+//! caller walks it) with this module's own walk made iterative as well.
+//!
 //! **Colour space, real as of 2026-08-06**: [`write()`]/[`read`] carry a
 //! real `Option<&aurora_color::IccProfile>`/`Option<IccProfile>` now,
 //! not just a bare tag — `None` (the compact, common case, matching
@@ -76,6 +102,112 @@ const HISTORY_ENTRY: &str = "history";
 /// own backward-compatibility policy: unconditional, never a hard
 /// cutoff).
 const MANIFEST_VERSION: u32 = 1;
+
+/// The largest declared uncompressed size [`read`] will accept for the
+/// `manifest`/`history` entries. Both are `postcard`-encoded and
+/// DEFLATE-compressed, so a hostile container can claim (and really
+/// deliver) orders of magnitude more bytes than it occupies on disk —
+/// the classic zip-bomb shape, and one that matters here because
+/// `aurora-app` reads an autosave container on its own pre-window
+/// startup path. 64 MiB is deliberately generous rather than tight:
+/// this project promises unlimited layers and unlimited history (PRD
+/// §6), so a real document's manifest/journal has no small, principled
+/// bound — but it does have a *finite* one, and turning "unbounded" into
+/// "large" is the whole point.
+const MAX_METADATA_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The largest size [`read`] will accept for one tile entry, unlike the
+/// metadata cap above a genuinely tight one: a tile entry holds
+/// `aurora_tile::codec::encode`'s own output for exactly one
+/// `TILE * TILE` f16 RGBA tile, so its real ceiling is that tile's own
+/// uncompressed size (`SAMPLES` samples, two bytes each) plus slack for
+/// an `lz4_flex` frame that failed to compress at all. Nothing
+/// legitimate can exceed it.
+const MAX_TILE_ENTRY_BYTES: u64 = (aurora_tile::SAMPLES as u64) * 2 + 64 * 1024;
+
+/// The most tiles [`read`]'s own tile scan will visit across *all* of a
+/// manifest's pixel layers put together.
+///
+/// `tile_grid` already refuses any single layer larger than the document
+/// ceiling, but nothing bounds how many layers a manifest may declare —
+/// this project promises unlimited layers (PRD §6), and a `LayerEntry`
+/// costs only tens of bytes on the wire, so a manifest well under
+/// [`MAX_METADATA_ENTRY_BYTES`] can hold hundreds of thousands of them.
+/// Each individually-legal ceiling-sized layer contributes another
+/// ~1.37 million grid positions, each costing a `format!` and a ZIP
+/// central-directory lookup, so the per-layer check alone still leaves a
+/// kilobyte-scale file able to spin for hours on `aurora-app`'s own
+/// pre-window startup path.
+///
+/// The budget is exactly *one* layer at the documented ceiling: the
+/// largest single document PRD §7.3.1 says can exist still loads
+/// untouched, while a manifest that only reaches a bigger number by
+/// stacking many large layers is refused. It is expressed in terms of
+/// the ceiling and the tile size rather than a bare literal, so it
+/// follows either if they ever change.
+const MAX_TOTAL_TILES_PER_DOCUMENT: u64 = {
+    let side = (aurora_core::MAX_DOCUMENT_EXTENT as u64).div_ceil(TILE as u64);
+    side * side
+};
+
+/// One entry's whole contents, refusing anything past `cap` — see
+/// [`MAX_METADATA_ENTRY_BYTES`]/[`MAX_TILE_ENTRY_BYTES`] for why a cap
+/// exists at all. Both halves are real checks, not one belt-and-braces
+/// pair: `ZipFile::size()` is the container's own *claim* about the
+/// uncompressed size and a crafted archive is free to lie about it, so
+/// the actual read is bounded by `Read::take` as well.
+fn read_capped(mut file: zip::read::ZipFile<'_>, name: &str, cap: u64) -> Result<Vec<u8>, IoError> {
+    let declared = file.size();
+    if declared > cap {
+        return Err(IoError::EntryTooLarge {
+            name: name.to_owned(),
+            size: declared,
+            cap,
+        });
+    }
+    let mut bytes = Vec::new();
+    // `cap + 1`: reading one byte past the cap is what makes an entry
+    // that lied about its own size distinguishable from one that sits
+    // exactly at the limit.
+    let read = file
+        .by_ref()
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if read as u64 > cap {
+        return Err(IoError::EntryTooLarge {
+            name: name.to_owned(),
+            size: read as u64,
+            cap,
+        });
+    }
+    Ok(bytes)
+}
+
+/// How many tiles wide and tall `bounds` is, rejecting bounds past
+/// [`aurora_core::MAX_DOCUMENT_EXTENT`] (PRD §7.3.1's own document
+/// ceiling, the same one `aurora_core::Size::new` already enforces).
+///
+/// This is a real safety check, not a tidiness one. [`read`] derives
+/// this grid from a manifest it has just parsed out of an untrusted
+/// file, then loops `tiles_y * tiles_x` times — so an unchecked
+/// `u32::MAX` extent there is not a big loop but an unfinishable one
+/// (~2.8e14 iterations), reached from `aurora-app`'s own pre-window
+/// startup recovery *and* from opening any `.aur` file a user was sent.
+/// Clamping to the ceiling the format already documents bounds the
+/// worst case to something large but finite without newly restricting
+/// any legitimate document.
+fn tile_grid(bounds: aurora_core::Rect) -> Result<(u32, u32), IoError> {
+    if bounds.width > aurora_core::MAX_DOCUMENT_EXTENT
+        || bounds.height > aurora_core::MAX_DOCUMENT_EXTENT
+    {
+        return Err(IoError::LayerBoundsTooLarge {
+            width: bounds.width,
+            height: bounds.height,
+            max: aurora_core::MAX_DOCUMENT_EXTENT,
+        });
+    }
+    Ok((bounds.width.div_ceil(TILE), bounds.height.div_ceil(TILE)))
+}
 
 /// The manifest entry's own real shape, written by reference (avoids
 /// needing `LayerTree: Clone`, which nothing else has a real reason for
@@ -185,8 +317,7 @@ pub fn write<W: Write + Seek>(
         let Some(surface) = layers.surface_id(id) else {
             continue;
         };
-        let tiles_x = bounds.width.div_ceil(TILE);
-        let tiles_y = bounds.height.div_ceil(TILE);
+        let (tiles_x, tiles_y) = tile_grid(*bounds)?;
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let tile_id = TileId { x: tx, y: ty };
@@ -234,8 +365,21 @@ type AurDocument = (
 /// is absent (not a valid `.aur` file, or one truncated past recovery),
 /// [`IoError::ManifestDeserialization`]/[`IoError::Doc`] if either
 /// fails to decode, [`IoError::Color`] if an embedded ICC profile's own
-/// bytes fail to parse, or [`IoError::Tile`] if a tile entry fails to
-/// decode or doesn't decode to the expected sample count.
+/// bytes fail to parse, [`IoError::Tile`] if a tile entry fails to
+/// decode or doesn't decode to the expected sample count,
+/// [`IoError::LayerBoundsTooLarge`] if the manifest declares a layer
+/// past the document ceiling, [`IoError::CanvasTooLarge`] if it declares
+/// a *canvas* past that same ceiling, [`IoError::TooManyTiles`] if its
+/// layers together add up to more tiles than any real document has, or
+/// [`IoError::EntryTooLarge`] if an entry holds more bytes than it
+/// legitimately could — see
+/// `tile_grid`/`read_capped`/`MAX_TOTAL_TILES_PER_DOCUMENT` for why an
+/// untrusted manifest gets those checks before anything is looped over
+/// or allocated. A manifest whose `LayerTree` isn't structurally a tree
+/// at all (a group nested inside itself, or nested past
+/// `aurora_doc::MAX_LAYER_TREE_DEPTH`) is rejected as
+/// [`IoError::ManifestDeserialization`] by that type's own
+/// `Deserialize`, before this function ever walks it.
 pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocument, IoError> {
     let mut zip = ZipArchive::new(reader)?;
 
@@ -255,9 +399,25 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         ColorSpaceTag::Icc(bytes) => Some(aurora_color::IccProfile::from_bytes(&bytes)?),
     };
 
+    // The manifest's own canvas size gets the same document-ceiling
+    // check its layer bounds already get (`tile_grid`). `aurora-app`
+    // stores this straight into `App::canvas_size` and later allocates
+    // `width * height * 4` samples from it, so leaving it unchecked
+    // makes a 200-byte file an allocation request no machine can serve.
+    if manifest.canvas_width > aurora_core::MAX_DOCUMENT_EXTENT
+        || manifest.canvas_height > aurora_core::MAX_DOCUMENT_EXTENT
+    {
+        return Err(IoError::CanvasTooLarge {
+            width: manifest.canvas_width,
+            height: manifest.canvas_height,
+            max: aurora_core::MAX_DOCUMENT_EXTENT,
+        });
+    }
+
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
 
+    let mut total_tiles: u64 = 0;
     for id in pixel_layer_ids(&manifest.layers) {
         let Some(LayerKind::Pixel { bounds }) = manifest.layers.kind(id) else {
             continue;
@@ -265,17 +425,24 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         let Some(surface) = manifest.layers.surface_id(id) else {
             continue;
         };
-        let tiles_x = bounds.width.div_ceil(TILE);
-        let tiles_y = bounds.height.div_ceil(TILE);
+        let (tiles_x, tiles_y) = tile_grid(*bounds)?;
+        // Charged against the whole-document budget *before* this
+        // layer's own grid is walked, so an over-budget manifest costs
+        // one addition rather than a scan -- see
+        // `MAX_TOTAL_TILES_PER_DOCUMENT`.
+        total_tiles = total_tiles.saturating_add(u64::from(tiles_x) * u64::from(tiles_y));
+        if total_tiles > MAX_TOTAL_TILES_PER_DOCUMENT {
+            return Err(IoError::TooManyTiles {
+                total: total_tiles,
+                max: MAX_TOTAL_TILES_PER_DOCUMENT,
+            });
+        }
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let tile_id = TileId { x: tx, y: ty };
-                let bytes = match zip.by_name(&tile_entry_name(surface, tile_id)) {
-                    Ok(mut file) => {
-                        let mut bytes = Vec::new();
-                        file.read_to_end(&mut bytes)?;
-                        bytes
-                    }
+                let name = tile_entry_name(surface, tile_id);
+                let bytes = match zip.by_name(&name) {
+                    Ok(file) => read_capped(file, &name, MAX_TILE_ENTRY_BYTES)?,
                     // No entry for this tile -- it was blank when
                     // written (see this module's own doc comment) and
                     // stays at the store's own default.
@@ -313,19 +480,18 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
 
 /// Reads one required entry's whole contents, or
 /// [`IoError::MissingEntry`] if it isn't present at all — [`read`]'s own
-/// shared "the manifest/history entries are not optional" step.
+/// shared "the manifest/history entries are not optional" step. Capped
+/// at [`MAX_METADATA_ENTRY_BYTES`] ([`read_capped`]).
 fn read_entry<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
     name: &'static str,
 ) -> Result<Vec<u8>, IoError> {
-    let mut file = match zip.by_name(name) {
+    let file = match zip.by_name(name) {
         Ok(file) => file,
         Err(zip::result::ZipError::FileNotFound) => return Err(IoError::MissingEntry(name)),
         Err(err) => return Err(err.into()),
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    read_capped(file, name, MAX_METADATA_ENTRY_BYTES)
 }
 
 /// Every pixel layer in `layers`, at any nesting depth — [`write`]/
@@ -334,24 +500,38 @@ fn read_entry<R: Read + Seek>(
 /// `aurora_ui::layers_panel`'s own top-to-bottom paint-order
 /// convention) since this only decides which tiles to touch, not how
 /// to composite them.
+///
+/// Iterative on an explicit stack, never recursive. `LayerTree`'s own
+/// `Deserialize` already refuses a manifest whose tree isn't really a
+/// tree, so a cycle can no longer reach here from a file at all — but
+/// this walk runs on `aurora-app`'s own pre-window startup path, where
+/// the failure mode of unbounded recursion is a stack overflow, and a
+/// stack overflow is a process abort rather than an `Err` anything can
+/// report. `budget` bounds the walk at one visit per layer the tree
+/// actually holds, which is all a real tree ever needs.
 fn pixel_layer_ids(layers: &LayerTree) -> Vec<LayerId> {
     let mut ids = Vec::new();
-    collect_pixel_layers(layers, layers.roots(), &mut ids);
-    ids
-}
-
-fn collect_pixel_layers(layers: &LayerTree, siblings: &[LayerId], out: &mut Vec<LayerId>) {
-    for &id in siblings {
-        match layers.kind(id) {
-            Some(LayerKind::Pixel { .. }) => out.push(id),
-            Some(LayerKind::Group { .. }) => {
-                if let Some(children) = layers.children(id) {
-                    collect_pixel_layers(layers, children, out);
-                }
-            }
-            None => {}
+    // Reversed on the way in so popping yields each sibling list in its
+    // own stored order -- the order the recursive walk this replaced
+    // produced. (Order isn't load-bearing here, per the doc comment
+    // above; keeping it identical just means nothing downstream can
+    // quietly depend on a change.)
+    let mut stack: Vec<LayerId> = layers.roots().iter().rev().copied().collect();
+    let mut budget = layers.len();
+    while let Some(id) = stack.pop() {
+        let Some(kind) = layers.kind(id) else {
+            continue;
+        };
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        match kind {
+            LayerKind::Pixel { .. } => ids.push(id),
+            LayerKind::Group { children } => stack.extend(children.iter().rev().copied()),
         }
     }
+    ids
 }
 
 /// The ZIP entry name one tile's own encoded bytes live under —
@@ -643,6 +823,398 @@ mod tests {
         bytes.set_position(0);
         let (_dir, mut store) = real_tile_store();
         match read(bytes, &mut store) {
+            Err(super::IoError::ManifestDeserialization(_)) => {}
+            other => unreachable!("expected ManifestDeserialization, got {other:?}"),
+        }
+    }
+
+    /// A real container holding `manifest_bytes` verbatim, a real
+    /// (empty) history entry, and whatever `extra` entries a test needs
+    /// on top -- the shared "hand-craft a `.aur` file the writer would
+    /// never produce" step behind the hardening tests below.
+    fn container_with(manifest_bytes: &[u8], extra: &[(String, Vec<u8>)]) -> Cursor<Vec<u8>> {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut bytes);
+            let deflated = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            if let Err(err) = zip.start_file("manifest", deflated) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = std::io::Write::write_all(&mut zip, manifest_bytes) {
+                unreachable!("{err:?}");
+            }
+            let history = History::new();
+            let history_bytes = match history.save_journal() {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = zip.start_file("history", deflated) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = std::io::Write::write_all(&mut zip, &history_bytes) {
+                unreachable!("{err:?}");
+            }
+            for (name, contents) in extra {
+                if let Err(err) = zip.start_file(name.clone(), deflated) {
+                    unreachable!("{err:?}");
+                }
+                if let Err(err) = std::io::Write::write_all(&mut zip, contents) {
+                    unreachable!("{err:?}");
+                }
+            }
+            if let Err(err) = zip.finish() {
+                unreachable!("{err:?}");
+            }
+        }
+        bytes.set_position(0);
+        bytes
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_declaring_a_layer_past_the_document_ceiling() {
+        // The tile-scan loop derives its own iteration count from these
+        // bounds, so without the check this is not a slow read but an
+        // unfinishable one (~2.8e14 iterations for a 376-byte file) --
+        // on `aurora-app`'s pre-window startup path, where it looks
+        // exactly like a hung launch. The elapsed-time assertion is the
+        // point of the test: the answer must come back immediately, not
+        // eventually.
+        let mut layers = LayerTree::new();
+        let huge = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        if let Err(err) = layers.add_pixel_layer("huge", huge, None) {
+            unreachable!("{err:?}");
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1,
+            canvas_height: 1,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let (_dir, mut store) = real_tile_store();
+        let started = std::time::Instant::now();
+        match read(container_with(&manifest_bytes, &[]), &mut store) {
+            Err(super::IoError::LayerBoundsTooLarge { width, height, max }) => {
+                assert_eq!(width, u32::MAX);
+                assert_eq!(height, u32::MAX);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+            }
+            other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an oversized declared extent must be rejected up front, not looped over"
+        );
+    }
+
+    #[test]
+    fn read_accepts_bounds_exactly_at_the_document_ceiling() {
+        // The other side of the same check: the ceiling is documented,
+        // legal scope (PRD §7.3.1), so it must not be what gets
+        // rejected. Only the tile grid is exercised here -- no tile
+        // entries exist, so every lookup misses and leaves the store at
+        // its own blank default.
+        let mut layers = LayerTree::new();
+        let at_ceiling = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: 1,
+        };
+        if let Err(err) = layers.add_pixel_layer("wide", at_ceiling, None) {
+            unreachable!("{err:?}");
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: aurora_core::MAX_DOCUMENT_EXTENT,
+            canvas_height: 1,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        if let Err(err) = read(container_with(&manifest_bytes, &[]), &mut store) {
+            unreachable!("bounds at the documented ceiling must still read: {err:?}");
+        }
+    }
+
+    #[test]
+    fn read_rejects_a_tile_entry_far_larger_than_one_tile_can_hold() {
+        // The zip-bomb shape: a few kilobytes on disk that expand to
+        // orders of magnitude more in RAM. A tile entry's real ceiling
+        // is exactly one tile's worth of f16 RGBA samples, so anything
+        // past `MAX_TILE_ENTRY_BYTES` is refused before it is read
+        // rather than allocated first and validated after.
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("Background", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("id was just created as a pixel layer");
+        };
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 10,
+            canvas_height: 10,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bomb = (
+            super::tile_entry_name(surface, TileId { x: 0, y: 0 }),
+            vec![0u8; 4 * 1024 * 1024],
+        );
+        let container = container_with(&manifest_bytes, std::slice::from_ref(&bomb));
+        assert!(
+            container.get_ref().len() < 64 * 1024,
+            "the crafted container must really be small on disk -- that is the whole attack"
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        match read(container, &mut store) {
+            Err(super::IoError::EntryTooLarge { size, cap, .. }) => {
+                assert!(size > cap, "{size} must exceed the {cap}-byte cap");
+            }
+            other => unreachable!("expected EntryTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_whose_layers_add_up_past_the_whole_document_tile_budget() {
+        // Each of these layers is individually legal -- exactly at the
+        // documented document ceiling, which
+        // `read_accepts_bounds_exactly_at_the_document_ceiling` proves
+        // must keep working. What is not legal is their sum: the
+        // per-layer check says nothing about layer count, and a
+        // `LayerEntry` costs tens of bytes on the wire, so without a
+        // whole-document budget a small file could stack these until the
+        // tile scan never finished. As with the single-layer test above,
+        // the elapsed-time assertion is the point.
+        let mut layers = LayerTree::new();
+        let at_ceiling = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        for index in 0..64 {
+            if let Err(err) = layers.add_pixel_layer(format!("huge {index}"), at_ceiling, None) {
+                unreachable!("{err:?}");
+            }
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1,
+            canvas_height: 1,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let container = container_with(&manifest_bytes, &[]);
+        assert!(
+            container.get_ref().len() < 16 * 1024,
+            "the crafted container must really be small on disk -- that is the whole attack"
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        let started = std::time::Instant::now();
+        match read(container, &mut store) {
+            Err(super::IoError::TooManyTiles { total, max }) => {
+                assert!(total > max, "{total} must exceed the {max}-tile budget");
+                assert_eq!(max, super::MAX_TOTAL_TILES_PER_DOCUMENT);
+            }
+            other => unreachable!("expected TooManyTiles, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an over-budget manifest must be rejected on arithmetic, not by scanning it"
+        );
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_declaring_a_canvas_past_the_document_ceiling() {
+        // `aurora-app` stores this straight into its own live canvas
+        // size and later allocates `width * height * 4` samples from it,
+        // so an unchecked `u32::MAX` here is an allocation request no
+        // machine can serve -- from a file a few hundred bytes long. The
+        // layer bounds are deliberately tiny: the canvas value alone is
+        // what must be refused.
+        let mut layers = LayerTree::new();
+        if let Err(err) = layers.add_pixel_layer("small", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: u32::MAX,
+            canvas_height: u32::MAX,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        match read(container_with(&manifest_bytes, &[]), &mut store) {
+            Err(super::IoError::CanvasTooLarge { width, height, max }) => {
+                assert_eq!(width, u32::MAX);
+                assert_eq!(height, u32::MAX);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+            }
+            other => unreachable!("expected CanvasTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_accepts_a_canvas_exactly_at_the_document_ceiling() {
+        // The other side of the same check: the ceiling is documented,
+        // legal scope (PRD §7.3.1), so it must not be what gets
+        // rejected.
+        let mut layers = LayerTree::new();
+        if let Err(err) = layers.add_pixel_layer("small", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: aurora_core::MAX_DOCUMENT_EXTENT,
+            canvas_height: aurora_core::MAX_DOCUMENT_EXTENT,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        let (_, _, canvas_size, _) = match read(container_with(&manifest_bytes, &[]), &mut store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("a canvas at the documented ceiling must still read: {err:?}"),
+        };
+        assert_eq!(
+            canvas_size,
+            (
+                aurora_core::MAX_DOCUMENT_EXTENT,
+                aurora_core::MAX_DOCUMENT_EXTENT
+            )
+        );
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_whose_layer_tree_is_cyclic_rather_than_aborting() {
+        // Measured before the fix: a 226-byte container carrying exactly
+        // this tree killed the process with `fatal runtime error: stack
+        // overflow` (exit 134, core dumped) -- on `aurora-app`'s own
+        // pre-window startup path. Not a panic anything could catch.
+        //
+        // The tree is hand-crafted here because every path through
+        // `LayerTree`'s own API refuses to build one, which is exactly
+        // why nothing had caught this: the type's derived `Deserialize`
+        // was the one way in that skipped every one of those checks.
+        let manifest_bytes = {
+            #[derive(serde::Serialize)]
+            enum Kind {
+                #[allow(dead_code)]
+                Pixel {
+                    x: i32,
+                    y: i32,
+                    w: u32,
+                    h: u32,
+                },
+                Group {
+                    children: Vec<u64>,
+                },
+            }
+            #[derive(serde::Serialize)]
+            struct Lock {
+                transparency: bool,
+                pixels: bool,
+                position: bool,
+            }
+            #[derive(serde::Serialize)]
+            struct Entry {
+                name: String,
+                parent: Option<u64>,
+                kind: Kind,
+                opacity: f32,
+                fill_opacity: f32,
+                blend_mode: u32,
+                visible: bool,
+                lock: Lock,
+                mask: Option<()>,
+            }
+            #[derive(serde::Serialize)]
+            struct Tree {
+                ids: u64,
+                layers: std::collections::HashMap<u64, Entry>,
+                roots: Vec<u64>,
+            }
+            #[derive(serde::Serialize)]
+            struct Manifest {
+                version: u32,
+                canvas_width: u32,
+                canvas_height: u32,
+                color_space: u32,
+                layers: Tree,
+            }
+            let mut tree_layers = std::collections::HashMap::new();
+            tree_layers.insert(
+                0u64,
+                Entry {
+                    name: "cycle".to_owned(),
+                    parent: None,
+                    kind: Kind::Group { children: vec![0] },
+                    opacity: 1.0,
+                    fill_opacity: 1.0,
+                    blend_mode: 0,
+                    visible: true,
+                    lock: Lock {
+                        transparency: false,
+                        pixels: false,
+                        position: false,
+                    },
+                    mask: None,
+                },
+            );
+            let manifest = Manifest {
+                version: super::MANIFEST_VERSION,
+                canvas_width: 1,
+                canvas_height: 1,
+                color_space: 0,
+                layers: Tree {
+                    ids: 1,
+                    layers: tree_layers,
+                    roots: vec![0],
+                },
+            };
+            match postcard::to_allocvec(&manifest) {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        };
+
+        let (_dir, mut store) = real_tile_store();
+        match read(container_with(&manifest_bytes, &[]), &mut store) {
             Err(super::IoError::ManifestDeserialization(_)) => {}
             other => unreachable!("expected ManifestDeserialization, got {other:?}"),
         }
