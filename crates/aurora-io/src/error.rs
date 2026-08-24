@@ -59,9 +59,18 @@ pub enum IoError {
         expected: usize,
         actual: usize,
     },
-    /// [`crate::import::write_into_store`] failed to page a touched tile
-    /// in from the scratch disk.
-    #[error("failed to write image into the tile store: {0}")]
+    /// A [`aurora_tile::TileError`] surfaced through this crate — most
+    /// often paging a tile in from the scratch disk, from either
+    /// direction: [`crate::import::write_into_store`] hits it while
+    /// *writing* an imported image into the store, and
+    /// [`crate::aur::read`] hits it while *reading* a `.aur` file's own
+    /// tile entries back (a corrupt entry is rejected by
+    /// `aurora_tile::codec::decode` and arrives here). The message is
+    /// therefore deliberately direction-neutral: it used to say "failed
+    /// to write image into the tile store" and was shown to a user whose
+    /// *open* had failed, which is a misleading thing to tell someone
+    /// about their own file.
+    #[error("tile data error: {0}")]
     Tile(#[from] aurora_tile::TileError),
     /// [`crate::import::decode_by_extension`] was given a path whose
     /// extension names a format this crate doesn't decode (or has no
@@ -142,4 +151,27 @@ pub enum IoError {
         ".aur manifest's layers add up to {total} tiles, past this reader's own {max}-tile budget"
     )]
     TooManyTiles { total: u64, max: u64 },
+    /// A flat, composited export (`aurora-app`'s own `composite_document`)
+    /// could not read every tile it needed out of the tile store, so the
+    /// image it assembled is missing content — the skipped layers
+    /// contributed nothing at all rather than their real pixels.
+    ///
+    /// This is refused rather than written. The live canvas deliberately
+    /// degrades instead: one unreadable tile logs a warning and paints
+    /// what it can, because hard-failing every repaint over one corrupt
+    /// scratch file would be far worse to use. A *file* is different —
+    /// CLAUDE.md's own rule is that silently degrading a professional's
+    /// file is the worst failure this project can have — so the export
+    /// path turns the same condition into a real `Err` and writes
+    /// nothing.
+    ///
+    /// `first` is the message of the first underlying
+    /// [`aurora_tile::TileError`] seen; `skipped` counts every skip
+    /// across the whole export, which is why the error carries a count
+    /// rather than the error value itself.
+    #[error(
+        "refusing to export a document with missing content: {skipped} layer tile read(s) failed \
+         (first: {first})"
+    )]
+    IncompleteComposite { skipped: usize, first: String },
 }

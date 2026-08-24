@@ -32,8 +32,8 @@ pub enum TileError {
         source: std::io::Error,
     },
     /// A tile file on disk didn't parse as a valid tile (bad magic,
-    /// unsupported version, truncated payload, or a decompressed length
-    /// that doesn't match a whole number of texels).
+    /// unsupported version, truncated payload, or a decoded length that
+    /// isn't exactly one whole tile (`aurora_tile::SAMPLES` samples)).
     #[error("corrupt tile file: {0}")]
     CorruptFile(String),
     /// Propagated from `aurora-core` (e.g. an invalid `Size`).

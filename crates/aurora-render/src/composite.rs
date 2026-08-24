@@ -562,22 +562,45 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// job is to fail loudly if some future edit reintroduces a bespoke
 /// per-layer loop into [`composite_tile_cpu`] that drifts from this one.
 ///
-/// **Length mismatches are silently swallowed, and that is a gap, not a
-/// guarantee.** A `texels` (or `out`) slice whose length isn't a
-/// multiple of [`CHANNELS`] has its trailing partial texel dropped
-/// (`chunks_exact`), and because the two slices are *zipped*, a length
-/// mismatch between them composites only the shorter one's worth of
-/// texels. Neither case can index or write past either buffer's own
-/// end — but do not read that as a deliberate safety property. The
-/// honest statement is that this function drops content with no error
-/// and no way for a caller to notice. It is *not* purely hypothetical:
-/// `aurora_tile::codec`'s own decode path validates only an **upper**
-/// bound on a scratch-disk tile's decoded length, never that it equals
-/// [`aurora_tile::SAMPLES`], so a truncated or corrupted scratch file
-/// can reach a caller as a short slice. Closing that belongs in
-/// `aurora-tile`'s own decode validation, not here; it is recorded as
-/// separate open work in PLAN.md's M1.8 notes, and named here only so
-/// this zip is not mistaken for the thing that makes it safe.
+/// **Length mismatches are still silently swallowed here — that is not
+/// a safety property of this function, it is just no longer reachable.**
+/// A `texels` (or `out`) slice whose length isn't a multiple of
+/// [`CHANNELS`] has its trailing partial texel dropped (`chunks_exact`),
+/// and because the two slices are *zipped*, a length mismatch between
+/// them composites only the shorter one's worth of texels, with no error
+/// and no way for a caller to notice. Nothing about that changed. What
+/// changed (0.52.1) is that no caller in this workspace can produce a
+/// mismatched pair any more — not through one unified mechanism, but
+/// because every producer of a tile-shaped `&[f16]` in this workspace
+/// independently either allocates exactly [`SAMPLES`] or preserves its
+/// input's own length. As of 0.52.1 that is, exhaustively:
+///
+/// * [`transparent_tile`] — `vec![…; SAMPLES]`. Both accumulators
+///   (`aurora-app`'s `composite_roots_into_tile` and `resolve_tile`'s
+///   own per-group `isolated`) start here, which is what fixes `out`.
+/// * `aurora-app`'s `read_layer_window` — allocates
+///   `TILE * TILE * CHANNELS` directly and *copies into* it, so a
+///   missing or unreadable source tile leaves transparent pixels rather
+///   than a short buffer.
+/// * `aurora_tile::TileStore::get` → `Tile::texels()` — every `Tile` is
+///   `Tile::blank` (`SAMPLES`-long by construction) or
+///   `Tile::from_texels` fed only by `aurora_tile::codec::decode`, which
+///   since 0.52.1 rejects any decoded length other than exactly one
+///   whole tile. That is the one that closed the real, reachable hole: a
+///   truncated or corrupted scratch-disk file used to page in as a short
+///   slice, and is now a `TileError` at its source.
+/// * `aurora-app`'s `dissolve_gate` and `apply_mask_clip` — both
+///   allocate `vec![…; texels.len()]`, so they are length-preserving
+///   whatever they are handed.
+/// * `aurora-app`'s `decode_f16_samples` (the GPU readback path) —
+///   enforces `out.len() == aurora_tile::SAMPLES` itself and returns
+///   `None` otherwise, entirely independently of this crate.
+///
+/// So the honest statement is "five separate enforcement points, one of
+/// which was fixed", not "one invariant guarantees it". Treat this list
+/// as a note about *why* the zip is currently harmless — and as
+/// something to re-check when a sixth producer appears — not as licence
+/// to hand this function slices of differing lengths.
 ///
 /// **Scope**: [`BlendMode`] covers 26 of `aurora_doc::BlendMode`'s
 /// real 27 variants. The inventory, the `Dissolve` boundary, and why

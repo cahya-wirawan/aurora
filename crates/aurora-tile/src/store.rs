@@ -632,6 +632,47 @@ mod tests {
         );
     }
 
+    /// A corrupted scratch file must surface as a `TileError`, never as a
+    /// short `Tile`. `Tile::from_texels` (this crate's only non-blank tile
+    /// constructor, `pub(crate)`) is fed exclusively by `codec::decode`, at
+    /// `page_in` and the `pending` branch of `ensure_resident` -- so
+    /// `codec`'s own exact-length check is what makes "every `Tile` this
+    /// store hands out holds exactly `SAMPLES` samples" true for the
+    /// paged-in case, and therefore what keeps `aurora-app`'s own
+    /// `write_composited`/`copy_from_slice` and
+    /// `aurora_render::composite_layer_into`'s zip out of reach of a short
+    /// buffer. Before the fix this returned `Ok` with a half-length tile.
+    #[test]
+    fn a_truncated_scratch_file_pages_in_as_an_error_not_a_short_tile() {
+        let (dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 0, y: 0 };
+
+        // A structurally valid tile file holding half a tile -- what a
+        // crash mid-write or another process in the scratch directory
+        // leaves behind. Written to the real path `page_in` will read.
+        let half = vec![half::f16::from_f32(0.5); crate::tile::SAMPLES / 2];
+        // `encode_any_length`, not `encode`: `encode` now debug-asserts a
+        // whole tile precisely so production code cannot write a file
+        // like this one by accident. Building the fixture is the one
+        // legitimate reason to bypass that.
+        let bytes = crate::codec::encode_any_length(&half);
+        let path = dir.path().join("truncated.tile");
+        if let Err(err) = std::fs::write(&path, &bytes) {
+            unreachable!("test-local scratch disk must accept the write: {err}");
+        }
+        store.paged_out.insert((s, id), path);
+
+        match store.get(s, id) {
+            Err(crate::TileError::CorruptFile(_)) => {}
+            Ok(tile) => unreachable!(
+                "a truncated scratch file must not page in as a {}-sample tile",
+                tile.texels().len()
+            ),
+            Err(other) => unreachable!("expected CorruptFile, got {other:?}"),
+        }
+    }
+
     // -- Multi-surface addressing (ADR 0010) --
 
     #[test]

@@ -3748,6 +3748,15 @@ struct CompositeBudget {
     /// composite pass. See the type's own doc comment for why this
     /// survives [`Self::next_tile`].
     reported: bool,
+    /// How many layer tiles this whole pass skipped because
+    /// `aurora_tile::TileStore::get` failed — see [`Self::note_store_error`]
+    /// for why this rides along here. Per *pass*, so like `reported` it
+    /// deliberately survives [`Self::next_tile`].
+    store_errors: usize,
+    /// The first such failure's own message, kept because
+    /// `aurora_tile::TileError` is neither `Clone` nor cheap to hold on
+    /// to while the store it borrows from is still being mutated.
+    first_store_error: Option<String>,
 }
 
 impl CompositeBudget {
@@ -3757,6 +3766,8 @@ impl CompositeBudget {
         Self {
             nodes: layers.len(),
             reported: false,
+            store_errors: 0,
+            first_store_error: None,
         }
     }
 
@@ -3786,6 +3797,44 @@ impl CompositeBudget {
         let first = !self.reported;
         self.reported = true;
         first
+    }
+
+    /// Records that one layer's tile could not be read out of the store
+    /// and was therefore skipped — that layer contributed *nothing* to
+    /// the tile being composited, rather than its real pixels.
+    ///
+    /// **Why this lives on the budget.** It is the one piece of state
+    /// already threaded, by `&mut`, through every frame of
+    /// [`resolve_tile`]'s recursion and back out to both of its
+    /// top-level callers, and it is already the pass's diagnostics
+    /// carrier (`reported`), not purely a bound. Giving the skip count a
+    /// second `&mut` parameter of its own would have meant the same
+    /// thread-through with two things to keep in step.
+    ///
+    /// The two callers then do deliberately different things with it.
+    /// [`recomposite_visible_tiles`] ignores it: the live canvas must
+    /// keep painting what it can, because hard-failing every repaint
+    /// over one corrupt scratch-disk tile is far worse to use than a
+    /// visibly missing layer plus a log line, and that graceful-degrade
+    /// behaviour long predates this. [`composite_document`] — the
+    /// export/save path — checks it and refuses to hand back an
+    /// `aurora_io::Image` that is quietly missing content, because a
+    /// *file* written that way is the failure CLAUDE.md names as the
+    /// worst this project can have.
+    fn note_store_error(&mut self, err: &aurora_tile::TileError) {
+        self.store_errors = self.store_errors.saturating_add(1);
+        if self.first_store_error.is_none() {
+            self.first_store_error = Some(err.to_string());
+        }
+    }
+
+    /// `Some((how many skips, the first one's message))` if any layer
+    /// tile was skipped during this pass because the store could not
+    /// read it; `None` if every tile read cleanly. See
+    /// [`Self::note_store_error`].
+    fn store_error(&self) -> Option<(usize, &str)> {
+        let first = self.first_store_error.as_deref()?;
+        Some((self.store_errors, first))
     }
 
     /// Whether this tile's node budget is already spent. Lets a sibling
@@ -4111,12 +4160,17 @@ fn resolve_tile(
                 match store.get(surface, tile_id) {
                     Ok(tile) => tile.texels().to_vec(),
                     Err(err) => {
+                        // Recorded, not just logged: the live canvas is
+                        // content to skip this layer and repaint, but the
+                        // export path must be able to tell that it did.
+                        // See `CompositeBudget::note_store_error`.
+                        budget.note_store_error(&err);
                         tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
                         return None;
                     }
                 }
             } else {
-                read_layer_window(store, surface, origin, doc_origin)
+                read_layer_window(store, surface, origin, doc_origin, budget)
             };
             // Mask clip runs first, ahead of `Dissolve` below: it
             // restricts which pixels are even in play before any blend
@@ -4988,6 +5042,18 @@ fn recomposite_visible_tiles(
     // exactly: a `TileStore::get_mut` failure leaves the tile un-cached
     // so a later redraw retries it, rather than silently marking a
     // never-written tile "done".
+    //
+    // The length guard before `copy_from_slice` is this function's own,
+    // deliberately not delegated: `copy_from_slice` *panics* on a
+    // mismatch, and this crate holds a professional's unsaved work, so a
+    // panic here loses it. Every producer of `composited` is
+    // `SAMPLES`-long today (`aurora_render::transparent_tile` via
+    // `composite_roots_into_tile`, or `decode_f16_samples`, which
+    // enforces its own length) -- but that is an argument about other
+    // functions, and `aurora_io::aur::read` already sets the precedent
+    // of checking a length itself rather than trusting one. Skipping
+    // leaves the tile un-cached, exactly as a `get_mut` failure does, so
+    // a later redraw retries it.
     let write_composited = |store: &mut aurora_tile::TileStore,
                             cache: &mut CompositeCache,
                             tile_id: aurora_tile::TileId,
@@ -4995,6 +5061,15 @@ fn recomposite_visible_tiles(
         let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
             return;
         };
+        if dest.texels().len() != composited.len() {
+            tracing::warn!(
+                ?tile_id,
+                composited = composited.len(),
+                expected = dest.texels().len(),
+                "composited tile is not one whole tile; skipping this tile's write"
+            );
+            return;
+        }
         dest.texels_mut().copy_from_slice(composited);
         dest.mark_dirty(full_tile);
         cache.mark_current(tile_id);
@@ -5188,6 +5263,7 @@ fn read_layer_window(
     surface: aurora_tile::SurfaceId,
     layer_origin: (i64, i64),
     doc_origin: (i64, i64),
+    budget: &mut CompositeBudget,
 ) -> Vec<half::f16> {
     let tile_size = i64::from(aurora_tile::TILE);
     let window_x = doc_origin.0 - layer_origin.0;
@@ -5222,14 +5298,29 @@ fn read_layer_window(
             if col_lo >= col_hi {
                 continue;
             }
-            let Ok(src) = store.get(
+            let src = match store.get(
                 surface,
                 aurora_tile::TileId {
                     x: tile_col,
                     y: tile_row,
                 },
-            ) else {
-                continue;
+            ) {
+                Ok(src) => src,
+                Err(err) => {
+                    // Same reason as `resolve_tile`'s own direct
+                    // `store.get`: skipping leaves this part of the
+                    // window transparent, which is silent content loss
+                    // unless somebody upstream is told. See
+                    // `CompositeBudget::note_store_error`.
+                    budget.note_store_error(&err);
+                    tracing::warn!(
+                        ?err,
+                        tile_x = tile_col,
+                        tile_y = tile_row,
+                        "skipping a moved layer's source tile for this composite tile"
+                    );
+                    continue;
+                }
             };
             let texels = src.texels().to_vec();
             for src_row in row_lo..row_hi {
@@ -5326,12 +5417,31 @@ fn read_layer_window(
 /// A layer whose own tile fails to load for a given output tile is
 /// logged and skipped for that tile only, the same "one bad tile
 /// shouldn't abort the rest" discipline [`recomposite_visible_tiles`]
-/// already uses — not grounds to abort the whole export.
+/// already uses — the *walk* is not aborted. **The export is**, at the
+/// end: see `# Errors` below. That split is deliberate and is the whole
+/// point of 0.52.1's second half — the live canvas may degrade
+/// gracefully, a file may not.
 ///
 /// # Errors
 ///
-/// Returns [`aurora_io::IoError`] if the assembled buffer doesn't come
-/// out to exactly `width * height * 4` samples — structurally
+/// Returns [`aurora_io::IoError::IncompleteComposite`] if any layer tile
+/// could not be read out of `store` during the walk. Every such layer
+/// contributed nothing at all to its tile rather than its real pixels,
+/// so the assembled image is quietly missing content — a corrupted
+/// scratch-disk tile (a crash mid-write, a full disk, another process in
+/// the scratch directory) is exactly how that happens to a document that
+/// is open and being edited. Until 0.52.1 this returned `Ok` with the
+/// holes in it and [`App::save_file`] wrote that straight to the user's
+/// file: silent, unannounced content loss, the failure CLAUDE.md names
+/// as the worst this project can have. It is refused instead.
+///
+/// The caller's obligation stops at *not writing the file*. Turning this
+/// into the itemized, user-visible warning FR-001's lossy-save rule
+/// calls for is real, separate, still-open work — tracked in PLAN.md,
+/// not done here.
+///
+/// Also returns [`aurora_io::IoError`] if the assembled buffer doesn't
+/// come out to exactly `width * height * 4` samples — structurally
 /// unreachable given this function's own tile walk, but surfaced
 /// through the same `aurora_io::Image::new` contract
 /// [`aurora_io::read_from_store`] already goes through, rather than
@@ -5394,6 +5504,24 @@ fn composite_document(
                     }
                 }
             }
+        }
+
+        // Checked once for the whole export, after the tile walk rather
+        // than inside it: one unreadable tile does not abort the other
+        // thousands (the CPU cost of finishing is trivial next to
+        // getting the answer wrong), but it does mean this function has
+        // no honest `Image` to return. See this function's own `# Errors`
+        // section and `CompositeBudget::note_store_error`.
+        if let Some((skipped, first)) = budget.store_error() {
+            tracing::error!(
+                skipped,
+                first,
+                "refusing to export a document with tiles that could not be read"
+            );
+            return Err(aurora_io::IoError::IncompleteComposite {
+                skipped,
+                first: first.to_owned(),
+            });
         }
     }
 
@@ -6439,6 +6567,16 @@ impl App {
     /// absent-precondition honesty [`Self::paint_dab`] already uses. A
     /// real, logged failure (compositing the pixels, encoding, or
     /// writing the file) is worth a warning, though.
+    ///
+    /// **Nothing is written if the composite came out incomplete.**
+    /// [`composite_document`] returns
+    /// [`aurora_io::IoError::IncompleteComposite`] when a layer tile
+    /// could not be read out of the store (a corrupted scratch-disk
+    /// tile, say), and this function then returns without touching
+    /// `path` at all — no partial file, no overwrite of whatever was
+    /// there. That refusal is currently log-only: surfacing it as the
+    /// itemized, user-visible warning FR-001 wants is separate, still-
+    /// open work tracked in PLAN.md.
     fn save_file(&mut self, path: &Path) {
         if is_aur_path(path) {
             self.save_aur_file(path);
@@ -6451,7 +6589,14 @@ impl App {
         let image = match composite_document(&self.layers, store, width, height) {
             Ok(image) => image,
             Err(err) => {
-                tracing::warn!(?err, "failed to composite the document for export");
+                // Includes `IoError::IncompleteComposite` -- the export
+                // refused because one or more layer tiles could not be
+                // read (see `composite_document`'s own `# Errors`). The
+                // *file* is safe either way: nothing is written, and
+                // whatever was already at `path` is untouched. What is
+                // still missing is telling the user, rather than only the
+                // log -- tracked in PLAN.md, not solved here.
+                tracing::error!(?err, "refusing to export: could not composite the document");
                 return;
             }
         };
@@ -10791,6 +10936,115 @@ mod tests {
                 [0.5, 0.0, 0.5, 1.0],
                 "opaque red bottom under opaque blue top at 50% opacity"
             );
+        }
+    }
+
+    /// The export half of 0.52.1. `aurora-tile`'s own exact-length check
+    /// turns a corrupted scratch-disk tile into a real `TileError`
+    /// instead of a short buffer -- but `resolve_tile` *catches* that
+    /// error, logs it, and skips the layer, which on the export path
+    /// meant `composite_document` returned `Ok` with that layer's pixels
+    /// silently missing and `App::save_file` wrote the result straight
+    /// over the user's file. Unannounced content loss in a saved file is
+    /// the failure CLAUDE.md names as the worst this project can have,
+    /// so the export refuses.
+    ///
+    /// Deliberately *not* changed, and therefore not asserted here: the
+    /// live canvas (`recomposite_visible_tiles`) still skips-and-repaints,
+    /// because failing every frame over one bad tile is worse to use than
+    /// a visibly missing layer.
+    ///
+    /// The corruption is real, not mocked: a budget-of-1 store evicts the
+    /// bottom layer's tile to the scratch directory, `flush` confirms the
+    /// write, and the file is then truncated the way a crash mid-write or
+    /// a full disk leaves it. Every sibling `composite_document_*` test
+    /// here is the positive control -- they run against an uncorrupted
+    /// store and get `Ok`.
+    #[test]
+    fn composite_document_refuses_to_export_when_a_layer_tile_cannot_be_read() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // One resident tile at a time, so the second layer's first touch
+        // evicts the first layer's tile to disk.
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        // `bottom`'s tile is now evicted and in flight; `flush` makes the
+        // write real so the file below is the one `page_in` will read.
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        let mut scratch_files: Vec<std::path::PathBuf> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        for entry in entries.flatten() {
+            scratch_files.push(entry.path());
+        }
+        assert_eq!(
+            scratch_files.len(),
+            1,
+            "exactly one tile should have been evicted: {scratch_files:?}"
+        );
+        let Some(victim) = scratch_files.first() else {
+            unreachable!("just asserted there is exactly one");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        match composite_document(&layers, &mut store, 10, 10) {
+            Err(aurora_io::IoError::IncompleteComposite { skipped, first }) => {
+                assert_eq!(skipped, 1, "exactly one layer tile was unreadable");
+                assert!(
+                    first.contains("corrupt tile file"),
+                    "the refusal must carry the real underlying tile error: {first}"
+                );
+            }
+            Ok(_) => unreachable!(
+                "exporting a document whose bottom layer cannot be read must not quietly \
+                 succeed with that layer missing"
+            ),
+            Err(other) => unreachable!("expected IncompleteComposite, got {other:?}"),
         }
     }
 

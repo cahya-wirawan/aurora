@@ -7704,35 +7704,209 @@ structural design work.
     own real bug so it is not lost. It also blocked one of the halo
     item's own verification attempts above, so the two are worth picking
     up in that order.
-- [ ] **A corrupted scratch-disk tile can reach a real `panic` via
-    `copy_from_slice`** — found 2026-08-24 by the same review, also
-    **pre-existing** (it reproduces on the pre-fix code) and also
-    disclosed rather than fixed here. `aurora_tile::codec`'s decode path
+- [x] **A corrupted scratch-disk tile could reach a real `panic` via
+    `copy_from_slice`, and could silently drop a layer out of an exported
+    file** — found 2026-08-24 by the 0.52.0 review (and
+    **pre-existing** to that fix), disclosed there, fixed in 0.52.1.
+    `aurora_tile::codec`'s decode path
     (`crates/aurora-tile/src/codec.rs`, `decode` → `from_raw_bytes`)
-    checks that a decoded payload is a whole number of `f16` samples and
-    that a compressed payload's declared size is within
-    `MAX_DECOMPRESSED_BYTES` — an **upper** bound only. It never checks
-    that the decoded length actually *equals* `aurora_tile::SAMPLES`. A
-    short tile therefore decodes successfully, and
+    checked only that a decoded payload was a whole number of `f16`
+    samples, plus a compressed payload's declared size against
+    `MAX_DECOMPRESSED_BYTES` — an **upper** bound. It never checked that
+    the decoded length actually *equalled* `aurora_tile::SAMPLES`, so a
+    short tile decoded successfully and
     `write_composited`'s `dest.texels_mut().copy_from_slice(composited)`
     (`crates/aurora-app/src/lib.rs`, inside `recomposite_visible_tiles`)
-    panics on the length mismatch — precisely what the workspace's
+    panicked on the length mismatch — precisely what the workspace's
     `unwrap`/`expect`/`panic`/`indexing_slicing` deny policy exists to
     prevent, in a program holding unsaved work.
 
-    Likelihood is lower than the item above: it needs real scratch-disk
-    corruption — a crash mid-write, a full disk, or another process
-    writing into the scratch directory — not ordinary use. The fix
-    belongs in `aurora-tile`'s own decode validation (reject a decoded
-    length that isn't `SAMPLES`, with a `TileError::CorruptFile`), which
-    is why it is not being patched from `aurora-app` here. Related, and
-    part of the same fix: `aurora_render::composite_layer_into` zips its
-    two slices, so a short buffer that *doesn't* reach a
-    `copy_from_slice` instead silently composites only part of the tile.
-    Its doc comment was corrected in 0.51.0 to describe that as an
-    unreported gap — the first version of that comment framed the zip as
-    a safety property ("nothing is written past either buffer's own
-    end"), which is true but misleading about what actually happens.
+    **The fix**: `from_raw_bytes` now rejects any decoded length other
+    than exactly `SAMPLES * 2` bytes (`EXPECTED_DECODED_BYTES`) with a
+    `TileError::CorruptFile` naming both the actual and the expected byte
+    count. One check covers both on-disk branches, because `decode`
+    tail-calls `from_raw_bytes` on the raw and the compressed path
+    alike. The old `is_multiple_of(2)` check was removed rather than kept
+    alongside it: an odd length is never equal to an even constant, so it
+    had become dead code.
+
+    The check also moved *earlier* wherever that was free, matching this
+    module's own "check the size, then allocate" doctrine rather than
+    contradicting it. On the raw (`compressed: 0`) branch it now runs
+    before `payload.to_vec()`, so an arbitrarily large corrupt file is
+    rejected instead of being copied into memory first. On the compressed
+    branch, the pre-allocation guard on lz4's own attacker-controlled
+    size prefix became an *equality* (`declared != EXPECTED_DECODED_BYTES`)
+    rather than an upper bound, so an under-sized claim is now refused
+    before `lz4_flex` is handed the bytes at all. That made the separate
+    `MAX_DECOMPRESSED_BYTES` constant redundant — it and
+    `EXPECTED_DECODED_BYTES` were two independently declared spellings of
+    `SAMPLES * 2` and could have drifted — so the two were merged into
+    one constant carrying both roles, with the whole zip-bomb rationale
+    (the measured 26-byte input that claimed 3 GB and got it) preserved
+    verbatim in its doc comment. `from_raw_bytes` still re-runs the exact
+    check on what `lz4_flex` actually produced: defence in depth on the
+    compressed branch, a no-op repeat on the raw one.
+
+    `encode` gained a `debug_assert_eq!(texels.len(), SAMPLES)`. The two
+    halves of this module had become asymmetric — `decode` accepts
+    exactly one whole tile, `encode` accepted any length — so a future
+    caller passing a partial tile would have silently written a file that
+    can never be read back. Both production callers
+    (`TileStore::make_room`, `aurora_io::aur::write`) pass a real `Tile`'s
+    own buffer and are unaffected. The corruption fixtures in this
+    crate's own tests, which legitimately need a wrong-sized payload, go
+    through a new `pub(crate) encode_any_length` — the shared body,
+    without the assert.
+
+    `aurora_io::aur`'s own independent per-tile length check was
+    deliberately left in place: formally redundant now, but cheap defence
+    at a different crate boundary (a hostile `.aur` ZIP, not scratch-disk
+    corruption). It carries a comment saying exactly that, including that
+    it has no test of its own and should not be read as evidence.
+
+    `aurora-app`'s `write_composited` — the named panic site itself —
+    gained its own length guard before `copy_from_slice`, warning and
+    skipping the tile instead of panicking. It is redundant given the
+    upstream fix, on purpose: `copy_from_slice` panics, this program
+    holds unsaved work, and `aurora_io::aur` already sets the precedent
+    of checking a length itself rather than trusting one from another
+    crate.
+
+    **Tests.** *Three* of the four fail against pre-fix code:
+    `codec::tests::rejects_a_compressed_payload_that_decodes_to_less_than_one_whole_tile`
+    (the primary regression test — a well-formed lz4 tile file holding
+    half a tile),
+    `codec::tests::rejects_a_raw_payload_that_is_not_exactly_one_whole_tile`
+    (the `compressed: 0` branch, header built by hand since `encode`
+    never picks that branch for compressible data), and
+    `store::tests::a_truncated_scratch_file_pages_in_as_an_error_not_a_short_tile`
+    — the store-level evidence that the panic path is actually closed: a
+    truncated file at the real path `page_in` reads now surfaces as
+    `TileError::CorruptFile` instead of `Ok` with a half-length `Tile`.
+
+    The fourth, `codec::tests::rejects_a_raw_payload_of_odd_length`,
+    **passes pre-fix by construction** and is not a regression test at
+    all: the old `is_multiple_of(2)` check already covered odd lengths.
+    It exists so that replacing that check cannot silently lose the
+    property it owned. (An earlier draft of this entry claimed all four
+    failed pre-fix, which contradicted its own next sentence; corrected
+    in the 0.52.1 review round.)
+
+    Every one of the four rejection tests now asserts on the error
+    *message*, not just `Err(CorruptFile(_))`. The wildcard also matches
+    a bad-magic or bad-version rejection, so a change that broke header
+    parsing earlier in `decode` would have left the length-check tests
+    green while proving nothing — confirmed by mutation. For the same
+    reason `rejects_bad_magic` now corrupts a *full* tile rather than a
+    one-sample one, so it cannot pass on the length check with the magic
+    check deleted, and the short-compressed-payload fixture moved from
+    half a tile to a quarter: half a tile is 262144 bytes, which is also
+    `SAMPLES`' own numeral, so `contains("262144")` was satisfied by the
+    expected-count half of the message whether or not the actual size was
+    reported at all.
+
+    `codec::tests::round_trips_bit_exact`'s fixture was widened from 1000
+    samples to a full `SAMPLES`-sample tile, since the strict check makes
+    a short fixture undecodable. That had an unnoticed side effect: the
+    widened fixture cycles the same 1000 values, which is trivially
+    lz4-compressible, so the test moved off the raw branch onto the
+    compressed one and the `compressed: 0` decode path lost its only
+    success-path test — a real regression there would have shipped
+    undetected, proven by mutation. `codec::tests::round_trips_incompressible_data_through_the_raw_branch`
+    restores it: one whole tile of deterministic xorshift64\* noise, which
+    lz4 cannot compress, pinned to the raw branch by asserting the
+    on-disk flag byte and then round-tripped bit-exactly. Both round-trip
+    tests now assert which branch they took.
+
+    **`aurora_render::composite_layer_into`**: closed by construction,
+    not separately patched. It still zips its two slices, and that zip
+    still cannot itself *report* a mismatch — but no caller in this
+    workspace can produce a mismatched pair any more. Not, however, for
+    the single tidy reason a first draft of its doc comment claimed
+    ("every `&[f16]` reaching this function traces back to a `Tile`"),
+    which is simply not true: `read_layer_window` allocates a fresh
+    `SAMPLES`-length buffer and copies into it, `transparent_tile` is a
+    bare `vec![…; SAMPLES]`, `dissolve_gate`/`apply_mask_clip` allocate
+    `vec![…; texels.len()]`, and the GPU readback path's
+    `decode_f16_samples` enforces its own `== SAMPLES` check — none of
+    them pass through a `Tile` or `codec::decode` at all. The doc comment
+    now lists all five enforcement points and says plainly that the
+    guarantee is distributed, not unified, and needs re-checking when a
+    sixth producer appears. Only one of the five was ever a reachable
+    hole, and that is the one `codec::decode` closed.
+
+    **The export path was the other half of this bug, and it was not the
+    panic.** `resolve_tile` *catches* a `TileStore::get` failure, logs it,
+    and skips that layer for that tile — deliberate, pre-existing,
+    graceful degradation for the live canvas. On the export path
+    (`composite_document` → `App::save_file`) the same behaviour meant a
+    corrupted scratch-disk tile produced an `Ok(Image)` with a layer's
+    pixels silently missing, which was then encoded and written over the
+    user's file with no warning anywhere. Making `decode` strict turned a
+    short-buffer bug into a clean `Err` *inside the store*, but did not
+    change what happened after `resolve_tile` swallowed it — so the fix
+    above, on its own, converted a wrong-length composite into a
+    quietly-incomplete one.
+
+    `CompositeBudget` — already the `&mut` state threaded through every
+    frame of `resolve_tile`'s recursion, and already the pass's
+    diagnostics carrier, not purely a bound — now also records how many
+    layer tiles were skipped for a store error, and the first such
+    error's message. The two callers then diverge on purpose:
+    `recomposite_visible_tiles` ignores it and keeps painting (failing
+    every repaint over one bad tile is worse to use than a visibly
+    missing layer plus a log line), while `composite_document` checks it
+    once at the end of its tile walk and returns a new
+    `aurora_io::IoError::IncompleteComposite { skipped, first }` instead
+    of an `Image`. `App::save_file` already returned early on `Err`, so
+    nothing is written and whatever was at the path is untouched.
+    `read_layer_window`'s own silent `continue` on a store error (the
+    moved-layer path) records through the same counter. `.aur` saves were
+    never affected: `aurora_io::aur::write` propagates `store.get`'s error
+    with `?` already.
+
+    Regression test:
+    `composite_document_refuses_to_export_when_a_layer_tile_cannot_be_read`
+    — a budget-of-1 store really evicts the bottom layer's tile to the
+    scratch directory, `flush` makes the write real, the file is
+    truncated the way a crash mid-write leaves it, and the export is then
+    asserted to return `IncompleteComposite { skipped: 1, .. }`. Confirmed
+    to fail (`Ok`, with the layer silently missing) with the new check
+    disabled.
+
+    **Follow-up, explicitly not done here**: the refusal is currently
+    log-only (`tracing::error!` in `save_file`). Turning it into the
+    itemized, user-visible warning FR-001's lossy-save rule calls for
+    needs a dialog this shell does not have yet — see the new open item
+    below.
+- [ ] **An export refused for unreadable tiles is only logged, never
+    shown to the user.** Opened 2026-08-24 by the 0.52.1 review, as the
+    named remainder of the item above. `composite_document` now returns
+    `IoError::IncompleteComposite` rather than silently writing a file
+    with missing content, and `App::save_file` correctly writes nothing —
+    but from the user's side a Save that refuses looks identical to a
+    Save that worked, unless they are reading the log. PRD FR-001's rule
+    is an *itemized warning before any lossy save*; this is the same
+    obligation on the same path. Needs a modal/notification surface in
+    `aurora-ui` that `save_file` can drive, which is real UI work rather
+    than a one-line change, and is why it was scoped out of 0.52.1 rather
+    than half-built.
+- [ ] **A tile whose page-in fails is forgotten, so the *next* read of it
+    silently returns a blank tile.** Found 2026-08-24 while writing the
+    export test above; **pre-existing**, not introduced by 0.52.1, and
+    deliberately not fixed there. `TileStore::ensure_resident` does
+    `paged_out.remove(...)` *before* calling `page_in`, so a failed
+    page-in drops the mapping: the first read surfaces
+    `TileError::CorruptFile`, and every read after it falls through to
+    the "never touched" branch and gets `Tile::blank()`. A user who hits
+    the refused export above and simply tries again would therefore get
+    an `Ok` export with that tile silently blank — the same class of
+    failure, one step removed. The fix looks small (peek, page in, remove
+    only on success) but it changes `TileStore`'s recovery semantics and
+    wants its own test, so it is recorded here rather than folded into an
+    unrelated round.
+
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
   mutator with an undo-recording version and kept its own undo/redo
@@ -10277,6 +10451,33 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-08-24 (0.52.1) — one of the three open items the 0.52.0
+review opened is now closed, and it had a second half nobody had named.**
+A corrupted or truncated scratch-disk tile no longer decodes
+"successfully" at the wrong length: `aurora_tile::codec` now rejects any
+payload that isn't exactly one whole tile (`SAMPLES * 2` bytes), checked
+before the copy on the raw branch and before decompression on the
+compressed one — the single point every paged-in tile passes through.
+That closes the `copy_from_slice` panic in `aurora-app`'s
+`write_composited` (which also gained its own guard, redundantly and on
+purpose) and, by construction, the silent half-composite in
+`aurora_render::composite_layer_into`.
+
+The second half: making `decode` strict turns a short buffer into a clean
+`Err`, but `resolve_tile` *catches* store errors and skips the layer, so
+on the **export** path that converted a wrong-length composite into a
+quietly incomplete one — `Ok(Image)`, a layer's pixels missing, written
+straight over the user's file. `composite_document` now refuses, with a
+new `aurora_io::IoError::IncompleteComposite`; the live canvas keeps its
+skip-and-repaint behaviour deliberately. Surfacing that refusal to the
+user rather than only to the log is named as its own open item, as is a
+pre-existing `TileStore` bug found while testing it (a failed page-in
+forgets the tile, so the *next* read of it returns blank). See the
+now-`[x]` item in M1.9's notes for the full account and the tests. The
+other two items from the 0.52.0 review — the dark-halo artefact and the
+zoom-0.5 rendering bug — are still open, as is CI's silent self-skipping
+of GPU-gated tests.
 
 **Addendum 2026-08-24 (0.52.0) — the premultiplied-alpha correctness bug
 is fixed, and it turned out to span three layers, not two.** The item

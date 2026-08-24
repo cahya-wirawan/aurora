@@ -452,6 +452,16 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
                 let decoded = aurora_tile::codec::decode(&bytes)?;
                 let tile = store.get_mut(surface, tile_id)?;
                 let texels = tile.texels_mut();
+                // Redundant by construction since 0.52.1: `codec::decode`
+                // now rejects anything that isn't exactly one whole tile,
+                // so `decoded.len()` can only be `SAMPLES` here, which is
+                // also what `texels.len()` always is. Kept deliberately --
+                // it is this crate's own independent guard on the
+                // `copy_from_slice` below (a panic on mismatch), it costs
+                // one comparison per tile, and it is what makes this read
+                // correct on its own terms rather than by an argument
+                // about another crate. It is *not* covered by any test of
+                // its own, so do not read it as evidence of anything.
                 if decoded.len() != texels.len() {
                     return Err(IoError::Tile(aurora_tile::TileError::CorruptFile(format!(
                         "tile {tile_id:?} on surface {surface:?} decoded to {} samples, expected {}",
