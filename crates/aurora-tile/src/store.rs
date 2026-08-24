@@ -9,7 +9,7 @@
 //! thread and one real LRU memory bound covering all of them combined —
 //! the property a naive one-store-per-surface design would not have.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +33,27 @@ pub struct Stats {
     pub faults: u64,
     pub bytes_written: u64,
     pub bytes_read: u64,
+    /// Page-ins that did not produce a tile — the `fs::read` failed, or
+    /// the bytes it returned did not decode. Counted separately from
+    /// `faults` (which counts *completed* page-ins) because since 0.52.2
+    /// a failed page-in is retried on every subsequent read of that key
+    /// rather than healing into a blank tile, so a single broken scratch
+    /// file shows up here as a climbing counter — the store's own,
+    /// cheapest signal that something is wrong with the scratch disk.
+    pub failed_page_ins: u64,
+    /// Tiles whose bytes were dropped because the memory held for
+    /// *failed* writes hit its cap (a private detail of [`TileStore`],
+    /// described here rather than linked to). Each one is a tile whose
+    /// pixels are genuinely gone; anything above zero means the scratch
+    /// disk has been failing long enough for the store to start choosing
+    /// bounded memory over content, and is worth surfacing.
+    ///
+    /// Such a tile reads back as an error, not as blank and not as stale:
+    /// the store deletes the superseded scratch file when it drops the
+    /// newer content, and keeps the `paged_out` mapping so the read fails
+    /// loudly. The one exception is a deletion that itself fails, which
+    /// is reported at `error!` when it happens.
+    pub dropped_failed_writes: u64,
 }
 
 /// A sparse, paging, LRU-bounded store of [`Tile`]s, addressed by
@@ -82,6 +103,14 @@ pub struct TileStore {
     /// already-encoded bytes `make_room` also handed to `writer.submit`,
     /// so a revisit before the write lands never has to touch disk.
     pending: HashMap<(SurfaceId, TileId), Vec<u8>>,
+    /// The keys in [`Self::pending`] whose background write actually
+    /// *failed*, oldest first — the retention queue
+    /// [`Self::cap_failed_writes`] bounds. A successful write's `pending`
+    /// entry clears itself the moment its result drains, so those are
+    /// self-limiting; a failed one is kept deliberately (it is the tile's
+    /// only surviving copy) and nothing else would ever drop it, which is
+    /// exactly why this queue and its cap exist.
+    failed_writes: VecDeque<(SurfaceId, TileId)>,
     budget: NonZeroUsize,
     scratch_dir: PathBuf,
     writer: BackgroundWriter,
@@ -111,6 +140,7 @@ impl TileStore {
             resident: LruCache::new(budget),
             paged_out: HashMap::new(),
             pending: HashMap::new(),
+            failed_writes: VecDeque::new(),
             budget,
             scratch_dir,
             writer: BackgroundWriter::spawn(),
@@ -169,20 +199,36 @@ impl TileStore {
         self.writer.flush();
         let mut first_err = None;
         for result in self.writer.drain_results() {
-            // Every write this call waited on is now confirmed one way or
-            // another (succeeded or definitively failed) -- either way it
-            // is no longer "in flight", so the in-memory holding area for
-            // it can go. See `ensure_resident`/`make_room`'s doc comments
-            // for the full race this closes.
-            self.pending.remove(&(result.surface, result.id));
-            if let Err(source) = result.outcome {
-                tracing::error!(surface = ?result.surface, tile = ?result.id, %source, "scratch-disk write failed");
-                if first_err.is_none() {
-                    first_err = Some(TileError::Io {
-                        surface: result.surface,
-                        id: result.id,
-                        source,
-                    });
+            match result.outcome {
+                // Confirmed durable: the scratch file is now a real
+                // replacement for the in-memory copy, so the holding area
+                // for it can go. See `ensure_resident`/`make_room`'s doc
+                // comments for the full race this closes.
+                Ok(()) => {
+                    self.forget_pending((result.surface, result.id));
+                }
+                // Kept, deliberately: these bytes are the *only* surviving
+                // copy of that tile. Dropping them here (as this did until
+                // 0.52.2) sent the next read to a scratch file that was
+                // never written -- and since 0.52.2 a failed page-in no
+                // longer heals into a blank tile, that read fails forever.
+                // One transient write failure (a full disk, a momentarily
+                // read-only mount) would therefore have destroyed pixels
+                // that were sitting safely in memory. Bounded by
+                // `retain_failed_write`'s own cap, so a *persistent*
+                // failure cannot grow this without limit. See
+                // `reconcile_pending` for the same rule and the memory
+                // trade it accepts.
+                Err(source) => {
+                    self.retain_failed_write((result.surface, result.id));
+                    tracing::error!(surface = ?result.surface, tile = ?result.id, %source, "scratch-disk write failed");
+                    if first_err.is_none() {
+                        first_err = Some(TileError::Io {
+                            surface: result.surface,
+                            id: result.id,
+                            source,
+                        });
+                    }
                 }
             }
         }
@@ -225,9 +271,34 @@ impl TileStore {
     ///
     /// Invariant, extended from the pre-existing `resident`/`paged_out`
     /// one to now also cover `pending`: a `(surface, id)` key is never
-    /// simultaneously resident *and* present in `pending` or `paged_out`.
-    /// Branch (b) below restores that invariant by removing the key from
-    /// both maps in the same step it re-inserts it into `resident`.
+    /// simultaneously resident *and* present in `pending` or `paged_out`
+    /// **as observed by any caller** — both paging branches restore it
+    /// before they return, though not identically. Branch (b) removes the
+    /// key from both maps and only then re-inserts it into `resident`, so
+    /// the two are never both true even mid-branch. Branch (c) is the
+    /// other order: `page_in` puts the tile into `resident` first, and the
+    /// `paged_out` entry is removed on the statement after it, so the
+    /// invariant is transiently false in between. That is harmless rather
+    /// than sloppy — this store is single-threaded, `page_in` is private,
+    /// and nothing runs between those two statements that could observe
+    /// the overlap — but the ordering is forced: the `paged_out` mapping
+    /// must survive until `page_in` has actually succeeded, which is the
+    /// whole point of the paragraph below.
+    ///
+    /// **A failed page-in keeps its mapping.** Branches (b) and (c)
+    /// remove a key from `pending`/`paged_out` only once they hold a
+    /// real, whole tile to put in `resident`. Until 0.52.2 they removed
+    /// first, so a tile whose scratch file was corrupt or truncated
+    /// errored on its first read and then fell through to branch (d) on
+    /// every read after that, silently returning `Tile::blank()` -- which
+    /// meant a save or export that was correctly *refused* for that tile
+    /// (`aurora_io::IoError::IncompleteComposite`) quietly succeeded on
+    /// the retry, with the tile blank. The consequence to be aware of:
+    /// such a tile now fails for the whole life of this store rather than
+    /// healing into an empty one. That is the intended trade -- the
+    /// pixels are gone either way, and the corrupt file is left on disk
+    /// rather than being overwritten by a re-eviction of the blank tile
+    /// that replaced it.
     fn ensure_resident(&mut self, surface: SurfaceId, id: TileId) -> Result<(), TileError> {
         // Cheap and non-blocking (`drain_results` never waits) -- run on
         // every touch so `pending` can't grow past "evictions since the
@@ -238,15 +309,34 @@ impl TileStore {
         if self.resident.contains(&(surface, id)) {
             return Ok(());
         }
-        if let Some(bytes) = self.pending.remove(&(surface, id)) {
-            let texels = codec::decode(&bytes)?;
+        // Peeked, not removed: `codec::decode` can fail even here, on
+        // bytes this store itself encoded (a future encoder bug, or
+        // memory corruption), and dropping the mapping before there is a
+        // real tile to replace it with is what let the *next* read of the
+        // same key find neither map and invent a blank tile -- turning one
+        // loud, recoverable error into silent, permanent content loss.
+        // Both removes below therefore happen only once `decode` has
+        // actually produced a whole tile.
+        if let Some(bytes) = self.pending.get(&(surface, id)) {
+            let texels = codec::decode(bytes)?;
+            self.forget_pending((surface, id));
             self.paged_out.remove(&(surface, id));
             self.make_room();
             self.resident.put((surface, id), Tile::from_texels(texels));
             return Ok(());
         }
-        if let Some(path) = self.paged_out.remove(&(surface, id)) {
-            self.page_in(surface, id, &path)
+        // Same rule as the branch above, and this is the branch where it
+        // actually bit: a corrupted or truncated scratch file fails
+        // `page_in` on every attempt, so forgetting the path here is what
+        // let a *retried* save/export succeed with that tile silently
+        // blank -- see this method's own doc comment. The `PathBuf` is
+        // cloned because `page_in` needs `&mut self`; that clone is paid
+        // only on a page-in (a fault or a failure), never on the resident
+        // fast path above.
+        if let Some(path) = self.paged_out.get(&(surface, id)).cloned() {
+            self.page_in(surface, id, &path)?;
+            self.paged_out.remove(&(surface, id));
+            Ok(())
         } else {
             self.make_room();
             self.resident.put((surface, id), Tile::blank());
@@ -257,36 +347,228 @@ impl TileStore {
 
     /// Drains whatever background-write results have completed so far
     /// (non-blocking -- see [`BackgroundWriter::drain_results`]) and
-    /// clears each one's entry from [`Self::pending`]: its write is now
-    /// confirmed durable, so a future revisit of that key is safe to fall
-    /// through to the ordinary `paged_out` disk-read path. A failed write
-    /// is logged via `tracing::warn!` and otherwise ignored here -- a
-    /// routine reconciliation pass touched by every tile access is the
-    /// wrong place to fail every subsequent, unrelated tile access over
-    /// one bad write. [`Self::flush`] remains the authoritative point
-    /// where a write failure surfaces as a real `Err`, unchanged by this.
+    /// clears each *successful* one's entry from [`Self::pending`]: its
+    /// write is now confirmed durable, so a future revisit of that key is
+    /// safe to fall through to the ordinary `paged_out` disk-read path. A
+    /// failed write is logged via `tracing::warn!` and otherwise not
+    /// escalated here -- a routine reconciliation pass touched by every
+    /// tile access is the wrong place to fail every subsequent, unrelated
+    /// tile access over one bad write. [`Self::flush`] remains the
+    /// authoritative point where a write failure surfaces as a real
+    /// `Err`, unchanged by this.
+    ///
+    /// **A failed write keeps its bytes** (0.52.2). The scratch file that
+    /// write was meant to produce does not exist, or is half-written, so
+    /// `pending`'s copy is the only whole one left; dropping it would
+    /// hand the next read a file that isn't there. That is the same rule
+    /// [`Self::ensure_resident`] follows for a failed *read*, and it
+    /// accepts the same trade in the other direction: the entry occupies
+    /// memory (compressed, one tile) until the key is revisited -- which
+    /// reinstates it as a resident tile and lets an ordinary later
+    /// eviction retry the write. Losing a professional's pixels is the
+    /// worse half of that trade by a wide margin.
+    ///
+    /// That retention is **bounded**, not unlimited: see
+    /// [`Self::retain_failed_write`], which caps how many unwritable
+    /// tiles may be held at once and drops the oldest beyond it. A
+    /// persistent scratch-disk failure would otherwise grow `pending`
+    /// with every eviction for as long as the session lasts, which is
+    /// invariant §7.3.1's own "nothing assumes a document fits in memory"
+    /// broken by the back door.
     fn reconcile_pending(&mut self) {
         for result in self.writer.drain_results() {
-            self.pending.remove(&(result.surface, result.id));
-            if let Err(source) = result.outcome {
-                tracing::warn!(
-                    surface = ?result.surface,
-                    tile = ?result.id,
-                    %source,
-                    "scratch-disk write failed (reconciled in background)"
+            match result.outcome {
+                Ok(()) => {
+                    self.forget_pending((result.surface, result.id));
+                }
+                Err(source) => {
+                    self.retain_failed_write((result.surface, result.id));
+                    tracing::warn!(
+                        surface = ?result.surface,
+                        tile = ?result.id,
+                        %source,
+                        "scratch-disk write failed (reconciled in background); keeping the \
+                         tile's only surviving copy in memory"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drops one key's `pending` entry and, with it, any place that key
+    /// held in the failed-write retention queue — the two must move
+    /// together or the queue accumulates keys that are no longer holding
+    /// anything, which would make [`Self::cap_failed_writes`] trim live
+    /// entries early. The `retain` is `O(n)` in a queue whose length is
+    /// capped at the store's own tile budget, on a path that already
+    /// costs a decode or a disk write.
+    fn forget_pending(&mut self, key: (SurfaceId, TileId)) {
+        self.pending.remove(&key);
+        self.failed_writes.retain(|held| *held != key);
+    }
+
+    /// How many tiles' worth of *failed* writes this store will hold in
+    /// memory before it starts dropping the oldest.
+    ///
+    /// The store's one real promise about memory is its resident tile
+    /// budget (ADR 0005: at a fixed tile size, a tile count *is* a byte
+    /// budget), so the cap is that same number: a store allowed `budget`
+    /// resident tiles will hold at most `budget` more in compressed,
+    /// unwritable form. That bounds the worst case at roughly twice the
+    /// configured budget — in practice much less, since `pending` holds
+    /// `codec::encode` output rather than raw texels — and it scales with
+    /// the store instead of being an arbitrary constant that is far too
+    /// small on a workstation and far too large on a small machine.
+    /// Invariant §7.3.1 is the reason a cap has to exist at all: nothing
+    /// here may grow with document size.
+    const fn failed_write_capacity(&self) -> usize {
+        self.budget.get()
+    }
+
+    /// Records that `key`'s background write failed, so its `pending`
+    /// bytes are being kept as the tile's only surviving copy, and
+    /// enforces the cap on how many such tiles may be kept at once.
+    ///
+    /// **Why a cap** (0.52.2, second review round): keeping a failed
+    /// write's bytes is right for the case it was written for — a
+    /// transient failure, where the tile is served from memory until the
+    /// next eviction retries the write. Under a *persistent* failure (a
+    /// full disk, a read-only mount) nothing ever retries successfully
+    /// and nothing else ever removes those entries, so unbounded
+    /// retention turns a broken scratch disk into an out-of-memory abort:
+    /// measured at ~1.05 GB retained over 2,000 evicted tiles with a
+    /// four-tile budget. An abort loses the *whole* document, which is
+    /// strictly worse than losing the tiles that could not be written.
+    ///
+    /// So this is the bounded trade: up to
+    /// [`Self::failed_write_capacity`] unwritable tiles are held and stay
+    /// readable; beyond that, the oldest is dropped. A dropped tile is
+    /// *not* silently blanked and *not* silently stale — the `paged_out`
+    /// mapping is kept so the next read is a loud `TileError` rather than
+    /// an invented `Tile::blank()`, and any superseded scratch file
+    /// behind it is deleted first ([`Self::discard_stale_scratch_file`],
+    /// which also documents the one case that can defeat this: a deletion
+    /// that itself fails).
+    ///
+    /// Note what this does *not* cover: a `pending` entry cleared by the
+    /// completion of an **older** write for the same key can still send a
+    /// later read to a stale file with no error. That is the separate,
+    /// still-open stale-write race (no generation numbers on write jobs)
+    /// disclosed in `PLAN.md`, not something this cap either causes or
+    /// closes.
+    fn retain_failed_write(&mut self, key: (SurfaceId, TileId)) {
+        if !self.pending.contains_key(&key) {
+            // Already revisited and reinstated, or already dropped: there
+            // is nothing being held for this key, so nothing to bound.
+            return;
+        }
+        if !self.failed_writes.contains(&key) {
+            self.failed_writes.push_back(key);
+        }
+        self.cap_failed_writes();
+    }
+
+    /// Drops the oldest failed-write entries until at most
+    /// [`Self::failed_write_capacity`] remain — see
+    /// [`Self::retain_failed_write`] for why the cap exists.
+    fn cap_failed_writes(&mut self) {
+        while self.failed_writes.len() > self.failed_write_capacity() {
+            let Some(oldest) = self.failed_writes.pop_front() else {
+                break;
+            };
+            if self.pending.remove(&oldest).is_some() {
+                self.stats.dropped_failed_writes += 1;
+                self.discard_stale_scratch_file(oldest);
+                tracing::error!(
+                    surface = ?oldest.0,
+                    tile = ?oldest.1,
+                    held = self.failed_writes.len(),
+                    "scratch disk has been failing long enough to fill the failed-write memory \
+                     cap; dropping this tile's only surviving copy to stay inside the store's \
+                     memory budget"
+                );
+            }
+        }
+    }
+
+    /// Deletes the scratch file behind a key whose newer content
+    /// [`Self::cap_failed_writes`] just dropped, so the next read of that
+    /// key fails loudly instead of succeeding with **stale** pixels.
+    ///
+    /// Without this the cap had a silent-wrong-content hole, found by
+    /// review after the cap itself landed. It only bites a key that was
+    /// evicted successfully at least once before: that write left a real
+    /// file, the tile was then paged back in and edited, and the *second*
+    /// eviction is the one that failed and got capped. `make_room`
+    /// re-inserts `paged_out` pointing at the same path either way, so
+    /// the mapping would still resolve — to the older file, whose content
+    /// is exactly the pre-edit version the user changed. A read would
+    /// have returned it as if it were current, with no error at all,
+    /// which is the failure class this whole line of work exists to
+    /// close. For a key whose first-ever write failed there is no file to
+    /// delete and `NotFound` is the expected, ignored answer.
+    ///
+    /// Deleting loses that older content. That is deliberate: it is
+    /// already superseded, and a loud `TileError::Io` on the next read is
+    /// strictly better than silently handing back a version of the tile
+    /// the user edited away from. The `paged_out` mapping is kept, not
+    /// removed, precisely so the read *is* that error — removing it would
+    /// send the key to the never-touched branch and invent a blank tile,
+    /// silently, which is the same class of problem in a different coat.
+    ///
+    /// If the deletion itself fails (a read-only mount fails writes and
+    /// deletes alike, so this is reachable), the stale file survives and
+    /// the guarantee genuinely does not hold for that key. There is
+    /// nothing better available at that point, so it is reported at
+    /// `error!` — the one case where a later read can silently return
+    /// stale content, named at the moment it becomes possible rather than
+    /// discovered afterwards.
+    fn discard_stale_scratch_file(&mut self, key: (SurfaceId, TileId)) {
+        let Some(path) = self.paged_out.get(&key) else {
+            return;
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::error!(
+                    surface = ?key.0,
+                    tile = ?key.1,
+                    path = %path.display(),
+                    %err,
+                    "could not delete the superseded scratch file for a tile whose newer content \
+                     was just dropped; a later read of this tile can now return stale, pre-edit \
+                     pixels instead of failing"
                 );
             }
         }
     }
 
     fn page_in(&mut self, surface: SurfaceId, id: TileId, path: &Path) -> Result<(), TileError> {
-        let bytes = std::fs::read(path).map_err(|source| TileError::Io {
-            surface,
-            id,
-            source,
-        })?;
-        let texels = codec::decode(&bytes)?;
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(source) => {
+                self.stats.failed_page_ins += 1;
+                return Err(TileError::Io {
+                    surface,
+                    id,
+                    source,
+                });
+            }
+        };
+        // Charged against `bytes_read` here, before the decode below and
+        // regardless of whether it succeeds: this read really did move
+        // these bytes off the scratch disk, and a throughput counter that
+        // only counts I/O whose *decode* also worked understates exactly
+        // the case worth seeing -- a corrupt file re-read on every touch.
         self.stats.bytes_read += bytes.len() as u64;
+        let texels = match codec::decode(&bytes) {
+            Ok(texels) => texels,
+            Err(err) => {
+                self.stats.failed_page_ins += 1;
+                return Err(err);
+            }
+        };
         self.stats.faults += 1;
         self.make_room();
         self.resident.put((surface, id), Tile::from_texels(texels));
@@ -363,6 +645,30 @@ mod tests {
     /// multi-surface tests care about more than one distinct value.
     fn surface() -> SurfaceId {
         SurfaceId::from_raw(0)
+    }
+
+    /// Asserts that a `TileError::CorruptFile` rejection was made *for
+    /// the payload's length*, the property the half-a-tile fixtures below
+    /// exist to prove.
+    ///
+    /// Matching the variant alone is not enough, and 0.52.1's own `codec`
+    /// tests already established why: `CorruptFile` equally covers a bad
+    /// magic, an unsupported version and a truncated header, so a
+    /// regression earlier in `codec::decode` that rejected these fixtures
+    /// before ever reaching the length check would leave a wildcard match
+    /// green while proving nothing. Both of `decode`'s own length
+    /// rejections (the compressed branch's size-prefix equality check and
+    /// the raw branch's post-decode one) name the byte count of exactly
+    /// one whole tile, which is what this looks for.
+    fn assert_rejected_for_its_length(read: u32, message: &str) {
+        let whole_tile_bytes = (crate::tile::SAMPLES * 2).to_string();
+        assert!(
+            message.contains("of exactly one") && message.contains(&whole_tile_bytes),
+            "read {read}: this fixture is a well-formed ATIL file holding half a tile, so it must \
+             be rejected for its length -- naming the {whole_tile_bytes} bytes one whole tile \
+             occupies -- not for its magic, version or header, which `CorruptFile` also covers: \
+             {message}"
+        );
     }
 
     #[test]
@@ -630,6 +936,326 @@ mod tests {
             1,
             "with `pending` empty, the revisit must take the real disk page_in path"
         );
+        // The `paged_out` branch's own half of the same bookkeeping,
+        // asserted here because this is the one test that reaches it
+        // deterministically (the revisit above provably took the disk
+        // path, per the `faults` assertion): a successful `page_in`
+        // leaves the key resident and in neither map.
+        assert!(
+            !store.paged_out.contains_key(&(s, a)),
+            "a successful page-in must clear the paged-out mapping it just consumed"
+        );
+        assert!(!store.pending.contains_key(&(s, a)));
+    }
+
+    /// A scratch-disk write that *fails* must not take the tile's only
+    /// surviving copy with it (0.52.2). Until this fix, `flush` and
+    /// `reconcile_pending` both dropped the `pending` entry on an `Err`
+    /// outcome as readily as on `Ok` — so a full disk, a momentarily
+    /// read-only mount, or one permission hiccup silently destroyed the
+    /// evicted tile: `pending` no longer held it and the scratch file it
+    /// was supposed to be written to was never created. Combined with the
+    /// rest of 0.52.2 (a failed page-in no longer heals into a blank
+    /// tile) the destruction is permanent for the life of the store.
+    ///
+    /// The write is made to fail deterministically, and portably, by
+    /// occupying the exact path `make_room` will write to with a
+    /// *directory*: `fs::write` cannot succeed against one on any
+    /// platform this ships to, and unlike a permissions change it needs
+    /// no `unix`-only API and no privileged environment.
+    #[test]
+    fn a_failed_write_keeps_the_tiles_only_copy_readable_from_pending() {
+        let (_dir, mut store) = store(2);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        let c = TileId { x: 2, y: 0 };
+
+        if let Err(err) = std::fs::create_dir(store.tile_path(s, a)) {
+            unreachable!("test-local scratch dir must accept a subdirectory: {err}");
+        }
+
+        if let Ok(tile) = store.get_mut(s, a)
+            && let Some(first) = tile.texels_mut().first_mut()
+        {
+            *first = half::f16::from_f32(0.5);
+        }
+        if let Err(err) = store.get_mut(s, b) {
+            unreachable!("{err}");
+        }
+        // Budget is 2; this evicts `a`, whose write can only fail.
+        if let Err(err) = store.get_mut(s, c) {
+            unreachable!("{err}");
+        }
+
+        // `flush` joins the writer thread, so the failure has definitely
+        // happened and been drained by the time this returns — no timing
+        // dependency anywhere in this test.
+        match store.flush() {
+            Err(crate::TileError::Io { surface, id, .. }) => {
+                assert_eq!((surface, id), (s, a));
+            }
+            Ok(()) => unreachable!("writing a tile over a directory cannot succeed"),
+            Err(other) => unreachable!("expected TileError::Io, got {other:?}"),
+        }
+
+        assert!(
+            store.pending.contains_key(&(s, a)),
+            "a failed write must leave the tile's own bytes in `pending`, which is now the only \
+             copy of them that exists"
+        );
+
+        let a_again = match store.get(s, a) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!(
+                "the tile must still be readable straight from memory after a failed write: {err}"
+            ),
+        };
+        let Some(first) = a_again.texels().first() else {
+            unreachable!("a tile's texel buffer is never empty");
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(first.to_f32(), 0.5, "and with its real content, not blank");
+        }
+        // Served from memory: no disk read was attempted or needed.
+        assert_eq!(store.stats().faults, 0);
+        assert_eq!(store.stats().failed_page_ins, 0);
+        // `a`, `b` and `c`'s own first touches, and nothing else: the
+        // revisit of `a` above reinstated a real tile rather than
+        // inventing a fourth blank one.
+        assert_eq!(store.stats().tiles_created, 3);
+    }
+
+    /// The cap on that retention (0.52.2, second review round). Keeping a
+    /// failed write's bytes is right for a *transient* failure; under a
+    /// *persistent* one nothing ever retries successfully and nothing
+    /// else ever removes those entries, so unbounded retention turns a
+    /// broken scratch disk into an out-of-memory abort — measured by the
+    /// review at ~1.05 GB held over 2,000 evicted tiles with a four-tile
+    /// budget. An abort loses the whole document, which is worse than
+    /// losing the tiles that could not be written, so the retention is
+    /// bounded at the store's own tile budget.
+    ///
+    /// Every write here fails, deterministically and portably: each tile
+    /// path is occupied by a directory before anything is touched.
+    #[test]
+    fn retention_of_failed_writes_is_bounded_by_the_stores_own_tile_budget() {
+        const BUDGET: usize = 4;
+        const TILES: u32 = 40;
+
+        let (_dir, mut store) = store(BUDGET);
+        let s = surface();
+
+        for x in 0..TILES {
+            if let Err(err) = std::fs::create_dir(store.tile_path(s, TileId { x, y: 0 })) {
+                unreachable!("test-local scratch dir must accept a subdirectory: {err}");
+            }
+        }
+        // Touch every tile: each one evicts an earlier one, and every one
+        // of those evictions' writes can only fail.
+        for x in 0..TILES {
+            if let Err(err) = store.get_mut(s, TileId { x, y: 0 }) {
+                unreachable!("a first touch always succeeds: {err}");
+            }
+        }
+        // `flush` joins the writer, so every failure has been reported
+        // and reconciled by the time this returns.
+        match store.flush() {
+            Err(crate::TileError::Io { .. }) => {}
+            Ok(()) => unreachable!("writing a tile over a directory cannot succeed"),
+            Err(other) => unreachable!("expected TileError::Io, got {other:?}"),
+        }
+
+        assert!(
+            store.pending.len() <= BUDGET,
+            "failed-write retention must stay inside the store's own tile budget, held {}",
+            store.pending.len()
+        );
+        assert_eq!(store.failed_writes.len(), store.pending.len());
+        // The cap really did have to drop tiles -- otherwise this test
+        // would pass just as well against unbounded retention. Exactly
+        // `TILES - BUDGET` evictions happen (the last `BUDGET` tiles are
+        // still resident), every one of them fails, and `BUDGET` of those
+        // are retained: everything else was dropped.
+        let Ok(budget) = u64::try_from(BUDGET) else {
+            unreachable!("4 fits in a u64");
+        };
+        assert_eq!(
+            store.stats().dropped_failed_writes,
+            u64::from(TILES) - budget - budget,
+            "every failed write past the cap must have been dropped"
+        );
+
+        // A dropped tile is not silently blanked: its `paged_out` mapping
+        // still points at a scratch file that was never written, so the
+        // read is a loud error, never `Tile::blank()`.
+        let dropped = TileId { x: 0, y: 0 };
+        assert!(!store.pending.contains_key(&(s, dropped)));
+        match store.get(s, dropped) {
+            Err(crate::TileError::Io { .. }) => {}
+            Ok(tile) => unreachable!(
+                "a dropped failed write must not read back as a blank {}-sample tile",
+                tile.texels().len()
+            ),
+            Err(other) => unreachable!("expected TileError::Io, got {other:?}"),
+        }
+        // And a *retained* one is still served from memory, which is the
+        // whole point of retaining it.
+        let Some(&(_, retained)) = store
+            .failed_writes
+            .back()
+            .map(|key| (key.0, key.1))
+            .as_ref()
+        else {
+            unreachable!("the cap keeps `budget` entries, so the queue is not empty");
+        };
+        if let Err(err) = store.get(s, retained) {
+            unreachable!("a retained failed write must still be readable from memory: {err}");
+        }
+    }
+
+    /// The hole the cap above left behind, found by review after it
+    /// landed: a capped drop used to leave `paged_out` pointing at a
+    /// scratch file from an **earlier, successful** write of the same
+    /// key, so the next read succeeded and returned the pre-edit content
+    /// as if it were current — silently. (For a key whose first-ever
+    /// write failed there is no such file, which is why the original
+    /// "reads back as a loud error" claim looked true.)
+    ///
+    /// Hand-builds exactly that state, the way the mid-eviction tests
+    /// above hand-build theirs: a real old file holding 0.25, `pending`
+    /// holding the newer 0.75 whose write failed, and a second key
+    /// present only to push the first past a one-tile cap. The write
+    /// failures are reported against the real keys while their jobs point
+    /// at directories, so the *stale file itself is left intact* for the
+    /// test to prove something about — which is the whole point.
+    #[test]
+    fn a_capped_drop_deletes_the_superseded_file_instead_of_serving_stale_pixels() {
+        let (dir, mut store) = store(1);
+        let s = surface();
+        let (stale, filler) = (TileId { x: 0, y: 0 }, TileId { x: 1, y: 0 });
+
+        // The earlier, successful eviction of `stale`: a real file.
+        let old = crate::codec::encode(&vec![half::f16::from_f32(0.25); crate::tile::SAMPLES]);
+        let stale_path = store.tile_path(s, stale);
+        if let Err(err) = std::fs::write(&stale_path, &old) {
+            unreachable!("test-local scratch disk must accept the write: {err}");
+        }
+
+        // Paged back in, edited to 0.75, re-evicted -- and that write
+        // failed, so the newer content is only in `pending`.
+        store.paged_out.insert((s, stale), stale_path.clone());
+        store.pending.insert(
+            (s, stale),
+            crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]),
+        );
+        store
+            .paged_out
+            .insert((s, filler), store.tile_path(s, filler));
+        store.pending.insert(
+            (s, filler),
+            crate::codec::encode(&vec![half::f16::from_f32(0.5); crate::tile::SAMPLES]),
+        );
+
+        for (index, id) in [stale, filler].into_iter().enumerate() {
+            let unwritable = dir.path().join(format!("unwritable_{index}"));
+            if let Err(err) = std::fs::create_dir(&unwritable) {
+                unreachable!("test-local scratch dir must accept a subdirectory: {err}");
+            }
+            store.writer.submit(crate::writer::WriteJob {
+                surface: s,
+                id,
+                path: unwritable,
+                bytes: vec![1, 2, 3, 4],
+            });
+        }
+        // Joined before draining, so both failures are queued and their
+        // order (oldest first) is the submission order, deterministically.
+        store.writer.flush();
+        store.reconcile_pending();
+
+        assert_eq!(store.stats().dropped_failed_writes, 1);
+        assert!(
+            !store.pending.contains_key(&(s, stale)),
+            "the one-tile cap must have dropped the oldest failed write"
+        );
+        assert!(
+            !stale_path.exists(),
+            "the superseded scratch file must be deleted, or the next read of this tile silently \
+             returns the content the user edited away from"
+        );
+        match store.get(s, stale) {
+            Err(crate::TileError::Io { .. }) => {}
+            Ok(tile) => {
+                let value = tile
+                    .texels()
+                    .first()
+                    .map_or(f32::NAN, |sample| sample.to_f32());
+                unreachable!(
+                    "a dropped tile must fail loudly, not read back as {value} from a superseded \
+                     scratch file"
+                );
+            }
+            Err(other) => unreachable!("expected TileError::Io, got {other:?}"),
+        }
+        // The retained one is untouched by any of this.
+        assert!(store.pending.contains_key(&(s, filler)));
+    }
+
+    /// The background half of the test above, for the path a running
+    /// application actually takes: `reconcile_pending`, not `flush`.
+    /// Deterministic by construction — the write job is handed to the
+    /// writer directly and the writer is joined (`BackgroundWriter::flush`
+    /// drops the sender and joins the thread) *before* `reconcile_pending`
+    /// drains it, so the failed result is provably already queued and
+    /// nothing here depends on OS scheduling. Draining after that join is
+    /// exactly what `TileStore::flush` itself does.
+    #[test]
+    fn reconcile_pending_keeps_the_bytes_of_a_write_that_failed() {
+        let (_dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 3, y: 7 };
+
+        // A directory at the tile's own path: the write below fails, and
+        // so would any later `page_in` from it.
+        let path = store.tile_path(s, id);
+        if let Err(err) = std::fs::create_dir(&path) {
+            unreachable!("test-local scratch dir must accept a subdirectory: {err}");
+        }
+
+        let texels = vec![half::f16::from_f32(0.25); crate::tile::SAMPLES];
+        let bytes = crate::codec::encode(&texels);
+        // Exactly the state `make_room` leaves behind for an eviction:
+        // both maps populated, the same bytes handed to the writer.
+        store.pending.insert((s, id), bytes.clone());
+        store.paged_out.insert((s, id), path.clone());
+        store.writer.submit(crate::writer::WriteJob {
+            surface: s,
+            id,
+            path,
+            bytes,
+        });
+        store.writer.flush();
+
+        store.reconcile_pending();
+
+        assert!(
+            store.pending.contains_key(&(s, id)),
+            "reconciling a *failed* write must keep its bytes; only a confirmed-durable write has \
+             a real replacement to point later reads at"
+        );
+        let tile = match store.get(s, id) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("the tile must still be served from `pending`: {err}"),
+        };
+        let Some(first) = tile.texels().first() else {
+            unreachable!("a tile's texel buffer is never empty");
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(first.to_f32(), 0.25);
+        }
     }
 
     /// A corrupted scratch file must surface as a `TileError`, never as a
@@ -671,6 +1297,160 @@ mod tests {
             ),
             Err(other) => unreachable!("expected CorruptFile, got {other:?}"),
         }
+    }
+
+    /// The retry half of the test above, and the more dangerous half: a
+    /// corrupted scratch file must keep failing, not heal into a blank
+    /// tile on the second read. Until 0.52.2 `ensure_resident` removed
+    /// the `paged_out` mapping *before* calling `page_in`, so a failed
+    /// page-in forgot the tile entirely -- read one surfaced
+    /// `CorruptFile`, read two fell through to the never-touched branch
+    /// and returned `Tile::blank()`. A user whose export was correctly
+    /// refused (`aurora_io::IoError::IncompleteComposite`) and who simply
+    /// pressed Save again therefore got an `Ok` file with that tile
+    /// silently blank: the same class of failure CLAUDE.md names as the
+    /// worst this project can have, one step removed. Three reads, not
+    /// two -- the rule is "every read", not "the first two".
+    #[test]
+    fn a_corrupted_scratch_file_keeps_failing_on_every_read_not_just_the_first() {
+        let (dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 0, y: 0 };
+
+        // Same fixture as the test above: a structurally valid ATIL file
+        // holding half a tile, at the real path `page_in` will read.
+        let half = vec![half::f16::from_f32(0.5); crate::tile::SAMPLES / 2];
+        let bytes = crate::codec::encode_any_length(&half);
+        let path = dir.path().join("truncated.tile");
+        if let Err(err) = std::fs::write(&path, &bytes) {
+            unreachable!("test-local scratch disk must accept the write: {err}");
+        }
+        store.paged_out.insert((s, id), path);
+
+        for read in 1..=3 {
+            match store.get(s, id) {
+                Err(crate::TileError::CorruptFile(message)) => {
+                    assert_rejected_for_its_length(read, &message);
+                }
+                Ok(tile) => unreachable!(
+                    "read {read} of a corrupted scratch file returned a {}-sample tile instead of \
+                     an error",
+                    tile.texels().len()
+                ),
+                Err(other) => unreachable!("read {read}: expected CorruptFile, got {other:?}"),
+            }
+        }
+        // Every one of those reads really did hit the disk and really did
+        // fail — `failed_page_ins` is the store's own counter for exactly
+        // the "retried forever" case this fix creates.
+        assert_eq!(store.stats().failed_page_ins, 3);
+        assert_eq!(store.stats().faults, 0, "no page-in ever completed");
+
+        // The mapping survived all three failures -- this is the actual
+        // fix, stated directly rather than only through its symptom.
+        assert!(
+            store.paged_out.contains_key(&(s, id)),
+            "a failed page-in must leave the paged-out mapping in place, or the next read invents \
+             a blank tile"
+        );
+        // And nothing was ever invented for this key: `Tile::blank()`
+        // would have made it resident and bumped `tiles_created`.
+        assert_eq!(store.stats().tiles_created, 0);
+        assert_eq!(store.resident_len(), 0);
+    }
+
+    /// The `pending` branch's own half of the same rule. Undecodable
+    /// bytes in `pending` are not scratch-disk corruption -- they are
+    /// this store's own encoder output, so this is the defensive case,
+    /// not the expected one. It is tested anyway because the *failure
+    /// mode* is identical (drop the mapping, and the next read invents a
+    /// blank tile) and only a test that reads twice can see it.
+    /// Hand-constructs the exact mid-eviction state `make_room` leaves
+    /// behind -- the same key in both maps, the idiom
+    /// `ensure_resident_serves_directly_from_pending_bypassing_disk_entirely`
+    /// above already uses -- with the bytes deliberately wrong-length.
+    #[test]
+    fn undecodable_pending_bytes_keep_failing_and_leave_both_maps_untouched() {
+        let (dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 0, y: 0 };
+
+        let half = vec![half::f16::from_f32(0.5); crate::tile::SAMPLES / 2];
+        let never_created = dir.path().join("this_file_is_never_created.tile");
+        store
+            .pending
+            .insert((s, id), crate::codec::encode_any_length(&half));
+        store.paged_out.insert((s, id), never_created);
+
+        for read in 1..=2 {
+            match store.get(s, id) {
+                Err(crate::TileError::CorruptFile(message)) => {
+                    assert_rejected_for_its_length(read, &message);
+                }
+                Ok(tile) => unreachable!(
+                    "read {read} of undecodable pending bytes returned a {}-sample tile",
+                    tile.texels().len()
+                ),
+                Err(other) => unreachable!("read {read}: expected CorruptFile, got {other:?}"),
+            }
+        }
+
+        assert!(
+            store.pending.contains_key(&(s, id)),
+            "a failed decode must leave `pending` exactly as it was"
+        );
+        assert!(
+            store.paged_out.contains_key(&(s, id)),
+            "a failed decode must leave `paged_out` exactly as it was"
+        );
+        assert_eq!(store.stats().tiles_created, 0);
+        assert_eq!(store.resident_len(), 0);
+    }
+
+    /// The same rule for the failure a real scratch disk is far likelier
+    /// to produce than a corrupt payload: the file is simply *not there*
+    /// (a scratch directory cleaned out mid-session by a `/tmp` reaper or
+    /// by the user, a removed volume, a permissions change). That path
+    /// returns `TileError::Io` rather than `CorruptFile` and, before
+    /// 0.52.2, dropped the `paged_out` mapping just as readily — so the
+    /// second read of a tile whose file had been deleted quietly handed
+    /// back a blank one. Three reads, and the mapping must survive all of
+    /// them.
+    #[test]
+    fn a_missing_scratch_file_keeps_failing_and_keeps_its_mapping() {
+        let (dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 0, y: 0 };
+
+        store
+            .paged_out
+            .insert((s, id), dir.path().join("this_file_is_never_created.tile"));
+
+        for read in 1..=3 {
+            match store.get(s, id) {
+                Err(crate::TileError::Io {
+                    surface, id: got, ..
+                }) => {
+                    assert_eq!((surface, got), (s, id), "read {read}");
+                }
+                Ok(tile) => unreachable!(
+                    "read {read} of a missing scratch file returned a {}-sample tile instead of \
+                     an error",
+                    tile.texels().len()
+                ),
+                Err(other) => unreachable!("read {read}: expected TileError::Io, got {other:?}"),
+            }
+        }
+
+        assert!(
+            store.paged_out.contains_key(&(s, id)),
+            "a page-in that failed at the `fs::read` must leave the paged-out mapping in place, \
+             or the next read invents a blank tile"
+        );
+        assert_eq!(store.stats().failed_page_ins, 3);
+        assert_eq!(store.stats().faults, 0);
+        assert_eq!(store.stats().tiles_created, 0);
+        assert_eq!(store.resident_len(), 0);
     }
 
     // -- Multi-surface addressing (ADR 0010) --

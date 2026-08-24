@@ -38,7 +38,9 @@ pub mod jpeg;
 pub mod png;
 pub mod tiff;
 
-pub use aur::{read as read_aur, write as write_aur};
+pub use aur::{
+    SkippedTile, read as read_aur, write as write_aur, write_best_effort as write_aur_best_effort,
+};
 pub use error::IoError;
 pub use image::Image;
 pub use import::{decode_by_extension, encode_by_extension, read_from_store, write_into_store};

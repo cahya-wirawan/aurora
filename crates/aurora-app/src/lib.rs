@@ -1087,6 +1087,34 @@ fn autosave_path() -> PathBuf {
 /// Errors are logged, never fatal — the same shape
 /// [`write_session_marker`] already uses: failing to autosave must
 /// never stop the application starting or interrupt an edit.
+///
+/// **A knowingly incomplete result never lands on `path`.** A write that
+/// had to skip tiles is renamed to [`partial_autosave_path`] instead, and
+/// whatever complete autosave already exists is left exactly where it is;
+/// a complete write lands on `path` and deletes any partial left over
+/// from before. Crash-recovery protection is therefore monotonic — a
+/// snapshot is only ever replaced by one at least as good — which the
+/// first shape of the best-effort change got wrong: it renamed the
+/// degraded result over the single fixed [`autosave_path`], so a document
+/// that already had a complete autosave lost it the moment the scratch
+/// disk went bad.
+///
+/// **One unreadable tile no longer costs the whole document its
+/// crash-recovery protection** (0.52.2). This goes through
+/// `aurora_io::write_aur_best_effort`, which leaves a tile it cannot page
+/// in out of the container and names it, rather than `write_aur`, which
+/// refuses the entire write. The explicit Save/Export path
+/// ([`App::save_aur_file`], `composite_document`) still refuses, and that
+/// difference is deliberate: a deliberate user action on a user's own
+/// file must not quietly write incomplete content, while an automatic
+/// background snapshot the user never asked for and cannot see fail has
+/// nothing better to offer than "protect what is still readable". It is
+/// the same split `recomposite_visible_tiles` (degrades, repaints) and
+/// `composite_document` (refuses) already draw for the live canvas.
+/// Since 0.52.2 an unreadable tile fails on *every* read rather than
+/// healing into a blank one, so without this one bad tile would have
+/// aborted every autosave for the rest of the session — every other
+/// layer, every subsequent edit, silently unprotected.
 fn write_autosave(
     path: &Path,
     layers: &aurora_doc::LayerTree,
@@ -1101,11 +1129,41 @@ fn write_autosave(
     // `profile: None`, the same reason [`App::save_aur_file`] already
     // passes it: no colour-management UI exists to have set a document
     // profile in the first place, so there is nothing real to embed.
-    if let Err(err) = aurora_io::write_aur(&mut file, layers, history, canvas_size, None, store) {
-        tracing::warn!(?err, path = %temp_path.display(), "failed to write the autosave container");
-        drop(file);
-        remove_autosave_temp(&temp_path);
-        return;
+    //
+    // `write_aur_best_effort`, not `write_aur` -- see this function's own
+    // doc comment for why an autosave is the one caller that degrades
+    // rather than refusing.
+    // Where this write is allowed to land, decided by whether it turned
+    // out to be complete -- see this function's own doc comment.
+    let destination;
+    match aurora_io::write_aur_best_effort(&mut file, layers, history, canvas_size, None, store) {
+        Ok(skipped) if skipped.is_empty() => {
+            destination = path.to_path_buf();
+        }
+        Ok(skipped) => {
+            // Loud, and every time: the file about to be written is
+            // knowingly incomplete, which is exactly the thing that must
+            // never be silent. The first one is named in full; the count
+            // covers the rest without turning a broken scratch disk into
+            // an unbounded log.
+            let first = skipped
+                .first()
+                .map_or_else(String::new, |tile| format!("{tile:?}"));
+            destination = partial_autosave_path(path);
+            tracing::warn!(
+                skipped = skipped.len(),
+                %first,
+                path = %destination.display(),
+                "autosaving with tiles missing to the *partial* autosave path; the last complete \
+                 autosave is left in place"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(?err, path = %temp_path.display(), "failed to write the autosave container");
+            drop(file);
+            remove_autosave_temp(&temp_path);
+            return;
+        }
     }
     // Before the rename, not after: a `rename` of a file whose contents
     // are still only in the page cache is exactly how a power loss
@@ -1117,9 +1175,43 @@ fn write_autosave(
         return;
     }
     drop(file);
-    if let Err(err) = std::fs::rename(&temp_path, path) {
-        tracing::warn!(?err, path = %path.display(), "failed to swap the autosave container into place");
+    if let Err(err) = std::fs::rename(&temp_path, &destination) {
+        tracing::warn!(?err, path = %destination.display(), "failed to swap the autosave container into place");
         remove_autosave_temp(&temp_path);
+        return;
+    }
+    // A complete snapshot supersedes any partial one: leaving a stale
+    // partial around is how an *older*, lossy snapshot could later
+    // resurface as if it were current.
+    if destination == path {
+        remove_partial_autosave(path);
+    }
+}
+
+/// Where a *knowingly incomplete* autosave goes — a sibling of `path`,
+/// never `path` itself.
+///
+/// The distinction is the whole point (0.52.2, second review round).
+/// Best-effort autosaving means a write can succeed while quietly
+/// dropping tiles the scratch disk could no longer supply, and the
+/// original shape of that change renamed the result over the single
+/// fixed [`autosave_path`] regardless — so a document that already had a
+/// **complete** autosave lost it to a degraded one the moment the
+/// scratch disk went bad, with nothing left to recover the dropped
+/// content from. Crash-recovery protection has to be monotonic: a
+/// snapshot may only ever be replaced by one at least as good.
+fn partial_autosave_path(path: &Path) -> PathBuf {
+    path.with_extension("partial.aur")
+}
+
+/// Deletes the partial autosave beside `path`, if there is one. A
+/// missing file is not an error; anything else is logged, never fatal.
+fn remove_partial_autosave(path: &Path) {
+    let partial = partial_autosave_path(path);
+    if let Err(err) = std::fs::remove_file(&partial)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %partial.display(), "failed to remove the partial autosave");
     }
 }
 
@@ -1202,6 +1294,9 @@ fn remove_autosave(path: &Path) {
     {
         tracing::warn!(?err, path = %path.display(), "failed to remove this session's autosave");
     }
+    // Both files, for the same confidentiality reason and so a partial
+    // snapshot from this session can never resurface in a later one.
+    remove_partial_autosave(path);
 }
 
 /// Reads the `.aur` autosave container at `path`, if one is present and
@@ -1221,6 +1316,81 @@ fn remove_autosave(path: &Path) {
 /// — the recovered surfaces would overwrite whatever those same
 /// `SurfaceId`s currently hold.
 fn recover_document(
+    path: &Path,
+    store: &mut aurora_tile::TileStore,
+) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+    // A complete autosave always wins, even if a partial one is newer
+    // (0.52.2, second review round). The partial file exists only for
+    // the case where the scratch disk went bad before any complete
+    // snapshot could be written; preferring it over a complete one would
+    // trade known-good content for a few more recent edits on the layers
+    // that still happened to be readable, which is the wrong side of
+    // that trade for a crash-recovery file. `write_autosave` deletes any
+    // partial as soon as a complete write lands, and
+    // [`remove_autosave`] deletes both on a clean shutdown, so a stale
+    // partial cannot linger to be picked up here later.
+    //
+    // A canonical file that exists but does not read back is handled one
+    // level up, by [`recover_partial_after_a_failed_read`] -- it needs
+    // the tile store replaced between the two attempts, which needs the
+    // slot this function does not have.
+    if !path.exists() {
+        let partial = partial_autosave_path(path);
+        if !partial.exists() {
+            return None;
+        }
+        tracing::warn!(
+            path = %partial.display(),
+            "no complete autosave; recovering from a partial one, which is missing whatever tiles \
+             the scratch disk could not supply when it was written"
+        );
+        return read_autosave_container(&partial, store);
+    }
+    read_autosave_container(path, store)
+}
+
+/// Reads the partial autosave beside `path` after the canonical
+/// container was found and *failed* to read back — corruption, a
+/// missing entry, an unsupported version, an undecodable tile. Without
+/// this, keeping a partial snapshot protected nothing in precisely the
+/// case it exists for: [`recover_document`] only reaches the partial
+/// when the canonical file is absent, so a corrupt one shadowed it
+/// completely.
+///
+/// **The store is replaced first**, the same reopen (and for the same
+/// reason) [`startup_document`] already performs after a failed
+/// recovery: `aurora_io::read_aur` writes each tile into the store as it
+/// goes, so an attempt that fails partway through leaves real pixels
+/// behind on surfaces the partial container's own layers are about to
+/// claim. Recovering *into* those leftovers would show fragments of the
+/// container that failed to read, mixed into the document that
+/// succeeded. This takes `&mut Option<_>` for exactly that reason —
+/// `None` from [`open_tile_store`] means the session simply continues
+/// without painting, which is what `None` already means everywhere else
+/// on this path.
+fn recover_partial_after_a_failed_read(
+    path: &Path,
+    store_slot: &mut Option<aurora_tile::TileStore>,
+) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+    let partial = partial_autosave_path(path);
+    if !partial.exists() {
+        return None;
+    }
+    *store_slot = open_tile_store();
+    let store = store_slot.as_mut()?;
+    tracing::warn!(
+        path = %partial.display(),
+        "the complete autosave could not be read; falling back to the partial one, which is \
+         missing whatever tiles the scratch disk could not supply when it was written"
+    );
+    read_autosave_container(&partial, store)
+}
+
+/// [`recover_document`]'s own single-file half: opens and reads one
+/// `.aur` container, with every failure answered by `None` rather than
+/// an error. Split out so the complete-vs-partial choice above reads as
+/// the policy it is.
+fn read_autosave_container(
     path: &Path,
     store: &mut aurora_tile::TileStore,
 ) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
@@ -1306,6 +1476,20 @@ fn startup_document(
     let recovered = match (had_previous_marker, store_slot.as_mut()) {
         (true, Some(store)) => recover_document(autosave_path, store),
         _ => None,
+    };
+    // A canonical container that *exists* but does not read back is
+    // exactly the case a partial snapshot is kept for -- corruption --
+    // and [`recover_document`] cannot try it on its own, because
+    // recovering from the partial needs the store replaced first and only
+    // this function owns the slot to replace. When the canonical file is
+    // simply absent, `recover_document` has already tried the partial and
+    // this must not re-read it.
+    let recovered = match recovered {
+        Some(document) => Some(document),
+        None if had_previous_marker && autosave_path.exists() => {
+            recover_partial_after_a_failed_read(autosave_path, store_slot)
+        }
+        None => None,
     };
     if let Some((layers, history, canvas_size)) = recovered {
         // Nothing written back out: the file on disk *is* this
@@ -4165,7 +4349,23 @@ fn resolve_tile(
                         // export path must be able to tell that it did.
                         // See `CompositeBudget::note_store_error`.
                         budget.note_store_error(&err);
-                        tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
+                        // Gated like both bound warnings above, and for a
+                        // reason 0.52.2 made concrete: a tile whose
+                        // page-in fails now fails on *every* touch rather
+                        // than healing into a blank one, so an ungated
+                        // warning here is one log line per layer per tile
+                        // per frame for as long as the scratch file stays
+                        // broken. The count still reaches the caller
+                        // exactly (`note_store_error`), which is what the
+                        // export refusal is built on -- only the logging
+                        // is rate-limited.
+                        if budget.should_report() {
+                            tracing::warn!(
+                                ?err,
+                                ?tile_id,
+                                "skipping layer for this composite tile"
+                            );
+                        }
                         return None;
                     }
                 }
@@ -5313,12 +5513,19 @@ fn read_layer_window(
                     // unless somebody upstream is told. See
                     // `CompositeBudget::note_store_error`.
                     budget.note_store_error(&err);
-                    tracing::warn!(
-                        ?err,
-                        tile_x = tile_col,
-                        tile_y = tile_row,
-                        "skipping a moved layer's source tile for this composite tile"
-                    );
+                    // Gated for the same reason as `resolve_tile`'s own
+                    // sibling warning, and doubly so here: a moved
+                    // layer's window reads up to four source tiles per
+                    // composite tile, so one broken file is up to four
+                    // log lines per tile per frame.
+                    if budget.should_report() {
+                        tracing::warn!(
+                            ?err,
+                            tile_x = tile_col,
+                            tile_y = tile_row,
+                            "skipping a moved layer's source tile for this composite tile"
+                        );
+                    }
                     continue;
                 }
             };
@@ -7842,7 +8049,7 @@ mod tests {
         handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
         is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
         open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
+        palette_commands, partial_autosave_path, pointer_in_canvas, pointer_on_rail_divider,
         previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
         replace_document, resized_rail_width, resolve_tile, run_command, sample_pixel,
         select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
@@ -10947,7 +11154,10 @@ mod tests {
     /// silently missing and `App::save_file` wrote the result straight
     /// over the user's file. Unannounced content loss in a saved file is
     /// the failure CLAUDE.md names as the worst this project can have,
-    /// so the export refuses.
+    /// so the export refuses. Extended in 0.52.2 with the *retry*: the
+    /// refusal is only worth anything if pressing Save again refuses
+    /// too, which it did not until `TileStore::ensure_resident` stopped
+    /// dropping the paged-out mapping of a tile whose page-in failed.
     ///
     /// Deliberately *not* changed, and therefore not asserted here: the
     /// live canvas (`recomposite_visible_tiles`) still skips-and-repaints,
@@ -11043,6 +11253,28 @@ mod tests {
             Ok(_) => unreachable!(
                 "exporting a document whose bottom layer cannot be read must not quietly \
                  succeed with that layer missing"
+            ),
+            Err(other) => unreachable!("expected IncompleteComposite, got {other:?}"),
+        }
+
+        // The retry, and the point of this addition (0.52.2): before
+        // `aurora_tile::TileStore::ensure_resident` stopped forgetting a
+        // tile whose page-in failed, this second call returned
+        // `Ok(Image)` with the bottom layer silently blank -- so a user
+        // who hit the refusal above and simply pressed Save again got
+        // exactly the quietly-incomplete file the first refusal exists to
+        // prevent. Nothing in this crate changed to fix that; the store
+        // returning a real `Err` on every read is the whole of it.
+        match composite_document(&layers, &mut store, 10, 10) {
+            Err(aurora_io::IoError::IncompleteComposite { skipped, .. }) => {
+                assert_eq!(
+                    skipped, 1,
+                    "the retry must refuse for the same one unreadable tile"
+                );
+            }
+            Ok(_) => unreachable!(
+                "a retried export of a still-corrupt document must not quietly succeed with the \
+                 layer blank"
             ),
             Err(other) => unreachable!("expected IncompleteComposite, got {other:?}"),
         }
@@ -15827,6 +16059,230 @@ mod tests {
         );
     }
 
+    /// Red-team's own reproduction, as a regression test: a complete
+    /// autosave exists, the scratch disk then goes bad, and the next
+    /// autosave — which now succeeds best-effort with tiles missing —
+    /// must **not** replace it. Crash-recovery protection has to be
+    /// monotonic: a snapshot may only ever be replaced by one at least as
+    /// good. The first shape of the best-effort change renamed the
+    /// degraded result straight over the single fixed `autosave_path`, so
+    /// the complete snapshot was gone and its dropped tiles were
+    /// unrecoverable from anywhere.
+    #[test]
+    fn a_degraded_autosave_never_overwrites_a_complete_one() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let scratch = match tempfile::tempdir() {
+            Ok(scratch) => scratch,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(scratch.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        for name in ["first", "second"] {
+            let id = match history.add_pixel_layer(&mut layers, name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let _painted = paint_one_texel(&mut store, &layers, id);
+        }
+
+        // Autosave #1, with every tile readable: complete, and it lands
+        // on the canonical path.
+        let path = dir.path().join("aurora-autosave.aur");
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let Ok(complete) = std::fs::read(&path) else {
+            unreachable!("the complete autosave must have been written");
+        };
+        assert!(!complete.is_empty());
+        assert!(!partial_autosave_path(&path).exists());
+
+        // The scratch disk goes bad: one tile is now permanently
+        // unreadable.
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        let Ok(entries) = std::fs::read_dir(scratch.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        assert!(
+            !files.is_empty(),
+            "at least one tile should have been evicted"
+        );
+        // Every scratch file, not just one: with a one-tile budget
+        // exactly one tile is resident and served from memory, and which
+        // one that is depends on the order `write_aur_best_effort`
+        // happened to walk the layers in. Corrupting all of them makes
+        // "at least one tile is unreadable" true without depending on
+        // that order.
+        for victim in &files {
+            let Ok(bytes) = std::fs::read(victim) else {
+                unreachable!("the evicted tile file must be readable");
+            };
+            let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+                unreachable!("half of a slice's own length is always in range");
+            };
+            if let Err(err) = std::fs::write(victim, truncated) {
+                unreachable!("test-local scratch disk must accept the write: {err:?}");
+            }
+        }
+
+        // Autosave #2, degraded.
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+
+        let Ok(after) = std::fs::read(&path) else {
+            unreachable!("the complete autosave must still be there");
+        };
+        assert_eq!(
+            after, complete,
+            "a degraded autosave must leave the complete one byte-for-byte untouched"
+        );
+        assert!(
+            partial_autosave_path(&path).exists(),
+            "the degraded snapshot must still be kept, beside the complete one"
+        );
+        // And recovery still prefers the complete snapshot.
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let Some((recovered, ..)) = recover_document(&path, &mut fresh_store) else {
+            unreachable!("the complete autosave must reopen");
+        };
+        assert_eq!(recovered.len(), 2);
+    }
+
+    /// A tile that cannot be read back must cost the autosave that
+    /// *tile*, not the whole document (0.52.2). Since this round made an
+    /// unreadable tile fail on every read rather than healing into a
+    /// blank one, `write_autosave` calling the refusing `write_aur` would
+    /// have meant one bad tile permanently ending crash-recovery
+    /// protection for every layer and every later edit in the session,
+    /// with nothing visible to the user. It calls
+    /// `aurora_io::write_aur_best_effort` instead — see its own doc
+    /// comment for why autosave and an explicit Save deliberately differ.
+    ///
+    /// Two layers, a one-tile store budget: touching the second layer
+    /// evicts the first's tile, `flush` makes that write real, and
+    /// truncating the file it landed in leaves a tile whose every
+    /// subsequent read fails.
+    #[test]
+    fn write_autosave_still_protects_the_rest_of_the_document_when_one_tile_is_unreadable() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let scratch = match tempfile::tempdir() {
+            Ok(scratch) => scratch,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(scratch.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let mut painted = Vec::new();
+        for name in ["broken", "intact"] {
+            let id = match history.add_pixel_layer(&mut layers, name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            painted.push(paint_one_texel(&mut store, &layers, id));
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        // Corrupt the one evicted tile file: "broken"'s own tile.
+        let Ok(entries) = std::fs::read_dir(scratch.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let [victim] = files.as_slice() else {
+            unreachable!("exactly one tile should have been evicted: {files:?}");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        let path = dir.path().join("aurora-autosave.aur");
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+
+        // Nothing complete was ever written here, so the salvaged
+        // snapshot is all there is -- and it lands on the *partial* path,
+        // never on the canonical one.
+        assert!(
+            !path.exists(),
+            "a knowingly incomplete autosave must not claim the canonical path"
+        );
+        assert!(
+            partial_autosave_path(&path).exists(),
+            "one unreadable tile must not leave the document with no autosave at all"
+        );
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let Some((recovered_layers, ..)) = recover_document(&path, &mut fresh_store) else {
+            unreachable!("the salvaged autosave must reopen from the partial path");
+        };
+        assert_eq!(recovered_layers.len(), 2, "no layer was dropped");
+        // The readable layer's own painted texel survived; the
+        // unreadable one's tile is simply absent, which reads back
+        // blank -- lost either way, since its pixels are gone from the
+        // scratch disk, but everything else is still protected.
+        let [
+            (broken_surface, index, _),
+            (intact_surface, intact_index, intact_value),
+        ] = painted.as_slice()
+        else {
+            unreachable!("two layers were just painted");
+        };
+        for (surface, index, expected) in [
+            (*broken_surface, *index, 0.0),
+            (*intact_surface, *intact_index, *intact_value),
+        ] {
+            let tile = match fresh_store.get(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(&sample) = tile.texels().get(index) else {
+                unreachable!("index 3 is in bounds for a full tile");
+            };
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(sample.to_f32(), expected);
+            }
+        }
+    }
+
     #[test]
     fn write_autosave_produces_a_real_aur_container_with_its_own_archive_entries() {
         // Asserts the container's *actual* ZIP structure (ADR 0009),
@@ -16023,6 +16479,59 @@ mod tests {
             Err(err) => unreachable!("{err}"),
         };
         assert_eq!(mode, 0o600, "the autosave must be owner-only");
+    }
+
+    /// A canonical autosave that exists but cannot be read must not
+    /// shadow a usable partial one (0.52.2, final review round).
+    /// Corruption is precisely the case the partial snapshot is kept for,
+    /// and `recover_document` alone reaches the partial only when the
+    /// canonical file is *absent* — so before this, a corrupt canonical
+    /// container defeated the fallback entirely.
+    #[test]
+    fn startup_recovers_from_the_partial_autosave_when_the_complete_one_is_corrupt() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        {
+            let (_store_dir, mut store) = real_tile_store();
+            let _painted = paint_one_texel(&mut store, &layers, id);
+            write_autosave(&path, &layers, &history, (37, 21), &mut store);
+        }
+        // A good partial snapshot beside a canonical file that is then
+        // corrupted -- a half-written ZIP, the realistic shape.
+        let partial = partial_autosave_path(&path);
+        if let Err(err) = std::fs::copy(&path, &partial) {
+            unreachable!("{err}");
+        }
+        let full_len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(err) => unreachable!("{err}"),
+        };
+        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err}"),
+        };
+        if let Err(err) = file.set_len(full_len / 2) {
+            unreachable!("{err}");
+        }
+        drop(file);
+
+        let (_fresh_dir, fresh_store) = real_tile_store();
+        let mut slot = Some(fresh_store);
+        let startup = super::startup_document(true, &path, &mut slot);
+
+        assert!(
+            startup.was_recovered,
+            "a corrupt complete autosave must fall back to the partial one, not to a demo document"
+        );
+        assert_eq!(
+            startup.canvas_size,
+            (37, 21),
+            "the recovered document must be the partial container's own, not a fresh one"
+        );
     }
 
     #[test]

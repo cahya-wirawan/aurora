@@ -275,6 +275,13 @@ enum ColorSpaceTag {
 /// fails, [`IoError::Color`] if `profile.to_bytes()` fails, or
 /// [`IoError::Tile`] if paging a touched tile in from the scratch disk
 /// fails.
+///
+/// That last one aborts the whole write, deliberately: an explicit save
+/// must refuse rather than quietly produce a document with content
+/// missing. A caller whose alternative to an incomplete file is *no*
+/// file — crash-recovery autosave, and only that — wants
+/// [`write_best_effort`] instead, which skips the unreadable tiles and
+/// names them.
 pub fn write<W: Write + Seek>(
     writer: W,
     layers: &LayerTree,
@@ -283,6 +290,109 @@ pub fn write<W: Write + Seek>(
     profile: Option<&aurora_color::IccProfile>,
     store: &mut TileStore,
 ) -> Result<(), IoError> {
+    // The returned list is empty by construction, not by assumption:
+    // `UnreadableTile::Refuse` is handled by the single `return
+    // Err(err.into())` in `write_with_policy`'s tile loop, which is the
+    // only place a `SkippedTile` is ever pushed and the only place that
+    // policy is read. It is dropped rather than asserted on because a
+    // `debug_assert!` here would be a `panic!` that the workspace's own
+    // `panic`-denying lints do not see (they lint the macro, not what it
+    // expands to) — a bad trade for restating something the type-level
+    // control flow already guarantees.
+    let _empty = write_with_policy(
+        writer,
+        layers,
+        history,
+        canvas_size,
+        profile,
+        store,
+        UnreadableTile::Refuse,
+    )?;
+    Ok(())
+}
+
+/// One tile [`write_best_effort`] could not read, and therefore left out
+/// of the container it wrote.
+#[derive(Debug, Clone)]
+pub struct SkippedTile {
+    pub surface: aurora_tile::SurfaceId,
+    pub tile: TileId,
+    /// The underlying [`aurora_tile::TileError`]'s own message — kept as
+    /// a `String` because that type is not `Clone`, the same reason
+    /// `aurora-app`'s own `CompositeBudget` already keeps one.
+    pub reason: String,
+}
+
+/// [`write()`], except that a tile which cannot be read out of `store` is
+/// **left out** of the container instead of aborting the whole write.
+/// Returns whatever it had to skip, in the order it hit them, so a
+/// caller can say so; an empty vector means the file is complete and
+/// identical to what [`write()`] would have produced.
+///
+/// **This exists for autosave, and deliberately not for Save/Export.**
+/// An explicit save is a professional's deliberate action on their own
+/// file, and 0.52.1 settled that such a save must *refuse* rather than
+/// quietly write a document with content missing — [`write()`] keeps that
+/// behaviour, unchanged, and every user-facing save path keeps calling
+/// it. A background autosave is the opposite case: it is crash-recovery
+/// protection the user never asked for and cannot see fail, and its
+/// alternative to an incomplete file is **no file at all**. Before this
+/// existed, one unreadable tile aborted every autosave for the rest of
+/// the session — so the whole document, every other layer included,
+/// silently stopped being protected because of one bad tile. Writing the
+/// rest and naming what was dropped is strictly better than that, and it
+/// is the same distinction `aurora-app` already draws between its live
+/// canvas (degrades and repaints) and `composite_document` (refuses).
+///
+/// Only a tile read is tolerated. A container/I/O failure, a bad
+/// manifest, or a layer whose bounds exceed the document ceiling still
+/// fail the write outright — those say the *output* is broken, not that
+/// one piece of input is unreadable.
+///
+/// # Errors
+///
+/// Same as [`write()`], minus [`IoError::Tile`] for a tile that fails to
+/// page in.
+pub fn write_best_effort<W: Write + Seek>(
+    writer: W,
+    layers: &LayerTree,
+    history: &History,
+    canvas_size: (u32, u32),
+    profile: Option<&aurora_color::IccProfile>,
+    store: &mut TileStore,
+) -> Result<Vec<SkippedTile>, IoError> {
+    write_with_policy(
+        writer,
+        layers,
+        history,
+        canvas_size,
+        profile,
+        store,
+        UnreadableTile::Skip,
+    )
+}
+
+/// What [`write_with_policy`] does about a tile it cannot read: the two
+/// halves of the deliberate refuse-vs-degrade split
+/// [`write_best_effort`]'s own doc comment explains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadableTile {
+    /// Fail the whole write with that tile's own [`IoError::Tile`].
+    Refuse,
+    /// Leave the tile out and record it in the returned list.
+    Skip,
+}
+
+fn write_with_policy<W: Write + Seek>(
+    writer: W,
+    layers: &LayerTree,
+    history: &History,
+    canvas_size: (u32, u32),
+    profile: Option<&aurora_color::IccProfile>,
+    store: &mut TileStore,
+    unreadable: UnreadableTile,
+) -> Result<Vec<SkippedTile>, IoError> {
+    let mut skipped: Vec<SkippedTile> = Vec::new();
     let mut zip = ZipWriter::new(writer);
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -321,7 +431,26 @@ pub fn write<W: Write + Seek>(
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let tile_id = TileId { x: tx, y: ty };
-                let tile = store.get(surface, tile_id)?;
+                let tile = match store.get(surface, tile_id) {
+                    Ok(tile) => tile,
+                    Err(err) => match unreadable {
+                        UnreadableTile::Refuse => return Err(err.into()),
+                        UnreadableTile::Skip => {
+                            tracing::warn!(
+                                ?surface,
+                                ?tile_id,
+                                %err,
+                                "leaving an unreadable tile out of a best-effort .aur write"
+                            );
+                            skipped.push(SkippedTile {
+                                surface,
+                                tile: tile_id,
+                                reason: err.to_string(),
+                            });
+                            continue;
+                        }
+                    },
+                };
                 if tile.texels().iter().all(|sample| sample.to_f32() == 0.0) {
                     continue;
                 }
@@ -333,7 +462,7 @@ pub fn write<W: Write + Seek>(
     }
 
     zip.finish()?;
-    Ok(())
+    Ok(skipped)
 }
 
 /// [`read`]'s own return shape: the reconstructed `LayerTree`/`History`,
@@ -554,7 +683,7 @@ fn tile_entry_name(surface: SurfaceId, id: TileId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{read, write};
+    use super::{read, write, write_best_effort};
     use aurora_doc::{BlendMode, History, LayerKind, LayerTree};
     use aurora_tile::{TileId, TileStore};
     use half::f16;
@@ -576,6 +705,49 @@ mod tests {
             }
         };
         (dir, store)
+    }
+
+    /// A store that can hold exactly one tile resident, so touching a
+    /// second tile evicts the first to the scratch disk — the setup
+    /// [`break_the_only_scratch_file`] needs.
+    fn one_tile_store() -> (tempfile::TempDir, TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let store = match TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+        (dir, store)
+    }
+
+    /// Truncates the one file in `dir` to half its length, leaving a
+    /// well-formed-but-short ATIL file — what a crash mid-write really
+    /// leaves behind, and what `aurora_tile::codec::decode` rejects on
+    /// every read (0.52.2), making the tile permanently unreadable.
+    fn break_the_only_scratch_file(dir: &tempfile::TempDir) {
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let [victim] = files.as_slice() else {
+            unreachable!("exactly one tile should have been evicted: {files:?}");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
     }
 
     fn bounds() -> aurora_core::Rect {
@@ -1227,6 +1399,115 @@ mod tests {
         match read(container_with(&manifest_bytes, &[]), &mut store) {
             Err(super::IoError::ManifestDeserialization(_)) => {}
             other => unreachable!("expected ManifestDeserialization, got {other:?}"),
+        }
+    }
+
+    /// One unreadable tile must not cost a background autosave the
+    /// *whole* document (0.52.2). `write` refuses — correctly, and
+    /// unchanged: an explicit save that quietly dropped content would be
+    /// the worst failure this project can have. `write_best_effort`
+    /// exists for the other caller, the one whose only alternative to an
+    /// incomplete file is no file at all, and whose failure the user
+    /// cannot see: before it existed, one permanently unreadable tile
+    /// aborted every autosave for the rest of the session, so every other
+    /// layer and every subsequent edit silently stopped being protected.
+    ///
+    /// The unreadable tile is manufactured the way `aurora-app`'s own
+    /// `composite_document_refuses_to_export_...` test does it: a
+    /// one-tile store budget forces the first layer's tile out to the
+    /// scratch disk, `flush` makes that write real, and truncating the
+    /// file it landed in leaves a well-formed-but-short ATIL file that
+    /// `aurora_tile::codec::decode` rejects on every read.
+    #[test]
+    fn best_effort_write_skips_an_unreadable_tile_while_write_still_refuses() {
+        let (dir, mut store) = one_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let mut layer_ids = Vec::new();
+        for name in ["broken", "intact"] {
+            let id = match history.add_pixel_layer(&mut layers, name, bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            // A distinctive, non-blank first texel, so a tile that does
+            // survive is provably the real one and not a blank stand-in.
+            let tile = match store.get_mut(surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Some(sample) = tile.texels_mut().first_mut() {
+                *sample = f16::from_f32(0.5);
+            }
+            layer_ids.push((id, surface));
+        }
+        // Touching "intact" above evicted "broken"'s tile; `flush` makes
+        // that write real so the file truncated below is the one a later
+        // page-in will read.
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_file(&dir);
+
+        // The explicit-save contract, unchanged.
+        let mut refused = Cursor::new(Vec::new());
+        match write(&mut refused, &layers, &history, (10, 10), None, &mut store) {
+            Err(super::IoError::Tile(_)) => {}
+            Ok(()) => unreachable!("an explicit save must not silently drop an unreadable tile"),
+            Err(other) => unreachable!("expected IoError::Tile, got {other:?}"),
+        }
+
+        // The autosave contract: write what can be written, and say what
+        // could not.
+        let mut salvaged = Cursor::new(Vec::new());
+        let skipped =
+            match write_best_effort(&mut salvaged, &layers, &history, (10, 10), None, &mut store) {
+                Ok(skipped) => skipped,
+                Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+            };
+        let [only] = skipped.as_slice() else {
+            unreachable!("exactly one tile is unreadable, got {skipped:?}");
+        };
+        let Some(&(_, broken_surface)) = layer_ids.first() else {
+            unreachable!("two layers were just created");
+        };
+        assert_eq!(only.surface, broken_surface);
+        assert_eq!(only.tile, TileId { x: 0, y: 0 });
+        assert!(
+            only.reason.contains("corrupt tile file"),
+            "the skip must carry the real underlying tile error: {}",
+            only.reason
+        );
+
+        // And the file it produced is a real, readable `.aur` document
+        // holding every layer -- the broken one blank, the other one's
+        // pixels intact.
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        salvaged.set_position(0);
+        let (restored_layers, _history, canvas_size, _profile) =
+            match read(salvaged, &mut fresh_store) {
+                Ok(result) => result,
+                Err(err) => unreachable!("the salvaged autosave must reopen: {err:?}"),
+            };
+        assert_eq!(canvas_size, (10, 10));
+        assert_eq!(restored_layers.len(), 2, "no layer was dropped");
+        let Some(&(_, intact_surface)) = layer_ids.get(1) else {
+            unreachable!("two layers were just created");
+        };
+        for (surface, expected) in [(broken_surface, 0.0), (intact_surface, 0.5)] {
+            let tile = match fresh_store.get(surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(&first) = tile.texels().first() else {
+                unreachable!("a tile's texel buffer is never empty");
+            };
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(first.to_f32(), expected);
+            }
         }
     }
 

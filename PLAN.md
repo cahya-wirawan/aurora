@@ -7892,20 +7892,425 @@ structural design work.
     `aurora-ui` that `save_file` can drive, which is real UI work rather
     than a one-line change, and is why it was scoped out of 0.52.1 rather
     than half-built.
-- [ ] **A tile whose page-in fails is forgotten, so the *next* read of it
-    silently returns a blank tile.** Found 2026-08-24 while writing the
-    export test above; **pre-existing**, not introduced by 0.52.1, and
-    deliberately not fixed there. `TileStore::ensure_resident` does
-    `paged_out.remove(...)` *before* calling `page_in`, so a failed
-    page-in drops the mapping: the first read surfaces
-    `TileError::CorruptFile`, and every read after it falls through to
-    the "never touched" branch and gets `Tile::blank()`. A user who hits
-    the refused export above and simply tries again would therefore get
-    an `Ok` export with that tile silently blank — the same class of
-    failure, one step removed. The fix looks small (peek, page in, remove
-    only on success) but it changes `TileStore`'s recovery semantics and
-    wants its own test, so it is recorded here rather than folded into an
-    unrelated round.
+- [x] **A tile whose page-in fails is forgotten, so the *next* read of it
+    silently returns a blank tile** — found 2026-08-24 while writing the
+    export test above (**pre-existing**, not introduced by 0.52.1, and
+    deliberately not fixed there); **fixed 2026-08-24 (0.52.2)**.
+    The pattern was remove-then-attempt in both of
+    `TileStore::ensure_resident`'s recovery branches:
+    `pending.remove(...)` before `codec::decode`, and
+    `paged_out.remove(...)` before `page_in`. A failure therefore dropped
+    the mapping, so the first read surfaced `TileError::CorruptFile` and
+    every read after it fell through to the "never touched" branch and
+    got `Tile::blank()`. Measured, not argued: with the two new tests
+    below in place against the *old* code, read 2 of a truncated scratch
+    file returned a full 262,144-sample blank tile, and the extended
+    `aurora-app` test's retried export returned `Ok`.
+
+    The fix is one line per branch — peek (`get`, plus a `.cloned()` on
+    the `PathBuf` so `page_in` can take `&mut self`), attempt, and remove
+    from both maps only once a whole tile actually exists to put in
+    `resident`. Nothing outside `crates/aurora-tile/src/store.rs`
+    changed; every consumer that reads through the store
+    (`resolve_tile`, `composite_document`, `read_layer_window`,
+    `App::paint_dab`/`stamp_dab`) inherits the corrected semantics
+    without edits, because all of them already go through `get`/`get_mut`
+    and already handle a `TileError`.
+
+    Tests, and what each one actually guards — stated per branch, because
+    "five tests guard this" was too coarse to be checkable:
+
+    - Branch (c), the `paged_out` disk-read path, on **failure**:
+      `a_corrupted_scratch_file_keeps_failing_on_every_read_not_just_the_first`
+      (three reads of one corrupt file, all `CorruptFile`, mapping
+      asserted still present, `tiles_created == 0`, `resident_len() == 0`)
+      and `a_missing_scratch_file_keeps_failing_and_keeps_its_mapping`
+      (the same rule for `TileError::Io` — a scratch file that is simply
+      gone, which is the likelier real-world failure and was untested
+      until the 0.52.2 review said so).
+    - Branch (b), the `pending` fast path, on **failure**:
+      `undecodable_pending_bytes_keep_failing_and_leave_both_maps_untouched`
+      — defensive rather than expected, since those bytes are this
+      store's own encoder output, but the failure mode is identical.
+      Both of these and the corrupt-file test above assert on the
+      rejection's *message*, not just the `CorruptFile` variant: that
+      variant also covers a bad magic, an unsupported version and a
+      truncated header, so a wildcard would stay green if a regression
+      earlier in `codec::decode` rejected the fixture for the wrong
+      reason — the same convention 0.52.1 established in `codec`'s own
+      tests, applied here after the review found it missing.
+    - Branch (b) on **success**:
+      `ensure_resident_serves_directly_from_pending_bypassing_disk_entirely`
+      (deterministic, hand-built mid-eviction state, `faults == 0`) and
+      `real_eviction_then_immediate_revisit_always_succeeds` (a real
+      `make_room` eviction and an immediate revisit).
+    - Branch (c) on **success**:
+      `pending_entries_clear_once_writes_are_confirmed` (the only test
+      that deterministically reaches it — `faults == 1` proves the disk
+      path was taken) and `eviction_and_page_in_round_trip`. That first
+      test gained **one additive assertion** in this round, the single
+      change made to an existing test: mutation testing during the review
+      showed that deleting branch (c)'s own `paged_out.remove` was caught
+      by only one test, and that one usually takes a different path on a
+      given machine. It now asserts `!paged_out.contains_key(...)` at the
+      point it provably went through that removal, and the mutation is
+      caught deterministically.
+    - The short-tile rule itself (0.52.1's own):
+      `a_truncated_scratch_file_pages_in_as_an_error_not_a_short_tile`.
+
+    The existing
+    `composite_document_refuses_to_export_when_a_layer_tile_cannot_be_read`
+    in `aurora-app` was extended in place — same name, no shared helper
+    extracted — with a second `composite_document` call proving the
+    **retry** refuses too.
+
+    **The deliberate consequences**, recorded so they are not
+    rediscovered as bugs. Such a tile now fails for the whole life of the
+    store rather than healing into an empty one. That is the intended
+    trade — the pixels are gone either way, and the corrupt file is left
+    on disk rather than being overwritten by a re-eviction of the blank
+    tile that replaced it. Every one of the following follows from it,
+    and the first four are *not* obvious from the fix itself, which is
+    why they are listed rather than left implicit:
+
+    1. **Export/Save refuses, and keeps refusing on retry.** The point of
+       the fix — `composite_document` returns `IncompleteComposite` on
+       the second attempt as well as the first.
+    2. **Painting on such a tile fails every dab**, instead of silently
+       succeeding on a blanked one from the second attempt onward. A
+       stroke that straddles a healthy and a broken tile now also stops
+       at the broken one and leaves a dead zone — tracked as its own open
+       item below, not fixed here.
+    3. **Undo could permanently lose a history entry** —
+       `PixelHistory::undo` popped the stroke and only then applied it, so
+       a restore that failed dropped the snapshot entirely. Harmless when
+       a read failed at most once; not harmless once it fails forever.
+       **Fixed in the same 0.52.2 round** (peek, apply, pop only on
+       success — the same rule this fix applies to the store's own maps),
+       with `an_undo_whose_restore_fails_keeps_the_entry_instead_of_destroying_it`
+       and its `redo` twin, both confirmed to fail against the old code.
+
+       That fix needed a second one, found by the review round after it,
+       and the interaction is worth recording: making a failed undo
+       *retryable* is only safe if the restore is **atomic**, and
+       `StrokeSnapshot::apply` was not — it captured each tile's inverse
+       immediately before overwriting that tile, so a failure partway
+       through left the store half-restored and the retry then captured
+       its inverse from *that* state. The redo built from that inverse
+       silently lost the stroke on a nondeterministic subset of tiles
+       (`HashMap` iteration order) while returning `Ok` — reproduced at
+       2–6 of 8 tiles, every run. `apply` is now two-phase: every tile is
+       read into the inverse before a single byte is written, so a failed
+       read leaves the store untouched; the narrow write-phase failure (a
+       tile evicted between the phases whose page-in then fails) rolls
+       back what it already wrote. Test:
+       `a_retried_undo_restores_every_tile_and_its_redo_puts_every_stroke_back`,
+       which fails 3/3 against the one-phase version.
+    4. **Autosave would have died for the whole document.**
+       `write_autosave` → `aurora_io::write_aur` propagated any
+       `TileError` with `?` while walking the tile grid, and treats that
+       as fatal, so one unreadable tile silently ended crash-recovery
+       protection for every layer and every later edit in the session —
+       the exact "a professional's unsaved work" value CLAUDE.md opens
+       with. **Fixed in the same round**, additively: a new
+       `aurora_io::aur::write_best_effort` (re-exported as
+       `write_aur_best_effort`) skips a tile it cannot read, logs it, and
+       returns the list; `write_autosave` calls it and warns with the
+       count. `write`'s own contract is untouched and every explicit
+       Save/Export path still refuses — the deliberate 0.52.1 design, and
+       the same automatic-degrades / deliberate-refuses split
+       `recomposite_visible_tiles` and `composite_document` already draw.
+       Tests: `best_effort_write_skips_an_unreadable_tile_while_write_still_refuses`
+       (`aurora-io`) and
+       `write_autosave_still_protects_the_rest_of_the_document_when_one_tile_is_unreadable`
+       (`aurora-app`).
+
+       That fix also needed a second one. Its first shape renamed the
+       best-effort result over the single fixed `autosave_path()`
+       unconditionally, so a document that already had a **complete**
+       autosave lost it to a degraded one the moment the scratch disk
+       went bad — protection going backwards, which is the one thing a
+       crash-recovery file must never do. Reproduced by the following
+       review round. Now: a complete write lands on `autosave_path()` and
+       deletes any stale partial; a write that had to skip tiles lands on
+       `partial_autosave_path()` (`aurora-autosave.partial.aur`) and
+       leaves the complete one untouched. `recover_document` prefers the
+       complete snapshot and falls back to the partial only when no
+       complete one exists at all — deliberately, even if the partial is
+       newer: trading known-good content for a few more recent edits on
+       whichever layers were still readable is the wrong side of that
+       trade. `remove_autosave` deletes both on a clean shutdown, so a
+       stale partial cannot resurface later. Test:
+       `a_degraded_autosave_never_overwrites_a_complete_one`, asserting
+       the complete file is byte-for-byte untouched.
+
+       Two qualifications, both from the final judging round. First,
+       "complete" means *complete*, not necessarily *current*: both
+       `write_autosave` call sites can run across different open
+       documents in one session, so the complete snapshot preferred here
+       could in principle describe the document open before a
+       replacement while the partial describes the one after. The
+       preference is still the right default — a complete container is a
+       whole document, a partial one is knowingly missing content — but
+       the tie-break is "complete beats partial", not "newer beats
+       older", and that is a real limitation of a single fixed autosave
+       path rather than a decision that would survive a per-document
+       autosave design. Second, a canonical container that *exists but
+       does not read back* used to shadow the partial entirely: the
+       fallback triggered only on an absent file, i.e. never in the
+       corruption case the partial exists for. `startup_document` now
+       retries through `recover_partial_after_a_failed_read`, which
+       replaces the tile store first — the same reopen, for the same
+       reason, that function already performs after a failed recovery
+       (`read_aur` commits tiles as it goes, so a failed attempt must not
+       leak surfaces into the one that succeeds). Test:
+       `startup_recovers_from_the_partial_autosave_when_the_complete_one_is_corrupt`.
+    5. **A persistently broken tile logs on every touch.** The store-error
+       warnings in `resolve_tile` and `read_layer_window` were not behind
+       `CompositeBudget::should_report()`, unlike their two bound-check
+       siblings, so a broken tile meant a log line per layer per tile per
+       frame. Both are gated now; the counter the export refusal is built
+       on (`note_store_error`) is unchanged and still exact.
+
+    **Why there is no cached "known broken" state**, settled here rather
+    than left to be re-litigated: a cached error would convert *transient*
+    I/O faults into permanent ones — a full disk that later drains, a
+    transient `EIO`, an antivirus or indexer holding a brief file lock on
+    Windows. Re-attempting on every read is correct for the recoverable
+    cases; a cache is only correct for the unrecoverable ones, which the
+    store cannot distinguish.
+
+    **The cost of that re-attempt, measured** — the first write-up here
+    said "one failed syscall per read", and that was wrong in a way worth
+    correcting: for the common corruption (a truncated-but-present file)
+    the syscall *succeeds* and reads real bytes, and the failure happens
+    afterwards, in `codec::decode`. The 0.52.2 review measured it at
+    **~36 µs per read** for a realistically tile-sized corrupt file, and
+    fuzzing found no meaningful 60 FPS regression at that cost. It only
+    becomes expensive (~11 ms) for an artificially huge planted file,
+    which additionally requires local write access to the shared scratch
+    directory — itself a separate, now-disclosed problem (see the
+    scratch-directory item below). The store also counts these now:
+    `Stats::failed_page_ins`, incremented on both the read-failure and
+    the decode-failure path, with `bytes_read` charged before the decode
+    is attempted rather than after it — a corrupt file re-read forever
+    was previously invisible in every one of the store's own counters.
+
+    Still not covered: the user-visible *surfacing* of the refusal is the
+    separate open item above — this round makes the retry refuse, it does
+    not make the refusal legible in the UI.
+
+- [x] **A scratch-disk write that *fails* threw away the tile's only
+    surviving copy** — found 2026-08-24 by the 0.52.2 review (**pre-
+    existing**, and made materially worse by the fix above); **fixed
+    2026-08-24 (0.52.2)**. `TileStore::flush` and
+    `TileStore::reconcile_pending` both did
+    `pending.remove(&(result.surface, result.id))` unconditionally as each
+    write result drained, including when `result.outcome` was `Err`. Those
+    bytes are the only whole copy of an evicted tile until its write
+    lands, and the scratch file the write was meant to produce does not
+    exist after a failure — so one transient write failure (a full disk, a
+    momentarily read-only mount, a permission hiccup) destroyed that
+    tile's pixels while they were sitting safely in memory a moment
+    earlier. Reproduced by the review with a real `chmod`: the tile became
+    permanently unreadable, and stayed unreadable after permissions were
+    restored. With the fix above in place it is worse than it used to be —
+    the tile no longer even heals into a blank one, it fails forever.
+
+    Fix: remove the `pending` entry only on `Ok`. On `Err` the bytes stay,
+    so `ensure_resident`'s existing `pending` fast path keeps serving the
+    tile from memory and an ordinary later eviction retries the write.
+    Mechanically the same rule as the fix above — never let go of the only
+    copy until a real replacement exists — applied to the other direction.
+    The trade, stated: a scratch disk that fails every write holds
+    compressed tiles in memory instead of losing one tile per eviction.
+    Losing a professional's pixels is the worse half by a wide margin —
+    but that retention has to be **bounded**, and the first shape of this
+    fix was not. A second review round measured ~1.05 GB retained over
+    2,000 evicted tiles against a four-tile budget with a persistently
+    failing scratch disk, which is invariant §7.3.1 broken by the back
+    door and an out-of-memory abort (losing the *whole* document) at the
+    end of it. Bounded now, in the same round: `retain_failed_write`/
+    `cap_failed_writes` keep at most `budget` unwritable tiles — the same
+    number the resident LRU is allowed, so worst-case memory is bounded at
+    roughly twice the configured budget and scales with the store rather
+    than being an arbitrary constant — and drop the oldest beyond that,
+    counted in `Stats::dropped_failed_writes`. A dropped tile is neither
+    silently blanked nor silently stale: the `paged_out` mapping is kept,
+    so the next read is a loud `TileError` rather than an invented blank
+    tile, and any *superseded* scratch file behind it is deleted first
+    (`discard_stale_scratch_file`).
+
+    That deletion closes a hole the cap itself opened, found by the
+    judging round after it landed, and the first write-up here
+    overclaimed by omitting it: "the mapping points at a file that was
+    never written" is only true for a key whose **first-ever** write
+    failed. A key evicted successfully once, paged back in, edited, then
+    re-evicted into a *failing* write has a real file on disk holding its
+    **pre-edit** content — so a capped drop used to leave the next read
+    succeeding, silently, with the version the user had edited away from.
+    Deleting the superseded file makes that read fail loudly instead;
+    deleting rather than keeping is deliberate, since the content is
+    already superseded and a loud error beats silently authoritative
+    stale pixels. The one case that still defeats it — a deletion that
+    itself fails, reachable on a read-only mount, where writes and
+    deletes fail alike — is reported at `error!` the moment it happens.
+    Regression test:
+    `a_capped_drop_deletes_the_superseded_file_instead_of_serving_stale_pixels`,
+    which hand-builds exactly that history and, without the deletion,
+    reads back 0.25 where the user had painted 0.75.
+
+    Related but distinct, and closed by none of this: a `pending` entry
+    cleared by the completion of an **older** write for the same key can
+    still send a later read to a stale file with no error at all. That is
+    the separate stale-write race disclosed in its own item below (write
+    jobs carry no sequence number).
+
+    So the honest summary of the trade is: transient failures now cost
+    nothing (the tile is served from memory and the write is retried on
+    the next eviction), and a persistent failure costs the same tiles it
+    always did, but only after `budget` of them have been held — with
+    memory bounded throughout.
+
+    Tests, both in `aurora-tile`, both confirmed to fail against the old
+    unconditional removes:
+    `a_failed_write_keeps_the_tiles_only_copy_readable_from_pending` (real
+    eviction, `flush` path) and
+    `reconcile_pending_keeps_the_bytes_of_a_write_that_failed` (the
+    background path, deterministic — the job is handed to the writer and
+    the writer joined before `reconcile_pending` drains it). Both force
+    the write to fail portably, with no `unix`-only API and no privileged
+    environment, by occupying the exact path `make_room` will write to
+    with a *directory*. The cap has its own test,
+    `retention_of_failed_writes_is_bounded_by_the_stores_own_tile_budget`
+    (40 tiles, four-tile budget, every write failing): `pending` stays
+    within budget, the dropped count is exact, a dropped tile reads back
+    as a loud error rather than blank, and a retained one is still served
+    from memory. Confirmed to fail with the cap disabled.
+- [ ] **A tile dropped from a best-effort autosave is indistinguishable
+    from a genuinely blank one inside the file.** Opened 2026-08-25 by
+    the second 0.52.2 review round (red-team RT-04). `aurora_io::aur`
+    already omits an all-zero tile from a `.aur` container as a size
+    optimisation, and a *skipped* tile is omitted the same way — so the
+    container records no difference between "this tile was empty" and
+    "this tile's pixels could not be read". `write_best_effort` returns
+    the list, and `write_autosave` logs it and now routes the whole file
+    to `aurora-autosave.partial.aur` rather than the canonical path, so
+    within one session and for a human reading either the log or the file
+    name the loss is visible. What is *not* visible is the per-tile
+    detail after a restart, in a different process: reopening the partial
+    container cannot say which tiles were dropped or offer to warn about
+    them.
+
+    Not fixed here because the honest fix is a **file-format change** —
+    a `skipped_tiles` list in the manifest and a `MANIFEST_VERSION` bump,
+    which is an ADR 0009 backward-compatibility decision (every past
+    version must keep reading) rather than a patch-scope edit, and it
+    wants the reader side and a user-facing warning designed with it.
+    The same still-open "an export refused for unreadable tiles is only
+    logged, never shown to the user" item above is where that warning
+    surface belongs, and the two should be done together.
+
+    Minor related note from the same round (red-team RT-05): a
+    `debug_assert!` is **not** caught by this workspace's
+    `panic`/`unwrap`-denying clippy lints, which lint those macros rather
+    than what `assert!` expands to. One had been added to `aur::write` in
+    the previous round and has been removed rather than left as a
+    precedent; `aurora_tile::codec::encode`'s own `debug_assert_eq!`
+    remains, deliberately (it guards an encoder misuse that is otherwise
+    silent), and is now the only one. Whether the lint configuration
+    should cover debug assertions at all is a small, separate decision,
+    noted here rather than settled.
+- [ ] **A stroke that reaches a permanently broken tile leaves a dead
+    zone, and can leave a phantom undo entry.** Opened 2026-08-24 by the
+    0.52.2 review (critic AT-04/AT-05(a), red-team RT-06, found
+    independently); a direct consequence of that round's own
+    fail-forever design, not fixed there. Two related defects on the same
+    path:
+
+    1. `aurora_brush::stamp_dab`/`erase_dab`
+       (`crates/aurora-brush/src/stamp.rs`) return on the first tile whose
+       `store.get_mut` fails, so every tile *later in iteration order* is
+       never painted at all. A dab straddling a healthy tile and a broken
+       one leaves a half-applied stroke — red-team reproduced exactly
+       that — and a brush dragged across a broken tile leaves a dead zone
+       up to a full 512×512 px (the four tiles a dab can span) even where
+       the underlying tiles are perfectly readable.
+    2. `App::paint_dab` (`crates/aurora-app/src/lib.rs`) calls
+       `StrokeSnapshot::record_touch` *before* `stamp_dab`, so a stroke
+       whose paint then fails still has a captured tile in its snapshot:
+       `is_empty()` is false, `PixelHistory::push` records it, and the
+       user gets an undo entry for a stroke that painted nothing.
+
+    Concrete fix shape, for whoever picks this up: have
+    `stamp_dab`/`erase_dab` continue past a failing tile, accumulating the
+    first error and returning it only after every reachable tile has been
+    attempted (so a broken tile costs its own 256×256 px and nothing
+    else); and either defer `record_touch` until after a successful paint
+    of that tile, or roll the capture back when the resulting stroke
+    turns out to be a no-op. Not done in 0.52.2 because both require
+    restructuring `paint_dab`/`stamp_dab`'s control flow, which is more
+    than that round's patch scope and deserves its own tests.
+- [ ] **Stale-write race: write jobs carry no sequence number, so a
+    completed *old* write can clear a *newer* pending entry and later
+    reads silently return pre-edit pixels.** Opened 2026-08-24 by the
+    0.52.2 review (critic AT-02, red-team RT-01, found independently and
+    reproduced). **Entirely pre-existing**; 0.52.2 neither introduced nor
+    fixed it. `WriteJob`/`WriteResult`
+    (`crates/aurora-tile/src/writer.rs`) are keyed only by
+    `(SurfaceId, TileId)`. If a key is evicted, revisited from `pending`
+    before its write lands, edited, and evicted again, the *first* job's
+    eventual completion drains a result whose key matches the *second*
+    job's `pending` entry and clears it. A later read then falls through
+    to the disk path and reads whatever bytes are actually there — which
+    may be the pre-edit content — with no error at all. Silent wrong
+    pixels, the worst failure class this store has.
+
+    Red-team reproduced it through the public API only, with a
+    20,000-step randomized fuzz: **164 silently wrong tile reads and 556
+    errors on the fixed (0.52.2) code, against 227 wrong reads and 87
+    errors on the pre-fix code**. Read that honestly: 0.52.2 is a net
+    improvement on this axis (fewer silent wrong reads, more loud
+    errors), and it does not touch the underlying race at all.
+
+    Concrete fix shape: give `WriteJob`/`WriteResult` a monotonically
+    increasing generation number, store `(generation, bytes)` in
+    `pending`, and remove a `pending` entry only when the draining
+    result's generation matches the one currently stored. Needs its own
+    round: it changes the writer's contract and wants its own fuzz
+    harness as the regression test, not a hand-written case.
+- [ ] **HIGH PRIORITY — the tile scratch directory is a fixed, shared,
+    world-readable path with filenames that collide across processes,
+    documents and users.** Opened 2026-08-24 by the 0.52.2 review
+    (red-team RT-03, newly found). **Entirely pre-existing** and unrelated
+    to that round's own file; flagged high because it is a live
+    data-integrity *and* privacy exposure rather than a robustness gap.
+    `tile_store_scratch_dir()` (`crates/aurora-app/src/lib.rs`) resolves
+    to `std::env::temp_dir().join("aurora-tiles")` — no per-user,
+    per-process or per-session component — and tile filenames are
+    `{surface}_{x}_{y}.tile`, where `SurfaceId` comes from a `LayerId`
+    generator that restarts from 0 for every fresh document. So two
+    documents, or two Aurora processes, or two *users* on the same
+    machine, address the same files. Red-team confirmed the directory is
+    world-readable on disk (`ls -ld`) and demonstrated two documents
+    silently reading and corrupting each other's in-progress pixel
+    content with no error raised. On a multi-user box, any local user can
+    read another user's unsaved image content, and can plant a file that
+    a victim's store will page in as pixels.
+
+    Note the existing partial precedent: the autosave file and its temp
+    sibling were given owner-only permissions in 0.49.0
+    (`create_autosave_temp`) for exactly this reason. The scratch
+    directory — which holds far more of the document, continuously —
+    never got the same treatment.
+
+    Concrete fix shape: a per-process scratch directory created mode
+    `0700` (e.g. `tempfile::Builder` rooted under the platform's
+    app-support/cache directory rather than `/tmp`), plus a per-session
+    nonce in each tile filename so a collision is structurally impossible
+    rather than merely improbable, plus removal on clean shutdown. Its own
+    dedicated round: it touches process lifecycle, Windows ACLs (where
+    `PermissionsExt` does not apply), and crash-leftover cleanup policy.
 
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
@@ -10471,13 +10876,27 @@ quietly incomplete one — `Ok(Image)`, a layer's pixels missing, written
 straight over the user's file. `composite_document` now refuses, with a
 new `aurora_io::IoError::IncompleteComposite`; the live canvas keeps its
 skip-and-repaint behaviour deliberately. Surfacing that refusal to the
-user rather than only to the log is named as its own open item, as is a
-pre-existing `TileStore` bug found while testing it (a failed page-in
-forgets the tile, so the *next* read of it returns blank). See the
-now-`[x]` item in M1.9's notes for the full account and the tests. The
-other two items from the 0.52.0 review — the dark-halo artefact and the
-zoom-0.5 rendering bug — are still open, as is CI's silent self-skipping
-of GPU-gated tests.
+user rather than only to the log is named as its own open item; the
+pre-existing `TileStore` bug found while testing it — a failed page-in
+forgot the tile, so the *next* read of it returned blank and a retried
+save quietly succeeded with that tile missing — **is now fixed in
+0.52.2** (`ensure_resident` removes a `pending`/`paged_out` mapping only
+once it holds a whole tile; see that item in M1.9's notes for the full
+account, the new store tests, and the deliberate consequences that a
+corrupt tile now fails for the life of the store — one of which, autosave
+dying for the entire document on one bad tile, is fixed in the same round
+via a new best-effort `.aur` write used by autosave *only*, with every
+explicit Save/Export still refusing). The independent review of that fix
+found and closed a second, related loss of pixels — `flush`/
+`reconcile_pending` discarding the in-memory copy of a tile whose write
+*failed* — and disclosed three larger pre-existing issues it deliberately
+did not fix: a stale-write race with no generation numbers, a shared
+world-readable tile scratch directory, and brush strokes dead-zoning at a
+broken tile. All are their own `[ ]` items in M1.9's notes. See the
+now-`[x]` items there for the full account and the tests. The other two
+items from the 0.52.0 review — the dark-halo artefact and the zoom-0.5
+rendering bug — are still open, as is CI's silent self-skipping of
+GPU-gated tests, and so is surfacing the refused save to the user.
 
 **Addendum 2026-08-24 (0.52.0) — the premultiplied-alpha correctness bug
 is fixed, and it turned out to span three layers, not two.** The item
