@@ -109,6 +109,45 @@ pub struct LayerTree {
 /// sent. A 226-byte crafted file was enough to abort the process, so
 /// this is validated here, once, rather than defended against
 /// separately in every traversal.
+///
+/// The validated scope has since grown past "no cycles, not too deep":
+/// [`validate_shape`] also holds each entry's own recorded `parent` to
+/// the shape the downward walk actually found, and refuses an entry the
+/// walk never reaches at all. That closes a second, quieter abort of
+/// exactly the same class — [`LayerTree::remove_capturing`] and
+/// [`LayerTree::reparent`] read an entry's recorded `parent` and then
+/// expect to find the id in that parent's sibling list, and a crafted
+/// manifest could make that expectation false.
+///
+/// The `ids` field is checked too, by [`validate_id_allocator`], and
+/// that one is not about shape at all. `IdGenerator` is `Deserialize`,
+/// so a manifest can hand back a counter that has *already been used* —
+/// while every shape rule above passes, because the tree really is a
+/// tree. One ordinary `add_group` on such a document then generates an
+/// id a live layer already holds, and (before this) silently replaced
+/// it, orphaning its contents and splicing the replacement into its own
+/// `children`: a cycle constructed *after* deserialization, where a
+/// validator that runs once, here, can never see it. The counter is
+/// therefore held to "strictly ahead of every id present", and
+/// [`LayerTree::insert`] refuses a colliding id besides.
+///
+/// "Every id *present*" is load-bearing, and was for one round a gap of
+/// its own: a manifest could *name* an id — from `roots`, or from a
+/// group's `children` — while carrying no entry for it, and such an id is
+/// present in neither `layers.keys()` nor anything the shape walk counts.
+/// Both validators passed, and the next ordinary `add_pixel_layer` was
+/// handed exactly that id, making the new layer a fresh root *and* an
+/// already-named child at once. [`validate_shape`] therefore refuses a
+/// dangling reference outright ([`DocError::DanglingLayerReference`])
+/// rather than skipping it, which is what makes "every id present" and
+/// "every id the tree names" the same set — and so makes the counter
+/// check above complete rather than merely nearly complete.
+///
+/// One thing checked here is not about structure at all:
+/// [`validate_opacities`] holds each entry's `opacity`/`fill_opacity` to
+/// the `0.0..=1.0` range [`LayerTree::set_opacity`] enforces on live
+/// edits, since a crafted manifest can otherwise hand the compositor
+/// `NaN`.
 #[derive(serde::Deserialize)]
 struct LayerTreeRepr {
     ids: IdGenerator<Layer>,
@@ -121,7 +160,21 @@ impl TryFrom<LayerTreeRepr> for LayerTree {
 
     fn try_from(repr: LayerTreeRepr) -> Result<Self, Self::Error> {
         let LayerTreeRepr { ids, layers, roots } = repr;
-        validate_shape(&layers, &roots)?;
+        // `None`: a manifest's `roots` are the root-level sibling list by
+        // definition, so every layer named there must record no parent
+        // of its own. (`LayerTree::restore` is the other caller, and
+        // passes the captured subtree's own recorded parent instead.)
+        // `1`: these roots really are the top level, so the depth budget
+        // starts from scratch.
+        validate_shape(&layers, &roots, None, 1)?;
+        // Shape first, then the allocator: a file can be wrong in both
+        // ways at once, and a malformed *shape* is the one that aborts a
+        // traversal outright, so it is the more useful thing to report.
+        // Property ranges last, for the same ordering reason -- an
+        // out-of-range opacity renders wrongly, which is worth refusing
+        // but strictly less urgent than a traversal that never returns.
+        validate_id_allocator(&ids, &layers)?;
+        validate_opacities(&layers)?;
         Ok(Self { ids, layers, roots })
     }
 }
@@ -130,36 +183,98 @@ impl TryFrom<LayerTreeRepr> for LayerTree {
 /// isn't a real tree — see [`LayerTreeRepr`] for why this runs at
 /// deserialization time.
 ///
+/// `root_parent` is the parent the *starting* sibling list hangs under,
+/// so one validator serves both callers: [`LayerTree::try_from`] passes
+/// `None` (a manifest's `roots` are root-level by definition), and
+/// [`LayerTree::restore`] passes the captured subtree's own recorded
+/// parent with `roots = &[subtree_root]`.
+///
+/// `start_depth` is the depth the entries in `roots` themselves sit at,
+/// so the depth budget is cumulative rather than per-call: a manifest's
+/// own roots are depth `1`, while a subtree [`LayerTree::restore`]
+/// splices under a live group starts one level below however deep that
+/// group already sits. Without it, two crafted `Restore` ops could each
+/// stay inside [`MAX_LAYER_TREE_DEPTH`] and still build a tree twice
+/// that deep between them.
+///
 /// Iterative on an explicit stack, never recursive: the whole point is
 /// to survive input designed to blow the call stack, so the validator
-/// itself must not be the thing that overflows. Two rules:
+/// itself must not be the thing that overflows. Four rules:
 ///
 /// - **Each layer is reached at most once.** A second visit means either
 ///   a cycle (a group inside itself) or the same layer listed under two
 ///   parents; neither is a tree, and both make a downward walk either
 ///   loop forever or duplicate work exponentially.
 /// - **Nesting stays within [`MAX_LAYER_TREE_DEPTH`].**
+/// - **Every layer's own recorded `parent` agrees with where the walk
+///   found it** — `root_parent` for a starting-list entry, and the
+///   group that named it for anything reached through a `children`
+///   list. Otherwise [`DocError::InconsistentLayerParent`]. Because a
+///   child is only ever descended into *through* some group's
+///   `children`, "recorded equals actual" also proves, for free, that a
+///   non-`None` recorded parent exists and really is a group — which is
+///   exactly the assumption [`LayerTree::remove_capturing`] and
+///   [`LayerTree::reparent`] make when they read an entry's `parent`
+///   and then look the id up in that parent's sibling list.
+/// - **No orphans**: every entry in `layers` is reached. Otherwise
+///   [`DocError::OrphanedLayer`], naming the lowest-numbered
+///   unreachable id so the error does not depend on `HashMap`'s
+///   arbitrary iteration order.
 ///
-/// An id that names nothing in `layers` is skipped rather than rejected
-/// — that is exactly what every traversal here already does with a
-/// dangling reference (`kind` returns `None`), so rejecting it would
-/// newly refuse files this reader used to open. Skipping it also keeps
-/// the explicit stack bounded by `layers.len()`: only ids that really
+/// - **No dangling references**: every id named — in `roots`, or in
+///   some group's `children` — has an entry of its own in `layers`.
+///   Otherwise [`DocError::DanglingLayerReference`]. Note this is a
+///   *different* case from the orphan rule above, and its exact mirror:
+///   an orphan is an entry nothing names, a dangling reference is a name
+///   with no entry.
+///
+/// That last rule was, in the first round of this validation, the
+/// opposite: a dangling id was *skipped* rather than rejected, reasoned
+/// as "every traversal here already tolerates one (`kind` returns
+/// `None`), so rejecting it would newly refuse files this reader used to
+/// open". The reasoning was wrong in the part that mattered. No tree
+/// this project *writes* can contain a dangling reference —
+/// [`LayerTree::insert`], [`LayerTree::remove_capturing`],
+/// [`LayerTree::reparent`] and [`LayerTree::restore`] each write a
+/// sibling list and the `layers` map together — so nothing legitimate is
+/// refused. Meanwhile skipping it left the named-but-absent id invisible
+/// to [`validate_id_allocator`], which compares the counter only against
+/// ids actually *present*: a manifest naming id `1` from a group's
+/// `children` while carrying no entry for it passed both validators, and
+/// the very next ordinary `add_pixel_layer` was then handed exactly id
+/// `1` — a layer that is simultaneously a fresh root and an
+/// already-named child of that group. Refusing the reference outright is
+/// what keeps "every id present" and "every id named" the same set, so
+/// that [`validate_id_allocator`] checking the first really does cover
+/// the second.
+///
+/// Rejecting rather than skipping does not loosen the bound on the
+/// explicit stack, which is still `layers.len()`: only ids that really
 /// exist are ever pushed, and each is pushed at most once.
 fn validate_shape(
     layers: &HashMap<LayerId, LayerEntry>,
     roots: &[LayerId],
+    root_parent: Option<LayerId>,
+    start_depth: usize,
 ) -> Result<(), DocError> {
     let mut seen: HashSet<LayerId> = HashSet::with_capacity(layers.len());
     let mut stack: Vec<(LayerId, usize)> = Vec::new();
 
     for &id in roots {
-        if layers.contains_key(&id) {
-            if !seen.insert(id) {
-                return Err(DocError::MalformedLayerTree(id));
-            }
-            stack.push((id, 1));
+        let Some(entry) = layers.get(&id) else {
+            return Err(DocError::DanglingLayerReference(id));
+        };
+        // The duplicate/cycle check stays *before* the parent check: a
+        // group listing itself is both, and it is the cycle that every
+        // downward traversal actually cannot survive, so that is the
+        // error worth reporting.
+        if !seen.insert(id) {
+            return Err(DocError::MalformedLayerTree(id));
         }
+        if entry.parent != root_parent {
+            return Err(DocError::InconsistentLayerParent(id));
+        }
+        stack.push((id, start_depth));
     }
 
     while let Some((id, depth)) = stack.pop() {
@@ -169,6 +284,11 @@ fn validate_shape(
                 max: MAX_LAYER_TREE_DEPTH,
             });
         }
+        // Nothing that is not present in `layers` is ever pushed (both
+        // push sites above return `DanglingLayerReference` first), so
+        // this cannot miss -- kept as a `continue` rather than an
+        // assertion because a validator whose whole job is surviving
+        // hostile input must not be the thing that aborts.
         let Some(entry) = layers.get(&id) else {
             continue;
         };
@@ -176,13 +296,150 @@ fn validate_shape(
             continue;
         };
         for &child in children {
-            if !layers.contains_key(&child) {
-                continue;
-            }
+            let Some(child_entry) = layers.get(&child) else {
+                return Err(DocError::DanglingLayerReference(child));
+            };
+            // Same ordering as the root loop above, for the same reason.
             if !seen.insert(child) {
                 return Err(DocError::MalformedLayerTree(child));
             }
+            if child_entry.parent != Some(id) {
+                return Err(DocError::InconsistentLayerParent(child));
+            }
             stack.push((child, depth.saturating_add(1)));
+        }
+    }
+
+    if seen.len() != layers.len() {
+        // Deterministic despite `HashMap`'s arbitrary iteration order.
+        // `aurora_core::Id<T>` deliberately has no `Ord` (it is an
+        // opaque handle, not a sortable value), so the minimum is taken
+        // over the raw values rather than over the ids themselves.
+        if let Some(orphan) = layers
+            .keys()
+            .copied()
+            .filter(|id| !seen.contains(id))
+            .min_by_key(|id| id.to_raw())
+        {
+            return Err(DocError::OrphanedLayer(orphan));
+        }
+    }
+    Ok(())
+}
+
+/// Holds a tree's own id counter to the ids the tree actually contains:
+/// the next id the generator would hand out must be strictly greater
+/// than every raw id present in `layers`.
+///
+/// [`validate_shape`]'s companion, and deliberately separate from it,
+/// because the defect is of a different kind. A tree whose counter has
+/// fallen behind is a perfectly well-formed *tree* — every shape rule
+/// passes — so nothing in the shape walk can see it. What it breaks is
+/// the invariant every insert path relies on: that a freshly generated
+/// id is unused. One `add_group` on such a tree hands out an id a live
+/// layer already holds, `HashMap::insert` replaces that layer, and the
+/// new group is spliced into the sibling list that the *replaced* entry
+/// was named in — for a group listing itself as its own child, that is a
+/// cycle built after deserialization, which the one-shot shape validator
+/// never gets a second look at. See
+/// [`DocError::StaleLayerIdGenerator`].
+///
+/// Deterministic despite `HashMap`'s arbitrary iteration order: the
+/// *highest* colliding id is reported, which is unique.
+///
+/// Comparing against `layers.keys()` — the ids actually *present* —
+/// covers every id the tree names only because [`validate_shape`] refuses
+/// a name with no entry behind it. See [`LayerTreeRepr`] for the round
+/// where that was not yet true and this check could be walked around.
+fn validate_id_allocator(
+    ids: &IdGenerator<Layer>,
+    layers: &HashMap<LayerId, LayerEntry>,
+) -> Result<(), DocError> {
+    let next = ids.peek_next();
+    if let Some(highest) = layers
+        .keys()
+        .copied()
+        .filter(|id| id.to_raw() >= next)
+        .max_by_key(|id| id.to_raw())
+    {
+        return Err(DocError::StaleLayerIdGenerator {
+            next,
+            existing: highest,
+        });
+    }
+    Ok(())
+}
+
+/// Rejects a group `children` reference that points from one of two
+/// about-to-be-merged maps into the other.
+///
+/// [`LayerTree::restore`] splices a captured subtree into a live tree,
+/// and each half was only ever validated on its own: [`validate_shape`]
+/// walks `incoming` alone, and the live tree's own shape was settled back
+/// when it was deserialized. Neither walk can see a reference that points
+/// *across* the two, because to the map it was handed the id simply names
+/// nothing — and [`validate_shape`]'s own dangling-reference rule is no
+/// help here either, since this is precisely the case where the reference
+/// is not dangling: the instant the maps are merged it resolves, and the
+/// layer it names becomes reachable from two parents at once. Caught
+/// before the merge, because afterwards no walk of either half alone can
+/// see it.
+///
+/// Called in **both** directions by [`LayerTree::restore`], because the
+/// defect is symmetric and one direction alone leaves the other open: an
+/// incoming group's `children` naming a live layer, and a live group's
+/// `children` naming an incoming one, produce the same two-parent shape.
+/// (The second direction only became reachable at all through a live tree
+/// that already carried a dangling reference — which [`validate_shape`]
+/// now refuses outright — so this is the belt to that fix's braces, kept
+/// because a cycle reaching `aurora-app`'s recursive `resolve_tile` is a
+/// process abort, not a catchable error.)
+///
+/// One implementation used twice rather than two hand-written checks
+/// that must be kept in step: the earlier rounds of this work established
+/// that discipline for [`validate_shape`] (shared by the manifest and
+/// splice paths) and it applies just as much here.
+fn validate_cross_references(
+    from: &HashMap<LayerId, LayerEntry>,
+    to: &HashMap<LayerId, LayerEntry>,
+) -> Result<(), DocError> {
+    for entry in from.values() {
+        let LayerKind::Group { children } = &entry.kind else {
+            continue;
+        };
+        for child in children {
+            if !from.contains_key(child) && to.contains_key(child) {
+                return Err(DocError::MalformedRemovedSubtree(*child));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Holds every deserialized layer's `opacity` and `fill_opacity` to the
+/// same `0.0..=1.0` bar [`LayerTree::set_opacity`] enforces on a live
+/// edit.
+///
+/// Both are plain `f32` fields in the manifest, so a crafted file can
+/// carry `NaN`, a negative value, or `1e38` straight past validators that
+/// only look at ids, and on into the compositor — which multiplies texels
+/// by them. Unlike the shape defects this module's other validators
+/// refuse, this is not a crash: it is a rendering-correctness one, of the
+/// same "trust a number from an untrusted file" class the rest of this
+/// round has been closing (contrast `Rect`, which `aurora-io` already
+/// bounds on the way in).
+///
+/// Rejected rather than clamped, so that the file's own value is what
+/// gets reported and a document never silently renders as something other
+/// than what it says. The range test is [`LayerTree::set_opacity`]'s,
+/// character for character — which also rejects `NaN`, since a
+/// `RangeInclusive::contains` is false for it.
+fn validate_opacities(layers: &HashMap<LayerId, LayerEntry>) -> Result<(), DocError> {
+    for entry in layers.values() {
+        for value in [entry.opacity, entry.fill_opacity] {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(DocError::OpacityOutOfRange(value));
+            }
         }
     }
     Ok(())
@@ -206,7 +463,10 @@ impl LayerTree {
     ///
     /// Returns [`DocError::UnknownLayer`] if `parent` is `Some` and
     /// doesn't exist, or [`DocError::NotAGroup`] if `parent` names a
-    /// pixel layer. Nothing is added when this happens.
+    /// pixel layer. Also returns [`DocError::LayerIdCollision`] if the
+    /// id generated for the new layer is somehow already in use — see
+    /// that variant for why it is returned rather than asserted away.
+    /// Nothing is added when any of these happens.
     pub fn add_pixel_layer(
         &mut self,
         name: impl Into<String>,
@@ -256,8 +516,29 @@ impl LayerTree {
         }
 
         let id = self.ids.next_id();
-        self.layers.insert(id, LayerEntry::new(name, parent, kind));
+        // The displaced value is checked, not discarded: a plain
+        // `HashMap::insert` here would *silently destroy* whatever layer
+        // was already under `id`, orphan everything it contained, and
+        // then splice the replacement into a sibling list under the same
+        // id -- which, for a group, is a group listing itself as its own
+        // child. That is a cycle constructed after deserialization, so
+        // the one-shot `validate_shape` never sees it and every downward
+        // walk recurses forever. `validate_id_allocator` refuses the
+        // crafted file that makes this reachable; this refuses the
+        // insert itself, whatever the generator's provenance. Nothing
+        // has been mutated but the counter (monotonic, so harmless), and
+        // the displaced entry goes straight back.
+        if let Some(previous) = self.layers.insert(id, LayerEntry::new(name, parent, kind)) {
+            self.layers.insert(id, previous);
+            return Err(DocError::LayerIdCollision(id));
+        }
 
+        // Left as an assertion rather than a `?`, unlike the ones in
+        // `remove_capturing`/`reparent`: `parent` here is a caller's own
+        // argument, checked twelve lines above with no intervening
+        // mutation of `self.layers` that could invalidate it, and no
+        // deserialized `parent` field is involved at all. See
+        // `reparent`'s own comment for the same distinction spelled out.
         let siblings = match self.sibling_list_mut(parent) {
             Ok(list) => list,
             Err(err) => {
@@ -291,6 +572,16 @@ impl LayerTree {
     /// # Errors
     ///
     /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist.
+    ///
+    /// Returns [`DocError::UnknownLayer`]/[`DocError::NotAGroup`] naming
+    /// `id`'s *recorded parent*, or
+    /// [`DocError::InconsistentLayerParent`], if `id`'s recorded `parent`
+    /// disagrees with where `id` actually sits — a tree that reached this
+    /// type through [`validate_shape`] (every deserialized one, and every
+    /// [`Self::restore`]d subtree) cannot be in that state, and neither
+    /// can one built through this type's own API, so these exist to make
+    /// the abort impossible by construction rather than merely
+    /// unreachable by argument. Nothing is removed when they happen.
     pub(crate) fn remove_capturing(&mut self, id: LayerId) -> Result<RemovedSubtree, DocError> {
         let parent = self
             .layers
@@ -298,12 +589,9 @@ impl LayerTree {
             .ok_or(DocError::UnknownLayer(id))?
             .parent;
 
-        let siblings = match self.sibling_list_mut(parent) {
-            Ok(list) => list,
-            Err(err) => unreachable!("id's own recorded parent must be valid: {err:?}"),
-        };
+        let siblings = self.sibling_list_mut(parent)?;
         let Some(index) = siblings.iter().position(|&sibling| sibling == id) else {
-            unreachable!("id's own recorded parent must list id as one of its children");
+            return Err(DocError::InconsistentLayerParent(id));
         };
         siblings.remove(index);
 
@@ -361,7 +649,37 @@ impl LayerTree {
     /// pixel layer — both only reachable if something removed or replaced
     /// that parent after this subtree was captured, since normal
     /// [`crate::History`] undo/redo never reaches here out of order.
-    /// Nothing is changed when this happens.
+    ///
+    /// Returns [`DocError::MalformedRemovedSubtree`] if `removed` is not
+    /// internally coherent before its shape is even walked — the same id
+    /// carried twice, an incoming id that the live tree already holds,
+    /// the declared `root` missing from `entries`, or an incoming
+    /// group's `children` naming a layer that is already live *outside*
+    /// the incoming set, or a *live* group's `children` already naming an
+    /// incoming id (either way, that layer would be reachable from two
+    /// parents the moment the two are merged). Beyond that, the
+    /// incoming subtree is held to exactly the bar a deserialized
+    /// manifest is: [`validate_shape`], rooted at `root` and hanging
+    /// under `parent`, so [`DocError::MalformedLayerTree`],
+    /// [`DocError::LayerTreeTooDeep`],
+    /// [`DocError::InconsistentLayerParent`],
+    /// [`DocError::OrphanedLayer`] and
+    /// [`DocError::DanglingLayerReference`] are all reachable too, as is
+    /// [`DocError::OpacityOutOfRange`] for an incoming entry whose
+    /// opacity or fill opacity is outside `0.0..=1.0`. None of that is
+    /// reachable from a `RemovedSubtree` this type itself produced; it is
+    /// reachable from the one inside an untrusted `.aur` file's history
+    /// journal, which [`crate::History::replay`] feeds straight back
+    /// through here.
+    ///
+    /// On success the tree's own id generator is advanced past every id
+    /// restored, so a subtree carrying ids this tree never allocated
+    /// (the [`crate::History::replay`] case, which starts from
+    /// [`Self::new`] with the counter at `0`) cannot make the next
+    /// `add_pixel_layer` alias one of them.
+    ///
+    /// Nothing is changed when any of these happens — every check runs
+    /// before the first mutation.
     pub(crate) fn restore(&mut self, removed: RemovedSubtree) -> Result<LayerId, DocError> {
         let RemovedSubtree {
             root,
@@ -371,7 +689,11 @@ impl LayerTree {
         } = removed;
 
         // Validate before mutating anything -- same "all or nothing"
-        // discipline `insert` uses for its own `parent` argument.
+        // discipline `insert` uses for its own `parent` argument. This
+        // one first, because it is the only check about the *live* tree
+        // (and it also catches a `parent` naming an id that only exists
+        // inside the incoming subtree, which is not in `self.layers`
+        // yet).
         if let Some(parent_id) = parent {
             match self.layers.get(&parent_id) {
                 None => return Err(DocError::UnknownLayer(parent_id)),
@@ -382,14 +704,54 @@ impl LayerTree {
             }
         }
 
+        // Move the flat capture into the map shape `validate_shape`
+        // works on -- cheap, since `removed` is consumed by value
+        // anyway -- rejecting the three ways it can be incoherent before
+        // its shape is even walked.
+        let mut incoming: HashMap<LayerId, LayerEntry> = HashMap::with_capacity(entries.len());
         for (id, entry) in entries {
-            self.layers.insert(id, entry);
+            if self.layers.contains_key(&id) {
+                return Err(DocError::MalformedRemovedSubtree(id));
+            }
+            if incoming.insert(id, entry).is_some() {
+                return Err(DocError::MalformedRemovedSubtree(id));
+            }
+        }
+        if !incoming.contains_key(&root) {
+            return Err(DocError::MalformedRemovedSubtree(root));
         }
 
-        let siblings = match self.sibling_list_mut(parent) {
-            Ok(list) => list,
-            Err(err) => unreachable!("just validated above: {err:?}"),
-        };
+        // Neither half's own shape walk can see a `children` reference
+        // that points across the two maps, and the merge is what makes
+        // such a reference resolve into a layer with two parents. Both
+        // directions, one implementation -- see
+        // `validate_cross_references` for why the second is not
+        // redundant.
+        validate_cross_references(&incoming, &self.layers)?;
+        validate_cross_references(&self.layers, &incoming)?;
+
+        // The subtree hangs under a live `parent`, so its depth budget
+        // continues that parent's rather than restarting -- otherwise a
+        // crafted journal could stack two individually-legal `Restore`
+        // ops into a tree twice past `MAX_LAYER_TREE_DEPTH`.
+        let start_depth = parent.map_or(1, |id| self.depth_of(id).saturating_add(1));
+        validate_shape(&incoming, &[root], parent, start_depth)?;
+        validate_opacities(&incoming)?;
+
+        // Every id in `incoming` is about to become live, and the ids in
+        // a captured subtree are whatever they originally were -- which,
+        // when the tree being restored into was built from scratch (as
+        // `crate::History::replay` builds it), can sit *ahead* of this
+        // tree's own counter. Moving the counter past them keeps the
+        // "a freshly generated id is unused" invariant true, so the very
+        // next `add_pixel_layer` cannot alias a layer just restored.
+        if let Some(highest) = incoming.keys().map(|id| id.to_raw()).max() {
+            self.ids.advance_past(highest);
+        }
+
+        self.layers.extend(incoming);
+
+        let siblings = self.sibling_list_mut(parent)?;
         let clamped = index.min(siblings.len());
         siblings.insert(clamped, root);
         Ok(root)
@@ -407,7 +769,22 @@ impl LayerTree {
     /// `Some`) doesn't exist, [`DocError::NotAGroup`] if `new_parent`
     /// names a pixel layer, or [`DocError::CycleDetected`] if
     /// `new_parent` is `id` itself or one of `id`'s own descendants.
-    /// Nothing is changed when this happens.
+    ///
+    /// Also returns [`DocError::UnknownLayer`]/[`DocError::NotAGroup`]
+    /// naming `id`'s *current* parent, or
+    /// [`DocError::InconsistentLayerParent`] naming `id` itself, if the
+    /// `parent` `id` records names something that is gone, is not a
+    /// group, or is a group that does not actually list `id`. That
+    /// cannot happen on a
+    /// tree built through this type's own API, nor on one deserialized
+    /// from bytes (whose shape — including every entry's own recorded
+    /// `parent` — is validated up front; see
+    /// [`DocError::InconsistentLayerParent`]). It is returned rather
+    /// than asserted anyway, so that a future caller holding a tree
+    /// assembled some third way gets an error instead of a process
+    /// abort.
+    ///
+    /// Nothing is changed when any of these happens.
     pub fn reparent(
         &mut self,
         id: LayerId,
@@ -435,16 +812,40 @@ impl LayerTree {
             }
         }
 
-        // Everything validated -- detach from the old position...
-        let old_siblings = match self.sibling_list_mut(old_parent) {
-            Ok(list) => list,
-            Err(err) => {
-                unreachable!("id's current parent, just read above, must be valid: {err:?}")
-            }
+        // Everything about the *destination* is validated. The source is
+        // not: `old_parent` is whatever `id`'s own entry records, and on
+        // a tree that never went through `validate_shape` that can name
+        // a layer that is gone, or a pixel layer. Returning the error
+        // rather than asserting it away is what keeps a crafted `.aur`
+        // file from aborting the process here (`panic = "abort"`); note
+        // it returns *before* the first mutation, so a refused reparent
+        // still changes nothing.
+        let old_siblings = self.sibling_list_mut(old_parent)?;
+        // Mirrors `remove_capturing`: find the position first, and treat
+        // "not there" as the invariant violation it is. A `retain` here
+        // was a silent no-op in exactly that case, and the move then
+        // went ahead anyway -- leaving `id` still listed in its old
+        // parent's `children` *and* listed under the new one, i.e. the
+        // very "same layer under two parents" shape `validate_shape`
+        // exists to forbid, manufactured through this method's own
+        // public API.
+        let Some(old_index) = old_siblings.iter().position(|&sibling| sibling == id) else {
+            return Err(DocError::InconsistentLayerParent(id));
         };
-        old_siblings.retain(|&sibling| sibling != id);
+        old_siblings.remove(old_index);
 
         // ...then attach at the new one.
+        //
+        // These last two `unreachable!`s stay, deliberately, where the
+        // `old_parent` one above became a real `?`. The asymmetry is the
+        // point: `old_parent` is *recorded data* that untrusted bytes
+        // can lie about, while `new_parent` and `id` were each read and
+        // checked a few lines above with no intervening mutation that
+        // could invalidate them (`retain` only drops an id from a `Vec`;
+        // it removes no entry and changes no `LayerKind`). They are also
+        // now past the first mutation, so turning them into `?` would
+        // trade an impossible abort for a reachable half-applied move --
+        // `id` detached from its old parent and attached to nothing.
         let new_siblings = match self.sibling_list_mut(new_parent) {
             Ok(list) => list,
             Err(err) => {
@@ -490,6 +891,56 @@ impl LayerTree {
             }
         }
         true
+    }
+
+    /// How deep `id` sits: `1` for a root, one more per enclosing group.
+    /// [`Self::restore`]'s starting depth, so a spliced subtree's own
+    /// depth budget continues the live tree's rather than restarting.
+    ///
+    /// Walks upward, bounded by the tree's own layer count for the same
+    /// reason [`Self::is_descendant`] is: a parent chain restored from an
+    /// untrusted journal can loop, and unbounded walking on that is a
+    /// hang rather than an error. Running out of budget means the chain
+    /// cycles, so it reports the largest depth it counted — the
+    /// direction that makes the caller *refuse* rather than accept.
+    fn depth_of(&self, id: LayerId) -> usize {
+        let mut depth: usize = 1;
+        let mut current = id;
+        for _ in 0..self.layers.len() {
+            match self.layers.get(&current).and_then(|entry| entry.parent) {
+                Some(parent) => {
+                    depth = depth.saturating_add(1);
+                    current = parent;
+                }
+                None => return depth,
+            }
+        }
+        depth
+    }
+
+    /// Holds this whole tree to exactly the bar
+    /// `#[serde(try_from = "LayerTreeRepr")]` holds a deserialized one
+    /// to — literally the same [`validate_shape`] call, rooted at
+    /// [`Self::roots`] with no parent above them.
+    ///
+    /// It exists because there is a second way an untrusted `.aur` file
+    /// reaches a live `LayerTree` that never touches
+    /// [`LayerTree::try_from`]: [`crate::History::load_journal`] followed
+    /// by [`crate::History::replay`], which starts from
+    /// [`LayerTree::new`] and applies the file's own recorded
+    /// [`crate::History`] ops. Validating the manifest alone would have
+    /// left that path open, so a journal is held to the same bar as a
+    /// manifest.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`validate_shape`] returns — see its own doc comment for
+    /// the four rules — plus [`DocError::StaleLayerIdGenerator`] from
+    /// [`validate_id_allocator`], the same pairing
+    /// `#[serde(try_from = "LayerTreeRepr")]` runs.
+    pub(crate) fn validate(&self) -> Result<(), DocError> {
+        validate_shape(&self.layers, &self.roots, None, 1)?;
+        validate_id_allocator(&self.ids, &self.layers)
     }
 
     /// The sibling list `parent` names: [`Self::roots`] if `None`, or a
@@ -924,7 +1375,7 @@ mod tests {
     use super::LayerTree;
     use crate::DocError;
     use crate::layer::{BlendMode, Layer, LayerKind, LayerLock, LayerMask};
-    use aurora_core::{Id, Rect};
+    use aurora_core::{Id, IdGenerator, Rect};
     use std::collections::HashMap;
 
     fn bounds() -> Rect {
@@ -2051,6 +2502,20 @@ mod tests {
         roots: Vec<super::LayerId>,
     }
 
+    /// An id generator positioned exactly where a real one would be for
+    /// `layers`: one past the highest id present. Every crafted repr
+    /// below uses it, so each test isolates the one defect it is about
+    /// rather than also tripping `validate_id_allocator` (see
+    /// `a_manifest_whose_id_counter_has_fallen_behind_is_rejected` for
+    /// that check's own tests).
+    fn ids_for(layers: &HashMap<super::LayerId, super::LayerEntry>) -> IdGenerator<Layer> {
+        let mut ids = IdGenerator::new();
+        if let Some(highest) = layers.keys().map(|id| id.to_raw()).max() {
+            ids.advance_past(highest);
+        }
+        ids
+    }
+
     fn group_entry(
         name: &str,
         parent: Option<super::LayerId>,
@@ -2080,7 +2545,7 @@ mod tests {
         let mut layers = HashMap::new();
         layers.insert(root, group_entry("cycle", None, vec![root]));
         let repr = TreeReprForTest {
-            ids: aurora_core::IdGenerator::new(),
+            ids: ids_for(&layers),
             layers,
             roots: vec![root],
         };
@@ -2093,7 +2558,7 @@ mod tests {
         // Serde error collapses to one variant) -- so the reason is
         // pinned down here, against the validator itself, rather than
         // against the deserialized message.
-        match super::validate_shape(&repr.layers, &repr.roots) {
+        match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
             Err(DocError::MalformedLayerTree(id)) => assert_eq!(id, root),
             other => unreachable!("expected MalformedLayerTree, got {other:?}"),
         }
@@ -2103,6 +2568,15 @@ mod tests {
     fn deserializing_a_tree_listing_one_layer_under_two_parents_is_rejected() {
         // Not a cycle, but not a tree either: the shared layer gets
         // walked (and composited, and saved) twice.
+        //
+        // *Which* rule refuses it depends on which of the two parents
+        // the walk reaches first, and both orders are worth pinning
+        // because both are real files. `roots` is a `Vec` walked on a
+        // LIFO stack, so listing `[a, b]` reaches `b` first: `shared`
+        // records `a`, so the parent cross-check fires before the
+        // duplicate one ever gets a chance. See
+        // `deserializing_a_layer_reached_from_two_parents_honest_one_first_is_rejected`
+        // for the other order, where the duplicate rule is what fires.
         let a = super::LayerId::from_raw(0);
         let b = super::LayerId::from_raw(1);
         let shared = super::LayerId::from_raw(2);
@@ -2118,7 +2592,7 @@ mod tests {
             ),
         );
         let repr = TreeReprForTest {
-            ids: aurora_core::IdGenerator::new(),
+            ids: ids_for(&layers),
             layers,
             roots: vec![a, b],
         };
@@ -2126,6 +2600,42 @@ mod tests {
             decode_tree(&repr).is_err(),
             "the same layer under two parents must be refused"
         );
+        // Pinned against the validator rather than postcard's own
+        // flattened message, like every neighbouring test.
+        match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
+            Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, shared),
+            other => unreachable!("expected InconsistentLayerParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserializing_a_layer_reached_from_two_parents_honest_one_first_is_rejected() {
+        // The other walk order of the test above: `roots` listed `[b,
+        // a]` reaches `a` first, whose claim on `shared` matches what
+        // `shared` records -- so the parent check passes and it is the
+        // *duplicate* rule that catches `b`'s second claim. This is the
+        // order that guards what the duplicate rule is actually for: a
+        // layer walked, composited, and saved twice.
+        let a = super::LayerId::from_raw(0);
+        let b = super::LayerId::from_raw(1);
+        let shared = super::LayerId::from_raw(2);
+        let mut layers = HashMap::new();
+        layers.insert(a, group_entry("a", None, vec![shared]));
+        layers.insert(b, group_entry("b", None, vec![shared]));
+        layers.insert(shared, pixel_entry("shared", Some(a)));
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![b, a],
+        };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "the same layer under two parents must be refused either way round"
+        );
+        match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
+            Err(DocError::MalformedLayerTree(id)) => assert_eq!(id, shared),
+            other => unreachable!("expected MalformedLayerTree, got {other:?}"),
+        }
     }
 
     /// A chain of `depth` groups, each the sole child of the one above.
@@ -2144,7 +2654,7 @@ mod tests {
             layers.insert(id, group_entry("g", parent, children));
         }
         TreeReprForTest {
-            ids: aurora_core::IdGenerator::new(),
+            ids: ids_for(&layers),
             layers,
             roots: vec![super::LayerId::from_raw(0)],
         }
@@ -2163,7 +2673,7 @@ mod tests {
         );
         // See the cycle test above for why the reason is checked against
         // the validator rather than the deserializer's own message.
-        match super::validate_shape(&repr.layers, &repr.roots) {
+        match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
             Err(DocError::LayerTreeTooDeep { depth, max }) => {
                 assert_eq!(depth, super::MAX_LAYER_TREE_DEPTH + 1);
                 assert_eq!(max, super::MAX_LAYER_TREE_DEPTH);
@@ -2272,5 +2782,1022 @@ mod tests {
             result.is_err(),
             "reparenting within a cyclic chain must be refused, not performed"
         );
+    }
+
+    // --- parent back-links and orphans -------------------------------
+    //
+    // `validate_shape` used to check only that the *downward* walk from
+    // `roots` was a tree. Nothing cross-checked each `LayerEntry`'s own
+    // recorded `parent` against that walk, and nothing noticed an entry
+    // the walk never reached at all -- yet `remove_capturing` and
+    // `reparent` both read that recorded `parent` and then expect to
+    // find the id in the sibling list it names. These craft the trees
+    // where that expectation is false.
+
+    fn pixel_entry(name: &str, parent: Option<super::LayerId>) -> super::LayerEntry {
+        super::LayerEntry::new(
+            name.to_owned(),
+            parent,
+            LayerKind::Pixel { bounds: bounds() },
+        )
+    }
+
+    #[test]
+    fn deserializing_a_root_that_records_a_parent_is_rejected() {
+        // It sits in `roots`, so its real parent is "none" -- but it
+        // claims to live inside `other`, whose `children` never mentions
+        // it. `remove_capturing` would look it up in `other`'s children
+        // and find nothing.
+        let root = super::LayerId::from_raw(0);
+        let other = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(root, pixel_entry("root", Some(other)));
+        layers.insert(other, group_entry("other", None, Vec::new()));
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![root, other],
+        };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a root recording a parent must be refused"
+        );
+        // See the cycle test above for why the reason is pinned against
+        // the validator rather than postcard's own flattened message.
+        match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
+            Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, root),
+            other => unreachable!("expected InconsistentLayerParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserializing_a_child_that_records_the_wrong_group_as_its_parent_is_rejected() {
+        // `leaf` really sits in `a`'s children, but records `b`. Both
+        // groups exist and both are groups, so nothing but the
+        // cross-check catches it.
+        let a = super::LayerId::from_raw(0);
+        let b = super::LayerId::from_raw(1);
+        let leaf = super::LayerId::from_raw(2);
+        let mut layers = HashMap::new();
+        layers.insert(a, group_entry("a", None, vec![leaf]));
+        layers.insert(b, group_entry("b", None, Vec::new()));
+        layers.insert(leaf, pixel_entry("leaf", Some(b)));
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![a, b],
+        };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a child recording the wrong group must be refused"
+        );
+        match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
+            Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, leaf),
+            other => unreachable!("expected InconsistentLayerParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserializing_a_child_that_records_no_parent_at_all_is_rejected() {
+        // The mirror of the root case: it really sits inside `a`, but
+        // records `None`, so `remove_capturing` would look for it among
+        // the tree's own roots.
+        let a = super::LayerId::from_raw(0);
+        let leaf = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(a, group_entry("a", None, vec![leaf]));
+        layers.insert(leaf, pixel_entry("leaf", None));
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![a],
+        };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a child recording no parent must be refused"
+        );
+        match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
+            Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, leaf),
+            other => unreachable!("expected InconsistentLayerParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserializing_a_tree_holding_a_layer_unreachable_from_its_roots_is_rejected() {
+        // In the map, named by nothing: invisible to every traversal in
+        // this project, yet still counted by `len` and still written
+        // back out on save.
+        let root = super::LayerId::from_raw(0);
+        let orphan = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(root, group_entry("root", None, Vec::new()));
+        layers.insert(orphan, pixel_entry("orphan", None));
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![root],
+        };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a layer unreachable from the roots must be refused"
+        );
+        match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
+            Err(DocError::OrphanedLayer(id)) => assert_eq!(id, orphan),
+            other => unreachable!("expected OrphanedLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_orphan_reported_is_the_lowest_numbered_one_not_whichever_hashmap_yields_first() {
+        // Two orphans, so which one gets named is a real choice. It must
+        // not depend on `HashMap`'s own per-process iteration order, or
+        // the same file produces a different error message on every run.
+        // The root is deliberately the *highest* id, so "first in the
+        // map" and "lowest numbered" cannot coincide by accident.
+        let low = super::LayerId::from_raw(1);
+        let high = super::LayerId::from_raw(2);
+        let root = super::LayerId::from_raw(3);
+        let mut layers = HashMap::new();
+        layers.insert(root, group_entry("root", None, Vec::new()));
+        layers.insert(high, pixel_entry("high", None));
+        layers.insert(low, pixel_entry("low", None));
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![root],
+        };
+        // Repeated, because a single run of a `HashMap` walk can agree
+        // with the required answer by luck.
+        for _ in 0..32 {
+            match super::validate_shape(&repr.layers, &repr.roots, None, 1) {
+                Err(DocError::OrphanedLayer(id)) => assert_eq!(id, low),
+                other => unreachable!("expected OrphanedLayer, got {other:?}"),
+            }
+        }
+    }
+
+    // --- the three sites that used to be `unreachable!()` -------------
+    //
+    // Each of these builds an inconsistent tree by hand (struct literal,
+    // only possible from inside this module) rather than through
+    // `decode_tree`, precisely because the validator above now refuses
+    // that shape at the door. What is under test here is the runtime
+    // site itself: that it *returns* rather than aborting the process,
+    // which under this workspace's `panic = "abort"` release profile is
+    // what an `unreachable!()` would have done.
+
+    #[test]
+    fn removing_a_layer_whose_recorded_parent_is_a_pixel_layer_errors_rather_than_aborting() {
+        let victim = super::LayerId::from_raw(0);
+        let not_a_group = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(victim, pixel_entry("victim", Some(not_a_group)));
+        layers.insert(not_a_group, pixel_entry("not a group", None));
+        let mut tree = LayerTree {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![not_a_group],
+        };
+        match tree.remove(victim) {
+            Err(DocError::NotAGroup(id)) => assert_eq!(id, not_a_group),
+            other => unreachable!("expected NotAGroup, got {other:?}"),
+        }
+        assert!(
+            tree.contains(victim),
+            "a refused remove must leave the tree alone"
+        );
+    }
+
+    #[test]
+    fn removing_a_layer_its_recorded_parent_does_not_list_errors_rather_than_aborting() {
+        let victim = super::LayerId::from_raw(0);
+        let group = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(victim, pixel_entry("victim", Some(group)));
+        // A real group -- it just does not list `victim` as a child.
+        layers.insert(group, group_entry("group", None, Vec::new()));
+        let mut tree = LayerTree {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![group],
+        };
+        match tree.remove(victim) {
+            Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, victim),
+            other => unreachable!("expected InconsistentLayerParent, got {other:?}"),
+        }
+        assert!(
+            tree.contains(victim),
+            "a refused remove must leave the tree alone"
+        );
+    }
+
+    #[test]
+    fn reparenting_a_layer_whose_recorded_parent_is_a_pixel_layer_errors_rather_than_aborting() {
+        let victim = super::LayerId::from_raw(0);
+        let not_a_group = super::LayerId::from_raw(1);
+        let destination = super::LayerId::from_raw(2);
+        let mut layers = HashMap::new();
+        layers.insert(victim, pixel_entry("victim", Some(not_a_group)));
+        layers.insert(not_a_group, pixel_entry("not a group", None));
+        layers.insert(destination, group_entry("destination", None, Vec::new()));
+        let mut tree = LayerTree {
+            ids: aurora_core::IdGenerator::new(),
+            layers,
+            roots: vec![not_a_group, destination],
+        };
+        match tree.reparent(victim, Some(destination), 0) {
+            Err(DocError::NotAGroup(id)) => assert_eq!(id, not_a_group),
+            other => unreachable!("expected NotAGroup, got {other:?}"),
+        }
+        // The error is returned before the first mutation, so the move
+        // must not be half-applied.
+        assert_eq!(tree.parent(victim), Some(not_a_group));
+        assert_eq!(tree.children(destination), Some([].as_slice()));
+        assert_eq!(tree.roots(), &[not_a_group, destination]);
+    }
+
+    #[test]
+    fn every_legitimate_remove_and_reparent_on_a_decoded_tree_still_succeeds() {
+        // The positive control for the three tests above: the new checks
+        // must refuse only genuinely broken trees, never real usage. A
+        // three-level tree is decoded from bytes (so it goes through the
+        // validator), then every id in it is moved and removed through
+        // the ordinary public API.
+        let outer = super::LayerId::from_raw(0);
+        let inner = super::LayerId::from_raw(1);
+        let deep = super::LayerId::from_raw(2);
+        let sibling = super::LayerId::from_raw(3);
+        let mut layers = HashMap::new();
+        layers.insert(outer, group_entry("outer", None, vec![inner]));
+        layers.insert(inner, group_entry("inner", Some(outer), vec![deep]));
+        layers.insert(deep, pixel_entry("deep", Some(inner)));
+        layers.insert(sibling, pixel_entry("sibling", None));
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![outer, sibling],
+        };
+        let mut tree = match decode_tree(&repr) {
+            Ok(tree) => tree,
+            Err(message) => unreachable!("a well-formed tree must still decode: {message}"),
+        };
+
+        // Every legal destination, including back to root.
+        for (id, destination) in [
+            (deep, None),
+            (deep, Some(inner)),
+            (sibling, Some(outer)),
+            (sibling, Some(inner)),
+            (sibling, None),
+            (inner, None),
+            (inner, Some(outer)),
+        ] {
+            if let Err(err) = tree.reparent(id, destination, 0) {
+                unreachable!("reparenting {id:?} under {destination:?} must succeed: {err:?}");
+            }
+        }
+
+        // Then remove every id, innermost first, so each one is removed
+        // from a different kind of sibling list.
+        for id in [deep, sibling, inner, outer] {
+            if let Err(err) = tree.remove(id) {
+                unreachable!("removing {id:?} must succeed: {err:?}");
+            }
+        }
+        assert!(tree.is_empty());
+        assert!(tree.roots().is_empty());
+    }
+
+    // --- the id allocator, not the shape ------------------------------
+    //
+    // A tree can be a perfectly well-formed tree and still be unsafe to
+    // *add to*: `IdGenerator` is `Deserialize`, so a crafted manifest
+    // can carry a counter that has already been used. Every check above
+    // passes on such a file. These cover both halves of the defence --
+    // refusing the file, and refusing the insert.
+
+    #[test]
+    fn a_manifest_whose_id_counter_has_fallen_behind_is_rejected() {
+        // Shape-wise flawless: one group at the root holding one pixel
+        // layer, every recorded parent correct, nothing orphaned. The
+        // only thing wrong is the counter: it says the next id to hand
+        // out is 1, while layer 1 is right there in the map.
+        let target = super::LayerId::from_raw(1);
+        let held = super::LayerId::from_raw(0);
+        let mut layers = HashMap::new();
+        layers.insert(target, group_entry("target", None, vec![held]));
+        layers.insert(held, pixel_entry("held", Some(target)));
+        let roots = vec![target];
+
+        // The shape validator has no complaint -- that is the point.
+        if let Err(err) = super::validate_shape(&layers, &roots, None, 1) {
+            unreachable!("the shape is valid; only the counter is stale: {err:?}");
+        }
+
+        let mut stale = IdGenerator::new();
+        let _ = stale.next_id(); // counter now 1, and layer 1 exists.
+        match super::validate_id_allocator(&stale, &layers) {
+            Err(DocError::StaleLayerIdGenerator { next, existing }) => {
+                assert_eq!(next, 1);
+                assert_eq!(existing, target);
+            }
+            other => unreachable!("expected StaleLayerIdGenerator, got {other:?}"),
+        }
+
+        // And it is refused at the door, through real bytes. (The reason
+        // is pinned against the validator above rather than this
+        // message, for the same reason every neighbouring test does it
+        // that way: postcard flattens a `TryFrom` error to one opaque
+        // string.)
+        let repr = TreeReprForTest {
+            ids: stale,
+            layers,
+            roots,
+        };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a manifest whose id counter has already been used must be refused"
+        );
+    }
+
+    #[test]
+    fn a_counter_exactly_one_past_the_highest_id_is_accepted() {
+        // The boundary, in the direction that must keep working: this is
+        // precisely where a real generator sits after allocating both
+        // ids, so an off-by-one here would refuse every genuine file.
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.add_pixel_layer("leaf", bounds(), Some(group)) {
+            unreachable!("{err:?}");
+        }
+        let bytes = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = postcard::from_bytes::<LayerTree>(&bytes) {
+            unreachable!("a tree written by this very build must decode: {err}");
+        }
+    }
+
+    #[test]
+    fn a_stale_counter_cannot_silently_destroy_the_layer_already_under_that_id() {
+        // The whole reason the counter is checked at all, reproduced as
+        // the sequence it would actually take. This builds the tree the
+        // rejected manifest above would have produced -- by struct
+        // literal, which is the only way to get one now -- and then does
+        // the single ordinary user action that used to weaponise it.
+        //
+        // Before: `add_group` generated id 1 (the stale counter), and
+        // `HashMap::insert` silently replaced the group already under it
+        // -- destroying it, orphaning the pixel layer it held, and then
+        // pushing id 1 into the *replacement's* own `children`, so the
+        // new group listed itself as its own child. That is a cycle
+        // built after deserialization, which the one-shot shape
+        // validator never re-runs on, and every downward walk
+        // (`paint_order` here, `aurora-app`'s `resolve_tile` in the real
+        // app) then recurses forever.
+        let target = super::LayerId::from_raw(1);
+        let held = super::LayerId::from_raw(0);
+        let mut layers = HashMap::new();
+        layers.insert(target, group_entry("target", None, vec![held]));
+        layers.insert(held, pixel_entry("held", Some(target)));
+        let mut stale = IdGenerator::new();
+        let _ = stale.next_id();
+        let mut tree = LayerTree {
+            ids: stale,
+            layers,
+            roots: vec![target],
+        };
+
+        match tree.add_group("new", None) {
+            Err(DocError::LayerIdCollision(id)) => assert_eq!(id, target),
+            other => unreachable!("expected LayerIdCollision, got {other:?}"),
+        }
+
+        // Nothing lost, nothing corrupted: the refused insert leaves the
+        // tree exactly as it was.
+        assert!(tree.contains(target), "the existing group must survive");
+        assert!(tree.contains(held), "its child must not be orphaned");
+        assert_eq!(tree.children(target), Some([held].as_slice()));
+        assert_eq!(tree.roots(), &[target]);
+        assert_eq!(
+            tree.len(),
+            2,
+            "a refused insert must not add a layer either"
+        );
+        assert_eq!(
+            tree.paint_order(),
+            vec![held],
+            "the pixel layer must still reach the composite"
+        );
+    }
+
+    // --- names with no entry behind them ------------------------------
+    //
+    // The first round of this validation deliberately *skipped* an id
+    // named by `roots` or by a group's `children` with no entry of its
+    // own, reasoning that every traversal here already tolerates one. The
+    // tests below are why that is now a rejection instead: the skip left
+    // the named-but-absent id invisible to `validate_id_allocator`, which
+    // only ever looked at ids actually present.
+
+    #[test]
+    fn a_manifest_naming_a_layer_it_does_not_carry_is_rejected() {
+        // The exploit, at the door. Shape-wise this passes every other
+        // rule: one group at the root, its recorded parent correct,
+        // nothing orphaned (`seen.len() == layers.len() == 1`). And the
+        // counter is exactly where a real generator would sit for the
+        // ids *present* -- one past the highest, so
+        // `validate_id_allocator` has nothing to say either. The only
+        // defect is that the group names a child, id 1, that the file
+        // does not carry.
+        let group = super::LayerId::from_raw(0);
+        let ghost = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(group, group_entry("group", None, vec![ghost]));
+        let roots = vec![group];
+
+        let ids = ids_for(&layers);
+        assert_eq!(
+            ids.peek_next(),
+            1,
+            "the counter is one past the highest id present -- the whole problem"
+        );
+        if let Err(err) = super::validate_id_allocator(&ids, &layers) {
+            unreachable!("the allocator check cannot see a named-but-absent id: {err:?}");
+        }
+
+        match super::validate_shape(&layers, &roots, None, 1) {
+            Err(DocError::DanglingLayerReference(id)) => assert_eq!(id, ghost),
+            other => unreachable!("expected DanglingLayerReference, got {other:?}"),
+        }
+
+        // And refused at the door, through real bytes. (The reason is
+        // pinned against the validator above rather than this message,
+        // for the same reason every neighbouring test does it that way:
+        // postcard flattens a `TryFrom` error to one opaque string.)
+        let repr = TreeReprForTest { ids, layers, roots };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a manifest naming a layer it does not carry must be refused"
+        );
+    }
+
+    #[test]
+    fn a_manifest_whose_roots_name_a_layer_it_does_not_carry_is_rejected() {
+        // The same defect in the other sibling list. `roots` is walked by
+        // its own loop, so it needs its own coverage.
+        let present = super::LayerId::from_raw(0);
+        let ghost = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(present, pixel_entry("present", None));
+        let roots = vec![present, ghost];
+
+        match super::validate_shape(&layers, &roots, None, 1) {
+            Err(DocError::DanglingLayerReference(id)) => assert_eq!(id, ghost),
+            other => unreachable!("expected DanglingLayerReference, got {other:?}"),
+        }
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots,
+        };
+        assert!(decode_tree(&repr).is_err());
+    }
+
+    #[test]
+    fn the_dangling_reference_a_manifest_names_cannot_be_handed_out_by_the_id_counter() {
+        // What refusing the file above actually prevents, spelled out as
+        // the sequence a user would perform: open a `.aur` someone sent,
+        // click "New Layer" once, save, reopen. This builds the tree the
+        // rejected manifest *would* have produced -- by struct literal,
+        // which is the only way to get one now -- and shows that the very
+        // next ordinary add lands on the named-but-absent id and leaves
+        // the document unopenable by Aurora itself.
+        //
+        // Note what does *not* save this: the counter is not stale (it is
+        // correctly one past every id present) and `insert`'s collision
+        // guard does not fire (nothing is under id 1), so both of the
+        // previous round's defences pass the add through. The defect had
+        // to be refused at the manifest, which is what
+        // `a_manifest_naming_a_layer_it_does_not_carry_is_rejected`
+        // covers.
+        let group = super::LayerId::from_raw(0);
+        let ghost = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(group, group_entry("group", None, vec![ghost]));
+        let mut tree = LayerTree {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![group],
+        };
+
+        let fresh = match tree.add_group("new", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("nothing here refuses the add: {err:?}"),
+        };
+        assert_eq!(
+            fresh, ghost,
+            "the counter hands out exactly the id the group already names"
+        );
+        // Simultaneously a root recording no parent, and a child of
+        // `group` -- the two-parent shape `validate_shape` forbids.
+        assert_eq!(tree.roots(), &[fresh, group]);
+        assert_eq!(tree.children(group), Some([ghost].as_slice()));
+        assert_eq!(tree.parent(ghost), None);
+
+        let bytes = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            postcard::from_bytes::<LayerTree>(&bytes).is_err(),
+            "Aurora would no longer be able to open its own save"
+        );
+    }
+
+    #[test]
+    fn every_tree_this_type_can_build_still_decodes_after_dangling_ids_became_an_error() {
+        // The direction that must keep working. A dangling reference is
+        // now refused on the reasoning that no tree this project *writes*
+        // can contain one, so exercise the paths that write sibling
+        // lists -- add, remove (which detaches a whole subtree), reparent,
+        // and restore (undo of that remove) -- and require the result to
+        // round-trip.
+        let mut tree = LayerTree::new();
+        let outer = match tree.add_group("outer", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let inner = match tree.add_group("inner", Some(outer)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let leaf = match tree.add_pixel_layer("leaf", bounds(), Some(inner)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let sibling = match tree.add_pixel_layer("sibling", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.reparent(leaf, Some(outer), 0) {
+            unreachable!("{err:?}");
+        }
+        let removed = match tree.remove_capturing(inner) {
+            Ok(removed) => removed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let re_encode = |tree: &LayerTree| match postcard::to_allocvec(tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // After the remove: `outer`'s children no longer name `inner`.
+        if let Err(err) = postcard::from_bytes::<LayerTree>(&re_encode(&tree)) {
+            unreachable!("a tree with a subtree removed must still decode: {err}");
+        }
+        if let Err(err) = tree.restore(removed) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = postcard::from_bytes::<LayerTree>(&re_encode(&tree)) {
+            unreachable!("a tree with a subtree restored must still decode: {err}");
+        }
+        assert_eq!(tree.roots(), &[sibling, outer]);
+    }
+
+    // --- restore: cross-references, in both directions -----------------
+
+    #[test]
+    fn restoring_a_subtree_a_live_group_already_names_is_refused() {
+        // The mirror of
+        // `restoring_a_subtree_whose_child_names_a_live_layer_is_refused`
+        // below: there, the *incoming* group named a live id; here, a
+        // *live* group already names an *incoming* one. Same two-parent
+        // shape after the merge, opposite direction, so it needs its own
+        // check -- one shared implementation called both ways rather than
+        // two hand-written ones that have to be kept in step.
+        //
+        // Reaching it needs a live tree that already carries a dangling
+        // reference, which is exactly what `validate_shape` now refuses
+        // at the door; built here by struct literal, the only way left.
+        let host = super::LayerId::from_raw(0);
+        let ghost = super::LayerId::from_raw(1);
+        let mut layers = HashMap::new();
+        layers.insert(host, group_entry("host", None, vec![ghost]));
+        let mut tree = LayerTree {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![host],
+        };
+
+        let removed = super::RemovedSubtree {
+            root: ghost,
+            parent: None,
+            index: 0,
+            entries: vec![(ghost, pixel_entry("ghost", None))],
+        };
+        match tree.restore(removed) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, ghost),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+        // Refused before the first mutation.
+        assert!(!tree.contains(ghost), "a refused restore must add nothing");
+        assert_eq!(tree.roots(), &[host]);
+        assert_eq!(tree.len(), 1);
+    }
+
+    // --- opacity ranges, not shape ------------------------------------
+
+    #[test]
+    fn a_manifest_carrying_a_nonsense_opacity_is_rejected() {
+        // `opacity`/`fill_opacity` are plain `f32`s on the wire, and
+        // `set_opacity`'s `0.0..=1.0` guard only covers live edits -- so
+        // until this check a crafted file handed the compositor whatever
+        // it liked. Not a crash like the shape defects above; a rendering
+        // -correctness one, the same "trust a number from an untrusted
+        // file" class.
+        for bad in [f32::NAN, -1.0, 1.0e38, f32::INFINITY] {
+            let id = super::LayerId::from_raw(0);
+            let mut entry = pixel_entry("a", None);
+            entry.opacity = bad;
+            let mut layers = HashMap::new();
+            layers.insert(id, entry);
+            match super::validate_opacities(&layers) {
+                Err(DocError::OpacityOutOfRange(_)) => {}
+                other => unreachable!("expected OpacityOutOfRange for {bad}, got {other:?}"),
+            }
+            let repr = TreeReprForTest {
+                ids: ids_for(&layers),
+                layers,
+                roots: vec![id],
+            };
+            assert!(
+                decode_tree(&repr).is_err(),
+                "a manifest carrying opacity {bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manifest_carrying_a_nonsense_fill_opacity_is_rejected() {
+        // The second field, which has its own slider and its own defect.
+        let id = super::LayerId::from_raw(0);
+        let mut entry = pixel_entry("a", None);
+        entry.fill_opacity = f32::NAN;
+        let mut layers = HashMap::new();
+        layers.insert(id, entry);
+        match super::validate_opacities(&layers) {
+            Err(DocError::OpacityOutOfRange(value)) => assert!(value.is_nan()),
+            other => unreachable!("expected OpacityOutOfRange, got {other:?}"),
+        }
+        let repr = TreeReprForTest {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![id],
+        };
+        assert!(decode_tree(&repr).is_err());
+    }
+
+    #[test]
+    fn the_opacity_range_boundaries_are_both_accepted() {
+        // The direction that must keep working: 0.0 and 1.0 are ordinary
+        // values a real document carries (a fully hidden layer, and every
+        // freshly created one), so an exclusive bound here would refuse
+        // genuine files.
+        let mut tree = LayerTree::new();
+        let a = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match tree.add_pixel_layer("b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_opacity(a, 0.0) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_fill_opacity(b, 1.0) {
+            unreachable!("{err:?}");
+        }
+        let bytes = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = postcard::from_bytes::<LayerTree>(&bytes) {
+            unreachable!("0.0 and 1.0 are ordinary opacities: {err}");
+        }
+    }
+
+    #[test]
+    fn restoring_a_subtree_carrying_a_nonsense_opacity_is_refused() {
+        // The splice path is held to the same bar as the manifest path,
+        // through the same validator -- a crafted history journal's own
+        // `Restore` op is the second way an untrusted `f32` reaches a
+        // live tree.
+        let mut tree = LayerTree::new();
+        let ghost = super::LayerId::from_raw(7);
+        let mut entry = pixel_entry("ghost", None);
+        entry.opacity = f32::NAN;
+        let removed = super::RemovedSubtree {
+            root: ghost,
+            parent: None,
+            index: 0,
+            entries: vec![(ghost, entry)],
+        };
+        match tree.restore(removed) {
+            Err(DocError::OpacityOutOfRange(value)) => assert!(value.is_nan()),
+            other => unreachable!("expected OpacityOutOfRange, got {other:?}"),
+        }
+        assert!(!tree.contains(ghost), "a refused restore must add nothing");
+        assert_eq!(tree.len(), 0);
+    }
+
+    // --- reparent's own stale sibling list ----------------------------
+
+    #[test]
+    fn reparenting_a_layer_its_recorded_parent_does_not_list_errors_rather_than_moving_it() {
+        // The counterpart to
+        // `removing_a_layer_its_recorded_parent_does_not_list_errors_rather_than_aborting`.
+        // `reparent` used to `retain` the id out of the old sibling list,
+        // which is a silent no-op when it is not there -- and then went
+        // ahead and attached it to the new parent anyway. On a tree where
+        // the old parent *did* still list it under some other name, that
+        // manufactures the "same layer under two parents" shape
+        // `validate_shape` exists to forbid, through the public API.
+        let victim = super::LayerId::from_raw(0);
+        let group = super::LayerId::from_raw(1);
+        let destination = super::LayerId::from_raw(2);
+        let mut layers = HashMap::new();
+        layers.insert(victim, pixel_entry("victim", Some(group)));
+        // A real group -- it just does not list `victim` as a child.
+        layers.insert(group, group_entry("group", None, Vec::new()));
+        layers.insert(destination, group_entry("destination", None, Vec::new()));
+        let mut tree = LayerTree {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![group, destination],
+        };
+        match tree.reparent(victim, Some(destination), 0) {
+            Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, victim),
+            other => unreachable!("expected InconsistentLayerParent, got {other:?}"),
+        }
+        // Refused before the first mutation, so nothing moved anywhere.
+        assert_eq!(tree.parent(victim), Some(group));
+        assert_eq!(tree.children(group), Some([].as_slice()));
+        assert_eq!(tree.children(destination), Some([].as_slice()));
+        assert_eq!(tree.roots(), &[group, destination]);
+    }
+
+    // --- restore: the live tree, not just the incoming subtree --------
+
+    #[test]
+    fn restoring_a_subtree_whose_child_names_a_live_layer_is_refused() {
+        // The incoming subtree is coherent read on its own -- the child
+        // id simply names nothing inside it, which every traversal here
+        // treats as a harmless dangling reference. It stops being
+        // harmless the instant the two maps are merged: the live layer
+        // it names is then reachable from its real parent *and* from the
+        // spliced-in group.
+        let mut tree = LayerTree::new();
+        let live = match tree.add_pixel_layer("live", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let thief = super::LayerId::from_raw(9);
+        let removed = super::RemovedSubtree {
+            root: thief,
+            parent: None,
+            index: 0,
+            entries: vec![(thief, group_entry("thief", None, vec![live]))],
+        };
+        match tree.restore(removed) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, live),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+        assert_eq!(tree.roots(), &[live]);
+        assert!(!tree.contains(thief), "a refused restore must add nothing");
+    }
+
+    #[test]
+    fn restoring_a_subtree_carrying_an_id_the_live_tree_already_holds_is_refused() {
+        // The third `MalformedRemovedSubtree` branch (the other two --
+        // an id carried twice, and a missing declared root -- are
+        // covered in `history.rs`). Without it, the splice would replace
+        // a live layer wholesale.
+        let mut tree = LayerTree::new();
+        let live = match tree.add_pixel_layer("live", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let removed = super::RemovedSubtree {
+            root: live,
+            parent: None,
+            index: 0,
+            entries: vec![(live, pixel_entry("impostor", None))],
+        };
+        match tree.restore(removed) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, live),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+        assert_eq!(tree.name(live), Some("live"), "the live layer must survive");
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn restoring_a_subtree_advances_the_id_generator_past_every_id_it_brings_back() {
+        // A subtree can carry ids this tree never allocated -- that is
+        // exactly the shape `History::replay` produces, rebuilding from
+        // `LayerTree::new()` (counter at 0) while every restored layer
+        // keeps its original id. Without this, the next `add_pixel_layer`
+        // hands out an id a restored layer already holds.
+        let mut tree = LayerTree::new();
+        let high = super::LayerId::from_raw(500);
+        let removed = super::RemovedSubtree {
+            root: high,
+            parent: None,
+            index: 0,
+            entries: vec![(high, pixel_entry("high", None))],
+        };
+        if let Err(err) = tree.restore(removed) {
+            unreachable!("an honest subtree must restore: {err:?}");
+        }
+        let next = match tree.add_pixel_layer("next", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_ne!(next, high, "a fresh id must not alias a restored one");
+        assert!(next.to_raw() > high.to_raw());
+        if let Err(err) = tree.validate() {
+            unreachable!("the resulting tree must pass its own validator: {err:?}");
+        }
+    }
+
+    /// A `RemovedSubtree` holding a chain of `depth` fresh groups, ids
+    /// running from `first_raw`, with `parent` above the first —
+    /// `restoring_a_subtree_counts_depth_from_where_it_is_spliced_in`'s
+    /// fixture.
+    fn spliced_chain(
+        first_raw: u64,
+        depth: u64,
+        parent: Option<super::LayerId>,
+    ) -> super::RemovedSubtree {
+        let mut entries = Vec::new();
+        for level in 0..depth {
+            let id = super::LayerId::from_raw(first_raw + level);
+            let children = if level + 1 < depth {
+                vec![super::LayerId::from_raw(first_raw + level + 1)]
+            } else {
+                Vec::new()
+            };
+            let above = if level == 0 {
+                parent
+            } else {
+                Some(super::LayerId::from_raw(first_raw + level - 1))
+            };
+            entries.push((id, group_entry("spliced", above, children)));
+        }
+        super::RemovedSubtree {
+            root: super::LayerId::from_raw(first_raw),
+            parent,
+            index: 0,
+            entries,
+        }
+    }
+
+    #[test]
+    fn restoring_a_subtree_counts_depth_from_where_it_is_spliced_in() {
+        // `restore` used to start the depth budget at 1 for the incoming
+        // subtree regardless of how deep the live `parent` already sat,
+        // so two individually-legal splices could stack past
+        // `MAX_LAYER_TREE_DEPTH` between them.
+        let mut tree = LayerTree::new();
+        let mut deepest: Option<super::LayerId> = None;
+        for level in 0..250 {
+            deepest = match tree.add_group(format!("g{level}"), deepest) {
+                Ok(id) => Some(id),
+                Err(err) => unreachable!("{err:?}"),
+            };
+        }
+        // 250 groups, so `deepest` sits at depth 250.
+
+        // 250 + 7 = 257, one past the limit.
+        match tree.restore(spliced_chain(1_000, 7, deepest)) {
+            Err(DocError::LayerTreeTooDeep { depth, max }) => {
+                assert_eq!(depth, 257);
+                assert_eq!(max, super::MAX_LAYER_TREE_DEPTH);
+            }
+            other => unreachable!("expected LayerTreeTooDeep, got {other:?}"),
+        }
+
+        // 250 + 6 = 256, exactly at it: still allowed.
+        if let Err(err) = tree.restore(spliced_chain(2_000, 6, deepest)) {
+            unreachable!("a splice landing exactly at the limit must succeed: {err:?}");
+        }
+    }
+
+    // --- the wire format did not move --------------------------------
+
+    /// A single-layer tree, encoded by the build immediately *before*
+    /// this round's validation changes. One map entry, so the bytes are
+    /// fully deterministic -- see
+    /// `encoding_a_two_layer_tree_still_matches_one_of_the_pre_change_orderings`
+    /// for why more than one entry is not.
+    const GOLDEN_ONE_LAYER: &[u8] = &[
+        1, 1, 0, 4, 79, 110, 108, 121, 0, 0, 0, 0, 10, 10, 0, 0, 128, 63, 0, 0, 128, 63, 0, 1, 0,
+        0, 0, 0, 1, 0,
+    ];
+
+    /// The same fixed two-layer tree, in the two orderings `HashMap` can
+    /// serialize its `layers` map in.
+    const GOLDEN_TWO_LAYER_GROUP_FIRST: &[u8] = &[
+        2, 2, 0, 5, 71, 114, 111, 117, 112, 0, 1, 1, 1, 0, 0, 128, 63, 0, 0, 128, 63, 0, 1, 0, 0,
+        0, 0, 1, 5, 73, 110, 110, 101, 114, 1, 0, 0, 0, 0, 10, 10, 0, 0, 128, 63, 0, 0, 128, 63, 0,
+        1, 0, 0, 0, 0, 1, 0,
+    ];
+    const GOLDEN_TWO_LAYER_INNER_FIRST: &[u8] = &[
+        2, 2, 1, 5, 73, 110, 110, 101, 114, 1, 0, 0, 0, 0, 10, 10, 0, 0, 128, 63, 0, 0, 128, 63, 0,
+        1, 0, 0, 0, 0, 0, 5, 71, 114, 111, 117, 112, 0, 1, 1, 1, 0, 0, 128, 63, 0, 0, 128, 63, 0,
+        1, 0, 0, 0, 0, 1, 0,
+    ];
+
+    #[test]
+    fn encoding_a_single_layer_tree_matches_the_pre_change_golden_bytes() {
+        // Byte-for-byte against a literal captured from the build before
+        // this round -- a stronger claim than "it still round-trips",
+        // which would stay green even if the encoding had shifted
+        // wholesale (ADR 0009's backward-compatibility policy is about
+        // files written by *older* builds).
+        let mut tree = LayerTree::new();
+        if let Err(err) = tree.add_pixel_layer("Only", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let bytes = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(bytes, GOLDEN_ONE_LAYER);
+    }
+
+    #[test]
+    fn encoding_a_two_layer_tree_still_matches_one_of_the_pre_change_orderings() {
+        // `layers` is a `HashMap`, and `postcard` writes a map in
+        // iteration order -- which `RandomState` reshuffles per process.
+        // So a two-entry tree has two legal encodings, both captured
+        // pre-change; asserting a single literal here would be a flaky
+        // test, not a stricter one.
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("Group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.add_pixel_layer("Inner", bounds(), Some(group)) {
+            unreachable!("{err:?}");
+        }
+        let bytes = match postcard::to_allocvec(&tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            bytes == GOLDEN_TWO_LAYER_GROUP_FIRST || bytes == GOLDEN_TWO_LAYER_INNER_FIRST,
+            "the wire format moved: {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn bytes_written_by_the_pre_change_build_still_decode() {
+        // The other direction, and the one that actually matters to a
+        // user: files this project already wrote must still open.
+        for golden in [GOLDEN_TWO_LAYER_GROUP_FIRST, GOLDEN_TWO_LAYER_INNER_FIRST] {
+            let tree = match postcard::from_bytes::<LayerTree>(golden) {
+                Ok(tree) => tree,
+                Err(err) => unreachable!("a pre-change file must still load: {err:?}"),
+            };
+            assert_eq!(tree.len(), 2);
+            let roots = tree.roots().to_vec();
+            let [group] = roots.as_slice() else {
+                unreachable!("expected exactly one root, got {roots:?}");
+            };
+            assert_eq!(tree.name(*group), Some("Group"));
+            let children = match tree.children(*group) {
+                Some(children) => children.to_vec(),
+                None => unreachable!("the root must still be a group"),
+            };
+            let [inner] = children.as_slice() else {
+                unreachable!("expected exactly one child, got {children:?}");
+            };
+            assert_eq!(tree.name(*inner), Some("Inner"));
+            assert_eq!(tree.bounds(*inner), Some(bounds()));
+            assert_eq!(tree.paint_order(), vec![*inner]);
+        }
+
+        let one = match postcard::from_bytes::<LayerTree>(GOLDEN_ONE_LAYER) {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("a pre-change file must still load: {err:?}"),
+        };
+        assert_eq!(one.len(), 1);
+        assert_eq!(one.roots().len(), 1);
     }
 }

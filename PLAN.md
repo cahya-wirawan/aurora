@@ -6332,7 +6332,9 @@ structural design work.
   **A third independent read of the hardened code (2026-08-24, same
   round) found three more gaps — none reachable from a live code path
   today, so none blocked this round, but named here rather than left
-  for someone to rediscover:**
+  for someone to rediscover.** The first two are now closed (0.49.1,
+  addenda inline below); the third is still open, as is a fourth named
+  at the end of this list.
 
   - **`validate_shape` checks `roots`/`children` but never
     `LayerEntry::parent`.** Three `unreachable!()` sites —
@@ -6356,6 +6358,55 @@ structural design work.
     indistinguishable from the `panic!` already denied there, and this
     is exactly the kind of place deserialized input defeats the
     assumption it relies on.)
+
+    **Addendum 2026-08-24 (0.49.1) — closed.** `validate_shape`
+    (`crates/aurora-doc/src/tree.rs`) now takes a third argument,
+    `root_parent: Option<LayerId>`, and enforces two more rules on the
+    same explicit-stack walk it already did: every entry's own recorded
+    `parent` must equal where the walk actually found it
+    (`DocError::InconsistentLayerParent`), and every entry in the
+    `layers` map must be reached at all
+    (`DocError::OrphanedLayer`, reporting the lowest-numbered
+    unreachable id so the error does not depend on `HashMap` iteration
+    order). Because a child is only ever descended into *through* some
+    group's `children`, "recorded equals actual" also proves the
+    recorded parent exists and is a group — exactly the assumption the
+    three sites made. The duplicate/cycle check deliberately stays
+    *before* the new parent check, so a self-referencing group still
+    reports `MalformedLayerTree` rather than the new variant.
+    All three named `unreachable!()`s are gone regardless of the
+    validator: `remove_capturing`'s two became a plain `?` and a
+    `DocError::InconsistentLayerParent` return, and `reparent`'s
+    old-parent one became a plain `?` — so the abort is impossible by
+    construction, not merely unreachable by argument. The two
+    `unreachable!()`s in `insert` and in `reparent`'s trailing
+    `get_mut`/new-parent lookup are deliberately left, with a comment
+    saying why: each re-reads something checked a few lines above with
+    no intervening mutation and no deserialized input involved, and the
+    two in `reparent` sit *after* the first mutation, where returning
+    `Err` would trade an impossible abort for a reachable half-applied
+    move. Evidence: `tree.rs` tests
+    `deserializing_a_root_that_records_a_parent_is_rejected`,
+    `deserializing_a_child_that_records_the_wrong_group_as_its_parent_is_rejected`,
+    `deserializing_a_child_that_records_no_parent_at_all_is_rejected`,
+    `deserializing_a_tree_holding_a_layer_unreachable_from_its_roots_is_rejected`,
+    `the_orphan_reported_is_the_lowest_numbered_one_not_whichever_hashmap_yields_first`,
+    plus one per replaced site
+    (`removing_a_layer_whose_recorded_parent_is_a_pixel_layer_errors_rather_than_aborting`,
+    `removing_a_layer_its_recorded_parent_does_not_list_errors_rather_than_aborting`,
+    `reparenting_a_layer_whose_recorded_parent_is_a_pixel_layer_errors_rather_than_aborting`)
+    and a positive control
+    (`every_legitimate_remove_and_reparent_on_a_decoded_tree_still_succeeds`).
+    Wire format unmoved, pinned by golden byte literals captured from
+    the pre-change build
+    (`encoding_a_single_layer_tree_matches_the_pre_change_golden_bytes`,
+    `encoding_a_two_layer_tree_still_matches_one_of_the_pre_change_orderings`,
+    `bytes_written_by_the_pre_change_build_still_decode`). The
+    parenthetical suggestion of `unreachable = "deny"` in the
+    workspace clippy table was **not** taken — three `unreachable!()`s
+    remain by design, so denying the lint would mean three
+    `#[allow]`s; left as a real, open judgement call rather than
+    silently dropped.
   - **`History::replay()` rebuilds a `LayerTree` from a journal without
     running it through `validate_shape` at all.** The `.aur` container's
     `history` entry is exactly as untrusted as its `manifest` entry —
@@ -6371,6 +6422,37 @@ structural design work.
     `validate_shape` (or equivalent) on the tree `replay()` produces, or
     document plainly that `replay()` must never be called on a
     `History` built from `load_journal` until it does.
+
+    **Addendum 2026-08-24 (0.49.1) — closed.** Both halves, sharing one
+    implementation with the manifest path rather than a second
+    independently-maintained check. `LayerTree::restore` — the one op
+    that splices deserialized `LayerEntry` values into a live tree —
+    now runs the *same* `validate_shape` on the incoming subtree
+    (`roots = &[removed.root]`, `root_parent = removed.parent`) after
+    three cheap coherence checks of its own (a duplicate id within the
+    capture, an incoming id colliding with a live one, or the declared
+    root missing from `entries`, all
+    `DocError::MalformedRemovedSubtree`); every check runs before the
+    first mutation, so a refused restore changes nothing. And
+    `History::replay()` ends with `tree.validate()?`, which is
+    literally `validate_shape(&self.layers, &self.roots, None)` — the
+    manifest path's own call. That second layer is not redundant: a
+    journal can name, in one subtree's `children`, an id an *earlier*
+    op already placed elsewhere, which `restore` skips as a dangling
+    reference because it is not part of the incoming subtree, and only
+    a walk of the finished tree catches. Evidence: `history.rs` tests
+    `replaying_a_journal_whose_restored_root_records_the_wrong_parent_errors`,
+    `replaying_a_journal_whose_restored_subtree_hides_an_unreachable_entry_errors`,
+    `replaying_a_journal_whose_restored_subtree_carries_the_same_id_twice_errors`,
+    `replaying_a_journal_whose_restored_subtree_is_missing_its_own_root_errors`,
+    `replaying_a_journal_whose_ops_are_each_valid_but_whose_result_is_not_errors`,
+    and the positive control
+    `replaying_an_honest_crafted_journal_still_succeeds`; the
+    pre-existing `load_journal_replays_into_the_same_tree_shape_as_the_original`
+    and the whole `replay_*` family pass unmodified.
+    `load_journal`'s own doc comment now says plainly that it
+    deserializes without validating, and that `replay` is where the
+    shape bar is enforced.
   - **`Rect.x`/`Rect.y` (`i64`) are unchecked where `width`/`height`
     now are.** `tile_grid` bounds a layer's extent but not its origin;
     `read_layer_window` and `Rect::right`/`bottom` do plain
@@ -6383,9 +6465,335 @@ structural design work.
     in the two call sites named above; either way, `aur.rs`'s own
     comment claiming "layer bounds are checked" should say *extent*,
     not *bounds*, until it's true.
+  - **A crafted `.aur` manifest can hand back an `IdGenerator` counter
+    that has already been used** — found while closing the two gaps
+    above (2026-08-24, 0.49.1), **and closed in the same round after an
+    independent review showed the first write-up of it had the
+    reachability exactly backwards.** That first write-up said the
+    defect was reachable only through `History::replay()`, and that the
+    manifest path was safe because it "carries the real `IdGenerator`
+    state". It does not: that state is bytes from the same untrusted
+    file as everything else in the manifest, so the *manifest* path was
+    the reachable half. `replay()` was the unreachable one —
+    `grep -rn "\.replay()"` across the workspace finds no caller
+    outside this crate's own tests. Recorded here rather than quietly
+    edited away, because "the untrusted path is the safe one" is
+    exactly the kind of reasoning error worth being able to find again.
 
-  Still open, unchanged: no interactive "Discard recovered document"
-  choice.
+    What the defect actually was, end to end, reproduced before it was
+    fixed: a manifest whose counter is `1` while a layer with id `1`
+    legitimately exists passes every shape rule (it *is* a tree), so
+    `aur::read` accepts it. One ordinary `add_group()` then calls
+    `LayerTree::insert`, whose `self.ids.next_id()` returns `1` again
+    and whose `self.layers.insert(id, ..)` — a plain `HashMap::insert`
+    with the displaced value discarded — silently destroyed the group
+    already there, orphaning its contents; the new group was then
+    spliced into the sibling list under that same id, so it listed
+    *itself* as its own child. That is a cycle built **after**
+    deserialization, which a validator that runs once, at deserialize
+    time, can never see. Observed consequences: `paint_order()` returns
+    `[]` (the surviving pixel layer vanishes from the composite), the
+    tree no longer round-trips through Aurora's own serializer, and
+    `aurora-app`'s `resolve_tile` — which has no depth or visit bound
+    of its own and relies entirely on the tree having been validated —
+    is back on a reachable stack-overflow abort, the exact failure
+    class two earlier rounds fixed elsewhere.
+
+    **Addendum 2026-08-24 (0.49.1) — closed, at three layers.**
+    (1) `aurora_core::IdGenerator` gained `peek_next()` (the next raw
+    value, without consuming it) and `advance_past(raw)` (move the
+    counter forward, never backward). (2) `aurora-doc`'s new
+    `validate_id_allocator` holds a tree's counter to "strictly ahead
+    of every id present in `layers`" — and the word *present* was
+    itself a gap, closed only in the third revision pass below; read
+    that item before trusting this sentence — returning
+    `DocError::StaleLayerIdGenerator { next, existing }` (naming the
+    *highest* colliding id, so it does not depend on `HashMap`
+    iteration order). It runs in both places `validate_shape` runs —
+    the `#[serde(try_from = "LayerTreeRepr")]` manifest path and
+    `LayerTree::validate` (hence `History::replay`) — shape first, so a
+    file wrong in both ways still reports the malformed shape, which is
+    the more serious of the two. (3) Independently of either,
+    `LayerTree::insert` now *checks* `HashMap::insert`'s displaced
+    value instead of discarding it: a collision puts the displaced
+    entry straight back and returns `DocError::LayerIdCollision`, so a
+    live collision can never destroy a layer whatever the generator's
+    provenance. And `LayerTree::restore` advances the tree's generator
+    past every id it splices back in, which is what makes the counter
+    check hold on the `replay()` path too (it rebuilds from
+    `LayerTree::new()`, counter at `0`, while restored layers keep
+    their original ids) — so the "replayed journal re-issues an id"
+    half is closed as well, not merely re-described.
+
+    Evidence: `tree.rs` tests
+    `a_manifest_whose_id_counter_has_fallen_behind_is_rejected`,
+    `a_counter_exactly_one_past_the_highest_id_is_accepted` (the
+    boundary in the direction that must keep working),
+    `a_stale_counter_cannot_silently_destroy_the_layer_already_under_that_id`
+    (the reproduction above, replayed as the sequence it actually
+    took, asserting the pre-existing group survives and
+    `paint_order()` still reaches the pixel layer),
+    `restoring_a_subtree_advances_the_id_generator_past_every_id_it_brings_back`;
+    `history.rs` test
+    `a_replayed_document_keeps_allocating_ids_past_the_ones_it_restored`;
+    `aurora-core` tests `peek_next_reports_the_next_id_without_consuming_it`,
+    `advance_past_moves_forward_but_never_backward`,
+    `advance_past_saturates_instead_of_wrapping`. Wire format unmoved —
+    the golden-byte tests are unchanged and still pass, because a
+    generator built through the real API is always already one past its
+    highest id.
+  - **`reparent` tolerated the same inconsistency `remove_capturing`
+    rejects** — found by the same review, fixed 2026-08-24 (0.49.1).
+    `reparent` dropped `id` from its old parent's sibling list with
+    `retain`, which is a *silent no-op* when the id is not there, and
+    then attached `id` to the new parent regardless — leaving a stale
+    reference behind and making the layer reachable from two places,
+    i.e. manufacturing through the public API precisely the shape
+    `validate_shape` was extended to forbid. It now mirrors
+    `remove_capturing`: find the position first, return
+    `DocError::InconsistentLayerParent(id)` before any mutation if it
+    is absent, and `remove(index)` otherwise. Evidence:
+    `reparenting_a_layer_its_recorded_parent_does_not_list_errors_rather_than_moving_it`.
+  - **`LayerTree::restore` validated the incoming subtree in isolation,
+    not the merged result** — fixed 2026-08-24 (0.49.1). A spliced
+    subtree whose group `children` name an id that is not in the
+    incoming set looks, to a walk of that set alone, like a harmless
+    dangling reference; if the *live* tree holds that id, merging makes
+    the layer reachable from two parents at once. `restore` now checks
+    incoming `children` against the live map before merging, so the
+    live tree is never in the broken state — which matters because
+    `undo`/`redo` call `restore` directly and have no closing
+    validation of their own (only `replay` did, and `replay` has no
+    callers outside this crate's tests). `replay`'s own closing
+    `tree.validate()` stays as the outer net. Its depth accounting was
+    narrowed at the same time: `validate_shape` gained a `start_depth`
+    argument and `restore` passes the live depth of the parent it
+    splices under, so two individually-legal `Restore` ops can no
+    longer stack past `MAX_LAYER_TREE_DEPTH` between them
+    (`restoring_a_subtree_counts_depth_from_where_it_is_spliced_in`
+    pins both the 257-deep rejection and the 256-deep acceptance).
+  - **`undo`/`redo` dropped a step from both stacks when `apply`
+    failed** — pre-existing, made more visible by this round (which
+    adds several new ways for the `LayerTree` calls `apply` makes to
+    refuse), fixed 2026-08-24 (0.49.1). Both pop before they apply; on
+    `Err` the popped step is now pushed back onto the stack it came
+    from, so a refused undo costs the user nothing. Evidence:
+    `a_refused_undo_keeps_the_step_on_the_undo_stack`,
+    `a_refused_redo_keeps_the_step_on_the_redo_stack`.
+
+  **A third revision pass on the same unit of work (2026-08-24, still
+  0.49.1) closed one more gap of the same class, found by direct code
+  tracing and then reproduced by execution before anything was
+  changed.** Both items below are fixed; neither needed a version bump,
+  since both correct something this same round had already landed and
+  gotten wrong.
+
+  - **`validate_shape` skipped a dangling reference, and that let the
+    id counter be walked around.** Round 1 deliberately *tolerated* an
+    id named by `roots` or by a group's `children` with no entry of its
+    own in `layers`, on the reasoning (written into `tree.rs`'s own doc
+    comment) that every traversal here already survives one, so
+    rejecting it "would newly refuse files this reader used to open".
+    The reasoning was wrong in the part that mattered. A
+    named-but-absent id is present in neither `layers.keys()` nor
+    anything the shape walk counts, so it is invisible to
+    `validate_id_allocator`, which compares the counter against ids
+    actually *present*. A manifest of `layers = {0: Group{children:
+    [1]}}`, `roots = [0]`, `ids.next = 1` therefore passes **both**
+    validators — verified by execution before any fix: a temporary
+    probe test asserted `validate_shape` returns `Ok`,
+    `validate_id_allocator` returns `Ok`, and the crafted bytes decode.
+    The very next ordinary `add_group()`/`add_pixel_layer()` is then
+    handed exactly id `1` (the counter is not stale, and `insert`'s
+    collision guard does not fire — nothing is under id `1` — so both
+    of round 2's defences pass the add straight through), and the new
+    layer is simultaneously a fresh root recording `parent: None`
+    *and* an already-named child of group `0`. That is the "same layer
+    reachable from two places" shape this whole round exists to
+    prevent, manufactured *after* deserialization where the one-shot
+    validator can never see it.
+
+    Two traced consequences. The first is **reachable today through the
+    shipping app**: after that single "New Layer" click the tree is in
+    the exact shape `validate_shape` itself rejects, so saving and
+    reopening fails — a user opens a `.aur` someone sent them, adds one
+    layer, saves, and Aurora can no longer open its own save. (Measured
+    in the probe, and now pinned by
+    `the_dangling_reference_a_manifest_names_cannot_be_handed_out_by_the_id_counter`.)
+    The second is **deferred**: a subsequent `reparent` could complete a
+    live cycle — `is_descendant`'s upward walk from the newly inserted
+    layer sees `parent: None` and finds nothing wrong — and
+    `aurora-app`'s recursive `resolve_tile`
+    (`crates/aurora-app/src/lib.rs`, the `LayerKind::Group` arm) still
+    has no depth or visited-set guard of its own, so a live cycle
+    reaching it is the same stack-overflow-abort class two earlier
+    rounds fixed elsewhere. Not user-reachable yet: `grep -rn
+    "\.reparent(" crates/aurora-app/src` is still empty (the only call
+    sites are `aurora-doc`'s own `history.rs`), and becomes reachable
+    the moment layer drag-reordering ships in the UI.
+
+    **Fix: reject dangling references outright**, rather than patching
+    each place their existence causes trouble downstream. `validate_shape`
+    now returns the new `DocError::DanglingLayerReference(id)` for an id
+    named in `roots` or in any group's `children` with no entry behind
+    it. This was checked against the reasoning that motivated the
+    original skip and found to cost nothing: no tree this project
+    *writes* can contain a dangling reference — `insert`,
+    `remove_capturing`, `reparent` and `restore` each write a sibling
+    list and the `layers` map together — and no existing test relied on
+    one being accepted (the full suite was run against the change before
+    any test was added: the temporary probe was the only failure). It
+    closes both the counter gap and the `restore` mirror gap below in
+    one stroke, because it makes "every id present" and "every id the
+    tree names" the same set, which is exactly what
+    `validate_id_allocator` had been assuming. Both entry points — the
+    `#[serde(try_from = "LayerTreeRepr")]` manifest path and
+    `LayerTree::restore`'s splice — get it from the one shared
+    `validate_shape`, matching this round's own established discipline
+    of not maintaining two copies of a check. The narrower alternative
+    (widen `validate_id_allocator` to the union of present and named
+    ids) was not taken: it would have left the tree still able to
+    *hold* a name with nothing behind it, and every future traversal
+    still owing that case a thought. Evidence:
+    `a_manifest_naming_a_layer_it_does_not_carry_is_rejected` (which
+    also asserts `validate_id_allocator` has no complaint about the same
+    manifest, pinning why the second validator was not enough),
+    `a_manifest_whose_roots_name_a_layer_it_does_not_carry_is_rejected`,
+    `the_dangling_reference_a_manifest_names_cannot_be_handed_out_by_the_id_counter`,
+    and the positive control
+    `every_tree_this_type_can_build_still_decodes_after_dangling_ids_became_an_error`
+    (add, reparent, remove, restore, each round-tripped). The
+    golden-byte wire-format tests are unchanged and still pass.
+
+    **The symmetric gap in `restore`, closed at the same time**: that
+    function checked only whether an *incoming* group's `children` names
+    a *live* id outside the incoming set — there was no mirror check for
+    a *live* group's `children` already naming an *incoming* id, which
+    produces the same two-parent shape after the merge and was reachable
+    via redo-of-an-add on a tree that already carried the dangling
+    reference above. Both directions now go through one shared
+    `validate_cross_references(from, to)`, called twice with the
+    arguments swapped, rather than two hand-written checks that have to
+    be kept in step. Evidence:
+    `restoring_a_subtree_a_live_group_already_names_is_refused`
+    alongside the existing
+    `restoring_a_subtree_whose_child_names_a_live_layer_is_refused`.
+    With dangling references now refused at the door this second
+    direction is belt-and-braces rather than live — kept because a cycle
+    reaching `resolve_tile` is a process abort, not a catchable error.
+
+  - **`LayerEntry::opacity`/`fill_opacity` were unvalidated on
+    deserialize.** `set_opacity`/`set_fill_opacity` enforce `0.0..=1.0`
+    on live edits, but both are plain `f32`s on the wire, so a crafted
+    manifest could carry `NaN`, a negative value, or `1e38` straight
+    past validators that only look at ids and on into the compositor,
+    which multiplies texels by them. Not a crash — a
+    rendering-correctness defect, lower severity than the id gap above,
+    but the same "trust a number from an untrusted file" class the rest
+    of this round has been closing (contrast `Rect`, which `aurora-io`
+    already bounds on the way in). **Fixed**, since the fix was cheap:
+    the new `validate_opacities` applies `set_opacity`'s own range test
+    character for character — which also rejects `NaN`, a
+    `RangeInclusive::contains` being false for it — and runs on both
+    entry points, the manifest path and `restore`'s incoming subtree.
+    Rejected (`DocError::OpacityOutOfRange`, the existing variant)
+    rather than clamped, so a document never silently renders as
+    something other than what its file says. Evidence:
+    `a_manifest_carrying_a_nonsense_opacity_is_rejected` (NaN, negative,
+    `1e38`, infinity), `a_manifest_carrying_a_nonsense_fill_opacity_is_rejected`,
+    `restoring_a_subtree_carrying_a_nonsense_opacity_is_refused`, and
+    the boundary control `the_opacity_range_boundaries_are_both_accepted`
+    (0.0 and 1.0 are ordinary values a real document carries).
+
+  **Verified after the third pass (2026-08-24)**: `cargo fmt --all
+  --check`, `python3 scripts/check_layering.py`, `python3
+  scripts/check_no_hardcoded_style.py`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` all clean; `cargo test
+  --workspace` — **1047 passed, 0 failed** (up from 1038; `aurora-doc`
+  155, of which nine are new here); `cargo test --workspace --doc` and
+  `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps
+  --all-features` clean. `cargo deny check all` **not run** — still not
+  installed in this environment, unverified for the third round running.
+  No GPU or interactive verification: this is headless deserialization
+  logic, and none of it has been exercised in a live session on real
+  hardware.
+
+  **Still open after 0.49.1, disclosed rather than silently dropped:**
+
+  - **The new `DocError` variants are invisible through the real file
+    read path.** `LayerTree` uses `#[serde(try_from =
+    "LayerTreeRepr")]`; serde funnels a `TryFrom` error through
+    `Error::custom`, and `postcard`'s error type carries no message
+    payload — so `MalformedLayerTree`, `InconsistentLayerParent`,
+    `OrphanedLayer`, `LayerTreeTooDeep` and `StaleLayerIdGenerator` all
+    collapse to the same opaque `"Serde Deserialization Error"` string
+    by the time `aurora_io::aur::read` wraps it in
+    `IoError::ManifestDeserialization`. The *rejections* work
+    (measured: every crafted file is refused); only the diagnostic does
+    not survive, so a real bug report cannot say which rule fired, and
+    the deliberate "lowest-numbered orphan, so the message is
+    deterministic" work is unobservable outside this crate's own tests.
+    Every test here therefore pins the reason by calling the validator
+    directly alongside the round-trip. Not fixed in 0.49.1 because the
+    only clean fix is architectural: `aurora-io`'s `read` would have to
+    deserialize the manifest's layer-tree field itself and call the
+    validator directly rather than going through
+    `postcard::from_bytes::<ManifestRead>`, which means either exposing
+    `LayerTreeRepr`/`validate_shape` across the crate seam or splitting
+    the manifest's positional encoding — a `.aur` reader change, not a
+    `LayerTree` change, and one that touches ADR 0009's wire format
+    policy. Worth doing when someone is next in `aur.rs`.
+  - **`Rect.x`/`Rect.y` (`i64`) are unchecked where `width`/`height`
+    now are** — unchanged, see the item above this list.
+  - **`aurora-app`'s `resolve_tile` still has no depth or visited-set
+    guard of its own** and depends entirely on the tree having been
+    validated. Every known way to hand it a cyclic tree is now closed,
+    but the dependency is one-directional trust across a crate seam, and
+    three rounds have now each found a fresh way to defeat the validator.
+    A depth bound in `resolve_tile` itself would make the abort
+    impossible by construction rather than by argument — deliberately
+    not done here (it is an `aurora-app` change, outside this unit of
+    work), and named so it is not rediscovered a fourth time.
+  - **A `RemovedSubtree` in a crafted journal is still only as safe as
+    `restore` makes it**, and `History::load_journal` deliberately does
+    not validate (its doc comment says so plainly); `replay` is where
+    the bar is enforced, and `replay` still has no caller outside this
+    crate's tests. The doc comments there now say that explicitly
+    rather than implying they close a currently-live risk.
+  - No interactive "Discard recovered document" choice.
+
+  **Three small follow-ups from the judge that closed this round out
+  (2026-08-24), none blocking, none fixed here:**
+
+  - **`LayerTree::validate()` doesn't call `validate_opacities`** —
+    `tree.rs` runs shape + allocator only there, while its own doc
+    comment claims it holds a tree "to exactly the bar
+    `#[serde(try_from = "LayerTreeRepr")]` holds a deserialized one to."
+    That's now overstated by one check. No live defect follows: its
+    only caller is `replay`, and every opacity-setting op reaching it
+    goes through `set_opacity`/`set_fill_opacity` (which already
+    enforce the range) or `restore` (which already validates) — but
+    it's exactly the "a guard's stated contract is broader than what it
+    does" drift that produced the dangling-reference gap above, left
+    here rather than fixed under the same discipline of naming it
+    instead of leaving it implicit. Fix: add the call, or narrow the
+    doc comment.
+  - **`validate_cross_references` mirrors group `children` only, not
+    `roots`.** A live tree's `roots` naming an incoming id during
+    `restore` is the same shape as the children-direction check it
+    already has, and is unreachable for the identical reason (dangling
+    references can't exist in a live tree) — so the mirror that exists
+    and the one that doesn't have identical reachability today. A
+    consistency nit in the belt-and-braces layer, not a gap with a
+    trigger.
+  - **No depth bound on live tree growth** — `add_group`/`reparent`
+    never check against `MAX_LAYER_TREE_DEPTH`, so that constant's own
+    doc comment (claiming it bounds `resolve_tile`'s per-level stack use)
+    holds for a deserialized or restored tree but not for one nested
+    purely through the API. Not input-reachable — a human would have to
+    deliberately nest 256+ groups by hand — so not the same class of
+    risk as the rest of this section, but named so `MAX_LAYER_TREE_DEPTH`'s
+    doc comment isn't read as a stronger guarantee than it is.
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
   mutator with an undo-recording version and kept its own undo/redo

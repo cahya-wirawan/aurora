@@ -443,17 +443,34 @@ impl History {
     /// own journal from empty, in the exact order every op was actually
     /// applied — see this module's own doc comment.
     ///
+    /// The rebuilt tree is checked before it is handed back, with the
+    /// *same* validator `LayerTree`'s own `Deserialize` runs on a `.aur`
+    /// manifest (`LayerTree::validate`). To be clear about what that
+    /// does and does not close today: **nothing outside this crate's own
+    /// tests calls `replay` yet**, so this is not a currently-live hole
+    /// being plugged. It will matter as soon as undo/redo can be seeded
+    /// from a file — a journal loaded by [`Self::load_journal`] is
+    /// untrusted bytes from exactly the same file the manifest came
+    /// from, and replay reaches a live `LayerTree` *without* going
+    /// through that `Deserialize` impl (it starts from
+    /// [`LayerTree::new`] and applies recorded ops), so validating only
+    /// the manifest would leave that second door open. The bar is set
+    /// now, while the path is still short, rather than retrofitted onto
+    /// the first caller.
+    ///
     /// # Errors
     ///
-    /// Returns an error if replaying the journal fails — should not
-    /// happen for a `History` only ever mutated through its own methods
-    /// (see this type's own doc comment about mixing in direct
-    /// `LayerTree` calls).
+    /// Returns an error if replaying the journal fails, or if the tree
+    /// it produces is not structurally a tree — neither should happen
+    /// for a `History` only ever mutated through its own methods (see
+    /// this type's own doc comment about mixing in direct `LayerTree`
+    /// calls); both are reachable from a crafted journal.
     pub fn replay(&self) -> Result<LayerTree, DocError> {
         let mut tree = LayerTree::new();
         for op in self.journal.clone() {
             apply(&mut tree, op)?;
         }
+        tree.validate()?;
         Ok(tree)
     }
 
@@ -494,6 +511,14 @@ impl History {
     /// applications already have after crash recovery — with the
     /// recovered journal itself intact for [`Self::replay`]/
     /// [`Self::journal_descriptions`].
+    ///
+    /// **This deserializes, it does not validate.** `bytes` are
+    /// untrusted — a `.aur` file's own `history` entry, from whoever
+    /// sent the file — and the ops they decode into are taken at face
+    /// value here; nothing checks that replaying them yields a coherent
+    /// tree. [`Self::replay`] is where that bar is enforced, so a
+    /// caller that loads a journal and never replays it has checked
+    /// nothing beyond "these bytes are well-formed `postcard`".
     ///
     /// # Errors
     ///
@@ -869,7 +894,22 @@ impl History {
             return Ok(None);
         };
         let forward = op.clone();
-        let (inverse, dirty) = apply(tree, op)?;
+        // A failed `apply` puts the step back where it came from. The
+        // `?` this replaced dropped it from the undo stack *and* never
+        // pushed it to the redo stack, so a single refused undo silently
+        // cost the user that step forever -- and this round adds several
+        // new ways for `apply` to refuse (see `LayerTree::reparent`'s
+        // and `restore`'s own error lists), which widens a window that
+        // was previously only reachable by mixing direct `LayerTree`
+        // calls into a `History`-managed tree. Every `LayerTree` call
+        // `apply` makes is all-or-nothing, so the tree is untouched too.
+        let (inverse, dirty) = match apply(tree, op) {
+            Ok(applied) => applied,
+            Err(err) => {
+                self.undo_stack.push(forward);
+                return Err(err);
+            }
+        };
         self.journal.push(forward);
         self.redo_stack.push(inverse);
         Ok(dirty)
@@ -887,7 +927,14 @@ impl History {
             return Ok(None);
         };
         let forward = op.clone();
-        let (inverse, dirty) = apply(tree, op)?;
+        // Same restore-on-failure as `undo` above, for the same reason.
+        let (inverse, dirty) = match apply(tree, op) {
+            Ok(applied) => applied,
+            Err(err) => {
+                self.redo_stack.push(forward);
+                return Err(err);
+            }
+        };
         self.journal.push(forward);
         self.undo_stack.push(inverse);
         Ok(dirty)
@@ -1991,5 +2038,311 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(recovered.journal_len(), 0);
+    }
+
+    // --- a crafted journal is untrusted input too ---------------------
+    //
+    // `LayerTree`'s own `Deserialize` validates a `.aur` manifest, but a
+    // journal never goes through it: `replay` starts from
+    // `LayerTree::new()` and applies recorded ops, so a crafted
+    // `history` entry in the same file was a second, unvalidated way to
+    // reach a live `LayerTree`. These craft the journals that used to
+    // get through.
+    //
+    // None of this is reachable from the app today -- nothing in the UI
+    // calls `remove`/`reparent` yet -- so this closes a latent gap
+    // before it goes live rather than fixing an active exploit.
+
+    fn pixel_entry(name: &str, parent: Option<super::LayerId>) -> super::LayerEntry {
+        super::LayerEntry::new(
+            name.to_owned(),
+            parent,
+            LayerKind::Pixel { bounds: bounds() },
+        )
+    }
+
+    fn group_entry(
+        name: &str,
+        parent: Option<super::LayerId>,
+        children: Vec<super::LayerId>,
+    ) -> super::LayerEntry {
+        super::LayerEntry::new(name.to_owned(), parent, LayerKind::Group { children })
+    }
+
+    /// Encodes `journal` exactly as `save_journal` would, loads it back
+    /// through the real public entry point, and replays it.
+    fn replay_crafted_journal(journal: &[super::LayerOp]) -> Result<LayerTree, DocError> {
+        let bytes = match postcard::to_allocvec(journal) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let recovered = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("a well-formed postcard journal must load: {err:?}"),
+        };
+        recovered.replay()
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_root_records_the_wrong_parent_errors() {
+        let root: super::LayerId = Id::from_raw(0);
+        let elsewhere: super::LayerId = Id::from_raw(7);
+        // The op says "put this back at the top level", the entry says
+        // "I live inside layer 7". `remove_capturing` would later look
+        // for it among layer 7's children.
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![(root, pixel_entry("a", Some(elsewhere)))],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, root),
+            other => unreachable!("expected InconsistentLayerParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_subtree_hides_an_unreachable_entry_errors() {
+        let root: super::LayerId = Id::from_raw(0);
+        let stowaway: super::LayerId = Id::from_raw(1);
+        // `stowaway` rides along in `entries` but no `children` list
+        // names it: it would land in the tree's map while being
+        // invisible to every traversal.
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![
+                (root, group_entry("g", None, Vec::new())),
+                (stowaway, pixel_entry("stowaway", None)),
+            ],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::OrphanedLayer(id)) => assert_eq!(id, stowaway),
+            other => unreachable!("expected OrphanedLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_subtree_carries_the_same_id_twice_errors() {
+        let root: super::LayerId = Id::from_raw(0);
+        let twice: super::LayerId = Id::from_raw(1);
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![
+                (root, group_entry("g", None, vec![twice])),
+                (twice, pixel_entry("first", Some(root))),
+                (twice, pixel_entry("second", Some(root))),
+            ],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, twice),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_subtree_is_missing_its_own_root_errors() {
+        let root: super::LayerId = Id::from_raw(0);
+        let only: super::LayerId = Id::from_raw(1);
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![(only, pixel_entry("only", None))],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, root),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_ops_are_each_valid_but_whose_result_is_not_errors() {
+        // Each op here is internally coherent, and the damage only shows
+        // up in the *merged* tree: the second subtree's `children` names
+        // a layer the first op already placed at the top level, so once
+        // the two are merged that layer is reachable from two parents.
+        //
+        // `restore` used to walk only the incoming subtree, where that
+        // id looks like a harmless dangling reference, and this case was
+        // caught solely by `replay`'s own closing `tree.validate()`.
+        // `restore` now checks the incoming `children` against the
+        // *live* map before merging, so it is refused one op earlier and
+        // the live tree is never in the broken state at all -- which is
+        // what matters for `undo`/`redo`, which call `restore` directly
+        // and have no closing validate of their own. `replay`'s
+        // `tree.validate()` stays as the outer net for anything a
+        // pre-merge check cannot see.
+        let stolen: super::LayerId = Id::from_raw(0);
+        let thief: super::LayerId = Id::from_raw(1);
+        let journal = vec![
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: stolen,
+                parent: None,
+                index: 0,
+                entries: vec![(stolen, pixel_entry("stolen", None))],
+            }),
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: thief,
+                parent: None,
+                index: 0,
+                entries: vec![(thief, group_entry("thief", None, vec![stolen]))],
+            }),
+        ];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, stolen),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_restoring_an_id_the_tree_already_holds_errors() {
+        // The `MalformedRemovedSubtree` branch the other crafted-journal
+        // tests here miss: a second `Restore` naming an id the first one
+        // already made live. Merging it would replace that layer
+        // outright.
+        let clash: super::LayerId = Id::from_raw(0);
+        let subtree = |name: &str| {
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: clash,
+                parent: None,
+                index: 0,
+                entries: vec![(clash, pixel_entry(name, None))],
+            })
+        };
+        let journal = vec![subtree("first"), subtree("second")];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, clash),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_replayed_document_keeps_allocating_ids_past_the_ones_it_restored() {
+        // `replay` rebuilds from `LayerTree::new()`, whose counter starts
+        // at 0, while every layer it restores keeps its original id.
+        // Unless something advances the counter, the next edit on a
+        // recovered document hands out an id a restored layer already
+        // holds -- silently aliasing two layers and (via
+        // `LayerTree::surface_id`, which reuses the raw id) their tile
+        // storage with it. `LayerTree::restore` is where that is closed.
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let mut existing = Vec::new();
+        for name in ["a", "b", "c"] {
+            match history.add_pixel_layer(&mut tree, name, bounds(), None) {
+                Ok(id) => existing.push(id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let mut replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let fresh = match replayed.add_pixel_layer("fresh", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            !existing.contains(&fresh),
+            "a recovered document must not re-issue an id it already restored: \
+             {fresh:?} collides with one of {existing:?}"
+        );
+        assert_eq!(replayed.len(), 4, "nothing may have been overwritten");
+    }
+
+    #[test]
+    fn a_refused_undo_keeps_the_step_on_the_undo_stack() {
+        // `undo` pops before it applies. When `apply` then fails, the
+        // step used to be gone from both stacks -- silently costing the
+        // user that step forever. Reached here the documented way (see
+        // `History`'s own doc comment): a direct `LayerTree` call mixed
+        // into a `History`-managed tree, so the recorded inverse no
+        // longer matches reality.
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "layer", bounds(), None) {
+            Ok(added) => added,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Behind `History`'s back, so undoing the add cannot work.
+        if let Err(err) = tree.remove(id) {
+            unreachable!("{err:?}");
+        }
+        assert!(history.can_undo());
+        match history.undo(&mut tree) {
+            Err(DocError::UnknownLayer(missing)) => assert_eq!(missing, id),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+        assert!(
+            history.can_undo(),
+            "a refused undo must leave the step where it was, not consume it"
+        );
+        assert!(!history.can_redo(), "and must not half-move it to redo");
+    }
+
+    #[test]
+    fn a_refused_redo_keeps_the_step_on_the_redo_stack() {
+        // The mirror of the test above.
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "layer", bounds(), None) {
+            Ok(added) => added,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(history.can_redo());
+        // Behind `History`'s back again: something else now occupies the
+        // id the pending redo wants to restore.
+        let mut clash = LayerTree::new();
+        std::mem::swap(&mut tree, &mut clash);
+        if let Err(err) = tree.add_pixel_layer("squatter", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.roots().first().copied(), Some(id));
+        match history.redo(&mut tree) {
+            Err(DocError::MalformedRemovedSubtree(clashing)) => assert_eq!(clashing, id),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+        assert!(
+            history.can_redo(),
+            "a refused redo must leave the step where it was, not consume it"
+        );
+    }
+
+    #[test]
+    fn replaying_an_honest_crafted_journal_still_succeeds() {
+        // The positive control for the five above: a hand-built journal
+        // that *is* coherent must still replay, so the new checks are
+        // not simply refusing every journal that did not come from
+        // `save_journal`.
+        let group: super::LayerId = Id::from_raw(0);
+        let child: super::LayerId = Id::from_raw(1);
+        let journal = vec![
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: group,
+                parent: None,
+                index: 0,
+                entries: vec![(group, group_entry("g", None, Vec::new()))],
+            }),
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: child,
+                parent: Some(group),
+                index: 0,
+                entries: vec![(child, pixel_entry("c", Some(group)))],
+            }),
+        ];
+        let tree = match replay_crafted_journal(&journal) {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("a coherent journal must still replay: {err:?}"),
+        };
+        assert_eq!(tree.roots(), &[group]);
+        assert_eq!(tree.children(group), Some([child].as_slice()));
     }
 }
