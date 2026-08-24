@@ -80,11 +80,17 @@
 //! `PinLight`/`HardMix`), the 4-mode non-separable HSL family
 //! (`Hue`/`Saturation`/`Color`/`Luminosity`), and the 2-mode
 //! whole-colour-selection family (`DarkerColor`/`LighterColor`) are
-//! real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`
-//! — this family's own explicit, now sole boundary) still silently
-//! falls back to `Normal`
-//! — a real, still-open gap. Layer groups recurse at any depth
-//! (ancestor-visibility-gated: an invisible group hides its whole
+//! real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`)
+//! is real too, but not via this translation — `resolve_tile` intercepts
+//! it before `translate_blend_mode` ever runs and applies its own
+//! stochastic `dissolve_gate` instead, since Dissolve's per-pixel
+//! keep-or-drop decision isn't expressible as a per-pixel-colour blend
+//! function the way every other mode is (see `resolve_tile`'s own doc
+//! comment for the full account). Layer groups recurse at any depth
+//! `aurora-doc` will accept (bounded, as its own second line of
+//! defence, by `aurora_doc::MAX_LAYER_TREE_DEPTH` and a per-tile node
+//! budget — see `resolve_tile`'s own doc comment) and are
+//! ancestor-visibility-gated (an invisible group hides its whole
 //! subtree), so a layer nested inside a group does composite and export
 //! now; a group's own `opacity`/`blend_mode` **are** now aggregated
 //! into its children's effective compositing too, via `resolve_tile`'s
@@ -3698,6 +3704,100 @@ fn apply_mask_clip(
     clipped
 }
 
+/// The shared, per-composite-pass half of [`resolve_tile`]'s recursion
+/// bounds: a monotone node budget, plus a one-shot "already reported"
+/// flag. `depth`, the other half, stays a plain by-value parameter,
+/// because depth has to unwind as the recursion returns where these two
+/// deliberately must not — what bounds a fan-out cycle is what has
+/// already been spent, not what is on the stack right now.
+///
+/// **Why the budget is the document's own layer count.** In any tree
+/// `aurora-doc` accepts, every layer is reachable from
+/// `aurora_doc::LayerTree::roots` at most once — `validate_shape`
+/// rejects an id named by two parents, or twice by one — so a whole
+/// tile's composite (every root walked, every descendant visited)
+/// enters [`resolve_tile`] at most `aurora_doc::LayerTree::len()`
+/// times. The budget is exactly that count, which makes it both
+/// impossible for a well-formed document to be truncated by it and
+/// tight enough that a duplicate-reachability cycle runs out almost
+/// immediately. A fixed constant was the alternative and is the wrong
+/// tool here: PRD §6 promises *unlimited* layers, so any constant is
+/// either a real ceiling on a legitimate document or so far above one
+/// that it stops bounding anything. (Contrast `AUTOSAVE_EDIT_THRESHOLD`
+/// and the other tuned constants in this crate, which trade off two
+/// costs and have no derivable right answer. This one does.)
+///
+/// The node count is recomputed per tile, via [`Self::next_tile`] —
+/// it bounds one tile's work, not a whole pass's. `reported` is
+/// deliberately *not* reset with it: [`recomposite_visible_tiles`]
+/// calls [`resolve_tile`] once per invalidated tile per frame, so a
+/// per-breach `tracing::warn!` on a malformed document would fire at
+/// interactive-rate frequency on a path already over its latency
+/// budget (CLAUDE.md's own measurements). One report per pass is all
+/// the signal there is anyway — every tile after the first is
+/// re-reporting the same broken tree.
+#[derive(Debug)]
+struct CompositeBudget {
+    /// How many more times [`resolve_tile`] may be entered for the tile
+    /// currently being composited. Charged on entry, never refunded.
+    nodes: usize,
+    /// Whether either bound has already been reported during this
+    /// composite pass. See the type's own doc comment for why this
+    /// survives [`Self::next_tile`].
+    reported: bool,
+}
+
+impl CompositeBudget {
+    /// A budget for the first tile of a fresh composite pass over
+    /// `layers`, with nothing reported yet.
+    fn for_pass(layers: &aurora_doc::LayerTree) -> Self {
+        Self {
+            nodes: layers.len(),
+            reported: false,
+        }
+    }
+
+    /// Recharges the node budget for the next tile of the same pass.
+    /// Leaves `reported` alone on purpose — that is what keeps the
+    /// warning to once per pass rather than once per tile.
+    fn next_tile(&mut self, layers: &aurora_doc::LayerTree) {
+        self.nodes = layers.len();
+    }
+
+    /// Charges one visited node, returning `false` once the budget for
+    /// this tile is spent. `checked_sub` rather than a comparison plus a
+    /// decrement so that exhaustion and underflow are the same branch.
+    fn charge_node(&mut self) -> bool {
+        match self.nodes.checked_sub(1) {
+            Some(remaining) => {
+                self.nodes = remaining;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `true` exactly once per composite pass, for the first bound
+    /// breach it sees; `false` for every breach after that.
+    fn should_report(&mut self) -> bool {
+        let first = !self.reported;
+        self.reported = true;
+        first
+    }
+
+    /// Whether this tile's node budget is already spent. Lets a sibling
+    /// loop stop calling [`resolve_tile`] once every remaining call would
+    /// just re-fail [`Self::charge_node`] — without this, a group whose
+    /// `children` names far more entries than the tree actually holds
+    /// (the exact shape [`resolve_tile`]'s own doc comment names as the
+    /// thing this budget exists to bound) still costs one no-op call per
+    /// listed child rather than stopping at the first one, quadratic
+    /// rather than linear in a crafted tree's own size.
+    fn is_exhausted(&self) -> bool {
+        self.nodes == 0
+    }
+}
+
 /// Resolves `id`'s own composited texels for one `aurora_tile::TILE`-
 /// sized window at document-space `doc_origin` (`tile_id`'s own meaning
 /// once converted out of `reference_origin`'s frame — see
@@ -3724,8 +3824,64 @@ fn apply_mask_clip(
 /// buffer starting fully transparent via the same
 /// `aurora_render::composite_tile_cpu` this function's own caller uses
 /// one level up. A child that is itself a group is resolved by
-/// recursing into this branch again, so nesting to any depth falls out
-/// for free.
+/// recursing into this branch again, so nesting falls out for free (up
+/// to the two bounds below — every tree `aurora-doc` will accept stays
+/// inside both, so no well-formed document is affected).
+///
+/// **`depth` and `budget`, the two recursion bounds — defence in
+/// depth, not a duplicate of `aurora-doc`'s validation.** They bound
+/// two different things, and neither alone is enough, which is why both
+/// are here.
+///
+/// `depth` bounds how *deep* the recursion goes. Callers pass `1` for a
+/// root-level entry, the same seed `aurora_doc`'s own `validate_shape`
+/// uses for a manifest's `roots` ("these roots really are the top
+/// level, so the depth budget starts from scratch"), and each recursive
+/// step below adds one. The check is
+/// `depth > `[`aurora_doc::MAX_LAYER_TREE_DEPTH`] — strictly greater,
+/// matching that validator's own comparison exactly, so a legitimately
+/// 256-deep tree still composites its deepest layer. What that bounds
+/// is stack frames, and nothing else.
+///
+/// `budget` bounds how much *total work* one tile's composite may do,
+/// which `depth` provably does not. The recursive call below sits
+/// inside a loop over a group's `children`, so a node's own call count
+/// is `children.len()`, not one. A group whose `children` names the
+/// same id more than once — exactly the duplicate-reachability shape
+/// `aurora-doc`'s `validate_shape` checks for, and the shape three
+/// successive review rounds found real bugs in — therefore *branches*
+/// rather than walks: at fan-out two the visit count doubles per level,
+/// `2^slack` visits from however far above the bound the cycle is
+/// entered, which finishes at no realistic slack. `depth` does still
+/// terminate that traversal in the formal sense, but "terminates" would
+/// mean a hang on the compositing thread that cannot be interrupted
+/// from inside, rather than the stack-overflow abort this guard exists
+/// to prevent — no better for a user holding unsaved work. So
+/// [`CompositeBudget`] charges one node per entry into this function
+/// and never refunds it on return, bounding total visits per tile
+/// outright whatever shape the tree has.
+///
+/// Both bounds return `None` when breached, which the caller already
+/// treats as "this contributor is absent from the composite" (the same
+/// contract an invisible layer or a failed tile load already uses), so
+/// an over-deep or over-budget branch is dropped rather than the tile
+/// being aborted.
+///
+/// This exists **independently** of `aurora-doc`'s shape validation
+/// rather than trusting it: that validator has had real, separately
+/// exploitable gaps found in it across successive review rounds, and a
+/// cycle reaching this function would otherwise recurse until the stack
+/// overflows — an abort, which for an image editor holding unsaved work
+/// is the worst possible failure.
+///
+/// Two monotone counters rather than a visited set, still: a set would
+/// need correct remove-on-return discipline (get it wrong and
+/// legitimate sibling subtrees silently vanish) and would allocate per
+/// branch in the hot compositing path. A monotone budget is strictly
+/// cheaper than that and terminates just as hard; the one thing it
+/// gives up is telling a cycle apart from a legitimately enormous
+/// document, and sizing it from the document itself is what pays that
+/// back — see [`CompositeBudget`].
 ///
 /// **No "Pass Through" mode**: `aurora_doc::BlendMode`'s 27 variants
 /// have no such variant — Photoshop's real distinction between an
@@ -3867,6 +4023,17 @@ fn apply_mask_clip(
 /// `(tile_id, doc_origin, reference_origin)` are threaded through every
 /// recursive call completely unchanged; no new origin logic is needed
 /// beyond what a `Pixel` layer's own branch already had.
+// Eight arguments, and the alternative is worse: the seven that were
+// here before are all genuinely per-call, and `budget` is genuinely
+// shared, so bundling any of them into a struct would only move the
+// same values behind a name that explains less than they do.
+//
+// Over 100 lines by three, since the two bound checks went in. Splitting
+// the `Pixel` and `Group` arms into their own functions would mean
+// threading the same eight arguments through two more signatures and
+// separating each arm from the doc comment that explains it; the length
+// here is one `match` with two arms, not accumulated logic.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn resolve_tile(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
@@ -3874,7 +4041,45 @@ fn resolve_tile(
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
 ) -> Option<(Vec<half::f16>, f32, aurora_render::BlendMode)> {
+    // Both bounds are checked before anything else this function does,
+    // including the visibility test below: `aurora-doc`'s own shape
+    // validator is the primary guarantee that this recursion terminates,
+    // and these are the independent second one. See this function's own
+    // doc comment for the depth convention, and why bounding depth alone
+    // is not enough to bound the work.
+    if depth > aurora_doc::MAX_LAYER_TREE_DEPTH {
+        if budget.should_report() {
+            tracing::warn!(
+                ?id,
+                depth,
+                max = aurora_doc::MAX_LAYER_TREE_DEPTH,
+                "layer nesting past the tree depth bound; skipping this branch for this \
+                 composite tile"
+            );
+        }
+        return None;
+    }
+    // Charged after the depth check, not before it: a call refused for
+    // depth does no work worth charging, and the number of such refused
+    // calls is still bounded, because every one of them is issued by a
+    // call that *was* charged. Charging here also means the budget
+    // counts entries into this function, which is exactly the quantity a
+    // duplicate-child fan-out inflates.
+    if !budget.charge_node() {
+        if budget.should_report() {
+            tracing::warn!(
+                ?id,
+                depth,
+                nodes = layers.len(),
+                "composite recursion visited more layers than this document has; skipping \
+                 this branch for this composite tile"
+            );
+        }
+        return None;
+    }
     if layers.visible(id) != Some(true) {
         return None;
     }
@@ -3927,6 +4132,22 @@ fn resolve_tile(
         aurora_doc::LayerKind::Group { children } => {
             let mut child_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> = Vec::new();
             for &child_id in children.iter().rev() {
+                // Stop as soon as the budget is spent rather than still
+                // making one no-op `resolve_tile` call per remaining
+                // listed child -- see `CompositeBudget::is_exhausted`'s
+                // own doc comment for why this matters for a crafted
+                // tree, not just a well-formed one (where this never
+                // fires, since every child that gets this far is real).
+                if budget.is_exhausted() {
+                    break;
+                }
+                // `saturating_add` rather than plain `+`, mirroring
+                // `aurora-doc`'s own `validate_shape`: the guard at the
+                // top of this function makes an overflow structurally
+                // unreachable (`depth` can never get past
+                // `MAX_LAYER_TREE_DEPTH + 1` here), so this is about
+                // matching the validator's style, not about a real
+                // wrap this code could hit.
                 if let Some(resolved) = resolve_tile(
                     child_id,
                     layers,
@@ -3934,6 +4155,8 @@ fn resolve_tile(
                     tile_id,
                     doc_origin,
                     reference_origin,
+                    depth.saturating_add(1),
+                    budget,
                 ) {
                     child_texels.push(resolved);
                 }
@@ -4274,6 +4497,7 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// already use. A real GPU-side failure (a lost device, a bad map) can no
 /// longer be detected here — resolving the map is [`finish_tile_readback`]'s
 /// job now, in phase 3, once this function has already returned.
+#[allow(clippy::too_many_arguments)]
 fn begin_gpu_composite_tile(
     gpu: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
@@ -4282,12 +4506,25 @@ fn begin_gpu_composite_tile(
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
+    budget: &mut CompositeBudget,
 ) -> Option<PendingGpuReadback> {
     let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::new();
     for &id in layers.roots().iter().rev() {
-        if let Some((texels, opacity, _blend_mode)) =
-            resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
-        {
+        // `1`: a root-level layer, the same depth `aurora-doc`'s own
+        // validator starts its budget at. One `budget` for all of this
+        // tile's roots, not one each: in a well-formed tree their
+        // subtrees are disjoint, so the sum of their node counts is
+        // still bounded by the tree's own length.
+        if let Some((texels, opacity, _blend_mode)) = resolve_tile(
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            1,
+            budget,
+        ) {
             layer_texels.push((texels, opacity));
         }
     }
@@ -4506,6 +4743,12 @@ fn begin_gpu_composite_tile(
 /// far) is unaffected in practice either way: `composite_tile_cpu`
 /// reproduces a single full-opacity layer's own texels exactly, and (once
 /// GPU-tractable) so does the batched GPU path.
+// Over 100 lines by six, since the per-pass composite budget went in.
+// The body is three named, commented phases (issue, poll, drain) that
+// share `pending_gpu`, `budget` and two closures; splitting them apart
+// would mean passing all four across the seam for no gain in
+// readability.
+#[allow(clippy::too_many_lines)]
 fn recomposite_visible_tiles(
     residency: &aurora_gpu::TileResidency,
     layers: &aurora_doc::LayerTree,
@@ -4561,13 +4804,24 @@ fn recomposite_visible_tiles(
     let composite_tile_cpu_path = |layers: &aurora_doc::LayerTree,
                                    store: &mut aurora_tile::TileStore,
                                    tile_id: aurora_tile::TileId,
-                                   doc_origin: (i64, i64)| {
+                                   doc_origin: (i64, i64),
+                                   budget: &mut CompositeBudget| {
+        budget.next_tile(layers);
         let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
             Vec::with_capacity(layers.roots().len());
         for &id in layers.roots().iter().rev() {
-            if let Some(resolved) =
-                resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
-            {
+            // `1`: a root-level layer, the same depth `aurora-doc`'s
+            // own validator starts its budget at.
+            if let Some(resolved) = resolve_tile(
+                id,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                1,
+                budget,
+            ) {
                 layer_texels.push(resolved);
             }
         }
@@ -4586,6 +4840,11 @@ fn recomposite_visible_tiles(
     // composited on the CPU path immediately, right here, since that
     // path never blocks on the GPU.
     let mut pending_gpu: Vec<PendingGpuReadback> = Vec::new();
+    // One budget for the whole pass: its node count is recharged per
+    // tile (by `next_tile`, on both paths below), but its "already
+    // reported" flag deliberately is not, so a malformed document warns
+    // once per pass rather than once per invalidated tile per frame.
+    let mut budget = CompositeBudget::for_pass(layers);
     for tile_id in residency.visible_tiles() {
         if cache.is_current(tile_id) {
             continue;
@@ -4594,15 +4853,19 @@ fn recomposite_visible_tiles(
 
         let issued = if gpu_qualifies {
             match (gpu, compositor.as_deref_mut()) {
-                (Some(gpu), Some(compositor)) => begin_gpu_composite_tile(
-                    gpu,
-                    compositor,
-                    layers,
-                    store,
-                    tile_id,
-                    doc_origin,
-                    reference_origin,
-                ),
+                (Some(gpu), Some(compositor)) => {
+                    budget.next_tile(layers);
+                    begin_gpu_composite_tile(
+                        gpu,
+                        compositor,
+                        layers,
+                        store,
+                        tile_id,
+                        doc_origin,
+                        reference_origin,
+                        &mut budget,
+                    )
+                }
                 _ => None,
             }
         } else {
@@ -4612,7 +4875,8 @@ fn recomposite_visible_tiles(
         if let Some(pending) = issued {
             pending_gpu.push(pending);
         } else {
-            let composited = composite_tile_cpu_path(layers, store, tile_id, doc_origin);
+            let composited =
+                composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget);
             write_composited(store, cache, tile_id, &composited);
         }
     }
@@ -4639,7 +4903,7 @@ fn recomposite_visible_tiles(
             texels
         } else {
             let doc_origin = doc_origin_for(tile_id);
-            composite_tile_cpu_path(layers, store, tile_id, doc_origin)
+            composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget)
         };
         write_composited(store, cache, tile_id, &composited);
     }
@@ -4858,10 +5122,13 @@ fn read_layer_window(
 /// `PinLight`/`HardMix`), the 4-mode non-separable HSL family
 /// (`Hue`/`Saturation`/`Color`/`Luminosity`), and the 2-mode
 /// whole-colour-selection family (`DarkerColor`/`LighterColor`) are
-/// real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`
-/// — this family's own explicit, now sole boundary) still silently
-/// falls back to `Normal` at that same translation boundary — a real,
-/// still-open gap. Layer groups are recursed into at any depth via
+/// real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`)
+/// is real too, but [`resolve_tile`] intercepts it before this
+/// translation ever runs and applies its own stochastic `dissolve_gate`
+/// instead — see [`resolve_tile`]'s own doc comment for why. Layer
+/// groups are recursed into at any depth `aurora-doc` will accept
+/// (bounded independently by `aurora_doc::MAX_LAYER_TREE_DEPTH` and a
+/// per-tile node budget — see [`resolve_tile`]'s own doc comment) via
 /// [`resolve_tile`] (walking `aurora_doc::LayerTree::roots`/
 /// `LayerTree::children`, not `LayerTree::paint_order`, which stays a
 /// flat list for other, non-compositing callers), ancestor-visibility-
@@ -4903,6 +5170,11 @@ fn composite_document(
         vec![half::f16::from_f32(0.0); width as usize * height as usize * aurora_tile::CHANNELS];
 
     if width > 0 && height > 0 {
+        // One budget for the whole export, recharged per tile below --
+        // same shape as `recomposite_visible_tiles`', and for the same
+        // reason (a malformed document should warn once, not once per
+        // tile of a large export).
+        let mut budget = CompositeBudget::for_pass(layers);
         let tile_size = aurora_tile::TILE;
         let tiles_x = width.div_ceil(tile_size);
         let tiles_y = height.div_ceil(tile_size);
@@ -4915,12 +5187,22 @@ fn composite_document(
                     i64::from(ty) * i64::from(tile_size),
                 );
 
+                budget.next_tile(layers);
                 let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
                     Vec::with_capacity(layers.roots().len());
                 for &id in layers.roots().iter().rev() {
-                    if let Some(resolved) =
-                        resolve_tile(id, layers, store, tile_id, doc_origin, (0, 0))
-                    {
+                    // `1`: a root-level layer, the same depth
+                    // `aurora-doc`'s own validator starts its budget at.
+                    if let Some(resolved) = resolve_tile(
+                        id,
+                        layers,
+                        store,
+                        tile_id,
+                        doc_origin,
+                        (0, 0),
+                        1,
+                        &mut budget,
+                    ) {
                         layer_texels.push(resolved);
                     }
                 }
@@ -5967,7 +6249,9 @@ impl App {
     /// variant (`Dissolve` — this family's own explicit, now sole
     /// boundary) still
     /// silently falling back to `Normal` — a real, still-open gap. Layer
-    /// groups are recursed into at any depth, ancestor-visibility-gated
+    /// groups are recursed into at any depth `aurora-doc` will accept
+    /// (bounded independently by `aurora_doc::MAX_LAYER_TREE_DEPTH` —
+    /// see `resolve_tile`'s own doc comment), ancestor-visibility-gated
     /// (`resolve_tile`'s own shared recursion, walking
     /// `aurora_doc::LayerTree::roots`/`LayerTree::children`) — a
     /// group's own `opacity`/`blend_mode` **are** now aggregated into
@@ -7220,25 +7504,25 @@ mod tests {
         COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
-        ClipboardAccess, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess, Key, KeyChord,
-        Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind,
-        UndoOrder, activate_command, active_layer_origin, apply_mask_clip, apply_scroll_zoom,
-        autosave_path, background_color_from_theme, begin_drag, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, clear_session_marker,
-        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
-        composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
-        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eyedropper_sample,
-        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
-        handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path, layer_local_point,
-        load_scales, load_theme, logical_point, logical_size, open_command_palette,
-        open_crash_recovery_dialog, open_image, open_tile_store, palette_commands,
-        pointer_in_canvas, pointer_on_rail_divider, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, resized_rail_width,
-        run_command, sample_pixel, select_layer, splitmix64, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess,
+        Key, KeyChord, Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
+        UndoKind, UndoOrder, activate_command, active_layer_origin, apply_mask_clip,
+        apply_scroll_zoom, autosave_path, background_color_from_theme, begin_drag,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin,
+        clear_session_marker, close_command_palette, close_crash_recovery_dialog,
+        collect_widget_paints, composite_document, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eyedropper_sample, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, resized_rail_width, resolve_tile, run_command, sample_pixel,
+        select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -12111,6 +12395,452 @@ mod tests {
                  with each level's own isolated buffer correctly un-premultiplied"
             );
         }
+    }
+    /// Builds `layers` into: an opaque white full-coverage background
+    /// pixel layer at root level, plus a chain of `groups` nested groups
+    /// (the outermost at root level, i.e. depth 1, so the innermost sits
+    /// at depth `groups`) with one opaque red full-coverage pixel layer
+    /// inside the innermost group, at depth `groups + 1`. Both pixel
+    /// layers are filled in `store`. Returns nothing but the filled
+    /// tree/store — the caller composites and inspects the result.
+    ///
+    /// Shared by the two depth-bound tests below so the *only*
+    /// difference between them is the one extra level of nesting.
+    fn nested_group_chain_over_a_white_background(
+        layers: &mut aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        groups: usize,
+    ) {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        // Depth 1 is the outermost group (`parent: None`), matching the
+        // seed every real `resolve_tile` call site passes for a root.
+        let mut parent = None;
+        for level in 0..groups {
+            parent = match layers.add_group(format!("group-{level}"), parent) {
+                Ok(id) => Some(id),
+                Err(err) => unreachable!("{err:?}"),
+            };
+        }
+        let deepest = match layers.add_pixel_layer("deepest", bounds, parent) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [1.0, 1.0, 1.0, 1.0]),
+            (deepest, [1.0, 0.0, 0.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(store, surface, tile_id, rgba);
+        }
+    }
+
+    #[test]
+    // The boundary itself, isolated from any nesting: one ordinary
+    // visible pixel layer, resolved twice at two adjacent depths. This
+    // pins the exact comparison operator (`>`, not `>=`) — the one
+    // thing most likely to silently drift from `aurora-doc`'s own
+    // `validate_shape`, which rejects with `depth > MAX_LAYER_TREE_DEPTH`
+    // after seeding roots at 1.
+    fn resolve_tile_refuses_to_recurse_past_the_layer_tree_depth_bound() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let id = match layers.add_pixel_layer(
+            "solo",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(&mut store, surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+
+        assert!(
+            resolve_tile(
+                id,
+                &layers,
+                &mut store,
+                tile_id,
+                (0, 0),
+                (0, 0),
+                aurora_doc::MAX_LAYER_TREE_DEPTH,
+                &mut CompositeBudget::for_pass(&layers),
+            )
+            .is_some(),
+            "a layer sitting exactly at the maximum tree depth is still a legitimate \
+             contributor and must resolve"
+        );
+        assert!(
+            resolve_tile(
+                id,
+                &layers,
+                &mut store,
+                tile_id,
+                (0, 0),
+                (0, 0),
+                aurora_doc::MAX_LAYER_TREE_DEPTH + 1,
+                &mut CompositeBudget::for_pass(&layers),
+            )
+            .is_none(),
+            "one level past the maximum tree depth must be refused outright"
+        );
+    }
+
+    #[test]
+    // The "no regression" half of the depth bound, end to end through a
+    // real composite: 255 nested groups (depths 1..=255) with an opaque
+    // red pixel layer at depth 256 — exactly `MAX_LAYER_TREE_DEPTH`, the
+    // deepest a tree `aurora-doc` accepts can legitimately go. The red
+    // must survive to the composited image.
+    fn composite_document_still_includes_a_layer_at_exactly_the_maximum_tree_depth() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        // `- 1` groups, because the pixel layer inside them occupies the
+        // last level of the budget itself.
+        nested_group_chain_over_a_white_background(
+            &mut layers,
+            &mut store,
+            aurora_doc::MAX_LAYER_TREE_DEPTH - 1,
+        );
+
+        // This is what proves `resolve_tile`'s bound and `aurora-doc`'s
+        // bound actually agree, rather than that a number was picked
+        // that happens to work: the very same tree must round-trip
+        // through `LayerTree`'s own `#[serde(try_from = "LayerTreeRepr")]`
+        // validation, which is where `validate_shape` runs.
+        let bytes = match postcard::to_allocvec(&layers) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            postcard::from_bytes::<aurora_doc::LayerTree>(&bytes).is_ok(),
+            "a tree this deep is accepted by `aurora-doc`'s own validator, so `resolve_tile` \
+             must not be stricter than it"
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [1.0, 0.0, 0.0, 1.0],
+                "the layer at exactly the maximum tree depth must still be composited, \
+                 covering the white background with its own opaque red"
+            );
+        }
+    }
+
+    #[test]
+    // The other half: one more level of nesting than the maximum. The
+    // over-deep branch must be dropped — the assertion is on the *white*
+    // background showing through untouched, not merely on the call
+    // returning, so this proves the branch was treated as absent rather
+    // than that nothing crashed.
+    fn composite_document_drops_the_branch_that_nests_one_level_past_the_maximum_tree_depth() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        // One more group than the test above, so the red pixel layer
+        // lands at `MAX_LAYER_TREE_DEPTH + 1`.
+        nested_group_chain_over_a_white_background(
+            &mut layers,
+            &mut store,
+            aurora_doc::MAX_LAYER_TREE_DEPTH,
+        );
+
+        // The mirror of the round trip above: `aurora-doc` refuses this
+        // tree, which is exactly why `resolve_tile` must refuse it too.
+        // `postcard`'s own error type discards the underlying
+        // `DocError`, so only `is_err()` can be asserted here — the
+        // specific `LayerTreeTooDeep` variant is pinned by
+        // `aurora-doc`'s own tests instead.
+        let bytes = match postcard::to_allocvec(&layers) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            postcard::from_bytes::<aurora_doc::LayerTree>(&bytes).is_err(),
+            "a tree one level past the maximum is rejected by `aurora-doc`'s own validator"
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [1.0, 1.0, 1.0, 1.0],
+                "the over-deep branch must be dropped from the composite entirely, leaving \
+                 the white background untouched"
+            );
+        }
+    }
+
+    /// Builds a perfect binary tree of groups `levels` deep under one
+    /// new root group, with one opaque full-coverage pixel layer at
+    /// every leaf, and returns that root's id. `levels = 3` gives 7
+    /// groups and 8 pixel layers, i.e. 15 nodes reachable from the root
+    /// and nothing else in the tree.
+    ///
+    /// The shape matters: this is the *fan-out* direction, the one the
+    /// depth counter alone says nothing about, so it is what the node
+    /// budget's own tests are built on.
+    fn balanced_group_tree(
+        layers: &mut aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        levels: usize,
+    ) -> aurora_doc::LayerId {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let root = match layers.add_group("root", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut frontier = vec![root];
+        for level in 1..levels {
+            let mut next = Vec::new();
+            for parent in frontier {
+                for branch in 0..2 {
+                    match layers.add_group(format!("g-{level}-{branch}"), Some(parent)) {
+                        Ok(id) => next.push(id),
+                        Err(err) => unreachable!("{err:?}"),
+                    }
+                }
+            }
+            frontier = next;
+        }
+        for (leaf, parent) in frontier.into_iter().enumerate() {
+            for branch in 0..2 {
+                let id = match layers.add_pixel_layer(
+                    format!("leaf-{leaf}-{branch}"),
+                    bounds,
+                    Some(parent),
+                ) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let Some(surface) = layers.surface_id(id) else {
+                    unreachable!("just created as a pixel layer");
+                };
+                fill_solid(
+                    store,
+                    surface,
+                    aurora_tile::TileId { x: 0, y: 0 },
+                    [0.0, 1.0, 0.0, 1.0],
+                );
+            }
+        }
+        root
+    }
+
+    #[test]
+    // The node budget's "no false positives" half, and the reason it is
+    // sized from the document rather than from a constant: a legitimate
+    // tree that is *wide* as well as deep must composite in full, and
+    // must fit the budget exactly rather than merely comfortably. 15
+    // nodes, 15 charges, nothing left over and nothing dropped -- which
+    // is only true because every layer in a tree `aurora-doc` accepts is
+    // reachable from the roots at most once.
+    fn resolve_tile_spends_exactly_one_budget_node_per_layer_of_a_well_formed_tree() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let root = balanced_group_tree(&mut layers, &mut store, 3);
+        assert_eq!(layers.len(), 15, "7 groups plus 8 leaf pixel layers");
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let before = budget.nodes;
+        assert_eq!(before, layers.len(), "the budget is the tree's own size");
+
+        let resolved = resolve_tile(
+            root,
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            1,
+            &mut budget,
+        );
+        assert!(
+            resolved.is_some(),
+            "a well-formed 15-layer tree must composite in full, not be truncated by its \
+             own budget"
+        );
+        assert_eq!(
+            before - budget.nodes,
+            layers.len(),
+            "every layer is entered exactly once, so the budget lands exactly at zero -- \
+             one node tighter and this well-formed document would lose a layer"
+        );
+    }
+
+    #[test]
+    // The half that actually bounds the attack. The doubling red-team
+    // demonstrated -- a group whose `children` names the same id twice,
+    // costing `2^slack` visits from a shallow entry point -- inflates
+    // exactly one quantity: how many times `resolve_tile` is entered for
+    // one tile. That quantity is what this budget caps, monotonically
+    // and without refund on return, so the cap holds whatever shape the
+    // tree has.
+    //
+    // The malformed tree itself cannot be built from this crate:
+    // `aurora-doc`'s public API refuses to create a duplicate child, and
+    // its `Deserialize` refuses to accept one -- which is the whole
+    // premise of this guard being *defence in depth* rather than the
+    // primary check. So the budget is exercised the way the depth
+    // bound's own unit test exercises the depth counter: by handing
+    // `resolve_tile` a starting value directly. Burning one node up
+    // front leaves room for the group and the lower of its two children
+    // and nothing else, and the assertion is on the upper child being
+    // *absent from the composited result* -- not merely on the call
+    // returning -- so this pins that an over-budget branch is dropped
+    // the same way an over-deep one is.
+    fn resolve_tile_drops_the_branch_it_has_no_budget_left_for() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Added lower first: every add lands at index 0, so `children`
+        // ends up `[upper, lower]` and the bottom-to-top walk in
+        // `resolve_tile` reaches `lower` first.
+        for (name, rgba) in [
+            ("lower", [1.0, 1.0, 1.0, 1.0]),
+            ("upper", [1.0, 0.0, 0.0, 1.0]),
+        ] {
+            let id = match layers.add_pixel_layer(name, bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(
+                &mut store,
+                surface,
+                aurora_tile::TileId { x: 0, y: 0 },
+                rgba,
+            );
+        }
+
+        let group_texel =
+            |store: &mut aurora_tile::TileStore, budget: &mut CompositeBudget| -> [f32; 4] {
+                let resolved = resolve_tile(
+                    group,
+                    &layers,
+                    store,
+                    aurora_tile::TileId { x: 0, y: 0 },
+                    (0, 0),
+                    (0, 0),
+                    1,
+                    budget,
+                );
+                let Some((texels, _, _)) = resolved else {
+                    unreachable!("the group itself is inside every budget used here");
+                };
+                let Some([r, g, b, a]) = texels.get(..aurora_tile::CHANNELS) else {
+                    unreachable!("a resolved tile is at least one texel wide");
+                };
+                [r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]
+            };
+
+        let mut full = CompositeBudget::for_pass(&layers);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                group_texel(&mut store, &mut full),
+                [1.0, 0.0, 0.0, 1.0],
+                "with the real budget both children composite, so the upper (red) one wins"
+            );
+        }
+
+        let mut short = CompositeBudget::for_pass(&layers);
+        assert!(short.charge_node(), "burn one of the three nodes up front");
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                group_texel(&mut store, &mut short),
+                [1.0, 1.0, 1.0, 1.0],
+                "one node short, the upper child is dropped from the composite entirely -- \
+                 the white lower one shows through untouched"
+            );
+        }
+        assert_eq!(
+            short.nodes, 0,
+            "and the traversal stopped there rather than continuing to charge"
+        );
+    }
+
+    #[test]
+    // The throttle. `recomposite_visible_tiles` resolves once per
+    // invalidated tile per frame, so a per-breach warning on a malformed
+    // document would fire thousands of times a second on a path that is
+    // already over its latency budget. The node count is per tile; the
+    // "already said so" flag is per pass.
+    fn composite_budget_reports_a_breach_once_per_pass_and_recharges_per_tile() {
+        let mut layers = aurora_doc::LayerTree::new();
+        if let Err(err) = layers.add_group("group", None) {
+            unreachable!("{err:?}");
+        }
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        assert!(
+            budget.should_report(),
+            "the first breach of a pass is worth saying"
+        );
+        assert!(
+            !budget.should_report(),
+            "the second is the same broken tree"
+        );
+
+        assert!(budget.charge_node());
+        budget.next_tile(&layers);
+        assert_eq!(
+            budget.nodes,
+            layers.len(),
+            "the next tile gets its own full node budget"
+        );
+        assert!(
+            !budget.should_report(),
+            "but not its own warning -- one report per composite pass, not per tile"
+        );
     }
 
     #[test]

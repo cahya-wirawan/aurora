@@ -15,11 +15,25 @@ use crate::layer::{BlendMode, Layer, LayerEntry, LayerId, LayerKind, LayerLock, 
 /// The number is deliberately far above any real document and far below
 /// anything that strains a traversal: Photoshop's own UI has never let a
 /// user nest groups more than ten deep, so 256 is roughly twenty-five
-/// times past the deepest document anyone actually has. It also bounds
-/// the one traversal in this project that allocates per level —
-/// `aurora-app`'s own recursive `resolve_tile`, which holds about half a
-/// megabyte of tile buffer per group level — to a few hundred megabytes
-/// rather than an unbounded amount.
+/// times past the deepest document anyone actually has.
+///
+/// **What it does not bound.** It caps *depth*, and nothing else. It is
+/// tempting to read it as a memory bound on the one traversal in this
+/// project that allocates per level — `aurora-app`'s own recursive
+/// `resolve_tile`, which holds about half a megabyte of tile buffer per
+/// contributor — and an earlier version of this comment claimed exactly
+/// that. The claim was wrong: `resolve_tile` collects one such buffer
+/// per *sibling* before compositing them, so its peak is
+/// `O(siblings × depth)`, and a single group holding a few thousand
+/// ordinary sibling layers already costs a gigabyte on a ten-pixel-square
+/// document. Nothing malformed is needed to reach that, this constant
+/// does not restrain it, and the real fix (compositing in place instead
+/// of collect-then-composite) is separate, still-open work — see
+/// PLAN.md's own M1.8 notes. Likewise, because that traversal recurses
+/// once per child rather than once per level, a tree that defeats
+/// `validate_shape`'s duplicate check would fan out exponentially
+/// rather than merely deeply; `aurora-app` bounds that with its own
+/// per-tile node budget rather than relying on this constant.
 pub const MAX_LAYER_TREE_DEPTH: usize = 256;
 
 /// A layer (and, if it was a group, its whole subtree) detached from a

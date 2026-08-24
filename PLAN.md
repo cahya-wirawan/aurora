@@ -6632,6 +6632,124 @@ structural design work.
     sites are `aurora-doc`'s own `history.rs`), and becomes reachable
     the moment layer drag-reordering ships in the UI.
 
+    **Closed 2026-08-24 (0.49.2), on the consumer side.**
+    `resolve_tile` now carries its own `depth: usize` parameter,
+    seeded at `1` by all three call sites (`begin_gpu_composite_tile`,
+    `recomposite_visible_tiles`' CPU path, `composite_document`) — the
+    same depth `aurora-doc`'s own `validate_shape` starts a manifest's
+    `roots` at — incremented on the single recursive call in the
+    `LayerKind::Group` arm, and checked against
+    `aurora_doc::MAX_LAYER_TREE_DEPTH` reused directly, with the same
+    strictly-greater comparison that validator uses. Past the bound it
+    `tracing::warn!`s and returns `None`, which every caller already
+    treats as "this contributor is absent from the composite" (the same
+    contract an invisible layer or a failed tile load uses), so the
+    over-deep branch is dropped rather than the tile being aborted.
+    This is **defence in depth, not a replacement**: `aurora-doc`'s
+    validators are untouched, and the point is precisely that
+    `resolve_tile` no longer depends on them being correct.
+
+    **A depth counter alone was not enough, and the first version of
+    this guard shipped with a doc comment claiming it was.** Review
+    caught it with a running reproduction. The recursive call sits
+    inside a loop over a group's `children`, so a node's call count is
+    `children.len()`, not one: a group whose `children` names the same
+    id twice — the duplicate-reachability shape `validate_shape` checks
+    for, and the shape behind the real bug in all three prior rounds of
+    this section — *branches* rather than walks. Measured, driving
+    `resolve_tile` at decreasing depth slack against a `children =
+    [G, G]` self-cycle: slack 1 → 896 µs, slack 4 → 43.7 ms, slack 8 →
+    746.7 ms, a clean doubling per level that finishes at no realistic
+    slack. The depth bound does still make that terminate in the formal
+    sense, but "terminates" there means an uninterruptible hang on the
+    compositing thread — for a user holding unsaved work, no better
+    than the stack-overflow abort the guard exists to prevent. (The
+    control case, a genuine self-cycle at fan-out 1, terminated in
+    ~794 ms as claimed, so the depth bound itself was never the
+    problem; the fan-out was.)
+
+    **So `resolve_tile` now carries a second, independent bound: a
+    per-tile node budget** (`CompositeBudget`), charged once on entry
+    and never refunded on return, threaded `&mut` through the recursion
+    alongside `depth`. Depth bounds stack frames; the budget bounds
+    total work — the exact quantity a fan-out cycle inflates. The
+    budget is the document's own `LayerTree::len()`, recomputed per
+    tile, not a constant: in any tree `aurora-doc` accepts every layer
+    is reachable from the roots at most once, so a full well-formed
+    pass costs exactly `len()` entries and can never be truncated by
+    it, while PRD §6's *unlimited* layers means any fixed constant
+    would be either a real ceiling or no bound at all. Still a monotone
+    counter rather than a visited set — cheaper than the set the
+    original reasoning rejected, with the same termination guarantee.
+    The `tracing::warn!` on either bound is now throttled to once per
+    composite pass rather than once per breach (`recomposite_visible_tiles`
+    resolves once per invalidated tile per frame, so per-breach logging
+    would fire at interactive rate on a path already over budget); the
+    node count resets per tile, the "already reported" flag does not.
+
+    Pinned by
+    `resolve_tile_refuses_to_recurse_past_the_layer_tree_depth_bound`
+    (the boundary and the comparison operator, in isolation),
+    `composite_document_still_includes_a_layer_at_exactly_the_maximum_tree_depth`
+    and
+    `composite_document_drops_the_branch_that_nests_one_level_past_the_maximum_tree_depth`
+    (both end to end through a real 255/256-group chain, each also
+    round-tripping the same tree through `postcard` +
+    `LayerTree`'s own `#[serde(try_from = ...)]` validation, so the two
+    bounds are proven to agree rather than assumed to), plus, for the
+    budget,
+    `resolve_tile_spends_exactly_one_budget_node_per_layer_of_a_well_formed_tree`
+    (a 15-node fan-out-2 tree composites in full and lands the budget
+    exactly at zero — one node tighter would lose a layer),
+    `resolve_tile_drops_the_branch_it_has_no_budget_left_for` (the
+    over-budget child is *absent from the composited texels*, not
+    merely survived), and
+    `composite_budget_reports_a_breach_once_per_pass_and_recharges_per_tile`
+    (the throttle). Guard, comparison operator, budget size and
+    throttle were all mutation-checked: the tests fail when the depth
+    guard is disabled, when its `>` becomes `>=`, when the budget bail
+    is disabled, when the budget is loosened by a single node, and when
+    the report throttle always fires.
+
+    **Honest scope limit on the budget's own tests.** The malformed
+    tree cannot be built from `aurora-app`: `aurora-doc`'s public API
+    refuses to create a duplicate child and its `Deserialize` refuses
+    to accept one — which is the premise of this being defence in depth
+    rather than the primary check. So the budget is exercised the way
+    the depth bound's own unit test exercises the depth counter, by
+    handing `resolve_tile` a starting value directly, and what the
+    tests measure is the quantity the exploit inflates (entries into
+    `resolve_tile` per tile), not a stopwatch on the exploit itself.
+    The exponential shape above was reproduced by review against a
+    patched copy, not by a test in this workspace.
+
+    The **producer** side is still open — see the depth-bound bullet
+    below — but a tree grown past the bound through the live API can no
+    longer take the compositor down with it, at any fan-out.
+
+    **One more, smaller fix on the same day, from an independent judge
+    pass over the budget above.** The `Group` arm's own child loop kept
+    calling `resolve_tile` for every remaining listed child even after
+    `budget.is_exhausted()`, so each of those calls still cost one
+    real (if cheap, `O(1)`) function entry rather than being skipped
+    outright — turning a crafted tree's cost from exponential (fixed
+    above) into merely polynomial (`len() × children.len()`), not the
+    linear `O(len())` the budget's own doc comment already claimed.
+    Fixed with a new `CompositeBudget::is_exhausted`, checked at the
+    top of the loop body so the loop now stops calling `resolve_tile`
+    at all once the budget is spent, rather than continuing to call it
+    and losing every time. No new test: this changes cost, not
+    observable output — every existing budget/depth test still passes
+    unmodified and pins the same behaviour. The same pass also found
+    two stale doc-comment claims that `Dissolve` "still silently falls
+    back to `Normal`" (module doc and `composite_document`'s own doc)
+    — false since `resolve_tile` already intercepts `Dissolve` ahead of
+    that translation and applies real `dissolve_gate` stochastic
+    compositing (see `resolve_tile`'s own doc comment, unchanged and
+    accurate); both corrected to say so rather than continuing to claim
+    a gap that closed some time before this pass found the doc comment
+    still describing it.
+
     **Fix: reject dangling references outright**, rather than patching
     each place their existence causes trouble downstream. `validate_shape`
     now returns the new `DocError::DanglingLayerReference(id)` for an id
@@ -6793,7 +6911,61 @@ structural design work.
     purely through the API. Not input-reachable — a human would have to
     deliberately nest 256+ groups by hand — so not the same class of
     risk as the rest of this section, but named so `MAX_LAYER_TREE_DEPTH`'s
-    doc comment isn't read as a stronger guarantee than it is.
+    doc comment isn't read as a stronger guarantee than it is. Still
+    open as stated, but **the consequence is partly contained**: as of
+    0.49.2 `resolve_tile` bounds its own recursion (above), so an
+    API-grown over-deep tree loses its deepest branch from the composite
+    instead of overflowing the stack. `add_group`/`reparent` themselves
+    still do not check depth.
+
+    **Not contained: such a document can never be saved.** Traced by
+    review 2026-08-24. `aurora-io`'s `.aur` write path verifies by
+    reopening, and the read side runs `validate_shape`, which rejects a
+    >256-deep tree — so the write-to-temp / verify / swap never
+    completes and the user is told the save failed, every time, with no
+    way back other than manually un-nesting. "Unsaved work that cannot
+    be saved" is the failure class CLAUDE.md calls the worst this
+    project can have, so this is recorded as a real gap rather than a
+    theoretical one. What keeps it off the critical list today is
+    reachability: nothing in `aurora-app` calls `reparent`
+    (`grep -rn "\.reparent(" crates/aurora-app/src` is still empty),
+    and reaching it through `add_group` alone means a human deliberately
+    creating 256 nested groups by hand. It becomes ordinary-usage
+    reachable the moment layer drag-reordering ships.
+
+    **Deliberately deferred out of 0.49.2, not overlooked.** The fix
+    belongs in `aurora-doc`'s producer side, not in the `aurora-app`
+    guard this version is about, and it is not the one-liner it looks
+    like: `insert` could check `depth_of(parent) + 1` with the helper
+    0.49.1 already added, but `reparent` needs the moved subtree's own
+    *height* as well (a downward walk that does not exist yet), both
+    would newly return `DocError::LayerTreeTooDeep` from methods whose
+    contracts and callers assume they cannot, and the save-side
+    behaviour needs its own decision (refuse the nest, or warn at save
+    time) rather than falling out of the depth check. It would also
+    invalidate the two end-to-end tests above, which construct their
+    over-deep fixture through `add_group` precisely because nothing
+    stops them — so producer fix and consumer tests have to land
+    together, with a new way to build that fixture. Whoever picks this
+    up: it is a step of its own, and this paragraph is the brief.
+- [ ] **`resolve_tile`'s peak memory is `O(siblings × depth)`, not
+    bounded by depth at all** — found by review 2026-08-24, reachable
+    through completely ordinary usage, no malformed tree involved. The
+    `LayerKind::Group` arm collects one full tile buffer (512 KiB at
+    `f16` RGBA) per child into `child_texels` *before* compositing any
+    of them, so width dominates: 2,000 ordinary sibling layers on a
+    10 × 10 px document — a single tile — was measured at ~1 GB RSS.
+    `MAX_LAYER_TREE_DEPTH`'s own doc comment claimed this constant
+    bounded that allocation "to a few hundred megabytes"; it never did,
+    and the claim is corrected in `crates/aurora-doc/src/tree.rs` as
+    part of 0.49.2. The real fix is accumulate-in-place compositing
+    (fold each child into one destination buffer as it resolves, rather
+    than collect-then-composite), which changes the compositing
+    algorithm itself and its un-premultiply step — deliberately out of
+    scope for 0.49.2, which was a bounding guard, not a compositing
+    change. Sized but not scheduled; it is a real gap in the "nothing
+    assumes a document fits in memory" invariant (§7.3.1) for wide
+    documents, and it is not bounded by anything today.
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
   mutator with an undo-recording version and kept its own undo/redo
