@@ -4,17 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**Skeleton plus one measured spike.** The Cargo workspace, all 19 crates, CI, and the ADRs exist; **no functionality is implemented** — each library crate holds a placeholder `crate_name()` and one test so CI has something real to check.
+**A real, running editor — Phase 1 in progress.** As of `0.48.1`: roughly 53,000 lines across 20 crates, 985 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
 
-The vertical slice (PRD §13 Step 4) is built and measured: `spike/vertical-slice/`, results in [spike/FINDINGS.md](spike/FINDINGS.md). Read that before writing tile, render, or brush code — it corrected several assumptions, and its numbers are the only real performance data the project has.
+Five crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-text`, `aurora-filters`, `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. Everything else is real code.
 
-A second spike covers accessibility and IME (`spike/a11y-ime/`, [FINDINGS](spike/a11y-ime/FINDINGS.md)). It is **partial**: the tree builds and the platform adapter initializes, but nobody has yet confirmed a screen reader speaks the field or that CJK composition works — those need a human, and until they are done ADR 0001 is not de-risked.
+**[PLAN.md](PLAN.md) is the progress tracker** — task-level status per milestone, every `[x]` backed by linked evidence. Check it before starting work, and update the relevant checkbox in the same commit as the work. Its "Where we are" and "Next action" sections are the maintained, current summary; this file's summary is deliberately shorter and goes stale faster, so **PLAN.md wins on any disagreement**. README.md's status paragraph is also kept current, aimed at outside readers.
 
-Two constraints it already surfaced: **windows must be created hidden, adapted, then shown** (`accesskit_winit` panics otherwise — this shapes `aurora-app`'s window management), and the text stack sets the toolchain floor (`cosmic-text` needs ≥1.89, which is why the pin moved to 1.97).
+### What is not done
 
-Remaining Phase 0 work: finishing the human half of the a11y/IME verification, the design language and token system, running both spikes on Windows and Linux, and the RAW/ICC and PSD-write feasibility spikes.
+- **M1.10, the Phase 1 gate, is what is actually open.** Its remaining items are hardware-gated (below), design-owner-gated (which gallery component to build next is Cahya's call, not an engineering one), tooling-gated (the PSD spike needs `psd-tools` as an independent reader), or genuinely large multi-round work (all 26 blend-mode formulas ported to WGSL; real per-pixel/grayscale mask storage — masks clip to a rectangle today).
+- **Phase 0 has a tail.** Windows/DX12 validation, the Linux and Windows human legs of the accessibility/IME checklist, and macOS/Windows LGPL packaging all need hardware and a human.
+- **[ADR 0001](docs/adr/0001-custom-wgpu-ui.md) is still not de-risked** — the project's most durable open risk. macOS accessibility passes 9/10 ([spike/a11y-ime/FINDINGS.md](spike/a11y-ime/FINDINGS.md)); Linux (AT-SPI) and Windows (UIA) are entirely unverified, and each is a different platform API. Cahya accepted this as a risk rather than a blocker for starting Phase 1 (2026-07-28). It remains the one open item that could overturn the custom-`wgpu`-UI decision.
+- **60 FPS is measured and failing** — see "Measured, not assumed" below.
+- **Not started at all**: PSD/PSB in the app (a feasibility spike only, not wired in), filters and adjustments, selection tools beyond a raw data model, smart objects, RAW import, plugins, scripting, AI, and true infinite pasteboard panning (panning deliberately stops at the document's own edge).
 
-**[PLAN.md](PLAN.md) is the progress tracker** — task-level status for Phase 0 and a full Phase 1 breakdown. Check it before starting work to see what is done, blocked, or next, and update the relevant checkbox in the same commit as the work. It also lists findings carried forward from the spikes and where each one lands.
+### Spikes
+
+Five, all outside the workspace so they can never become dependencies of real code: `vertical-slice` (performance, [FINDINGS](spike/FINDINGS.md) — read before touching tile, render, or brush code), `a11y-ime`, `psd-write`, `raw-icc`, `lgpl-packaging`.
+
+Two constraints from the a11y spike still shape real code: **windows must be created hidden, adapted, then shown** (`accesskit_winit` panics otherwise — this is why `aurora-app` manages windows the way it does), and the text stack sets the toolchain floor (`cosmic-text` needs ≥1.89, which is why the pin is 1.97).
+
+### The lesson from the last round
+
+The first live interactive session on real hardware (2026-08-12/13) found four bugs — stroke slowness, paint offset from the cursor on Retina, sub-tile pan doing nothing, pan freezing at the edge — that 900+ passing tests, a green CI gate, and a headless software-Vulkan sandbox had all missed. GPU tests self-skip when no adapter is present, and a typical Linux dev box here has only Mesa llvmpipe software rendering. **A green test run is not evidence that canvas or UI work is correct.** Say so plainly rather than implying verification that did not happen, and expect anything involving DPI, real GPU timing, or interactive feel to need a human on real hardware.
 
 ## Commands
 
@@ -33,11 +45,14 @@ python3 scripts/check_no_hardcoded_style.py  # no literal colours/sizes in widge
 cargo deny check all                    # licences + advisories
 cargo doc --workspace --no-deps --open  # docs
 
+python3 design/check_contrast.py        # every token pair, every built-in theme
+cd design && python3 build_tokens_css.py > tokens.css   # regenerate the gallery's CSS
+
 cargo run -p aurora-app                 # the application
 cargo run -p aurora-cli                 # headless binary
 ```
 
-The spike is a separate crate, deliberately outside the workspace (root `Cargo.toml` `exclude`s it) so it can never become a dependency of real code:
+The spikes are separate crates, deliberately outside the workspace (root `Cargo.toml` `exclude`s them) so they can never become dependencies of real code:
 
 ```sh
 cd spike/vertical-slice
@@ -54,15 +69,32 @@ cargo fmt --all --check && python3 scripts/check_layering.py \
   && cargo nextest run --workspace
 ```
 
+Neither design script is in CI, and `design/tokens.css` is a review aid for the
+HTML mockups and gallery — Aurora itself never uses CSS. The TOML files under
+`design/tokens/` and `design/themes/` are the source of truth; regenerate after
+any token edit rather than hand-editing the CSS. (It went un-regenerated from the
+original scaffold through 0.48.0, because the generator crashed on the scalar
+`border.control_opacity` 0.18.0 added — fixed in 0.48.1.)
+
+`cargo nextest` is not always installed locally — `cargo test --workspace` is an
+acceptable stand-in, and CI additionally runs `cargo test --workspace --doc`
+(nextest does not run doctests) plus `cargo doc --workspace --no-deps
+--all-features`, so a broken intra-doc link fails CI even when every test passes.
+
+GPU-backed tests self-skip when no adapter is present, and print `SKIPPED` rather
+than failing. A dev box with only Mesa llvmpipe still runs them, but in software
+— see "The lesson from the last round" above before treating those numbers, or
+those passes, as evidence about real hardware.
+
 Toolchain is pinned in `rust-toolchain.toml` (1.97, edition 2024 — `cosmic-text` requires ≥1.89, so the text stack sets the floor). CI runs on Linux, macOS, and Windows from the first commit — cross-platform breakage is cheap to fix now and catastrophic in month 30.
 
 ## Lints worth knowing
 
-The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `Cargo.toml`). This is deliberate: Aurora holds a professional's unsaved work, and a panic loses it. Return errors instead. A crate needing `unsafe` (likely `aurora-gpu` for FFI) must override `unsafe_code` in its own `[lints]` table rather than the workspace's, so the exception is visible in review.
+The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `Cargo.toml`). This is deliberate: Aurora holds a professional's unsaved work, and a panic loses it. Return errors instead. A crate needing `unsafe` must override `unsafe_code` in its own `[lints]` table rather than the workspace's, so the exception is visible in review. **No crate has needed to yet** — `wgpu` and the FFI wrappers in use present safe Rust APIs, so the whole workspace is still `unsafe_code = "deny"`. Keep it that way if you can.
 
 ## Versioning
 
-SemVer, starting at `0.0.1`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place.
+SemVer, started at `0.0.1`, currently `0.48.1`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
 
 - **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
 - **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.
@@ -74,7 +106,7 @@ A release is a `vX.Y.Z` tag (e.g. `v0.1.0`) pushed once the matching version bum
 
 A cross-platform, GPU-accelerated, non-destructive professional image editor (a Photoshop alternative) for Windows, macOS, and Linux. PSD/PSB compatibility and AI-assisted editing are first-class requirements, not add-ons.
 
-## Planned architecture (PRD §7)
+## Architecture (PRD §7)
 
 A single Cargo workspace with crates layered so dependencies point **downward only** — `core` → `tile` → `graph`/`gpu` → `render`/`doc` → feature crates (`filters`, `brush`, `vector`, `text`, `io`, `ai`, `plugin`, `theme`) → `widgets` → `ui` → `app`/`cli`. PRD §7.2 has the full table. A lower crate must never depend on a higher one; CI enforces this.
 
@@ -134,17 +166,38 @@ Note these budgets are set at 8 bytes/px (half-float RGBA), which is 2× an 8-bi
 
 One GPU (Radeon Pro 5300M, Metal), so treat as indicative rather than settled — but these are real numbers and they changed the design:
 
-- **Stroke latency p99 9.1 ms against a 10 ms budget.** Under 1 ms of margin. Add a latency regression test in CI with the first Phase 1 commit; do not assume this holds as the brush engine grows.
+- **Stroke latency p99 9.1 ms against a 10 ms budget.** Under 1 ms of margin. A latency regression test now exists in CI; do not assume the margin holds as the brush engine grows.
 - **CPU compositing is the bottleneck, not disk I/O** — the opposite of what was assumed. Page-in panning runs at 7 ms; merging whole tiles costs ~20 ms. So: `aurora-tile` needs **per-tile dirty rectangles**, and compositing belongs on the **GPU** with the CPU path as fallback.
 - **Upload bandwidth caps pan speed** (~18 MB per screenful). Render a lower mip while panning and refine when motion stops — this is what the progressive-rendering requirement is for.
 - Invariants §7.3.1 and §7.3.8 hold; half-float round-trips bit-exact.
+
+### The live app, measured end to end (0.39.0, PLAN.md M1.10)
+
+The numbers above come from the throwaway slice. The real app has since been
+measured on its own path — brush → composite → tile upload → render pass →
+present — at the full 300,000 × 300,000 px ceiling, and **it misses the 60 FPS
+budget**:
+
+| Path | Budget | p50 | p99 |
+|---|---|---|---|
+| Pan while painting, GPU composite | 16.7 ms | 35.4 ms | **98.8 ms** (~5.9×) |
+| Same, CPU fallback (smaller viewport) | 16.7 ms | 22.6 ms | **54.1 ms** (~3.2×) |
+
+This is an honest, open finding, not a benchmark claim — report it that way. The
+tests assert a deliberately loose CI-safety threshold (350 ms / 180 ms) because
+they exist to produce a true number, not to pass at 60 FPS; do not read a green
+run as the budget being met. Later work reduced *how much* gets recomposited per
+edit, not the per-tile cost, and none of it has been re-measured on real GPU
+hardware.
 
 **PSD/PSB is full layered read *and* write** (PRD FR-001) — Aurora round-trips, so a file edited here must reopen in Photoshop with layers intact. Two rules follow: never overwrite a user's file in place (write to temp, verify by reopening, then swap), and warn with an itemized list before any lossy save. Silently degrading a professional's file is the worst failure this project can have.
 
 ## Phasing (PRD §9)
 
-**Phase 0 (de-risking) comes first** and is not yet done: `wgpu` validation on all three platforms, tile-paging prototype, screen-reader and CJK-IME spikes (the §8.3 escape-hatch triggers), widget toolkit foundations, the design language and token system (which must exist *before* widgets — tokens can't be retrofitted cheaply), RAW/ICC library decisions, PSD feasibility, and the workspace + CI skeleton. PRD §13 lists the ordered pre-implementation steps; Phase 1 feature work should not start before steps 1, 3, and 4 there are complete.
+**Phase 0 (de-risking)** satisfied its Phase 1 gate (PRD §13 Steps 1, 3, 4) on 2026-07-28: `wgpu` validation, the tile-paging prototype, the screen-reader and CJK-IME spikes (the §8.3 escape-hatch triggers), widget toolkit foundations, the design language and token system, RAW/ICC library decisions, PSD feasibility, and the workspace + CI skeleton. Its tail is still open — see "What is not done" above.
 
-Phase 1 is 9 months (not 6 — the widget toolkit is roughly a third of it) and Phase 3 is 10 months (not 8 — full PSD write). Total ~52 months. These estimates predate the prototype; PRD §13 Step 7 calls for re-grounding them now that the slice exists.
+**Phase 1 (document, canvas, layers, rendering, shell) is where the work is.** M1.1 and M1.6 are fully done; M1.2 through M1.9 are mostly done with named open items in their own PLAN.md sections; M1.10 is the gate.
+
+Calendar durations were dropped on 2026-07-28 (PRD §13 Step 7): this is solo development, so phases are milestone-based and not date-committed. Don't reintroduce month estimates.
 
 Each phase has a measurable exit criterion in §9 — prefer working toward the current gate over stubbing later-phase subsystems. Open questions that block design are tracked in PRD §12; risks in §11.
