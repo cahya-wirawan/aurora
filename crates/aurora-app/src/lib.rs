@@ -6521,14 +6521,116 @@ fn canvas_area_physical_size(
 /// `1.0` (no scaling) rather than propagating NaN/zero/negative into
 /// the GPU uniform.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
 fn effective_residency_zoom(canvas_zoom: f32, scale_factor: f64) -> f32 {
-    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
+    canvas_zoom * guarded_scale_factor(scale_factor)
+}
+
+/// `winit`'s reported `scale_factor` as an `f32`, with the degenerate
+/// values it should never actually report folded to `1.0` (no scaling)
+/// rather than propagating NaN/zero/negative into everything derived
+/// from it.
+///
+/// Factored out of [`effective_residency_zoom`] so [`canvas_min_zoom`]
+/// divides by *exactly* the number that function multiplies by. Two
+/// spellings of the same guard would be two chances for the two to
+/// disagree, which is the whole class of bug this round is closing.
+///
+/// **The guard runs on the `f32`, after the cast, not on the `f64`
+/// before it** — that ordering is the whole point and 0.57.3 had it the
+/// wrong way round. `f64 as f32` is a lossy narrowing that can *create*
+/// exactly the degenerate values this rejects: an `f64` above
+/// `f32::MAX` (~3.4e38) casts to `f32::INFINITY`, and one below
+/// `f32::MIN_POSITIVE` (~1.2e-38) casts to `0.0`. Both pass an
+/// `is_finite() && > 0.0` test applied to the `f64`, so validating
+/// first and casting second let precisely the values the guard names
+/// through — `inf` into a multiply and `0.0` into
+/// [`canvas_min_zoom`]'s own division. `winit` will report such a
+/// scale factor when `WINIT_X11_SCALE_FACTOR` or `Xft.dpi` is
+/// misconfigured, so this is reachable, not theoretical.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn guarded_scale_factor(scale_factor: f64) -> f32 {
+    let scale = scale_factor as f32;
+    if scale.is_finite() && scale > 0.0 {
+        scale
     } else {
         1.0
-    };
-    canvas_zoom * scale_factor as f32
+    }
+}
+
+/// The lower bound `App`'s own [`aurora_ui::CanvasView`] must be held
+/// to, in the *logical*-pixel zoom that view speaks, so that the atlas
+/// renders exactly the zoom the view reports.
+///
+/// [`aurora_gpu::TileResidency::min_zoom_for_viewport`] is the single
+/// source of truth for the floor itself; it is expressed against the
+/// **physical** viewport the atlas is sized in, so converting it into
+/// `CanvasView`'s logical zoom is a division by the same
+/// [`guarded_scale_factor`] [`effective_residency_zoom`] multiplies by.
+/// The identity that has to hold is
+/// `effective_residency_zoom(canvas_min_zoom(v, s), s) >=
+/// TileResidency::min_zoom_for_viewport(v)` — i.e. once the view is
+/// clamped here, the atlas never clamps again, so the scale it renders
+/// at and the scale [`aurora_ui::CanvasView::to_document`] divides by
+/// are the same number and a click cannot paint anywhere but under the
+/// cursor.
+///
+/// The `next_up` loop is what makes that an *exact* identity rather than
+/// an approximate one: `floor / scale * scale` can land one ulp below
+/// `floor`, which would put the atlas's own clamp back in play for that
+/// last ulp. Stepping the returned value up until the round trip lands
+/// at or above the floor costs at most a few ulps of zoom and removes
+/// the whole edge case; the bound is a guard against a much larger
+/// number being one, so rounding it up is always the safe direction.
+#[must_use]
+fn canvas_min_zoom(canvas_size: (u32, u32), scale_factor: f64) -> f32 {
+    let floor = aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_size);
+    let scale = guarded_scale_factor(scale_factor);
+    let mut min_zoom = floor / scale;
+    let mut steps = 0;
+    while min_zoom * scale < floor && steps < 8 {
+        min_zoom = min_zoom.next_up();
+        steps += 1;
+    }
+    min_zoom
+}
+
+/// A freshly reset [`aurora_ui::CanvasView`] for a newly opened
+/// document — default pan and zoom, but **never** a lapsed zoom floor.
+///
+/// `CanvasView::default()` resets `min_zoom` to `aurora_ui::canvas_view::MIN_ZOOM`,
+/// and the document-open paths assign one directly. That left a real
+/// window — from the assignment until the *next* `redraw`/`apply_resize`
+/// re-applied the floor — in which the view held no floor at all, and
+/// any scroll or click processed in that window went through
+/// `to_document` dividing by a zoom the atlas would decline to render:
+/// the exact render/paint divergence [`canvas_min_zoom`] and
+/// [`aurora_ui::CanvasView::set_min_zoom`] exist to close, reopened by
+/// the reset itself (measured at up to ~2,000 document px of offset at
+/// `MIN_ZOOM` on a 1920 px viewport). Resetting through this function
+/// closes it: the floor is re-derived from the live canvas area in the
+/// same statement that clears the view, so it is never absent, not even
+/// transiently.
+///
+/// `canvas_size` is [`canvas_area_physical_size`]'s own value (`None`
+/// only when the canvas-area widget id is unknown, which does not
+/// happen for `workspace.canvas_area` in practice). In that case
+/// `previous`'s floor is carried across rather than dropped — a stale
+/// floor from the last known canvas size is still a bound, and dropping
+/// to `MIN_ZOOM` is the one outcome this must not have.
+#[must_use]
+fn reset_canvas_view(
+    previous: &aurora_ui::CanvasView,
+    canvas_size: Option<(u32, u32)>,
+    scale_factor: f64,
+) -> aurora_ui::CanvasView {
+    let min_zoom = canvas_size.map_or_else(
+        || previous.min_zoom(),
+        |canvas_size| canvas_min_zoom(canvas_size, scale_factor),
+    );
+    let mut view = aurora_ui::CanvasView::default();
+    view.set_min_zoom(min_zoom);
+    view
 }
 
 /// The active pixel layer's own *surface-local, continuous* document
@@ -7156,7 +7258,15 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
-        self.canvas_view = aurora_ui::CanvasView::default();
+        // Through `reset_canvas_view`, never `CanvasView::default()`
+        // directly: the default drops the atlas's zoom floor, and a
+        // pointer event arriving before the next frame re-applies it
+        // would paint somewhere other than under the cursor.
+        self.canvas_view = reset_canvas_view(
+            &self.canvas_view,
+            canvas_area_physical_size(&self.workspace, self.scale_factor),
+            self.scale_factor,
+        );
         self.selection = aurora_doc::SelectionSet::new();
         // Dropped, deliberately not committed through `commit_drag`:
         // `pixel_history` was replaced wholesale a few lines up, so an
@@ -7245,7 +7355,15 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
-        self.canvas_view = aurora_ui::CanvasView::default();
+        // Through `reset_canvas_view`, never `CanvasView::default()`
+        // directly: the default drops the atlas's zoom floor, and a
+        // pointer event arriving before the next frame re-applies it
+        // would paint somewhere other than under the cursor.
+        self.canvas_view = reset_canvas_view(
+            &self.canvas_view,
+            canvas_area_physical_size(&self.workspace, self.scale_factor),
+            self.scale_factor,
+        );
         self.selection = aurora_doc::SelectionSet::new();
         // Dropped, deliberately not committed through `commit_drag`:
         // `pixel_history` was replaced wholesale a few lines up, so an
@@ -7976,10 +8094,15 @@ impl App {
         };
         surface.resize(gpu.device(), physical_size);
 
-        if let Some(residency) = self.residency.as_mut()
-            && let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor)
-        {
-            residency.resize(gpu.device(), gpu.queue(), canvas_size);
+        if let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor) {
+            // The atlas's own zoom floor moves with the canvas size, and
+            // a pointer event can arrive before the next frame -- see
+            // `redraw`'s own call for the full reasoning.
+            self.canvas_view
+                .set_min_zoom(canvas_min_zoom(canvas_size, self.scale_factor));
+            if let Some(residency) = self.residency.as_mut() {
+                residency.resize(gpu.device(), gpu.queue(), canvas_size);
+            }
         }
     }
 
@@ -8016,6 +8139,21 @@ impl App {
     // analogous reason.
     #[allow(clippy::too_many_lines)]
     fn redraw(&mut self) {
+        // Before anything reads `canvas_view`: hold its zoom to the
+        // floor the atlas can actually render at this canvas size
+        // (`canvas_min_zoom`). This is the one place guaranteed to run
+        // whenever what is on screen can have changed -- a window
+        // resize, a scale-factor change, or a dock layout that resized
+        // the canvas area without either -- so the view can never be
+        // holding a zoom the frame below is about to not honour, which
+        // is what made `to_document` (pointer -> document, i.e. where a
+        // brush dab lands) disagree with what was drawn. `apply_resize`
+        // does it too, so a pointer event arriving between a resize and
+        // the next frame is bounded as well.
+        if let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor) {
+            self.canvas_view
+                .set_min_zoom(canvas_min_zoom(canvas_size, self.scale_factor));
+        }
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -8600,18 +8738,19 @@ mod tests {
         ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, apply_mask_clip,
         apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
         begin_drag, brush_stroke_mut, canvas_area_physical_rect, canvas_area_physical_size,
-        canvas_local_origin, clean_shutdown_cleanup, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, collect_widget_paints, commit_ending_drag, composite_document,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eraser_stroke_mut, eyedropper_sample, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, is_aur_path, layer_local_point, load_scales, load_theme,
-        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
-        open_tile_store, palette_commands, partial_autosave_path, pointer_in_canvas,
-        pointer_on_rail_divider, previous_session_left_a_marker, recomposite_visible_tiles,
-        recover_document, replace_document, resized_rail_width, resolve_tile, run_command,
+        canvas_local_origin, canvas_min_zoom, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
+        commit_ending_drag, composite_document, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
+        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
+        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        palette_commands, partial_autosave_path, pointer_in_canvas, pointer_on_rail_divider,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
         sample_pixel, select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
         topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
         unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
@@ -18280,6 +18419,300 @@ mod tests {
         // above.
         assert_eq!(effective_residency_zoom(2.5, f64::NAN), 2.5);
         assert_eq!(effective_residency_zoom(2.5, f64::INFINITY), 2.5);
+    }
+
+    // -- The render path and the pointer path must read one zoom --
+    //
+    // RT12-04. `redraw` hands the atlas
+    // `effective_residency_zoom(canvas_view.zoom(), scale_factor)`, and
+    // `aurora_gpu::TileResidency` will not render below its own
+    // `min_zoom_for_viewport`; `CanvasView::to_document` -- what turns a
+    // click into the document position a brush dab lands on -- divides
+    // by `canvas_view.zoom()`. If those two numbers can differ, paint
+    // lands somewhere other than the pixel under the cursor, and nothing
+    // reports it. Measured before the fix, at canvas zoom 0.25 on a
+    // 1920 px viewport: a click at screen x = 960 converted to document
+    // x = 3840 while the pixel drawn there was document x ~= 1152; at
+    // `MIN_ZOOM` the two were ~83x apart. It is the same failure shape
+    // `CanvasView::clamp_pan_to_minimum` already documents on the pan
+    // axis, and the fix is the same: one bound, applied at the source.
+
+    /// Every canvas size and scale factor these tests sweep — a 1x and a
+    /// 2x display, tile-aligned and not, wide and tall.
+    const CANVAS_CASES: [((u32, u32), f64); 6] = [
+        ((1920, 1080), 1.0),
+        ((1920, 1080), 2.0),
+        ((3840, 2160), 2.0),
+        ((1366, 768), 1.0),
+        ((1024, 1024), 1.0),
+        ((777, 333), 1.25),
+    ];
+
+    #[test]
+    fn canvas_min_zoom_leaves_the_atlas_with_nothing_left_to_clamp() {
+        // The identity the whole fix rests on: once `CanvasView` is held
+        // at `canvas_min_zoom`, the zoom `redraw` passes the atlas is
+        // one the atlas renders *unchanged*. `TileResidency::
+        // effective_zoom` is that crate's own statement of what it will
+        // actually render, so comparing against it -- rather than
+        // re-deriving the floor here -- is what keeps the two crates
+        // from drifting apart on some later change.
+        for (canvas, scale_factor) in CANVAS_CASES {
+            let floor = canvas_min_zoom(canvas, scale_factor);
+            let passed = effective_residency_zoom(floor, scale_factor);
+            let rendered = aurora_gpu::TileResidency::effective_zoom(canvas, passed);
+            assert!(
+                (rendered - passed).abs() <= f32::EPSILON * passed,
+                "canvas {canvas:?} at scale factor {scale_factor}: the view's \
+                 own floor {floor} reaches the atlas as {passed}, which it \
+                 renders at {rendered}. Any gap here is a gap between where a \
+                 click paints and where the pixel under it was drawn"
+            );
+        }
+    }
+
+    #[test]
+    fn the_render_path_and_the_pointer_path_agree_on_scale_when_zoomed_out() {
+        // The reproduction itself, through the real helpers `redraw` and
+        // the pointer handlers use: `canvas_local_origin` (what the
+        // renderer is told is at the canvas's top-left corner),
+        // `effective_residency_zoom` (the zoom it is told to draw at),
+        // and `CanvasView::to_document` (where a click lands).
+        for (canvas, scale_factor) in CANVAS_CASES {
+            for requested in [0.01_f32, 0.25, 0.5, 1.0, 4.0] {
+                let mut view = CanvasView::new();
+                view.set_min_zoom(canvas_min_zoom(canvas, scale_factor));
+                view.zoom_at((0.0, 0.0), requested);
+                // An arbitrary, deliberately fractional pan, then the
+                // pan bound the real handlers apply.
+                view.pan_by((-137.75, -42.5));
+                view.clamp_pan_to_minimum((0.0, 0.0));
+
+                let layer_origin = (300.0, 150.0);
+                let doc_origin = canvas_local_origin(&view, layer_origin);
+                let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+                    canvas,
+                    effective_residency_zoom(view.zoom(), scale_factor),
+                );
+
+                #[allow(clippy::cast_precision_loss)]
+                let width_logical = canvas.0 as f32 / scale_factor as f32;
+                for screen_x in [0.0_f32, 1.0, width_logical / 2.0, width_logical - 1.0] {
+                    // Where the renderer actually draws: the atlas
+                    // covers `1 / rendered_zoom` document pixels per
+                    // *physical* pixel, starting at `doc_origin`.
+                    let physical_x = screen_x * scale_factor as f32;
+                    let drawn_here = doc_origin.0 + physical_x / rendered_zoom;
+                    // Where a click at the same place paints, in the
+                    // same layer-local space.
+                    let painted_here = view.to_document((screen_x, 0.0)).0 - layer_origin.0;
+                    assert!(
+                        (drawn_here - painted_here).abs() <= 0.05 + drawn_here.abs() * 1e-4,
+                        "canvas {canvas:?} at scale factor {scale_factor}, zoom \
+                         requested {requested} (held at {}): a click at canvas \
+                         x = {screen_x} paints document x = {painted_here}, but \
+                         the pixel actually drawn there is document x = \
+                         {drawn_here}",
+                        view.zoom()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn applying_the_zoom_floor_cannot_push_the_view_past_a_moved_layers_edge() {
+        // The ordering hazard: a view can already be zoomed out and
+        // panned to a moved layer's own top-left edge before the floor
+        // is known (the first frame of a session, or a scale-factor
+        // change). Raising the zoom then must not move
+        // `canvas_local_origin` negative -- `TileResidency::set_origin`
+        // clamps a negative document origin to zero while
+        // `CanvasView::to_document` would not, which is the pan-axis
+        // half of this same divergence and the one
+        // `clamp_pan_to_minimum` already exists to prevent.
+        let canvas = (1920, 1080);
+        let layer_origin = (300.0, 150.0);
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        view.pan_by((-90.0, -30.0));
+        view.clamp_pan_to_minimum(layer_origin);
+
+        view.set_min_zoom(canvas_min_zoom(canvas, 1.0));
+
+        let local = canvas_local_origin(&view, layer_origin);
+        assert!(
+            local.0 >= -1e-3 && local.1 >= -1e-3,
+            "after the floor was applied the renderer would be told to draw \
+             from layer-local {local:?}, which it clamps to (0, 0) while \
+             `to_document` keeps reporting the negative value -- render and \
+             paint disagreeing again, on the pan axis this time"
+        );
+    }
+
+    #[test]
+    fn a_view_left_unbounded_is_exactly_the_divergence_this_prevents() {
+        // The negative control: the same arithmetic with the floor *not*
+        // applied is the measured pre-fix report. Without this, the test
+        // above could pass because the numbers happen to be small rather
+        // than because anything is bounded.
+        let canvas = (1920, 1080);
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
+        let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+            canvas,
+            effective_residency_zoom(view.zoom(), 1.0),
+        );
+        let drawn_here = doc_origin.0 + 960.0 / rendered_zoom;
+        let painted_here = view.to_document((960.0, 0.0)).0;
+        assert!(
+            (drawn_here - painted_here).abs() > 1000.0,
+            "an unbounded 0.25 zoom must still diverge by thousands of \
+             document pixels ({painted_here} painted vs {drawn_here} drawn) -- \
+             if it no longer does, the test above has stopped proving anything"
+        );
+    }
+
+    #[test]
+    // Exact: the re-derived floor must be bit-identical to the one
+    // `canvas_min_zoom` produced, not merely close to it -- an
+    // approximate match here would hide exactly the lapse this covers.
+    #[allow(clippy::float_cmp)]
+    fn resetting_the_canvas_view_never_leaves_the_zoom_floor_absent() {
+        // `CanvasView::default()` resets `min_zoom` to `MIN_ZOOM`, and
+        // `open_file`/`open_aur_file` reset the view on every document
+        // open. Before this went through `reset_canvas_view`, the floor
+        // was simply gone until the next `redraw` re-applied it.
+        for (canvas, scale_factor) in CANVAS_CASES {
+            let mut previous = CanvasView::new();
+            previous.set_min_zoom(canvas_min_zoom(canvas, scale_factor));
+
+            let reset = reset_canvas_view(&previous, Some(canvas), scale_factor);
+            assert!(
+                reset.min_zoom() > aurora_ui::canvas_view::MIN_ZOOM,
+                "canvas {canvas:?} at scale factor {scale_factor}: a reset view \
+                 came back at the bare MIN_ZOOM {}, i.e. with no atlas floor at \
+                 all",
+                reset.min_zoom()
+            );
+            assert_eq!(
+                reset.min_zoom(),
+                previous.min_zoom(),
+                "canvas {canvas:?} at scale factor {scale_factor}: the re-derived \
+                 floor must be the same number the view already held"
+            );
+
+            // And with no canvas area to re-derive from, the previous
+            // floor is carried rather than dropped.
+            let carried = reset_canvas_view(&previous, None, scale_factor);
+            assert_eq!(carried.min_zoom(), previous.min_zoom());
+        }
+    }
+
+    #[test]
+    fn the_paths_still_agree_immediately_after_a_document_open_reset() {
+        // The reproduction for the reset window itself: open a document,
+        // then take a pointer position through the real conversion
+        // *before* any redraw has run. With `CanvasView::default()` in
+        // place of `reset_canvas_view` this diverges by hundreds to
+        // thousands of document pixels, because the view accepts a zoom
+        // the atlas will not render.
+        for (canvas, scale_factor) in CANVAS_CASES {
+            let mut previous = CanvasView::new();
+            previous.set_min_zoom(canvas_min_zoom(canvas, scale_factor));
+
+            let mut view = reset_canvas_view(&previous, Some(canvas), scale_factor);
+            // The scroll event that arrives before the next frame.
+            view.zoom_at((0.0, 0.0), aurora_ui::canvas_view::MIN_ZOOM);
+
+            let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
+            let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+                canvas,
+                effective_residency_zoom(view.zoom(), scale_factor),
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            let scale = scale_factor as f32;
+            #[allow(clippy::cast_precision_loss)]
+            let width_logical = canvas.0 as f32 / scale;
+            for screen_x in [0.0_f32, width_logical / 2.0, width_logical - 1.0] {
+                let drawn_here = doc_origin.0 + screen_x * scale / rendered_zoom;
+                let painted_here = view.to_document((screen_x, 0.0)).0;
+                assert!(
+                    (drawn_here - painted_here).abs() <= 0.05 + drawn_here.abs() * 1e-4,
+                    "canvas {canvas:?} at scale factor {scale_factor}: a click at \
+                     canvas x = {screen_x} immediately after a document-open reset \
+                     paints document x = {painted_here} while the pixel drawn there \
+                     is document x = {drawn_here}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    // Exact: the guard's whole contract is that it returns literally
+    // `1.0` for a degenerate input.
+    #[allow(clippy::float_cmp)]
+    fn the_scale_factor_guard_catches_values_that_only_degenerate_on_the_cast() {
+        // `f64 as f32` can *create* the degenerate values the guard
+        // rejects: above `f32::MAX` casts to infinity, below
+        // `f32::MIN_POSITIVE` casts to zero. Validating the `f64` first
+        // and casting second let both straight through.
+        for bad in [1e39_f64, -1e39, 1e-320, f64::MAX, f64::MIN_POSITIVE] {
+            assert!(
+                bad.is_finite(),
+                "this case is meant to be finite as an f64 -- the point is that \
+                 only the cast makes it degenerate"
+            );
+            let guarded = guarded_scale_factor(bad);
+            assert_eq!(
+                guarded, 1.0,
+                "scale factor {bad} degenerates on the cast to f32 and must fall \
+                 back to 1.0, not reach the zoom arithmetic as {guarded}"
+            );
+        }
+        // And a floor derived through it stays a real, usable number
+        // rather than 0 or infinity.
+        let floor = canvas_min_zoom((1920, 1080), 1e39);
+        assert!(
+            floor.is_finite() && floor > 0.0,
+            "a floor derived from an extreme scale factor came back as {floor}"
+        );
+    }
+
+    #[test]
+    fn the_ulp_correction_keeps_the_round_trip_at_or_above_the_atlas_floor() {
+        // The `next_up` loop in `canvas_min_zoom` fires only when
+        // `floor / scale * scale` lands one ulp below `floor`; no
+        // `CANVAS_CASES` entry reaches it. Sweeping real viewport and
+        // scale-factor combinations does, and the property asserted is
+        // the one the loop exists for.
+        let mut corrected = 0_u32;
+        for width in [1280_u32, 1366, 1440, 1600, 1920, 2560, 3440, 3840] {
+            for height in [720_u32, 768, 800, 900, 1080, 1440, 1600, 2160] {
+                for scale_factor in [1.0_f64, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
+                    let canvas = (width, height);
+                    let atlas_floor = aurora_gpu::TileResidency::min_zoom_for_viewport(canvas);
+                    let min_zoom = canvas_min_zoom(canvas, scale_factor);
+                    let round_trip = effective_residency_zoom(min_zoom, scale_factor);
+                    assert!(
+                        round_trip >= atlas_floor,
+                        "canvas {canvas:?} at scale factor {scale_factor}: the \
+                         view's floor {min_zoom} reaches the atlas as \
+                         {round_trip}, below its own floor {atlas_floor} -- the \
+                         last ulp where render and paint can still disagree"
+                    );
+                    if min_zoom > atlas_floor / guarded_scale_factor(scale_factor) {
+                        corrected += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            corrected > 0,
+            "no combination in this sweep needed the ulp correction, so this test \
+             is not exercising the loop it exists to cover"
+        );
     }
 
     fn laid_out_workspace() -> aurora_ui::Workspace {

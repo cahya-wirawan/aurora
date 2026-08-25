@@ -1194,7 +1194,18 @@ every widget in every state across all built-in themes with contrast checks gree
     coarse preview even at 1:1 zoom while a better one uploads, which
     automatic derivative-based LOD doesn't do). Neither is needed until
     an actual interactive canvas exists to drive them, which is later
-    Phase 1 work (`aurora-doc`, `aurora-app`).
+    Phase 1 work (`aurora-doc`, `aurora-app`). Enabling atlas LOD
+    additionally requires widening the sampled texture *view*'s
+    `mip_level_count` (pinned to `Some(1)` in 0.57.2, see the
+    zoom/checkerboard bug below) and choosing a `mipmap_filter`, and both
+    tests added there
+    (`canvas_pipeline_shows_tile_content_at_minifying_zoom_levels`,
+    `canvas_pipeline_samples_mip_level_zero_not_a_lower_level`) will
+    correctly start failing until the mip chain is actually populated
+    live — that failure is the intended signal, not a regression. Note
+    the pin must **not** be re-spelled as `lod_max_clamp: 0.0` on the
+    sampler: 0.57.2 measured that spelling silently disabling
+    `min_filter: Linear` outright.
   Full local CI gate clean throughout.
 - [~] **Async evaluation — the UI thread never blocks (§7.3.4)** —
   first piece done 2026-07-30, `crates/aurora-render/src/executor.rs`
@@ -7655,6 +7666,18 @@ structural design work.
     looking at a real window on real GPU hardware**, with translucent,
     soft or anti-aliased content, at several zoom levels below 100%.
 
+    **Note 2026-08-25 (0.57.2): that second blocker is gone, and one of
+    the two stated reasons for "unconfirmed" no longer holds.** Zoom 0.5
+    now renders real content (item below), and
+    `canvas_pipeline_min_filter_linear_still_applies_when_minified`
+    demonstrates on llvmpipe that linear minification filtering *is*
+    genuinely engaged — the sampler blends across a hard edge at zoom
+    0.6 — where before it provably was not (`lod_max_clamp: 0.0` had
+    silently reclassified every access as magnification). Deliberately
+    **not** investigated or fixed in that round: it is separate work of
+    its own size and the remaining reason to wait — no human, no real
+    GPU — is unchanged.
+
     Two candidate fixes, for whoever picks this up:
     (i) set `min_filter: Nearest` on the atlas sampler — a one-line,
     safe change that loses filtering smoothness while zoomed out, and is
@@ -7693,21 +7716,549 @@ structural design work.
     hatch stays available on a dev box and is impossible on a runner
     where a green run is being treated as evidence. Untouched by the
     0.52.0 round on purpose.
-- [ ] **At zoom 0.5 the live canvas renders pure checkerboard, with all
-    tile content invisible across the whole viewport.** Found 2026-08-24
+- [~] **The live canvas rendered pure checkerboard at zoom 0.5, with all
+    tile content invisible across the whole viewport** — found 2026-08-24
     during the 0.52.0 review; **pre-existing and unrelated to that fix**,
     confirmed by pixel readback reproducing it identically with either
-    the pre-0.52.0 or the post-0.52.0 `fs_canvas` formula in place. Zoom
-    1.0, 0.99 and 0.75 all render correctly; 0.5 does not. Most likely an
-    LOD/mip-selection problem rather than a blend problem — the atlas
-    sampler pairs `min_filter: Linear` with `mipmap_filter: Nearest` on a
-    texture whose mip levels may never be populated for the composite
-    surface, so a minification factor that crosses into mip 1 would
-    sample an empty level. Not blocking, not part of the premultiplied
-    fix, and deliberately not fixed in that round — recorded here as its
-    own real bug so it is not lost. It also blocked one of the halo
-    item's own verification attempts above, so the two are worth picking
-    up in that order.
+    the pre-0.52.0 or the post-0.52.0 `fs_canvas` formula in place. It
+    took three rounds and turned out to be four defects stacked on one
+    another: the reported mip-selection bug (0.57.1), a duplicated-content
+    bug the first fix unmasked (0.57.2), and the oscillating,
+    aspect-distorting, render-vs-paint-diverging clamp the *second* fix
+    introduced (0.57.3). Read all of it below, in order.
+
+    **`[~]` and not `[x]`, deliberately.** The reported symptom is gone —
+    every zoom renders real, correctly-addressed content, and the
+    geometry is now provably isotropic, pan-independent, and identical
+    between the render path and the pointer/paint path. What is *not*
+    fixed is the capability underneath it: the atlas still cannot render
+    minified at all, so 0.57.3 closes the range instead (see "What this
+    fix costs" below — on a 1× display zooming out no longer does
+    anything). Calling that `[x]` would be claiming a zoom-out that does
+    not exist.
+
+    **Important correction to the original report: this was never
+    specific to zoom 0.5.** `TileResidency::write_uniform`
+    (`crates/aurora-gpu/src/residency.rs`) sets
+    `uv_scale = viewport_px / zoom / tex_size`, so the atlas covers
+    `1/zoom` texels per screen pixel and the hardware's computed LOD is
+    `log2(1/zoom) = -log2(zoom)`. The sampler's `mipmap_filter` was left
+    at `wgpu`'s default (`MipmapFilterMode::Nearest`), which rounds LOD
+    to the nearest whole level — so it crossed from level 0 to level 1 at
+    LOD 0.5, i.e. `zoom = 2^-0.5 ≈ 0.7071`. **Every effective zoom below
+    ~71% was affected**, which is exactly why 1.0, 0.99 and 0.75 looked
+    fine and 0.5 did not. The atlas declares `mip_level_count:
+    MIP_LEVELS` = 4, but only level 0 is ever written live (`sync` writes
+    `mip_level: 0`; the one writer of levels 1-3, `upload_mip` via
+    `aurora_render::preview::upload_preview`, has no call site anywhere
+    in `aurora-app`'s frame loop). `wgpu` lazily zero-initializes
+    unwritten levels, so the sampler read `(0, 0, 0, 0)` and
+    `fs_canvas`'s straight-alpha `over` (`c.rgb * c.a + bg * (1 - c.a)`)
+    collapsed to pure `bg` — the checkerboard.
+
+    Because `aurora-app` multiplies canvas zoom by the window's DPI scale
+    factor before handing it to the atlas (`effective_residency_zoom`),
+    **the user-visible threshold is DPI-dependent**: ~71% canvas zoom on
+    a 1x display, but roughly **35% canvas zoom on a 2x/Retina display**.
+
+    **The fix (0.57.1, corrected in 0.57.2)**: pin every sample to mip
+    level 0. 0.57.1 did this with `lod_max_clamp: 0.0` on the sampler;
+    **0.57.2 replaced that with a view-level restriction** — the view
+    `TileResidency::new` builds for sampling is now created with
+    `mip_level_count: Some(1)`, so level 0 is the only level that exists
+    as far as sampling is concerned.
+
+    That was not a stylistic preference. Both the Vulkan and OpenGL specs
+    make the magnification/minification decision on the LOD **after** the
+    LOD clamp is applied, so `lod_max_clamp: 0.0` means the LOD can never
+    be positive, every access classifies as magnification, and
+    `mag_filter` (`Nearest`) silently replaces `min_filter` (`Linear`)
+    for every sample the canvas ever takes. This was **measured, not
+    inferred**: the new
+    `canvas_pipeline_min_filter_linear_still_applies_when_minified` scans
+    a hard black/white edge at zoom 0.6 and, with the 0.57.1 spelling in
+    place, found only the two source values `0` and `255` across all 50
+    sampled pixels — no blend anywhere. With the view restriction instead,
+    it blends. So 0.57.1 fixed the checkerboard at the cost of quietly
+    turning off canvas filtering; the two tests it shipped could not see
+    that because both used uniform-colour fixtures, under which `Nearest`
+    and `Linear` are indistinguishable by construction.
+
+    `TileResidency::new` is the only construction site (`resize` calls it
+    internally), so the fix propagates automatically — now pinned by
+    `canvas_pipeline_after_a_resize_still_shows_content_when_zoomed_out`
+    rather than left true by accident. `canvas.wgsl` was not touched;
+    `mip_level_count` on the *texture* stays at 4. The `MIP_LEVELS` doc
+    comment is now the single place the whole rationale lives (including
+    the ~33% atlas VRAM the unreachable levels cost, accepted on purpose
+    to keep `upload_mip` and its tests alive for M1.3), and `upload_mip`
+    points at it.
+
+    **Verified by two new tests** in
+    `crates/aurora-gpu/src/render_test.rs`:
+    `canvas_pipeline_shows_tile_content_at_minifying_zoom_levels` (four
+    opaque green tiles, sampled at zoom 1.0/0.99/0.75/0.5/0.25 — pre-fix
+    it read exactly `[61, 61, 61, 255]`, the checkerboard's lighter
+    square, at 0.5) and
+    `canvas_pipeline_samples_mip_level_zero_not_a_lower_level` (level 0
+    green, level 1 hand-filled magenta via `upload_mip` — pre-fix it read
+    `[255, 0, 255, 255]`, the positive proof that the sampler really was
+    selecting level 1 rather than merely finding transparency somewhere).
+    Both were confirmed failing in exactly that way *before* the
+    one-field change, and pass after it.
+
+    **0.57.2 added five more**, all confirmed failing before their fix
+    and passing after, all in `crates/aurora-gpu/src/render_test.rs`
+    (0.57.3 moved five of the tests in this file onto a new
+    `MINIFYING_VIEWPORT` of 300 × 300 — with the zoom floor in place, a
+    256 px viewport's floor is exactly 1.0, so a test asking for zoom 0.5
+    on it would silently be testing zoom 1.0 and would pass with the mip
+    bug fully present; 300 px rounds up to two tiles, giving a floor of
+    0.5859 and a genuinely minifying range. `render_and_sample_pixels`
+    now pads its readback row stride to `COPY_BYTES_PER_ROW_ALIGNMENT`
+    so a viewport can be chosen for its geometry rather than its byte
+    alignment):
+    `canvas_pipeline_does_not_duplicate_document_content_when_zoomed_out`
+    (position-encoded tiles, eight points across the frame at zoom 0.25;
+    asserts the tile index never goes *backwards* left-to-right — real
+    content may run out, it must never wrap and start over);
+    `canvas_pipeline_min_filter_linear_still_applies_when_minified` (the
+    Nearest-vs-Linear discriminator described above);
+    `canvas_pipeline_wraps_to_the_toroidal_slot_when_the_window_straddles_the_atlas_edge`
+    (pins the *legitimate* wrap that `ClampToEdge` would have destroyed);
+    `canvas_pipeline_survives_a_degenerate_zoom`; and
+    `canvas_pipeline_after_a_resize_still_shows_content_when_zoomed_out`.
+    The 0.57.1 zoom sweep also gained `2^-0.5` and `0.70` (bracketing the
+    mip boundary itself, the one value a coarse sweep steps over) and
+    `0.01` (`MIN_ZOOM`, which exercises the zoom floor too).
+
+    **0.57.3 added ten more**, each confirmed failing against 0.57.2's
+    own code and passing after — nine in `aurora-gpu`
+    (`crates/aurora-gpu/src/residency.rs`, driving the pure
+    `uniform_values` the shader is actually fed, so they need no GPU
+    adapter and run even where every `real_context()` test self-skips)
+    plus one full render-pass test:
+    `rendered_zoom_is_pan_independent_across_a_full_tile_of_pan`
+    (bit-identical scale across 65 sub-tile positions on each axis, five
+    zooms); `rendered_zoom_is_isotropic_on_a_non_square_viewport`;
+    `rendered_zoom_equals_the_requested_zoom_at_or_above_the_floor`;
+    `min_zoom_for_viewport_is_exactly_the_floor_the_uniform_applies` (the
+    public promise and the private behaviour pinned to each other);
+    `uv_scale_never_reaches_past_the_atlas_coverage` and
+    `uv_scale_stays_inside_an_atlas_smaller_than_the_viewport_asks_for`
+    (the no-duplication invariant, including the stale-grid case);
+    `clamp_doc_origin_bounds_every_degenerate_document_position` and
+    `set_origin_survives_a_huge_or_non_finite_document_origin`;
+    `resize_preserves_the_sub_tile_pan_offset`; and
+    `canvas_pipeline_keeps_one_scale_while_panning_a_whole_tile`, which
+    renders nine real frames spanning one tile of pan and checks the
+    document's own black/white edge lands where a constant scale puts it.
+
+    **Seven more in `aurora-ui`** (`canvas_view.rs`) cover `set_min_zoom`
+    itself — that it raises an already-too-small zoom, that it binds
+    every *later* `zoom_at`, that degenerate floors are ignored, that
+    `to_document` then reads the bounded zoom, and that the raise is
+    anchored at the canvas's own top-left corner. That last one is not
+    cosmetic: raising `zoom` while leaving `pan` alone moves
+    `to_document((0, 0))` back toward the document origin, which for a
+    layer whose own origin is not `(0, 0)` can push it under the boundary
+    `clamp_pan_to_minimum` had already pinned — reopening the *pan*-axis
+    version of the same divergence. Anchoring the raise holds that point
+    fixed. **Four in `aurora-app`** close the loop across the crate
+    boundary:
+    `canvas_min_zoom_leaves_the_atlas_with_nothing_left_to_clamp`
+    (the app's own floor, run back through
+    `TileResidency::effective_zoom`, comes back unchanged, over six
+    canvas-size/scale-factor pairs),
+    `the_render_path_and_the_pointer_path_agree_on_scale_when_zoomed_out`
+    (the measured reproduction: where the renderer draws a document pixel
+    vs. where a click at the same place paints, at five zooms including
+    `MIN_ZOOM`), and
+    `a_view_left_unbounded_is_exactly_the_divergence_this_prevents` (the
+    negative control — the same arithmetic without the bound must still
+    diverge by thousands of document pixels, so the test above cannot
+    pass by accident), and
+    `applying_the_zoom_floor_cannot_push_the_view_past_a_moved_layers_edge`
+    (the ordering hazard above, in the app's own terms: a view already
+    zoomed out and panned to a moved layer's edge before the floor is
+    known must not end up with a negative `canvas_local_origin`, which
+    `TileResidency::set_origin` clamps and `to_document` does not).
+
+    The two structural weaknesses those tests close are worth naming,
+    because they are the reason 0.57.1's own tests could not see either
+    remaining defect: every canvas test in the file painted a **single
+    uniform colour** across every tile, which makes it impossible to tell
+    *which* tile a pixel came from (so duplication is invisible) and
+    impossible to tell `Nearest` from `Linear` (so a disabled filter is
+    invisible); and every one sampled **one centre pixel**, which cannot
+    see how content varies across the viewport. `render_and_sample_pixels`
+    now reads many points from one frame, and `paint_position_encoded`
+    gives each tile a colour encoding its own document position.
+
+    **Third defect, same round (0.57.2): a degenerate `zoom` reached the
+    uniform unguarded.** `write_uniform` divides by `zoom`, and
+    `set_origin`'s doc comment argued no guard was needed because
+    `aurora_ui::CanvasView` clamps zoom to `[MIN_ZOOM, MAX_ZOOM]`. That
+    argument did not hold: `aurora-app` passes
+    `effective_residency_zoom(canvas_zoom, scale_factor)`, a product
+    formed in a different crate whose own guard covers `scale_factor` and
+    **not** `canvas_zoom`. Zero, negative, infinite and NaN all reached
+    `write_uniform` and poisoned `uv_scale`. `write_uniform` now
+    substitutes `1.0`, matching `effective_residency_zoom`'s own existing
+    pattern; the guard sits in `aurora-gpu` rather than `aurora-app` so it
+    covers every caller, including `new` and `resize`. A **denormal**
+    zoom deliberately does *not* take the fallback — it is finite and
+    positive, so it is a real if absurd zoom, and the new coverage clamp
+    already absorbs it exactly as `MIN_ZOOM` is absorbed (one reviewer
+    listed denormals among the degenerate cases; post-clamp they are not,
+    and the test pins the correct behaviour instead).
+
+    **Two smaller corrections in the same round.** `TileResidency::resize`
+    now restores `sub_tile` alongside `origin`, so a window resize no
+    longer silently snaps the view back to the nearest tile boundary —
+    its doc comment had listed what carried over without mentioning that
+    the sub-tile pan offset didn't. And the near-duplicated mip-clamp
+    rationale that had spread across five sites is consolidated:
+    `MIP_LEVELS`'s doc comment is the single home for it, everything else
+    points there.
+
+    **The second defect, found by two independent reviewers of the
+    0.57.1 fix and fixed in 0.57.2: the atlas UV wrapped and showed
+    duplicated document content when zoomed out.** This was never
+    introduced by the mip fix — it was *unmasked* by it. The atlas grid
+    is sized from the viewport alone (`viewport.div_ceil(TILE) + 1`) and
+    never from zoom, while `write_uniform`'s
+    `uv_scale = viewport_px / zoom / tex_size` grows without bound as
+    zoom falls. Once `uv_scale` exceeded the atlas's own coverage, the
+    sampler's `AddressMode::Repeat` wrapped and re-sampled the **same
+    resident tiles**, so the canvas showed a seamless, convincing
+    duplicate of a sub-region of the document instead of more of it —
+    and `sync` reported `uploaded = 0, errors = 0` throughout, so nothing
+    anywhere signalled that content was missing. Reproduced with a
+    position-encoded tile grid: at zoom 0.25 on a 256 px viewport the
+    tiles visible across the frame were `[0, 0, 1, 1, 0, 0, 1, 1]` where
+    `[0, 0, 1, 1, 2, 2, 3, 3]` was the document's real content.
+
+    The threshold is `zoom < viewport_px / atlas_px`, which on a real
+    1920 px canvas is `zoom < 0.833` — **higher** than the 0.7071 mip
+    boundary. So it was already reachable in the 0.71–0.83 band before
+    0.57.1 (hidden there by nothing; simply never looked at) and would
+    have become visible across the entire zoomed-out range after it.
+    `MIN_ZOOM` is 0.01, and "fit to window" on a large document lands
+    squarely inside the broken range.
+
+    **The 0.57.2 fix, and why it needed a third round.** 0.57.2 clamped
+    `uv_scale` per axis to the atlas's *actual* resident coverage
+    (`tex_size - sub_tile`, via a `TileResidency::axis_uv_scale` helper).
+    That did stop the duplication — every sample landed on a real,
+    correctly addressed tile — but an independent review of it found
+    three further real regressions, each reproduced with measurements,
+    and 0.57.3 replaces the whole approach:
+
+    - **The rendered scale oscillated as the user panned.** `sub_tile`
+      (the fractional pan position within the top-left tile) sweeps
+      `[0, TILE)` continuously, so a clamp that read it made the scale
+      ramp smoothly across one tile of panning and then snap back —
+      measured 0.500 → 0.889, a **1.78× scale change at a constant user
+      zoom of 0.5**. The geometry before 0.57.2 was at least stable while
+      wrong; this made it unstable *and* still wrong.
+    - **The per-axis clamp distorted aspect ratio.** The atlas is not
+      viewport-proportional, so the two axes saturate at different zooms;
+      once one had clamped and the other had not, they scaled by
+      different factors. Measured up to **33.6% distortion** on a
+      512 × 256 viewport, and a calculated ~18.5% permanent horizontal
+      stretch on 1920 × 1080. Circles rendered as ellipses.
+    - **Render geometry and pointer geometry silently diverged** — the
+      serious one. `aurora-app`'s `redraw` fed the renderer a *saturated*
+      zoom while `aurora_ui::CanvasView::to_document` — what turns a
+      click into the document position a brush dab lands on — kept
+      dividing by the raw one. At canvas zoom 0.25 on a 1920 px viewport
+      a click at screen x = 960 mapped to document x ≈ 3840 while the
+      pixel drawn there was document x ≈ 1152; at `MIN_ZOOM` the two were
+      ~83× apart. This is a **reintroduction of a failure mode this
+      codebase had already fixed once and written down**:
+      `CanvasView::clamp_pan_to_minimum`'s doc comment describes the
+      identical shape of bug on the *pan* axis ("render and paint then
+      silently disagreed for the rest of the session") and the fix it
+      chose — clamp at the source so downstream consumers cannot
+      diverge.
+
+    **The fix (0.57.3): one pan-independent, isotropic zoom floor, shared
+    by the renderer and the input path.**
+
+    - `TileResidency::min_zoom_for_viewport(viewport_px)` is the single
+      source of truth: `viewport_px / (tex_size - TILE)`, the larger of
+      the two axes. `tex_size - TILE` is the **worst case** over every
+      reachable `sub_tile`, so nothing in the formula reads the pan
+      position — the scale cannot move while panning. One scalar for both
+      axes, applied to `zoom` itself rather than to `uv_scale` per axis,
+      so both axes are scaled by the same number and the aspect ratio is
+      preserved by construction.
+    - There is no longer any clamp on `uv_scale` at all. `zoom >= floor`
+      already implies `viewport_px / zoom <= tex_size - TILE <= tex_size
+      - sub_tile` on both axes, which is exactly the no-duplication
+      condition; `uv_scale_never_reaches_past_the_atlas_coverage` asserts
+      that implication directly, at sixteen sub-tile pan positions across
+      five viewports and ten zooms including the degenerate ones, rather
+      than leaving it to a clamp that would then be both untested and — if
+      it ever did fire — pan-dependent again.
+    - **The same bounded value reaches both paths.**
+      `aurora_ui::CanvasView` gained `set_min_zoom`, the exact
+      counterpart of its own `clamp_pan_to_minimum`: it stores the floor
+      and `zoom_at` clamps to it, so the view cannot *hold* an
+      unrenderable zoom and every consumer — `to_document` for painting,
+      `canvas_local_origin` for the renderer — reads the same number.
+      `aurora-app`'s `canvas_min_zoom` converts
+      `min_zoom_for_viewport`'s physical-pixel floor into `CanvasView`'s
+      logical zoom by dividing by the same guarded scale factor
+      `effective_residency_zoom` multiplies by (both now call one
+      `guarded_scale_factor` helper, so there is one guard and not two
+      spellings of it), and `App::redraw` and `App::apply_resize` set it
+      from the same `canvas_area_physical_size` the atlas itself is sized
+      from. `aurora-gpu` sits *below* `aurora-ui` in the layering
+      (PRD §7.2), so the floor is exposed as data and `CanvasView` takes
+      it as a plain parameter — the same shape `clamp_pan_to_minimum`
+      already uses for `min_doc`.
+
+    **A correction to the reviewers' own proposed remedy, which was
+    measured to be wrong.** Two reviewers of 0.57.1 suggested pairing the
+    clamp with switching the sampler from `AddressMode::Repeat` to
+    `ClampToEdge`. That would have introduced a worse regression than the
+    bug it targeted: slot addressing is toroidal, so whenever the visible
+    window straddles the atlas's right or bottom edge — most pan
+    positions, at *every* zoom, since `uv_scale` is already 0.833 at 100%
+    on a 1920 px viewport — the far side of the screen legitimately
+    samples `uv > 1.0` and must wrap to slot 0 to find the tile that
+    belongs there. `ClampToEdge` cannot tell that wrap apart from an
+    out-of-coverage one. Measured, with the clamp already in place and
+    only the address mode changed: at **zoom 1.0**, origin `1.5 * TILE`,
+    the frame rendered `[1, 1, 1, 1, 1, 1, 1, 1]` instead of the correct
+    `[1, 1, 1, 1, 2, 2, 2, 2]` — half the canvas a duplicate of the wrong
+    tile during ordinary panning. `Repeat` therefore stays, and
+    `canvas_pipeline_wraps_to_the_toroidal_slot_when_the_window_straddles_the_atlas_edge`
+    now pins that so the same substitution cannot be made again.
+
+    **What this fix costs, stated plainly and without softening it:
+    zoom-out is effectively unavailable.** The floor works out to
+    `viewport_px / (viewport_px rounded up to whole tiles)`, which for
+    any real window is between 0.5 and 1.0 and usually near the top of
+    that range: **0.9375 on a 1920 × 1080 1× display, exactly 1.0 when
+    the canvas area happens to be a whole number of 256 px tiles.**
+    Because the atlas is sized in *physical* pixels, a 2× display gets a
+    logical floor near 0.5 — so zooming out works to about 50% on
+    Retina-class hardware and essentially not at all on a 1× display.
+    Below the floor the canvas renders at the floor: the zoom stops
+    changing anything.
+
+    That is a real, user-visible capability loss versus 0.57.2 (which
+    reached ~0.83, unstably) and versus 0.57.0 (which reached `MIN_ZOOM`,
+    while showing fabricated duplicates). It is accepted deliberately,
+    for the reason the numbers make plain: the atlas is a 1:1 sliding
+    window sized `viewport.div_ceil(TILE) + 1` tiles, and that one tile
+    of margin is exactly what a sub-tile pan consumes — **it has never
+    had the coverage to render minified at all.** Both previous rounds
+    papered over that with something worse (a fabricated duplicate, then
+    a pan-dependent anisotropic scale), and the third option — letting
+    the view keep shrinking while paint lands somewhere other than the
+    cursor — is the one CLAUDE.md's own rules rank worst of all. This is
+    the same trade `clamp_pan_to_minimum` already made on the pan axis:
+    remove the unrenderable part of the range rather than let two
+    consumers of the transform disagree.
+
+    **Residual gaps, described accurately rather than favourably.** An
+    earlier version of this paragraph claimed the clamp left "no
+    distorted region at all"; that was measurably false — the per-axis
+    clamp distorted by up to 33.6% — and it is corrected here rather than
+    quietly dropped. The accurate final state after 0.57.3:
+
+    - Every zoom that previously rendered pure checkerboard now renders
+      real content, and every sample corresponds to a genuinely resident
+      tile at the correct document position.
+    - The rendered scale is now **isotropic** (both axes always equal,
+      asserted at nine zooms across four viewports) and
+      **pan-independent** (bit-identical across 65 sub-tile pan positions
+      spanning a full tile on each axis, at five zooms), and it **equals
+      the zoom the view reports** at every zoom the view can now hold.
+      Render and paint therefore agree by construction, with tests on
+      both sides of the crate boundary asserting it against the same
+      shared value.
+    - **Zoom-out below the floor is gone, not fixed** (above). The floor
+      is viewport- and DPI-dependent, which is itself odd for a user:
+      the same document zooms out to 50% on a Retina display and not at
+      all on a 1× one. Sizing the atlas from zoom, or wiring
+      progressive/LOD rendering, is what actually fixes it, and both are
+      M1.3 work considerably larger than this round. **This is the one
+      thing to pick up next on this path.**
+    - Sampling is still **single-mip-level**. Mips 1-3 remain unpopulated
+      and `upload_preview` is still not wired into the frame loop
+      (separate, larger M1.3 work: per-frame cost on an already
+      over-budget path, plus mip invalidation logic that does not exist).
+      `min_filter: Linear` is genuinely in effect (0.57.1 had disabled
+      it; see above), which gives intra-level bilinear filtering but
+      **not** true minification filtering — aliasing and shimmer in the
+      narrow band between the floor and 100% are a real, still-open gap.
+    - **Two smaller defects found in the same review and fixed in
+      0.57.3.** `set_origin` guarded `zoom` but not its sibling
+      `doc_origin`: `write_uniform`'s `(origin.x * TILE) as f32`
+      overflows `u32` for a `doc_origin` around 4.295e9 (or
+      `f32::INFINITY`/`f32::MAX`), which is a hard panic in debug — where
+      this workspace denies `panic` precisely because "a panic loses
+      unsaved work" — and a silently wrong tile in release. `doc_origin`
+      is now clamped to `[0, MAX_DOCUMENT_EXTENT]`, the project's own
+      300,000 px document ceiling, with NaN landing on `0.0` rather than
+      propagating. And `resize`'s `sub_tile` restoration (0.57.2) had no
+      test at all — deleting the line left the whole suite green;
+      `resize_preserves_the_sub_tile_pan_offset` now covers it, confirmed
+      failing with the line removed.
+
+    **Not measured: frame timing.** No zoom-out frame-timing measurement
+    was taken in any of the three rounds, on a canvas path M1.10 already
+    measures at ~3-6× over its 60 FPS budget. 0.57.3 makes the per-frame
+    uniform write *cheaper* than 0.57.2 (one `max` on a scalar instead of
+    two `min`s plus two subtractions, once per `set_origin`, never per
+    pixel), so a regression is implausible — but implausible is not
+    measured, and this is recorded as an open gap rather than dressed up
+    as a null result.
+
+    **Honesty note**: everything above was run under this sandbox's Mesa
+    llvmpipe **software** Vulkan (adapter string: `llvmpipe (LLVM
+    21.1.8, 256 bits) (Vulkan, Cpu)`). No human has looked at a real
+    window on real GPU hardware at low zoom. What is established is that
+    the pixel-readback reproductions are resolved and that the geometry
+    is now correct as arithmetic — not that the canvas looks right when
+    zoomed out on a real machine. The magnification/minification finding
+    in particular is *spec*-derived and llvmpipe-confirmed; a real driver
+    could in principle classify differently, which would change how bad
+    0.57.1's filtering regression was but not the correctness of the
+    view-level fix. A source comment claiming that test "fails on real
+    hardware" was corrected in 0.57.3 to say what was actually measured
+    and where. Per CLAUDE.md's own "a green test run is not evidence that
+    canvas or UI work is correct," this still wants a human on real
+    hardware — and the zoom-out floor above is something a human will
+    notice in the first minute.
+
+    **Fourth round (0.57.4) — the floor could still lapse, and the round
+    had reintroduced the very defect class its own `clamp_doc_origin`
+    fix argued against.** A fourth review of 0.57.3 found four more
+    things, all fixed here; each new test below was confirmed failing
+    against 0.57.3's own code before its fix.
+
+    - **The floor was dropped entirely on every document open, not just
+      lowered.** `App::open_file` and `App::open_aur_file` both reset the
+      view with `aurora_ui::CanvasView::default()`, and that default
+      carries `min_zoom = MIN_ZOOM` (0.01). So from the moment a document
+      opened until the *next* `redraw` or `apply_resize` re-applied it,
+      the view held no atlas floor at all — and a scroll or click
+      processed in that window went straight back through the RT12-04
+      divergence this whole three-round effort existed to close (up to
+      ~2,000 document px of offset at `MIN_ZOOM` on a 1920 px viewport).
+      Both sites now go through a new `reset_canvas_view` helper that
+      re-derives the floor from the live canvas area *in the same
+      statement* that clears the view, so it is never absent, not even
+      transiently; with no canvas area to re-derive from it carries the
+      previous floor across rather than dropping to `MIN_ZOOM`.
+      `resetting_the_canvas_view_never_leaves_the_zoom_floor_absent` and
+      `the_paths_still_agree_immediately_after_a_document_open_reset`
+      (the reproduction: reset, then convert a pointer position with no
+      intervening frame) cover it.
+    - **`grid_for` was a new unguarded `u32` overflow, introduced by
+      0.57.3 itself.** `min_zoom_for_viewport`'s `(grid.0 * TILE) as f32`
+      overflows for a viewport above ~4.295e9 px — a hard panic in debug,
+      a silent wrap to garbage in release — which is *exactly* the defect
+      class 0.57.3's own `clamp_doc_origin`/`MAX_DOC_PX` fix (above)
+      argues against in its own doc comment. It also became newly
+      reachable in the same round: the floor computation sits above
+      `redraw`'s GPU/surface early-return, so it now runs with no GPU and
+      no wgpu size validation in front of it. `grid_for` and its callers'
+      multiplies are saturating now, which leaves the floor at a sane
+      ~1.0 rather than garbage;
+      `the_zoom_floor_survives_an_absurd_viewport_without_overflowing`
+      pins it at the exact pre-fix threshold and at `u32::MAX`.
+    - **`guarded_scale_factor` validated before the cast, not after.** It
+      checked `is_finite() && > 0.0` on the `f64` and *then* narrowed to
+      `f32` — but that narrowing is what creates the degenerate values:
+      an `f64` above `f32::MAX` casts to `inf`, one below
+      `f32::MIN_POSITIVE` casts to `0.0`, and both passed the check. So
+      `inf` reached a multiply and `0.0` reached `canvas_min_zoom`'s own
+      division, defeating the guard's stated purpose. Reachable, not
+      theoretical: a misconfigured `WINIT_X11_SCALE_FACTOR` or `Xft.dpi`
+      produces such a value. The guard now runs on the `f32`
+      (`the_scale_factor_guard_catches_values_that_only_degenerate_on_the_cast`).
+    - **`set_min_zoom`'s `MAX_ZOOM` cap is a boundary on the guarantee,
+      and now says so.** Capping the floor at `MAX_ZOOM` is still right —
+      an inverted `clamp(min, MAX_ZOOM)` panics, and no floor at all is
+      worse — but it silently abandons render/paint agreement for the
+      narrow band of absurd-but-reachable scale factors between "extreme"
+      and "the cast guard catches it". That is now a `tracing::error!`
+      naming it as a display/environment misconfiguration the user can
+      fix, plus an explicit doc comment on `set_min_zoom` recording that
+      the guarantee does not extend past `MAX_ZOOM` and that fixing it
+      properly needs the atlas sized from zoom (M1.3), the same work the
+      floor itself waits on. Deliberately diagnosed, not redesigned.
+    - **The `next_up` ulp-correction loop in `canvas_min_zoom` finally
+      has coverage.** It was real and load-bearing but untested — no
+      `CANVAS_CASES` entry reached it, and deleting the loop left the
+      suite green.
+      `the_ulp_correction_keeps_the_round_trip_at_or_above_the_atlas_floor`
+      sweeps 448 realistic viewport × scale-factor combinations, asserts
+      the round trip never lands below the atlas's own floor, and
+      additionally asserts that at least one combination *needed* the
+      correction, so the test cannot quietly stop exercising the loop.
+      Confirmed failing with the loop removed (a 1366 × 800 canvas at
+      scale factor 1.25 lands one ulp low).
+
+    Three further findings from the same review are **disclosed and not
+    fixed here**, each as its own item below: `select_layer` not calling
+    `clamp_pan_to_minimum`, no `clamp_pan_to_maximum` on the far
+    document edge, and an unreachable non-finite-pan case. They are
+    genuinely separate work from the zoom floor and are scoped that way
+    rather than folded into this fix — the first of the three is a real
+    Medium-severity bug that is simply not this round's.
+- [ ] **`select_layer` can reopen the pan-axis render/paint divergence,
+    the same failure shape as RT12-04 on a different trigger.** Found
+    2026-08-25 by the fourth review of the zoom-geometry fix above;
+    **pre-existing and not introduced by any of the 0.57.x rounds.**
+    `aurora_ui::CanvasView::clamp_pan_to_minimum` exists because
+    `aurora_gpu::TileResidency::set_origin` clamps a negative document
+    origin to `(0, 0)` while `CanvasView::to_document` happily reports
+    the negative value — so if the view's pan ever puts
+    `canvas_local_origin` negative, the renderer draws from the
+    document's corner while a click paints somewhere off it. Every path
+    that can move the *pan* calls the clamp. `select_layer` does not, and
+    it does not have to move the pan to break the invariant: the bound is
+    `pan` relative to the **active layer's own origin**
+    (`active_layer_origin`, subtracted in `canvas_local_origin`), so
+    switching from a layer at document `(0, 0)` to one at, say,
+    `(300, 150)` moves the boundary underneath an unchanged pan and
+    leaves `canvas_local_origin` negative with no clamp ever running.
+    Reproduced by red-team. Scoped deliberately as its own fix: it
+    touches `select_layer` and the pan-clamp call sites, not the
+    zoom-floor code the 0.57.x rounds touched, and the right shape is
+    probably a single "re-establish the pan bound" call that every
+    active-layer change routes through rather than another individual
+    call site. A regression test should switch the active layer to one
+    with a non-zero origin and assert `canvas_local_origin` stays
+    non-negative, mirroring
+    `applying_the_zoom_floor_cannot_push_the_view_past_a_moved_layers_edge`.
+- [ ] **Panning past the document's *far* edge has no bound matching the
+    origin-side one.** Found 2026-08-25, same review; informational, low.
+    `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together
+    bound the near edge, but nothing bounds the far one: past the
+    project's 300,000 px ceiling `clamp_doc_origin` saturates the
+    rendered origin at `MAX_DOC_PX` while `CanvasView::to_document` keeps
+    reporting ever-larger values, so render and paint drift apart again —
+    the same shape as the items above, at the opposite corner. Reaching
+    it requires deliberately panning a very long way past the end of the
+    document, so it is recorded rather than fixed; the natural fix is a
+    `clamp_pan_to_maximum` counterpart applied wherever
+    `clamp_pan_to_minimum` already is.
+- [ ] **A non-finite canvas pan is theoretically reachable through
+    accumulated drag.** Found 2026-08-25, same review; informational, and
+    **essentially unreachable** — `CanvasView::pan_by` accumulates `f32`
+    without a bound, so a large enough accumulated pan could in principle
+    poison the view to a non-finite value, but it takes on the order of
+    1e35 of accumulated drag to get there. Recorded for completeness; no
+    fix, and none proposed.
 - [x] **A corrupted scratch-disk tile could reach a real `panic` via
     `copy_from_slice`, and could silently drop a layer out of an exported
     file** — found 2026-08-24 by the 0.52.0 review (and
@@ -11678,6 +12229,137 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-08-25 (0.57.4) — the floor was still lapsing on every
+document open, and the round had reintroduced its own defect class.** A
+fourth review of 0.57.3 found the fix incomplete in one reachable place
+and self-inconsistent in another. `App::open_file` and
+`App::open_aur_file` reset the canvas view with
+`aurora_ui::CanvasView::default()`, which carries `min_zoom = MIN_ZOOM`
+(0.01) — so between opening a document and the next frame the atlas floor
+was **absent entirely**, and a scroll or click landing in that window
+reproduced RT12-04 exactly. Both sites now reset through
+`reset_canvas_view`, which re-derives the floor from the live canvas area
+in the same statement. Separately, 0.57.3's own new `grid_for`
+(`crates/aurora-gpu/src/residency.rs`) multiplied a viewport-derived
+`u32` unguarded — the *same* overflow-panic class the same round's
+`clamp_doc_origin`/`MAX_DOC_PX` fix argues against in its own doc
+comment, and newly reachable with no GPU at all because the floor
+computation sits above `redraw`'s surface early-return; it is saturating
+now. `guarded_scale_factor` validated the `f64` before narrowing to
+`f32`, so an `f64` past `f32::MAX` reached the arithmetic as `inf` and
+one below `f32::MIN_POSITIVE` as `0.0` — the guard now runs after the
+cast. And `set_min_zoom`'s `MAX_ZOOM` cap, which silently abandons the
+render/paint guarantee for absurd display scale factors, now logs at
+`error` and documents the boundary rather than hiding it. Five tests
+added, each confirmed failing against 0.57.3's code — including the first
+coverage of `canvas_min_zoom`'s `next_up` ulp-correction loop, which was
+load-bearing and entirely untested (deleting it left the suite green).
+**Three findings from that review are disclosed and deliberately not
+fixed**, as their own M1.9 items above: `select_layer` not
+re-establishing the pan bound (a real, pre-existing Medium bug — the same
+divergence shape on the layer-selection trigger), no `clamp_pan_to_maximum`
+at the document's far edge, and an essentially unreachable non-finite-pan
+case.
+
+**Addendum 2026-08-25 (0.57.3) — the zoom-out geometry is correct now,
+and the honest price is that zoom-out itself is gone.** The M1.9 item is
+`[~]`, not `[x]`, for exactly that reason. An independent review of
+0.57.2's clamp reproduced three further regressions it had introduced,
+all measured:
+
+- **The rendered scale oscillated with the pan position** — 0.500 →
+  0.889, a 1.78× change across one tile of panning at a *constant* user
+  zoom of 0.5, because the clamp read the live sub-tile offset.
+- **The per-axis clamp distorted aspect ratio** — up to 33.6% measured on
+  a 512 × 256 viewport; circles as ellipses.
+- **Render geometry and paint geometry silently diverged** — the
+  renderer got a saturated zoom, `CanvasView::to_document` kept the raw
+  one, and at canvas zoom 0.25 on a 1920 px viewport a click at screen
+  x = 960 painted at document x ≈ 3840 while the pixel drawn there was
+  document x ≈ 1152 (~83× apart at `MIN_ZOOM`). This codebase had
+  already fixed and documented this exact failure shape on the *pan*
+  axis (`CanvasView::clamp_pan_to_minimum`); it came back on the zoom
+  axis.
+
+0.57.3 replaces the per-axis, pan-dependent `uv_scale` clamp with **one
+pan-independent, isotropic floor on `zoom` itself**
+(`TileResidency::min_zoom_for_viewport`, computed from the worst-case
+sub-tile offset so nothing in it moves while panning), and — the part
+that actually closes the divergence — makes the *same* bounded value
+reach both consumers: `CanvasView::set_min_zoom` stores it and `zoom_at`
+clamps to it, so the view cannot hold a zoom the renderer will not
+honour, and `to_document` and the renderer read one number. `aurora-app`
+derives the logical-pixel floor from the physical one through the same
+guarded scale factor `effective_residency_zoom` uses, and sets it on
+every frame and every resize from the same canvas size the atlas is
+sized from. Twenty-one tests were added across the three crates,
+each confirmed failing against 0.57.2's code (or, for the two covering
+the interaction between the new zoom floor and the existing pan bound,
+against a version of the floor that ignored it).
+
+**The price, stated where nobody can miss it**: the floor is
+`viewport / (viewport rounded up to whole tiles)` — **0.9375 on a
+1920 × 1080 1× display, exactly 1.0 when the canvas is a whole number of
+tiles** — so on a 1× display zoom-out no longer does anything, and on a
+2× display it stops near 50%. The atlas is a 1:1 sliding window with one
+tile of margin, and a sub-tile pan consumes that margin: it has never had
+the coverage to minify. The two earlier rounds hid that behind a
+fabricated duplicate and then behind a distorted, breathing image; this
+round declines to hide it. Sizing the atlas from zoom, or wiring
+progressive/LOD rendering (M1.3), is the actual fix and is the next thing
+to pick up on this path. Two smaller defects from the same review are
+also fixed: `set_origin`'s `doc_origin` is now bounded to the 300,000 px
+document ceiling (`origin * TILE` overflowed `u32` — a debug panic, in a
+workspace that denies `panic` because a panic loses unsaved work), and
+0.57.2's `resize` sub-tile fix finally has a test.
+
+**Addendum 2026-08-25 (0.57.2) — superseded in part by the 0.57.3
+addendum above; its clamp was replaced.** 0.57.1 fixed the reported
+symptom (every zoom below ~71% rendered
+pure checkerboard, because the sampler selected a mip level nothing ever
+populates). An independent three-way review of that fix found that it was
+not sufficient and, in one respect, harmful:
+
+- **The atlas UV wrapped and duplicated document content when zoomed
+  out** — a *different* pre-existing bug, unmasked rather than introduced
+  by the mip fix, and found independently by two reviewers. The atlas
+  grid is sized from the viewport and never from zoom, so past
+  `zoom < viewport_px / atlas_px` (≈ 0.833 on a 1920 px canvas — *higher*
+  than the 0.7071 mip boundary) `AddressMode::Repeat` re-sampled the same
+  resident tiles: a seamless, convincing duplicate of content that is not
+  there, with `sync` reporting `uploaded = 0, errors = 0`. `uv_scale` is
+  now clamped per axis to the atlas's real coverage.
+- **0.57.1's `lod_max_clamp: 0.0` had silently disabled
+  `min_filter: Linear`.** Both the Vulkan and OpenGL specs classify
+  magnification vs. minification on the LOD *after* the clamp, so a
+  clamped LOD is never positive and `mag_filter` (`Nearest`) replaces
+  `min_filter` for every sample. Measured on llvmpipe, not merely
+  inferred. The pin now lives on the sampled texture *view*
+  (`mip_level_count: Some(1)`), which removes the ambiguity entirely.
+- **A degenerate `zoom` reached the uniform unguarded**, because the
+  value `aurora-app` passes is a product formed in another crate, not
+  `CanvasView`'s clamped one.
+
+**One reviewer recommendation was rejected with measurement**: both
+reviewers proposed switching the sampler to `AddressMode::ClampToEdge`.
+The atlas's wrap is load-bearing — toroidal slot addressing means the far
+side of the screen legitimately samples `uv > 1.0` at most pan positions,
+at *every* zoom — and with only the address mode changed, zoom **1.0**
+panning rendered `[1, 1, 1, 1, 1, 1, 1, 1]` where `[1, 1, 1, 1, 2, 2, 2,
+2]` was correct: half the canvas a duplicate of the wrong tile. `Repeat`
+stays; a test now pins it.
+
+**What is honestly still open on this path** (as of 0.57.3): zoom-out
+below the floor is *closed off* rather than saturating imperfectly — see
+the addendum above for what that costs and why; sampling is still
+single-mip-level, so aliasing and shimmer in the band between the floor
+and 100% remain a genuine gap; no zoom-out frame-timing measurement was
+taken in any of the three rounds, on a path M1.10 already measures at
+~3-6× over its 60 FPS budget; and **everything was verified under Mesa
+llvmpipe software Vulkan** — no human has seen a real window on real GPU
+hardware at low zoom. Sizing the atlas from zoom, or wiring
+progressive/LOD rendering, is the real fix and is M1.3 work.
+
 **Addendum 2026-08-24 (0.52.1) — one of the three open items the 0.52.0
 review opened is now closed, and it had a second half nobody had named.**
 A corrupted or truncated scratch-disk tile no longer decodes
@@ -11726,10 +12408,13 @@ from the tile it already holds in the instant before it first writes to
 it, which closes the phantom undo entry on the same path by
 construction; and every path that ends a drag, not only a pointer
 release, now commits the stroke it ends). See the
-now-`[x]` items there for the full account and the tests. The other two
-items from the 0.52.0 review — the dark-halo artefact and the zoom-0.5
-rendering bug — are still open, as is CI's silent self-skipping of
-GPU-gated tests, and so is surfacing the refused save to the user.
+now-`[x]` items there for the full account and the tests. Of the other
+two items from the 0.52.0 review, the zoom-0.5 rendering bug's reported
+symptom is **fixed** (0.57.1 through 0.57.3 — see the addenda above; it
+turned out to be four defects stacked on one another, and the item stays
+`[~]` because the atlas still cannot minify) and the dark-halo artefact is still
+open, as is CI's silent self-skipping of GPU-gated tests, and so is
+surfacing the refused save to the user.
 
 **Addendum 2026-08-24 (0.52.0) — the premultiplied-alpha correctness bug
 is fixed, and it turned out to span three layers, not two.** The item
