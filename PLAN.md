@@ -822,7 +822,11 @@ every widget in every state across all built-in themes with contrast checks gree
   panic is at least loud.
 
   **Fixed**: `TileStore` gained a third map, `pending: HashMap<(SurfaceId,
-  TileId), Vec<u8>>`, populated by `make_room` in the exact same call
+  TileId), (u64, Vec<u8>)>` — described below as it stands today; it held
+  a bare `Vec<u8>` when this item was closed, and gained the `u64`
+  generation alongside the bytes in 0.54.0, when the separate stale-write
+  race in M1.9's notes was closed (see that item for the mechanism) —
+  populated by `make_room` in the exact same call
   that populates `paged_out` (both maps gain the same key at the same
   instant during eviction), holding the tile's own already-encoded bytes.
   `ensure_resident` now checks three places in priority order: resident
@@ -8160,11 +8164,17 @@ structural design work.
     which hand-builds exactly that history and, without the deletion,
     reads back 0.25 where the user had painted 0.75.
 
-    Related but distinct, and closed by none of this: a `pending` entry
-    cleared by the completion of an **older** write for the same key can
-    still send a later read to a stale file with no error at all. That is
-    the separate stale-write race disclosed in its own item below (write
-    jobs carry no sequence number).
+    Related but distinct, and closed by none of *this*: a `pending` entry
+    cleared by the completion of an **older** write for the same key
+    could still send a later read to a stale file with no error at all.
+    That was the separate stale-write race disclosed in its own item
+    below — **now closed in 0.54.0**, by giving every write job a
+    generation and dropping a superseded result whole at both drain
+    sites, *before* its `Ok`/`Err` outcome is looked at. That ordering
+    matters to this item specifically: a superseded **failure** reaching
+    `retain_failed_write` would let the cap above drop, and
+    `discard_stale_scratch_file` delete, content *newer* than the write
+    that failed.
 
     So the honest summary of the trade is: transient failures now cost
     nothing (the tile is served from memory and the write is retried on
@@ -8251,7 +8261,7 @@ structural design work.
     turns out to be a no-op. Not done in 0.52.2 because both require
     restructuring `paint_dab`/`stamp_dab`'s control flow, which is more
     than that round's patch scope and deserves its own tests.
-- [ ] **Stale-write race: write jobs carry no sequence number, so a
+- [x] **Stale-write race: write jobs carry no sequence number, so a
     completed *old* write can clear a *newer* pending entry and later
     reads silently return pre-edit pixels.** Opened 2026-08-24 by the
     0.52.2 review (critic AT-02, red-team RT-01, found independently and
@@ -8279,6 +8289,169 @@ structural design work.
     result's generation matches the one currently stored. Needs its own
     round: it changes the writer's contract and wants its own fuzz
     harness as the regression test, not a hand-written case.
+
+    **Fixed 2026-08-25 (0.54.0)**, exactly along that shape:
+
+    1. **Every write job carries a generation.** `WriteJob` and
+       `WriteResult` (`crates/aurora-tile/src/writer.rs`) gained a
+       `generation: u64`; the writer thread never interprets it, only
+       echoes the submitted job's value back on its result.
+       `TileStore::make_room` mints it from a single store-wide
+       `write_generation` counter (`wrapping_add`, so a wrap is correct
+       where a debug-build overflow panic would not be) in the same
+       statement pair that inserts into `pending`, so the first real job
+       is generation `1` and `pending`'s value for a key only ever
+       increases. Deliberately **not** a per-key counter: that needs a
+       map outliving its `pending` entry (or its numbers restart and
+       collide with an in-flight job's), and such a map grows with the
+       number of distinct tiles ever evicted — invariant §7.3.1 through
+       the back door, for no gain over one `u64`.
+    2. **`pending` stores `(generation, bytes)`.** The field's value type
+       changed from `Vec<u8>` to `(u64, Vec<u8>)`; `ensure_resident`'s
+       fast path destructures it, and `forget_pending`,
+       `retain_failed_write` and `cap_failed_writes` are unchanged (they
+       use `remove`/`contains_key`, which are value-type agnostic).
+    3. **Both drain sites drop a superseded result whole, before the
+       `Ok`/`Err` match.** A shared `TileStore::is_superseded` predicate
+       answers "does `pending` hold a *different* generation for this
+       key"; `reconcile_pending` and `flush` each `continue` past such a
+       result and count it in the new `Stats::superseded_writes`. A key
+       absent from `pending` is deliberately **not** superseded — there
+       is nothing to protect, and treating it as stale would swallow a
+       genuine write failure for a tile since reinstated, making `flush`
+       return `Ok` where it correctly reports `Err`. Running the check
+       *before* the match rather than inside the `Ok` arm is the
+       load-bearing detail: a superseded **failure** would otherwise
+       enter `failed_writes`, and `cap_failed_writes` would then drop the
+       *newer* bytes and have `discard_stale_scratch_file` delete a file
+       a live job was about to rewrite — the same wrong-pixel bug reached
+       from the other arm. Because that placement has to hold at *both*
+       sites, the prologue is one shared method,
+       `TileStore::drop_if_superseded` (predicate, counter and log
+       together), rather than two verbatim copies a later edit could
+       land at only one of.
+    4. **A knock-on the cap's own disclosure could then be tightened.**
+       `discard_stale_scratch_file` used to disclose a residual
+       delete-versus-in-flight-write ordering. It is now unreachable, and
+       its doc comment says so affirmatively: a key only reaches that
+       method off `failed_writes`, which only a *non*-superseded `Err`
+       fills, which means `pending` holds that result's own generation,
+       which means no later eviction of the key has happened — and a
+       later eviction is the only thing that could queue another write
+       for it, since any revisit in between goes through
+       `forget_pending`, which moves the `pending` entry and the
+       `failed_writes` place together. The guarantee is stated as resting
+       on `forget_pending` continuing to move both maps in one call.
+    5. **What the generation check does *not* cover, documented where it
+       could be broken.** The check protects the in-memory `pending`
+       map. It says nothing about which bytes end up in the *file*: that
+       comes entirely from `BackgroundWriter` being one thread draining
+       one `mpsc` queue strictly FIFO, combined with `make_room` minting
+       generations in submission order. If tile writes were ever spread
+       across a pool, jobs 1, 2, 3 for one key could complete 1, 3, 2 —
+       `pending` cleared correctly by generation 3's result while the
+       file held generation 2's bytes, and the next read silently
+       returning superseded pixels *with the generation check present*.
+       Not a live bug (the current design is single-threaded by
+       construction) but a trap worth naming, so `BackgroundWriter::spawn`
+       now carries a prominent "load-bearing invariant" doc section, and
+       `writes_for_one_path_land_in_submission_order` pins the ordering
+       so a future threading change has something concrete to fail
+       against. Verified by mutation rather than asserted: dispatching
+       each job to its own worker thread with descending delays makes
+       that test fail with the *first* submission's bytes on disk. The
+       randomized churn test fails under the same mutation too, on
+       genuine stale reads — so the claim that *nothing* could catch
+       this is too strong — but timing-dependently, while every
+       deterministic store-level test stays green.
+
+    Tests, all in `aurora-tile`, all confirmed to **fail** with the
+    generation check neutralized at both drain sites and to pass with it
+    restored:
+
+    - `a_completed_older_write_must_not_clear_a_newer_pending_entry` —
+      the decisive deterministic case, hand-building the mid-race state
+      (a generation-2 `pending` entry, an in-flight generation-1 job
+      carrying the pre-edit bytes to the same path). Pre-fix it fails on
+      the bug's own signature: `left: 0.25, right: 0.75`.
+    - `flush_ignores_a_superseded_write_result_and_the_newer_one_still_reconciles`
+      — the `flush`-path twin, and past that the other half of the
+      contract: the *newer* job still reconciles normally, clearing
+      `pending` and leaving a file that holds the newer content, after
+      which a read legitimately faults from disk. Pre-fix it fails on
+      "flush must not clear a `pending` entry on an older write's
+      result".
+    - `a_superseded_failed_write_never_enters_the_failed_write_queue` —
+      what proves the *placement*, not just the predicate: two keys, a
+      one-tile cap, `pending` at generation 2, two failing generation-1
+      jobs. Pre-fix it fails on "a superseded failure … must never reach
+      the failed-write queue", with one tile's newer bytes dropped and
+      its scratch file deleted.
+    - `a_failed_write_for_a_key_no_longer_in_pending_is_reported_not_swallowed`
+      — the *other* half of the predicate's contract, and the half
+      nothing else pins: a key absent from `pending` is not superseded.
+      A reachable state (evict, revisit — which calls `forget_pending` —
+      then the write fails), and inverting the predicate to treat an
+      absent key as stale leaves **every other test in this crate
+      green** while making `flush()` return `Ok` over a tile that never
+      reached disk. Confirmed by mutation: with the inversion applied,
+      43 tests pass and only this one fails.
+    - `evict_revisit_edit_evict_read_never_returns_the_pre_edit_tile` —
+      the bug's exact shape driven through the public API only
+      (`get_mut`/`get`, no hand-built state), 400 rounds of
+      write → evict → revisit-from-`pending` → edit → re-evict → read.
+      Measured here (Linux, debug): the race window is entered ~27–95
+      times per run, all handled correctly; **pre-fix it failed on 5 of
+      5 runs**, on the bug's own signature (a read returning the value
+      written before the edit). Nothing asserts on the window count —
+      that is timing-dependent — only that no read ever returns pixels
+      the store was not holding.
+    - `randomized_read_write_churn_never_returns_a_stale_tile` —
+      public-API-only fuzz (fixed-seed xorshift64\*, no `rand`
+      dependency), committed at 2,000 steps. Explicitly **defense in
+      depth, not the primary proof**: its pre-fix failure is
+      timing-dependent rather than guaranteed. A 20,000-step validation
+      was run locally, `--release`, five times each way: **post-fix 0
+      silently wrong reads and 0 errors on all five runs; pre-fix 77,
+      57, 56, 77 and 37 wrong reads (0 errors) on the five runs** —
+      observed numbers, not a promised figure, and `--release` only; the
+      committed 2,000-step configuration takes about 1.7 s in the
+      ordinary debug `cargo test` build. Its value space was widened
+      after review: it drew texels from 64 possible values, so roughly
+      one genuine stale read in 64 was masked by the pre- and post-edit
+      values coinciding. Every write in a run now uses a distinct value,
+      making "before differs from after" structural rather than
+      probabilistic.
+
+    Two existing tests (`reconcile_pending_keeps_the_bytes_of_a_write_that_failed`
+    and `a_capped_drop_deletes_the_superseded_file_instead_of_serving_stale_pixels`)
+    hand-insert into `pending` *and* hand-submit a job for the same key.
+    Their generations are matched at `0` on purpose, with a comment
+    saying so at each site: a mismatch would make the first pass for the
+    wrong reason (its `Err` arm skipped as superseded, never run) and the
+    second fail outright. Both were re-run with the check neutralized and
+    still pass, confirming they exercise the same arms they always did.
+
+    Known limits, stated plainly: the counter is per `TileStore`
+    instance, so it says nothing across two stores sharing a scratch
+    directory (0.53.0's per-instance filename token is what covers that);
+    this closes the race between *this store's own* write jobs, not any
+    interaction with an external process mutating the scratch files
+    underneath it; and, as item 5 above records, the disk-side half of
+    the guarantee rests on the writer staying single-threaded and FIFO.
+- [ ] **`make_room` clones every evicted tile's encoded bytes.** Noticed
+    by the 0.54.0 review (critic PERF-02, distinct from the same round's
+    PERF-01 about the fuzz test's own runtime) and deliberately **not**
+    fixed there: it predates that round's stale-write fix and is not a
+    regression from it. `make_room` hands `bytes.clone()` to `pending`
+    and the original to the `WriteJob`, so every eviction pays one extra
+    allocation and copy of a compressed tile on the caller's thread — the
+    same thread the 10 ms brush budget is measured on. The obvious fix is
+    an `Arc<[u8]>` (or `Arc<Vec<u8>>`) shared by both, which touches
+    `WriteJob`, `pending`'s value type and `ensure_resident`'s decode
+    branch. Wants its own round, and a measurement first: eviction
+    already pays a synchronous `codec::encode`, so the clone may well be
+    noise beside it.
 - [x] **HIGH PRIORITY — the tile scratch directory is a fixed, shared,
     world-readable path with filenames that collide across processes,
     documents and users.** Opened 2026-08-24 by the 0.52.2 review
@@ -11127,7 +11300,11 @@ found and closed a second, related loss of pixels — `flush`/
 *failed* — and disclosed three larger pre-existing issues it deliberately
 did not fix: a stale-write race with no generation numbers, a shared
 world-readable tile scratch directory, and brush strokes dead-zoning at a
-broken tile. All are their own `[ ]` items in M1.9's notes. See the
+broken tile. All are their own items in M1.9's notes; the scratch
+directory is fixed in 0.53.0 and the stale-write race in 0.54.0 (write
+jobs now carry a generation, and a superseded result is dropped whole at
+both drain sites before its outcome is inspected), leaving the
+brush-stroke dead zone the one still open. See the
 now-`[x]` items there for the full account and the tests. The other two
 items from the 0.52.0 review — the dark-halo artefact and the zoom-0.5
 rendering bug — are still open, as is CI's silent self-skipping of

@@ -19,7 +19,7 @@ use lru::LruCache;
 use crate::codec;
 use crate::error::TileError;
 use crate::tile::{SurfaceId, Tile, TileId};
-use crate::writer::{BackgroundWriter, WriteJob};
+use crate::writer::{BackgroundWriter, WriteJob, WriteResult};
 
 /// Counters mirroring `spike/vertical-slice`'s own `Stats` (paging
 /// throughput/eviction-cost numbers depend on these being tracked, not
@@ -54,6 +54,25 @@ pub struct Stats {
     /// loudly. The one exception is a deletion that itself fails, which
     /// is reported at `error!` when it happens.
     pub dropped_failed_writes: u64,
+    /// Write results dropped because a later eviction of the same tile
+    /// had already replaced the bytes `pending` holds for it. Not an
+    /// error: it is the ordinary, correct outcome of
+    /// evict/revisit/edit/evict, and it is the only externally visible
+    /// evidence that the generation check is doing its job.
+    ///
+    /// **`0` is the expected value in ordinary use.** The window a
+    /// superseded write needs -- a key evicted, revisited, edited and
+    /// re-evicted all while the first write is still in flight -- is
+    /// tiny against a healthy scratch disk, and only a deliberately
+    /// pathological configuration (a tile budget far smaller than the
+    /// working set, churned hard) drives this counter up at all: this
+    /// crate's own such test measures a few hundred over several
+    /// thousand evictions, while ordinary paging measures none. A
+    /// persistently non-zero value under *normal* use is therefore
+    /// informative rather than alarming -- it says eviction churn is
+    /// unusually aggressive relative to scratch-disk throughput, not
+    /// that anything is wrong.
+    pub superseded_writes: u64,
 }
 
 /// A sparse, paging, LRU-bounded store of [`Tile`]s, addressed by
@@ -93,6 +112,21 @@ pub struct Stats {
 /// `make_room`'s own doc comments for the mechanism) — a revisit during
 /// that window is served straight from memory, never disk, so the race
 /// window is zero by construction rather than merely narrowed.
+///
+/// **Stale-write race, closed** (0.54.0): the same window has a second
+/// half. A key can be evicted (job 1 queued), revisited from `pending`
+/// before job 1 lands, edited, and evicted again (job 2 queued for the
+/// same key and the same path). Both results are keyed by
+/// `(SurfaceId, TileId)` alone, so job 1's *eventual* completion used to
+/// clear the `pending` entry holding job 2's newer bytes — and the next
+/// read then fell through to a file still holding the pre-edit content,
+/// silently, with no error raised. Every job now carries a generation
+/// minted by `make_room` (`write_generation`) and stored
+/// alongside the bytes in `pending`; both drain sites
+/// (`reconcile_pending` and [`Self::flush`]) drop, whole, any
+/// result whose generation is not the one `pending` holds — before they
+/// look at whether it succeeded, so a superseded *failure* cannot enter
+/// the failed-write queue either. Counted in [`Stats::superseded_writes`].
 #[derive(Debug)]
 pub struct TileStore {
     resident: LruCache<(SurfaceId, TileId), Tile>,
@@ -102,7 +136,14 @@ pub struct TileStore {
     /// [`Self::ensure_resident`] and [`Self::make_room`]. Holds the exact
     /// already-encoded bytes `make_room` also handed to `writer.submit`,
     /// so a revisit before the write lands never has to touch disk.
-    pending: HashMap<(SurfaceId, TileId), Vec<u8>>,
+    ///
+    /// The `u64` is the [`Self::write_generation`] of the job whose
+    /// bytes these are. A drained [`crate::writer::WriteResult`] is only
+    /// allowed to act on this entry if it carries the same number: an
+    /// older job for the same key, superseded by a later eviction, must
+    /// not clear (or record a failure against) bytes that are not its
+    /// own — see this type's own "Stale-write race, closed" note.
+    pending: HashMap<(SurfaceId, TileId), (u64, Vec<u8>)>,
     /// The keys in [`Self::pending`] whose background write actually
     /// *failed*, oldest first — the retention queue
     /// [`Self::cap_failed_writes`] bounds. A successful write's `pending`
@@ -111,6 +152,14 @@ pub struct TileStore {
     /// only surviving copy) and nothing else would ever drop it, which is
     /// exactly why this queue and its cap exist.
     failed_writes: VecDeque<(SurfaceId, TileId)>,
+    /// Mints the generation stamped on every [`WriteJob`] and stored in
+    /// [`Self::pending`]. Store-wide and monotonic, not per key: a
+    /// per-key counter would need a map that outlives its `pending`
+    /// entry (or its numbers would restart and collide with an
+    /// in-flight job's), and such a map grows with the number of
+    /// distinct tiles ever evicted -- invariant §7.3.1 broken by the
+    /// back door, for no gain over a single `u64`.
+    write_generation: u64,
     budget: NonZeroUsize,
     scratch_dir: PathBuf,
     /// A component of every filename this store writes, distinct for
@@ -375,6 +424,7 @@ impl TileStore {
             paged_out: HashMap::new(),
             pending: HashMap::new(),
             failed_writes: VecDeque::new(),
+            write_generation: 0,
             budget,
             scratch_dir,
             instance: instance_token(),
@@ -426,6 +476,14 @@ impl TileStore {
     /// dropping the rest silently would contradict the point of
     /// reporting a scratch-disk failure at all.
     ///
+    /// A *superseded* result — one whose generation is not the one
+    /// `pending` holds for its key, because a later eviction
+    /// replaced those bytes while this write was in flight — is dropped
+    /// whole and reported as neither success nor failure, exactly as in
+    /// `reconcile_pending`. It says nothing about the content
+    /// this store is actually holding, and the newer job for that key
+    /// reconciles on its own result.
+    ///
     /// # Errors
     ///
     /// Returns the first [`TileError::Io`] encountered among pending
@@ -434,6 +492,9 @@ impl TileStore {
         self.writer.flush();
         let mut first_err = None;
         for result in self.writer.drain_results() {
+            if self.drop_if_superseded(&result) {
+                continue;
+            }
             match result.outcome {
                 // Confirmed durable: the scratch file is now a real
                 // replacement for the in-memory copy, so the holding area
@@ -504,6 +565,14 @@ impl TileStore {
     /// confirmed complete, so `page_in` can never again race a
     /// still-in-flight or partially-written file.
     ///
+    /// "Confirmed complete" means *this* eviction's own write, not merely
+    /// some write for this key: since 0.54.0 a `pending` entry is cleared
+    /// only by the result carrying the generation stored beside its bytes
+    /// (see [`Self::is_superseded`] and this type's "Stale-write race,
+    /// closed" note). Without that, an older, still-in-flight write's
+    /// completion could clear a newer eviction's entry and send branch
+    /// (c) to a file holding pre-edit pixels — no error, wrong content.
+    ///
     /// Invariant, extended from the pre-existing `resident`/`paged_out`
     /// one to now also cover `pending`: a `(surface, id)` key is never
     /// simultaneously resident *and* present in `pending` or `paged_out`
@@ -552,7 +621,7 @@ impl TileStore {
         // loud, recoverable error into silent, permanent content loss.
         // Both removes below therefore happen only once `decode` has
         // actually produced a whole tile.
-        if let Some(bytes) = self.pending.get(&(surface, id)) {
+        if let Some((_generation, bytes)) = self.pending.get(&(surface, id)) {
             let texels = codec::decode(bytes)?;
             self.forget_pending((surface, id));
             self.paged_out.remove(&(surface, id));
@@ -610,8 +679,20 @@ impl TileStore {
     /// with every eviction for as long as the session lasts, which is
     /// invariant §7.3.1's own "nothing assumes a document fits in memory"
     /// broken by the back door.
+    ///
+    /// **A superseded result is dropped whole** (0.54.0), before its
+    /// outcome is even inspected: if `pending` holds a *different*
+    /// generation for the key, these bytes were replaced by a later
+    /// eviction while this write was in flight, so neither clearing the
+    /// entry nor recording a failure against it would be about the right
+    /// content. See [`Self::drop_if_superseded`] (the shared prologue
+    /// [`Self::flush`] runs too) and [`Self::is_superseded`], and
+    /// [`Stats::superseded_writes`] for the counter.
     fn reconcile_pending(&mut self) {
         for result in self.writer.drain_results() {
+            if self.drop_if_superseded(&result) {
+                continue;
+            }
             match result.outcome {
                 Ok(()) => {
                     self.forget_pending((result.surface, result.id));
@@ -640,6 +721,62 @@ impl TileStore {
     fn forget_pending(&mut self, key: (SurfaceId, TileId)) {
         self.pending.remove(&key);
         self.failed_writes.retain(|held| *held != key);
+    }
+
+    /// The shared prologue both drain sites ([`Self::reconcile_pending`]
+    /// and [`Self::flush`]) run over every result before they look at
+    /// its outcome: returns `true` -- having counted the result in
+    /// [`Stats::superseded_writes`] -- when the caller must drop this
+    /// result whole and move on.
+    ///
+    /// Extracted rather than written out twice on purpose. The check has
+    /// to sit at *both* sites and *before* each one's `Ok`/`Err` match,
+    /// which is precisely the kind of invariant a later edit lands at
+    /// only one of two verbatim copies of; one method means there is
+    /// only one place to edit.
+    ///
+    /// Dropped whole because this write's bytes are not the ones
+    /// `pending` holds: neither clearing that entry (which would send
+    /// the next read to a file holding pre-edit pixels) nor recording a
+    /// failure against it (which would let [`Self::cap_failed_writes`]
+    /// drop, and [`Self::discard_stale_scratch_file`] delete, *newer*
+    /// content) would be about the right content. The newer job for this
+    /// key reconciles on its own result, later.
+    fn drop_if_superseded(&mut self, result: &WriteResult) -> bool {
+        let key = (result.surface, result.id);
+        if !self.is_superseded(key, result.generation) {
+            return false;
+        }
+        self.stats.superseded_writes += 1;
+        tracing::debug!(
+            surface = ?key.0,
+            tile = ?key.1,
+            ok = result.outcome.is_ok(),
+            "dropping a superseded write result"
+        );
+        true
+    }
+
+    /// Whether `result`'s job has been superseded: `pending` holds a
+    /// *different* generation for this key, because a later eviction
+    /// replaced the bytes while this write was still in flight.
+    ///
+    /// A key that is not in `pending` at all is **not** superseded --
+    /// there is nothing to protect, and treating it as stale would
+    /// swallow a genuine write failure for a tile that has since been
+    /// reinstated ([`Self::flush`] would return `Ok` where it reports
+    /// `Err` today).
+    ///
+    /// The comparison is `!=`, not `<`, and deliberately so: a result
+    /// can never carry a generation *higher* than the one `pending`
+    /// holds, since [`Self::make_room`] mints the number and stores it
+    /// in the same statement pair, so `pending`'s value for a key only
+    /// ever increases. `!=` states the rule without implying the
+    /// impossible direction is handled.
+    fn is_superseded(&self, key: (SurfaceId, TileId), generation: u64) -> bool {
+        self.pending
+            .get(&key)
+            .is_some_and(|(held, _)| *held != generation)
     }
 
     /// How many tiles' worth of *failed* writes this store will hold in
@@ -685,12 +822,17 @@ impl TileStore {
     /// which also documents the one case that can defeat this: a deletion
     /// that itself fails).
     ///
-    /// Note what this does *not* cover: a `pending` entry cleared by the
-    /// completion of an **older** write for the same key can still send a
-    /// later read to a stale file with no error. That is the separate,
-    /// still-open stale-write race (no generation numbers on write jobs)
-    /// disclosed in `PLAN.md`, not something this cap either causes or
-    /// closes.
+    /// What this cap deliberately does not have to cover any more
+    /// (0.54.0): a `pending` entry cleared — or failed — by the
+    /// completion of an **older** write for the same key. That was a
+    /// separate, then-open stale-write race, and it is now closed at the
+    /// source: write jobs carry a generation ([`Self::is_superseded`]),
+    /// and both drain sites drop a superseded result *before* they look
+    /// at its outcome, so such a result never reaches this queue in the
+    /// first place. That ordering matters here specifically: a
+    /// superseded `Err` reaching [`Self::retain_failed_write`] would let
+    /// this cap drop, and [`Self::discard_stale_scratch_file`] delete,
+    /// content *newer* than the write that failed.
     fn retain_failed_write(&mut self, key: (SurfaceId, TileId)) {
         if !self.pending.contains_key(&key) {
             // Already revisited and reinstated, or already dropped: there
@@ -758,6 +900,29 @@ impl TileStore {
     /// `error!` — the one case where a later read can silently return
     /// stale content, named at the moment it becomes possible rather than
     /// discovered afterwards.
+    ///
+    /// **No in-flight write for this key can exist when this runs**
+    /// (0.54.0), so the delete-versus-write ordering this paragraph used
+    /// to disclose as a residual is not merely shrunk — it is
+    /// unreachable. [`Self::cap_failed_writes`] (this method's only
+    /// caller) does not join the writer thread the way [`Self::flush`]
+    /// does, so the question is real; the answer follows from how a key
+    /// gets here at all. It must have come off `failed_writes`, which
+    /// only [`Self::retain_failed_write`] fills, and only for a result
+    /// that reached the `Err` arm — i.e. one [`Self::drop_if_superseded`]
+    /// did *not* drop, which means `pending` holds that result's own
+    /// generation, which means no later eviction of this key has
+    /// happened. And a later eviction is the only thing that could queue
+    /// another write for it: any revisit in between goes through
+    /// [`Self::forget_pending`], which moves the `pending` entry and the
+    /// `failed_writes` place together, so the queued entry cannot
+    /// survive a revisit to be capped after a re-eviction. The write
+    /// whose failure put this key here is, by construction, already
+    /// finished.
+    ///
+    /// That guarantee rests on `forget_pending` continuing to move both
+    /// maps in one call. A future refactor that decoupled them would
+    /// have to re-examine this paragraph, not just that method.
     fn discard_stale_scratch_file(&mut self, key: (SurfaceId, TileId)) {
         let Some(path) = self.paged_out.get(&key) else {
             return;
@@ -827,6 +992,11 @@ impl TileStore {
             };
             let bytes = codec::encode(victim_tile.texels());
             let path = self.tile_path(victim_surface, victim_id);
+            // `wrapping_add` rather than `+=`: overflow here is unreachable
+            // (one eviction per nanosecond for 584 years), and a wrap is still
+            // correct where a debug-build overflow panic would not be.
+            self.write_generation = self.write_generation.wrapping_add(1);
+            let generation = self.write_generation;
             self.stats.bytes_written += bytes.len() as u64;
             self.stats.evictions += 1;
             self.paged_out
@@ -836,12 +1006,14 @@ impl TileStore {
             // memory if it's revisited before the write below actually
             // lands (see that method's doc comment for the full race this
             // closes). Cleared by `reconcile_pending` once the write is
-            // confirmed complete.
+            // confirmed complete -- and only by *this* submission's own
+            // result, which is what `generation` distinguishes.
             self.pending
-                .insert((victim_surface, victim_id), bytes.clone());
+                .insert((victim_surface, victim_id), (generation, bytes.clone()));
             self.writer.submit(WriteJob {
                 surface: victim_surface,
                 id: victim_id,
+                generation,
                 path,
                 bytes,
             });
@@ -1031,7 +1203,7 @@ mod tests {
         let texels = vec![half::f16::from_f32(0.75); crate::tile::SAMPLES];
         let bytes = crate::codec::encode(&texels);
         let nonexistent = dir.path().join("this_file_is_never_created.tile");
-        store.pending.insert((s, id), bytes);
+        store.pending.insert((s, id), (0, bytes));
         store.paged_out.insert((s, id), nonexistent);
 
         let tile = match store.get(s, id) {
@@ -1392,17 +1564,30 @@ mod tests {
 
         // Paged back in, edited to 0.75, re-evicted -- and that write
         // failed, so the newer content is only in `pending`.
+        //
+        // Every generation here is `0`, hand-set and deliberately
+        // *matched* with the jobs submitted below: a mismatch would make
+        // both results superseded and skipped, so this test would stop
+        // exercising the failed-write path it exists to prove (and would
+        // fail loudly on `dropped_failed_writes`, which is the point of
+        // keeping them consistent by hand rather than mechanically).
         store.paged_out.insert((s, stale), stale_path.clone());
         store.pending.insert(
             (s, stale),
-            crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]),
+            (
+                0,
+                crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]),
+            ),
         );
         store
             .paged_out
             .insert((s, filler), store.tile_path(s, filler));
         store.pending.insert(
             (s, filler),
-            crate::codec::encode(&vec![half::f16::from_f32(0.5); crate::tile::SAMPLES]),
+            (
+                0,
+                crate::codec::encode(&vec![half::f16::from_f32(0.5); crate::tile::SAMPLES]),
+            ),
         );
 
         for (index, id) in [stale, filler].into_iter().enumerate() {
@@ -1413,6 +1598,8 @@ mod tests {
             store.writer.submit(crate::writer::WriteJob {
                 surface: s,
                 id,
+                // Matches the `pending` generations set above, on purpose.
+                generation: 0,
                 path: unwritable,
                 bytes: vec![1, 2, 3, 4],
             });
@@ -1474,12 +1661,17 @@ mod tests {
         let texels = vec![half::f16::from_f32(0.25); crate::tile::SAMPLES];
         let bytes = crate::codec::encode(&texels);
         // Exactly the state `make_room` leaves behind for an eviction:
-        // both maps populated, the same bytes handed to the writer.
-        store.pending.insert((s, id), bytes.clone());
+        // both maps populated, the same bytes handed to the writer, and
+        // the same generation on both. The two `0`s are matched
+        // deliberately -- with a mismatch the result would be skipped as
+        // superseded and the `Err` arm this test exists to exercise
+        // would never run, leaving the test green for the wrong reason.
+        store.pending.insert((s, id), (0, bytes.clone()));
         store.paged_out.insert((s, id), path.clone());
         store.writer.submit(crate::writer::WriteJob {
             surface: s,
             id,
+            generation: 0,
             path,
             bytes,
         });
@@ -1503,6 +1695,542 @@ mod tests {
         {
             assert_eq!(first.to_f32(), 0.25);
         }
+    }
+
+    /// The decisive, fully deterministic proof that the stale-write race
+    /// is closed. The shape of the bug: a key is evicted (job 1 queued),
+    /// revisited from `pending` before job 1's write lands, edited, and
+    /// evicted again (job 2 queued for the same key and the same path).
+    /// Both results are keyed by `(SurfaceId, TileId)` alone, so job 1's
+    /// *eventual* completion used to clear the `pending` entry holding
+    /// job 2's newer bytes -- and the next read then fell through to a
+    /// file still holding the pre-edit content. No error, wrong pixels.
+    ///
+    /// Hand-builds exactly that mid-race state (the way the other
+    /// mid-eviction tests here hand-build theirs) so nothing depends on
+    /// OS scheduling: `pending` at generation 2 holding 0.75, an
+    /// in-flight generation-1 job carrying the pre-edit 0.25 to the one
+    /// path both writes target.
+    #[test]
+    fn a_completed_older_write_must_not_clear_a_newer_pending_entry() {
+        let (_dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 0, y: 0 };
+        let path = store.tile_path(s, id);
+
+        let old = crate::codec::encode(&vec![half::f16::from_f32(0.25); crate::tile::SAMPLES]);
+        let new = crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]);
+
+        // The second eviction's state: `pending` holds generation 2's
+        // bytes, `paged_out` points at the one path both writes target.
+        store.pending.insert((s, id), (2, new));
+        store.paged_out.insert((s, id), path.clone());
+
+        // The *first* eviction's write, still in flight, carrying the
+        // pre-edit bytes and its own older generation.
+        store.writer.submit(crate::writer::WriteJob {
+            surface: s,
+            id,
+            generation: 1,
+            path,
+            bytes: old,
+        });
+        store.writer.flush();
+        store.reconcile_pending();
+
+        // Sampled before the read below, which legitimately consumes the
+        // entry -- but asserted *after* it, so a regression fails on the
+        // bug's own user-visible signature (a stale 0.75 -> 0.25) rather
+        // than on the bookkeeping that produced it.
+        let pending_survived = store.pending.contains_key(&(s, id));
+
+        let tile = match store.get(s, id) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("the newer bytes are still in `pending`: {err}"),
+        };
+        let Some(first) = tile.texels().first() else {
+            unreachable!("a tile's texel buffer is never empty");
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                first.to_f32(),
+                0.75,
+                "reading 0.25 here is the race: the user's edit silently replaced by the \
+                 pre-edit version, with no error raised"
+            );
+        }
+        // And it came from memory, not from the file that holds 0.25.
+        assert_eq!(store.stats().faults, 0);
+        assert!(
+            pending_survived,
+            "an older write's completion must not clear the newer eviction's bytes"
+        );
+        assert_eq!(store.stats().superseded_writes, 1);
+    }
+
+    /// The other half of `is_superseded`'s contract, and the half every
+    /// other test here leaves unpinned: **a key that is not in `pending`
+    /// at all is not superseded.**
+    ///
+    /// The predicate is written as "present *and* holding a different
+    /// generation". Weakening it to "not present, or holding a different
+    /// generation" -- i.e. treating an absent key the same as a
+    /// mismatched one, which is exactly the shape a well-meaning
+    /// simplification takes -- leaves every other test in this suite
+    /// green, including the three above, while silently turning a real,
+    /// hard scratch-disk failure into an `Ok` from [`TileStore::flush`].
+    /// That is a save reporting success over a tile that never reached
+    /// disk.
+    ///
+    /// The state is reachable in ordinary use, which is why it matters:
+    /// a key is evicted (its write queued), revisited before that write
+    /// lands -- `ensure_resident`'s `pending` branch calls
+    /// `forget_pending`, so the entry is gone -- and the write then
+    /// fails. The result arrives for a key `pending` no longer holds.
+    /// There is nothing to protect and nothing to be stale about, so the
+    /// failure must be reported, not swallowed.
+    #[test]
+    fn a_failed_write_for_a_key_no_longer_in_pending_is_reported_not_swallowed() {
+        let (dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 2, y: 5 };
+
+        // A directory at the target path: the portable idiom the other
+        // failed-write tests here use to force `fs::write` to fail.
+        let unwritable = dir.path().join("unwritable");
+        if let Err(err) = std::fs::create_dir(&unwritable) {
+            unreachable!("test-local scratch dir must accept a subdirectory: {err}");
+        }
+
+        // Deliberately *no* `pending` entry for this key -- the whole
+        // point. The generation is non-zero and arbitrary: whatever it
+        // is, it can match nothing, and that must not be read as
+        // "superseded".
+        assert!(!store.pending.contains_key(&(s, id)));
+        store.writer.submit(crate::writer::WriteJob {
+            surface: s,
+            id,
+            generation: 9,
+            path: unwritable,
+            bytes: vec![1, 2, 3, 4],
+        });
+
+        match store.flush() {
+            Err(crate::TileError::Io {
+                surface, id: tile, ..
+            }) => {
+                assert_eq!((surface, tile), (s, id));
+            }
+            Ok(()) => unreachable!(
+                "the scratch write really failed; reporting `Ok` here is a save that says it \
+                 succeeded over a tile that never reached disk"
+            ),
+            Err(other) => unreachable!("expected TileError::Io, got {other:?}"),
+        }
+        assert_eq!(
+            store.stats().superseded_writes,
+            0,
+            "an absent `pending` entry means there is nothing this result could have superseded"
+        );
+    }
+
+    /// The `flush` twin of the test above -- the same check has to sit at
+    /// *both* drain sites, or a save-time flush reintroduces the race the
+    /// background path just closed -- and, past that, the other half of
+    /// the contract: the *newer* job still reconciles completely normally
+    /// once its own result arrives, clearing `pending` and leaving a
+    /// scratch file that holds the newer content.
+    #[test]
+    fn flush_ignores_a_superseded_write_result_and_the_newer_one_still_reconciles() {
+        let (_dir, mut store) = store(4);
+        let s = surface();
+        let id = TileId { x: 0, y: 0 };
+        let path = store.tile_path(s, id);
+
+        let old = crate::codec::encode(&vec![half::f16::from_f32(0.25); crate::tile::SAMPLES]);
+        let new = crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]);
+
+        store.pending.insert((s, id), (2, new.clone()));
+        store.paged_out.insert((s, id), path.clone());
+
+        // Generation 1: the superseded write, which really does land on
+        // disk (that is the point -- the file now holds 0.25).
+        store.writer.submit(crate::writer::WriteJob {
+            surface: s,
+            id,
+            generation: 1,
+            path: path.clone(),
+            bytes: old,
+        });
+        assert!(
+            store.flush().is_ok(),
+            "a superseded result is neither a success to act on nor a failure to report"
+        );
+        assert!(
+            store.pending.contains_key(&(s, id)),
+            "flush must not clear a `pending` entry on an older write's result"
+        );
+        assert_eq!(store.stats().superseded_writes, 1);
+
+        // Generation 2: the write those `pending` bytes actually belong
+        // to. This one reconciles for real.
+        store.writer.submit(crate::writer::WriteJob {
+            surface: s,
+            id,
+            generation: 2,
+            path: path.clone(),
+            bytes: new.clone(),
+        });
+        assert!(store.flush().is_ok());
+        assert!(
+            store.pending.is_empty(),
+            "the matching result must clear the entry it belongs to"
+        );
+        assert_eq!(store.stats().superseded_writes, 1);
+        match std::fs::read(&path) {
+            Ok(bytes) => assert_eq!(bytes, new, "the file must hold the newer eviction's bytes"),
+            Err(err) => unreachable!("flush joined the writer, so the file must exist: {err}"),
+        }
+
+        // With `pending` legitimately empty, the read now takes the disk
+        // path -- safely, because the file holds the newer content.
+        let tile = match store.get(s, id) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("the scratch file was just confirmed durable: {err}"),
+        };
+        let Some(first) = tile.texels().first() else {
+            unreachable!("a tile's texel buffer is never empty");
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(first.to_f32(), 0.75);
+        }
+        assert_eq!(store.stats().faults, 1);
+    }
+
+    /// Why the generation check runs *before* the `Ok`/`Err` match rather
+    /// than inside the `Ok` arm, which is the single easiest way to get
+    /// this fix subtly wrong.
+    ///
+    /// A superseded **failure** is just as dangerous as a superseded
+    /// success: `retain_failed_write` would enqueue the key, and
+    /// `cap_failed_writes` would then drop the *newer* bytes `pending`
+    /// holds and have `discard_stale_scratch_file` delete a file a live
+    /// job is about to rewrite -- a variant of the same wrong-pixel bug,
+    /// reached from the other arm. Two keys against a one-tile cap make
+    /// that happen immediately if the check is misplaced: this test fails
+    /// (`dropped_failed_writes == 1`, one scratch file gone, one
+    /// `pending` entry lost) rather than passing quietly.
+    #[test]
+    fn a_superseded_failed_write_never_enters_the_failed_write_queue() {
+        let (dir, mut store) = store(1);
+        let s = surface();
+        let (first_key, second_key) = (TileId { x: 0, y: 0 }, TileId { x: 1, y: 0 });
+
+        for id in [first_key, second_key] {
+            // A real scratch file from an earlier, successful eviction --
+            // exactly what `discard_stale_scratch_file` would delete.
+            let path = store.tile_path(s, id);
+            let older =
+                crate::codec::encode(&vec![half::f16::from_f32(0.25); crate::tile::SAMPLES]);
+            if let Err(err) = std::fs::write(&path, &older) {
+                unreachable!("test-local scratch disk must accept the write: {err}");
+            }
+            store.paged_out.insert((s, id), path);
+            // The newer eviction's bytes, at generation 2.
+            store.pending.insert(
+                (s, id),
+                (
+                    2,
+                    crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]),
+                ),
+            );
+        }
+
+        // Two older, still-in-flight writes that can only fail: their
+        // paths are occupied by directories, the portable idiom the
+        // failed-write tests above already use.
+        for (index, id) in [first_key, second_key].into_iter().enumerate() {
+            let unwritable = dir.path().join(format!("unwritable_{index}"));
+            if let Err(err) = std::fs::create_dir(&unwritable) {
+                unreachable!("test-local scratch dir must accept a subdirectory: {err}");
+            }
+            store.writer.submit(crate::writer::WriteJob {
+                surface: s,
+                id,
+                generation: 1,
+                path: unwritable,
+                bytes: vec![1, 2, 3, 4],
+            });
+        }
+        store.writer.flush();
+        store.reconcile_pending();
+
+        // Ordered so a regression fails on the damage first -- a
+        // superseded failure reaching the queue, the newer bytes dropped,
+        // the file deleted -- and only then on the counter.
+        assert!(
+            store.failed_writes.is_empty(),
+            "a superseded failure says nothing about the bytes `pending` holds, so it must never \
+             reach the failed-write queue"
+        );
+        for id in [first_key, second_key] {
+            assert!(
+                store.pending.contains_key(&(s, id)),
+                "the newer bytes must survive a superseded failure"
+            );
+            assert!(
+                store.tile_path(s, id).exists(),
+                "`discard_stale_scratch_file` must not have run: that file is the target of a \
+                 write that is still to come"
+            );
+        }
+        assert_eq!(store.stats().dropped_failed_writes, 0);
+        assert_eq!(store.stats().superseded_writes, 2);
+    }
+
+    /// The bug's exact real-world shape, driven repeatedly through the
+    /// **public API only** -- `get_mut`, `get`, `flush`; no reaching into
+    /// `pending`, no hand-submitted [`crate::writer::WriteJob`].
+    ///
+    /// The three deterministic tests below hand-build the mid-race state,
+    /// which is what makes them decisive; the cost is that they prove the
+    /// *predicate and its placement* rather than that a real caller can
+    /// still provoke the race through the front door. This one pays the
+    /// opposite trade. Each round walks the precise history that produces
+    /// the bug -- write a tile, evict it, revisit it from `pending`
+    /// before its write has landed, edit it, evict it again to the same
+    /// path, read it back -- so it enters the race window over and over
+    /// per run instead of waiting for random churn to stumble into it.
+    ///
+    /// Measured here (Linux, debug, 400 rounds): the window is entered a
+    /// few hundred times per run, all handled correctly. Timing-dependent
+    /// by nature, so nothing below asserts on that count -- a machine
+    /// whose scratch writes always beat the next eviction would enter it
+    /// zero times and still be correct. What *is* asserted is
+    /// unconditional: no read may ever return a value this test did not
+    /// last write, and none may error.
+    ///
+    /// Every write uses a value no other write in the run uses, so a
+    /// stale read is unambiguous rather than probabilistically
+    /// detectable -- see the churn test below for why that matters.
+    #[test]
+    fn evict_revisit_edit_evict_read_never_returns_the_pre_edit_tile() {
+        /// Enough rounds to enter the race window repeatedly on an
+        /// ordinary machine while staying well inside the exactly
+        /// representable `n / 1024.0` range in `f16` (two writes per
+        /// round, so 800 distinct values).
+        const ROUNDS: u64 = 400;
+
+        // Two resident tiles: touching both fillers is guaranteed to
+        // evict the target, since it is the least recently used of the
+        // three by then.
+        let (_dir, mut store) = store(2);
+        let s = surface();
+        let target = TileId { x: 0, y: 0 };
+        let fillers = [TileId { x: 1, y: 0 }, TileId { x: 2, y: 0 }];
+
+        let mut written: u64 = 0;
+        let mut wrong = Vec::new();
+        let mut errors = Vec::new();
+
+        let write = |store: &mut TileStore, written: &mut u64, errors: &mut Vec<String>| {
+            *written += 1;
+            let value = half::f16::from_f32(*written as f32 / 1024.0);
+            match store.get_mut(s, target) {
+                Ok(tile) => match tile.texels_mut().first_mut() {
+                    Some(first) => *first = value,
+                    None => errors.push(format!("write {written}: the target tile has no texels")),
+                },
+                Err(err) => errors.push(format!("write {written}: get_mut failed: {err}")),
+            }
+            value.to_bits()
+        };
+
+        for round in 0..ROUNDS {
+            // The pre-edit content, and the eviction that queues the
+            // write carrying it.
+            write(&mut store, &mut written, &mut errors);
+            for filler in fillers {
+                if let Err(err) = store.get(s, filler) {
+                    errors.push(format!("round {round}: filler {filler:?} failed: {err}"));
+                }
+            }
+
+            // Revisited before that write is confirmed (served straight
+            // from `pending` on any run where it is still in flight) and
+            // edited, then evicted again -- a second write, to the same
+            // path, while the first may still be outstanding. This is
+            // the whole bug: the older write's completion used to clear
+            // the entry holding these newer bytes.
+            let expected = write(&mut store, &mut written, &mut errors);
+            for filler in fillers {
+                if let Err(err) = store.get(s, filler) {
+                    errors.push(format!("round {round}: filler {filler:?} failed: {err}"));
+                }
+            }
+
+            match store.get(s, target) {
+                Ok(tile) => match tile.texels().first() {
+                    Some(first) if first.to_bits() == expected => {}
+                    Some(first) => wrong.push(format!(
+                        "round {round}: expected {} (bits {expected:#06x}), got {} (bits {:#06x})",
+                        half::f16::from_bits(expected),
+                        first,
+                        first.to_bits()
+                    )),
+                    None => wrong.push(format!("round {round}: the target tile has no texels")),
+                },
+                Err(err) => errors.push(format!("round {round}: get failed: {err}")),
+            }
+        }
+
+        assert!(
+            wrong.is_empty(),
+            "a read returned pixels the store was not holding -- the stale-write race: an older \
+             eviction's write completed, cleared the newer eviction's `pending` entry, and sent \
+             this read to a scratch file still holding the pre-edit content:\n{}",
+            wrong.join("\n")
+        );
+        assert!(
+            errors.is_empty(),
+            "ordinary paging against a healthy scratch disk must never error:\n{}",
+            errors.join("\n")
+        );
+    }
+
+    /// Defense in depth over the public API only, deliberately *not* the
+    /// primary proof: its pre-fix failure is timing-dependent rather than
+    /// guaranteed, because it needs a write to still be in flight across
+    /// a revisit-edit-re-evict sequence. The three tests above are the
+    /// actual, deterministic evidence that this bug is fixed; this one
+    /// exists to catch a variant none of them anticipated.
+    ///
+    /// A 20,000-step run was performed locally during development
+    /// (Linux, `--release`), five times in each direction. Post-fix: 0
+    /// stale reads and 0 errors on every run. Pre-fix (the generation
+    /// check at both drain sites neutralized): 77, 57, 56, 77 and 37
+    /// silently wrong reads, 0 errors -- timing-dependent numbers,
+    /// reported exactly as observed rather than as a promise. **Those
+    /// five-run numbers are `--release` only**; the committed
+    /// configuration below is 2,000 steps and is what the ordinary gate
+    /// runs, in a plain `cargo test` debug build, in about 1.7 s here.
+    /// The two are separate measurements and should not be read as one.
+    ///
+    /// **Every write uses a value no other write in the run uses**, so a
+    /// stale read cannot be masked by coincidence. This matters more
+    /// than it looks: drawing values from a small space (the original
+    /// `% 64`) silently discards roughly one stale read in 64, because
+    /// the pre-edit and post-edit values happen to be equal and the
+    /// comparison below cannot tell a correct read from a wrong one. A
+    /// per-write counter makes "before differs from after" structural
+    /// rather than probabilistic.
+    #[test]
+    fn randomized_read_write_churn_never_returns_a_stale_tile() {
+        const STEPS: u64 = 2_000;
+        /// Per surface; two surfaces, so twelve keys against a
+        /// three-tile budget -- nearly every step evicts and pages in.
+        const TILES: u64 = 6;
+
+        /// The same deterministic xorshift64\* stream `codec`'s own tests
+        /// use: no `rand` dependency, and identical on every run and
+        /// every platform, so a failure here is reproducible.
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state >> 12;
+            *state ^= *state << 25;
+            *state ^= *state >> 27;
+            (*state).wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        let (_dir, mut store) = store(3);
+        // The expected first texel of every key touched so far, compared
+        // by `to_bits` rather than as floats -- this crate's existing
+        // round-trip discipline, and it keeps `clippy::float_cmp` out of
+        // it. A never-written key reads back blank, whose bits are 0.
+        let mut expected: std::collections::HashMap<(SurfaceId, TileId), u16> =
+            std::collections::HashMap::new();
+        let mut stale = Vec::new();
+        let mut errors = Vec::new();
+        let mut writes: u64 = 0;
+
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for step in 0..STEPS {
+            let r = xorshift(&mut state);
+            let surface = if r & 1 == 0 {
+                SurfaceId::from_raw(0)
+            } else {
+                SurfaceId::from_raw(1)
+            };
+            let id = TileId {
+                x: ((r >> 8) % TILES) as u32,
+                y: 0,
+            };
+            let key = (surface, id);
+
+            if (r >> 16) & 1 == 0 {
+                // A fresh value for every write in the run, so no two
+                // writes -- to this key or any other -- can produce the
+                // same texel and hide a stale read behind a coincidental
+                // match. `n / 1024.0` is exact in `f16` for every
+                // `n` in `1..2048` (that is a multiple of 2^-10, and
+                // `f16`'s spacing is 2^-10 across [1, 2) and finer
+                // below), and 0 is reserved for the blank tile a
+                // never-written key reads back as. At the committed
+                // step count the counter cannot reach the `% 2047` wrap
+                // at all, so within one run the values really are all
+                // distinct; the modulo is there only so that raising
+                // `STEPS` degrades into "distinct within any 2,047
+                // consecutive writes" instead of silently leaving the
+                // exactly-representable range.
+                writes += 1;
+                let value = half::f16::from_f32((writes % 2047 + 1) as f32 / 1024.0);
+                match store.get_mut(surface, id) {
+                    Ok(tile) => match tile.texels_mut().first_mut() {
+                        Some(first) => {
+                            *first = value;
+                            expected.insert(key, value.to_bits());
+                        }
+                        None => errors.push(format!("step {step}: {key:?} has no texels")),
+                    },
+                    Err(err) => errors.push(format!("step {step}: {key:?} get_mut failed: {err}")),
+                }
+            } else {
+                let want = expected.get(&key).copied().unwrap_or(0);
+                match store.get(surface, id) {
+                    Ok(tile) => match tile.texels().first() {
+                        Some(first) if first.to_bits() == want => {}
+                        Some(first) => stale.push(format!(
+                            "step {step}: {key:?} expected {} (bits {want:#06x}), got {} (bits \
+                             {:#06x})",
+                            half::f16::from_bits(want),
+                            first,
+                            first.to_bits()
+                        )),
+                        None => stale.push(format!("step {step}: {key:?} has no texels")),
+                    },
+                    Err(err) => errors.push(format!("step {step}: {key:?} get failed: {err}")),
+                }
+            }
+
+            if step % 97 == 96
+                && let Err(err) = store.flush()
+            {
+                errors.push(format!("step {step}: flush failed: {err}"));
+            }
+        }
+
+        assert!(
+            stale.is_empty(),
+            "a read returned content the store was not holding -- the stale-write race, or \
+             something like it:\n{}",
+            stale.join("\n")
+        );
+        assert!(
+            errors.is_empty(),
+            "ordinary read/write churn against a healthy scratch disk must never error:\n{}",
+            errors.join("\n")
+        );
     }
 
     /// A corrupted scratch file must surface as a `TileError`, never as a
@@ -1626,7 +2354,7 @@ mod tests {
         let never_created = dir.path().join("this_file_is_never_created.tile");
         store
             .pending
-            .insert((s, id), crate::codec::encode_any_length(&half));
+            .insert((s, id), (0, crate::codec::encode_any_length(&half)));
         store.paged_out.insert((s, id), never_created);
 
         for read in 1..=2 {
