@@ -1,7 +1,7 @@
 # Aurora — Implementation Plan
 
 **Living document.** Tracks what is done, what is in progress, and what comes next.
-Last updated: **2026-08-24**.
+Last updated: **2026-08-25**.
 
 The [PRD](PRD.md) says *what* Aurora is and *why*. This file says *where we are*
 and *what to do next*. When they disagree, the PRD wins and this file is stale —
@@ -7983,8 +7983,9 @@ structural design work.
     2. **Painting on such a tile fails every dab**, instead of silently
        succeeding on a blanked one from the second attempt onward. A
        stroke that straddles a healthy and a broken tile now also stops
-       at the broken one and leaves a dead zone — tracked as its own open
-       item below, not fixed here.
+       at the broken one and leaves a dead zone — tracked as its own item
+       below, not fixed here; **fixed in 0.55.0**, where a failing tile
+       costs only itself and the dab reports what it managed to paint.
     3. **Undo could permanently lose a history entry** —
        `PixelHistory::undo` popped the stroke and only then applied it, so
        a restore that failed dropped the snapshot entirely. Harmless when
@@ -8231,7 +8232,7 @@ structural design work.
     silent), and is now the only one. Whether the lint configuration
     should cover debug assertions at all is a small, separate decision,
     noted here rather than settled.
-- [ ] **A stroke that reaches a permanently broken tile leaves a dead
+- [x] **A stroke that reaches a permanently broken tile leaves a dead
     zone, and can leave a phantom undo entry.** Opened 2026-08-24 by the
     0.52.2 review (critic AT-04/AT-05(a), red-team RT-06, found
     independently); a direct consequence of that round's own
@@ -8261,6 +8262,418 @@ structural design work.
     turns out to be a no-op. Not done in 0.52.2 because both require
     restructuring `paint_dab`/`stamp_dab`'s control flow, which is more
     than that round's patch scope and deserves its own tests.
+
+    **Fixed 2026-08-25 (0.55.0)**, along that shape for the first defect
+    and by a stronger route than either option offered for the second:
+
+    1. **A broken tile costs its own 256×256 px and nothing else.**
+       `stamp_dab`/`erase_dab` now `continue` past a tile whose
+       `get_mut` fails instead of returning, so every later tile in
+       iteration order is still attempted. A dab straddling a healthy
+       and a broken tile paints the healthy one in full.
+    2. **`Result<usize, TileError>` became `DabOutcome`.** The old return
+       type structurally could not express partial success — it forced a
+       choice between reporting the error and reporting the tiles
+       painted, and the error won. `DabOutcome` carries `painted()` (the
+       tiles really written, in iteration order) and `failed()` (**every**
+       failing tile with its own `TileError`, not just the first), plus
+       `first_error()` and `is_complete()` for callers that want one line
+       per dab. `stamp_stroke`/`erase_stroke` kept their old
+       `Result<usize, TileError>` contract in 0.55.0 and were **deleted
+       outright in 0.56.0**: both had only test callers, and that
+       contract means "the first broken tile abandons the rest of the
+       stroke" — the coarse-grained form of the very bug this item is
+       about, left standing inside the fix for it. `dab.rs`'s own
+       `dabs_along_path` tests already cover path-level dab placement,
+       and `aurora-app` composes `dabs_along_path` with `stamp_dab`
+       itself, deciding for itself what a partial failure means.
+    3. **The phantom undo entry is fixed by construction, not by
+       cleanup.** The capture moved *into* the dab:
+       `StrokeSnapshot::record_content` (new, infallible — the content is
+       already in hand) is called **in the instant before that tile's
+       first actual texel write** (0.55.0 called it one step earlier, on
+       the `get_mut` success arm; see item 5 below), so "captured" and
+       "painted" are the same set by definition. `App::paint_dab`/`App::erase_dab`
+       now pass the active `Drag`'s snapshot *to* `stamp_dab`/`erase_dab`
+       and no longer call `touched_tiles`/`record_touch` at all; they
+       invalidate `outcome.painted()` rather than the bounding box. A dab
+       that painted nothing captures nothing, so `is_empty()` stays true
+       and `PixelHistory::push` records no entry.
+
+       The tempting alternative — capture as before and prune the
+       snapshot afterward — was **rejected**: a tile can be captured by
+       an *earlier, successful* dab of the same stroke and only later
+       fail, and pruning it would silently destroy that dab's real undo
+       data. Deferring the capture to after a successful paint is also
+       wrong on its own terms: by then the pixels are already
+       overwritten. Capturing from the acquired tile is the only ordering
+       that is correct without a second read.
+    4. **A snapshot for a different `SurfaceId` is ignored rather than
+       mis-captured.** `App` cannot reach that case (its snapshot is
+       built from the same active layer), but nothing in the types said
+       so, and the dab now holds a snapshot it did not build.
+
+    **Revised 2026-08-25 (0.56.0)** after an independent three-way
+    review (critic, red team, verifier) of the 0.55.0 fix. Every finding
+    below was evidenced, and all of them are fixed here; nothing was
+    rejected as a false positive.
+
+    5. **Acquired is not painted.** 0.55.0 captured a tile, and counted
+       it in `painted()`, on the `get_mut` success arm — one step too
+       early. Acquiring a tile is not writing to it, and three ordinary
+       cases acquire one and then change nothing in it: a dab whose
+       bounding box clamps onto a tile its falloff circle never reaches
+       (the "known imprecision" 0.55.0 disclosed and left standing), a
+       dab landing entirely on pixels already at or above its own alpha
+       (the max-alpha rule), and an erase over already-transparent
+       pixels. Each still produced a full undo entry for pixels nothing
+       had touched — the same phantom entry this item exists to close,
+       one case narrower. Both the capture and the `painted()` push now
+       happen at a tile's **first real texel write**, so neither can name
+       a tile that still looks exactly as it did. The capture-before-
+       paint ordering is unchanged and still load-bearing: it happens
+       after the write is certain and before the write happens.
+    6. **Two new overflow/panic surfaces this round introduced, closed.**
+       `Vec::with_capacity(((t1.x - t0.x + 1) * (t1.y - t0.y + 1)) as usize)`
+       multiplies two `u32`s derived from caller-supplied floats. The red
+       team reproduced a real panic with `radius = 1e9` (and reached the
+       same line with `radius = f32::INFINITY`, since `as u32` saturates
+       rather than trapping); in release, with no `overflow-checks`, it
+       wraps to a nonsense capacity instead. The product is computed in
+       `u64` and capped (`reserved_tiles`, `MAX_RESERVED_TILES`) — the
+       cap because widening alone leaves the other half of the same
+       problem, a `with_capacity` large enough to abort the process on
+       allocation failure, which no `Result` can catch. `touched_tiles`
+       had the identical pre-existing shape and was fixed with it. A
+       non-finite `center`/`radius` is now refused outright
+       (`is_paintable`), which also closes a NaN centre silently landing
+       a dab on tile (0, 0).
+    7. **`record_content` was a new `pub`, infallible door into a
+       `copy_from_slice`.** It accepted any-length `&[f16]` and stored it
+       verbatim; `StrokeSnapshot::apply`'s `restore_tile` then panics on
+       a length mismatch in either direction (the red team confirmed
+       both). Unreachable today — both call sites pass `Tile::texels()` —
+       but this workspace denies `panic` precisely because a panic loses
+       a professional's unsaved work, and this codebase has already been
+       bitten once by a `copy_from_slice` (the `write_composited` item).
+       `record_content` now refuses and loudly logs anything that is not
+       `aurora_tile::SAMPLES` long, so every stored `Vec` is a whole tile
+       by construction, and `restore_tile` carries a second length check
+       rather than trusting it.
+    8. **The log flood was collapsed at the wrong granularity.** 0.55.0
+       went from one warning per failing *tile* to one per *dab*, but a
+       corrupt tile fails every dab for the rest of a drag: a ~600 px
+       drag across one still emitted ~100 identical lines. `Drag::Brush`/
+       `Drag::Eraser` now carry a per-stroke `warned: HashSet<TileId>`
+       (`unwarned_failures`), so one broken tile costs one line per
+       stroke. It lives on the drag, not on `App`, so its lifetime is
+       exactly the stroke's by construction.
+    9. **Smaller things.** A snapshot rejected for belonging to a
+       different `SurfaceId` now logs `tracing::error!` — it would be a
+       caller bug, and a silent drop leaves a stroke quietly unundoable
+       with no signal. `App::paint_dab`/`erase_dab`'s ~6 lines of
+       `self.drag` variant-matching are extracted to `brush_stroke_mut`/
+       `eraser_stroke_mut` free functions, which are headlessly testable
+       with no `App` (and therefore no GPU) to build.
+       `StrokeSnapshot::captured()` exposes the captured tile set, so the
+       tests proving "the broken tile was never captured" assert it
+       directly instead of inferring it from a later `undo` returning
+       `Ok(true)`. And `undo`'s own test module no longer keeps a
+       byte-identical private copy of the `test_support` fixtures this
+       round introduced.
+
+    **Sixteen new tests across the two rounds.** Ten in
+    `crates/aurora-brush/src/stamp.rs`, over a new shared
+    `crates/aurora-brush/src/test_support.rs` fixture
+    (`store_with_a_broken_tile` — budget 2, three tiles touched, `flush`,
+    then the one resulting scratch file truncated, which is the only
+    portable way to make a `TileStore` read fail on demand from outside
+    `aurora-tile`):
+    `a_dab_spanning_a_broken_tile_still_paints_the_healthy_tile_after_it`,
+    `..._before_it` (the broken tile first, then last, so the fix is not
+    order-dependent in either direction),
+    `a_dab_outcome_tells_total_failure_partial_success_and_a_clean_dab_apart`,
+    `a_dab_entirely_on_a_broken_tile_captures_nothing_and_pushes_no_undo_entry`,
+    `a_partially_failed_dab_records_an_undo_entry_covering_only_the_tiles_it_painted`,
+    `a_dab_on_a_healthy_store_captures_every_tile_it_paints`, the two
+    eraser mirrors
+    (`an_erase_dab_spanning_a_broken_tile_still_erases_the_healthy_tile_after_it`,
+    `a_partially_failed_erase_dab_records_an_undo_entry_covering_only_what_it_erased`),
+    and 0.56.0's own
+    `two_dabs_in_one_stroke_on_one_tile_undo_to_the_state_before_the_first`,
+    `a_dab_that_acquires_a_tile_but_writes_no_texel_paints_and_captures_nothing`,
+    `a_dab_landing_entirely_on_opaque_pixels_paints_and_captures_nothing`,
+    `an_erase_over_already_transparent_pixels_erases_and_captures_nothing`,
+    `a_dab_with_a_non_finite_center_or_radius_touches_nothing`, and
+    `reserving_capacity_for_an_absurd_tile_range_neither_overflows_nor_asks_for_the_moon`.
+    Four more in `crates/aurora-app/src/lib.rs` cover the extracted
+    wiring and the warning dedupe
+    (`a_broken_tile_is_reported_once_per_stroke_not_once_per_dab`).
+
+    The partial-failure undo tests earn their keep through a specific
+    mechanism: `StrokeSnapshot::apply` reads *every* captured tile before
+    writing any (0.52.2's all-or-nothing restructuring), so had the
+    broken tile been captured, `history.undo` would return `Err`. Its
+    returning `Ok(true)` is the actual proof the broken tile was never in
+    the snapshot — and since 0.56.0 those tests also assert the captured
+    set equals `outcome.painted()` outright, so the proof no longer rests
+    on an inference.
+
+    **Confirmed against pre-fix code**, twice. With the 0.55.0 tests in
+    place and only the `continue` reverted to the old early return,
+    **five of the eight fail** — both spanning-dab tests that put the
+    broken tile first, the `DabOutcome` discrimination test, and both
+    partial-failure undo tests — with `painted()` empty where the healthy
+    tile was expected. Three pass pre-fix by design: the `..._before_it`
+    guard (it exists to catch a regression in the *other* direction), and
+    the two healthy-store/total-failure capture tests (which guard the
+    new capture path, not the loop). Note this comparison is against an
+    intermediate build that already had `DabOutcome` and in-dab capture,
+    since the new tests cannot compile against 0.54.0's signature at all.
+
+    Separately, `record_content`'s **`entry().or_insert_with()` —
+    "first capture wins" — had zero coverage**: the red team mutated it
+    to an unconditional `insert` and the entire 1,123-test suite still
+    passed, even though that mutation makes undo restore a multi-dab
+    stroke to *after its first dab* rather than to where it began. The
+    same mutation was re-applied against 0.56.0 and now fails exactly one
+    test, `two_dabs_in_one_stroke_on_one_tile_undo_to_the_state_before_the_first`,
+    on exactly the intended assertion (the first dab's pixels stranded on
+    the canvas after undo).
+
+    **Honest limits.** Everything above is CPU-side and was verified on a
+    Linux dev box; the `aurora-app` tests that exercise the same path are
+    GPU-gated and ran against Mesa llvmpipe software rendering, which
+    CLAUDE.md is explicit is not evidence about real hardware. The
+    latency regression test
+    (`stamp_dab_latency_stays_within_a_generous_ci_safe_budget`) was
+    re-run and still passes well inside its threshold, but it is a
+    software-only number too — and it had **two flaws of its own until
+    0.56.0**: it passed `None` for the snapshot while production always
+    passes `Some`, so the whole-tile `to_vec` a first touch costs was
+    invisible to the only test guarding a budget with under 1 ms of
+    margin; and it re-stamped the identical dab 200 times, which the
+    max-alpha rule turns into 200 dabs that write nothing, so it was
+    timing the skip path rather than the paint path. It now clears the
+    tile before each timed iteration (outside the timed region) and
+    measures both a snapshot-less and a fresh-snapshot-per-dab run
+    against the same threshold. The one true interactive proof —
+    dragging a brush across a document with a genuinely corrupted scratch
+    tile on real hardware and seeing paint land either side of it — still
+    needs a human.
+
+    **Two follow-ups deliberately not attempted here**, both raised by
+    the same review and both disclosed rather than quietly dropped:
+
+    - [ ] **`store_with_a_broken_tile` only supports one broken tile.**
+        The fixture's technique — evict exactly one tile, then truncate
+        the single resulting scratch file — cannot express a dab
+        straddling *two* broken tiles, and that scenario was verified
+        only by a scratch test the red team wrote and deleted, not by a
+        permanent one. `DabOutcome::failed()` is a `Vec` for exactly that
+        case and nothing pins the multi-failure behaviour down.
+        Generalizing the fixture (evict N tiles, corrupt each by name the
+        way `undo`'s own `evicted_tile_file` already does) is a
+        nice-to-have, not a correctness gap in the current fix.
+    - [ ] **A brush stroke can never repaint an already-fully-opaque
+        pixel with a new colour.** `stamp_dab`'s max-alpha accumulation
+        (`if a <= dst_a { continue; }`) is per-dab with no per-stroke
+        reset, so painting red over an area already at alpha 1.0 leaves
+        it red-free: the alpha comparison rejects the write before the
+        colour is ever considered. This is a real product defect, it is
+        **entirely pre-existing** (ported from the spike, unchanged by
+        this round), and it is outside this item's scope. Fixing it
+        properly needs the scratch-layer redesign invariant §7.3.5
+        already describes — a stroke accumulates into its own scratch
+        surface, which is composited onto the layer once at stroke end,
+        so "max alpha within one stroke" stops meaning "max alpha
+        against whatever was already there". That is genuine brush-engine
+        work, not a patch, and it belongs with the brush engine's own
+        milestone.
+
+
+    **Revised again 2026-08-25 (0.57.0)** after the 0.56.0 revision was
+    independently re-verified (all 13 claims verified, gate green, 1,131
+    tests) and then hit with a *second*, fresh red-team pass. That pass
+    found five more real, evidenced defects in the revised code. All five
+    are fixed here; none was rejected as a false positive, and one of
+    them is worse than anything this item started with.
+
+    10. **The central claim of 0.56.0 was false for a trivially
+        reachable input: f16 rounding made "painted" fire on
+        bit-for-bit no-op writes.** Tile storage is `f16` (invariant
+        §7.3.1b) while the dab arithmetic is `f32`, and `stamp_dab`'s
+        gate compared the `f32` falloff `a` against the *already
+        quantized* `dst_a` before writing `f16::from_f32(a)`. Whenever
+        `a` rounds **down** onto the value already stored, the guard
+        passes and the write stores the bytes already there. This is not
+        an edge case: for `aurora-app`'s own 24 px brush, **812 of the
+        1,804 texels a dab writes — 45% of them —** round that way, so
+        clicking the brush twice on the exact same point with the same
+        colour produced a captured tile, a dirtied tile, a recomposite,
+        a `painted()` entry and a full undo entry for a dab that changed
+        nothing. A real, user-visible "Ctrl+Z did nothing", which is
+        precisely the symptom this whole item exists to eliminate.
+        `erase_dab` had the same hole with no change-detection at all
+        beyond `dst_a <= 0.0`: `f16` keeps 11 significand bits, so
+        `dst_a * (1.0 - a)` lands back on the stored bits for every texel
+        past roughly 99.6% of the falloff radius — the outer ~0.4% band —
+        and a dab merely *grazing* a neighbouring tile captured and
+        dirtied it for nothing. Both now compute the value that would
+        actually be **stored** and skip the texel unless it differs from
+        what is there bit-for-bit (`stores_the_same_bits`, `to_bits`
+        rather than `==` so a NaN channel settles instead of
+        re-reporting itself forever). Strictly better than the old gate
+        in both directions: it also stops needless `mark_dirty`/
+        recomposite work for tiles nothing changed in.
+    11. **`record_content`'s own refusal path silently traded a panic
+        for lost undo coverage.** Item 7 above made it refuse a
+        wrong-length slice — and return `()`. The callers had already
+        decided to write by the time they asked: they wrote the texels,
+        set `touched_this_tile`, and pushed the tile onto
+        `outcome.painted()`. So on that path a tile would be painted and
+        reported successful with **no undo entry covering it at all** —
+        strictly worse than the panic it replaced, since a panic at
+        least loses nothing already committed. It now returns
+        `#[must_use] bool`, and `stamp_dab`/`erase_dab` abandon such a
+        tile *before* its first write and report it through
+        `DabOutcome::failed` instead, so `failed`'s own "left completely
+        untouched" contract holds and "captured and painted are the same
+        set" is true by construction on this path too. The error is a
+        new, narrow `TileError::MalformedTile { surface, id, samples,
+        expected }` rather than a borrowed `CorruptFile`: no file is
+        involved — the tile is resident and simply the wrong length in
+        memory — and reporting a scratch-disk corruption that did not
+        happen would send whoever reads the log to the wrong place.
+        Still unreachable from any production path, as both red-team
+        passes concluded; closed because it was cheap to close while
+        this exact code was open.
+    12. **Multi-tile dab failures were suppressed after the first,
+        contradicting `unwarned_failures`' own doc comment.** That
+        function marks *every* fresh failing tile warned as it goes, but
+        both call sites logged only `fresh.first()` plus a count. A dab
+        spans up to four tiles, so one dab across a failing scratch
+        directory marked tiles #2..#n reported while never printing
+        their `TileId`/`TileError` — not on that dab, and never again
+        for the rest of the stroke — against a doc comment that says in
+        so many words "Nothing is dropped — the first failure on each
+        tile is always reported." Both sites now log one line per entry.
+    13. **A finite-but-absurd radius still froze or aborted the
+        process.** Item 6 capped the `Vec::with_capacity` *hint* and
+        nothing else, so the double loop still walked the full tile
+        range however large it was: `radius = 1e6` is a 15-million-tile
+        bounding box (an unbounded freeze on the UI thread, which is
+        where painting happens) and `radius = 1e10` saturates the casts
+        to ~2.8e14 tiles, which `touched_tiles`' own `Vec::with_capacity`
+        then tries to allocate for — an allocation-failure process abort
+        no `Result` and no `catch_unwind` can catch. `is_paintable` now
+        rejects any dab whose true (uncapped) tile span exceeds
+        `MAX_DAB_TILES` = 4,096, logging `error!` and returning an empty
+        `DabOutcome` exactly as the `radius <= 0.0` case does. 4,096
+        tiles is a 16,384 × 16,384 px bounding box — radii to ~8,100 px,
+        better than 3× Photoshop's own largest brush (5,000 px across)
+        and 340× `aurora-app`'s hardcoded 24 px — so it bounds caller
+        bugs, not brushes. Not reachable today, since `BRUSH_RADIUS`/
+        `ERASER_RADIUS` are that constant; live the moment brush size
+        becomes user-configurable, which is named upcoming work.
+    14. **A second pointer press, or the cursor leaving the window,
+        silently destroyed an in-progress stroke's undo snapshot.** The
+        worst of the five, and worse than the phantom entry 0.56.0
+        fixed. `App::handle_pointer_released` was the *only* site that
+        pushed a stroke onto `pixel_history`, but it was never the only
+        way a drag ends: `handle_pointer_pressed` assigned
+        `self.drag = begin_drag(...)` unconditionally, and the
+        `CursorLeft` arm did `self.drag = None` outright. So pressing
+        the middle button to pan mid-stroke, pressing the right button,
+        or dragging the cursor off the window edge — all ordinary
+        gestures — dropped a live `Drag::Brush`/`Drag::Eraser` with its
+        pixels already on the layer and **no undo entry ever pushed for
+        them**. The next `Ctrl+Z` then undid the *previous* stroke: a
+        phantom entry at least did nothing, while this silently
+        mis-targets the undo stack for a real edit. The commit logic is
+        extracted to a free `commit_ending_drag` (plus a thin
+        `App::commit_drag` wrapper) and called from **every** path that
+        ends a drag: the second-press path (on the old drag, before the
+        new one is assigned), the `CursorLeft` arm, and
+        `handle_pointer_released`, which is now a two-line delegation
+        rather than a duplicate. `App::finish_move` moved out to a free
+        `finish_move` alongside it and is reached through the same
+        commit — deliberately, not as extra scope: leaving `Drag::Move`
+        behind would have left the same two paths dropping a completed
+        move's coalesced undo entry with the layer already repositioned
+        on screen. The two document-replacement sites (`open_file`'s
+        flat-image path, `open_aur_file`) still drop the drag
+        uncommitted, which is **correct and now commented**: they
+        replace `pixel_history` wholesale two lines earlier, so an entry
+        pushed there would be discarded immediately — and would name
+        tiles on a surface belonging to a document that is no longer
+        open.
+
+    **Nine more tests (0.57.0), 1,140 in the workspace** (`cargo test
+    --workspace`, up from 1,131). In
+    `crates/aurora-brush/src/stamp.rs`:
+    `a_second_identical_dab_on_the_same_spot_paints_and_captures_nothing`
+    (the double-click repro),
+    `an_erase_that_only_grazes_a_tile_paints_and_captures_nothing_there`
+    (the eraser's outer-falloff band, geometry chosen so the grazed
+    tile's nearest covered texel column sits 23.95 px from the centre of
+    a 24 px dab),
+    `an_absurd_but_finite_radius_is_refused_instead_of_iterated` (which
+    asserts *elapsed time*, because a wrong fix here still returns an
+    empty outcome, just slowly), and
+    `a_large_but_real_radius_is_still_painted` (1,000 px, 40× the app's
+    own brush, still paints — the bound must not reject real work). In
+    `crates/aurora-brush/src/undo.rs`:
+    `record_content_reports_whether_it_actually_captured`. In
+    `crates/aurora-app/src/lib.rs`:
+    `a_dab_failing_on_several_tiles_reports_every_one_of_them_exactly_once`
+    (over a new local `store_with_broken_tiles` fixture that evicts and
+    truncates N tiles, which also closes the first follow-up left open
+    above for the case that mattered),
+    `a_stroke_interrupted_by_a_second_press_becomes_its_own_undo_entry`,
+    `a_stroke_interrupted_by_the_cursor_leaving_becomes_its_own_undo_entry`,
+    and `the_ordinary_release_path_commits_exactly_what_it_always_did`.
+
+    **Confirmed against pre-fix code.** With the 0.57.0 tests in place
+    and *only* the two new bit-equality gates reverted, both f16 tests
+    fail and the other 55 brush tests pass — so they bite on exactly the
+    defect they describe and nothing else. The 45%-of-texels figure in
+    item 10 is a direct count over the falloff curve at `radius = 24`,
+    not an estimate.
+
+    **Honest limit on item 14, disclosed rather than buried.** The three
+    drag-interruption tests exercise `commit_ending_drag` and the exact
+    call sequence each site now runs (`drag.take()`, commit, then
+    `begin_drag` for the press path), but they cannot drive `App`
+    itself: it needs a real window and GPU surface to construct, which
+    is why the whole `Drag` layer is free functions in the first place.
+    That the three call sites are wired to it is verified by reading,
+    not by a headless test. Two adjacent gaps found while implementing
+    it, neither in scope and neither silently dropped:
+
+    - [ ] **Clicking a Layers-panel row mid-stroke changes the active
+        layer without ending the drag.** `handle_pointer_pressed`
+        returns early on that path, so the stroke survives and its
+        eventual release still commits it — no undo entry is lost. But
+        subsequent dabs then paint the *new* active layer's surface
+        while carrying the old layer's snapshot, which
+        `usable_snapshot` refuses (loudly, `tracing::error!`, since
+        0.56.0), leaving those dabs unundoable. Pre-existing, already
+        logged, and a different defect from item 14; it wants a
+        deliberate decision about what a mid-stroke layer change should
+        even mean, not a reflexive `commit_drag` call. **Raised priority
+        2026-08-25** (native judge, 0.57.0 round): this compounds with
+        the next item — alt-tab away mid-stroke leaves the drag live
+        (no `Focused(false)` handling), and clicking back in on a
+        Layers row is an entirely ordinary way to return from a task
+        switch, so the combination is more reachable in practice than
+        either gap looks in isolation.
+    - [ ] **No `WindowEvent::Focused(false)` handling.** Alt-tabbing
+        away mid-stroke leaves the drag live rather than ending it. The
+        undo entry is not lost (the next release still commits it), so
+        this is a feel/robustness question rather than a correctness
+        one.
+
 - [x] **Stale-write race: write jobs carry no sequence number, so a
     completed *old* write can clear a *newer* pending entry and later
     reads silently return pre-edit pixels.** Opened 2026-08-24 by the
@@ -11303,8 +11716,16 @@ world-readable tile scratch directory, and brush strokes dead-zoning at a
 broken tile. All are their own items in M1.9's notes; the scratch
 directory is fixed in 0.53.0 and the stale-write race in 0.54.0 (write
 jobs now carry a generation, and a superseded result is dropped whole at
-both drain sites before its outcome is inspected), leaving the
-brush-stroke dead zone the one still open. See the
+both drain sites before its outcome is inspected), and the brush-stroke
+dead zone in 0.55.0, revised in 0.56.0 after an independent three-way
+review and again in 0.57.0 after a second red-team pass (a dab continues
+past a tile it cannot page in and returns a `DabOutcome` saying which
+tiles it really *changed* — judged against the `f16` values actually
+stored, not the `f32` ones computed — capturing each one's undo content
+from the tile it already holds in the instant before it first writes to
+it, which closes the phantom undo entry on the same path by
+construction; and every path that ends a drag, not only a pointer
+release, now commits the stroke it ends). See the
 now-`[x]` items there for the full account and the tests. The other two
 items from the 0.52.0 review — the dark-halo artefact and the zoom-0.5
 rendering bug — are still open, as is CI's silent self-skipping of

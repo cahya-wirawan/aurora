@@ -205,9 +205,9 @@
 //! into a real, live document for the first time in this project.
 //! **Eraser followed the same day**: the same drag/dab-spacing
 //! machinery, a new `Drag::Eraser` variant alongside `Drag::Brush`, and
-//! `aurora_brush::erase_dab`/`erase_stroke` (subtractive — reduces
-//! existing alpha instead of blending a colour) in place of
-//! `stamp_dab`/`stamp_stroke`; bound to `e`, matching `b` for Brush.
+//! `aurora_brush::erase_dab` (subtractive — reduces existing alpha
+//! instead of blending a colour) in place of `stamp_dab`; bound to `e`,
+//! matching `b` for Brush.
 //! **Active-layer selection followed the brush milestone**:
 //! `aurora_ui::layers_panel`'s own rows are now real, non-zero-sized,
 //! clickable widgets (`aurora_widgets::WidgetTree::hit_test`, new for
@@ -283,10 +283,13 @@
 //! wording, applied to raw pixel data instead of a layer's own scalar
 //! properties) has no home in `aurora_doc::LayerOp`, and `aurora-brush`
 //! can't depend on `aurora-doc` to add one anyway (PRD §7.2's own
-//! layering). `Self::paint_dab`/`Self::erase_dab` now call
-//! `aurora_brush::touched_tiles` before each real write and record the
-//! result into the active `Drag::Brush`/`Drag::Eraser`'s own `stroke`
-//! field; `Self::handle_pointer_released` pushes the completed stroke
+//! layering). `Self::paint_dab`/`Self::erase_dab` hand the active
+//! `Drag::Brush`/`Drag::Eraser`'s own `stroke` field to
+//! `aurora_brush::stamp_dab`/`erase_dab`, which captures each tile as
+//! it acquires it (since 0.55.0 — before that, `App` captured every
+//! tile `aurora_brush::touched_tiles` listed *before* stamping, so a
+//! dab whose paint then failed still left a real but useless undo
+//! entry); `Self::handle_pointer_released` pushes the completed stroke
 //! onto `Self::pixel_history` once the drag ends. `Ctrl+Z`/
 //! `Ctrl+Shift+Z` (`run_command`) checked `pixel_history` first and
 //! fell back to `history` at the time — a real, useful default, but not
@@ -344,8 +347,10 @@
 //! `history`/`undo_order` entirely and calls `LayerTree::set_bounds`
 //! directly, purely for live visual feedback while the pointer is still
 //! down; the actual undo entry is recorded once, retroactively, by a new
-//! `Self::finish_move`, called from `Self::handle_pointer_released` when
-//! the drag ends, via `aurora_doc::History::record_bounds_change` (the
+//! `finish_move`, called (from 0.57.0) through `commit_ending_drag` on
+//! every path that ends a drag rather than only from
+//! `Self::handle_pointer_released`, via
+//! `aurora_doc::History::record_bounds_change` (the
 //! start bounds captured when the drag began, the tree's own current
 //! bounds as the end point) and `UndoOrder::record`, the same coalescing
 //! shape `Self::handle_pointer_released` already used for a completed
@@ -3277,12 +3282,25 @@ enum Drag {
         /// honesty rather than picking an arbitrary placeholder
         /// `SurfaceId`.
         stroke: Option<aurora_brush::StrokeSnapshot>,
+        /// Tiles this stroke has already logged a page-in failure for.
+        ///
+        /// A corrupt tile fails *every* dab for the rest of the drag, so
+        /// collapsing the log to one line per dab (0.55.0) still left a
+        /// ~600 px drag across one broken tile emitting ~100 identical
+        /// warnings. This dedupes across the whole stroke instead: one
+        /// line per broken tile, per stroke. It lives on the drag rather
+        /// than on `App` so its lifetime is exactly the stroke's by
+        /// construction — a new drag cannot inherit a stale set, and no
+        /// caller has to remember to clear it.
+        warned: std::collections::HashSet<aurora_tile::TileId>,
     },
     Eraser {
         last_doc: (f32, f32),
         carry: f32,
         /// Same as `Drag::Brush`'s own `stroke` field, above.
         stroke: Option<aurora_brush::StrokeSnapshot>,
+        /// Same as `Drag::Brush`'s own `warned` field, above.
+        warned: std::collections::HashSet<aurora_tile::TileId>,
     },
     Move {
         layer_id: aurora_doc::LayerId,
@@ -3291,6 +3309,189 @@ enum Drag {
         current_bounds: aurora_core::Rect,
     },
     Eyedropper,
+}
+
+/// The active `Drag::Brush`'s own accumulated stroke snapshot, if there
+/// is one — `None` for any other drag (including a `Drag::Eraser`, which
+/// has its own snapshot and its own accessor), for a `Drag::Brush` that
+/// began with no real active pixel layer to paint into, and for no drag
+/// at all.
+///
+/// A free function over `&mut Option<Drag>` rather than an `&mut self`
+/// method on purpose: [`App::paint_dab`] needs this *and* `self.tile_store`
+/// borrowed at the same time, and a `&mut self` helper would borrow all
+/// of `App`. Extracted in 0.56.0 so the variant-matching itself is
+/// testable headlessly, with no `App` (and therefore no GPU) to build.
+fn brush_stroke_mut(drag: &mut Option<Drag>) -> Option<&mut aurora_brush::StrokeSnapshot> {
+    match drag {
+        Some(Drag::Brush { stroke, .. }) => stroke.as_mut(),
+        _ => None,
+    }
+}
+
+/// [`brush_stroke_mut`]'s eraser counterpart, on exactly the same terms:
+/// a `Drag::Eraser`'s own snapshot only, never a `Drag::Brush`'s.
+fn eraser_stroke_mut(drag: &mut Option<Drag>) -> Option<&mut aurora_brush::StrokeSnapshot> {
+    match drag {
+        Some(Drag::Eraser { stroke, .. }) => stroke.as_mut(),
+        _ => None,
+    }
+}
+
+/// The failures in `outcome` this stroke hasn't already logged, marking
+/// each one logged as it goes — so one permanently broken tile costs one
+/// warning per stroke rather than one per dab.
+///
+/// 0.55.0 collapsed the log from one line per failing *tile* to one per
+/// *dab*, which is not where the flood actually comes from: a corrupt
+/// tile fails every dab for the rest of the drag, so a ~600 px drag
+/// across one still emitted ~100 identical lines. Nothing is dropped —
+/// the *first* failure on each tile is always reported, and a second
+/// broken tile later in the same stroke gets its own line.
+///
+/// Allocates nothing on the overwhelmingly common path (a dab that
+/// failed on no tile at all returns an empty `Vec`, which does not
+/// allocate).
+fn unwarned_failures<'a>(
+    drag: &mut Option<Drag>,
+    outcome: &'a aurora_brush::DabOutcome,
+) -> Vec<(aurora_tile::TileId, &'a aurora_tile::TileError)> {
+    if outcome.is_complete() {
+        return Vec::new();
+    }
+    let all = || {
+        outcome
+            .failed()
+            .iter()
+            .map(|(tile, err)| (*tile, err))
+            .collect()
+    };
+    let Some(Drag::Brush { warned, .. } | Drag::Eraser { warned, .. }) = drag else {
+        // No stroke to remember them in. Unreachable in practice (only
+        // a brush/eraser drag reaches a dab at all), but under-reporting
+        // a scratch-disk failure is the wrong way to be wrong about it.
+        return all();
+    };
+    outcome
+        .failed()
+        .iter()
+        .filter(|(tile, _)| warned.insert(*tile))
+        .map(|(tile, err)| (*tile, err))
+        .collect()
+}
+
+/// Records a completed `Drag::Move` as a single undo step, from
+/// `start_bounds` to wherever `layer_id` actually ended up — already
+/// applied, live, by every [`App::apply_move`] call during the drag —
+/// via `aurora_doc::History::record_bounds_change`, which journals the
+/// move without re-applying it (the tree already reflects it). Called
+/// once, from [`commit_ending_drag`], when the drag that just ended was
+/// a `Drag::Move`.
+///
+/// A no-op if the layer never actually ended up anywhere different
+/// (`start_bounds` still matches its current bounds — e.g. a click that
+/// started and ended a drag with no real pointer movement, or `layer_id`
+/// no longer exists at all): nothing for a later undo to meaningfully
+/// reverse. A real, logged failure otherwise is worth a warning, the
+/// same discipline [`App::apply_move`] already uses.
+///
+/// A free function over the four pieces of state it actually needs
+/// rather than an `&mut self` method (0.57.0), for the same reason
+/// [`brush_stroke_mut`] is one: it makes the behaviour testable without
+/// an `App`, which needs a real window and GPU surface to construct.
+fn finish_move(
+    layers: &aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+    layer_id: aurora_doc::LayerId,
+    start_bounds: aurora_core::Rect,
+) {
+    if layers.bounds(layer_id) == Some(start_bounds) {
+        return;
+    }
+    match history.record_bounds_change(layers, layer_id, start_bounds) {
+        Ok(()) => undo_order.record(UndoKind::Structural, history, pixel_history),
+        Err(err) => tracing::warn!(?err, "failed to record the completed move"),
+    }
+}
+
+/// Commits a drag that is ending — for whatever reason — into the undo
+/// state its own kind belongs in: a `Drag::Brush`/`Drag::Eraser`
+/// carrying a real `stroke` becomes a `PixelHistory` entry (and, if
+/// `PixelHistory::push` reports it recorded something, an entry in
+/// `undo_order`'s own unified sequence); a `Drag::Move` is coalesced
+/// into one structural entry by [`finish_move`]. Every other variant,
+/// and `None`, is a no-op — a pan, a marquee, an eyedropper sample and
+/// "no drag at all" have nothing to commit.
+///
+/// **The only place a stroke becomes undoable, and it is called from
+/// every path that ends one** (0.57.0). This logic used to live inside
+/// [`App::handle_pointer_released`], which is not the only way a drag
+/// ends: [`App::handle_pointer_pressed`] overwrote `App::drag`
+/// unconditionally, and the `CursorLeft` handler cleared it outright.
+/// So pressing the middle button to pan mid-stroke, pressing the right
+/// button mid-stroke, or simply dragging the cursor off the window edge
+/// — all routine gestures — dropped a live `Drag::Brush` whose pixels
+/// were already on the layer, and no undo entry was ever pushed for
+/// them. The next `Ctrl+Z` then undid the *previous* stroke: strictly
+/// worse than the phantom entry 0.56.0 removed, because a phantom entry
+/// at least did nothing, while this silently mis-targeted a real edit.
+///
+/// `Drag::Move` is handled here too, not only in the release path. It
+/// is the same extraction, not extra scope: leaving it behind would
+/// have left `handle_pointer_pressed` and `CursorLeft` dropping a live
+/// `Drag::Move`'s coalesced undo entry in exactly the way this function
+/// exists to stop, with the layer already repositioned on screen.
+///
+/// The two document-replacement sites (`App::open_file`'s flat-image
+/// path and `App::open_aur_file`) deliberately do *not* call this. They
+/// clear `drag` as part of replacing `layers`/`history`/`pixel_history`
+/// wholesale with the newly opened document's own; committing the
+/// outgoing stroke there would push an entry onto a `PixelHistory` that
+/// is discarded two lines later, and — worse — one whose captured tiles
+/// name a surface belonging to a document that is no longer open.
+/// Dropping it is correct there, and it is the only place dropping one
+/// is.
+fn commit_ending_drag(
+    drag: Option<Drag>,
+    layers: &aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+) {
+    match drag {
+        Some(
+            Drag::Brush {
+                stroke: Some(stroke),
+                ..
+            }
+            | Drag::Eraser {
+                stroke: Some(stroke),
+                ..
+            },
+        ) => {
+            // `push`'s own `bool` is what tells "a real stroke happened"
+            // apart from "a click that never touched a tile" without
+            // asking the snapshot itself.
+            if pixel_history.push(stroke) {
+                undo_order.record(UndoKind::Pixel, history, pixel_history);
+            }
+        }
+        Some(Drag::Move {
+            layer_id,
+            start_bounds,
+            ..
+        }) => finish_move(
+            layers,
+            history,
+            pixel_history,
+            undo_order,
+            layer_id,
+            start_bounds,
+        ),
+        _ => {}
+    }
 }
 
 /// Starts a drag for `tool`/`button` at `canvas_point` (already
@@ -3336,12 +3537,14 @@ fn begin_drag(
             carry: 0.0,
             stroke: active_pixel_layer
                 .map(|(id, _)| aurora_brush::StrokeSnapshot::new(surface_id_for(id))),
+            warned: std::collections::HashSet::new(),
         }),
         (aurora_ui::Tool::Eraser, PointerButton::Primary) => Some(Drag::Eraser {
             last_doc: view.to_document(canvas_point),
             carry: 0.0,
             stroke: active_pixel_layer
                 .map(|(id, _)| aurora_brush::StrokeSnapshot::new(surface_id_for(id))),
+            warned: std::collections::HashSet::new(),
         }),
         (aurora_ui::Tool::Move, PointerButton::Primary) => {
             let (layer_id, bounds) = active_pixel_layer?;
@@ -3560,13 +3763,13 @@ fn handle_zoom_tool_click(
 // -- live tile store, and a way to pick which layer is active --
 //
 // PLAN.md M1.9's "basic brush and eraser" bullet, picking up exactly
-// where `aurora_brush::stamp_dab`/`stamp_stroke` (ADR 0010) left off:
+// where `aurora_brush::stamp_dab` (ADR 0010) left off:
 // this crate's first *live* document (`App::layers`, kept alive instead
 // of being discarded after populating the panels, as it was through
 // M1.8/M1.9 until now) and first real `aurora_tile::TileStore`. Eraser
 // (`App::erase_dab`, `Drag::Eraser`) reuses that same live store and
-// active layer, calling `aurora_brush::erase_dab`/`erase_stroke` instead
-// of `stamp_dab`/`stamp_stroke` -- the bullet's other named half, now
+// active layer, calling `aurora_brush::erase_dab` instead of
+// `stamp_dab` -- the bullet's other named half, now
 // closed. `select_layer` closes the layer-selection half: `active_layer`
 // no longer just defaults to the topmost pixel layer and stays there
 // forever -- a real click on a real, clickable Layers-panel row
@@ -5510,10 +5713,10 @@ fn recomposite_visible_tiles(
 /// origin every `TileId` is measured from, shifting every tile's own
 /// meaning at once). [`Self::invalidate`] is the precise counterpart: a
 /// brush/eraser dab (`App::paint_dab`/`App::erase_dab`) knows exactly
-/// which tiles it touched (`aurora_brush::touched_tiles`, in the same
-/// document-space-relative-to-the-active-layer's-own-origin frame
-/// `reference_origin` already uses — see those functions' own call
-/// sites) and invalidates only those, since a full bump on every dab of
+/// which tiles it really wrote (`aurora_brush::DabOutcome::painted`, in
+/// the same document-space-relative-to-the-active-layer's-own-origin
+/// frame `reference_origin` already uses — see those functions' own
+/// call sites) and invalidates only those, since a full bump on every dab of
 /// a stroke would mean recompositing the *entire* visible grid on every
 /// dab rather than just the tile(s) the dab actually changed.
 ///
@@ -5556,8 +5759,9 @@ impl CompositeCache {
     /// Invalidates just `id`, leaving every other cached tile untouched —
     /// the single-tile analog of [`Self::bump`], for a caller that knows
     /// precisely which tile(s) an edit actually touched (a brush/eraser
-    /// dab, via `aurora_brush::touched_tiles`) rather than needing to
-    /// distrust the whole cache. Safe to call with an `id` that isn't
+    /// dab, via `aurora_brush::DabOutcome::painted` — what the dab
+    /// really wrote, not merely what its bounding box covered) rather
+    /// than needing to distrust the whole cache. Safe to call with an `id` that isn't
     /// currently cached at all — `HashSet::remove` is a no-op then.
     fn invalidate(&mut self, id: aurora_tile::TileId) {
         self.current.remove(&id);
@@ -6954,6 +7158,12 @@ impl App {
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
         self.selection = aurora_doc::SelectionSet::new();
+        // Dropped, deliberately not committed through `commit_drag`:
+        // `pixel_history` was replaced wholesale a few lines up, so an
+        // entry pushed here would be discarded immediately -- and it
+        // would capture tiles on a surface belonging to a document that
+        // is no longer open. This is the one place dropping a live drag
+        // is right; see `commit_ending_drag`.
         self.drag = None;
         self.push_accessibility();
     }
@@ -7037,6 +7247,12 @@ impl App {
         self.layer_rows = layer_rows;
         self.canvas_view = aurora_ui::CanvasView::default();
         self.selection = aurora_doc::SelectionSet::new();
+        // Dropped, deliberately not committed through `commit_drag`:
+        // `pixel_history` was replaced wholesale a few lines up, so an
+        // entry pushed here would be discarded immediately -- and it
+        // would capture tiles on a surface belonging to a document that
+        // is no longer open. This is the one place dropping a live drag
+        // is right; see `commit_ending_drag`.
         self.drag = None;
         self.push_accessibility();
     }
@@ -7377,6 +7593,15 @@ impl App {
             );
             return;
         }
+        // A second press while a drag is still in progress -- the middle
+        // button to pan mid-stroke, the right button, a stylus barrel
+        // button -- ends that drag as surely as a release does, and the
+        // assignment below is about to drop it. Commit it first, or the
+        // pixels it already painted stay on the layer with no undo entry
+        // naming them and the next Ctrl+Z reaches past them into the
+        // previous stroke (`commit_ending_drag`).
+        let interrupted = self.drag.take();
+        self.commit_drag(interrupted);
         self.drag = begin_drag(
             self.tool,
             button,
@@ -7413,16 +7638,37 @@ impl App {
     /// e.g. the scratch disk failing mid-session) is worth a warning,
     /// though, unlike those absent-precondition cases.
     ///
-    /// Before the real write, captures every tile this dab is about to
-    /// touch ([`aurora_brush::touched_tiles`]) into the active
-    /// `Drag::Brush`'s own `stroke` snapshot
-    /// ([`aurora_brush::StrokeSnapshot::record_touch`]), if there is
-    /// one — the pixel-edit half of `Self::history`'s own Undo/Redo,
-    /// closed by [`Self::handle_pointer_released`] once the stroke
-    /// completes. A no-op for that half specifically (still paints)
-    /// when `self.drag` isn't actually a `Drag::Brush` with a real
-    /// `stroke` — shouldn't happen given how this is always called, but
-    /// this doesn't assume it.
+    /// The active `Drag::Brush`'s own `stroke` snapshot, if there is
+    /// one ([`brush_stroke_mut`]), is handed *to*
+    /// [`aurora_brush::stamp_dab`] rather than filled in beforehand —
+    /// the pixel-edit half of `Self::history`'s own Undo/Redo, closed by
+    /// [`Self::handle_pointer_released`] once the stroke completes. A
+    /// no-op for that half specifically (still paints) when `self.drag`
+    /// isn't actually a `Drag::Brush` with a real `stroke` — shouldn't
+    /// happen given how this is always called, but this doesn't assume
+    /// it.
+    ///
+    /// **Capture happens inside the dab now, not before it** (0.55.0).
+    /// This used to call [`aurora_brush::touched_tiles`] first and
+    /// [`aurora_brush::StrokeSnapshot::record_touch`] on every listed
+    /// tile, *then* stamp. A stroke whose paint subsequently failed
+    /// therefore still got a captured snapshot and a real — but
+    /// useless — undo entry, covering pixels nothing had changed.
+    /// `stamp_dab` now captures each tile in the instant before it first
+    /// writes to that tile
+    /// ([`aurora_brush::StrokeSnapshot::record_content`]), so captured
+    /// and painted are the same set — and, since 0.56.0, that set
+    /// excludes a tile the dab acquired but then changed nothing in, so
+    /// neither an undo entry nor the invalidation loop below names a
+    /// tile that still looks exactly as it did. The loop walks
+    /// [`aurora_brush::DabOutcome::painted`] — what the dab really
+    /// wrote — instead of what it merely aimed at.
+    ///
+    /// **One warning per broken tile per stroke** (0.56.0), via
+    /// [`unwarned_failures`]: a permanently corrupt tile fails every dab
+    /// for the rest of the drag, and 0.55.0's own one-line-per-dab
+    /// collapse still left a long drag across one emitting ~100
+    /// identical lines.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
         let Some(layer_id) = self.active_layer else {
             return;
@@ -7438,33 +7684,51 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
-        let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
-        if let Some(Drag::Brush {
-            stroke: Some(stroke),
-            ..
-        }) = self.drag.as_mut()
-        {
-            for &tile in &touched {
-                if let Err(err) = stroke.record_touch(store, tile) {
-                    tracing::warn!(?err, ?tile, "failed to capture a pixel-undo snapshot");
-                }
-            }
-        }
-        if let Err(err) =
-            aurora_brush::stamp_dab(store, surface, local, BRUSH_RADIUS, self.current_colour)
-        {
-            tracing::warn!(?err, "failed to stamp a brush dab");
-        }
-        for tile in touched {
+        // Both borrows are of distinct fields of `self`, so they
+        // coexist. This is why the accessor is a free function over
+        // `&mut Option<Drag>` and not a `&mut self` helper method: that
+        // would borrow all of `self` and conflict with `self.tile_store`
+        // above.
+        let snapshot = brush_stroke_mut(&mut self.drag);
+        let outcome = aurora_brush::stamp_dab(
+            store,
+            surface,
+            local,
+            BRUSH_RADIUS,
+            self.current_colour,
+            snapshot,
+        );
+        for &tile in outcome.painted() {
             self.composite_cache.invalidate(tile);
+        }
+        // One line per broken tile per *stroke*, not per dab and not per
+        // tile per dab -- see `unwarned_failures`. Every fresh failure
+        // gets its own line (0.57.0): a radius-24 dab spans up to four
+        // tiles, and logging only `fresh.first()` marked tiles #2..#n
+        // warned while never printing their own `TileId`/`TileError` --
+        // not on this dab, and never again for the rest of the stroke,
+        // flatly contradicting `unwarned_failures`' own promise that
+        // the first failure on each tile is always reported.
+        let fresh = unwarned_failures(&mut self.drag, &outcome);
+        for (tile, err) in &fresh {
+            tracing::warn!(
+                ?err,
+                ?tile,
+                first_failures = fresh.len(),
+                failed = outcome.failed().len(),
+                painted = outcome.painted().len(),
+                "failed to stamp part of a brush dab"
+            );
         }
     }
 
     /// Erases one dab at `doc_point` (document space) from the active
     /// layer's own surface in the live tile store — `aurora_brush::erase_dab`,
     /// [`Self::paint_dab`]'s subtractive counterpart, sharing every one
-    /// of its preconditions, silent-no-op cases, and undo-snapshot
-    /// capture (against `Drag::Eraser`'s own `stroke` field instead).
+    /// of its preconditions, silent-no-op cases, partial-failure
+    /// reporting, per-stroke warning dedupe, and in-dab undo-snapshot
+    /// capture (against `Drag::Eraser`'s own `stroke` field instead,
+    /// via [`eraser_stroke_mut`]).
     fn erase_dab(&mut self, doc_point: (f32, f32)) {
         let Some(layer_id) = self.active_layer else {
             return;
@@ -7480,23 +7744,24 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
-        let touched = aurora_brush::touched_tiles(local, ERASER_RADIUS);
-        if let Some(Drag::Eraser {
-            stroke: Some(stroke),
-            ..
-        }) = self.drag.as_mut()
-        {
-            for &tile in &touched {
-                if let Err(err) = stroke.record_touch(store, tile) {
-                    tracing::warn!(?err, ?tile, "failed to capture a pixel-undo snapshot");
-                }
-            }
-        }
-        if let Err(err) = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS) {
-            tracing::warn!(?err, "failed to erase a dab");
-        }
-        for tile in touched {
+        // Same distinct-field borrow pair `Self::paint_dab` relies on.
+        let snapshot = eraser_stroke_mut(&mut self.drag);
+        let outcome = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS, snapshot);
+        for &tile in outcome.painted() {
             self.composite_cache.invalidate(tile);
+        }
+        // One line per broken tile per stroke, every one of them --
+        // `Self::paint_dab`'s own reasoning, mirrored.
+        let fresh = unwarned_failures(&mut self.drag, &outcome);
+        for (tile, err) in &fresh {
+            tracing::warn!(
+                ?err,
+                ?tile,
+                first_failures = fresh.len(),
+                failed = outcome.failed().len(),
+                painted = outcome.painted().len(),
+                "failed to erase part of a dab"
+            );
         }
     }
 
@@ -7507,7 +7772,7 @@ impl App {
     /// ([`Self::handle_pointer_moved`]), for live visual feedback only.
     /// Deliberately bypasses `self.history`/`self.undo_order` — the
     /// whole point of coalescing a drag into one undo step
-    /// ([`Self::finish_move`]) is *not* recording an entry for every
+    /// ([`finish_move`]) is *not* recording an entry for every
     /// intermediate position a fast drag passes through. A real, logged
     /// failure (an unknown or non-pixel `layer_id`) shouldn't happen in
     /// practice — `layer_id` always comes from `Drag::Move` itself, set
@@ -7524,37 +7789,20 @@ impl App {
         self.composite_cache.bump();
     }
 
-    /// Records a completed `Drag::Move` as a single undo step, from
-    /// `start_bounds` to wherever `layer_id` actually ended up — already
-    /// applied, live, by every [`Self::apply_move`] call during the drag
-    /// — via `aurora_doc::History::record_bounds_change`, which journals
-    /// the move without re-applying it (the tree already reflects it).
-    /// Called once, from [`Self::handle_pointer_released`], when the
-    /// drag that just ended was a `Drag::Move`.
-    ///
-    /// A no-op if the layer never actually ended up anywhere different
-    /// (`start_bounds` still matches its current bounds — e.g. a click
-    /// that started and ended a drag with no real pointer movement, or
-    /// `layer_id` no longer exists at all): nothing for a later undo to
-    /// meaningfully reverse. A real, logged failure otherwise is worth a
-    /// warning, the same discipline [`Self::apply_move`] already uses.
-    fn finish_move(&mut self, layer_id: aurora_doc::LayerId, start_bounds: aurora_core::Rect) {
-        if self.layers.bounds(layer_id) == Some(start_bounds) {
-            return;
-        }
-        match self
-            .history
-            .record_bounds_change(&self.layers, layer_id, start_bounds)
-        {
-            Ok(()) => {
-                self.undo_order.record(
-                    UndoKind::Structural,
-                    &mut self.history,
-                    &mut self.pixel_history,
-                );
-            }
-            Err(err) => tracing::warn!(?err, "failed to record the completed move"),
-        }
+    /// Commits `drag`, whatever it turns out to be, into this
+    /// application's own undo state — [`commit_ending_drag`] against
+    /// `App`'s own fields. A `&mut self` wrapper so every call site can
+    /// spell it `self.commit_drag(self.drag.take())`; the real logic is
+    /// the free function, which needs no `App` (and therefore no GPU
+    /// adapter) to test.
+    fn commit_drag(&mut self, drag: Option<Drag>) {
+        commit_ending_drag(
+            drag,
+            &self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.undo_order,
+        );
     }
 
     /// Samples the live, **composited** document at `doc_point` (document
@@ -7619,51 +7867,25 @@ impl App {
     /// which button a drag actually started with, and a single active
     /// window only ever has one drag in progress at a time.
     ///
-    /// If the ending drag was a `Drag::Brush`/`Drag::Eraser` with a real
-    /// `stroke`, pushes it onto [`Self::pixel_history`] and, if that
-    /// actually recorded something, into [`Self::undo_order`] too — a
-    /// completed stroke becomes a real, `Ctrl+Z`-undoable step in the
-    /// unified order. `PixelHistory::push`'s own `bool` return (`false`
-    /// for an empty snapshot) is exactly what lets this tell "a real
-    /// stroke happened" apart from "a click/drag that never actually
-    /// touched a tile" (e.g. a zero-radius brush, or no active layer at
-    /// all) without checking `stroke.is_empty()` itself. If the ending
-    /// drag was a `Drag::Move`, [`Self::finish_move`] records the whole
-    /// gesture as one coalesced undo step, from wherever it started.
+    /// Whatever the ending drag turns out to be, committing it is
+    /// [`commit_ending_drag`]'s job, not this method's (0.57.0): a
+    /// `Drag::Brush`/`Drag::Eraser` with a real `stroke` becomes a
+    /// `Ctrl+Z`-undoable step in the unified order, a `Drag::Move` is
+    /// coalesced into one structural entry, everything else is a no-op.
+    /// **This is no longer the only path that ends a drag** — a second
+    /// pointer press and `CursorLeft` end one too, and used to end it by
+    /// silently dropping a live stroke's whole undo entry; see
+    /// [`commit_ending_drag`] for the bug that shape caused and why the
+    /// commit now lives in one shared place.
+    ///
     /// Also ends any in-progress rail resize ([`RailResize`]) — nothing
     /// further to record for that one; `aurora_ui::set_rail_width` has
     /// already applied every intermediate width live, on each move
     /// event, not just the final one.
     fn handle_pointer_released(&mut self) {
         self.rail_resize = None;
-        match self.drag.take() {
-            Some(
-                Drag::Brush {
-                    stroke: Some(stroke),
-                    ..
-                }
-                | Drag::Eraser {
-                    stroke: Some(stroke),
-                    ..
-                },
-            ) => {
-                if self.pixel_history.push(stroke) {
-                    self.undo_order.record(
-                        UndoKind::Pixel,
-                        &mut self.history,
-                        &mut self.pixel_history,
-                    );
-                }
-            }
-            Some(Drag::Move {
-                layer_id,
-                start_bounds,
-                ..
-            }) => {
-                self.finish_move(layer_id, start_bounds);
-            }
-            _ => {}
-        }
+        let ending = self.drag.take();
+        self.commit_drag(ending);
     }
 
     /// A real `WindowEvent::MouseWheel`: zooms around the pointer's last
@@ -8218,7 +8440,12 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_position = None;
-                self.drag = None;
+                // Dragging off the window edge ends the drag, and used
+                // to end it by simply dropping it -- losing a live
+                // stroke's whole undo entry along with it. Commit it the
+                // same way a release would (`commit_ending_drag`).
+                let interrupted = self.drag.take();
+                self.commit_drag(interrupted);
             }
             _ => {}
         }
@@ -8372,22 +8599,23 @@ mod tests {
         Key, KeyChord, Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
         ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, apply_mask_clip,
         apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
-        begin_drag, canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, collect_widget_paints, composite_document,
+        begin_drag, brush_stroke_mut, canvas_area_physical_rect, canvas_area_physical_size,
+        canvas_local_origin, clean_shutdown_cleanup, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, collect_widget_paints, commit_ending_drag, composite_document,
         composite_surface_id, continue_drag, crash_recovery_dialog_message,
         create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
         document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eyedropper_sample, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, partial_autosave_path, pointer_in_canvas, pointer_on_rail_divider,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, resized_rail_width, resolve_tile, run_command, sample_pixel,
-        select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
+        effective_residency_zoom, eraser_stroke_mut, eyedropper_sample, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, is_aur_path, layer_local_point, load_scales, load_theme,
+        logical_point, logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
+        open_tile_store, palette_commands, partial_autosave_path, pointer_in_canvas,
+        pointer_on_rail_divider, previous_session_left_a_marker, recomposite_visible_tiles,
+        recover_document, replace_document, resized_rail_width, resolve_tile, run_command,
+        sample_pixel, select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
         topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -9397,7 +9625,7 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert_eq!(layers.bounds(id), Some(moved));
-        // Simulates what `App::finish_move` itself does after a
+        // Simulates what `finish_move` itself does after a
         // successful `history.record_bounds_change` call, since this
         // test drives `history` directly rather than through `App`.
         let mut undo_order = UndoOrder::default();
@@ -15372,9 +15600,11 @@ mod tests {
     // that `App::paint_dab`/`App::erase_dab` now use instead of a full
     // `bump()` on every dab. `App` itself can't be constructed headlessly
     // (it needs a real `winit` window), so these tests replicate the
-    // exact sequence those two methods run -- `aurora_brush::touched_tiles`
-    // computed once, `aurora_brush::stamp_dab`, then `cache.invalidate`
-    // per touched tile -- directly against a real `TileStore` and a real
+    // exact sequence those two methods run -- `aurora_brush::stamp_dab`,
+    // then `cache.invalidate` per tile in its returned
+    // `aurora_brush::DabOutcome::painted` (they keep a
+    // `aurora_brush::touched_tiles` assertion alongside it only to state
+    // the geometry each dab is aimed at) -- directly against a real `TileStore` and a real
     // `CompositeCache`, the same technique `measure_pan_and_paint_frames`
     // above already uses to exercise `App::redraw`'s own frame loop
     // without a real `App`.
@@ -15469,12 +15699,19 @@ mod tests {
             vec![aurora_tile::TileId { x: 0, y: 0 }],
             "setup: this dab must touch exactly tile (0, 0)"
         );
-        if let Err(err) =
-            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
-        {
-            unreachable!("{err:?}");
-        }
-        for tile in touched {
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            local,
+            BRUSH_RADIUS,
+            [0.8, 0.1, 0.05],
+            None,
+        );
+        assert!(
+            outcome.is_complete(),
+            "a healthy store must paint every tile this dab covers"
+        );
+        for &tile in outcome.painted() {
             cache.invalidate(tile);
         }
 
@@ -15505,13 +15742,24 @@ mod tests {
         };
 
         let local = (50.0, 50.0);
-        let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
-        if let Err(err) =
-            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
-        {
-            unreachable!("{err:?}");
-        }
-        for &tile in &touched {
+        assert_eq!(
+            aurora_brush::touched_tiles(local, BRUSH_RADIUS),
+            vec![aurora_tile::TileId { x: 0, y: 0 }],
+            "setup: this dab must be aimed at exactly tile (0, 0)"
+        );
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            local,
+            BRUSH_RADIUS,
+            [0.8, 0.1, 0.05],
+            None,
+        );
+        assert!(
+            outcome.is_complete(),
+            "a healthy store must paint every tile this dab covers"
+        );
+        for &tile in outcome.painted() {
             cache.invalidate(tile);
         }
 
@@ -15608,12 +15856,19 @@ mod tests {
             ]),
             "setup: a corner dab must touch all four visible tiles"
         );
-        if let Err(err) =
-            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
-        {
-            unreachable!("{err:?}");
-        }
-        for tile in touched {
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            local,
+            BRUSH_RADIUS,
+            [0.8, 0.1, 0.05],
+            None,
+        );
+        assert!(
+            outcome.is_complete(),
+            "a healthy store must paint every tile this dab covers"
+        );
+        for &tile in outcome.painted() {
             cache.invalidate(tile);
         }
 
@@ -15648,12 +15903,19 @@ mod tests {
                 vec![aurora_tile::TileId { x: 0, y: 0 }],
                 "setup: every dab in this stroke must stay within tile (0, 0)"
             );
-            if let Err(err) =
-                aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
-            {
-                unreachable!("{err:?}");
-            }
-            for tile in touched {
+            let outcome = aurora_brush::stamp_dab(
+                &mut store,
+                surface,
+                local,
+                BRUSH_RADIUS,
+                [0.8, 0.1, 0.05],
+                None,
+            );
+            assert!(
+                outcome.is_complete(),
+                "a healthy store must paint every tile this dab covers"
+            );
+            for &tile in outcome.painted() {
                 cache.invalidate(tile);
             }
         }
@@ -16399,14 +16661,21 @@ mod tests {
             // budget or a `flush()` call this loop's real counterpart
             // (`App::redraw`) never makes either.
             let dab_center = (x as f32 + 300.0, y as f32 + 300.0);
-            if let Err(err) = aurora_brush::stamp_dab(
+            let outcome = aurora_brush::stamp_dab(
                 store,
                 surface,
                 dab_center,
                 BRUSH_RADIUS,
                 [0.95, 0.62, 0.25],
-            ) {
-                tracing::warn!(?err, "failed to stamp a brush dab this frame");
+                None,
+            );
+            if let Some(err) = outcome.first_error() {
+                tracing::warn!(
+                    ?err,
+                    failed = outcome.failed().len(),
+                    painted = outcome.painted().len(),
+                    "failed to stamp part of a brush dab this frame"
+                );
             }
             cache.bump();
 
@@ -16795,11 +17064,18 @@ mod tests {
     fn sample_pixel_reads_back_a_real_stamped_dab() {
         let (_dir, mut store) = real_tile_store();
         let surface = aurora_tile::SurfaceId::from_raw(0);
-        if let Err(err) =
-            aurora_brush::stamp_dab(&mut store, surface, (10.5, 10.5), 20.0, [1.0, 0.0, 0.0])
-        {
-            unreachable!("{err:?}");
-        }
+        assert!(
+            aurora_brush::stamp_dab(
+                &mut store,
+                surface,
+                (10.5, 10.5),
+                20.0,
+                [1.0, 0.0, 0.0],
+                None
+            )
+            .is_complete(),
+            "a healthy store must paint every tile this dab covers"
+        );
         let Some([r, g, b, a]) = sample_pixel(&mut store, surface, (10.5, 10.5)) else {
             unreachable!("a dab was just stamped exactly here");
         };
@@ -18276,12 +18552,17 @@ mod tests {
                 last_doc,
                 carry,
                 stroke,
+                warned,
             }) => {
                 assert_eq!(last_doc, (10.0, 20.0));
                 assert_eq!(carry, 0.0);
                 assert!(
                     stroke.is_none(),
                     "no active pixel layer means nothing to snapshot"
+                );
+                assert!(
+                    warned.is_empty(),
+                    "a fresh stroke has warned about nothing yet"
                 );
             }
             other => unreachable!("{other:?}"),
@@ -18303,6 +18584,7 @@ mod tests {
                 last_doc,
                 carry,
                 stroke,
+                warned,
             }) => {
                 assert_eq!(last_doc, (10.0, 20.0));
                 assert_eq!(carry, 0.0);
@@ -18310,9 +18592,656 @@ mod tests {
                     stroke.is_none(),
                     "no active pixel layer means nothing to snapshot"
                 );
+                assert!(
+                    warned.is_empty(),
+                    "a fresh stroke has warned about nothing yet"
+                );
             }
             other => unreachable!("{other:?}"),
         }
+    }
+
+    /// A `Drag::Brush` for a real active pixel layer, and the two
+    /// accessors that pull its snapshot out. Headless by construction:
+    /// `Drag` is a plain enum, so none of this needs an `App` (and
+    /// therefore no GPU adapter) to exercise.
+    fn brush_drag_with_a_stroke() -> Drag {
+        Drag::Brush {
+            last_doc: (0.0, 0.0),
+            carry: 0.0,
+            stroke: Some(aurora_brush::StrokeSnapshot::new(
+                aurora_tile::SurfaceId::from_raw(7),
+            )),
+            warned: std::collections::HashSet::new(),
+        }
+    }
+
+    fn eraser_drag_with_a_stroke() -> Drag {
+        Drag::Eraser {
+            last_doc: (0.0, 0.0),
+            carry: 0.0,
+            stroke: Some(aurora_brush::StrokeSnapshot::new(
+                aurora_tile::SurfaceId::from_raw(7),
+            )),
+            warned: std::collections::HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn brush_stroke_mut_finds_an_active_brush_strokes_own_snapshot() {
+        let mut drag = Some(brush_drag_with_a_stroke());
+        let Some(stroke) = brush_stroke_mut(&mut drag) else {
+            unreachable!("a Drag::Brush carrying a real stroke must yield it");
+        };
+        assert_eq!(stroke.surface(), aurora_tile::SurfaceId::from_raw(7));
+        assert!(
+            brush_stroke_mut(&mut Some(Drag::Brush {
+                last_doc: (0.0, 0.0),
+                carry: 0.0,
+                stroke: None,
+                warned: std::collections::HashSet::new(),
+            }))
+            .is_none(),
+            "a brush drag that began with no active pixel layer has no snapshot to find"
+        );
+    }
+
+    #[test]
+    fn the_two_stroke_accessors_never_cross_tools() {
+        let mut eraser = Some(eraser_drag_with_a_stroke());
+        assert!(
+            brush_stroke_mut(&mut eraser).is_none(),
+            "an eraser stroke must never be handed to `stamp_dab` -- it would capture the \
+             right tiles for the wrong operation"
+        );
+        assert!(eraser_stroke_mut(&mut eraser).is_some());
+
+        let mut brush = Some(brush_drag_with_a_stroke());
+        assert!(
+            eraser_stroke_mut(&mut brush).is_none(),
+            "and the mirror of the same"
+        );
+        assert!(brush_stroke_mut(&mut brush).is_some());
+    }
+
+    #[test]
+    fn neither_stroke_accessor_finds_anything_in_another_drag_or_in_no_drag() {
+        let mut pan = Some(Drag::Pan {
+            last_screen: (0.0, 0.0),
+        });
+        assert!(brush_stroke_mut(&mut pan).is_none());
+        assert!(eraser_stroke_mut(&mut pan).is_none());
+
+        let mut none: Option<Drag> = None;
+        assert!(brush_stroke_mut(&mut none).is_none());
+        assert!(eraser_stroke_mut(&mut none).is_none());
+    }
+
+    /// One permanently broken tile must cost one warning for the whole
+    /// stroke, not one per dab. 0.55.0 collapsed per-tile to per-dab,
+    /// which is not where the flood is: the tile fails *every* dab for
+    /// the rest of the drag, so a ~600 px drag across it emitted ~100
+    /// identical lines.
+    #[test]
+    fn a_broken_tile_is_reported_once_per_stroke_not_once_per_dab() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Budget 2, three tiles touched: the dab's own tile (0, 0) is the
+        // LRU victim the third touch evicts, so exactly one scratch file
+        // exists to corrupt.
+        let Some(budget) = std::num::NonZeroUsize::new(2) else {
+            unreachable!("2 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for tile in [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 50, y: 50 },
+        ] {
+            if let Err(err) = store.get_mut(surface, tile) {
+                unreachable!("a fresh store must accept a first touch of {tile:?}: {err:?}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let [victim] = files.as_slice() else {
+            unreachable!("exactly one tile should have been evicted: {files:?}");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        let mut drag = Some(brush_drag_with_a_stroke());
+        // Ten dabs, all landing on the same permanently broken tile --
+        // the shape of a drag crossing one.
+        let mut reported = 0;
+        for _ in 0..10 {
+            let outcome = aurora_brush::stamp_dab(
+                &mut store,
+                surface,
+                (128.0, 128.0),
+                BRUSH_RADIUS,
+                [1.0, 0.0, 0.0],
+                None,
+            );
+            assert_eq!(
+                outcome.failed().len(),
+                1,
+                "setup: the tile really is broken"
+            );
+            reported += unwarned_failures(&mut drag, &outcome).len();
+        }
+        assert_eq!(
+            reported, 1,
+            "one broken tile must produce exactly one warning across the whole stroke"
+        );
+
+        // A *new* stroke starts from a clean slate -- the set lives on
+        // the drag, so it cannot outlive the stroke it belongs to.
+        let mut next = Some(brush_drag_with_a_stroke());
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            (128.0, 128.0),
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert_eq!(
+            unwarned_failures(&mut next, &outcome).len(),
+            1,
+            "a new stroke must report the failure again rather than inheriting a stale set"
+        );
+    }
+
+    /// A scratch store in which `broken` are all permanently unreadable
+    /// and every other tile is fine — the only portable way to make a
+    /// `TileStore` read fail on demand from outside `aurora-tile`, in
+    /// the multi-tile form `a_dab_failing_on_several_tiles...` needs.
+    ///
+    /// Budget `broken.len()`, so touching one filler tile per broken
+    /// tile after them evicts exactly the broken ones and leaves exactly
+    /// that many scratch files to truncate.
+    fn store_with_broken_tiles(
+        broken: &[aurora_tile::TileId],
+    ) -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(broken.len()) else {
+            unreachable!("at least one tile must be asked for");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for tile in broken {
+            if let Err(err) = store.get_mut(surface, *tile) {
+                unreachable!("a fresh store must accept a first touch of {tile:?}: {err:?}");
+            }
+        }
+        // One filler per broken tile, far away, so each broken tile is
+        // in turn the LRU victim and gets written out.
+        for (n, _) in broken.iter().enumerate() {
+            let filler = aurora_tile::TileId {
+                x: 50 + u32::try_from(n).unwrap_or(0),
+                y: 50,
+            };
+            if let Err(err) = store.get_mut(surface, filler) {
+                unreachable!("a fresh store must accept a first touch of {filler:?}: {err:?}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        assert_eq!(
+            files.len(),
+            broken.len(),
+            "exactly the broken tiles should have been evicted: {files:?}"
+        );
+        for victim in &files {
+            let Ok(bytes) = std::fs::read(victim) else {
+                unreachable!("the evicted tile file must be readable");
+            };
+            let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+                unreachable!("half of a slice's own length is always in range");
+            };
+            if let Err(err) = std::fs::write(victim, truncated) {
+                unreachable!("test-local scratch disk must accept the write: {err:?}");
+            }
+        }
+        (dir, store)
+    }
+
+    /// **Every** fresh failure has to reach the caller, not just the
+    /// first (0.57.0). `unwarned_failures` marks every failing tile
+    /// warned as it goes, so a caller that logged only `fresh.first()`
+    /// — which both `App::paint_dab` and `App::erase_dab` did —
+    /// permanently swallowed tiles #2..#n: marked as already reported,
+    /// never actually printed, this stroke or ever. A radius-24 dab
+    /// spans up to four tiles, so a failing scratch directory hits that
+    /// case immediately, and the doc comment on `unwarned_failures`
+    /// explicitly promises the opposite ("the first failure on each tile
+    /// is always reported").
+    #[test]
+    fn a_dab_failing_on_several_tiles_reports_every_one_of_them_exactly_once() {
+        let first = aurora_tile::TileId { x: 0, y: 0 };
+        let second = aurora_tile::TileId { x: 1, y: 0 };
+        let (_dir, mut store) = store_with_broken_tiles(&[first, second]);
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        // Centred on the boundary between them, so one dab spans both.
+        let spanning = (256.5, 128.5);
+
+        let mut drag = Some(brush_drag_with_a_stroke());
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            spanning,
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert_eq!(
+            outcome.failed().len(),
+            2,
+            "setup: one dab, two permanently broken tiles"
+        );
+
+        let fresh = unwarned_failures(&mut drag, &outcome);
+        let mut reported: Vec<aurora_tile::TileId> = fresh.iter().map(|(tile, _)| *tile).collect();
+        reported.sort_unstable_by_key(|tile| (tile.y, tile.x));
+        assert_eq!(
+            reported,
+            [first, second],
+            "both broken tiles must be handed to the caller, each with its own error -- the \
+             call sites log one line per entry, so this is exactly what gets printed"
+        );
+
+        // And the once-per-stroke dedupe still holds for both of them.
+        let again = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            spanning,
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert_eq!(again.failed().len(), 2, "setup: still broken");
+        assert!(
+            unwarned_failures(&mut drag, &again).is_empty(),
+            "a second dab across the same two tiles must report nothing further"
+        );
+    }
+
+    /// The surface `brush_drag_with_a_stroke`/`eraser_drag_with_a_stroke`
+    /// already build their snapshots for — the one every drag-commit
+    /// test below paints into.
+    fn commit_test_surface() -> aurora_tile::SurfaceId {
+        aurora_tile::SurfaceId::from_raw(7)
+    }
+
+    fn commit_test_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(16) else {
+            unreachable!("16 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+        (dir, store)
+    }
+
+    /// Tile-local texel `(lx, ly)`'s alpha in tile (0, 0) — how the
+    /// drag-commit tests tell "this stroke's pixels" apart from "some
+    /// other stroke's pixels" rather than merely counting undo entries.
+    fn commit_test_alpha(store: &mut aurora_tile::TileStore, lx: u32, ly: u32) -> f32 {
+        let tile = match store.get(commit_test_surface(), aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let index = (ly * aurora_tile::TILE + lx) as usize * aurora_tile::CHANNELS;
+        let Some(&alpha) = tile.texels().get(index + 3) else {
+            unreachable!("index is in bounds for a full tile");
+        };
+        alpha.to_f32()
+    }
+
+    /// One real dab painted through a fresh brush drag — the state `App`
+    /// holds mid-stroke, with pixels genuinely on the layer and the
+    /// pre-dab content genuinely captured in the drag's own snapshot.
+    fn a_brush_drag_that_painted(store: &mut aurora_tile::TileStore, centre: (f32, f32)) -> Drag {
+        let mut drag = Some(brush_drag_with_a_stroke());
+        let outcome = aurora_brush::stamp_dab(
+            store,
+            commit_test_surface(),
+            centre,
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            brush_stroke_mut(&mut drag),
+        );
+        assert!(
+            !outcome.painted().is_empty(),
+            "setup: the dab must really have painted"
+        );
+        match drag {
+            Some(drag) => drag,
+            None => unreachable!("just built"),
+        }
+    }
+
+    /// `a_brush_drag_that_painted`'s eraser counterpart, over pixels it
+    /// paints first (erasing transparent pixels is a documented no-op).
+    fn an_eraser_drag_that_erased(store: &mut aurora_tile::TileStore, centre: (f32, f32)) -> Drag {
+        assert!(
+            !aurora_brush::stamp_dab(
+                store,
+                commit_test_surface(),
+                centre,
+                BRUSH_RADIUS,
+                [1.0, 0.0, 0.0],
+                None,
+            )
+            .painted()
+            .is_empty(),
+            "setup: there must be paint to erase"
+        );
+        let mut drag = Some(eraser_drag_with_a_stroke());
+        let outcome = aurora_brush::erase_dab(
+            store,
+            commit_test_surface(),
+            centre,
+            ERASER_RADIUS,
+            eraser_stroke_mut(&mut drag),
+        );
+        assert!(
+            !outcome.painted().is_empty(),
+            "setup: the erase must really have erased"
+        );
+        match drag {
+            Some(drag) => drag,
+            None => unreachable!("just built"),
+        }
+    }
+
+    /// **RT-08.** Press the middle button to pan without releasing the
+    /// brush first — an ordinary gesture — and until 0.57.0 the live
+    /// `Drag::Brush` was simply overwritten. Its pixels stayed on the
+    /// layer and no undo entry was ever pushed for them, so the next
+    /// `Ctrl+Z` reached past them and undid the *previous* stroke:
+    /// worse than the phantom entry 0.56.0 removed, because a phantom
+    /// entry at least did nothing.
+    ///
+    /// The load-bearing assertion is the last pair: the entry that
+    /// exists has to be the interrupted stroke's own, not just *an*
+    /// entry.
+    #[test]
+    fn a_stroke_interrupted_by_a_second_press_becomes_its_own_undo_entry() {
+        let (_dir, mut store) = commit_test_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        // An earlier, properly released stroke -- the one a mis-targeted
+        // Ctrl+Z would reach into.
+        let earlier = a_brush_drag_that_painted(&mut store, (30.5, 30.5));
+        commit_ending_drag(
+            Some(earlier),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+        );
+
+        // The stroke still in progress when the middle button goes down.
+        let mut drag = Some(a_brush_drag_that_painted(&mut store, (200.5, 200.5)));
+        assert!(commit_test_alpha(&mut store, 30, 30) > 0.5, "setup");
+        assert!(commit_test_alpha(&mut store, 200, 200) > 0.5, "setup");
+
+        // Exactly the sequence `App::handle_pointer_pressed` now runs:
+        // take the in-progress drag, commit it, then start the new one.
+        let interrupted = drag.take();
+        commit_ending_drag(
+            interrupted,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+        );
+        drag = begin_drag(
+            Tool::Brush,
+            PointerButton::Middle,
+            (1.0, 1.0),
+            &CanvasView::new(),
+            None,
+        );
+        assert!(
+            matches!(drag, Some(Drag::Pan { .. })),
+            "setup: the interrupting press really does start its own drag"
+        );
+
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel, UndoKind::Pixel],
+            "the interrupted stroke must have its own entry in the unified order"
+        );
+        match pixel_history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(
+            commit_test_alpha(&mut store, 200, 200) < 0.01,
+            "Ctrl+Z must remove the interrupted stroke's own pixels"
+        );
+        assert!(
+            commit_test_alpha(&mut store, 30, 30) > 0.5,
+            "and must not have reached past them into the earlier stroke"
+        );
+    }
+
+    /// The same, for dragging the cursor off the window edge
+    /// (`WindowEvent::CursorLeft`), which used to do `self.drag = None`
+    /// outright. An eraser drag here, so both stroke-carrying variants
+    /// are covered across the two tests.
+    #[test]
+    fn a_stroke_interrupted_by_the_cursor_leaving_becomes_its_own_undo_entry() {
+        let (_dir, mut store) = commit_test_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        // Paint something elsewhere first and leave it alone: whatever
+        // the undo does, it must not touch this.
+        assert!(
+            !aurora_brush::stamp_dab(
+                &mut store,
+                commit_test_surface(),
+                (30.5, 30.5),
+                BRUSH_RADIUS,
+                [1.0, 0.0, 0.0],
+                None,
+            )
+            .painted()
+            .is_empty(),
+            "setup"
+        );
+
+        let mut drag = Some(an_eraser_drag_that_erased(&mut store, (200.5, 200.5)));
+        assert!(
+            commit_test_alpha(&mut store, 200, 200) < 0.01,
+            "setup: really erased"
+        );
+
+        // Exactly the sequence the `CursorLeft` arm now runs.
+        let interrupted = drag.take();
+        commit_ending_drag(
+            interrupted,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+        );
+        assert!(drag.is_none(), "setup: the drag really is gone");
+
+        assert_eq!(undo_order.undo, vec![UndoKind::Pixel]);
+        match pixel_history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(
+            commit_test_alpha(&mut store, 200, 200) > 0.5,
+            "Ctrl+Z must put the interrupted eraser stroke's own pixels back"
+        );
+        assert!(
+            commit_test_alpha(&mut store, 30, 30) > 0.5,
+            "and must have left the untouched paint alone"
+        );
+    }
+
+    /// The ordinary path has to behave exactly as it always did — one
+    /// entry per released stroke, nothing at all for a drag with no
+    /// stroke, a drag that painted nothing, a non-painting drag, or no
+    /// drag — and `Drag::Move` must still coalesce into one structural
+    /// entry now that `finish_move` is reached through the same shared
+    /// commit rather than from `handle_pointer_released` directly.
+    #[test]
+    fn the_ordinary_release_path_commits_exactly_what_it_always_did() {
+        let (_dir, mut store) = commit_test_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        // (a) A released stroke: one entry, and it undoes its own paint.
+        let released = a_brush_drag_that_painted(&mut store, (30.5, 30.5));
+        commit_ending_drag(
+            Some(released),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+        );
+        assert_eq!(undo_order.undo, vec![UndoKind::Pixel]);
+        assert!(pixel_history.can_undo());
+
+        // (b) Nothing to commit: a brush drag that began with no active
+        // pixel layer, a brush drag whose snapshot is empty, a pan, and
+        // no drag at all.
+        for nothing in [
+            Some(Drag::Brush {
+                last_doc: (0.0, 0.0),
+                carry: 0.0,
+                stroke: None,
+                warned: std::collections::HashSet::new(),
+            }),
+            Some(brush_drag_with_a_stroke()),
+            Some(Drag::Pan {
+                last_screen: (0.0, 0.0),
+            }),
+            Some(Drag::Eyedropper),
+            None,
+        ] {
+            commit_ending_drag(
+                nothing,
+                &layers,
+                &mut history,
+                &mut pixel_history,
+                &mut undo_order,
+            );
+            assert_eq!(
+                undo_order.undo,
+                vec![UndoKind::Pixel],
+                "nothing here changed a pixel, so nothing may become an undo step"
+            );
+        }
+
+        // (c) A move still coalesces into exactly one structural entry.
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let layer = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let moved = aurora_core::Rect {
+            x: 5,
+            y: 5,
+            ..bounds
+        };
+        if let Err(err) = layers.set_bounds(layer, moved) {
+            unreachable!("{err:?}");
+        }
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: layer,
+                start_doc: (0.0, 0.0),
+                start_bounds: bounds,
+                current_bounds: moved,
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+        );
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel, UndoKind::Structural],
+            "a completed move must still record one structural step"
+        );
+
+        // (d) A move that ended where it started records nothing.
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: layer,
+                start_doc: (0.0, 0.0),
+                start_bounds: moved,
+                current_bounds: moved,
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+        );
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel, UndoKind::Structural],
+            "a move that ended where it started has nothing to reverse"
+        );
     }
 
     #[test]
@@ -18451,6 +19380,7 @@ mod tests {
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
+            warned: std::collections::HashSet::new(),
         };
         // radius 24, DEFAULT_SPACING 0.25 -> step 6; a 12-unit segment
         // lands dabs at 6 and 12 (the segment's own start, 0, is not
@@ -18486,6 +19416,7 @@ mod tests {
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
+            warned: std::collections::HashSet::new(),
         };
         let first = continue_drag(&mut drag, (3.0, 0.0), &mut view, &mut selection, (0.0, 0.0));
         // Segment shorter than one step (6): no new dab yet, but the 3
@@ -18516,6 +19447,7 @@ mod tests {
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
+            warned: std::collections::HashSet::new(),
         };
         // Same radius/spacing as Brush (ERASER_RADIUS == BRUSH_RADIUS ==
         // 24, DEFAULT_SPACING 0.25 -> step 6), so the same dab positions

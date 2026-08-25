@@ -52,12 +52,12 @@ pub enum Tool {
     /// `Brush` paints with. See this module's own doc comment for why
     /// the actual sampling lives there, not here.
     Eyedropper,
-    /// Paints — real, via `aurora_brush::stamp_dab`/`stamp_stroke`
+    /// Paints — real, via `aurora_brush::stamp_dab`
     /// against `aurora-app`'s own live `aurora_tile::TileStore` and
     /// active layer. See this module's own doc comment for why the
     /// actual stamping logic lives there, not here.
     Brush,
-    /// Erases — real, via `aurora_brush::erase_dab`/`erase_stroke`
+    /// Erases — real, via `aurora_brush::erase_dab`
     /// against the same live `aurora_tile::TileStore` and active layer
     /// `Brush` uses, subtractive instead of blended. Same reason the
     /// actual erasing logic lives in `aurora-app`, not here.
