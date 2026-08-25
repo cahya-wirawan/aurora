@@ -8279,7 +8279,7 @@ structural design work.
     result's generation matches the one currently stored. Needs its own
     round: it changes the writer's contract and wants its own fuzz
     harness as the regression test, not a hand-written case.
-- [ ] **HIGH PRIORITY — the tile scratch directory is a fixed, shared,
+- [x] **HIGH PRIORITY — the tile scratch directory is a fixed, shared,
     world-readable path with filenames that collide across processes,
     documents and users.** Opened 2026-08-24 by the 0.52.2 review
     (red-team RT-03, newly found). **Entirely pre-existing** and unrelated
@@ -8311,6 +8311,241 @@ structural design work.
     rather than merely improbable, plus removal on clean shutdown. Its own
     dedicated round: it touches process lifecycle, Windows ACLs (where
     `PermissionsExt` does not apply), and crash-leftover cleanup policy.
+
+    **Fixed 2026-08-24 (0.53.0)**, in three parts:
+
+    1. **A per-session directory, randomly named and created
+       exclusively.** `tile_store_scratch_dir()` no longer returns a
+       fixed path. `create_tile_store_scratch_dir()` builds one
+       `tempfile::Builder::new().prefix("aurora-scratch-").tempdir()`
+       directory per process, and `tile_store_scratch_dir()` memoizes it
+       in a `OnceLock` so the store's legitimate mid-run reopens
+       (`startup_document`, `recover_partial_after_a_failed_read`) share
+       one directory instead of stranding a new one on disk per call.
+       The random name is what keeps another local user from
+       pre-creating or symlinking the path, and `tempfile`'s exclusive
+       creation is what keeps this process from *adopting* somebody
+       else's directory the way `create_dir_all` would. The `mkdir` mode
+       is set explicitly to `0o700` via `tempfile::Builder::permissions`
+       rather than left to `tempfile`: unlike its temp *files* (which are
+       `0o600`), its temp *directories* get plain umask-derived
+       permissions, and this was caught on disk at `0o775` during the
+       fix's own verification, in the ordering where the only store
+       opened was the `.aur` verifier's — which lives in a *child* of the
+       session directory and so never re-asserts the parent's mode.
+    2. **Owner-only permissions, enforced by the store itself.**
+       `aurora_tile::TileStore::new` now goes through
+       `create_private_dir`, which `mkdir`s at mode `0o700` (so there is
+       no window where a freshly created directory is world-readable)
+       *and* then `set_permissions(0o700)`. The second step is **not**
+       about the umask, as this originally said: a umask can only clear
+       permission bits, never add them, so `mkdir(0o700)` cannot produce
+       anything wider than `0o700` on its own. It is there for the one
+       case `mkdir` does not cover — `recursive(true)` silently accepts
+       an already-existing directory at whatever mode it already has,
+       and that is the mode `set_permissions` tightens. A directory that
+       cannot be made owner-only is a `TileError::ScratchDirUnavailable`,
+       not a logged warning.
+
+       Hardened further after this round's own review, which
+       demonstrated two real primitives against the original shape:
+       `set_permissions` follows symlinks, so a symlink planted at the
+       scratch path chmod-ed its *target* (an unrelated `0o755`
+       directory was silently tightened to `0o700` in the demo) and
+       would have had the document's pixels written wherever the link
+       pointed; and the adopt-an-existing-directory branch leaves a
+       pre-existing `0o777` directory genuinely world-accessible for a
+       measurable window before the chmod (9,132 accessible
+       observations in 42,530 samples). `create_private_dir` now refuses
+       a symlink outright rather than following it, refuses a
+       non-directory with a message of its own, and **verifies** the
+       settled mode by re-reading `symlink_metadata` after the chmod —
+       so its doc comment's "confirmed owner-only" is now a fact rather
+       than an intention, and a symlink swapped in mid-sequence fails
+       the call instead of being reported as its target's mode. The
+       permissions are also read *before* they are written, so a
+       directory the call just created at `0o700` — which is every
+       caller in Aurora — never reaches `set_permissions` at all, and
+       `set_permissions` is exactly the call that follows symlinks.
+       Only adopting a pre-existing, wider directory reaches it.
+
+       Neither primitive was reachable from the shipped app (every
+       caller passes a freshly created, randomly named `tempfile`
+       directory or a child of one), and two residuals are documented on
+       the function rather than closed: **ownership is still not
+       checked** for a pre-existing directory, and the fully race-free
+       shape (`open(O_DIRECTORY|O_NOFOLLOW)` plus `fchmod`) is not
+       implemented. Both want `libc`, which would mean this workspace's
+       first `unsafe_code` override, and both become reachable only when
+       a *caller-supplied* scratch path is possible — FR-026's still-open
+       scratch-disk-location preference. Recorded as a follow-up below.
+    3. **A per-instance filename token, so collision is structurally
+       impossible even inside a shared directory.** Every `TileStore`
+       generates an `instance_token()` (pid + construction nanosecond +
+       process-lifetime counter, the same idiom `autosave_temp_path`
+       already uses) at construction, and `tile_path` writes
+       `{instance}_{surface}_{x}_{y}.tile`. This closes the collision
+       independently of the directory change — including for the
+       *second* instance of the same bug found this round: the `.aur`
+       export verifier had its own fixed, cross-process
+       `std::env::temp_dir().join("aurora-aur-verify")` path.
+       `aur_verify_scratch_dir()` is now a child of the session
+       directory, inheriting its mode, its random name, and its
+       clean-shutdown removal.
+
+    Removal on a clean shutdown is wired at the same
+    `WindowEvent::CloseRequested` point that already runs
+    `clear_session_marker` and `remove_autosave`, for the same reason —
+    all three now going through one `clean_shutdown_cleanup` function so
+    a test can execute them as a unit (the event-handler arm itself
+    needs a real `winit` event loop to reach, and a review round showed
+    that deleting the scratch-directory step from it left every test
+    green). The function reads what it needs through a small
+    `ShutdownState` trait rather than four arguments, after a later
+    round showed the four-argument call site could silently pass `None`
+    for the store *and* the scratch directory and still pass the whole
+    gate. It takes the live `TileStore` out and drops it *before*
+    removing the directory: dropping a store joins its background writer
+    thread, so once that line returns no eviction can still be in
+    flight. That ordering is not a fix for a reproduced race — whether
+    `remove_dir_all` can actually lose to an in-flight write is
+    filesystem-dependent and nobody has demonstrated it here — it
+    removes the question at zero cost, using drop semantics that are
+    deterministic and blocking by construction.
+
+    **Deviation from the fix shape recorded above, deliberately.** That
+    shape said the scratch directory should move to "the platform's
+    app-support/cache directory rather than `/tmp`". It stayed under
+    `std::env::temp_dir()`: scratch tiles are the definition of
+    ephemeral, run to gigabytes, and are already removed on a clean
+    shutdown, and *where* they should live on a given machine is
+    FR-026's still-open, user-facing scratch-disk preference — not
+    something for a security fix to settle by silently redirecting a
+    document's paging traffic into `directories::ProjectDirs`' data
+    directory. The confidentiality half of that shape is met by other
+    means: a randomly named, exclusively created, `0o700` directory.
+    `create_tile_store_scratch_dir`'s own doc comment says the same.
+
+    The `.aur` export verifier's store gets a **fresh directory per
+    call**, held as a `tempfile::TempDir` for the body of `verify_aur`
+    so its `Drop` removes it on every return path. Sharing one directory
+    across calls leaked: every verification builds a new `TileStore`,
+    whose per-instance token makes every file it writes a new file, so a
+    document saved repeatedly accumulated a full set of paged-out tiles
+    per save with nothing ever deleting them (measured at 9 leftover
+    tile files per save on a 25-tile document, growing linearly).
+    Regression tests cover both halves — that repeated verification
+    leaves nothing behind, and that the verifier's directory is nested
+    under the session one and is not the old fixed `aurora-aur-verify`
+    path.
+
+    Nesting it there introduced, and a later round caught, a third
+    problem worth recording: the session directory is a memoized
+    *path*, not a directory guaranteed to exist, and a temp cleaner
+    sweeping `/tmp` mid-run deletes it. `tempdir_in` against a missing
+    parent then failed, `verify_aur` returned `false`, and
+    `App::save_aur_file` responded the way it does to a corrupt
+    export — by deleting the file it had just written. A swept temp
+    directory therefore discarded every subsequent save for the rest of
+    the run, silently. `aur_verify_scratch_dir` now recreates the
+    session directory (owner-only) and, failing that, falls back to an
+    independent temp directory rather than returning `None`: the
+    degraded case gives up the nesting, never the save.
+
+    Two gaps are named rather than silently closed:
+
+    - **Windows permissions are disclosed, not addressed.**
+      `PermissionsExt` is Unix-only and the Win32 ACL equivalent
+      (`SetNamedSecurityInfoW` with an explicit DACL) has no portable
+      `std` surface and would need `unsafe`, which no crate in this
+      workspace has yet required. A Windows scratch directory inherits
+      its parent's ACL — already user-only under the default per-user
+      `%LOCALAPPDATA%\Temp`, *not* under a machine-wide `TMP`. This
+      matches the disclosure 0.49.0's `create_autosave_temp` already
+      makes for its own `0o600`.
+    - **Leftovers from a run that never reaches the cleanup are not
+      cleaned up** — see the follow-up item below.
+
+- [ ] **Scratch directories from sessions that never reach the shutdown
+    cleanup are never cleaned up.** Opened 2026-08-24, split out of the
+    item above as the one part of it deliberately left to its own round.
+    Any run that does not reach the `WindowEvent::CloseRequested`
+    handler leaves its `aurora-scratch-*` directory — potentially
+    gigabytes of the user's real painted pixels — behind for the
+    platform's temp cleaner, which on many machines means indefinitely.
+
+    **That is not only crashes**, as this item first said. It is equally
+    every *clean* quit that bypasses that specific handler: macOS's
+    native menu Quit item terminates through AppKit rather than
+    delivering a winit `CloseRequested` event, and `App::fail`'s own
+    early-exit path never reaches it either. Nor is it unique to the
+    scratch directory — the session marker and the autosave are cleared
+    at exactly the same point and have exactly the same gap, which for
+    the marker means the *next* run shows a crash-recovery dialog after
+    a perfectly clean menu Quit. Strictly better than the pre-0.53.0
+    state (that single fixed directory was never cleaned up *either*,
+    and was world-readable besides), but still a real disk-space and
+    confidentiality leak.
+
+    Two halves, then: sweeping *other* runs' leftovers (below), and
+    hooking the exit paths this handler misses
+    (`ApplicationHandler::exiting`, or a menu-quit handler) so a clean
+    quit through any route runs `clean_shutdown_cleanup`. The second is
+    the cheaper one and covers the marker and autosave too.
+
+    Concrete fix shape: a sweep at startup over `aurora-scratch-*`
+    siblings, deleting only those whose owning process is provably gone.
+    That liveness check is the whole reason this is its own round — it is
+    a per-platform question (an advisory lock file inside each directory
+    is the most portable answer; a bare pid check races pid reuse), and
+    getting it wrong deletes a *live* session's scratch tiles, which is
+    worse than the leak it fixes.
+
+- [ ] **`aurora_tile::create_private_dir` wants `O_NOFOLLOW` and a real
+    ownership check before FR-026 lets a user choose the scratch
+    location.** Opened 2026-08-25. Today it refuses a symlink, refuses a
+    non-directory, and verifies the settled mode — enough while every
+    caller passes a freshly created `tempfile` directory, so nothing
+    pre-existing is ever adopted. A user-configurable scratch path
+    changes that: a pre-existing directory would then be tightened and
+    adopted without confirming the current user owns it, and with a real
+    (measured) window at its original mode before the chmod. The
+    race-free shape is `open(O_DIRECTORY|O_NOFOLLOW)` plus `fchmod`/
+    `fstat` on the descriptor; `std` exposes neither, nor a `geteuid`,
+    so this is the first thing in the workspace that would need a
+    `libc` dependency and an `unsafe_code` override in one crate's own
+    `[lints]` table. That is an architecture decision, not a bug fix,
+    which is why it is its own item.
+
+    **Same gap on the `aurora-app` side, found by the round's final
+    judge pass and not yet fixed.** `create_dir_owner_only`
+    (`crates/aurora-app/src/lib.rs`, the self-heal helper
+    `aur_verify_scratch_dir` calls when the session directory has
+    disappeared) does `DirBuilder::recursive(true).mode(0o700)` with no
+    symlink refusal, on the stated reasoning that the only caller is
+    "recreating a directory this process itself created." That
+    precondition is exactly what's false at the one moment this helper
+    exists to handle: the directory is missing because *something else*
+    removed it, which is also the precondition for a local attacker to
+    plant a symlink at that exact name first. Impact is bounded — the
+    live store never takes this path (it goes through the hardened
+    `create_private_dir` above and fails closed), and the nested verify
+    directory it recreates is itself `0o700` and owned by the victim, so
+    the worst realistic outcome is a forced, attacker-triggerable
+    verification failure, not a data leak. Fold into the same
+    `O_NOFOLLOW` round when it happens, or give `create_dir_owner_only`
+    the cheaper symlink-refusal half of `create_private_dir`'s check on
+    its own first.
+
+- [ ] **Nice-to-have: create the scratch *tile files* `0o600` too.**
+    Opened 2026-08-25. Defence in depth only — 0.53.0's stated scope was
+    directory-level protection, and a `0o700` directory already denies
+    every other user the traversal needed to reach the files inside it.
+    Would matter if the directory's mode were ever weakened, or on a
+    filesystem that does not enforce directory permissions. The change
+    belongs in `aurora-tile`'s background writer (`fs::write` currently
+    creates at the umask default), and on Windows has the same missing-
+    ACL story `create_autosave_temp` already discloses.
 
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`

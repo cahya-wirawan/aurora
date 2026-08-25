@@ -359,6 +359,35 @@ mod tests {
         sample.to_f32()
     }
 
+    /// The scratch file `dir`'s single store paged `tile` out to.
+    ///
+    /// Found by scanning rather than by rebuilding the name: since
+    /// 0.53.0 `aurora_tile::TileStore` prefixes every scratch file with
+    /// a per-store instance token (so two stores sharing a directory
+    /// cannot collide), and that token is deliberately private to that
+    /// crate. The `(surface, x, y)` tail is still the stable,
+    /// addressable part, and exactly one file in a single-store
+    /// directory ends with it.
+    fn evicted_tile_file(dir: &std::path::Path, tile: TileId) -> std::path::PathBuf {
+        let suffix = format!("_{}_{}_{}.tile", surface().to_raw(), tile.x, tile.y);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let matches: Vec<std::path::PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .collect();
+        match matches.as_slice() {
+            [only] => only.clone(),
+            other => unreachable!("exactly one evicted file names this tile, found {other:?}"),
+        }
+    }
+
     #[test]
     // Exact-literal round-trip through f16 storage, no arithmetic --
     // same reasoning `aurora-doc`'s own tests already document for
@@ -612,19 +641,15 @@ mod tests {
         let Some(&broken) = tiles.first() else {
             unreachable!("eight tiles were just built");
         };
-        let victim = dir.path().join(format!(
-            "{}_{}_{}.tile",
-            surface().to_raw(),
-            broken.x,
-            broken.y
-        ));
-        let Ok(original) = std::fs::read(&victim) else {
+        let victim = evicted_tile_file(dir.path(), broken);
+        let victim = victim.as_path();
+        let Ok(original) = std::fs::read(victim) else {
             unreachable!("the evicted tile file must be readable");
         };
         let Some(truncated) = original.get(..original.len() / 2) else {
             unreachable!("half of a slice's own length is always in range");
         };
-        if let Err(err) = std::fs::write(&victim, truncated) {
+        if let Err(err) = std::fs::write(victim, truncated) {
             unreachable!("test-local scratch disk must accept the write: {err:?}");
         }
 
@@ -643,7 +668,7 @@ mod tests {
             );
         }
 
-        if let Err(err) = std::fs::write(&victim, &original) {
+        if let Err(err) = std::fs::write(victim, &original) {
             unreachable!("test-local scratch disk must accept the write: {err:?}");
         }
 

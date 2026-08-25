@@ -113,8 +113,231 @@ pub struct TileStore {
     failed_writes: VecDeque<(SurfaceId, TileId)>,
     budget: NonZeroUsize,
     scratch_dir: PathBuf,
+    /// A component of every filename this store writes, distinct for
+    /// every `TileStore` this process constructs and, in practice,
+    /// distinct across processes too — see [`instance_token`] for
+    /// exactly how far that guarantee reaches. Two stores pointed at the
+    /// *same* directory therefore cannot address the same file, which is
+    /// what keeps two documents, two sessions, or two users from
+    /// silently reading and overwriting each other's in-progress
+    /// pixels.
+    instance: String,
     writer: BackgroundWriter,
     stats: Stats,
+}
+
+/// Creates `dir` (and any missing parent) owner-only on Unix, and
+/// returns having re-read the directory's own metadata to confirm that
+/// no group or other permission bit is set.
+///
+/// # What this checks, exactly
+///
+/// - **A symlink at `dir` is refused, not followed.**
+///   `std::fs::set_permissions` follows symlinks, so a symlink planted
+///   at this path would silently chmod its *target* — an unrelated
+///   directory elsewhere — to `0o700` while leaving the scratch files
+///   themselves in whatever directory the link points at. A path whose
+///   `symlink_metadata` says "symlink" is an error instead.
+/// - **A non-directory at `dir` is refused** as
+///   [`std::io::ErrorKind::NotADirectory`], rather than surfacing
+///   `mkdir`'s own less specific `EEXIST`.
+/// - **The final mode is verified**, by reading `symlink_metadata` back
+///   off the path. That is what lets this function's contract say
+///   "owner-only" as a fact rather than as an intention. It also
+///   *detects* a symlink swapped in after the first check — detects,
+///   not prevents: if a chmod had already run against it, the target's
+///   mode has already been changed by then.
+/// - **The chmod is skipped when it is not needed.** The permissions
+///   are read before they are written, so a directory this call just
+///   created at `0o700` — which is every caller in Aurora — never
+///   reaches `set_permissions` at all, and `set_permissions` is exactly
+///   the call that follows symlinks. Only adopting a pre-existing,
+///   wider directory reaches it.
+///
+/// The `mkdir` sets mode `0o700` directly so a freshly created
+/// directory is never group- or world-readable for even an instant. The
+/// following `set_permissions` is *not* about the umask: a umask can
+/// only clear permission bits, never add them, so `mkdir(0o700)` cannot
+/// produce anything wider than `0o700` on its own. It is there for the
+/// one case `mkdir` does not cover — `recursive(true)` silently accepts
+/// a directory that *already exists*, at whatever mode it already has,
+/// and that is the mode `set_permissions` tightens.
+///
+/// # What this does *not* check
+///
+/// - **Ownership.** A pre-existing directory is tightened and adopted
+///   without confirming the current user owns it; `std::` exposes no
+///   stable `geteuid`, and reaching for `libc` would mean this
+///   workspace's first `unsafe_code` override. So would the fully
+///   race-free shape of this function (`open(O_DIRECTORY|O_NOFOLLOW)`
+///   plus `fchmod` on the resulting descriptor), which is why the
+///   check-then-chmod sequence above is what is implemented.
+/// - **Intermediate parents.** Only the final component is checked for
+///   being a symlink; a symlinked parent is not.
+/// - **The window before the chmod.** For a directory that already
+///   existed at a wider mode, it stays at that wider mode until
+///   `set_permissions` runs. Nothing of the user's has been written
+///   into it yet at that point, but an attacker who could already write
+///   there could have planted files or symlinks the chmod does not
+///   remove.
+///
+/// None of the three is reachable from Aurora today: every caller in
+/// the app passes a freshly created, randomly named directory from
+/// `tempfile::Builder` (`aurora_app::create_tile_store_scratch_dir`) or
+/// a child of one, so there is never a pre-existing directory to adopt.
+/// They become reachable the moment a *caller-supplied* scratch path is
+/// possible — FR-026's still-open, user-facing scratch-disk-location
+/// preference — which is when this wants the `O_NOFOLLOW` treatment and
+/// a real ownership check. Recorded as a follow-up in PLAN.md.
+///
+/// A failure to make the directory private is returned, not logged and
+/// ignored: refusing to page a document's pixels into a directory this
+/// process cannot secure is the point of the function.
+///
+/// **Windows is not covered.** `PermissionsExt` is Unix-only and the
+/// Win32 ACL equivalent (`SetNamedSecurityInfoW` with an explicit DACL)
+/// has no portable `std` surface — the same gap
+/// `aurora_app::create_autosave_temp` already discloses for `0o600`. A
+/// Windows scratch directory is created with the parent directory's
+/// inherited ACL. On the default per-user `%LOCALAPPDATA%\Temp`, that
+/// inherited ACL is already user-only; on a machine-wide `TMP` it is
+/// not.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    if let Ok(existing) = std::fs::symlink_metadata(dir) {
+        if existing.file_type().is_symlink() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "refusing to use {} as a scratch directory: it is a symlink, and following \
+                     it would chmod and write into whatever it points at",
+                    dir.display()
+                ),
+            ));
+        }
+        if !existing.is_dir() {
+            // `NotADirectory`, not `AlreadyExists`: `DirBuilder::create`
+            // would reject a plain file here too, but with `EEXIST` --
+            // indistinguishable from a dozen unrelated causes. A kind of
+            // this branch's own is what lets a test pin *this* check
+            // rather than an overlapping one.
+            return Err(Error::new(
+                ErrorKind::NotADirectory,
+                format!(
+                    "refusing to use {} as a scratch directory: it already exists and is not a \
+                     directory",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+
+    // Read before writing, so the ordinary case never chmods at all.
+    // Every caller in Aurora reaches here having just *created* the
+    // directory at mode `0o700`, which is already owner-only, so the
+    // check below returns without calling `set_permissions` — and
+    // `set_permissions` is precisely the call that follows symlinks.
+    // Only the adopt-an-existing-wider-directory case reaches the chmod.
+    //
+    // `symlink_metadata` (not `metadata`) deliberately: it reports the
+    // path itself rather than a link's target, so a symlink swapped in
+    // after the check above is caught here instead of being silently
+    // reported as its target's mode.
+    let mut settled = std::fs::symlink_metadata(dir)?;
+    if settled.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        settled = std::fs::symlink_metadata(dir)?;
+    }
+
+    if settled.file_type().is_symlink() || !settled.is_dir() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{} stopped being a plain directory while it was being prepared as a scratch \
+                 directory",
+                dir.display()
+            ),
+        ));
+    }
+    let mode = settled.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "scratch directory {} is still group- or world-accessible (mode {mode:o}) after \
+                 being made owner-only",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Non-Unix counterpart of the above — see its doc comment for what is
+/// deliberately not covered here.
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// A filename component that distinguishes one [`TileStore`] from every
+/// other store sharing a scratch directory.
+///
+/// **Strength of the guarantee, stated honestly.** Within one process
+/// this is unique *by construction*: the atomic counter alone
+/// guarantees it, whatever the clock and the pid do. Across processes
+/// it is unique *in practice*, not by proof — it is pid plus wall-clock
+/// nanosecond plus counter, and none of those is a globally unique
+/// identifier. The only construction anyone has managed to describe
+/// where two stores could collide needs all of: two processes reporting
+/// the *same* pid (distinct PID namespaces — separate containers — that
+/// nevertheless share a bind-mounted scratch directory), the same
+/// counter value, and a clock that fails to report a time at all in
+/// both, so both fall back to `0` nanoseconds.
+///
+/// That residual is moot in Aurora regardless, and deliberately so:
+/// since 0.53.0 each process gets its own randomly named session
+/// directory (`aurora_app::create_tile_store_scratch_dir`), so two
+/// processes do not share a directory in the first place. This token is
+/// the second, independent line — what keeps two stores *within* one
+/// process (two documents, and the `.aur` export verifier's throwaway
+/// store) from addressing the same file, which is the case that
+/// actually happened before 0.53.0.
+///
+/// The three parts, each closing a case the others do not: the process
+/// id (two stores alive at the same instant are in processes with
+/// distinct pids, by definition of a pid), the wall-clock nanosecond of
+/// construction (pids are recycled, so a *later* process reusing a pid
+/// still differs here), and a process-lifetime counter (one process can
+/// build two stores inside the same clock tick). The same
+/// counter-plus-pid idiom `aurora_app::autosave_temp_path` already uses
+/// for its own unique temp names.
+///
+/// This is a *uniqueness* token, not a secret: it is deliberately
+/// derivable, and nothing depends on it being unguessable. Keeping an
+/// attacker from *finding* the directory is the caller's job (see
+/// `aurora_app::create_tile_store_scratch_dir`); keeping two honest
+/// stores from colliding is this function's.
+///
+/// A clock that fails to report a time at all contributes `0` rather
+/// than propagating an error — the pid and counter still make the
+/// result unique within any one process, and the store must not fail to
+/// open because the clock is unavailable.
+fn instance_token() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    format!("{:x}-{nanos:x}-{sequence:x}", std::process::id())
 }
 
 impl TileStore {
@@ -125,16 +348,27 @@ impl TileStore {
     /// budget; ADR 0010: one such budget per document, not one per
     /// surface).
     ///
+    /// The directory is created *owner-only* on Unix (`0o700`) — it
+    /// holds the document's real, unsaved painted pixels for as long as
+    /// the session lasts, so a group- or world-readable one is not
+    /// acceptable. See this module's own `create_private_dir` for what
+    /// that does and does not cover (Windows is disclosed, not
+    /// addressed) — not linked, because it is private and this doc
+    /// comment is public.
+    ///
     /// # Errors
     ///
     /// Returns [`TileError::ScratchDirUnavailable`] if `scratch_dir`
-    /// can't be created.
+    /// can't be created — *or*, on Unix, if it can't be made and
+    /// confirmed owner-only, or if something other than a plain
+    /// directory (notably a symlink) is already sitting at that path.
+    /// Those cases are deliberately errors and not logged warnings:
+    /// refusing to page a document's pixels into a directory this
+    /// process cannot secure is the point.
     pub fn new(scratch_dir: PathBuf, budget: NonZeroUsize) -> Result<Self, TileError> {
-        std::fs::create_dir_all(&scratch_dir).map_err(|source| {
-            TileError::ScratchDirUnavailable {
-                path: scratch_dir.clone(),
-                source,
-            }
+        create_private_dir(&scratch_dir).map_err(|source| TileError::ScratchDirUnavailable {
+            path: scratch_dir.clone(),
+            source,
         })?;
         Ok(Self {
             resident: LruCache::new(budget),
@@ -143,6 +377,7 @@ impl TileStore {
             failed_writes: VecDeque::new(),
             budget,
             scratch_dir,
+            instance: instance_token(),
             writer: BackgroundWriter::spawn(),
             stats: Stats::default(),
         })
@@ -613,9 +848,21 @@ impl TileStore {
         }
     }
 
+    /// Where `(surface, id)`'s scratch file lives.
+    ///
+    /// [`Self::instance`] leads the name deliberately: `SurfaceId`
+    /// restarts from 0 for every fresh document, so before 0.53.0 two
+    /// stores sharing a scratch directory — two documents, two Aurora
+    /// processes, or two local users — addressed byte-for-byte the same
+    /// files and silently overwrote each other's in-progress pixels.
     fn tile_path(&self, surface: SurfaceId, id: TileId) -> PathBuf {
-        self.scratch_dir
-            .join(format!("{}_{}_{}.tile", surface.to_raw(), id.x, id.y))
+        self.scratch_dir.join(format!(
+            "{}_{}_{}_{}.tile",
+            self.instance,
+            surface.to_raw(),
+            id.x,
+            id.y
+        ))
     }
 }
 
@@ -1617,5 +1864,252 @@ mod tests {
             p50 < std::time::Duration::from_micros(500),
             "median paint+dirty latency regressed: {p50:?} (budget: 500us); p95={p95:?} p99={p99:?}"
         );
+    }
+
+    // -- Scratch-directory privacy and per-store filename uniqueness
+    // (0.53.0) --
+
+    /// The directory under test is deliberately pre-created
+    /// world-readable (`0o777`) rather than taken straight from
+    /// `tempfile`: a `tempfile::tempdir()` is *already* `0o700`, so a
+    /// test written that way would pass against the pre-0.53.0 plain
+    /// `create_dir_all` and prove nothing at all.
+    #[cfg(unix)]
+    #[test]
+    fn new_leaves_the_scratch_directory_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("tempdir creation must succeed in a test environment: {err}"),
+        };
+        let dir = parent.path().join("wide-open");
+        if let Err(err) = std::fs::create_dir(&dir) {
+            unreachable!("creating a directory inside a fresh tempdir must succeed: {err}");
+        }
+        // `set_permissions` is not masked by the umask, unlike `mkdir`'s
+        // own mode argument, so this really does land at 0o777.
+        if let Err(err) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)) {
+            unreachable!("chmod of a just-created directory must succeed: {err}");
+        }
+        let before = match std::fs::metadata(&dir) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the directory was just created: {err}"),
+        };
+        // Guards the guard: if the filesystem had refused 0o777, the
+        // real assertion below would be vacuously true.
+        assert_eq!(
+            before, 0o777,
+            "this test's premise is a world-readable directory"
+        );
+
+        let Some(budget) = NonZeroUsize::new(4) else {
+            unreachable!("4 is non-zero");
+        };
+        let store = match TileStore::new(dir.clone(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("an existing, writable directory must be usable: {err}"),
+        };
+        drop(store);
+
+        let after = match std::fs::metadata(&dir) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the directory still exists: {err}"),
+        };
+        assert_eq!(
+            after, 0o700,
+            "a scratch directory holds the document's real unsaved pixels; `TileStore::new` must \
+             leave it owner-only even when it already existed wide open"
+        );
+    }
+
+    /// A symlink at the scratch path must be *refused*, not followed.
+    ///
+    /// `std::fs::set_permissions` follows symlinks, so the pre-hardening
+    /// version of `create_private_dir` chmod-ed the link's target: a
+    /// demonstrated attack in which an unrelated, pre-existing `0o755`
+    /// directory elsewhere was silently tightened to `0o700` merely
+    /// because a link pointed at it — and, worse, in which the
+    /// document's unsaved pixels would then have been written into a
+    /// directory of the attacker's choosing. Both halves are asserted:
+    /// the call fails, *and* the target is left exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn new_refuses_a_symlinked_scratch_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("tempdir creation must succeed in a test environment: {err}"),
+        };
+        let target = parent.path().join("someone-elses-directory");
+        if let Err(err) = std::fs::create_dir(&target) {
+            unreachable!("creating a directory inside a fresh tempdir must succeed: {err}");
+        }
+        if let Err(err) = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+        {
+            unreachable!("chmod of a just-created directory must succeed: {err}");
+        }
+        let link = parent.path().join("scratch");
+        if let Err(err) = std::os::unix::fs::symlink(&target, &link) {
+            unreachable!("creating a symlink inside a fresh tempdir must succeed: {err}");
+        }
+
+        let Some(budget) = NonZeroUsize::new(4) else {
+            unreachable!("4 is non-zero");
+        };
+        // The *symlink* branch specifically, not merely "some error".
+        // The `is_dir` check right below it rejects a symlink too
+        // (`symlink_metadata` reports a link's own file type, not its
+        // target's), so an `is_err()` assertion here would still pass
+        // with the symlink check deleted -- pinning nothing.
+        match TileStore::new(link.clone(), budget) {
+            Err(crate::TileError::ScratchDirUnavailable { path, source }) => {
+                assert_eq!(path, link);
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    source.to_string().contains("symlink"),
+                    "the symlink check is what must reject this, not an overlapping one: {source}"
+                );
+            }
+            other => unreachable!("a symlink at the scratch path must be refused: {other:?}"),
+        }
+
+        let after = match std::fs::metadata(&target) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the link target still exists: {err}"),
+        };
+        assert_eq!(
+            after, 0o755,
+            "refusing must leave the link's target untouched -- chmod-ing it is the attack"
+        );
+        // And nothing was written through the link either.
+        let entries = match std::fs::read_dir(&target) {
+            Ok(entries) => entries.count(),
+            Err(err) => unreachable!("the link target is readable: {err}"),
+        };
+        assert_eq!(
+            entries, 0,
+            "no scratch file may be created through the link"
+        );
+    }
+
+    /// A plain file at the scratch path is refused with a message of its
+    /// own rather than `mkdir`'s bare `EEXIST`.
+    #[test]
+    fn new_refuses_a_scratch_path_that_is_not_a_directory() {
+        let parent = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("tempdir creation must succeed in a test environment: {err}"),
+        };
+        let file = parent.path().join("not-a-directory");
+        if let Err(err) = std::fs::write(&file, b"") {
+            unreachable!("writing a file inside a fresh tempdir must succeed: {err}");
+        }
+        let Some(budget) = NonZeroUsize::new(4) else {
+            unreachable!("4 is non-zero");
+        };
+        // `NotADirectory` is this branch's own kind. `DirBuilder::create`
+        // rejects a plain file as well, but as `AlreadyExists` -- so an
+        // `is_err()` assertion would pass with this check deleted and
+        // prove nothing about it.
+        match TileStore::new(file.clone(), budget) {
+            Err(crate::TileError::ScratchDirUnavailable { path, source }) => {
+                assert_eq!(path, file);
+                assert_eq!(
+                    source.kind(),
+                    std::io::ErrorKind::NotADirectory,
+                    "the is-a-directory check is what must reject this, not `mkdir`'s own \
+                     `EEXIST`: {source}"
+                );
+            }
+            other => unreachable!("a plain file at the scratch path must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_stores_sharing_a_directory_never_address_the_same_tile_file() {
+        /// Paints `value` into `a`'s first texel, then touches `b` —
+        /// with a budget of 1 that evicts `a` — and blocks until the
+        /// eviction's write has actually reached disk.
+        fn paint_and_page_out(store: &mut TileStore, a: TileId, b: TileId, value: f32) {
+            match store.get_mut(surface(), a) {
+                Ok(tile) => {
+                    if let Some(first) = tile.texels_mut().first_mut() {
+                        *first = half::f16::from_f32(value);
+                    }
+                }
+                Err(err) => unreachable!("first touch of a blank tile cannot fail: {err}"),
+            }
+            if let Err(err) = store.get_mut(surface(), b) {
+                unreachable!("touching a second tile must evict the first, not fail: {err}");
+            }
+            if let Err(err) = store.flush() {
+                unreachable!("a test-local scratch disk must accept the write: {err}");
+            }
+        }
+
+        fn first_texel(store: &mut TileStore, id: TileId) -> f32 {
+            match store.get(surface(), id) {
+                Ok(tile) => match tile.texels().first() {
+                    Some(sample) => sample.to_f32(),
+                    None => unreachable!("a tile's texel buffer is never empty"),
+                },
+                Err(err) => unreachable!("the tile was written by this store: {err}"),
+            }
+        }
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("tempdir creation must succeed in a test environment: {err}"),
+        };
+        let Some(budget) = NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut first = match TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must be usable: {err}"),
+        };
+        let mut second = match TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must be usable: {err}"),
+        };
+
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        assert_ne!(
+            first.tile_path(surface(), a),
+            second.tile_path(surface(), a),
+            "two stores sharing one directory must not name the same file for the same key"
+        );
+
+        paint_and_page_out(&mut first, a, b, 0.25);
+        paint_and_page_out(&mut second, a, b, 0.75);
+
+        // Two *real* files, not one that the second store overwrote.
+        assert!(first.tile_path(surface(), a).is_file());
+        assert!(second.tile_path(surface(), a).is_file());
+        let entries = match std::fs::read_dir(dir.path()) {
+            Ok(entries) => entries.filter_map(Result::ok).count(),
+            Err(err) => unreachable!("the scratch directory is readable: {err}"),
+        };
+        assert_eq!(
+            entries, 2,
+            "one paged-out tile per store, kept apart on disk rather than collided"
+        );
+
+        // 0.25 and 0.75 are exact in both f16 and f32 -- the same
+        // bit-exact round trip `eviction_and_page_in_round_trip` asserts,
+        // not the accumulated-rounding case `float_cmp` warns about.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(first_texel(&mut first, a), 0.25);
+            assert_eq!(first_texel(&mut second, a), 0.75);
+        }
+    }
+
+    #[test]
+    fn each_store_gets_its_own_filename_token() {
+        assert_ne!(super::instance_token(), super::instance_token());
     }
 }

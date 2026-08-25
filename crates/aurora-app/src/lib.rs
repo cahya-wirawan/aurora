@@ -817,13 +817,128 @@ fn document_canvas_size(layers: &aurora_doc::LayerTree) -> (u32, u32) {
 
 /// Where a `.aur` export's own "verify by reading it back"
 /// ([`verify_aur`]) keeps its throwaway `aurora_tile::TileStore`
-/// scratch files — deliberately separate from [`tile_store_scratch_dir`]
-/// (the live document's own store): verifying a fresh export must never
-/// touch the live document's real tiles. Not a proper per-platform
-/// app-support directory yet, the same scope this crate's other
-/// `std::env::temp_dir()`-based paths already accept.
-fn aur_verify_scratch_dir() -> PathBuf {
-    std::env::temp_dir().join("aurora-aur-verify")
+/// scratch files: a fresh directory *per call*, created inside
+/// [`tile_store_scratch_dir`]'s per-session one, and returned as the
+/// owning `tempfile::TempDir` so that dropping it deletes the whole
+/// directory and every tile the verification paged into it.
+///
+/// **Per call, not per session, and that is the point.** Verifying an
+/// export builds a brand-new store, whose per-instance filename token
+/// ([`aurora_tile::TileStore`], 0.53.0) makes every tile it writes a
+/// *new* file. A directory shared across calls would therefore
+/// accumulate one full set of paged-out tiles per save, for the life of
+/// the session, with nothing ever deleting them — `TileStore` has no
+/// `Drop` that removes its own files. Returning the `TempDir` binds
+/// that cleanup to the verification's own stack frame instead, so it
+/// happens on every return path, success and failure alike, without
+/// this having to enumerate them.
+///
+/// **Nested under the session directory, not beside it.** Until 0.53.0
+/// this was a *second* fixed, world-readable, cross-process path
+/// (`std::env::temp_dir().join("aurora-aur-verify")`) with exactly the
+/// collision and confidentiality problems the live store's own fixed
+/// path had. Being a child of the session directory means it inherits
+/// its `0o700` mode, its unpredictable name, and its clean-shutdown
+/// removal; verifying a fresh export still never touches the live
+/// document's real tiles.
+///
+/// **It never returns `None` merely because the session directory went
+/// away.** The session directory is a memoized *path*, not a guaranteed
+/// directory: a temp cleaner or a user clearing `/tmp` can delete it
+/// mid-run. This recreates it (owner-only) and, if even that fails,
+/// falls back to an independent temp directory rather than failing —
+/// because failing here reaches [`App::save_aur_file`] as "the export
+/// did not verify", which *deletes the export*. Silently discarding a
+/// professional's save is the worst thing this project can do, so the
+/// degraded case gives up the nesting, not the save.
+fn aur_verify_scratch_dir() -> Option<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("aur-verify-");
+    // Same reasoning as `create_tile_store_scratch_dir`'s own call:
+    // `tempfile` gives temp *directories* plain umask-derived
+    // permissions. The parent is already `0o700`, so this is
+    // belt-and-braces rather than load-bearing -- but it costs one line
+    // and does not depend on the parent for its own correctness.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+
+    if let Some(session) = tile_store_scratch_dir() {
+        // Recreate the session directory if it is gone. It is a *path*
+        // that is memoized, not a directory that is guaranteed to exist:
+        // a temp cleaner sweeping `/tmp`, or a user clearing temp files,
+        // removes it out from under a running session, and
+        // `tempdir_in` against a missing parent just fails. That failure
+        // used to reach `App::save_aur_file` as "verification failed",
+        // which deletes the export it has just written -- so a swept
+        // temp directory silently discarded every subsequent save for
+        // the rest of the run. `recursive(true)` makes this a no-op in
+        // the overwhelmingly common case where the directory is still
+        // there. The live tile store already self-heals this way
+        // (`aurora_tile::TileStore::new` creates its directory on every
+        // open); this is the same property for the verifier.
+        if let Err(err) = create_dir_owner_only(session) {
+            tracing::warn!(
+                ?err,
+                path = %session.display(),
+                "could not recreate this session's scratch directory for .aur verification"
+            );
+        }
+        match builder.tempdir_in(session) {
+            Ok(dir) => return Some(dir),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    path = %session.display(),
+                    "could not nest the .aur verification scratch directory under this session's; \
+                     falling back to an independent one"
+                );
+            }
+        }
+    }
+
+    // Degraded, but never silently: an independent temp directory,
+    // still randomly named, still exclusively created, still `0o700`.
+    // It gives up inheriting the session directory's clean-shutdown
+    // removal -- but this call's own `TempDir` guard is what actually
+    // deletes it, and a verification that cannot run at all is far
+    // worse than one running a directory further out.
+    match builder.tempdir() {
+        Ok(dir) => Some(dir),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to create any scratch directory for the .aur verification store"
+            );
+            None
+        }
+    }
+}
+
+/// Creates `dir` (and any missing parent) owner-only on Unix, and
+/// accepts one that already exists — `aurora_tile`'s own
+/// `create_private_dir` without the hardening checks, which is all this
+/// needs: the only caller ([`aur_verify_scratch_dir`]) is recreating a
+/// directory this process itself created under a random name, not
+/// adopting an arbitrary caller-supplied path.
+///
+/// Windows gets the parent's inherited ACL, the same gap
+/// [`create_autosave_temp`] already discloses.
+#[cfg(unix)]
+fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Non-Unix counterpart of the above — see its doc comment.
+#[cfg(not(unix))]
+fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 /// Reads `path` back as a `.aur` file, against a fresh, throwaway
@@ -835,6 +950,14 @@ fn aur_verify_scratch_dir() -> PathBuf {
 /// manifest, history, and every tile entry it names is itself the
 /// check). `false` (logged) if the scratch store fails to open or
 /// `aurora_io::read_aur` itself fails for any reason.
+///
+/// The scratch directory is a `tempfile::TempDir` bound for the whole
+/// body: it is declared *before* `store`, so on every return path the
+/// store drops first (joining its background writer thread, so no write
+/// can still be in flight) and the directory's own `Drop` then removes
+/// it and everything the verification paged into it. Verifying a large
+/// document evicts real tiles, and before 0.53.0 those files were never
+/// deleted at all.
 #[must_use]
 fn verify_aur(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
@@ -844,7 +967,11 @@ fn verify_aur(path: &Path) -> bool {
     let Some(budget) = std::num::NonZeroUsize::new(16) else {
         unreachable!("16 is non-zero");
     };
-    let mut store = match aurora_tile::TileStore::new(aur_verify_scratch_dir(), budget) {
+    let Some(scratch_dir) = aur_verify_scratch_dir() else {
+        tracing::warn!("no scratch directory for the .aur verification store");
+        return false;
+    };
+    let mut store = match aurora_tile::TileStore::new(scratch_dir.path().to_path_buf(), budget) {
         Ok(store) => store,
         Err(err) => {
             tracing::warn!(?err, "failed to open the .aur verification scratch store");
@@ -1005,7 +1132,12 @@ fn replace_document(
 // real fix for both is the same move to a per-user app-support
 // directory (`directories::ProjectDirs`, already a dependency for
 // [`layout_path`]), which is separate, still-open work rather than
-// something to fold into this change.
+// something to fold into this change. The *tile scratch directory*, the
+// third temp-directory path this crate used to keep at a fixed name, is
+// no longer one of them: 0.53.0 moved it to a randomly named, `0o700`,
+// per-session directory ([`create_tile_store_scratch_dir`]) removed on a
+// clean shutdown. The marker and the autosave still use fixed temp
+// paths.
 
 /// Where this run's own "I'm still running" marker lives.
 fn marker_path() -> PathBuf {
@@ -5764,11 +5896,178 @@ fn select_layer(
     }
 }
 
-/// Where this session's shared tile store keeps its scratch files —
-/// analogous to [`marker_path`]/[`autosave_path`], and for the same
-/// reason not a proper per-platform app-support directory yet.
-fn tile_store_scratch_dir() -> PathBuf {
-    std::env::temp_dir().join("aurora-tiles")
+/// Creates a fresh scratch directory for one session's tile store,
+/// under the platform temp directory, and returns its path. `None`
+/// (logged) if it cannot be created.
+///
+/// **Why not a fixed path.** Until 0.53.0 this was
+/// `std::env::temp_dir().join("aurora-tiles")`: one directory, shared by
+/// every process, every document and every *user* on the machine,
+/// holding files named only `{surface}_{x}_{y}.tile` — where
+/// `SurfaceId` restarts from 0 for each fresh document. Two documents
+/// open at once addressed the same files and silently corrupted each
+/// other's unsaved pixels, and the directory was world-readable. The
+/// name is now random (so it cannot be pre-created or symlinked into
+/// place by another local user), the creation is exclusive (`tempfile`
+/// retries on `EEXIST` rather than adopting somebody else's directory),
+/// and `aurora_tile::TileStore::new` makes it `0o700` on Unix.
+///
+/// Still under `std::env::temp_dir()`, deliberately: scratch tiles are
+/// the definition of ephemeral, run to gigabytes, and are already
+/// removed on a clean shutdown ([`clean_shutdown_cleanup`]).
+/// Where they *should* live on a given machine is a still-open,
+/// user-facing scratch-disk preference (FR-026), not something to decide
+/// here by silently redirecting a document's paging traffic into
+/// `directories::ProjectDirs`' data directory.
+fn create_tile_store_scratch_dir() -> Option<PathBuf> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("aurora-scratch-");
+    // `tempfile` creates a *directory* with the process's default
+    // permissions (a plain `DirBuilder::create`, so umask-derived and
+    // typically `0o755`/`0o775`) -- unlike its temp *files*, which are
+    // `0o600`. Saying `0o700` here makes the mode part of the `mkdir`
+    // itself, so the directory is never world-readable for even an
+    // instant. `aurora_tile::TileStore::new` re-asserts `0o700` when it
+    // opens a store here, but that is not a substitute: the store may be
+    // opened on a *child* of this directory (`aur_verify_scratch_dir`)
+    // and never on this one, in which case nothing else would ever fix
+    // the parent's mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    match builder.tempdir() {
+        Ok(dir) => Some(dir.keep()),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to create this session's tile scratch directory"
+            );
+            None
+        }
+    }
+}
+
+/// This process's own scratch directory — created once, on first use,
+/// and reused by every [`open_tile_store`] call for the rest of the run.
+///
+/// Memoized rather than recreated per call because the store is
+/// legitimately reopened mid-run ([`startup_document`],
+/// [`recover_partial_after_a_failed_read`]): a fresh directory per call
+/// would strand the previous one on disk with nothing left holding its
+/// path to delete it. `None` means no scratch directory could be created
+/// at all, which [`open_tile_store`] turns into its existing "painting
+/// is disabled this session" degradation, not a crash.
+///
+/// Two acknowledged edge cases, neither fixed here and neither with a
+/// demonstrated practical impact: a `None` memoizes, so a single
+/// transient failure at first use disables paging for the whole run
+/// rather than being retried; and a run that creates the directory but
+/// never opens a store in it still creates it (and still deletes it at
+/// shutdown), so the cost of the memoization is one empty directory in
+/// the case where nothing needed one.
+fn tile_store_scratch_dir() -> Option<&'static Path> {
+    static SCRATCH_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SCRATCH_DIR
+        .get_or_init(create_tile_store_scratch_dir)
+        .as_deref()
+}
+
+/// Everything a clean shutdown has to undo, in one directly callable
+/// place: clear this run's own "I'm still running" marker so the *next*
+/// run's `previous_session_left_a_marker` reads false, delete the
+/// autosave (nothing is left to recover once the run has ended
+/// cleanly), and delete this session's tile scratch directory and every
+/// unsaved pixel paged into it.
+///
+/// **Why a function and not three statements in the event handler.**
+/// The `WindowEvent::CloseRequested` arm needs a real `winit` event
+/// loop to reach, so nothing in this crate's test module can execute
+/// it; a review round demonstrated that deleting the scratch-directory
+/// cleanup from that arm entirely left all 1101 tests green. The state
+/// arrives through [`ShutdownState`] precisely so a test *can* call
+/// this — against throwaway paths, not the live session's, which
+/// deleting would pull the scratch disk out from under every other test
+/// sharing this binary. See that trait for why it is a trait and not
+/// four parameters.
+///
+/// **The store is taken and dropped before the directory is removed.**
+/// Dropping a `aurora_tile::TileStore` joins its background writer
+/// thread (its `BackgroundWriter`'s own `Drop` calls `flush`, which
+/// drops the sender and joins), so once that line has returned no
+/// eviction can still be in flight. This is not a fix for a race
+/// anyone has reproduced: whether `remove_dir_all` can actually lose to
+/// a writer creating a file mid-walk (`ENOTEMPTY`, orphaned unsaved
+/// pixels) depends on the filesystem, and no one has demonstrated it
+/// here. Rust's drop semantics are deterministic and blocking, so
+/// ordering it this way removes the question at zero cost rather than
+/// answering it.
+///
+/// **Crash leftovers are not covered** — see PLAN.md's own follow-up
+/// item. A run that never reaches this leaves its directory behind for
+/// the platform's temp cleaner, and that includes clean quits that
+/// bypass `WindowEvent::CloseRequested` (macOS's own menu Quit,
+/// [`App::fail`]), not only crashes. The marker and the autosave have
+/// exactly the same gap.
+fn clean_shutdown_cleanup(state: &mut impl ShutdownState) {
+    clear_session_marker(state.marker_path());
+    remove_autosave(&state.autosave_path());
+    // Taken and dropped *before* the directory goes: dropping a
+    // `aurora_tile::TileStore` joins its background writer thread (its
+    // `BackgroundWriter`'s own `Drop` calls `flush`, which drops the
+    // sender and joins), so no eviction can still be in flight against
+    // a directory that is being deleted. Deterministic by construction
+    // rather than a race this has to win.
+    drop(state.take_tile_store());
+    if let Some(dir) = state.scratch_dir() {
+        remove_scratch_dir(dir);
+    }
+}
+
+/// Everything [`clean_shutdown_cleanup`] needs from the running
+/// application, as one source of truth rather than four arguments.
+///
+/// **Why a trait and not four parameters.** A review round showed that
+/// changing the single production call site to pass `None` for the
+/// store and `None` for the scratch directory compiled, ran, and passed
+/// the entire gate — a plausible slip with no protection whatsoever,
+/// and one `dead_code` would not catch either, since the function still
+/// had callers. With the state behind a trait the call site is
+/// `clean_shutdown_cleanup(self)`: there is no argument left to get
+/// wrong, and what remains is a four-line `impl` for [`App`] whose
+/// bodies are each a single field or function reference.
+///
+/// It is also what keeps the function testable. The real
+/// implementation resolves the live session directory and the live
+/// store; a test supplies throwaway paths instead, because removing the
+/// live session directory from a test would pull the scratch disk out
+/// from under every other test sharing this binary.
+trait ShutdownState {
+    /// This run's own "I'm still running" marker.
+    fn marker_path(&self) -> &Path;
+    /// Where the autosave this run has been writing lives.
+    fn autosave_path(&self) -> PathBuf;
+    /// Takes the live tile store out of the application, so dropping it
+    /// joins its writer thread. Leaves nothing behind.
+    fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore>;
+    /// This session's scratch directory, or `None` if one was never
+    /// created (painting disabled for the run).
+    fn scratch_dir(&self) -> Option<&Path>;
+}
+
+/// [`clean_shutdown_cleanup`]'s scratch-directory step, split out so it
+/// can also be called on its own against a *throwaway* directory: the
+/// caller in the event handler passes the one live, memoized session
+/// directory ([`tile_store_scratch_dir`]), and deleting that from a
+/// test would pull the scratch disk out from under every other test
+/// sharing the binary.
+fn remove_scratch_dir(dir: &Path) {
+    if let Err(err) = std::fs::remove_dir_all(dir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %dir.display(), "failed to remove this session's tile scratch directory");
+    }
 }
 
 /// A practical resident-tile budget for this crate's first live store —
@@ -5782,12 +6081,19 @@ const TILE_BUDGET: usize = 256;
 /// Errors are logged, not fatal -- the same "must never stop the
 /// application starting" shape [`write_session_marker`]'s own I/O
 /// already uses; a store that fails to open just means painting is
-/// silently disabled for the session, not a crash.
+/// silently disabled for the session, not a crash. Since 0.53.0 a
+/// scratch directory that could not be *created* at all takes that same
+/// path (it is already logged by [`create_tile_store_scratch_dir`]),
+/// rather than falling back to a shared one.
 fn open_tile_store() -> Option<aurora_tile::TileStore> {
     let Some(budget) = std::num::NonZeroUsize::new(TILE_BUDGET) else {
         unreachable!("TILE_BUDGET is a fixed, non-zero constant");
     };
-    match aurora_tile::TileStore::new(tile_store_scratch_dir(), budget) {
+    let Some(scratch_dir) = tile_store_scratch_dir() else {
+        tracing::warn!("no tile scratch directory; painting is disabled this session");
+        return None;
+    };
+    match aurora_tile::TileStore::new(scratch_dir.to_path_buf(), budget) {
         Ok(store) => Some(store),
         Err(err) => {
             tracing::warn!(
@@ -6316,6 +6622,24 @@ struct App {
     /// "block until something changes." Starts `true` so the window's
     /// very first frame actually paints.
     needs_redraw: bool,
+}
+
+impl ShutdownState for App {
+    fn marker_path(&self) -> &Path {
+        &self.marker_path
+    }
+
+    fn autosave_path(&self) -> PathBuf {
+        autosave_path()
+    }
+
+    fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore> {
+        self.tile_store.take()
+    }
+
+    fn scratch_dir(&self) -> Option<&Path> {
+        tile_store_scratch_dir()
+    }
 }
 
 impl App {
@@ -7830,12 +8154,20 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 // (see the "persisted workspace layout" section's own
                 // doc comment for why this is the one point this crate
                 // writes it).
-                clear_session_marker(&self.marker_path);
-                // Nothing left to recover once this run has ended
+                // All three cleanups -- the marker, the autosave
+                // (nothing is left to recover once this run has ended
                 // cleanly, and the file holds real pixel content at a
-                // predictable path in a shared temp directory -- see
-                // [`remove_autosave`]'s own doc comment.
-                remove_autosave(&autosave_path());
+                // predictable path in a shared temp directory; see
+                // [`remove_autosave`]'s own doc comment), and this
+                // session's paged-out tiles, which are its unsaved
+                // pixels and which nothing recovers after a clean exit
+                // -- go through one function so a test can execute them
+                // as a unit; this arm itself needs a real event loop
+                // to reach. `self` is the only argument on purpose --
+                // an earlier four-argument shape let this call site
+                // silently pass `None` for the store and the scratch
+                // directory and still pass the whole gate.
+                clean_shutdown_cleanup(self);
                 if let Some(layout_path) = self.layout_path.as_deref() {
                     save_workspace_layout(layout_path, &self.workspace);
                 }
@@ -8038,12 +8370,13 @@ mod tests {
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess,
         Key, KeyChord, Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
-        UndoKind, UndoOrder, activate_command, active_layer_origin, apply_mask_clip,
-        apply_scroll_zoom, autosave_path, background_color_from_theme, begin_drag,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin,
-        clear_session_marker, close_command_palette, close_crash_recovery_dialog,
-        collect_widget_paints, composite_document, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, default_shortcuts, demo_document, dissolve_gate,
+        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, apply_mask_clip,
+        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
+        begin_drag, canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, collect_widget_paints, composite_document,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
         document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
         effective_residency_zoom, eyedropper_sample, handle_dialog_key, handle_dialog_pointer,
         handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
@@ -8487,6 +8820,14 @@ mod tests {
 
     #[test]
     fn verify_aur_accepts_a_real_written_file_and_rejects_garbage() {
+        // Shared with `repeated_aur_verification_does_not_accumulate_
+        // scratch_tiles`, which counts what verification leaves in the
+        // session scratch directory and cannot do so while another
+        // verification is in flight.
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err:?}"),
@@ -10230,7 +10571,14 @@ mod tests {
 
     #[test]
     fn tile_store_scratch_dir_is_distinct_from_the_marker_and_autosave_paths() {
-        let scratch = tile_store_scratch_dir();
+        // Since 0.53.0 the scratch directory is per-session and randomly
+        // named rather than the fixed `aurora-tiles`, so this can no
+        // longer collide by construction -- still asserted, because all
+        // three still live under `std::env::temp_dir()` and the marker
+        // and autosave paths *are* still fixed.
+        let Some(scratch) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
         assert_ne!(scratch, super::marker_path());
         assert_ne!(scratch, autosave_path());
     }
@@ -10238,13 +10586,553 @@ mod tests {
     #[test]
     fn open_tile_store_succeeds_against_the_real_scratch_directory() {
         // A real, if unremarkable, assertion: this crate's own scratch
-        // directory is always writable in a real environment (the same
+        // directory (per-session since 0.53.0, created on first use) is
+        // always creatable and writable in a real environment (the same
         // assumption `write_session_marker`'s own `std::env::temp_dir()`
         // use already makes) -- confirms `open_tile_store` doesn't
         // always return `None` in ordinary conditions, not this
         // function's own I/O error path (real disk-failure injection is
         // not something this sandbox can do).
         assert!(open_tile_store().is_some());
+    }
+
+    /// Two calls must not hand back the same directory -- the whole
+    /// point of 0.53.0's change away from the one fixed `aurora-tiles`
+    /// path every process and every user shared.
+    #[test]
+    fn each_scratch_directory_is_a_new_one() {
+        let (Some(first), Some(second)) = (
+            create_tile_store_scratch_dir(),
+            create_tile_store_scratch_dir(),
+        ) else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        assert_ne!(first, second);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+        let fixed = std::env::temp_dir().join("aurora-tiles");
+        assert_ne!(first, fixed);
+        assert_ne!(second, fixed);
+        // These two are deliberately *not* the memoized session
+        // directory, so nothing else is using them -- clean up rather
+        // than leaving two directories behind per test run.
+        for dir in [first, second] {
+            if let Err(err) = std::fs::remove_dir_all(&dir) {
+                unreachable!("a directory this test just created must be removable: {err}");
+            }
+        }
+    }
+
+    /// A freshly created scratch directory must *already* be owner-only,
+    /// before any `aurora_tile::TileStore` has been opened in it.
+    ///
+    /// Not redundant with
+    /// [`the_session_scratch_directory_is_owner_only`]: `tempfile`
+    /// creates directories with default (umask-derived, typically
+    /// world-readable) permissions, and this was observed on disk at
+    /// `0o775` when the only store opened during a run was the `.aur`
+    /// verifier's, which lives in a *child* of this directory and so
+    /// never re-asserts the parent's mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_scratch_directory_is_owner_only_before_any_store_opens() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(dir) = create_tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let mode = match std::fs::metadata(&dir) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the directory was just created: {err}"),
+        };
+        if let Err(err) = std::fs::remove_dir_all(&dir) {
+            unreachable!("a directory this test just created must be removable: {err}");
+        }
+        // The security property, not the exact mode. This directory's
+        // permissions come from `tempfile`'s `mkdir` mode argument,
+        // which *is* masked by the process umask -- unlike
+        // `set_permissions`, which is not, and which is why
+        // [`the_session_scratch_directory_is_owner_only`] can afford an
+        // exact `0o700`. Under a umask that clears owner bits (`umask
+        // 0177`, say) this would land at `0o500` and an `assert_eq!`
+        // would fail on a directory that is *more* private than
+        // required, not less.
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a fresh scratch directory must grant nothing to group or other (mode {mode:o})"
+        );
+    }
+
+    /// The directory holds the document's real unsaved pixels, in a
+    /// world-readable temp directory. `aurora_tile::TileStore::new` is
+    /// what re-asserts the mode when a store opens directly in it; this
+    /// asserts the app actually gets that benefit end to end.
+    ///
+    /// Takes `AUR_VERIFY_SCRATCH_LOCK` because
+    /// `aur_verification_survives_the_session_scratch_directory_being_swept_away`
+    /// deletes this same live, memoized session directory under that
+    /// lock -- without it, `cargo test --workspace`'s shared-binary,
+    /// multi-threaded run (unlike `cargo nextest`'s process-per-test
+    /// isolation, which CI actually uses) can observe the directory gone
+    /// between this test's own `open_tile_store()` and `metadata()`.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_scratch_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(open_tile_store().is_some());
+        let Some(dir) = tile_store_scratch_dir() else {
+            unreachable!("open_tile_store just succeeded against it");
+        };
+        let mode = match std::fs::metadata(dir) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the directory was just used by a live store: {err}"),
+        };
+        assert_eq!(mode, 0o700);
+    }
+
+    /// Load-bearing, not a tautology: the store is legitimately reopened
+    /// mid-run (`startup_document`,
+    /// `recover_partial_after_a_failed_read`), and each reopen must land
+    /// in the *same* directory -- a fresh one per call would strand the
+    /// previous one on disk with nothing left holding its path.
+    #[test]
+    fn tile_store_scratch_dir_is_stable_within_one_process() {
+        assert_eq!(tile_store_scratch_dir(), tile_store_scratch_dir());
+    }
+
+    #[test]
+    fn removing_the_session_scratch_directory_removes_its_tiles_too() {
+        // Deliberately a throwaway directory, not the live memoized
+        // session one: removing the real one would pull the scratch
+        // disk out from under every other test sharing this binary.
+        let Some(dir) = create_tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let tile = dir.join("0-0-0_0_0_0.tile");
+        if let Err(err) = std::fs::write(&tile, [0_u8; 4]) {
+            unreachable!("a fresh scratch directory must be writable: {err}");
+        }
+        super::remove_scratch_dir(&dir);
+        assert!(!tile.exists(), "the paged-out tiles go with the directory");
+        assert!(!dir.exists());
+
+        // And it tolerates an absent directory -- the "shutting down
+        // twice" / "never created one" case, the same shape
+        // `clear_session_marker` and `remove_autosave` already accept.
+        // Called for its (lack of) panic, not a value.
+        super::remove_scratch_dir(&dir);
+    }
+
+    /// Serializes the tests that count what `.aur` verification leaves
+    /// behind in the session scratch directory. `verify_aur` creates its
+    /// directory *inside* the one live, memoized session directory, so
+    /// two verifications running concurrently in this binary would see
+    /// each other's in-flight directory and make the count
+    /// non-deterministic.
+    static AUR_VERIFY_SCRATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `(subdirectories, files under them)` sitting in the session
+    /// scratch directory right now.
+    ///
+    /// Deliberately every *subdirectory*, not just ones matching some
+    /// `aur-verify-` name: `.aur` verification is the only thing that
+    /// ever nests a directory inside the session directory, so this
+    /// counts what verification left behind however that directory
+    /// comes to be named — including the pre-0.53.0 shape, a single
+    /// fixed child reused by every save, whose file count is what grows
+    /// there. The session directory's own top-level `*.tile` files
+    /// belong to the live store other tests share and are not counted.
+    fn aur_verify_leftovers() -> (usize, usize) {
+        fn count_files(dir: &std::path::Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .map(|entry| {
+                    if entry.path().is_dir() {
+                        count_files(&entry.path())
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+
+        let Some(session) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let entries = match std::fs::read_dir(session) {
+            Ok(entries) => entries,
+            Err(err) => unreachable!("the session scratch directory is readable: {err}"),
+        };
+        let mut dirs = 0;
+        let mut files = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            dirs += 1;
+            files += count_files(&path);
+        }
+        (dirs, files)
+    }
+
+    /// The `.aur` verifier's scratch store must not leak its paged-out
+    /// tiles across saves.
+    ///
+    /// Every `verify_aur` call builds a fresh `aurora_tile::TileStore`,
+    /// and since 0.53.0 every store folds a per-instance token into
+    /// every filename it writes. A directory shared across calls would
+    /// therefore gain a *new* full set of evicted tiles per save, with
+    /// nothing ever deleting them (`TileStore` has no `Drop` that
+    /// removes its own files) — a document saved repeatedly in one
+    /// session would grow an unbounded pile of full-resolution
+    /// compressed pixel data until the whole session directory went
+    /// away at shutdown.
+    ///
+    /// The document here is deliberately larger than the verifier's own
+    /// 16-tile budget (1280 × 1280 px is 5 × 5 = 25 tiles at ADR 0005's
+    /// 256 px tile), so verification really does evict to disk. A test
+    /// on a small document would pass against the leaking version and
+    /// prove nothing.
+    #[test]
+    fn repeated_aur_verification_does_not_accumulate_scratch_tiles() {
+        /// 5 x 5 = 25 tiles at ADR 0005's 256 px tile, against
+        /// `verify_aur`'s own 16-tile budget.
+        const SIDE: u32 = 1280;
+
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_store_dir, mut store) = real_tile_store();
+        let image = fake_image(SIDE, SIDE);
+        let (layers, history, id) = document_from_image("big", &image);
+        // Real painted tiles, not just a layer of the right size:
+        // `document_from_image` only adds the layer, and a `.aur` whose
+        // manifest names no tiles pages nothing in when it is read back,
+        // so the store under test would never evict and the leak would
+        // not reproduce.
+        let surface = super::surface_id_for(id);
+        let tiles = SIDE.div_ceil(aurora_tile::TILE);
+        for y in 0..tiles {
+            for x in 0..tiles {
+                let tile_id = aurora_tile::TileId { x, y };
+                let tile = match store.get_mut(surface, tile_id) {
+                    Ok(tile) => tile,
+                    Err(err) => unreachable!("touching a blank tile cannot fail: {err:?}"),
+                };
+                let Some(sample) = tile.texels_mut().first_mut() else {
+                    unreachable!("a full tile has texels");
+                };
+                *sample = half::f16::from_f32(0.5);
+            }
+        }
+        assert!(
+            tiles * tiles > 16,
+            "the document must exceed the verifier's own tile budget"
+        );
+        let path = dir.path().join("big.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) =
+            aurora_io::write_aur(file, &layers, &history, (SIDE, SIDE), None, &mut store)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let baseline = aur_verify_leftovers();
+        assert_eq!(
+            baseline,
+            (0, 0),
+            "nothing else may be mid-verification while this test holds the lock"
+        );
+
+        let mut after = Vec::new();
+        for _ in 0..3 {
+            assert!(
+                verify_aur(&path),
+                "a real, just-written .aur file must verify"
+            );
+            after.push(aur_verify_leftovers());
+        }
+        assert_eq!(
+            after,
+            vec![(0, 0), (0, 0), (0, 0)],
+            "each verification must take its own scratch directory with it; leftovers that grow \
+             per save are the leak this test exists for"
+        );
+    }
+
+    /// The `.aur` verifier's scratch directory must live *under* the
+    /// per-session one, and must not be the pre-0.53.0 fixed,
+    /// cross-process path.
+    ///
+    /// Not a tautology: a review round demonstrated that reverting this
+    /// half of the fix — putting the verifier back on
+    /// `std::env::temp_dir().join("aurora-aur-verify")`, a second fixed,
+    /// world-readable directory shared by every process and every user
+    /// on the machine — passed the entire gate with nothing failing.
+    /// This is the assertion that would have caught it, and it mirrors
+    /// [`each_scratch_directory_is_a_new_one`]'s own `assert_ne!`
+    /// against the live store's old fixed path.
+    #[test]
+    fn the_aur_verify_scratch_directory_is_nested_and_not_the_old_fixed_path() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let Some(session) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(first) = aur_verify_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(second) = aur_verify_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let fixed = std::env::temp_dir().join("aurora-aur-verify");
+        for dir in [first.path(), second.path()] {
+            assert!(dir.is_dir());
+            assert!(
+                dir.starts_with(session),
+                "the verifier's scratch directory must be a child of the session directory \
+                 ({}), not a sibling or a fixed path of its own: {}",
+                session.display(),
+                dir.display()
+            );
+            assert_ne!(dir, fixed);
+        }
+        // Per call, not per session -- the whole reason the leak above
+        // cannot come back by sharing one directory across saves.
+        assert_ne!(first.path(), second.path());
+
+        // And the `TempDir` guard is what deletes it: dropping must
+        // leave nothing behind.
+        let path = first.path().to_path_buf();
+        drop(first);
+        assert!(!path.exists(), "dropping the guard removes the directory");
+        drop(second);
+    }
+
+    /// The three things a clean shutdown must undo, exercised as a unit.
+    ///
+    /// The `WindowEvent::CloseRequested` arm that calls this needs a
+    /// real `winit` event loop, so no test can execute the arm itself —
+    /// a review round showed that deleting the scratch-directory
+    /// cleanup from it left every test green. Each step is asserted here
+    /// against throwaway paths (never the live session's, which every
+    /// other test in this binary shares), so only the single call in the
+    /// handler is left to inspection.
+    #[test]
+    fn clean_shutdown_cleanup_removes_the_marker_the_autosave_and_the_scratch_tiles() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let marker = dir.path().join("aurora-session.marker");
+        if let Err(err) = std::fs::write(&marker, b"") {
+            unreachable!("a fresh tempdir must be writable: {err}");
+        }
+        let autosave = dir.path().join("aurora-autosave.aur");
+        if let Err(err) = std::fs::write(&autosave, b"") {
+            unreachable!("a fresh tempdir must be writable: {err}");
+        }
+
+        // A real, live store with a real paged-out tile in a real
+        // scratch directory -- not an empty directory, which would pass
+        // even if the removal never ran against anything.
+        let Some(scratch) = create_tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(scratch.clone(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("a fresh scratch directory must be usable: {err}"),
+        };
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for id in [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+        ] {
+            if let Err(err) = store.get_mut(surface, id) {
+                unreachable!("touching a blank tile cannot fail: {err}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("a test-local scratch disk must accept the write: {err}");
+        }
+        let tiles = match std::fs::read_dir(&scratch) {
+            Ok(entries) => entries.flatten().count(),
+            Err(err) => unreachable!("the scratch directory is readable: {err}"),
+        };
+        assert!(
+            tiles > 0,
+            "this test's premise is a scratch directory with real paged-out tiles in it"
+        );
+
+        let mut state = FakeShutdownState {
+            marker: marker.clone(),
+            autosave: autosave.clone(),
+            store: Some(store),
+            scratch: Some(scratch.clone()),
+        };
+        clean_shutdown_cleanup(&mut state);
+        assert!(
+            state.store.is_none(),
+            "the store must be taken out of the slot and dropped, not left alive holding a \
+             writer thread against a directory that is being deleted"
+        );
+
+        assert!(!marker.exists(), "the session marker must be cleared");
+        assert!(!autosave.exists(), "the autosave must be removed");
+        assert!(
+            !scratch.exists(),
+            "the session's scratch directory and its unsaved pixels must be removed"
+        );
+    }
+
+    /// [`ShutdownState`]'s test double — the four things a clean
+    /// shutdown reads out of the running application, backed by
+    /// throwaway paths instead of the live session's.
+    struct FakeShutdownState {
+        marker: PathBuf,
+        autosave: PathBuf,
+        store: Option<aurora_tile::TileStore>,
+        scratch: Option<PathBuf>,
+    }
+
+    impl ShutdownState for FakeShutdownState {
+        fn marker_path(&self) -> &std::path::Path {
+            &self.marker
+        }
+
+        fn autosave_path(&self) -> PathBuf {
+            self.autosave.clone()
+        }
+
+        fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore> {
+            self.store.take()
+        }
+
+        fn scratch_dir(&self) -> Option<&std::path::Path> {
+            self.scratch.as_deref()
+        }
+    }
+
+    /// A session scratch directory swept out from under a running
+    /// process must not silently discard every save for the rest of the
+    /// run.
+    ///
+    /// `tile_store_scratch_dir` memoizes a *path*, not a directory that
+    /// is guaranteed to still exist: a temp cleaner sweeping `/tmp`, or
+    /// a user clearing temp files, deletes it mid-session. Nesting the
+    /// verifier's scratch directory under it (0.53.0) made
+    /// `tempdir_in` fail in that state, `verify_aur` return `false`,
+    /// and `App::save_aur_file` respond by deleting the export it had
+    /// just written — the save gone, with nothing but a `tracing::warn!`
+    /// to show for it, for every save afterwards too. CLAUDE.md names
+    /// silently degrading a professional's file as the worst failure
+    /// this project can have.
+    #[test]
+    fn aur_verification_survives_the_session_scratch_directory_being_swept_away() {
+        // Deliberately removes the one live session directory, so it
+        // takes the same lock the other verification tests do. The
+        // directory is recreated by the very call under test, so the
+        // window in which it is absent is a single `verify_aur` call.
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_store_dir, mut store) = real_tile_store();
+        let image = fake_image(4, 4);
+        let (layers, history, _id) = document_from_image("photo", &image);
+        let path = dir.path().join("real.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), None, &mut store) {
+            unreachable!("{err:?}");
+        }
+
+        let Some(session) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        super::remove_scratch_dir(session);
+        assert!(
+            !session.exists(),
+            "this test's premise is a session directory that has been swept away"
+        );
+
+        assert!(
+            verify_aur(&path),
+            "a real, just-written .aur file must still verify after the session scratch \
+             directory has been swept away -- returning false here deletes the user's export"
+        );
+        assert!(
+            session.is_dir(),
+            "the session directory must be recreated, not merely worked around once"
+        );
+        // And it is owner-only again, not whatever the umask says.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = match std::fs::metadata(session) {
+                Ok(meta) => meta.permissions().mode() & 0o777,
+                Err(err) => unreachable!("the directory was just recreated: {err}"),
+            };
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "a recreated session directory holds the same unsaved pixels the original did \
+                 (mode {mode:o})"
+            );
+        }
+    }
+
+    /// The "nothing to clean up" shape, which a clean shutdown really
+    /// can reach: no scratch directory was ever created (painting was
+    /// disabled for the session), and the marker/autosave are already
+    /// gone. Called for its lack of panic, and to pin that an absent
+    /// path is not treated as an error.
+    #[test]
+    fn clean_shutdown_cleanup_tolerates_having_nothing_to_remove() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let marker = dir.path().join("never-written.marker");
+        let autosave = dir.path().join("never-written.aur");
+        let mut state = FakeShutdownState {
+            marker: marker.clone(),
+            autosave: autosave.clone(),
+            store: None,
+            scratch: None,
+        };
+        clean_shutdown_cleanup(&mut state);
+        assert!(!marker.exists());
+        assert!(!autosave.exists());
     }
 
     #[test]

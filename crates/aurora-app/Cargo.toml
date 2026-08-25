@@ -57,6 +57,19 @@ postcard = { workspace = true }
 # comment for why this is a real per-platform app-support directory,
 # not `std::env::temp_dir()`.
 directories = { workspace = true }
+# This session's own tile scratch directory (`create_tile_store_scratch_dir`)
+# -- was dev-only until 0.53.0, when the fix for the fixed, shared
+# `aurora-tiles` path needed a randomly *named*, exclusively *created*
+# directory in production code, not just in tests: a predictable name in a
+# world-writable temp directory can be pre-created or symlinked into place
+# by another local user, and `create_dir_all` would happily adopt it.
+# What this move does and does not change: nothing new enters the graph
+# `cargo deny` checks (`deny.toml`, `all-features = true` already covered
+# dev-dependencies, so the whole `tempfile` subtree was already resolved
+# and licence-checked), so there is no new licence or advisory surface.
+# The *shipped binary* genuinely does gain that subtree, though -- it is
+# linked into `aurora-app` now rather than only into its test harness.
+tempfile = { workspace = true }
 
 # macOS only -- see the workspace `Cargo.toml`'s own comment on `muda`
 # for why Windows/Linux aren't included here. `objc2-app-kit` is already
@@ -87,7 +100,6 @@ objc2-app-kit = { workspace = true }
 # `aurora_doc::LayerTree::insert_pixel_ignoring_the_depth_limit`.
 aurora-doc = { workspace = true, features = ["test-support"] }
 accesskit = { workspace = true }
-tempfile = { workspace = true }
 # Test-only: the autosave file is a real `.aur` ZIP container now
 # (`write_autosave`), so a test can assert its actual archive entries
 # (`mimetype`/`manifest`/`history`) directly rather than only via
