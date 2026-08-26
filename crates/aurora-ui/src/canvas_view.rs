@@ -135,6 +135,19 @@ impl CanvasView {
     /// `(0, 0)` holds `to_document((0, 0))` fixed across the raise, so a
     /// view that satisfied the pan bound before still satisfies it
     /// after.
+    ///
+    /// **This method moves the view**, despite reading like a plain
+    /// bounds setter, and a caller holding anything anchored to the old
+    /// one has to deal with that (0.57.8). Only `to_document((0, 0))`
+    /// is held fixed: for every other point the raise from `z0` to `z1`
+    /// shifts `to_document(x)` by `x * (1/z1 - 1/z0)` — zero at the
+    /// anchor, growing linearly away from it, so it is *not* one
+    /// uniform shift the way a pure pan change would be. `aurora-app`
+    /// carries the live-drag case (a stroke held while the window is
+    /// resized), where a document-space reference point fixed at the
+    /// start of a drag would otherwise be measured against a view that
+    /// moved under it; this crate has no drag to re-anchor and
+    /// deliberately keeps none.
     pub fn set_min_zoom(&mut self, min_zoom: f32) {
         if min_zoom.is_finite() && min_zoom > MAX_ZOOM {
             tracing::error!(

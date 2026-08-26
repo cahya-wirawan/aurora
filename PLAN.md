@@ -8214,7 +8214,7 @@ structural design work.
     genuinely separate work from the zoom floor and are scoped that way
     rather than folded into this fix — the first of the three is a real
     Medium-severity bug that is simply not this round's.
-- [ ] **`select_layer` can reopen the pan-axis render/paint divergence,
+- [x] **`select_layer` can reopen the pan-axis render/paint divergence,
     the same failure shape as RT12-04 on a different trigger.** Found
     2026-08-25 by the fourth review of the zoom-geometry fix above;
     **pre-existing and not introduced by any of the 0.57.x rounds.**
@@ -8240,6 +8240,413 @@ structural design work.
     with a non-zero origin and assert `canvas_local_origin` stays
     non-negative, mirroring
     `applying_the_zoom_floor_cannot_push_the_view_past_a_moved_layers_edge`.
+
+    **Fixed in 0.57.5, completed in 0.57.6.** The shape is the single
+    re-establishing call the item above guessed at:
+    `clamp_pan_to_active_layer(view, layers, active_layer)`
+    (`crates/aurora-app/src/lib.rs`, immediately after
+    `active_layer_origin`). Nothing in
+    `crates/aurora-ui/src/canvas_view.rs` changed — `clamp_pan_to_minimum`
+    was already the right primitive; only the callers were missing.
+
+    **0.57.6 rebuilt how that call is reached, because 0.57.5's version
+    was enforced only by comments.** An independent three-way review
+    reproduced, by mutation, that reordering the clamp before
+    `reset_canvas_view` or deleting it outright from `App::open_file`,
+    `App::open_aur_file` and `App::new` left the entire suite green,
+    including all seven of 0.57.5's own new tests — because every one of
+    them re-spelled the sequence rather than calling it. `App` is not
+    constructible under test (it needs a real `EventLoopProxy`), so the
+    answer was to give each multi-statement sequence a name and test the
+    name:
+
+    - `load_document_view` — `reset_canvas_view` then the clamp, in that
+      order, as one step. Called by all three document-adopting paths.
+      `App::new`'s bare `aurora_ui::CanvasView::default()` (the one
+      spelling 0.57.4 banned at the other two entry points) is gone: it
+      passes `canvas_size: None` and uses `reset_canvas_view`'s own
+      documented "carry the previous floor across" branch.
+    - `commit_ending_drag`'s own `Drag::Move` arm now clamps, so a
+      finished Move re-establishes the bound.
+    - `after_undo_redo` — the composite-cache bump and the clamp, the two
+      things an undo/redo invalidates outside the document model.
+    - `press_layer_row` — end the live drag through the shared commit,
+      *then* `select_layer`. `select_layer` itself still takes the view
+      and clamps, as in 0.57.5.
+
+    `App::clamp_canvas_pan`, 0.57.5's `&mut self` wrapper, no longer
+    exists: every path now goes through one of the four units above.
+    `App::active_layer`'s doc comment was rewritten because it overclaimed
+    — it said "every writer of this field re-clamps", which does not close
+    the risk, since the boundary is `(active layer, that layer's bounds)`
+    and the second half moves without the field changing. It now states
+    the invariant over both inputs and lists where each of the six paths
+    re-establishes it; `active_layer_origin` carries a short version of
+    the same note, being the function whoever adds a bounds-mutating path
+    is likeliest to read.
+
+    **The AC-3 audit of every `active_layer` writer, stated plainly.**
+    Four exist. Three were genuinely vulnerable: `select_layer` (the
+    reported trigger); `App::open_aur_file`, because `aurora_core::Rect`
+    serializes its `x`/`y` through the `.aur` manifest and
+    `App::apply_move` never bakes a Move into pixel data, so a file saved
+    after moving its topmost layer reopens with a non-`(0, 0)`-origin
+    active layer while `reset_canvas_view` zeroes the pan — negative from
+    the *first frame*, no panning needed; and `App::new`'s own
+    crash-recovery branch, which reaches the identical `.aur` round trip
+    through `recover_document`/`read_autosave_container`. Two were
+    provably safe today and are routed through the clamp anyway, because
+    a no-op clamp costs nothing and removes the need for the proof to
+    stay true forever: `App::open_file`'s flat-image path
+    (`document_from_image` hardcodes `(0, 0)`) and `App::new`'s
+    fresh-document path (`demo_document` likewise). That proof is now an
+    executable test rather than a claim in a comment.
+
+    **Honest, user-visible behaviour changes.** Opening a `.aur` file
+    whose topmost layer sits away from `(0, 0)` now starts the view at
+    that layer's own corner rather than at document `(0, 0)`. **And the
+    more common one, which 0.57.5 disclosed only the file case of:
+    clicking a row in the Layers panel can now jump the canvas view by
+    hundreds of document pixels with no other gesture** — that is exactly
+    what `changing_the_active_layer_re_establishes_the_pan_bound`
+    demonstrates, it is correct under the invariant, and it is the single
+    most common interaction this fix touches. Whether it reads as
+    intentional or as a glitch is an interactive judgement, not a
+    testable one: **this needs confirming by a human on real hardware**,
+    per CLAUDE.md's own standing rule about canvas and UI work. Committing
+    a Move and undoing/redoing one can jump the view the same way, for the
+    same reason. All of it is correct under the rule every pan gesture
+    already enforces — the view cannot sit before the active layer's
+    origin — but it *is* a visible difference from before, stated here
+    rather than left to be discovered. The real end state is
+    negative-space panning (signed tile addressing), still deliberately
+    deferred.
+
+    **Fourteen tests in total across the two rounds**, all in
+    `crates/aurora-app/src/lib.rs`. 0.57.5's seven:
+    `changing_the_active_layer_re_establishes_the_pan_bound`,
+    `an_active_layer_change_without_the_re_clamp_is_the_divergence_this_prevents`
+    (the negative control — asserts the un-clamped case is far negative,
+    not marginally so),
+    `an_aur_round_trip_preserves_a_moved_layers_origin_so_the_open_paths_need_the_clamp`
+    (the evidence the open-path exposure is real, through the real
+    `write_autosave`/`recover_document` pair),
+    `loading_a_documents_view_leaves_a_moved_layers_origin_non_negative`
+    (renamed and rewritten in 0.57.6 — it used to re-spell the
+    `reset_canvas_view`-then-clamp sequence, and now calls
+    `load_document_view` itself, so a reorder or deletion inside that
+    function fails here),
+    `the_flat_image_and_demo_documents_active_layer_is_always_at_the_document_origin`,
+    `the_pan_bound_and_the_zoom_floor_compose_in_either_order` (the two
+    clamps commute, because `set_min_zoom` raises zoom through
+    `zoom_at((0, 0), ..)`), and the existing
+    `select_layer_sets_active_layer_and_marks_only_its_own_row_selected`,
+    updated for the new parameters with **no assertion changed** — its
+    passing unmodified is the evidence the accessibility behaviour did
+    not regress. The three behavioural tests were each confirmed failing
+    before the fix (reproducing `(-300.0, -150.0)`) and again with the
+    clamp neutered afterwards, while the two evidence tests and the
+    negative control stayed green through both.
+
+    0.57.6 adds seven, and rewrites one of 0.57.5's in place (above):
+    `loading_a_documents_view_with_no_window_yet_still_clamps`
+    (`App::new`'s `canvas_size: None` branch),
+    `committing_a_move_re_establishes_the_pan_bound` (which also asserts,
+    inline, that the violation really is live mid-drag — the transient
+    this deliberately tolerates),
+    `undoing_a_move_re_establishes_the_pan_bound` (through the real
+    `run_command` and the real `after_undo_redo`, with the un-clamped
+    intermediate state asserted as its own negative control),
+    `selecting_a_layer_row_during_a_live_drag_ends_the_drag_before_the_view_moves`,
+    `a_layer_row_click_commits_a_move_against_the_outgoing_layer_not_the_incoming_one`
+    (the one assertion that can tell `press_layer_row`'s two statements
+    apart by their order),
+    `a_stroke_interrupted_by_a_layer_row_click_still_becomes_its_own_undo_entry`,
+    and `a_user_facing_aur_save_and_open_preserves_a_moved_layers_origin`
+    (the `aurora_io::write_aur`/`read_aur` pair `App::save_aur_file` and
+    `App::open_aur_file` actually call, alongside 0.57.5's autosave-pair
+    evidence — the vulnerability reproduces on the user-facing path too,
+    which is stronger evidence than the round originally claimed).
+
+    **Mutation-tested, one at a time, restored and re-hashed between
+    each.** Neutering the clamp inside `load_document_view`, reordering
+    it before the reset there, deleting the clamp from
+    `commit_ending_drag`'s `Drag::Move` arm, deleting either half of
+    `after_undo_redo`, dropping the commit from `press_layer_row`, and
+    swapping `press_layer_row`'s two statements each fail at least one
+    named test. **The residual, stated plainly**: the `App`-level *call
+    sites* themselves are still unreachable by any test, because `App`
+    needs a real `EventLoopProxy`. There are **six** of them, not the
+    four this paragraph claimed through 0.57.6 (corrected 0.57.7, after
+    the red team pointed out both the miscount and the omission):
+
+    1. `self.canvas_view = load_document_view(..)` in `App::new`
+    2. the same, in `App::open_file`
+    3. the same, in `App::open_aur_file`
+    4. `press_layer_row(..)` in `App::handle_pointer_pressed`'s
+       layer-row branch
+    5. `perform_undo_redo(..)` in `App::run_undo_redo` (0.57.6 listed
+       `after_undo_redo(..)` here; 0.57.7 replaced it — see below)
+    6. `commit_ending_drag(..)` in `App::commit_drag`
+
+    `App::new` was the omitted one, and it is not a harmless omission:
+    the red team's own mutation pass confirmed that reverting it to a
+    bare `aurora_ui::CanvasView::default()` reopens **both** 0.57.4's
+    zoom-floor bug and 0.57.5's pan bug with the whole suite still green,
+    and that hoisting a field assignment above the `load_document_view`
+    call in either open path does the same. **0.57.7 adds two more**
+    sites of the same kind, for eight in total: the
+    `self.commit_drag(interrupted)` that now runs ahead of
+    `handle_pointer_pressed`'s Zoom-tool branch, and the
+    `self.drag.as_mut()` handed to `apply_scroll_zoom` in
+    `App::handle_mouse_wheel`. **0.57.8 adds two more, for ten**: the
+    `apply_canvas_min_zoom(..)` calls in `App::apply_resize` and
+    `App::redraw`, each of which reads `self.drag`/`self.pointer_position`
+    that no test can reach.
+
+    What *did* change, and is worth keeping in view: each site is now a
+    single call to a fully tested atomic unit rather than a
+    two-or-three-statement sequence whose internal order a comment was
+    the only thing enforcing. The mutation that survives is "delete or
+    mis-order the whole call"; the mutation that no longer survives is
+    "break the sequence inside it". **The real fix is making `App`
+    constructible under test**, which is its own, larger change (a seam
+    around `EventLoopProxy`, or an `App` core split from its platform
+    shell) and is deliberately not attempted here — this is a known,
+    now-fully-stated architectural gap, not a new one.
+- [x] **`App::apply_move` and undo/redo of a Move had the same failure
+    shape.** Found 2026-08-25 while fixing the item above;
+    **pre-existing**, same severity class, different trigger. Moving the
+    *active* layer with the Move tool changes `bounds.x`/`bounds.y` —
+    which is the pan boundary itself — so the same unchanged pan can end
+    up outside it, exactly as a layer *switch* did, and undo/redo of a
+    recorded `LayerOp::SetBounds` restores `bounds` the same way.
+
+    0.57.5 deferred both on the grounds that the obvious fix is a
+    feedback loop. **That reasoning was right about the wrong moment.**
+    It holds only for clamping per pointer-move event during a live drag:
+    `continue_drag`'s own `Drag::Move` arm reads a fixed `start_doc`
+    against the live view, so a mid-drag clamp would move `to_document`
+    under it and the layer would chase the clamp. It does not hold at
+    drag *commit*, or after an undo/redo completes — there is no drag in
+    progress at either moment, so there is no loop.
+
+    **Fixed in 0.57.6** at exactly those two moments:
+    `commit_ending_drag`'s own `Drag::Move` arm clamps after
+    `finish_move`, and `run_undo_redo` clamps via `after_undo_redo`
+    alongside the composite-cache bump it already did unconditionally for
+    this same "bounds might have changed" reason. `App::apply_move` itself
+    is unchanged and still does not clamp, deliberately.
+
+    **What remains open, precisely**: the bound is transiently violated
+    *for the duration of a Move drag itself* — from the first pointer-move
+    event until the button comes up. During that window the canvas can
+    render clamped while `CanvasView::to_document` does not agree. That is
+    tolerable, not merely tolerated: the divergence matters because
+    `to_document` is what turns a click into the document point a dab
+    lands on, and no dab is being placed during a `Drag::Move` (a Move
+    drag is not a Brush drag; `handle_pointer_moved` routes to
+    `apply_move`, not `paint_dab`). It is a visual artefact under a
+    pointer that is not painting, and the commit closes it. Closing the
+    transient too would need the drag state machine to track its
+    reference point in a frame the clamp cannot move — its own round, if
+    it is ever worth one.
+- [x] **The 0.57.6 clamp could itself move the view out from under a
+    live drag, at three sites it never audited.** Found 2026-08-26 by the
+    red team reviewing 0.57.6; **introduced by 0.57.6** (the undo/redo
+    site) and pre-existing at the other two. **Fixed in 0.57.7.**
+
+    The hazard is the exact one `press_layer_row` was written to close,
+    stated as a rule: a drag in progress holds a *document-space*
+    reference point fixed from the moment it began (`Drag::Brush`/
+    `Drag::Eraser`'s `last_doc`, `Drag::Move`/`Drag::Marquee`'s
+    `start_doc`), so any path that moves the view under it makes the next
+    pointer-move event measure against a view the drag knows nothing
+    about. 0.57.6 fixed the one site it was reported at and did not audit
+    the others.
+
+    - **`run_undo_redo` (high).** Reproduced here before fixing, at the
+      number the red team reported: an `Undo` arriving mid-stroke moved
+      the view `(40, 40)` -> `(340, 190)` and the very next event placed
+      **55 dabs across a 335 px line with the pointer completely still** —
+      real paint the user never drew. The same call also dropped the live
+      stroke's undo entry, so the `Undo` that caused it reached *past*
+      those pixels into the previous step: `commit_ending_drag`'s own
+      0.57.0 bug, at a fourth site. Fixed by `perform_undo_redo`, a new
+      free function that is the whole activation as one unit — commit the
+      live drag, run the command, *then* `after_undo_redo` — mirroring
+      `press_layer_row`. `App::run_undo_redo` is now a thin `&mut self`
+      wrapper over it, the same split `App::commit_drag` already uses,
+      so the three steps are testable with no `App` and the ordering is
+      not something a caller can get wrong. Committing **before**
+      `run_command` is what makes a mid-stroke `Undo` undo the stroke the
+      user is actually drawing.
+    - **`handle_pointer_pressed`'s Zoom-tool branch (medium).** It
+      `return`ed before reaching the shared "a second press ends the live
+      drag" commit *and* moved the view (`handle_zoom_tool_click` clamps
+      the pan) — the identical pair of bugs `press_layer_row` fixed, one
+      branch further down the same function. A live `Drag::Brush` really
+      does reach it: `z` switches to the Zoom tool mid-stroke without
+      ending the stroke. Fixed by moving the existing commit above the
+      branch, which closes both halves in one line.
+    - **`handle_mouse_wheel` (medium) — fixed differently, deliberately.**
+      Scrolling to zoom while painting is an ordinary thing to do
+      mid-stroke, unlike clicking a layer row or invoking Undo, so
+      forcibly ending the stroke would be worse than the bug. The
+      investigation the review asked for: `zoom_at` holds the document
+      point under its own anchor fixed, and a stored document-space
+      reference *is* a document position, so the zoom itself invalidates
+      nothing. The `clamp_pan_to_minimum` that follows it is what bites —
+      and it only changes `pan`, at a now-fixed zoom, so it shifts
+      `to_document(p)` by the *same* amount for every `p`. So
+      `apply_scroll_zoom` now takes the live drag and re-anchors it by
+      exactly that shift, measured at the zoom anchor where the zoom's
+      own contribution is zero (`shift_drag_reference`). Measured, not
+      assumed: without it, one scroll-zoom against the document edge
+      places **15 dabs with the pointer still**, and shifts a
+      `Drag::Move`'s layer by the same jump. `Drag::Pan` (whose
+      `last_screen` is a *screen* position) and `Drag::Eyedropper` (which
+      holds no reference at all) are deliberately untouched.
+
+    Pairing each fix with the thing it protects is the point, the same as
+    0.57.6's: `perform_undo_redo` owns the commit-run-clamp order, and
+    `apply_scroll_zoom` owns the zoom-then-re-anchor pair, so "move the
+    view without dealing with the live drag" now means bypassing a shared
+    function rather than skipping an optional step.
+    `App::active_layer`'s doc comment states the rule over both
+    directions: every path that moves the view must either end the drag
+    first or re-anchor it. (That rule had a live exception at the moment
+    it was written — see the `set_min_zoom` item below, found by the
+    review of this one.)
+
+    **Four new tests**, all in `crates/aurora-app/src/lib.rs`:
+    `an_undo_during_a_live_stroke_commits_it_instead_of_painting_a_line_the_user_never_drew`
+    (drives the real `perform_undo_redo` and the real `continue_drag`;
+    confirmed failing before the fix, with the 55 dabs measured),
+    `a_stroke_interrupted_by_a_zoom_tool_click_still_becomes_its_own_undo_entry`,
+    `scroll_zooming_mid_stroke_re_anchors_the_stroke_instead_of_painting_a_line_never_drawn`
+    and `scroll_zooming_mid_move_leaves_the_layer_where_the_pointer_put_it`
+    (the latter two confirmed failing with the re-anchor deleted — 15
+    dabs, and a layer that teleports — and carrying their own negative
+    control: a zoom that never reaches the bound must not shift the
+    reference at all).
+
+    **Still open, disclosed rather than fixed**: the `Ctrl+Z`/
+    `Ctrl+Shift+Z` chord does **not** reach `App::run_undo_redo` at all.
+    The red team's report described it as the trigger; on inspection it
+    is not. `handle_key` resolves the chord in `ShortcutRegistry` and
+    runs `run_command` inline, returning `None`, so only the command
+    palette's own Undo/Redo entries and the macOS menu (including its
+    `Cmd+Z` accelerator) reach `run_undo_redo` — which is why the bug
+    above is real, and reachable, but not by the route it was reported
+    by. The consequence is that **the keyboard chord still gets neither
+    half**: no pan re-clamp after an undone Move (0.57.6's fix does not
+    cover its most-travelled route), and no commit of a live stroke
+    before the undo (0.57.0's bug, still live there). This is a real,
+    same-severity gap and it is *not* being quietly deferred — it is
+    left out of 0.57.7 because closing it means changing `handle_key`'s
+    contract so `Undo`/`Redo` are returned to `App` as an
+    `ActivatedCommand` rather than run inline, which orphans its
+    `composite_cache` parameter and touches all six of its call sites.
+    That is a routing change, not a bug fix, and it belongs in its own
+    commit with its own review.
+- [x] **The Move-tool feedback-loop rationale had no test** (RT-06).
+    Found 2026-08-26, same review; **fixed in 0.57.7**. The design
+    argument that `continue_drag`'s own `Drag::Move` arm must never
+    clamp — it would feed the moved view back into a delta derived from
+    a fixed `start_doc`, and the drag would chase itself — shapes the
+    whole Move-tool fix and was defended only by a comment: the red team
+    added the clamp to that arm and the entire suite stayed green.
+    `clamping_inside_the_move_arm_would_feed_back_into_its_own_delta`
+    now drives the real arm and a local re-spelling *with* the banned
+    clamp over the same four-event pointer path, and asserts they
+    diverge: the real one tracks the pointer's own `(80, 80)` delta
+    exactly, the fed-back one runs away from it.
+- [x] **The rule 0.57.7 stated had a live exception in the same commit:
+    `CanvasView::set_min_zoom` moves the view, at two more unaudited
+    sites.** Found 2026-08-26 reviewing 0.57.7; **pre-existing** (both
+    sites predate this whole round). **Fixed in 0.57.8.**
+
+    `set_min_zoom` reads like a plain bounds setter, and is the reason
+    the audit missed it: when the current zoom is below a newly raised
+    floor it raises it through `zoom_at` anchored at `(0, 0)`, which
+    rewrites `pan` as well. `App::apply_resize` and `App::redraw` both
+    call it on every canvas-size or scale-factor change, and neither
+    ends nor re-anchors a live drag — so a window resize, a dock layout
+    change, or a display scale change *while a stroke is held* is the
+    same hazard class as the three sites 0.57.7 fixed, with the same
+    consequence: paint the user never drew.
+
+    **Measured here before fixing, on the same still pointer the other
+    reproductions use**: a view at zoom 0.25 (what a freshly opened
+    document plus a zoom-out leaves, until the next frame re-applies the
+    floor) raised to a 1920 × 1080 canvas's own floor of 0.9375 places
+    **244 dabs from a completely still pointer**, and teleports a
+    `Drag::Move`'s layer by **(-1173, -880) document px**.
+
+    Fixed by re-anchoring, not by ending the drag — a resize mid-stroke
+    is no more "I am done dragging" than a scroll-zoom is — through the
+    same `shift_drag_reference` machinery, in a new
+    `apply_canvas_min_zoom` that pairs the floor with the correction the
+    way `apply_scroll_zoom` already pairs the zoom with it.
+
+    **The algebra does *not* transfer unchanged, which is the part worth
+    recording.** `apply_scroll_zoom`'s correction is one uniform shift
+    measurable at any convenient point, because the only thing that
+    moves the view there is a pan clamp at an already-fixed zoom. This
+    path changes the **zoom**: raising `z0` to `z1` anchored at `(0, 0)`
+    leaves `pan` at `p0 * z1 / z0`, so
+    `to_document_after(x) - to_document_before(x) = x * (1/z1 - 1/z0)` —
+    exactly zero at the anchor and growing linearly away from it. So the
+    correction is measured at the **pointer** specifically, which is the
+    point that makes a single shift correct anyway: `Drag::Brush`/
+    `Eraser`'s `last_doc` *is* `to_document(pointer)` as of the last
+    move event, and `Drag::Move`/`Marquee`'s `start_doc` enters only as
+    `to_document(pointer) - start_doc`, which shifting both ends leaves
+    alone. Measuring at the anchor instead — the "it should transfer"
+    mistake — corrects by nothing at all; both that and deleting the
+    re-anchor outright were mutation-tested and each fails two of the
+    three new tests.
+
+    **Three new tests**, all in `crates/aurora-app/src/lib.rs`:
+    `resizing_mid_stroke_re_anchors_the_stroke_instead_of_painting_a_line_never_drawn`
+    (carrying its own negative control: the same raise with no drag
+    handed over paints the 244 dabs),
+    `resizing_mid_move_leaves_the_layer_where_the_pointer_put_it` (with
+    the other negative control: a floor the view already satisfies moves
+    nothing and must correct nothing), and
+    `raising_the_zoom_floor_shifts_to_document_by_a_different_amount_at_every_point`,
+    which pins the non-uniform identity above so the next reader cannot
+    re-derive the wrong one.
+
+    **The one file outside `aurora-app` this whole multi-round fix has
+    touched**: `crates/aurora-ui/src/canvas_view.rs`, doc comment only —
+    `set_min_zoom` now says it moves the view and states the shift.
+    No behaviour there changed.
+
+    **Two adjacent residuals, stated rather than absorbed.** (1) When
+    the pointer is not over the canvas area (`pointer_in_canvas` returns
+    `None` — over a dock panel, or off the window) there is no point to
+    measure at and the floor is applied with no correction. No drag can
+    advance in that state (`App::handle_pointer_moved` returns before
+    `continue_drag`), and a pointer that leaves the canvas area and
+    returns already interpolates across the excursion, so this is a
+    smaller error inside an already-approximate case — but it is not
+    zero. (2) A layout change that moves the canvas *area's own origin*
+    (a rail resize, say) shifts `to_document(pointer)` on its own, since
+    the view speaks canvas-relative coordinates; this correction
+    brackets `set_min_zoom` only and does not cover that. A rail resize
+    cannot coexist with a canvas drag today (`handle_pointer_pressed`
+    starts one or the other, never both), so it is recorded, not fixed.
+- [ ] **`aurora_doc::LayerTree::set_bounds` accepts any `Rect`, including
+    negative and `i64::MAX` origins.** Found 2026-08-26 by the red team
+    while reviewing the pan-clamp fix; informational, low, **unrelated to
+    that fix** and deliberately not addressed by it. There is no ceiling
+    check against the 300,000 × 300,000 px document limit (PRD §7.3.1) and
+    no rejection of a negative origin, so a corrupt or hand-edited `.aur`
+    manifest can put a layer somewhere the tile store cannot address. The
+    pan clamp is not the place to fix it — validation belongs in
+    `aurora-doc` (or at the `.aur` reader), where the invariant is owned.
 - [ ] **Panning past the document's *far* edge has no bound matching the
     origin-side one.** Found 2026-08-25, same review; informational, low.
     `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together
@@ -12228,6 +12635,134 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-08-26 (0.57.8) — the rule 0.57.7 wrote down had a live
+exception in the same commit.** `App::active_layer`'s doc comment states
+it plainly: *every* path that moves the view must either end the live
+drag or re-anchor it. Reviewing 0.57.7 found two paths that did neither.
+`aurora_ui::CanvasView::set_min_zoom` **moves the view** — below a newly
+raised floor it raises the zoom through `zoom_at` anchored at `(0, 0)`,
+rewriting `pan` too — and `App::apply_resize` and `App::redraw` both call
+it on every canvas-size or scale-factor change. So a window resize, a
+dock layout change, or a display scale change *while a stroke is held*
+is the same bug as the three sites 0.57.7 fixed: measured here before
+fixing, **244 dabs from a completely still pointer**, and a
+`Drag::Move`'s layer teleporting **(-1173, -880) document px**. Fixed by
+re-anchoring rather than ending the drag (resizing mid-stroke is not "I
+am done dragging"), through the same `shift_drag_reference` the
+scroll-zoom fix added, in a new `apply_canvas_min_zoom` that pairs the
+floor with the correction. **The scroll-zoom algebra does not transfer
+unchanged, and assuming it did would fix nothing**: that correction is
+uniform because only `pan` moves there, while this one changes the
+*zoom*, so the shift is `x * (1/z1 - 1/z0)` — zero at the anchor,
+different at every other point — and it is therefore measured at the
+**pointer**, the point every drag's own reference is derived from. Three
+new tests (280 in `aurora-app`, up from 277), each carrying a negative
+control; deleting the re-anchor and measuring it at the anchor instead
+were both mutation-tested and each fails two of the three. Also here:
+the `Ctrl+Z` routing gap's disclosure is now a comment on `handle_key`'s
+own Undo/Redo branch, where someone editing it will actually see it, not
+only on `App::run_undo_redo`. This is the first change in this whole
+multi-round fix to touch a file outside `aurora-app` —
+`crates/aurora-ui/src/canvas_view.rs`, doc comment only, no behaviour.
+**Still open**, unchanged: the `Ctrl+Z` chord itself still reaches
+neither the mid-stroke commit nor the pan re-clamp (a routing change to
+`handle_key`'s contract, its own commit); the `App`-level call sites —
+**ten** now — remain mutation-survivable because `App` needs a real
+`EventLoopProxy`; and two smaller residuals this fix does not cover are
+named in M1.9's own list (a pointer that is not over the canvas area has
+no point to measure at, and a layout change that moves the canvas area's
+own origin shifts `to_document` on its own).
+
+**Addendum 2026-08-26 (0.57.7) — the 0.57.6 clamp reviewed in turn, and
+the three sites where it moved the view under a live drag.** The review
+of 0.57.6 found that the rule `press_layer_row` established was applied
+at the site it was reported at and nowhere else. **(1) The new
+`after_undo_redo` clamp, reached with a stroke still held, moved the view
+`(40, 40)` -> `(340, 190)` and the next event painted 55 dabs across a
+335 px line with the pointer completely still** — reproduced here before
+fixing — while also dropping that stroke's undo entry so the `Undo`
+reached past it into the previous step. `perform_undo_redo` is now the
+whole activation as one unit (commit the live drag, run the command, then
+re-establish), with `App::run_undo_redo` a thin wrapper. **(2) The
+Zoom-tool click branch** `return`ed before the shared commit *and* moved
+the view — the identical pair, one branch further down the same function;
+the commit now runs ahead of it. **(3) Scroll-to-zoom** gets a different
+fix on purpose: zooming mid-stroke is an ordinary gesture, so
+`apply_scroll_zoom` re-anchors the live drag by exactly the shift its own
+pan clamp introduced (`shift_drag_reference`) rather than ending it —
+without which one scroll against the document edge places 15 dabs from a
+still pointer. Also fixed: the Move-tool feedback-loop rationale now has
+the negative-control test it never had, `select_layer`'s doc comment
+(accidentally merged into `press_layer_row`'s) is back where it belongs,
+and the residual disclosure's call-site count is corrected from four to
+six, naming `App::new`. Four new tests plus the negative control (277 in
+`aurora-app`, up from 272). **Disclosed, not fixed**: `Ctrl+Z` itself
+never reaches `App::run_undo_redo` — `handle_key` resolves the chord and
+runs `run_command` inline — so the keyboard route still gets neither the
+pan re-clamp nor the mid-stroke commit. That is a real gap of the same
+severity; closing it is a routing change to `handle_key`'s contract and
+belongs in its own commit. The `App`-level call sites (eight now) remain
+mutation-survivable because `App` needs a real `EventLoopProxy`; making
+`App` testable is the known, larger fix and is still not attempted.
+
+**Addendum 2026-08-26 (0.57.6) — the pan-clamp fix reviewed, and the
+three gaps the review found closed.** An independent three-way review of
+0.57.5 (critic, red team, verifier) confirmed every claim it made *and*
+found it incomplete in three ways. All three are now fixed. **(1) The
+Move tool and undo/redo were live, reachable instances of the very bug
+0.57.5 fixed**, disclosed but deferred on reasoning that turned out to
+apply only to clamping mid-drag, not at drag commit or after an
+undo/redo completes — there is no drag in progress at either moment, so
+the feedback loop the deferral feared cannot occur.
+`commit_ending_drag`'s `Drag::Move` arm and the new `after_undo_redo` now
+close both. **(2) The ordering at the `App`-level call sites was enforced
+only by comments** — mutation testing showed the clamp could be reordered
+or deleted from three of four call sites with the whole suite still
+green, because 0.57.5's tests re-spelled each sequence instead of calling
+it. Each sequence is now a named, tested unit (`load_document_view`,
+`after_undo_redo`, `press_layer_row`), and every such mutation now fails
+a named test. `App::new`'s bare `CanvasView::default()` is gone with it.
+**(3) `select_layer` could clamp the view out from under a live drag**,
+because the Layers-panel row branch returned before reaching the shared
+"a second press ends the drag" commit; `press_layer_row` ends the drag
+first, which also recovers an interrupted stroke's undo entry that branch
+used to drop. Seven new tests and one rewritten (272 in `aurora-app`, up
+from 265). Also
+disclosed: **clicking a Layers-panel row can now jump the canvas view by
+hundreds of document pixels** — correct under the invariant, the most
+common interaction this touches, and **needing a human on real hardware**
+to say whether it reads as intentional. Still open by design: the bound
+is violated for the duration of a Move drag itself, which is a visual
+artefact under a pointer that is not painting.
+
+**Addendum 2026-08-25 (0.57.5) — the pan-axis counterpart of the zoom
+fix: changing the active layer moves the *boundary*, and nothing
+re-established it.** 0.57.4 disclosed this and deliberately left it; this
+round fixes it. The pan bound is the view's pan measured against the
+active layer's own origin, so switching to a layer at, say, `(300, 150)`
+leaves `canvas_local_origin` at `(-300, -150)` with no clamp ever
+running — and a negative local origin is the render/paint divergence
+`clamp_pan_to_minimum` exists to close (`TileResidency::set_origin`
+clamps it; `CanvasView::to_document`, which turns a click into the
+document point a dab lands on, does not). One new free function,
+`clamp_pan_to_active_layer`, is now called by `select_layer` itself and
+by every document-open path. An audit of all four `active_layer` writers
+found **three** genuinely vulnerable — `select_layer`, `App::open_aur_file`
+and `App::new`'s crash-recovery branch, the latter two because a `.aur`
+file round-trips a moved layer's origin and `reset_canvas_view` zeroes
+the pan, so those start negative on the *first frame* with no panning at
+all — and two provably safe today, routed through the clamp anyway.
+Nothing in `crates/aurora-ui/src/canvas_view.rs` changed. Seven tests;
+the three behavioural ones were confirmed failing before the fix.
+**Visible consequence, stated rather than buried**: opening a `.aur`
+file whose topmost layer sits away from `(0, 0)` now starts the view at
+that layer's corner instead of at document `(0, 0)`. **And one sibling
+disclosed, not fixed**: `App::apply_move` has the identical shape, but
+clamping inside it would fight `continue_drag`'s own fixed `start_doc`
+and make the layer chase the clamp mid-drag — its own M1.9 item above.
+*(Superseded by 0.57.6, which fixed it at drag commit instead, where no
+drag is in progress and no such loop exists.)*
 
 **Addendum 2026-08-25 (0.57.4) — the floor was still lapsing on every
 document open, and the round had reintroduced its own defect class.** A

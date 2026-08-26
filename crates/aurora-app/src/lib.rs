@@ -2985,6 +2985,14 @@ fn handle_key(
         // Only Undo/Redo can change what a composite tile shows -- see
         // `App::run_undo_redo`'s own matching bump for the command-
         // palette/menu path to the same two commands.
+        //
+        // And that split is a disclosed, still-open gap, not a detail:
+        // `Ctrl+Z`/`Ctrl+Shift+Z` runs Undo/Redo *here*, inline, so it
+        // reaches neither half of `perform_undo_redo` -- no commit of a
+        // live stroke before the undo, and no pan re-clamp after an
+        // undone Move. See PLAN.md's own residual disclosure (0.57.7)
+        // before editing this branch; closing it is a change to this
+        // function's contract, not a line here.
         if matches!(command, AppCommand::Undo | AppCommand::Redo) {
             composite_cache.bump();
         }
@@ -3453,12 +3461,38 @@ fn finish_move(
 /// name a surface belonging to a document that is no longer open.
 /// Dropping it is correct there, and it is the only place dropping one
 /// is.
+///
+/// **Takes `view`/`active_layer` because committing a `Drag::Move` is
+/// one of the two ways the pan boundary moves** (the other is the
+/// active layer itself changing — [`select_layer`]). A Move rewrites
+/// the layer's own `bounds` (`App::apply_move`), and the pan bound is
+/// measured against exactly that origin ([`active_layer_origin`]), so a
+/// finished Move can leave a pan that never moved sitting outside its
+/// own bound — the same `(-300, -150)` `canvas_local_origin` divergence
+/// [`clamp_pan_to_active_layer`] describes. Re-establishing it *here*,
+/// rather than in each of the three callers, is what stops the next
+/// path that ends a drag from silently reopening it — the same reason
+/// the commit itself lives in one shared place.
+///
+/// Only at the commit, deliberately not per pointer-move event:
+/// `continue_drag`'s own `Drag::Move` arm derives its delta from a
+/// *fixed* `start_doc` through `view.to_document`, so clamping the view
+/// mid-drag would feed the moved view back into the next event's delta
+/// and chase itself. At the commit there is no drag left in progress,
+/// so there is no loop to close. The cost is a transient violation for
+/// the duration of the drag itself: the canvas can render clamped while
+/// `to_document` does not agree, which is a visual artefact under the
+/// pointer that is *not* being used to paint (a `Drag::Move` is not a
+/// `Drag::Brush`), and it is resolved by this clamp the moment the drag
+/// ends.
 fn commit_ending_drag(
     drag: Option<Drag>,
     layers: &aurora_doc::LayerTree,
     history: &mut aurora_doc::History,
     pixel_history: &mut aurora_brush::PixelHistory,
     undo_order: &mut UndoOrder,
+    view: &mut aurora_ui::CanvasView,
+    active_layer: Option<aurora_doc::LayerId>,
 ) {
     match drag {
         Some(
@@ -3482,14 +3516,27 @@ fn commit_ending_drag(
             layer_id,
             start_bounds,
             ..
-        }) => finish_move(
-            layers,
-            history,
-            pixel_history,
-            undo_order,
-            layer_id,
-            start_bounds,
-        ),
+        }) => {
+            finish_move(
+                layers,
+                history,
+                pixel_history,
+                undo_order,
+                layer_id,
+                start_bounds,
+            );
+            // The move is over, `layers` already carries the new
+            // bounds, and no drag is in progress -- see this function's
+            // own doc comment for why the clamp belongs at exactly this
+            // point and nowhere earlier. Clamped against the *active*
+            // layer, not this drag's own `layer_id`: the pan bound is
+            // defined by whichever layer is active, and those are the
+            // same layer for every move a user can actually start
+            // (`begin_drag` takes `Move`'s id from `active_pixel_layer`)
+            // -- so this is the definition, spelled out, rather than a
+            // second source of truth that could drift from it.
+            clamp_pan_to_active_layer(view, layers, active_layer);
+        }
         _ => {}
     }
 }
@@ -3717,16 +3764,81 @@ fn zoom_steps_for_scroll(delta: winit::event::MouseScrollDelta) -> f32 {
 /// `anchor` fixed, and that new `pan` can land past the document's own
 /// top-left edge just as easily as a plain `pan_by` can (see
 /// `continue_drag`'s own doc comment for why that must never happen).
+///
+/// **Takes the live `drag`, if there is one, because that clamp moves
+/// the view** (0.57.7) — and a drag in progress is holding a
+/// document-space reference point fixed from the moment it began. The
+/// two are paired here, in the one function, rather than left to each
+/// caller to remember: see [`shift_drag_reference`] for why re-anchoring
+/// is the right answer for *this* gesture where ending the drag is the
+/// right answer for a layer-row click ([`press_layer_row`]) or an undo
+/// ([`perform_undo_redo`]).
 fn apply_scroll_zoom(
     view: &mut aurora_ui::CanvasView,
+    drag: Option<&mut Drag>,
     anchor: (f32, f32),
     delta: winit::event::MouseScrollDelta,
     min_doc: (f32, f32),
 ) {
+    let before = view.to_document(anchor);
     let steps = zoom_steps_for_scroll(delta);
     let factor = ZOOM_WHEEL_BASE.powf(steps);
     view.zoom_at(anchor, view.zoom() * factor);
     view.clamp_pan_to_minimum(min_doc);
+    let after = view.to_document(anchor);
+    if let Some(drag) = drag {
+        shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+    }
+}
+
+/// Moves every document-space reference point a live `drag` is holding
+/// by `delta`, after something moved `view` out from under it.
+///
+/// **Why a drag survives this at all, unlike the ones
+/// [`press_layer_row`] and [`perform_undo_redo`] end outright**
+/// (0.57.7). Clicking a Layers-panel row, or invoking Undo, is a
+/// gesture that says "I am done with this drag"; scrolling to zoom
+/// while painting is not — it is an ordinary thing to do mid-stroke,
+/// and forcibly ending the stroke would be worse than the bug. So this
+/// path keeps the drag and re-anchors it instead.
+///
+/// **Why a single uniform `delta` is the exact correction.**
+/// [`aurora_ui::CanvasView::zoom_at`] holds the document point under
+/// its own anchor fixed, and a stored document-space reference *is* a
+/// document position, so a pure zoom leaves every one of them still
+/// naming the same place: nothing to correct. The clamp that follows it
+/// ([`aurora_ui::CanvasView::clamp_pan_to_minimum`]) is what actually
+/// bites — and it only ever changes `pan`, at a zoom now fixed, so it
+/// shifts `to_document(p)` by the same amount for every `p`. Measuring
+/// that shift at the zoom anchor (where the zoom's own contribution is
+/// exactly zero) therefore yields the whole correction, for reference
+/// points anywhere on the canvas.
+///
+/// Without it, a scroll-zoom that hits the pan bound left a live
+/// `Drag::Brush`'s own `last_doc` naming the pre-clamp document
+/// position while `continue_drag` read the post-clamp one from the
+/// moved view — and the next pointer-move event interpolated a whole
+/// segment of dabs between them, paint the user never drew. The same
+/// stale reference shifts a `Drag::Move`'s layer and a
+/// `Drag::Marquee`'s rect by the same jump.
+///
+/// `Drag::Pan` and `Drag::Eyedropper` are deliberately untouched, not
+/// overlooked: a pan's own `last_screen` is a *screen* position, which a
+/// view move does not invalidate (and its arm re-clamps on its own next
+/// event), and an eyedropper holds no reference point at all — it
+/// samples wherever the pointer currently is.
+fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
+    match drag {
+        Drag::Marquee { start_doc } | Drag::Move { start_doc, .. } => {
+            start_doc.0 += delta.0;
+            start_doc.1 += delta.1;
+        }
+        Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => {
+            last_doc.0 += delta.0;
+            last_doc.1 += delta.1;
+        }
+        Drag::Pan { .. } | Drag::Eyedropper => {}
+    }
 }
 
 /// How much one Zoom-tool click zooms in (or, with `Alt` held, out) —
@@ -3818,6 +3930,13 @@ fn active_pixel_layer(
 /// surface-local space, now that a layer can actually sit somewhere
 /// other than the document's own origin (`aurora_doc::LayerTree::set_bounds`,
 /// the Move tool's own document-model support).
+///
+/// **This value is also the canvas pan boundary**
+/// ([`clamp_pan_to_active_layer`]), so it moves when *either* of its two
+/// inputs does: a different layer becoming active, or the active
+/// layer's own `bounds` changing under it. Any new code path that does
+/// either must re-clamp — see [`App::active_layer`]'s own doc comment
+/// for the full list of the ones that already do.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 fn active_layer_origin(
@@ -3826,6 +3945,154 @@ fn active_layer_origin(
 ) -> (f32, f32) {
     active_pixel_layer(layers, active_layer)
         .map_or((0.0, 0.0), |(_, bounds)| (bounds.x as f32, bounds.y as f32))
+}
+
+/// Re-establishes the pan bound after the *boundary* moved rather than
+/// the pan.
+///
+/// [`aurora_ui::CanvasView::clamp_pan_to_minimum`] bounds the view
+/// against the active layer's own origin ([`active_layer_origin`], the
+/// value [`canvas_local_origin`] subtracts), and every gesture that
+/// moves the *pan* already calls it ([`continue_drag`],
+/// [`apply_scroll_zoom`], [`handle_zoom_tool_click`]). This is the
+/// counterpart for the other way the same invariant breaks: the active
+/// layer's own origin changing moves the boundary out from under a pan
+/// that never moved. Switching from a layer at document `(0, 0)` to one
+/// at `(300, 150)` leaves `canvas_local_origin` at `(-300, -150)` with
+/// no clamp ever running — and a negative local origin is precisely the
+/// render/paint divergence `clamp_pan_to_minimum`'s own doc comment
+/// describes (`aurora_gpu::TileResidency::set_origin` clamps it to the
+/// layer's own corner; `CanvasView::to_document`, which turns a click
+/// into the document point a dab lands on, does not).
+///
+/// The active layer's own origin is not the only way this breaks:
+/// *that layer's own `bounds` changing* moves the same boundary without
+/// the active layer changing at all (the Move tool, and an undo/redo of
+/// one). See [`App::active_layer`]'s own doc comment for the full list
+/// of paths that have to re-clamp and where each does it.
+///
+/// **Ordering matters**: this must run *after* any
+/// [`reset_canvas_view`] call, since that resets the pan to `(0, 0)` —
+/// which is not within a moved layer's own bound. Callers do not get to
+/// choose: [`load_document_view`] is the two of them as one step, and
+/// is what the document-open paths call.
+fn clamp_pan_to_active_layer(
+    view: &mut aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+) {
+    view.clamp_pan_to_minimum(active_layer_origin(layers, active_layer));
+}
+
+/// Everything an `Undo`/`Redo` invalidates *outside* the document model
+/// itself — run after [`run_command`] has already applied the command.
+///
+/// Both halves are here for the same reason: either command can
+/// revert/reapply a `LayerOp::SetBounds` (`aurora_doc::History::undo`
+/// and `::redo` both return the dirtied `Rect`), so the active layer's
+/// own origin can move without [`App::active_layer`] itself changing.
+/// That invalidates the composite cache (a moved layer's content lands
+/// at different composite tiles) *and* the pan bound (which is measured
+/// against exactly that origin — [`clamp_pan_to_active_layer`]). The
+/// cache half was already unconditional for precisely this reason; the
+/// pan half was the missing counterpart, and an undone Move reproduced
+/// the same `canvas_local_origin` divergence a layer *switch* does.
+///
+/// Unconditional rather than "only when the command really was a
+/// structural one": both are idempotent no-ops when nothing moved (the
+/// clamp leaves a pan already within its bound untouched), and
+/// `run_command` deliberately reports nothing back about what it ran.
+/// Kept a free function so the pairing is testable with no `App` — and
+/// therefore no GPU adapter — to build.
+fn after_undo_redo(
+    view: &mut aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    composite_cache: &mut CompositeCache,
+) {
+    composite_cache.bump();
+    clamp_pan_to_active_layer(view, layers, active_layer);
+}
+
+/// One `Undo`/`Redo` activation, whole: end whatever drag was still
+/// live ([`commit_ending_drag`]), *then* run the command
+/// ([`run_command`]), *then* re-establish everything it invalidated
+/// outside the document model ([`after_undo_redo`]).
+///
+/// **The order is the point, which is why this is a function** — the
+/// same reason [`press_layer_row`] is one, closing the same hazard at
+/// the second site it turned up at (0.57.7). `after_undo_redo` clamps
+/// the pan, i.e. it moves the view. A drag in progress holds a
+/// document-space reference point fixed at the moment it began
+/// (`Drag::Brush`/`Drag::Eraser`'s own `last_doc`, `Drag::Move`/
+/// `Drag::Marquee`'s own `start_doc`), so clamping the view out from
+/// under one makes the next pointer-move event compute its delta
+/// against a view that moved for reasons the drag knows nothing about.
+/// For a `Drag::Brush` that is not a cosmetic glitch: undoing while a
+/// stroke is still held moved the view `(40, 40)` -> `(340, 190)` and
+/// the very next event interpolated **55 dabs across a 335 px line
+/// with the pointer completely still** — real paint the user never
+/// drew.
+///
+/// Committing first also closes the same second, older hole
+/// `press_layer_row` found in its own branch: the live stroke's pixels
+/// were already on the layer with no undo entry naming them, so the
+/// very `Undo` that triggered this reached *past* them into the
+/// previous step — [`commit_ending_drag`]'s own 0.57.0 bug, at a fourth
+/// site. With the commit in place the mid-stroke `Undo` undoes the
+/// stroke the user is actually drawing, which is what pressing it means.
+///
+/// Committing **before** `run_command`, not after, is what makes that
+/// true: the commit is what turns the in-progress stroke into the
+/// entry the command is then free to reverse. Reversed, the command
+/// would undo the step underneath a stroke whose pixels are still
+/// live, and the commit would then push an entry whose captured tiles
+/// describe content the undo had already replaced.
+///
+/// Every path that reaches `Undo`/`Redo` with a `Drag` to worry about
+/// goes through here ([`App::run_undo_redo`], the `&mut self` wrapper
+/// [`App::commit_drag`] is for `commit_ending_drag`). Calling
+/// `after_undo_redo` directly instead is what "clamp without first
+/// ending any live drag" now costs.
+#[allow(clippy::too_many_arguments)]
+fn perform_undo_redo(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+    tool: &mut aurora_ui::Tool,
+    layers: &mut aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    store: Option<&mut aurora_tile::TileStore>,
+    undo_order: &mut UndoOrder,
+    composite_cache: &mut CompositeCache,
+    view: &mut aurora_ui::CanvasView,
+    active_layer: Option<aurora_doc::LayerId>,
+    drag: &mut Option<Drag>,
+    command: AppCommand,
+) {
+    commit_ending_drag(
+        drag.take(),
+        layers,
+        history,
+        pixel_history,
+        undo_order,
+        view,
+        active_layer,
+    );
+    run_command(
+        workspace,
+        focus,
+        palette,
+        tool,
+        layers,
+        history,
+        pixel_history,
+        store,
+        undo_order,
+        command,
+    );
+    after_undo_redo(view, layers, active_layer, composite_cache);
 }
 
 /// The reserved `aurora_tile::SurfaceId` this crate uses for its own
@@ -6071,20 +6338,85 @@ fn composite_document(
     aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples)
 }
 
-/// Selects `layer_id` as the active layer: sets `*active_layer` and
-/// marks its own Layers-panel row (`layer_rows` —
+/// One press on a Layers-panel row, whole: end whatever drag was still
+/// live ([`commit_ending_drag`]) and *then* select the row's layer
+/// ([`select_layer`]).
+///
+/// **The order is the point, which is why this is a function.**
+/// `select_layer` re-establishes the pan bound against the newly active
+/// layer, i.e. it moves the view. A drag in progress holds a reference
+/// point fixed at the moment it began — `Drag::Pan`'s own `last_screen`,
+/// `Drag::Move`/`Drag::Marquee`'s own `start_doc` — so clamping the view
+/// out from under one makes the next pointer-move event compute its
+/// delta against a view that moved for reasons the drag knows nothing
+/// about. `Drag::Pan` happens to recover on its own next event (its arm
+/// re-clamps), but that is a coincidence of one variant, not an
+/// invariant: `Drag::Marquee`, `Drag::Brush`, `Drag::Eraser` and
+/// `Drag::Eyedropper` never clamp at all. Not having a live drag here is
+/// the invariant.
+///
+/// [`perform_undo_redo`] is the same shape for the same reason, at the
+/// second site the hazard turned up at (0.57.7).
+///
+/// Ending it via the shared commit rather than dropping it also closes a
+/// second, older hole in this branch, which used to `return` before ever
+/// reaching `handle_pointer_pressed`'s own "a second press ends the live
+/// drag" commit: a brush stroke interrupted by a layer-row click lost
+/// its whole undo entry, exactly the 0.57.0 bug
+/// [`commit_ending_drag`]'s own doc comment describes for the other
+/// gestures.
+///
+/// Pushing the updated accessibility tree and bumping the composite
+/// cache stay the caller's job — the same split [`select_layer`] itself
+/// already documents.
+#[allow(clippy::too_many_arguments)]
+fn press_layer_row(
+    workspace: &mut aurora_ui::Workspace,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+    drag: &mut Option<Drag>,
+    layer_id: aurora_doc::LayerId,
+) {
+    commit_ending_drag(
+        drag.take(),
+        layers,
+        history,
+        pixel_history,
+        undo_order,
+        view,
+        *active_layer,
+    );
+    select_layer(workspace, layer_rows, active_layer, view, layers, layer_id);
+}
+
+/// Selects `layer_id` as the active layer: sets `*active_layer`, marks
+/// its own Layers-panel row (`layer_rows` —
 /// `aurora_ui::populate_layers_panel`'s own return value) as accessibly
 /// selected (`accesskit::Node::set_selected`), clearing that state from
-/// every other row. Pushing the updated accessibility tree to the
-/// platform is the caller's job (`App::push_accessibility`) — this
-/// function only touches `workspace`/`active_layer`, the same "pure
-/// dispatch, caller owns the one real platform side-effect" split every
-/// other function in this crate already uses
-/// (`open_crash_recovery_dialog`, `begin_drag`, ...).
+/// every other row, and re-establishes `view`'s own pan bound against
+/// the newly active layer ([`clamp_pan_to_active_layer`]). Pushing the
+/// updated accessibility tree to the platform is still the caller's job
+/// (`App::push_accessibility`), the same "pure dispatch, caller owns the
+/// one real platform side-effect" split every other function in this
+/// crate already uses (`open_crash_recovery_dialog`, `begin_drag`, ...).
+///
+/// The pan clamp is **not** an unrelated extra. The pan bound is
+/// `view`'s own pan measured against the *active layer's* own origin, so
+/// this function moving `*active_layer` is itself what can violate it —
+/// see [`clamp_pan_to_active_layer`]. Taking `view`/`layers` rather than
+/// leaving the clamp to the caller is what stops the next new call site
+/// from silently reopening the bug.
 fn select_layer(
     workspace: &mut aurora_ui::Workspace,
     layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
     active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
     layer_id: aurora_doc::LayerId,
 ) {
     *active_layer = Some(layer_id);
@@ -6098,6 +6430,11 @@ fn select_layer(
             tracing::warn!(?err, "failed to update a layer row's selection state");
         }
     }
+    // After the row loop, not before: nothing here depends on the
+    // ordering, but keeping the accessibility work untouched and the
+    // new bound re-established at the end keeps this function's two
+    // jobs readable as two jobs.
+    clamp_pan_to_active_layer(view, layers, Some(layer_id));
 }
 
 /// Creates a fresh scratch directory for one session's tile store,
@@ -6595,6 +6932,77 @@ fn canvas_min_zoom(canvas_size: (u32, u32), scale_factor: f64) -> f32 {
     min_zoom
 }
 
+/// Applies [`canvas_min_zoom`]'s own floor to `view`, re-anchoring a
+/// live `drag` against the view move that floor can cause (0.57.8).
+///
+/// **`aurora_ui::CanvasView::set_min_zoom` moves the view**, which is
+/// easy to miss because it reads as a bounds setter. When the current
+/// zoom is below a newly raised floor it raises it through `zoom_at`
+/// anchored at the canvas area's own top-left corner, and that rewrites
+/// `pan` too — so `to_document(p)`, the conversion that turns the
+/// pointer into the document point a dab lands on, names a different
+/// place for every `p` but the anchor itself. A live drag holds a
+/// *document-space* reference point fixed from the moment it began, so
+/// this is the same hazard [`apply_scroll_zoom`] closes for
+/// scroll-to-zoom, reached from `App::apply_resize` and `App::redraw`:
+/// a window resize, a dock layout change, or a scale-factor change
+/// while a stroke is still held. Resizing a window mid-stroke is no
+/// more "I am done dragging" than scrolling is, so this re-anchors the
+/// drag ([`shift_drag_reference`]) rather than ending it, and pairs the
+/// two in one function for the same reason `apply_scroll_zoom` does:
+/// so moving the view without dealing with the live drag means
+/// bypassing a shared function rather than skipping an optional step.
+///
+/// **Why the correction is measured at the pointer, and why the
+/// scroll-zoom argument does not simply transfer.** There, the only
+/// thing that moves the view is a pan clamp at an already-fixed zoom,
+/// which shifts `to_document(p)` by the *same* amount for every `p` —
+/// so any measuring point does, and the zoom anchor is the convenient
+/// one. That reasoning does **not** hold here, and assuming it did
+/// would correct by the wrong amount: this path changes the *zoom*.
+/// Raising `z0` to `z1` anchored at `(0, 0)` leaves `pan` at
+/// `p0 * z1 / z0`, so
+///
+/// ```text
+/// to_document_after(x) - to_document_before(x) = x * (1/z1 - 1/z0)
+/// ```
+///
+/// — exactly zero at the anchor and growing linearly away from it, not
+/// one shift for the whole canvas. The pointer is the point that makes
+/// a single shift right anyway, because every live drag's reference is
+/// derived from it and compared against it: `Drag::Brush`/`Eraser`'s
+/// `last_doc` *is* `to_document(pointer)` as of the last move event, so
+/// shifting it by the change measured there leaves the next event's
+/// segment exactly the pointer's own travel (nothing, for a still
+/// pointer); `Drag::Move`/`Drag::Marquee`'s `start_doc` enters only as
+/// `to_document(pointer) - start_doc`, and shifting both ends by the
+/// same amount leaves that difference untouched, so the layer does not
+/// teleport.
+///
+/// `pointer` is the pointer's canvas-area-relative position
+/// ([`pointer_in_canvas`]) — `None` when it is over a dock panel, off
+/// the window, or before the first layout. There is then no point to
+/// measure at, so the floor is applied with no correction rather than a
+/// guessed one: no drag advances while the pointer is not over the
+/// canvas (`App::handle_pointer_moved` returns before reaching
+/// [`continue_drag`]), and a pointer that leaves the canvas area and
+/// comes back already interpolates across wherever it went in between.
+fn apply_canvas_min_zoom(
+    view: &mut aurora_ui::CanvasView,
+    drag: Option<&mut Drag>,
+    pointer: Option<(f32, f32)>,
+    min_zoom: f32,
+) {
+    let (Some(drag), Some(pointer)) = (drag, pointer) else {
+        view.set_min_zoom(min_zoom);
+        return;
+    };
+    let before = view.to_document(pointer);
+    view.set_min_zoom(min_zoom);
+    let after = view.to_document(pointer);
+    shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+}
+
 /// A freshly reset [`aurora_ui::CanvasView`] for a newly opened
 /// document — default pan and zoom, but **never** a lapsed zoom floor.
 ///
@@ -6630,6 +7038,46 @@ fn reset_canvas_view(
     );
     let mut view = aurora_ui::CanvasView::default();
     view.set_min_zoom(min_zoom);
+    view
+}
+
+/// The whole canvas-view half of adopting a freshly loaded document:
+/// [`reset_canvas_view`] and then [`clamp_pan_to_active_layer`], in that
+/// order, as one indivisible step.
+///
+/// **The order is the entire point, which is why this is a function and
+/// not two statements at each call site.** `reset_canvas_view` returns
+/// a pan of `(0, 0)`, and `(0, 0)` is only *within* the pan bound when
+/// the newly active layer's own origin is `(0, 0)` too. A document
+/// whose active layer sits elsewhere — a `.aur` file saved after a Move,
+/// since `aurora_core::Rect`'s own `x`/`y` round-trip through the
+/// manifest and `App::apply_move` never bakes the offset into pixels —
+/// would otherwise start with `canvas_local_origin` negative on its very
+/// first frame, no panning needed to trigger it. Clamping *before* the
+/// reset is worse than useless: the reset would throw the clamp away.
+///
+/// Every document-adopting path goes through here — [`App::open_file`]'s
+/// own flat-image path, [`App::open_aur_file`], and [`App::new`] (which
+/// has no window yet, so it passes `canvas_size: None` and leans on
+/// `reset_canvas_view`'s own documented "carry `previous`'s floor
+/// across" branch, with a default `previous`). Before this existed the
+/// sequence was open-coded at each of them and the ordering was
+/// enforced only by a comment, which no test could fail.
+///
+/// `canvas_size` is the *canvas area's* own physical size
+/// ([`canvas_area_physical_size`]), not the document's — see
+/// [`reset_canvas_view`], whose parameter this is passed straight
+/// through to.
+#[must_use]
+fn load_document_view(
+    previous: &aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(u32, u32)>,
+    scale_factor: f64,
+) -> aurora_ui::CanvasView {
+    let mut view = reset_canvas_view(previous, canvas_size, scale_factor);
+    clamp_pan_to_active_layer(&mut view, layers, active_layer);
     view
 }
 
@@ -6822,6 +7270,59 @@ struct App {
     /// clicked that turns out to be a group (groups are never inserted
     /// into `layer_rows` at all, so this can't actually happen via a
     /// click — only via never having a pixel layer to begin with).
+    ///
+    /// **The canvas pan boundary is a function of this field — and of
+    /// this layer's own `bounds`.** The bound
+    /// ([`aurora_ui::CanvasView::clamp_pan_to_minimum`]) is measured
+    /// against the active layer's document-space origin
+    /// ([`active_layer_origin`], what [`canvas_local_origin`]
+    /// subtracts), so it moves when *either* input moves, and a pan that
+    /// never moved is then outside it — reopening the render/paint
+    /// divergence that clamp exists to close. Writing this field is
+    /// therefore only half of what has to re-clamp; the other half is
+    /// every path that changes the active layer's `bounds` without
+    /// touching this field at all.
+    ///
+    /// Both halves, and where each re-establishes the bound:
+    ///
+    /// - *Which layer is active.* [`Self::new`], [`Self::open_file`] and
+    ///   [`Self::open_aur_file`] set it and then build the view through
+    ///   [`load_document_view`], which clamps as part of the same step.
+    ///   [`select_layer`] takes the view and clamps itself.
+    /// - *That layer's own bounds.* [`Self::apply_move`] rewrites them
+    ///   live, per pointer-move event, and deliberately does **not**
+    ///   clamp there (it would feed back into `continue_drag`'s own
+    ///   fixed `start_doc` — see [`commit_ending_drag`]); the clamp
+    ///   happens once, at the commit, in [`commit_ending_drag`]'s own
+    ///   `Drag::Move` arm. [`Self::run_undo_redo`] can revert or reapply
+    ///   a recorded bounds change without this field changing at all,
+    ///   and clamps via [`perform_undo_redo`]'s own [`after_undo_redo`]
+    ///   step.
+    ///
+    /// A new writer of either that skips the clamp is a bug with no
+    /// visible symptom until someone paints.
+    ///
+    /// **And a clamp that runs while a drag is still live is its own
+    /// bug** (0.57.7), in the opposite direction: the drag holds a
+    /// document-space reference point fixed from the moment it began,
+    /// so a view that moves under it makes the next pointer-move event
+    /// measure against a view the drag knows nothing about — for a
+    /// `Drag::Brush`, a line of dabs the user never drew. Every path
+    /// that moves the view has to say which it does: end the drag first
+    /// ([`press_layer_row`], [`perform_undo_redo`], and the Zoom-tool
+    /// click branch of [`Self::handle_pointer_pressed`], all through
+    /// [`commit_ending_drag`]), or re-anchor it
+    /// ([`shift_drag_reference`], for [`apply_scroll_zoom`] and
+    /// [`apply_canvas_min_zoom`], where the gesture is not "I am done
+    /// dragging").
+    ///
+    /// The second of those two was the rule's own first exception, and
+    /// is worth knowing about as a shape rather than a one-off:
+    /// `aurora_ui::CanvasView::set_min_zoom` moves the view without
+    /// reading like it does (0.57.8), so `App::apply_resize`/
+    /// `App::redraw` broke the rule for a whole round while stating it.
+    /// A "setter" that ends up in `zoom_at` or `pan_by` is a path that
+    /// moves the view.
     active_layer: Option<aurora_doc::LayerId>,
     /// The colour `Brush` paints with — [`DEFAULT_COLOUR`] until the
     /// Eyedropper tool samples a real pixel and changes it
@@ -7005,6 +7506,34 @@ impl App {
             unreachable!("workspace.properties was just built by build_workspace above: {err:?}");
         }
         let active_layer = topmost_pixel_layer(&layers);
+        // The pan bound, established before the first frame. Crash
+        // recovery reopens a real `.aur` container
+        // (`recover_document`/`read_autosave_container`), so this
+        // document's own active layer can already sit away from
+        // `(0, 0)` — the same `.aur` round-trip `Self::open_aur_file`
+        // has to clamp for, just reached at startup instead.
+        //
+        // Clamped here at zoom 1.0, before any zoom floor exists (there
+        // is no window yet, so no canvas size to derive one from --
+        // hence `canvas_size: None`, `load_document_view`'s own
+        // "carry `previous`'s floor across" branch, with a default
+        // `previous` whose floor is `MIN_ZOOM`; identical to the bare
+        // `CanvasView::default()` this used to build, minus the missing
+        // clamp). That is sound rather than merely early: the floor is
+        // applied later by `set_min_zoom` (from `redraw`/`apply_resize`),
+        // which raises zoom through `zoom_at((0.0, 0.0), ..)`, and
+        // `zoom_at` sets `pan = anchor - to_document(anchor) * new_zoom`
+        // — at the `(0, 0)` anchor that holds `to_document((0, 0))`
+        // fixed across the raise. So a view satisfying the bound here
+        // still satisfies it after the floor lands; the raise cannot
+        // undo this clamp.
+        let canvas_view = load_document_view(
+            &aurora_ui::CanvasView::default(),
+            &layers,
+            active_layer,
+            None,
+            1.0,
+        );
 
         let mut focus = FocusManager::default();
         let mut crash_recovery_dialog = None;
@@ -7036,7 +7565,7 @@ impl App {
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
             tool: aurora_ui::Tool::default(),
-            canvas_view: aurora_ui::CanvasView::default(),
+            canvas_view,
             selection: aurora_doc::SelectionSet::new(),
             layers,
             canvas_size,
@@ -7139,16 +7668,26 @@ impl App {
         self.push_accessibility();
     }
 
-    /// Runs `command` (`AppCommand::Undo` or `::Redo`) via
-    /// [`run_command`] against this app's own live state — what the
-    /// command palette's and (macOS) native menu's own Undo/Redo
-    /// entries fall back to once `activate_command` hands the bare
-    /// command back up (deliberately kept free of `layers`/`history`/
-    /// `pixel_history`/the tile store — see [`ActivatedCommand`]'s own
-    /// doc comment for why), the same path `Ctrl+Z`/`Ctrl+Shift+Z`
-    /// themselves already run through.
+    /// Runs `command` (`AppCommand::Undo` or `::Redo`) against this
+    /// app's own live state — [`perform_undo_redo`] against `App`'s own
+    /// fields. A `&mut self` wrapper so the two call sites can spell it
+    /// in one line; the real logic (**and the order the three steps
+    /// have to run in** — commit the live drag, run the command, then
+    /// re-establish the composite cache and the pan bound) is the free
+    /// function, which needs no `App` (and therefore no GPU adapter) to
+    /// test, the same split [`Self::commit_drag`] already uses.
+    ///
+    /// What the command palette's and (macOS) native menu's own
+    /// Undo/Redo entries fall back to once `activate_command` hands the
+    /// bare command back up (deliberately kept free of `layers`/
+    /// `history`/`pixel_history`/the tile store — see
+    /// [`ActivatedCommand`]'s own doc comment for why). **Not** the
+    /// `Ctrl+Z`/`Ctrl+Shift+Z` path, which [`handle_key`] resolves and
+    /// runs through [`run_command`] itself without ever returning an
+    /// `ActivatedCommand` — see PLAN.md's own residual disclosure for
+    /// what that costs and why closing it is its own change.
     fn run_undo_redo(&mut self, command: AppCommand) {
-        run_command(
+        perform_undo_redo(
             &mut self.workspace,
             &mut self.focus,
             &mut self.command_palette,
@@ -7158,13 +7697,12 @@ impl App {
             &mut self.pixel_history,
             self.tile_store.as_mut(),
             &mut self.undo_order,
+            &mut self.composite_cache,
+            &mut self.canvas_view,
+            self.active_layer,
+            &mut self.drag,
             command,
         );
-        // Either command could revert/reapply a bounds change (Move) as
-        // well as a pixel edit -- coarse but safe, matching
-        // `CompositeCache`'s own documented "any edit invalidates
-        // everything" scoping.
-        self.composite_cache.bump();
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -7258,12 +7796,16 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
-        // Through `reset_canvas_view`, never `CanvasView::default()`
-        // directly: the default drops the atlas's zoom floor, and a
-        // pointer event arriving before the next frame re-applies it
-        // would paint somewhere other than under the cursor.
-        self.canvas_view = reset_canvas_view(
+        // Through `load_document_view`, never `reset_canvas_view` or
+        // `CanvasView::default()` directly: the default drops the
+        // atlas's zoom floor, and the reset on its own drops the pan
+        // bound. `load_document_view` is both, in the one order that is
+        // correct -- see its own doc comment. Assigned after
+        // `self.active_layer`/`self.layers` above, since it reads them.
+        self.canvas_view = load_document_view(
             &self.canvas_view,
+            &self.layers,
+            self.active_layer,
             canvas_area_physical_size(&self.workspace, self.scale_factor),
             self.scale_factor,
         );
@@ -7355,12 +7897,16 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
-        // Through `reset_canvas_view`, never `CanvasView::default()`
-        // directly: the default drops the atlas's zoom floor, and a
-        // pointer event arriving before the next frame re-applies it
-        // would paint somewhere other than under the cursor.
-        self.canvas_view = reset_canvas_view(
+        // Through `load_document_view`, never `reset_canvas_view` or
+        // `CanvasView::default()` directly: the default drops the
+        // atlas's zoom floor, and the reset on its own drops the pan
+        // bound. `load_document_view` is both, in the one order that is
+        // correct -- see its own doc comment. Assigned after
+        // `self.active_layer`/`self.layers` above, since it reads them.
+        self.canvas_view = load_document_view(
             &self.canvas_view,
+            &self.layers,
+            self.active_layer,
             canvas_area_physical_size(&self.workspace, self.scale_factor),
             self.scale_factor,
         );
@@ -7636,6 +8182,17 @@ impl App {
     /// erases/samples its own starting point immediately
     /// ([`Self::paint_dab`]/[`Self::erase_dab`]/[`Self::sample_eyedropper`]),
     /// so a plain click (no drag at all) still does something.
+    ///
+    /// **Every branch that reaches the canvas ends whatever drag was
+    /// still live first** — the layer-row branch through
+    /// [`press_layer_row`], the Zoom-tool and drag branches through the
+    /// shared `self.commit_drag(self.drag.take())` (moved above the
+    /// Zoom-tool branch in 0.57.7, which used to `return` past it). A
+    /// press is a second gesture, and the two things it would otherwise
+    /// do to a live drag — drop its undo entry, and move the view out
+    /// from under its fixed reference point — are exactly the pair
+    /// [`commit_ending_drag`] and [`Self::active_layer`]'s own doc
+    /// comment describe.
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
         let Some(button) = translate_pointer_button(button) else {
             return;
@@ -7667,10 +8224,19 @@ impl App {
             && let Some(hit) = self.workspace.tree.hit_test(position)
             && let Some(&layer_id) = self.layer_rows.get(&hit)
         {
-            select_layer(
+            // Through `press_layer_row`, never `select_layer` alone:
+            // the selection moves the pan bound, and no drag may still
+            // be live under it. See that function's own doc comment.
+            press_layer_row(
                 &mut self.workspace,
                 &self.layer_rows,
                 &mut self.active_layer,
+                &mut self.canvas_view,
+                &self.layers,
+                &mut self.history,
+                &mut self.pixel_history,
+                &mut self.undo_order,
+                &mut self.drag,
                 layer_id,
             );
             // Changes `recomposite_visible_tiles`'s own reference origin
@@ -7702,6 +8268,26 @@ impl App {
             return;
         };
 
+        // A second press while a drag is still in progress -- the middle
+        // button to pan mid-stroke, the right button, a stylus barrel
+        // button -- ends that drag as surely as a release does, and the
+        // assignment below is about to drop it. Commit it first, or the
+        // pixels it already painted stay on the layer with no undo entry
+        // naming them and the next Ctrl+Z reaches past them into the
+        // previous stroke (`commit_ending_drag`).
+        //
+        // Ahead of the Zoom-tool branch below, not after it (0.57.7):
+        // that branch `return`s, so it used to reach neither this commit
+        // nor any other -- and it *also* moves the view
+        // (`handle_zoom_tool_click` clamps the pan), out from under a
+        // drag still holding a fixed document-space reference point.
+        // Both halves are exactly what `press_layer_row` was written to
+        // fix, one branch further down this same function, and a live
+        // `Drag::Brush` really can reach here: `z` switches to the Zoom
+        // tool mid-stroke without ending the stroke.
+        let interrupted = self.drag.take();
+        self.commit_drag(interrupted);
+
         if self.tool == aurora_ui::Tool::Zoom && button == PointerButton::Primary {
             handle_zoom_tool_click(
                 &mut self.canvas_view,
@@ -7711,15 +8297,6 @@ impl App {
             );
             return;
         }
-        // A second press while a drag is still in progress -- the middle
-        // button to pan mid-stroke, the right button, a stylus barrel
-        // button -- ends that drag as surely as a release does, and the
-        // assignment below is about to drop it. Commit it first, or the
-        // pixels it already painted stay on the layer with no undo entry
-        // naming them and the next Ctrl+Z reaches past them into the
-        // previous stroke (`commit_ending_drag`).
-        let interrupted = self.drag.take();
-        self.commit_drag(interrupted);
         self.drag = begin_drag(
             self.tool,
             button,
@@ -7920,6 +8497,8 @@ impl App {
             &mut self.history,
             &mut self.pixel_history,
             &mut self.undo_order,
+            &mut self.canvas_view,
+            self.active_layer,
         );
     }
 
@@ -8010,6 +8589,13 @@ impl App {
     /// known position ([`apply_scroll_zoom`]) if it's over the canvas
     /// area — a no-op otherwise (e.g. scrolling while the pointer is
     /// over a dock panel must not zoom the canvas).
+    ///
+    /// Hands the live drag, if any, straight to `apply_scroll_zoom`
+    /// (0.57.7). Zooming while a stroke is held is an ordinary thing to
+    /// do, so unlike the gestures that mean "I am done dragging" this
+    /// one keeps the drag and re-anchors it against the moved view —
+    /// see [`shift_drag_reference`] for why the pan clamp inside that
+    /// zoom would otherwise paint a line the user never drew.
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
         let Some(position) = self.pointer_position else {
             return;
@@ -8019,6 +8605,7 @@ impl App {
         };
         apply_scroll_zoom(
             &mut self.canvas_view,
+            self.drag.as_mut(),
             canvas_point,
             delta,
             active_layer_origin(&self.layers, self.active_layer),
@@ -8097,9 +8684,19 @@ impl App {
         if let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor) {
             // The atlas's own zoom floor moves with the canvas size, and
             // a pointer event can arrive before the next frame -- see
-            // `redraw`'s own call for the full reasoning.
-            self.canvas_view
-                .set_min_zoom(canvas_min_zoom(canvas_size, self.scale_factor));
+            // `redraw`'s own call for the full reasoning. Through
+            // `apply_canvas_min_zoom` because raising the floor moves
+            // the view, and a resize arriving mid-stroke must not move
+            // it out from under the live drag (0.57.8).
+            let pointer = self
+                .pointer_position
+                .and_then(|position| pointer_in_canvas(&self.workspace, position));
+            apply_canvas_min_zoom(
+                &mut self.canvas_view,
+                self.drag.as_mut(),
+                pointer,
+                canvas_min_zoom(canvas_size, self.scale_factor),
+            );
             if let Some(residency) = self.residency.as_mut() {
                 residency.resize(gpu.device(), gpu.queue(), canvas_size);
             }
@@ -8149,10 +8746,20 @@ impl App {
         // is what made `to_document` (pointer -> document, i.e. where a
         // brush dab lands) disagree with what was drawn. `apply_resize`
         // does it too, so a pointer event arriving between a resize and
-        // the next frame is bounded as well.
+        // the next frame is bounded as well. Through
+        // `apply_canvas_min_zoom`, because raising the floor moves the
+        // view: a live drag has to be re-anchored against it, not left
+        // measuring against a view it knows nothing about (0.57.8).
         if let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor) {
-            self.canvas_view
-                .set_min_zoom(canvas_min_zoom(canvas_size, self.scale_factor));
+            let pointer = self
+                .pointer_position
+                .and_then(|position| pointer_in_canvas(&self.workspace, position));
+            apply_canvas_min_zoom(
+                &mut self.canvas_view,
+                self.drag.as_mut(),
+                pointer,
+                canvas_min_zoom(canvas_size, self.scale_factor),
+            );
         }
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
@@ -8735,10 +9342,11 @@ mod tests {
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess,
         Key, KeyChord, Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
-        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, apply_mask_clip,
-        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
-        begin_drag, brush_stroke_mut, canvas_area_physical_rect, canvas_area_physical_size,
-        canvas_local_origin, canvas_min_zoom, clean_shutdown_cleanup, clear_session_marker,
+        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask_clip, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, brush_stroke_mut,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
         close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
         commit_ending_drag, composite_document, composite_surface_id, continue_drag,
         crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
@@ -8746,15 +9354,16 @@ mod tests {
         document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
         eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
         handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        is_aur_path, layer_local_point, load_scales, load_theme, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, partial_autosave_path, pointer_in_canvas, pointer_on_rail_divider,
+        is_aur_path, layer_local_point, load_document_view, load_scales, load_theme, logical_point,
+        logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
+        open_tile_store, palette_commands, partial_autosave_path, perform_undo_redo,
+        pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
         previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
         replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
-        sample_pixel, select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        sample_pixel, select_layer, shift_bounds, splitmix64, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -8959,7 +9568,15 @@ mod tests {
         };
         let mut active_layer = None;
 
-        select_layer(&mut workspace, &layer_rows, &mut active_layer, a);
+        let mut view = CanvasView::new();
+        select_layer(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            a,
+        );
         assert_eq!(active_layer, Some(a));
         let Some(node_a) = workspace.tree.accessibility(row_a) else {
             unreachable!("just populated");
@@ -8972,7 +9589,14 @@ mod tests {
 
         // Selecting the other layer must flip both rows, not just add
         // to whatever was already selected.
-        select_layer(&mut workspace, &layer_rows, &mut active_layer, b);
+        select_layer(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            b,
+        );
         assert_eq!(active_layer, Some(b));
         let Some(node_a) = workspace.tree.accessibility(row_a) else {
             unreachable!("just populated");
@@ -8982,6 +9606,862 @@ mod tests {
             unreachable!("just populated");
         };
         assert_eq!(node_b.is_selected(), Some(true));
+    }
+
+    // -- the pan bound and a *changing* active layer --
+    //
+    // `CanvasView::clamp_pan_to_minimum` bounds the view against the
+    // active layer's own origin, and every pan-moving gesture calls it.
+    // These cover the other half: the boundary itself moving, because
+    // the active layer changed. See `clamp_pan_to_active_layer`.
+
+    /// A layer deliberately away from the document origin — the shape a
+    /// `.aur` file saved after a Move actually round-trips (`Rect`'s own
+    /// `x`/`y` are serialized, and `App::apply_move` never bakes the
+    /// offset into pixels).
+    fn moved_layer_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 300,
+            y: 150,
+            width: 10,
+            height: 10,
+        }
+    }
+
+    /// A `LayerTree` with `a` at the document origin and `b` moved to
+    /// `(300, 150)`, plus the populated Layers-panel rows `select_layer`
+    /// needs.
+    fn two_layers_one_moved() -> (
+        aurora_ui::Workspace,
+        aurora_doc::LayerTree,
+        std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+    ) {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut layers = aurora_doc::LayerTree::new();
+        let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match layers.add_pixel_layer("b", moved_layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (workspace, layers, layer_rows, a, b)
+    }
+
+    #[test]
+    fn changing_the_active_layer_re_establishes_the_pan_bound() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut active_layer = Some(a);
+        // Panned right/down past `a`'s own boundary and clamped back to
+        // it — the state any real session is in after a hand-tool drag
+        // toward the top-left of the document.
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+
+        select_layer(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            b,
+        );
+
+        assert_eq!(active_layer, Some(b));
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(
+            local_x >= -1e-3,
+            "the surface-local origin must not go negative on x: {local_x}"
+        );
+        assert!(
+            local_y >= -1e-3,
+            "the surface-local origin must not go negative on y: {local_y}"
+        );
+        // Equivalently, in document space: the canvas area's own
+        // top-left corner cannot show anything before `b`'s own corner.
+        let (doc_x, doc_y) = view.to_document((0.0, 0.0));
+        assert!(doc_x >= 300.0 - 1e-3, "{doc_x}");
+        assert!(doc_y >= 150.0 - 1e-3, "{doc_y}");
+    }
+
+    /// The negative control for the test above: the same active-layer
+    /// change with only the *old* layer's bound ever applied — which is
+    /// exactly what this crate did before `clamp_pan_to_active_layer`
+    /// existed. Asserts the divergence is large, not marginal, so this
+    /// cannot pass by a coincidence of small numbers.
+    #[test]
+    fn an_active_layer_change_without_the_re_clamp_is_the_divergence_this_prevents() {
+        let (_workspace, layers, _layer_rows, a, b) = two_layers_one_moved();
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        // Clamped against `a` only — the boundary as it was *before* the
+        // active layer changed.
+        clamp_pan_to_active_layer(&mut view, &layers, Some(a));
+
+        // The active layer becomes `b`, and nothing re-clamps.
+        let (local_x, local_y) = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local_x < -100.0,
+            "without the re-clamp the local origin is far negative on x: {local_x}"
+        );
+        assert!(
+            local_y < -50.0,
+            "without the re-clamp the local origin is far negative on y: {local_y}"
+        );
+    }
+
+    /// The evidence that the *open* paths are genuinely exposed, not
+    /// hypothetically: a `.aur` container written from a document whose
+    /// topmost layer sits at `(300, 150)` reopens with that origin
+    /// intact. `App::open_aur_file` and `App::new`'s own crash-recovery
+    /// branch both go through this reader, and `reset_canvas_view`
+    /// zeroes the pan — so without the clamp those documents start with
+    /// a negative surface-local origin on their very first frame, with
+    /// no panning needed to trigger it.
+    #[test]
+    fn an_aur_round_trip_preserves_a_moved_layers_origin_so_the_open_paths_need_the_clamp() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (_scratch, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let base = match history.add_pixel_layer(&mut layers, "base", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _painted = paint_one_texel(&mut store, &layers, base);
+        // Added last, so it is the topmost root — what
+        // `topmost_pixel_layer` (and therefore `active_layer`) picks.
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _painted = paint_one_texel(&mut store, &layers, moved);
+
+        let path = dir.path().join("aurora-autosave.aur");
+        write_autosave(&path, &layers, &history, (320, 160), &mut store);
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let Some((recovered, _history, _canvas)) = recover_document(&path, &mut fresh_store) else {
+            unreachable!("the autosave just written must reopen");
+        };
+        let Some(active) = topmost_pixel_layer(&recovered) else {
+            unreachable!("the recovered document has pixel layers");
+        };
+        match recovered.kind(active) {
+            Some(aurora_doc::LayerKind::Pixel { bounds }) => {
+                assert_eq!(
+                    *bounds,
+                    moved_layer_bounds(),
+                    "a moved layer's own origin must survive the .aur round trip"
+                );
+            }
+            other => unreachable!("expected a pixel layer, got {other:?}"),
+        }
+        // And that is exactly the state the open paths hand to
+        // `reset_canvas_view`.
+        assert_eq!(
+            active_layer_origin(&recovered, Some(active)),
+            (300.0, 150.0)
+        );
+    }
+
+    /// The autosave pair above is what `App::new`'s own crash-recovery
+    /// branch reaches; this is the *user-facing* one — the exact
+    /// `aurora_io::write_aur`/`read_aur` pair `App::save_aur_file` and
+    /// `App::open_aur_file` themselves call. Same conclusion, on the
+    /// path a user actually takes: File > Save As a `.aur`, reopen it,
+    /// and the topmost layer is still at `(300, 150)`, so
+    /// `load_document_view`'s clamp is load-bearing on the very first
+    /// frame.
+    #[test]
+    fn a_user_facing_aur_save_and_open_preserves_a_moved_layers_origin() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (_scratch, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let base = match history.add_pixel_layer(&mut layers, "base", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _painted = paint_one_texel(&mut store, &layers, base);
+        // Added last, so it is the topmost root -- what
+        // `topmost_pixel_layer` (and therefore `active_layer`) picks.
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _painted = paint_one_texel(&mut store, &layers, moved);
+
+        let path = dir.path().join("moved.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err}"),
+        };
+        if let Err(err) =
+            aurora_io::write_aur(file, &layers, &history, (320, 160), None, &mut store)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (reopened, _history, _canvas, _profile) =
+            match aurora_io::read_aur(file, &mut fresh_store) {
+                Ok(result) => result,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let Some(active) = topmost_pixel_layer(&reopened) else {
+            unreachable!("the reopened document has pixel layers");
+        };
+        assert_eq!(
+            active_layer_origin(&reopened, Some(active)),
+            (300.0, 150.0),
+            "a moved layer's own origin must survive the user-facing .aur round trip"
+        );
+
+        // And that origin, fed through the very step the open path runs,
+        // is what the clamp is for.
+        let view = load_document_view(
+            &CanvasView::new(),
+            &reopened,
+            Some(active),
+            Some((750, 800)),
+            1.0,
+        );
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&reopened, Some(active)));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+    }
+
+    /// `App` itself is not constructible under test (it needs a real
+    /// `EventLoopProxy`), so no test can call `App::open_file`/
+    /// `App::open_aur_file`/`App::new` themselves. This calls the one
+    /// thing all three of them *delegate* the whole canvas-view step to
+    /// — [`load_document_view`] — rather than re-spelling its two
+    /// statements here, which is what this test used to do and why
+    /// deleting the clamp from either open path left the suite green.
+    /// Reordering or removing the clamp inside `load_document_view` now
+    /// fails right here.
+    ///
+    /// The ordering is the point: the reset returns a pan of `(0, 0)`,
+    /// which is outside a moved layer's own bound, so the clamp has to
+    /// come second.
+    #[test]
+    fn loading_a_documents_view_leaves_a_moved_layers_origin_non_negative() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let moved = match layers.add_pixel_layer("moved", moved_layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+
+        // A view left panned somewhere by the previous document, exactly
+        // as `App` would have it on entry.
+        let mut previous = CanvasView::new();
+        previous.pan_by((-500.0, -500.0));
+        let view = load_document_view(&previous, &layers, active_layer, Some((750, 800)), 1.0);
+
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+        // The reset's own half still happened too -- this is both
+        // statements as one unit, not the clamp having replaced the
+        // reset. `canvas_min_zoom` for this canvas is the floor a bare
+        // `CanvasView::default()` would have dropped (0.57.4).
+        assert!(
+            (view.min_zoom() - canvas_min_zoom((750, 800), 1.0)).abs() < 1e-6,
+            "the zoom floor must be re-derived, not carried from `previous`: {}",
+            view.min_zoom()
+        );
+    }
+
+    /// [`App::new`]'s own spelling of the call above: no window yet, so
+    /// no canvas size to derive a floor from. Covers the branch
+    /// separately because it is the one that used to be a bare
+    /// `aurora_ui::CanvasView::default()` — the exact spelling
+    /// `reset_canvas_view` exists to ban — and because `canvas_size:
+    /// None` takes `reset_canvas_view`'s other, less-travelled path.
+    #[test]
+    fn loading_a_documents_view_with_no_window_yet_still_clamps() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let moved = match layers.add_pixel_layer("moved", moved_layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+
+        let view = load_document_view(&CanvasView::default(), &layers, active_layer, None, 1.0);
+
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+        assert!(
+            (view.min_zoom() - CanvasView::default().min_zoom()).abs() < 1e-6,
+            "with no canvas size the previous view's own floor is carried across"
+        );
+    }
+
+    /// Turns "these two construction paths are safe today" into an
+    /// executable check rather than a claim in a comment: `open_file`'s
+    /// own flat-image path and `App::new`'s own fresh-document path both
+    /// build their layers at the document origin, so their clamp is a
+    /// no-op. If either ever stops being true, this breaks here instead
+    /// of silently in the canvas.
+    #[test]
+    fn the_flat_image_and_demo_documents_active_layer_is_always_at_the_document_origin() {
+        let image = fake_image(64, 48);
+        let (layers, _history, id) = document_from_image("photo", &image);
+        assert_eq!(topmost_pixel_layer(&layers), Some(id));
+        assert_eq!(active_layer_origin(&layers, Some(id)), (0.0, 0.0));
+
+        let (demo, _history) = demo_document();
+        let Some(active) = topmost_pixel_layer(&demo) else {
+            unreachable!("demo_document has pixel layers");
+        };
+        assert_eq!(active_layer_origin(&demo, Some(active)), (0.0, 0.0));
+    }
+
+    /// The pan bound (this round) and the zoom floor (0.57.4) are two
+    /// clamps on the same view, applied from different call sites in an
+    /// order nothing guarantees — `App::new` clamps the pan before any
+    /// floor exists, while `redraw`/`apply_resize` raise the floor
+    /// later. They have to commute. They do, because `set_min_zoom`
+    /// raises zoom through `zoom_at((0, 0), ..)`, which holds
+    /// `to_document((0, 0))` fixed across the raise. Asserted here
+    /// rather than assumed, and without touching `canvas_view.rs`.
+    #[test]
+    fn the_pan_bound_and_the_zoom_floor_compose_in_either_order() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let moved = match layers.add_pixel_layer("moved", moved_layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+        let floor = 2.0;
+
+        let start = || {
+            let mut view = CanvasView::new();
+            view.zoom_at((0.0, 0.0), 0.5);
+            view.pan_by((80.0, 80.0));
+            view
+        };
+
+        let mut pan_first = start();
+        clamp_pan_to_active_layer(&mut pan_first, &layers, active_layer);
+        pan_first.set_min_zoom(floor);
+
+        let mut zoom_first = start();
+        zoom_first.set_min_zoom(floor);
+        clamp_pan_to_active_layer(&mut zoom_first, &layers, active_layer);
+
+        for (label, view) in [("pan first", &pan_first), ("zoom first", &zoom_first)] {
+            let (local_x, local_y) =
+                canvas_local_origin(view, active_layer_origin(&layers, active_layer));
+            assert!(local_x >= -1e-3, "{label}: {local_x}");
+            assert!(local_y >= -1e-3, "{label}: {local_y}");
+        }
+        let (pan_first_x, pan_first_y) = pan_first.to_document((0.0, 0.0));
+        let (zoom_first_x, zoom_first_y) = zoom_first.to_document((0.0, 0.0));
+        assert!(
+            (pan_first_x - zoom_first_x).abs() < 1e-3,
+            "the two orders must agree on x: {pan_first_x} vs {zoom_first_x}"
+        );
+        assert!(
+            (pan_first_y - zoom_first_y).abs() < 1e-3,
+            "the two orders must agree on y: {pan_first_y} vs {zoom_first_y}"
+        );
+    }
+
+    /// The *other* way the boundary moves: the active layer stays the
+    /// same and its own `bounds` change under it. `App::apply_move`
+    /// rewrites them on every pointer-move event of a `Drag::Move` and
+    /// deliberately does not clamp there (it would feed back into
+    /// `continue_drag`'s own fixed `start_doc`); the clamp happens once,
+    /// at the commit. This asserts both halves — the violation really is
+    /// live while the drag is (its own negative control, inline) and
+    /// really is closed by the commit.
+    #[test]
+    fn committing_a_move_re_establishes_the_pan_bound() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let dragged = match layers.add_pixel_layer("dragged", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let active_layer = Some(dragged);
+
+        // Panned to the document's own corner and clamped there against
+        // the layer's starting origin of (0, 0).
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+
+        // The drag itself: `App::apply_move`'s own `set_bounds`, with no
+        // clamp, exactly as the live handler runs it.
+        if let Err(err) = layers.set_bounds(dragged, moved_layer_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (mid_x, mid_y) = canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(
+            mid_x < -100.0 && mid_y < -50.0,
+            "setup: mid-drag the bound really is violated, which is what the commit has to close: ({mid_x}, {mid_y})"
+        );
+
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: dragged,
+                start_doc: (0.0, 0.0),
+                start_bounds: layer_bounds(),
+                current_bounds: moved_layer_bounds(),
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            active_layer,
+        );
+
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Structural],
+            "setup: the move still records its one structural step"
+        );
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(
+            local_x >= -1e-3,
+            "the commit must re-establish the bound on x: {local_x}"
+        );
+        assert!(
+            local_y >= -1e-3,
+            "the commit must re-establish the bound on y: {local_y}"
+        );
+    }
+
+    /// And the third way: an `Undo`. It restores a recorded
+    /// `LayerOp::SetBounds` without [`App::active_layer`] changing at
+    /// all, so the boundary moves with nothing else in the app aware of
+    /// it. (Reached from the command palette and the macOS menu, via
+    /// [`App::run_undo_redo`]. The `Ctrl+Z` chord itself resolves and
+    /// runs inside [`handle_key`] and never gets here — PLAN.md's own
+    /// residual disclosure covers what that still costs.) The sequence is an ordinary session — move a layer to the
+    /// document's own corner, pan all the way into that corner (which
+    /// the relaxed bound now allows), then undo the move.
+    ///
+    /// Goes through the real [`run_command`] and the real
+    /// [`after_undo_redo`], not a re-spelling of either, so deleting the
+    /// clamp from `after_undo_redo` fails here.
+    #[test]
+    fn undoing_a_move_re_establishes_the_pan_bound() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+        let mut view = CanvasView::new();
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+
+        // Drag it back to the document origin and let go.
+        if let Err(err) = layers.set_bounds(moved, layer_bounds()) {
+            unreachable!("{err:?}");
+        }
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: moved,
+                start_doc: (0.0, 0.0),
+                start_bounds: moved_layer_bounds(),
+                current_bounds: layer_bounds(),
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            active_layer,
+        );
+        assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
+
+        // Now pan up/left into the corner the move just freed up.
+        view.pan_by((1000.0, 1000.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        let (corner_x, corner_y) = view.to_document((0.0, 0.0));
+        assert!(
+            corner_x.abs() < 1e-3 && corner_y.abs() < 1e-3,
+            "setup: the view really is at the document's own corner: ({corner_x}, {corner_y})"
+        );
+
+        cache.mark_current(aurora_tile::TileId { x: 0, y: 0 });
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::Undo,
+        );
+        assert_eq!(
+            layers.bounds(moved),
+            Some(moved_layer_bounds()),
+            "setup: the undo really did restore the moved bounds"
+        );
+        // The state `run_undo_redo` is in between the two statements:
+        // the boundary has moved and nothing has re-clamped yet.
+        let (before_x, before_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(
+            before_x < -100.0 && before_y < -50.0,
+            "setup: the undo really does reopen the divergence: ({before_x}, {before_y})"
+        );
+
+        after_undo_redo(&mut view, &layers, active_layer, &mut cache);
+
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+        assert!(
+            !cache.is_current(aurora_tile::TileId { x: 0, y: 0 }),
+            "the composite cache half of `after_undo_redo` must still run too"
+        );
+    }
+
+    /// **RT-01 (0.57.7).** The same clamp, reached while a brush stroke
+    /// is still live — the hazard `press_layer_row` was written to close
+    /// at the *other* site, never audited at this one. `run_undo_redo`
+    /// moved the view out from under a `Drag::Brush` whose own
+    /// `last_doc` was fixed when the stroke began, and the very next
+    /// pointer-move event then interpolated a full segment between the
+    /// stale reference and the moved view: a line of dabs the user
+    /// never drew, painted with the pointer completely still. Worse,
+    /// the live stroke's own pixels were left on the layer with no undo
+    /// entry naming them, so the `Undo` that caused it reached past
+    /// them into the previous step (`commit_ending_drag`'s own 0.57.0
+    /// bug, at a fourth site).
+    ///
+    /// Drives the real [`perform_undo_redo`] and the real
+    /// [`continue_drag`], not a re-spelling of either, so removing the
+    /// commit from `perform_undo_redo` fails here.
+    #[test]
+    fn an_undo_during_a_live_stroke_commits_it_instead_of_painting_a_line_the_user_never_drew() {
+        let (_dir, mut store) = commit_test_store();
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut selection = aurora_doc::SelectionSet::new();
+
+        // Exactly `undoing_a_move_re_establishes_the_pan_bound`'s own
+        // setup: a layer moved to (300, 150), dragged back to the
+        // document origin, with the view panned into the corner that
+        // move freed up. Undoing the move is what moves the boundary.
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+        let mut view = CanvasView::new();
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        if let Err(err) = layers.set_bounds(moved, layer_bounds()) {
+            unreachable!("{err:?}");
+        }
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: moved,
+                start_doc: (0.0, 0.0),
+                start_bounds: moved_layer_bounds(),
+                current_bounds: layer_bounds(),
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            active_layer,
+        );
+        view.pan_by((1000.0, 1000.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
+
+        // The stroke still in progress when the Undo arrives, with real
+        // pixels already on the layer and its own reference point at
+        // the pointer's current document position.
+        let pointer = (40.0, 40.0);
+        let mut drag = Some(a_brush_drag_that_painted(&mut store, (30.5, 30.5)));
+        match drag.as_mut() {
+            Some(Drag::Brush { last_doc, .. }) => *last_doc = view.to_document(pointer),
+            _ => unreachable!("just built a brush drag"),
+        }
+        assert!(commit_test_alpha(&mut store, 30, 30) > 0.5, "setup");
+
+        perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            active_layer,
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert!(
+            drag.is_none(),
+            "no drag may still be live once the undo has clamped the view under it"
+        );
+        // The pointer has not moved at all. Whatever the view did, the
+        // next move event must not paint.
+        let dabs = match drag.as_mut() {
+            Some(live) => continue_drag(
+                live,
+                pointer,
+                &mut view,
+                &mut selection,
+                active_layer_origin(&layers, active_layer),
+            ),
+            None => Vec::new(),
+        };
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint: {} dabs were placed",
+            dabs.len()
+        );
+        // And the Undo has to have reached the live stroke, not past it
+        // into the move underneath.
+        assert_eq!(
+            undo_order.redo,
+            vec![UndoKind::Pixel],
+            "the undo must have undone the interrupted stroke's own entry"
+        );
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Structural],
+            "and must have left the move underneath it alone"
+        );
+        assert!(
+            commit_test_alpha(&mut store, 30, 30) < 0.01,
+            "the interrupted stroke's own pixels are what the undo removes"
+        );
+        assert_eq!(
+            layers.bounds(moved),
+            Some(layer_bounds()),
+            "the move underneath must still be applied"
+        );
+    }
+
+    /// Selecting a Layers-panel row now moves the pan bound
+    /// ([`select_layer`]), and that branch of `handle_pointer_pressed`
+    /// used to `return` before ever reaching the shared "a second press
+    /// ends the live drag" commit — so a middle-button pan held down
+    /// while left-clicking a row left the view being clamped out from
+    /// under a drag that still holds a fixed reference point. Ending the
+    /// drag first is the fix; this is the sequence that branch now runs.
+    #[test]
+    fn selecting_a_layer_row_during_a_live_drag_ends_the_drag_before_the_view_moves() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+
+        // The middle button goes down over the canvas and stays down.
+        let mut drag = begin_drag(
+            Tool::Brush,
+            PointerButton::Middle,
+            (10.0, 10.0),
+            &view,
+            None,
+        );
+        assert!(
+            matches!(drag, Some(Drag::Pan { .. })),
+            "setup: the middle button really starts a pan"
+        );
+
+        // The left button then clicks a Layers-panel row.
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut drag,
+            b,
+        );
+
+        assert!(
+            drag.is_none(),
+            "no drag may still be live once the selection has clamped the view under it"
+        );
+        assert_eq!(active_layer, Some(b));
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+    }
+
+    /// The ordering *within* [`press_layer_row`], made observable: a
+    /// `Drag::Move` interrupted by a layer-row click has to be committed
+    /// against the layer that was active while it was being dragged, not
+    /// against the one the click is about to select. Both orders leave
+    /// the same undo entry, so only the resulting pan tells them apart —
+    /// which it does whenever the dragged layer ends up further from the
+    /// document origin than the newly selected one.
+    #[test]
+    fn a_layer_row_click_commits_a_move_against_the_outgoing_layer_not_the_incoming_one() {
+        let (mut workspace, mut layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+
+        // `a` is dragged well past `b`'s own origin -- far enough that
+        // the two clamps disagree.
+        let dragged_to = aurora_core::Rect {
+            x: 500,
+            y: 500,
+            ..layer_bounds()
+        };
+        if let Err(err) = layers.set_bounds(a, dragged_to) {
+            unreachable!("{err:?}");
+        }
+        let mut drag = Some(Drag::Move {
+            layer_id: a,
+            start_doc: (0.0, 0.0),
+            start_bounds: layer_bounds(),
+            current_bounds: dragged_to,
+        });
+
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut drag,
+            b,
+        );
+
+        assert_eq!(active_layer, Some(b));
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Structural],
+            "setup: the interrupted move still records its own step"
+        );
+        let (doc_x, doc_y) = view.to_document((0.0, 0.0));
+        assert!(
+            (doc_x - 500.0).abs() < 1e-3 && (doc_y - 500.0).abs() < 1e-3,
+            "the move must be committed against `a`'s own dragged origin (500, 500) before the \
+             selection relaxes the bound to `b`'s (300, 150); selecting first would leave this at \
+             (300, 150): ({doc_x}, {doc_y})"
+        );
+    }
+
+    /// The same branch's other, pre-existing casualty, now fixed by the
+    /// same line: a live brush stroke interrupted by a layer-row click
+    /// used to be dropped outright, losing its whole undo entry the way
+    /// `commit_ending_drag`'s own doc comment describes for the gestures
+    /// 0.57.0 already covered.
+    #[test]
+    fn a_stroke_interrupted_by_a_layer_row_click_still_becomes_its_own_undo_entry() {
+        let (_dir, mut store) = commit_test_store();
+        let (mut workspace, layers, layer_rows, _a, b) = two_layers_one_moved();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut active_layer = None;
+        let mut view = CanvasView::new();
+
+        let mut drag = Some(a_brush_drag_that_painted(&mut store, (30.5, 30.5)));
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut drag,
+            b,
+        );
+
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel],
+            "the interrupted stroke must have its own entry in the unified order"
+        );
+        assert!(pixel_history.can_undo());
     }
 
     /// `demo_document`'s whole point (unlike a plain `LayerTree` built
@@ -19455,6 +20935,8 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CanvasView::new(),
+            None,
         );
 
         // The stroke still in progress when the middle button goes down.
@@ -19471,6 +20953,8 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CanvasView::new(),
+            None,
         );
         drag = begin_drag(
             Tool::Brush,
@@ -19484,6 +20968,76 @@ mod tests {
             "setup: the interrupting press really does start its own drag"
         );
 
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel, UndoKind::Pixel],
+            "the interrupted stroke must have its own entry in the unified order"
+        );
+        match pixel_history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(
+            commit_test_alpha(&mut store, 200, 200) < 0.01,
+            "Ctrl+Z must remove the interrupted stroke's own pixels"
+        );
+        assert!(
+            commit_test_alpha(&mut store, 30, 30) > 0.5,
+            "and must not have reached past them into the earlier stroke"
+        );
+    }
+
+    /// **RT-02 (0.57.7).** The Zoom tool's own click branch in
+    /// [`App::handle_pointer_pressed`] `return`ed before ever reaching
+    /// that same shared commit — and it *also* moves the view
+    /// ([`handle_zoom_tool_click`] clamps the pan) out from under
+    /// whatever drag was still live. That is the identical pair of bugs
+    /// [`press_layer_row`] was written to fix, one branch further down
+    /// the same function, and a live `Drag::Brush` really does reach
+    /// it: `z` switches to the Zoom tool mid-stroke without ending the
+    /// stroke.
+    ///
+    /// The branch now runs the commit first, exactly this sequence.
+    #[test]
+    fn a_stroke_interrupted_by_a_zoom_tool_click_still_becomes_its_own_undo_entry() {
+        let (_dir, mut store) = commit_test_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut view = CanvasView::new();
+
+        // An earlier, properly released stroke -- the one a mis-targeted
+        // Ctrl+Z would reach into.
+        let earlier = a_brush_drag_that_painted(&mut store, (30.5, 30.5));
+        commit_ending_drag(
+            Some(earlier),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            None,
+        );
+        let mut drag = Some(a_brush_drag_that_painted(&mut store, (200.5, 200.5)));
+
+        // Exactly the sequence that branch now runs.
+        let interrupted = drag.take();
+        commit_ending_drag(
+            interrupted,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            None,
+        );
+        handle_zoom_tool_click(&mut view, (100.0, 100.0), Modifiers::none(), (0.0, 0.0));
+
+        assert!(
+            drag.is_none(),
+            "no drag may still be live once the zoom has clamped the view under it"
+        );
         assert_eq!(
             undo_order.undo,
             vec![UndoKind::Pixel, UndoKind::Pixel],
@@ -19545,6 +21099,8 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CanvasView::new(),
+            None,
         );
         assert!(drag.is_none(), "setup: the drag really is gone");
 
@@ -19569,6 +21125,13 @@ mod tests {
     /// drag — and `Drag::Move` must still coalesce into one structural
     /// entry now that `finish_move` is reached through the same shared
     /// commit rather than from `handle_pointer_released` directly.
+    // Four commits, each now carrying the view and active layer
+    // `commit_ending_drag` re-establishes the pan bound against (0.57.6)
+    // -- eight lines of parameters past the 100-line lint, with the
+    // assertions themselves unchanged. Splitting the four cases apart
+    // would lose the "one released drag of each kind, in sequence"
+    // shape that is the point of the test.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn the_ordinary_release_path_commits_exactly_what_it_always_did() {
         let (_dir, mut store) = commit_test_store();
@@ -19585,6 +21148,8 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CanvasView::new(),
+            None,
         );
         assert_eq!(undo_order.undo, vec![UndoKind::Pixel]);
         assert!(pixel_history.can_undo());
@@ -19612,6 +21177,8 @@ mod tests {
                 &mut history,
                 &mut pixel_history,
                 &mut undo_order,
+                &mut CanvasView::new(),
+                None,
             );
             assert_eq!(
                 undo_order.undo,
@@ -19650,6 +21217,8 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CanvasView::new(),
+            None,
         );
         assert_eq!(
             undo_order.undo,
@@ -19669,6 +21238,8 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CanvasView::new(),
+            None,
         );
         assert_eq!(
             undo_order.undo,
@@ -19974,6 +21545,7 @@ mod tests {
         let mut view = CanvasView::new();
         apply_scroll_zoom(
             &mut view,
+            None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
             (0.0, 0.0),
@@ -19986,6 +21558,7 @@ mod tests {
         let mut view = CanvasView::new();
         apply_scroll_zoom(
             &mut view,
+            None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, -1.0),
             (0.0, 0.0),
@@ -20098,6 +21671,7 @@ mod tests {
         let mut view = CanvasView::new();
         apply_scroll_zoom(
             &mut view,
+            None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
             (0.0, 0.0),
@@ -20125,5 +21699,403 @@ mod tests {
         };
         handle_zoom_tool_click(&mut view, (100.0, 100.0), alt_held, (0.0, 0.0));
         assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
+    }
+
+    // -- a view that moves under a drag that is still live (0.57.7) --
+    //
+    // RT-02. The clamp above is the whole hazard `press_layer_row` and
+    // `perform_undo_redo` end a drag to avoid, reached from a gesture
+    // that is *not* "I am done dragging": scrolling to zoom while
+    // painting is an ordinary thing to do mid-stroke. So this path
+    // re-anchors the drag instead of ending it
+    // (`shift_drag_reference`), and these are the two halves of that.
+
+    /// The bug, with the pointer completely still: zooming out hard
+    /// against the document's own top-left edge makes the clamp move
+    /// the view, and a `Drag::Brush`'s own `last_doc` then names the
+    /// pre-clamp document position while `continue_drag` reads the
+    /// post-clamp one. Without the re-anchor the next move event
+    /// interpolates a whole segment between them.
+    #[test]
+    fn scroll_zooming_mid_stroke_re_anchors_the_stroke_instead_of_painting_a_line_never_drawn() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let pointer = (40.0, 40.0);
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        let before = view.to_document(pointer);
+        apply_scroll_zoom(
+            &mut view,
+            Some(&mut drag),
+            pointer,
+            winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
+            (0.0, 0.0),
+        );
+        let after = view.to_document(pointer);
+        assert!(
+            (after.0 - before.0).abs() > 50.0 && (after.1 - before.1).abs() > 50.0,
+            "setup: the clamp really does move the document point under the still pointer: \
+             {before:?} -> {after:?}"
+        );
+
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// The same re-anchor for a `Drag::Move`, where a stale `start_doc`
+    /// does not paint but does teleport the layer: `current_bounds` is
+    /// `start_bounds` plus `current_doc - start_doc`, so a view that
+    /// moved under it shifts the layer by the clamp's own jump on the
+    /// next event. Also the negative control for the other half — a
+    /// zoom that never reaches the bound must leave the reference
+    /// exactly alone, since `zoom_at` already holds it valid.
+    #[test]
+    fn scroll_zooming_mid_move_leaves_the_layer_where_the_pointer_put_it() {
+        let start_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        let pointer = (40.0, 40.0);
+        let a_move = |view: &aurora_ui::CanvasView| Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: view.to_document(pointer),
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+
+        // (a) A zoom that hits the bound.
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = a_move(&view);
+        apply_scroll_zoom(
+            &mut view,
+            Some(&mut drag),
+            pointer,
+            winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
+            (0.0, 0.0),
+        );
+        let _ = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        let Drag::Move { current_bounds, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert_eq!(
+            current_bounds, start_bounds,
+            "a still pointer must not move the layer"
+        );
+
+        // (b) A zoom nowhere near it: nothing to correct, and nothing
+        // corrected.
+        let mut view = CanvasView::new();
+        view.pan_by((-400.0, -400.0));
+        let mut drag = a_move(&view);
+        let Drag::Move {
+            start_doc: start_doc_before,
+            ..
+        } = drag
+        else {
+            unreachable!("just built a move drag")
+        };
+        apply_scroll_zoom(
+            &mut view,
+            Some(&mut drag),
+            pointer,
+            winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+            (0.0, 0.0),
+        );
+        let Drag::Move { start_doc, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert!(
+            (start_doc.0 - start_doc_before.0).abs() < 1e-3
+                && (start_doc.1 - start_doc_before.1).abs() < 1e-3,
+            "a zoom that never reaches the bound must not shift the reference: \
+             {start_doc_before:?} -> {start_doc:?}"
+        );
+    }
+
+    // RT-02c (0.57.8). The same hazard again, at the one kind of path
+    // neither `apply_scroll_zoom` nor `commit_ending_drag` covers:
+    // `aurora_ui::CanvasView::set_min_zoom`, which reads like a plain
+    // bounds setter and *moves the view*. `App::apply_resize` and
+    // `App::redraw` both call it on every canvas-size or scale-factor
+    // change, neither of which is a "I am done dragging" gesture -- so
+    // a window resize while a stroke is held is the trigger, with the
+    // pointer completely still.
+
+    /// The bug and the fix over the same still pointer. Part (a) is the
+    /// pre-0.57.8 behaviour, spelled by handing
+    /// [`apply_canvas_min_zoom`] no drag to re-anchor, and measures what
+    /// it costs; part (b) is the same raise with the live drag passed.
+    #[test]
+    fn resizing_mid_stroke_re_anchors_the_stroke_instead_of_painting_a_line_never_drawn() {
+        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        let pointer = (400.0, 300.0);
+        // A view below the floor is exactly what a freshly opened
+        // document plus a zoom-out leaves behind, until the next
+        // frame -- or a resize -- re-applies the floor.
+        let below_the_floor = || {
+            let mut view = CanvasView::new();
+            view.zoom_at((0.0, 0.0), 0.25);
+            view
+        };
+        let a_stroke = |view: &CanvasView| Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+        let mut selection = SelectionSet::new();
+
+        // (a) No re-anchor.
+        let mut view = below_the_floor();
+        let mut drag = a_stroke(&view);
+        let before = view.to_document(pointer);
+        apply_canvas_min_zoom(&mut view, None, Some(pointer), floor);
+        let after = view.to_document(pointer);
+        assert!(
+            (after.0 - before.0).abs() > 100.0 && (after.1 - before.1).abs() > 100.0,
+            "setup: raising the floor really does move the document point under \
+             a still pointer: {before:?} -> {after:?}"
+        );
+        let stale = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        assert!(
+            stale.len() > 50,
+            "setup: without the re-anchor a still pointer paints a whole line of \
+             dabs; got {}",
+            stale.len()
+        );
+
+        // (b) The fix.
+        let mut view = below_the_floor();
+        let mut drag = a_stroke(&view);
+        apply_canvas_min_zoom(&mut view, Some(&mut drag), Some(pointer), floor);
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// The same re-anchor for a `Drag::Move`, where a stale `start_doc`
+    /// does not paint but does teleport the layer — and the negative
+    /// control: a floor the view already satisfies moves nothing, so it
+    /// must correct nothing.
+    #[test]
+    fn resizing_mid_move_leaves_the_layer_where_the_pointer_put_it() {
+        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        let pointer = (400.0, 300.0);
+        let start_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        let a_move = |view: &CanvasView| Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: view.to_document(pointer),
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+        let mut selection = SelectionSet::new();
+
+        // (a) A raise that really moves the view.
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        let mut drag = a_move(&view);
+        apply_canvas_min_zoom(&mut view, Some(&mut drag), Some(pointer), floor);
+        let _ = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        let Drag::Move { current_bounds, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert_eq!(
+            current_bounds, start_bounds,
+            "a still pointer must not move the layer"
+        );
+
+        // (b) A view already above the floor: nothing to correct, and
+        // nothing corrected.
+        let mut view = CanvasView::new();
+        let mut drag = a_move(&view);
+        let Drag::Move {
+            start_doc: start_doc_before,
+            ..
+        } = drag
+        else {
+            unreachable!("just built a move drag");
+        };
+        apply_canvas_min_zoom(&mut view, Some(&mut drag), Some(pointer), floor);
+        let Drag::Move { start_doc, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert!(
+            (start_doc.0 - start_doc_before.0).abs() < 1e-3
+                && (start_doc.1 - start_doc_before.1).abs() < 1e-3,
+            "a floor the view already satisfies must not shift the reference: \
+             {start_doc_before:?} -> {start_doc:?}"
+        );
+    }
+
+    /// **Why the correction is measured at the pointer**, and why
+    /// `apply_scroll_zoom`'s own "one uniform shift, measured anywhere"
+    /// argument does not transfer to this path (0.57.8). There, a pan
+    /// clamp at an already-fixed zoom shifts `to_document(p)` by the
+    /// same amount for every `p`. Here the *zoom* changes, and raising
+    /// `z0` to `z1` anchored at `(0, 0)` shifts `to_document(x)` by
+    /// `x * (1/z1 - 1/z0)` — exactly zero at the anchor, and different
+    /// at every other point. Measuring anywhere but the point each
+    /// drag's own reference is derived from would correct by the wrong
+    /// amount; measuring at the anchor would correct by nothing at all.
+    #[test]
+    fn raising_the_zoom_floor_shifts_to_document_by_a_different_amount_at_every_point() {
+        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        // A non-zero pan too: the identity is not an artefact of the
+        // view starting at the origin.
+        view.pan_by((-37.0, 19.0));
+        let old_zoom = view.zoom();
+        let probes = [(0.0, 0.0), (100.0, 40.0), (900.0, 700.0)];
+        let before = probes.map(|probe| view.to_document(probe));
+
+        apply_canvas_min_zoom(&mut view, None, None, floor);
+
+        let new_zoom = view.zoom();
+        assert!(
+            new_zoom > old_zoom,
+            "setup: the floor really raises this view's zoom: \
+             {old_zoom} -> {new_zoom}"
+        );
+        let scale = 1.0 / new_zoom - 1.0 / old_zoom;
+        for (probe, was) in probes.iter().zip(before.iter()) {
+            let now = view.to_document(*probe);
+            let shift = (now.0 - was.0, now.1 - was.1);
+            let expected = (probe.0 * scale, probe.1 * scale);
+            assert!(
+                (shift.0 - expected.0).abs() <= expected.0.abs().mul_add(1e-3, 1e-3)
+                    && (shift.1 - expected.1).abs() <= expected.1.abs().mul_add(1e-3, 1e-3),
+                "at {probe:?} the shift must be x * (1/z1 - 1/z0): expected \
+                 {expected:?}, got {shift:?}"
+            );
+        }
+        // The two halves of "not uniform", stated as assertions rather
+        // than left to the formula above: nothing moves at the anchor,
+        // and something very much does elsewhere.
+        let anchor_now = view.to_document((0.0, 0.0));
+        let Some(anchor_was) = before.first() else {
+            unreachable!("three probes");
+        };
+        assert!(
+            (anchor_now.0 - anchor_was.0).abs() < 1e-3
+                && (anchor_now.1 - anchor_was.1).abs() < 1e-3,
+            "the (0, 0) anchor is held fixed across the raise: \
+             {anchor_was:?} -> {anchor_now:?}"
+        );
+        let Some(far_was) = before.last() else {
+            unreachable!("three probes");
+        };
+        let far_now = view.to_document((900.0, 700.0));
+        assert!(
+            (far_now.0 - far_was.0).abs() > 100.0,
+            "and a point far from it is not: {far_was:?} -> {far_now:?}"
+        );
+    }
+
+    /// **The negative control for `continue_drag`'s own `Drag::Move`
+    /// arm** (RT-06). `commit_ending_drag`'s doc comment argues that
+    /// arm must *not* clamp — the clamp would feed the moved view back
+    /// into the next event's delta, which is derived from a fixed
+    /// `start_doc` through `to_document`, and the drag would chase
+    /// itself. Until now that argument was defended only by prose:
+    /// adding the clamp there passed the whole suite.
+    ///
+    /// So this re-spells the arm both ways over the same pointer path —
+    /// the real [`continue_drag`], and a local copy with exactly the
+    /// clamp the design bans (against the moving layer's own origin,
+    /// which is what `active_layer_origin` reports once
+    /// `App::apply_move` has written `current_bounds` back) — and
+    /// asserts they disagree. The real one tracks the pointer exactly;
+    /// the fed-back one runs away from it.
+    #[test]
+    fn clamping_inside_the_move_arm_would_feed_back_into_its_own_delta() {
+        let start_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        // Panned right/down, so a clamp against a layer origin at or
+        // past the document origin really does have something to bite.
+        let start_view = || {
+            let mut view = CanvasView::new();
+            view.pan_by((40.0, 40.0));
+            view
+        };
+        let path = [(60.0, 60.0), (80.0, 80.0), (100.0, 100.0), (120.0, 120.0)];
+
+        let mut real_view = start_view();
+        let mut selection = SelectionSet::new();
+        let start_doc = real_view.to_document((40.0, 40.0));
+        let mut real = Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc,
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+        for point in path {
+            let _ = continue_drag(&mut real, point, &mut real_view, &mut selection, (0.0, 0.0));
+        }
+        let Drag::Move {
+            current_bounds: real_bounds,
+            ..
+        } = real
+        else {
+            unreachable!("still a Move drag");
+        };
+
+        // The same arm, with the clamp added.
+        let mut fed_back_view = start_view();
+        let mut fed_back = start_bounds;
+        for point in path {
+            let current_doc = fed_back_view.to_document(point);
+            fed_back = shift_bounds(
+                start_bounds,
+                (current_doc.0 - start_doc.0, current_doc.1 - start_doc.1),
+            );
+            // What `App::apply_move` writes back, and what a clamp in
+            // this arm would then measure against.
+            #[allow(clippy::cast_precision_loss)]
+            fed_back_view.clamp_pan_to_minimum((fed_back.x as f32, fed_back.y as f32));
+        }
+
+        assert_eq!(
+            real_bounds,
+            aurora_core::Rect {
+                x: 80,
+                y: 80,
+                ..start_bounds
+            },
+            "the real arm tracks the pointer's own (80, 80) delta exactly"
+        );
+        assert_ne!(
+            fed_back, real_bounds,
+            "a clamp in this arm has to visibly diverge, or the design rationale for leaving it \
+             out is untested"
+        );
+        assert!(
+            fed_back.x > real_bounds.x && fed_back.y > real_bounds.y,
+            "and it diverges by running away from the pointer: {fed_back:?} vs {real_bounds:?}"
+        );
     }
 }
