@@ -10010,6 +10010,36 @@ structural design work.
     - **Leftovers from a run that never reaches the cleanup are not
       cleaned up** — see the follow-up item below.
 
+    **Fixed 2026-08-26 (0.57.9): a real Windows CI failure, not a
+    theoretical gap.** `store::tests::new_refuses_a_scratch_path_that_is_not_a_directory`
+    is not platform-gated (unlike its symlink sibling, which is rightly
+    `#[cfg(unix)]`-only) — it asserts that a plain file at the scratch
+    path is refused as `NotADirectory`, not whatever the underlying
+    directory-creation call reports on its own for a path that already
+    exists. The Unix `create_private_dir` already has this exact check
+    (`existing.is_dir()` before ever calling `mkdir`), but the
+    `#[cfg(not(unix))]` counterpart was just `std::fs::create_dir_all(dir)`
+    with no pre-check at all, so on the Windows runner it surfaced
+    `AlreadyExists` (Win32 `ERROR_ALREADY_EXISTS`, os error 183) instead
+    — a real, reproducible cross-platform gap this project's own
+    Linux-only sandbox cannot run, caught only because Windows CI runs
+    on every push per this file's own "cross-platform breakage is cheap
+    to fix now" principle. The is-a-directory check itself is not
+    Unix-specific (only the ACL/ownership/symlink treatment discussed
+    above is), so it is not skipped on other platforms: the same
+    `symlink_metadata`-then-`is_dir` check was added to the
+    `#[cfg(not(unix))]` branch, using only portable `std::fs` calls.
+    Verified by cross-checking `aurora-tile` against the
+    `x86_64-pc-windows-gnu` target from this Linux sandbox (`rustup
+    target add` plus `cargo check --target`) rather than merely arguing
+    it by inspection — the new branch compiles clean there. A full
+    workspace cross-check hit an unrelated, expected wall
+    (`lcms2-sys`'s C build script needs a `mingw` cross-compiler this
+    sandbox does not have; the real Windows runner has its own native
+    toolchain and does not hit this). No new symlink handling was added
+    to the Windows branch — that gap is still correctly disclosed above
+    as Unix-only-covered, and its own test stays `#[cfg(unix)]`-gated.
+
 - [ ] **Scratch directories from sessions that never reach the shutdown
     cleanup are never cleaned up.** Opened 2026-08-24, split out of the
     item above as the one part of it deliberately left to its own round.

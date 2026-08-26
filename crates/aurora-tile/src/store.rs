@@ -331,9 +331,30 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Non-Unix counterpart of the above — see its doc comment for what is
-/// deliberately not covered here.
+/// deliberately not covered here (the ACL/ownership treatment, and the
+/// symlink check, both Unix-specific). The is-a-directory check is not
+/// Unix-specific, so it is not skipped here: a plain file at `dir` must
+/// still be refused as [`std::io::ErrorKind::NotADirectory`], not
+/// whatever [`std::fs::create_dir_all`] happens to report on its own for
+/// a path that already exists (`AlreadyExists`, on Windows) — the same
+/// reasoning the Unix version's own doc comment gives for its check.
 #[cfg(not(unix))]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    if let Ok(existing) = std::fs::symlink_metadata(dir) {
+        if !existing.is_dir() {
+            return Err(Error::new(
+                ErrorKind::NotADirectory,
+                format!(
+                    "refusing to use {} as a scratch directory: it already exists and is not a \
+                     directory",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+
     std::fs::create_dir_all(dir)
 }
 
