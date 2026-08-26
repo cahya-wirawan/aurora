@@ -3485,6 +3485,7 @@ fn finish_move(
 /// pointer that is *not* being used to paint (a `Drag::Move` is not a
 /// `Drag::Brush`), and it is resolved by this clamp the moment the drag
 /// ends.
+#[allow(clippy::too_many_arguments)]
 fn commit_ending_drag(
     drag: Option<Drag>,
     layers: &aurora_doc::LayerTree,
@@ -3493,6 +3494,7 @@ fn commit_ending_drag(
     undo_order: &mut UndoOrder,
     view: &mut aurora_ui::CanvasView,
     active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(f32, f32)>,
 ) {
     match drag {
         Some(
@@ -3535,7 +3537,7 @@ fn commit_ending_drag(
             // (`begin_drag` takes `Move`'s id from `active_pixel_layer`)
             // -- so this is the definition, spelled out, rather than a
             // second source of truth that could drift from it.
-            clamp_pan_to_active_layer(view, layers, active_layer);
+            clamp_pan_to_active_layer(view, layers, active_layer, canvas_size);
         }
         _ => {}
     }
@@ -3641,26 +3643,30 @@ fn begin_drag(
 /// always returns an empty `Vec` too; the caller samples directly at
 /// `canvas_point` itself (`App::sample_eyedropper`).
 ///
-/// `min_doc` is the active layer's own document-space origin
-/// (`active_layer_origin`) — after `Drag::Pan`'s own `pan_by` call,
-/// this clamps the view (`CanvasView::clamp_pan_to_minimum`) so it can
-/// never scroll past that edge. Without this, panning right/down kept
-/// moving `view`'s pan arbitrarily far, making `to_document` (used both
-/// here, for `Marquee`/`Brush`/`Eraser`/`Move`, and by the caller for
+/// `bounds` is the whole canvas pan bound ([`PanBounds`], built by
+/// [`pan_bounds`] from the active layer and the canvas area's own
+/// logical size) — after `Drag::Pan`'s own `pan_by` call, this applies
+/// it so the view can never scroll past *either* edge. Without the near
+/// half, panning right/down kept moving `view`'s pan arbitrarily far,
+/// making `to_document` (used both here, for
+/// `Marquee`/`Brush`/`Eraser`/`Move`, and by the caller for
 /// `Eyedropper`) report a true, unbounded — eventually negative —
 /// document position, while the renderer (`canvas_local_origin` /
 /// `aurora_gpu::TileResidency::set_origin`) silently pinned the
 /// *drawn* view at the document's own top-left tile forever, since
 /// `aurora_tile::TileId`'s unsigned fields have no way to represent a
-/// negative tile. Paint and render then silently disagreed. Clamping
-/// here keeps both reading the same, already-bounded `view` instead.
+/// negative tile. Paint and render then silently disagreed. Without the
+/// far half the identical thing happened past the document's own
+/// 300,000 px ceiling, where that same `set_origin` saturates instead.
+/// Applying both here keeps render and paint reading the same,
+/// already-bounded `view`.
 #[must_use]
 fn continue_drag(
     drag: &mut Drag,
     canvas_point: (f32, f32),
     view: &mut aurora_ui::CanvasView,
     selection: &mut aurora_doc::SelectionSet,
-    min_doc: (f32, f32),
+    bounds: PanBounds,
 ) -> Vec<(f32, f32)> {
     match drag {
         Drag::Pan { last_screen } => {
@@ -3669,7 +3675,7 @@ fn continue_drag(
                 canvas_point.1 - last_screen.1,
             );
             view.pan_by(delta);
-            view.clamp_pan_to_minimum(min_doc);
+            bounds.apply(view);
             *last_screen = canvas_point;
             Vec::new()
         }
@@ -3758,12 +3764,20 @@ fn zoom_steps_for_scroll(delta: winit::event::MouseScrollDelta) -> f32 {
 /// gesture that works regardless of which tool is active, matching
 /// every professional raster editor's own convention.
 ///
-/// `min_doc` is the active layer's own document-space origin
-/// (`active_layer_origin`), passed to `CanvasView::clamp_pan_to_minimum`
+/// `bounds` is the whole canvas pan bound ([`PanBounds`]), applied
 /// after `zoom_at` — `zoom_at` recomputes `pan` from scratch to keep
 /// `anchor` fixed, and that new `pan` can land past the document's own
-/// top-left edge just as easily as a plain `pan_by` can (see
-/// `continue_drag`'s own doc comment for why that must never happen).
+/// top-left edge, or past its far one, just as easily as a plain
+/// `pan_by` can (see `continue_drag`'s own doc comment for why that
+/// must never happen).
+///
+/// **`bounds.apply` sits strictly between the two `to_document(anchor)`
+/// measurements**, and that placement is the whole correctness of the
+/// re-anchor below: whatever the clamp moves — near edge or far — is
+/// inside the window [`shift_drag_reference`] measures, so the live
+/// drag is corrected for it. Moving the call either side of that window
+/// silently reopens the "dabs painted from a stationary pointer" bug at
+/// whichever edge got left outside.
 ///
 /// **Takes the live `drag`, if there is one, because that clamp moves
 /// the view** (0.57.7) — and a drag in progress is holding a
@@ -3778,13 +3792,13 @@ fn apply_scroll_zoom(
     drag: Option<&mut Drag>,
     anchor: (f32, f32),
     delta: winit::event::MouseScrollDelta,
-    min_doc: (f32, f32),
+    bounds: PanBounds,
 ) {
     let before = view.to_document(anchor);
     let steps = zoom_steps_for_scroll(delta);
     let factor = ZOOM_WHEEL_BASE.powf(steps);
     view.zoom_at(anchor, view.zoom() * factor);
-    view.clamp_pan_to_minimum(min_doc);
+    bounds.apply(view);
     let after = view.to_document(anchor);
     if let Some(drag) = drag {
         shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
@@ -3806,13 +3820,23 @@ fn apply_scroll_zoom(
 /// [`aurora_ui::CanvasView::zoom_at`] holds the document point under
 /// its own anchor fixed, and a stored document-space reference *is* a
 /// document position, so a pure zoom leaves every one of them still
-/// naming the same place: nothing to correct. The clamp that follows it
-/// ([`aurora_ui::CanvasView::clamp_pan_to_minimum`]) is what actually
-/// bites — and it only ever changes `pan`, at a zoom now fixed, so it
-/// shifts `to_document(p)` by the same amount for every `p`. Measuring
-/// that shift at the zoom anchor (where the zoom's own contribution is
-/// exactly zero) therefore yields the whole correction, for reference
-/// points anywhere on the canvas.
+/// naming the same place: nothing to correct. The clamps that follow it
+/// ([`PanBounds::apply`]) are what actually bite — and they only ever
+/// change `pan`, at a zoom now fixed, so each shifts `to_document(p)`
+/// by the same amount for every `p`. Measuring that shift at the zoom
+/// anchor (where the zoom's own contribution is exactly zero)
+/// therefore yields the whole correction, for reference points
+/// anywhere on the canvas.
+///
+/// **That reasoning covers the far clamp exactly as it covers the near
+/// one** (0.57.10), which is why the far edge needed no second
+/// mechanism here: [`aurora_ui::CanvasView::clamp_pan_to_maximum`]
+/// writes nothing but `pan`, at a zoom the preceding `zoom_at` has
+/// already fixed, so it is a uniform translation of `to_document` by
+/// construction — the same statement, in the opposite direction. Both
+/// clamps run inside the one before/after window the caller measures,
+/// so a `delta` computed there carries whichever of them fired, or
+/// both.
 ///
 /// Without it, a scroll-zoom that hits the pan bound left a live
 /// `Drag::Brush`'s own `last_doc` naming the pre-clamp document
@@ -3841,6 +3865,26 @@ fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
     }
 }
 
+/// The document-space reference point `drag` holds fixed, if it holds
+/// one at all — the read counterpart of [`shift_drag_reference`]'s own
+/// write, and deliberately the same `match` in the same order so the
+/// two cannot drift apart: a `Drag` variant that gains a reference has
+/// to be handled in both or in neither.
+///
+/// The one caller is [`apply_canvas_min_zoom`], which projects this
+/// back to screen (`aurora_ui::CanvasView::to_screen`) to recover a
+/// point to measure a view move at when the pointer is not over the
+/// canvas area. `Drag::Pan` and `Drag::Eyedropper` return `None` for
+/// the reason `shift_drag_reference` ignores them.
+#[must_use]
+fn drag_reference(drag: &Drag) -> Option<(f32, f32)> {
+    match drag {
+        Drag::Marquee { start_doc } | Drag::Move { start_doc, .. } => Some(*start_doc),
+        Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
+        Drag::Pan { .. } | Drag::Eyedropper => None,
+    }
+}
+
 /// How much one Zoom-tool click zooms in (or, with `Alt` held, out) —
 /// [`handle_zoom_tool_click`]'s own factor.
 const ZOOM_CLICK_FACTOR: f32 = 2.0;
@@ -3851,16 +3895,16 @@ const ZOOM_CLICK_FACTOR: f32 = 2.0;
 /// out), distinct from [`apply_scroll_zoom`], which works with any tool
 /// active.
 ///
-/// `min_doc` is the active layer's own document-space origin
-/// (`active_layer_origin`) — same reasoning as `apply_scroll_zoom`'s own
-/// doc comment: `zoom_at` recomputes `pan` to keep `canvas_point` fixed
-/// on screen, and that new `pan` needs the same post-hoc
-/// `clamp_pan_to_minimum` call to stay within the document's own edge.
+/// `bounds` is the whole canvas pan bound ([`PanBounds`]) — same
+/// reasoning as `apply_scroll_zoom`'s own doc comment: `zoom_at`
+/// recomputes `pan` to keep `canvas_point` fixed on screen, and that new
+/// `pan` needs the same post-hoc [`PanBounds::apply`] to stay within
+/// both of the document's own edges.
 fn handle_zoom_tool_click(
     view: &mut aurora_ui::CanvasView,
     canvas_point: (f32, f32),
     modifiers: Modifiers,
-    min_doc: (f32, f32),
+    bounds: PanBounds,
 ) {
     let factor = if modifiers.alt {
         1.0 / ZOOM_CLICK_FACTOR
@@ -3868,7 +3912,7 @@ fn handle_zoom_tool_click(
         ZOOM_CLICK_FACTOR
     };
     view.zoom_at(canvas_point, view.zoom() * factor);
-    view.clamp_pan_to_minimum(min_doc);
+    bounds.apply(view);
 }
 
 // -- Brush painting, eraser, and layer selection: a live document, a
@@ -3931,12 +3975,24 @@ fn active_pixel_layer(
 /// other than the document's own origin (`aurora_doc::LayerTree::set_bounds`,
 /// the Move tool's own document-model support).
 ///
-/// **This value is also the canvas pan boundary**
-/// ([`clamp_pan_to_active_layer`]), so it moves when *either* of its two
+/// **This value is also the canvas pan boundary**, both edges of it
+/// ([`pan_bounds`], [`clamp_pan_to_active_layer`]) — the near one is
+/// this origin and the far one is this origin plus the document
+/// ceiling. So the bound moves when *either* of this function's two
 /// inputs does: a different layer becoming active, or the active
-/// layer's own `bounds` changing under it. Any new code path that does
-/// either must re-clamp — see [`App::active_layer`]'s own doc comment
-/// for the full list of the ones that already do.
+/// layer's own `bounds` changing under it.
+///
+/// **And since 0.57.10 there is a third input that is not one of
+/// this function's own**: the canvas area's own logical size
+/// ([`canvas_area_logical_size`]). The far bound is a statement about
+/// the document position at the canvas area's *bottom-right* corner,
+/// so growing that area violates the bound with neither the active
+/// layer nor its `bounds` having changed at all — a window resize is a
+/// pan-bound-moving event in its own right, which is why
+/// [`apply_canvas_min_zoom`] re-applies [`PanBounds`] and not only the
+/// zoom floor. Any new code path that changes any of the three must
+/// re-clamp — see [`App::active_layer`]'s own doc comment for the full
+/// list of the ones that already do.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 fn active_layer_origin(
@@ -3947,14 +4003,155 @@ fn active_layer_origin(
         .map_or((0.0, 0.0), |(_, bounds)| (bounds.x as f32, bounds.y as f32))
 }
 
+/// The whole canvas pan bound, both edges, as one value — what every
+/// path that can move the view (or move the boundary out from under a
+/// view that never moved) applies via [`Self::apply`].
+///
+/// **Why one struct rather than two loose tuples.** The near edge was
+/// closed first (`aurora_ui::CanvasView::clamp_pan_to_minimum`, 0.57.8
+/// and before) and the far edge only afterwards (0.57.10), and every
+/// round of that work found the same failure: a call site that moved
+/// the view and forgot one of the clamps. Bundling the bound with the
+/// one function that applies it means a new pan-moving path takes a
+/// `PanBounds` and cannot silently apply half of it — the grep for
+/// `clamp_pan_to_minimum` across this crate is supposed to return
+/// exactly one hit, inside [`Self::apply`], and that is the check that
+/// makes the centralisation real rather than aspirational.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PanBounds {
+    /// The lowest document-space position the canvas area's own
+    /// top-left corner may show — [`active_layer_origin`].
+    min_doc: (f32, f32),
+    /// The highest document-space position the canvas area's own
+    /// bottom-right corner may show — `min_doc` plus
+    /// [`aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX`].
+    max_doc: (f32, f32),
+    /// The canvas area's own size in **logical** pixels
+    /// ([`canvas_area_logical_size`]) — the space `CanvasView`'s own
+    /// `pan`/`to_document` work in. `(0.0, 0.0)` when it is not known
+    /// yet; see [`pan_bounds`].
+    canvas_size: (f32, f32),
+}
+
+/// The pan bound for `active_layer` in `layers`, at a canvas area of
+/// `canvas_size` logical pixels.
+///
+/// **Both edges are measured from the active layer's own origin, and
+/// the far one's *extent* is the document ceiling** — not the ceiling
+/// itself, and not the layer's own width/height. That is not a choice;
+/// it is what the render path already does.
+/// `aurora_gpu::TileResidency::set_origin` is handed
+/// [`canvas_local_origin`]`(view, `[`active_layer_origin`]`(..))`, a
+/// **layer-local** position, and clamps it to
+/// `[0, `[`aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX`]`]`. Mapping
+/// that range back into document space by adding the layer origin gives
+/// exactly `[min_doc, min_doc + MAX_DOC_ORIGIN_PX]`, so a view held
+/// inside these bounds is a view whose `to_document` and whose rendered
+/// origin agree — which is the entire property both clamps exist for.
+///
+/// **`canvas_size: None` degrades to `(0.0, 0.0)` rather than skipping
+/// the far clamp**, deliberately. With a zero canvas size the far clamp
+/// bounds the canvas area's own *top-left* corner at `max_doc` instead
+/// of its bottom-right — and the top-left corner is precisely the
+/// position `set_origin` receives, so the minimal render/paint
+/// divergence condition is still closed; the view is merely allowed
+/// further out than a known canvas size would allow. An unknown canvas
+/// size weakens the bound and never removes it, the same stance
+/// [`reset_canvas_view`] already takes on a stale zoom floor (a bound
+/// from the last known canvas size is still a bound, and having none is
+/// the one outcome that must not happen).
+#[must_use]
+fn pan_bounds(
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(f32, f32)>,
+) -> PanBounds {
+    let min_doc = active_layer_origin(layers, active_layer);
+    PanBounds {
+        min_doc,
+        max_doc: (
+            min_doc.0 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
+            min_doc.1 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
+        ),
+        canvas_size: canvas_size.unwrap_or((0.0, 0.0)),
+    }
+}
+
+impl PanBounds {
+    /// Applies both edges to `view`.
+    ///
+    /// **The order is load-bearing: the near bound is applied last, so
+    /// it wins on conflict.** The two cannot actually cross on any path
+    /// this crate can produce — [`pan_bounds`] builds `max_doc` as
+    /// `min_doc` plus a large positive ceiling — but if they ever did
+    /// (a future bound derived some other way), the near edge is the
+    /// one to keep: below `min_doc` the *tile addressing itself* has no
+    /// representation, since `aurora_tile::TileId`'s fields are
+    /// unsigned, whereas past `max_doc` the failure is a saturating
+    /// clamp inside `aurora_gpu::TileResidency::set_origin`. Applying
+    /// maximum first and minimum last makes that the outcome without
+    /// needing a conditional, and `aurora-ui`'s own
+    /// `applying_the_maximum_then_the_minimum_leaves_the_near_bound_holding`
+    /// pins it.
+    ///
+    /// **The precision caveat on "cannot cross", stated rather than
+    /// left implicit.** `min_doc + MAX_DOC_ORIGIN_PX` is `f32`
+    /// arithmetic, so at very large layer origins the ceiling stops
+    /// surviving the addition: measured, the sum goes inexact from
+    /// around 1.0e9, and the ceiling is absorbed *entirely* from around
+    /// 1.6384e13, where `max_doc == min_doc` and the two bounds
+    /// degenerate to a single point. They still never **cross** —
+    /// round-to-nearest on two positive values cannot land below the
+    /// larger one — so the ordering guarantee above holds unchanged and
+    /// nothing goes non-finite; the bound merely becomes uselessly
+    /// tight. Reaching it needs a layer origin some eight orders of
+    /// magnitude past the 300,000 px document ceiling, which
+    /// `aurora_doc::LayerTree::set_bounds` will currently accept (an
+    /// `i64` origin; `i64::MAX as f32` ≈ 9.2e18). That missing
+    /// validation is its own tracked PLAN.md item — this is one more
+    /// consequence downstream of it, not a defect in the ordering.
+    ///
+    /// **"The two bounds cannot cross" and "the two bounds cannot be
+    /// jointly unsatisfiable" are different claims, and only the first
+    /// is true.** They never cross, for the reason above. They can
+    /// still both be unsatisfiable at once, and by an ordinary
+    /// condition rather than a degenerate one: the far bound
+    /// constrains `to_document(canvas_size)` and the near bound
+    /// constrains `to_document((0, 0))`, so a `pan` satisfying both at
+    /// once exists only while the *visible document span* —
+    /// `canvas_size / zoom` — fits inside `max_doc - min_doc`, the
+    /// 300,000 px document ceiling. A wide canvas area at a zoom far
+    /// enough out does not fit (3,000 logical px at
+    /// `aurora_ui::canvas_view::MIN_ZOOM` already spans exactly the
+    /// ceiling), and the degenerate `max_doc == min_doc` case the
+    /// precision caveat above describes does not fit at any zoom at
+    /// all.
+    ///
+    /// The max-then-min ordering decides what happens then, and decides
+    /// it the right way round: the near bound is applied last and holds
+    /// exactly, and the far bound is silently left unenforced. That is
+    /// the outcome to want, not a second bug — what these clamps exist
+    /// for is render/paint *agreement*, and the renderer's own origin
+    /// (`aurora_gpu::TileResidency::set_origin`) is anchored at the
+    /// canvas area's top-left corner, the very position the near bound
+    /// pins. A view held there agrees with what is drawn no matter how
+    /// far past `max_doc` its bottom-right corner reaches; a view
+    /// pinned at the far bound instead would not.
+    fn apply(self, view: &mut aurora_ui::CanvasView) {
+        view.clamp_pan_to_maximum(self.max_doc, self.canvas_size);
+        view.clamp_pan_to_minimum(self.min_doc); // last: the near bound wins on conflict
+    }
+}
+
 /// Re-establishes the pan bound after the *boundary* moved rather than
 /// the pan.
 ///
-/// [`aurora_ui::CanvasView::clamp_pan_to_minimum`] bounds the view
-/// against the active layer's own origin ([`active_layer_origin`], the
-/// value [`canvas_local_origin`] subtracts), and every gesture that
-/// moves the *pan* already calls it ([`continue_drag`],
-/// [`apply_scroll_zoom`], [`handle_zoom_tool_click`]). This is the
+/// [`PanBounds`] bounds the view against the active layer's own origin
+/// ([`active_layer_origin`], the value [`canvas_local_origin`]
+/// subtracts) on the near edge and that origin plus the document
+/// ceiling on the far one, and every gesture that moves the *pan*
+/// already applies it ([`continue_drag`], [`apply_scroll_zoom`],
+/// [`handle_zoom_tool_click`]). This is the
 /// counterpart for the other way the same invariant breaks: the active
 /// layer's own origin changing moves the boundary out from under a pan
 /// that never moved. Switching from a layer at document `(0, 0)` to one
@@ -3976,12 +4173,18 @@ fn active_layer_origin(
 /// which is not within a moved layer's own bound. Callers do not get to
 /// choose: [`load_document_view`] is the two of them as one step, and
 /// is what the document-open paths call.
+///
+/// `canvas_size` is the canvas area's own **logical** size
+/// ([`canvas_area_logical_size`]), which the far half of the bound
+/// needs and the near half does not; `None` weakens the far bound
+/// rather than dropping it — see [`pan_bounds`].
 fn clamp_pan_to_active_layer(
     view: &mut aurora_ui::CanvasView,
     layers: &aurora_doc::LayerTree,
     active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(f32, f32)>,
 ) {
-    view.clamp_pan_to_minimum(active_layer_origin(layers, active_layer));
+    pan_bounds(layers, active_layer, canvas_size).apply(view);
 }
 
 /// Everything an `Undo`/`Redo` invalidates *outside* the document model
@@ -4009,9 +4212,10 @@ fn after_undo_redo(
     layers: &aurora_doc::LayerTree,
     active_layer: Option<aurora_doc::LayerId>,
     composite_cache: &mut CompositeCache,
+    canvas_size: Option<(f32, f32)>,
 ) {
     composite_cache.bump();
-    clamp_pan_to_active_layer(view, layers, active_layer);
+    clamp_pan_to_active_layer(view, layers, active_layer, canvas_size);
 }
 
 /// One `Undo`/`Redo` activation, whole: end whatever drag was still
@@ -4071,6 +4275,7 @@ fn perform_undo_redo(
     drag: &mut Option<Drag>,
     command: AppCommand,
 ) {
+    let canvas_size = canvas_area_logical_size(workspace);
     commit_ending_drag(
         drag.take(),
         layers,
@@ -4079,6 +4284,7 @@ fn perform_undo_redo(
         undo_order,
         view,
         active_layer,
+        canvas_size,
     );
     run_command(
         workspace,
@@ -4092,7 +4298,7 @@ fn perform_undo_redo(
         undo_order,
         command,
     );
-    after_undo_redo(view, layers, active_layer, composite_cache);
+    after_undo_redo(view, layers, active_layer, composite_cache, canvas_size);
 }
 
 /// The reserved `aurora_tile::SurfaceId` this crate uses for its own
@@ -6390,6 +6596,7 @@ fn press_layer_row(
         undo_order,
         view,
         *active_layer,
+        canvas_area_logical_size(workspace),
     );
     select_layer(workspace, layer_rows, active_layer, view, layers, layer_id);
 }
@@ -6419,6 +6626,10 @@ fn select_layer(
     layers: &aurora_doc::LayerTree,
     layer_id: aurora_doc::LayerId,
 ) {
+    // Read before the row loop below takes `workspace.tree` mutably --
+    // the value itself is independent of the loop, but the borrow is
+    // not.
+    let canvas_size = canvas_area_logical_size(workspace);
     *active_layer = Some(layer_id);
     for (&row, &id) in layer_rows {
         let Some(node) = workspace.tree.accessibility(row) else {
@@ -6434,7 +6645,7 @@ fn select_layer(
     // ordering, but keeping the accessibility work untouched and the
     // new bound re-established at the end keeps this function's two
     // jobs readable as two jobs.
-    clamp_pan_to_active_layer(view, layers, Some(layer_id));
+    clamp_pan_to_active_layer(view, layers, Some(layer_id), canvas_size);
 }
 
 /// Creates a fresh scratch directory for one session's tile store,
@@ -6824,6 +7035,40 @@ fn canvas_area_physical_size(
     ))
 }
 
+/// The canvas dock area's own size in **logical** pixels — the canvas
+/// area's laid-out `bounds`, read straight out of the widget tree with
+/// no scaling applied at all.
+///
+/// [`canvas_area_physical_size`]'s counterpart, and deliberately **not**
+/// derived from it. `WidgetTree::compute_layout` is fed a *logical*
+/// window size ([`logical_size`]) precisely so widget padding/spacing
+/// stay DPI-independent, so `bounds` is already logical and this is one
+/// cast, not a round trip; dividing the physical size back down by
+/// `scale_factor` would reintroduce the rounding
+/// `canvas_area_physical_size` deliberately applies (`round().max(1.0)`)
+/// and give a second, subtly different answer to the same question.
+///
+/// [`PanBounds`] is the consumer: `CanvasView`'s `pan`/`to_document`
+/// are defined in the canvas area's own logical space (see that type's
+/// own doc comment), and
+/// [`aurora_ui::CanvasView::clamp_pan_to_maximum`] bounds the document
+/// position at `canvas_size` — so a physical size here would place the
+/// far bound at `scale_factor` times the right distance on any display
+/// where that is not 1.0.
+///
+/// `None` only for a genuinely unknown widget id, which
+/// `workspace.canvas_area` never actually is — **not** before the first
+/// layout, where `bounds` reports a zero rect rather than `None` (the
+/// same real finding [`canvas_area_physical_rect`]'s own doc comment
+/// records). A zero size is a legitimate weaker bound, not a failure —
+/// see [`pan_bounds`].
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn canvas_area_logical_size(workspace: &aurora_ui::Workspace) -> Option<(f32, f32)> {
+    let bounds = workspace.tree.bounds(workspace.canvas_area)?;
+    Some((bounds.width as f32, bounds.height as f32))
+}
+
 /// Converts [`aurora_ui::CanvasView::zoom`]'s own logical-pixel zoom
 /// into the *effective* zoom `redraw`'s real
 /// [`aurora_gpu::TileResidency::set_origin`] call site must pass
@@ -6980,27 +7225,109 @@ fn canvas_min_zoom(canvas_size: (u32, u32), scale_factor: f64) -> f32 {
 /// teleport.
 ///
 /// `pointer` is the pointer's canvas-area-relative position
-/// ([`pointer_in_canvas`]) — `None` when it is over a dock panel, off
-/// the window, or before the first layout. There is then no point to
-/// measure at, so the floor is applied with no correction rather than a
-/// guessed one: no drag advances while the pointer is not over the
-/// canvas (`App::handle_pointer_moved` returns before reaching
-/// [`continue_drag`]), and a pointer that leaves the canvas area and
-/// comes back already interpolates across wherever it went in between.
+/// ([`pointer_in_canvas`]) — `None` when it is over a dock panel, over
+/// the rail divider, off the window, or before the first layout.
+///
+/// **That arm used to skip the correction entirely, and that was a bug
+/// in its own right — RT-04, found by dynamic testing and fixed in
+/// 0.57.11.** None of those four states ends a live drag: a keyboard
+/// shortcut toggling a panel's collapsed state, a rail-divider drag
+/// (`App::handle_pointer_pressed`'s divider branch returns *before*
+/// the `self.drag.take()` below it), and a window or monitor resize
+/// all reach here mid-stroke with the pointer parked outside the
+/// canvas area. The old early return still applied `bounds` — moving
+/// the view — and then returned without re-anchoring, so the live
+/// drag's own reference kept naming the *pre*-move document position
+/// and the next pointer-move event, even one back to the very same
+/// screen position, interpolated a whole segment of dabs across the
+/// difference: measured at 166 dabs from a still pointer for the far
+/// clamp and 55 for the near one, the latter being exactly the "click
+/// a layer row, the canvas jumps, the next click paints somewhere
+/// else" symptom this round of work started from. Having no measuring
+/// point is not a reason to skip the correction; it is a reason to
+/// find another point to measure at.
+///
+/// **The point it falls back to is the drag's own reference, projected
+/// back to screen** ([`drag_reference`] and
+/// `aurora_ui::CanvasView::to_screen`). For `Drag::Brush`/`Eraser`
+/// that is exact, not approximate: their `last_doc` *is*
+/// `to_document(canvas_point)` as of the last move event, so
+/// `to_screen(last_doc)` is that same canvas point back again — the
+/// very position the correction would have been measured at had the
+/// pointer stayed over the canvas. For a *pure translation* it is
+/// exact for every drag kind, because a translation shifts
+/// `to_document(p)` by the same amount at every `p`
+/// ([`shift_drag_reference`]'s own doc comment makes that argument for
+/// both clamps) — and a pure translation is what the reachable cases
+/// mostly are: a panel toggle or an ordinary resize moves the pan
+/// bound without the floor ever biting, since the floor only bites on
+/// a view zoomed further out than the atlas can render.
+///
+/// The one residual is `Drag::Move`/`Drag::Marquee` when the floor
+/// *also* raises, which is not a translation (see the formula above):
+/// their `start_doc` is not the pointer's own position, so holding it
+/// fixed on screen is not identical to the shift at the pointer, and
+/// the pointer is not knowable from here. The error is bounded by the
+/// on-screen drag distance times the relative zoom change, against an
+/// uncorrected reference — which moves by the *whole* view delta and
+/// is certainly wrong. Correcting by the best reference available
+/// beats leaving a known-stale one in place.
+///
+/// `Drag::Pan` and `Drag::Eyedropper` yield no reference and so still
+/// take the uncorrected path. That is correct rather than a gap, for
+/// exactly the reason [`shift_drag_reference`] already gives: a pan
+/// holds a *screen* position (which a view move does not invalidate)
+/// and an eyedropper holds nothing at all.
+///
+/// **`bounds` is applied here too, and the far half of it is not
+/// ceremony** (0.57.10). A resize changes the canvas area's own size,
+/// and the far bound is a statement about the document position at the
+/// canvas area's *bottom-right* corner — so growing the window while
+/// the view sits exactly on that bound pushes it past, with nothing
+/// else on this path to catch it. That is the one call site in this
+/// round that needed real analysis rather than mechanical mirroring of
+/// the pan-moving sites.
+///
+/// The **near** half is applied for uniformity, not necessity, and that
+/// is worth stating rather than leaving a reader to wonder: it is
+/// provably a no-op here. `set_min_zoom` raises zoom through
+/// `zoom_at((0, 0), ..)`, which holds `to_document((0, 0))` fixed by
+/// construction (`aurora-ui`'s own
+/// `set_min_zoom_holds_the_top_left_document_position_across_the_raise`
+/// pins exactly that), and the near bound is a statement about
+/// `to_document((0, 0))` alone. Going through the one shared
+/// [`PanBounds::apply`] rather than reaching for
+/// `clamp_pan_to_maximum` directly is what keeps this crate's single
+/// `clamp_pan_to_minimum` call site single.
+///
+/// Both clamps run **inside** the before/after measurement window, for
+/// the same reason [`apply_scroll_zoom`]'s does: whatever they move is
+/// then carried by [`shift_drag_reference`] into a live drag, instead
+/// of moving the view out from under one. A resize arriving mid-stroke
+/// is exactly the case this path exists for.
 fn apply_canvas_min_zoom(
     view: &mut aurora_ui::CanvasView,
     drag: Option<&mut Drag>,
     pointer: Option<(f32, f32)>,
     min_zoom: f32,
+    bounds: PanBounds,
 ) {
-    let (Some(drag), Some(pointer)) = (drag, pointer) else {
-        view.set_min_zoom(min_zoom);
-        return;
-    };
-    let before = view.to_document(pointer);
+    // The canvas-area point to measure the view's own move at: the
+    // pointer when it is over the canvas, and otherwise the live drag's
+    // own reference point projected back to screen -- never "nowhere",
+    // which is what left a stale reference behind before 0.57.11 (see
+    // this function's own doc comment). `None` only when there is no
+    // drag to correct, or a drag that holds no reference at all.
+    let anchor = drag.as_deref().and_then(|drag| {
+        pointer.or_else(|| drag_reference(drag).map(|reference| view.to_screen(reference)))
+    });
+    let before = anchor.map(|anchor| view.to_document(anchor));
     view.set_min_zoom(min_zoom);
-    let after = view.to_document(pointer);
-    shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+    bounds.apply(view);
+    if let (Some(drag), Some(anchor), Some(before)) = (drag, anchor, before) {
+        let after = view.to_document(anchor);
+        shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+    }
 }
 
 /// A freshly reset [`aurora_ui::CanvasView`] for a newly opened
@@ -7067,17 +7394,22 @@ fn reset_canvas_view(
 /// `canvas_size` is the *canvas area's* own physical size
 /// ([`canvas_area_physical_size`]), not the document's — see
 /// [`reset_canvas_view`], whose parameter this is passed straight
-/// through to.
+/// through to. `canvas_logical_size` is the same area measured in
+/// **logical** pixels ([`canvas_area_logical_size`]), which is what the
+/// pan bound's far half needs; the two are separate parameters rather
+/// than one derived from the other for the reason
+/// [`canvas_area_logical_size`]'s own doc comment gives.
 #[must_use]
 fn load_document_view(
     previous: &aurora_ui::CanvasView,
     layers: &aurora_doc::LayerTree,
     active_layer: Option<aurora_doc::LayerId>,
     canvas_size: Option<(u32, u32)>,
+    canvas_logical_size: Option<(f32, f32)>,
     scale_factor: f64,
 ) -> aurora_ui::CanvasView {
     let mut view = reset_canvas_view(previous, canvas_size, scale_factor);
-    clamp_pan_to_active_layer(&mut view, layers, active_layer);
+    clamp_pan_to_active_layer(&mut view, layers, active_layer, canvas_logical_size);
     view
 }
 
@@ -7271,19 +7603,19 @@ struct App {
     /// into `layer_rows` at all, so this can't actually happen via a
     /// click — only via never having a pixel layer to begin with).
     ///
-    /// **The canvas pan boundary is a function of this field — and of
-    /// this layer's own `bounds`.** The bound
-    /// ([`aurora_ui::CanvasView::clamp_pan_to_minimum`]) is measured
-    /// against the active layer's document-space origin
-    /// ([`active_layer_origin`], what [`canvas_local_origin`]
-    /// subtracts), so it moves when *either* input moves, and a pan that
-    /// never moved is then outside it — reopening the render/paint
-    /// divergence that clamp exists to close. Writing this field is
-    /// therefore only half of what has to re-clamp; the other half is
-    /// every path that changes the active layer's `bounds` without
-    /// touching this field at all.
+    /// **The canvas pan boundary is a function of this field, of this
+    /// layer's own `bounds`, and of the canvas area's own size.** The
+    /// bound ([`PanBounds`]) is measured against the active layer's
+    /// document-space origin ([`active_layer_origin`], what
+    /// [`canvas_local_origin`] subtracts) on the near edge, and against
+    /// that origin plus the document ceiling
+    /// ([`aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX`]) on the far
+    /// one — so it moves when *any* of the three inputs moves, and a pan
+    /// that never moved is then outside it, reopening the render/paint
+    /// divergence the clamps exist to close. Writing this field is
+    /// therefore only one third of what has to re-clamp.
     ///
-    /// Both halves, and where each re-establishes the bound:
+    /// All three, and where each re-establishes the bound:
     ///
     /// - *Which layer is active.* [`Self::new`], [`Self::open_file`] and
     ///   [`Self::open_aur_file`] set it and then build the view through
@@ -7298,9 +7630,17 @@ struct App {
     ///   a recorded bounds change without this field changing at all,
     ///   and clamps via [`perform_undo_redo`]'s own [`after_undo_redo`]
     ///   step.
+    /// - *The canvas area's own size* (0.57.10), which only the **far**
+    ///   half of the bound depends on: the document position at the
+    ///   canvas area's bottom-right corner moves when that area grows,
+    ///   with neither this field nor any layer's `bounds` changing.
+    ///   [`App::apply_resize`] and [`App::redraw`] both re-apply
+    ///   [`PanBounds`] through [`apply_canvas_min_zoom`], which is why
+    ///   that function takes one at all. The near half is provably
+    ///   unaffected by a resize — see its doc comment.
     ///
-    /// A new writer of either that skips the clamp is a bug with no
-    /// visible symptom until someone paints.
+    /// A new writer of any of the three that skips the clamp is a bug
+    /// with no visible symptom until someone paints.
     ///
     /// **And a clamp that runs while a drag is still live is its own
     /// bug** (0.57.7), in the opposite direction: the drag holds a
@@ -7531,6 +7871,11 @@ impl App {
             &aurora_ui::CanvasView::default(),
             &layers,
             active_layer,
+            None,
+            // No window and no layout yet, so no canvas area to
+            // measure -- the same `None` this call already passes for
+            // the physical size, and `pan_bounds` weakens the far bound
+            // rather than dropping it.
             None,
             1.0,
         );
@@ -7807,6 +8152,7 @@ impl App {
             &self.layers,
             self.active_layer,
             canvas_area_physical_size(&self.workspace, self.scale_factor),
+            canvas_area_logical_size(&self.workspace),
             self.scale_factor,
         );
         self.selection = aurora_doc::SelectionSet::new();
@@ -7908,6 +8254,7 @@ impl App {
             &self.layers,
             self.active_layer,
             canvas_area_physical_size(&self.workspace, self.scale_factor),
+            canvas_area_logical_size(&self.workspace),
             self.scale_factor,
         );
         self.selection = aurora_doc::SelectionSet::new();
@@ -8146,7 +8493,11 @@ impl App {
                 canvas_point,
                 &mut self.canvas_view,
                 &mut self.selection,
-                active_layer_origin(&self.layers, self.active_layer),
+                pan_bounds(
+                    &self.layers,
+                    self.active_layer,
+                    canvas_area_logical_size(&self.workspace),
+                ),
             );
             for doc_point in dabs {
                 if erasing {
@@ -8293,7 +8644,11 @@ impl App {
                 &mut self.canvas_view,
                 canvas_point,
                 self.modifiers,
-                active_layer_origin(&self.layers, self.active_layer),
+                pan_bounds(
+                    &self.layers,
+                    self.active_layer,
+                    canvas_area_logical_size(&self.workspace),
+                ),
             );
             return;
         }
@@ -8499,6 +8854,7 @@ impl App {
             &mut self.undo_order,
             &mut self.canvas_view,
             self.active_layer,
+            canvas_area_logical_size(&self.workspace),
         );
     }
 
@@ -8608,7 +8964,11 @@ impl App {
             self.drag.as_mut(),
             canvas_point,
             delta,
-            active_layer_origin(&self.layers, self.active_layer),
+            pan_bounds(
+                &self.layers,
+                self.active_layer,
+                canvas_area_logical_size(&self.workspace),
+            ),
         );
     }
 
@@ -8691,11 +9051,24 @@ impl App {
             let pointer = self
                 .pointer_position
                 .and_then(|position| pointer_in_canvas(&self.workspace, position));
+            // Read *after* the `compute_layout` above, deliberately:
+            // the canvas dock area's own bounds only reflect the new
+            // window size once layout has re-run, and the far pan bound
+            // is measured against exactly that size -- deriving it from
+            // stale pre-resize bounds would leave the bound one resize
+            // behind, which is the same shape of staleness the atlas
+            // resize just below already guards against.
+            let bounds = pan_bounds(
+                &self.layers,
+                self.active_layer,
+                canvas_area_logical_size(&self.workspace),
+            );
             apply_canvas_min_zoom(
                 &mut self.canvas_view,
                 self.drag.as_mut(),
                 pointer,
                 canvas_min_zoom(canvas_size, self.scale_factor),
+                bounds,
             );
             if let Some(residency) = self.residency.as_mut() {
                 residency.resize(gpu.device(), gpu.queue(), canvas_size);
@@ -8754,11 +9127,17 @@ impl App {
             let pointer = self
                 .pointer_position
                 .and_then(|position| pointer_in_canvas(&self.workspace, position));
+            let bounds = pan_bounds(
+                &self.layers,
+                self.active_layer,
+                canvas_area_logical_size(&self.workspace),
+            );
             apply_canvas_min_zoom(
                 &mut self.canvas_view,
                 self.drag.as_mut(),
                 pointer,
                 canvas_min_zoom(canvas_size, self.scale_factor),
+                bounds,
             );
         }
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
@@ -9341,29 +9720,29 @@ mod tests {
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess,
-        Key, KeyChord, Modifiers, NamedKey, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
-        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
-        apply_canvas_min_zoom, apply_mask_clip, apply_scroll_zoom, aur_verify_scratch_dir,
-        autosave_path, background_color_from_theme, begin_drag, brush_stroke_mut,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_crash_recovery_dialog, collect_widget_paints,
-        commit_ending_drag, composite_document, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        is_aur_path, layer_local_point, load_document_view, load_scales, load_theme, logical_point,
-        logical_size, open_command_palette, open_crash_recovery_dialog, open_image,
-        open_tile_store, palette_commands, partial_autosave_path, perform_undo_redo,
-        pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
-        sample_pixel, select_layer, shift_bounds, splitmix64, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        Key, KeyChord, Modifiers, NamedKey, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE,
+        RailResize, ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin,
+        after_undo_redo, apply_canvas_min_zoom, apply_mask_clip, apply_scroll_zoom,
+        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, collect_widget_paints, commit_ending_drag, composite_document,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eraser_stroke_mut, eyedropper_sample, guarded_scale_factor,
+        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
+        handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
+        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
+        resized_rail_width, resolve_tile, run_command, sample_pixel, select_layer, shift_bounds,
+        splitmix64, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
+        translate_key, translate_modifiers, translate_pointer_button, unwarned_failures,
+        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -9628,6 +10007,32 @@ mod tests {
         }
     }
 
+    /// [`pan_bounds`] for a synthetic one-layer document whose active
+    /// layer sits at `min_doc`, at an unknown canvas size — what the
+    /// many pan-clamping tests below want when what they care about is
+    /// the near edge and not which document produced it.
+    ///
+    /// Goes through the real `pan_bounds` rather than building a
+    /// `PanBounds` literal, deliberately: a literal here would be a
+    /// second copy of the `min_doc + MAX_DOC_ORIGIN_PX` derivation, and
+    /// a test that pins a far bound the production path would not
+    /// actually produce is worse than no test.
+    #[allow(clippy::cast_possible_truncation)]
+    fn bounds_at(min_doc: (f32, f32), canvas_size: Option<(f32, f32)>) -> PanBounds {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: min_doc.0 as i64,
+            y: min_doc.1 as i64,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("bound", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        pan_bounds(&layers, Some(id), canvas_size)
+    }
+
     /// A `LayerTree` with `a` at the document origin and `b` moved to
     /// `(300, 150)`, plus the populated Layers-panel rows `select_layer`
     /// needs.
@@ -9673,7 +10078,7 @@ mod tests {
         // toward the top-left of the document.
         let mut view = CanvasView::new();
         view.pan_by((40.0, 40.0));
-        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
 
         select_layer(
             &mut workspace,
@@ -9714,7 +10119,7 @@ mod tests {
         view.pan_by((40.0, 40.0));
         // Clamped against `a` only — the boundary as it was *before* the
         // active layer changed.
-        clamp_pan_to_active_layer(&mut view, &layers, Some(a));
+        clamp_pan_to_active_layer(&mut view, &layers, Some(a), None);
 
         // The active layer becomes `b`, and nothing re-clamps.
         let (local_x, local_y) = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
@@ -9855,6 +10260,7 @@ mod tests {
             &reopened,
             Some(active),
             Some((750, 800)),
+            None,
             1.0,
         );
         let (local_x, local_y) =
@@ -9889,7 +10295,14 @@ mod tests {
         // as `App` would have it on entry.
         let mut previous = CanvasView::new();
         previous.pan_by((-500.0, -500.0));
-        let view = load_document_view(&previous, &layers, active_layer, Some((750, 800)), 1.0);
+        let view = load_document_view(
+            &previous,
+            &layers,
+            active_layer,
+            Some((750, 800)),
+            None,
+            1.0,
+        );
 
         let (local_x, local_y) =
             canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
@@ -9921,7 +10334,14 @@ mod tests {
         };
         let active_layer = Some(moved);
 
-        let view = load_document_view(&CanvasView::default(), &layers, active_layer, None, 1.0);
+        let view = load_document_view(
+            &CanvasView::default(),
+            &layers,
+            active_layer,
+            None,
+            None,
+            1.0,
+        );
 
         let (local_x, local_y) =
             canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
@@ -9979,12 +10399,12 @@ mod tests {
         };
 
         let mut pan_first = start();
-        clamp_pan_to_active_layer(&mut pan_first, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut pan_first, &layers, active_layer, None);
         pan_first.set_min_zoom(floor);
 
         let mut zoom_first = start();
         zoom_first.set_min_zoom(floor);
-        clamp_pan_to_active_layer(&mut zoom_first, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut zoom_first, &layers, active_layer, None);
 
         for (label, view) in [("pan first", &pan_first), ("zoom first", &zoom_first)] {
             let (local_x, local_y) =
@@ -10028,7 +10448,7 @@ mod tests {
         // the layer's starting origin of (0, 0).
         let mut view = CanvasView::new();
         view.pan_by((40.0, 40.0));
-        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
 
         // The drag itself: `App::apply_move`'s own `set_bounds`, with no
         // clamp, exactly as the live handler runs it.
@@ -10054,6 +10474,7 @@ mod tests {
             &mut undo_order,
             &mut view,
             active_layer,
+            None,
         );
 
         assert_eq!(
@@ -10105,7 +10526,7 @@ mod tests {
         };
         let active_layer = Some(moved);
         let mut view = CanvasView::new();
-        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
 
         // Drag it back to the document origin and let go.
         if let Err(err) = layers.set_bounds(moved, layer_bounds()) {
@@ -10124,12 +10545,13 @@ mod tests {
             &mut undo_order,
             &mut view,
             active_layer,
+            None,
         );
         assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
 
         // Now pan up/left into the corner the move just freed up.
         view.pan_by((1000.0, 1000.0));
-        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
         let (corner_x, corner_y) = view.to_document((0.0, 0.0));
         assert!(
             corner_x.abs() < 1e-3 && corner_y.abs() < 1e-3,
@@ -10163,7 +10585,7 @@ mod tests {
             "setup: the undo really does reopen the divergence: ({before_x}, {before_y})"
         );
 
-        after_undo_redo(&mut view, &layers, active_layer, &mut cache);
+        after_undo_redo(&mut view, &layers, active_layer, &mut cache, None);
 
         let (local_x, local_y) =
             canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
@@ -10192,6 +10614,15 @@ mod tests {
     /// [`continue_drag`], not a re-spelling of either, so removing the
     /// commit from `perform_undo_redo` fails here.
     #[test]
+    // One linear scenario -- build a real document, start a real stroke,
+    // undo mid-stroke, then feed one more still-pointer move event --
+    // driven end to end through the real `perform_undo_redo` and
+    // `continue_drag`. Splitting it would relocate lines across more
+    // functions without making the sequence it exists to pin any
+    // shorter, the same call the surrounding tests already make. (It
+    // crossed the 100-line limit in 0.57.10 only because
+    // `commit_ending_drag` gained a `canvas_size` argument.)
+    #[allow(clippy::too_many_lines)]
     fn an_undo_during_a_live_stroke_commits_it_instead_of_painting_a_line_the_user_never_drew() {
         let (_dir, mut store) = commit_test_store();
         let mut workspace = aurora_ui::build_workspace();
@@ -10216,7 +10647,7 @@ mod tests {
         };
         let active_layer = Some(moved);
         let mut view = CanvasView::new();
-        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
         if let Err(err) = layers.set_bounds(moved, layer_bounds()) {
             unreachable!("{err:?}");
         }
@@ -10233,9 +10664,10 @@ mod tests {
             &mut undo_order,
             &mut view,
             active_layer,
+            None,
         );
         view.pan_by((1000.0, 1000.0));
-        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
         assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
 
         // The stroke still in progress when the Undo arrives, with real
@@ -10278,7 +10710,7 @@ mod tests {
                 pointer,
                 &mut view,
                 &mut selection,
-                active_layer_origin(&layers, active_layer),
+                pan_bounds(&layers, active_layer, None),
             ),
             None => Vec::new(),
         };
@@ -10326,7 +10758,7 @@ mod tests {
         let mut active_layer = Some(a);
         let mut view = CanvasView::new();
         view.pan_by((40.0, 40.0));
-        clamp_pan_to_active_layer(&mut view, &layers, active_layer);
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
 
         // The middle button goes down over the canvas and stays down.
         let mut drag = begin_drag(
@@ -20937,6 +21369,7 @@ mod tests {
             &mut undo_order,
             &mut CanvasView::new(),
             None,
+            None,
         );
 
         // The stroke still in progress when the middle button goes down.
@@ -20954,6 +21387,7 @@ mod tests {
             &mut pixel_history,
             &mut undo_order,
             &mut CanvasView::new(),
+            None,
             None,
         );
         drag = begin_drag(
@@ -21018,6 +21452,7 @@ mod tests {
             &mut undo_order,
             &mut view,
             None,
+            None,
         );
         let mut drag = Some(a_brush_drag_that_painted(&mut store, (200.5, 200.5)));
 
@@ -21031,8 +21466,14 @@ mod tests {
             &mut undo_order,
             &mut view,
             None,
+            None,
         );
-        handle_zoom_tool_click(&mut view, (100.0, 100.0), Modifiers::none(), (0.0, 0.0));
+        handle_zoom_tool_click(
+            &mut view,
+            (100.0, 100.0),
+            Modifiers::none(),
+            bounds_at((0.0, 0.0), None),
+        );
 
         assert!(
             drag.is_none(),
@@ -21101,6 +21542,7 @@ mod tests {
             &mut undo_order,
             &mut CanvasView::new(),
             None,
+            None,
         );
         assert!(drag.is_none(), "setup: the drag really is gone");
 
@@ -21150,6 +21592,7 @@ mod tests {
             &mut undo_order,
             &mut CanvasView::new(),
             None,
+            None,
         );
         assert_eq!(undo_order.undo, vec![UndoKind::Pixel]);
         assert!(pixel_history.can_undo());
@@ -21178,6 +21621,7 @@ mod tests {
                 &mut pixel_history,
                 &mut undo_order,
                 &mut CanvasView::new(),
+                None,
                 None,
             );
             assert_eq!(
@@ -21219,6 +21663,7 @@ mod tests {
             &mut undo_order,
             &mut CanvasView::new(),
             None,
+            None,
         );
         assert_eq!(
             undo_order.undo,
@@ -21239,6 +21684,7 @@ mod tests {
             &mut pixel_history,
             &mut undo_order,
             &mut CanvasView::new(),
+            None,
             None,
         );
         assert_eq!(
@@ -21324,7 +21770,7 @@ mod tests {
             (15.0, 8.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(view.pan(), (-45.0, -52.0));
         match drag {
@@ -21350,7 +21796,7 @@ mod tests {
             (30.0, 25.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         let Some(active) = selection.active() else {
             unreachable!("must select something");
@@ -21368,7 +21814,7 @@ mod tests {
             (50.0, 5.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         let Some(active) = selection.active() else {
             unreachable!("must still be selected");
@@ -21395,7 +21841,7 @@ mod tests {
             (12.0, 0.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
         match drag {
@@ -21422,7 +21868,13 @@ mod tests {
             stroke: None,
             warned: std::collections::HashSet::new(),
         };
-        let first = continue_drag(&mut drag, (3.0, 0.0), &mut view, &mut selection, (0.0, 0.0));
+        let first = continue_drag(
+            &mut drag,
+            (3.0, 0.0),
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         // Segment shorter than one step (6): no new dab yet, but the 3
         // units already travelled must carry forward, not reset to 0 --
         // the exact bug a fresh `dabs_along_path` call each event would
@@ -21439,7 +21891,13 @@ mod tests {
         // so exactly one dab lands (at the 6-unit mark, i.e. 3 units
         // into *this* segment) -- proving the carry from the first,
         // sub-step event was not lost.
-        let second = continue_drag(&mut drag, (7.0, 0.0), &mut view, &mut selection, (0.0, 0.0));
+        let second = continue_drag(
+            &mut drag,
+            (7.0, 0.0),
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         assert_eq!(second, vec![(6.0, 0.0)]);
     }
 
@@ -21461,7 +21919,7 @@ mod tests {
             (12.0, 0.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
         match drag {
@@ -21499,7 +21957,7 @@ mod tests {
             (15.0, -8.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, Vec::new(), "Move must never produce dabs to paint");
         let Drag::Move { current_bounds, .. } = drag else {
@@ -21527,7 +21985,7 @@ mod tests {
             (15.0, -8.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(
             dabs,
@@ -21548,7 +22006,7 @@ mod tests {
             None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert!(view.zoom() > 1.0, "zoom was {}", view.zoom());
     }
@@ -21561,7 +22019,7 @@ mod tests {
             None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, -1.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert!(view.zoom() < 1.0, "zoom was {}", view.zoom());
     }
@@ -21573,7 +22031,12 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn handle_zoom_tool_click_zooms_in_without_alt() {
         let mut view = CanvasView::new();
-        handle_zoom_tool_click(&mut view, (50.0, 50.0), Modifiers::none(), (0.0, 0.0));
+        handle_zoom_tool_click(
+            &mut view,
+            (50.0, 50.0),
+            Modifiers::none(),
+            bounds_at((0.0, 0.0), None),
+        );
         assert_eq!(view.zoom(), 2.0);
     }
 
@@ -21587,7 +22050,12 @@ mod tests {
             alt: true,
             ..Modifiers::none()
         };
-        handle_zoom_tool_click(&mut view, (50.0, 50.0), alt_held, (0.0, 0.0));
+        handle_zoom_tool_click(
+            &mut view,
+            (50.0, 50.0),
+            alt_held,
+            bounds_at((0.0, 0.0), None),
+        );
         assert_eq!(view.zoom(), 0.5);
     }
 
@@ -21617,7 +22085,7 @@ mod tests {
             (5_000.0, 5_000.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         // Render: the continuous position `redraw` feeds
         // `TileResidency::set_origin` must stay pinned at the document's
@@ -21649,7 +22117,7 @@ mod tests {
             (5_000.0, 5_000.0),
             &mut view,
             &mut selection,
-            (300.0, 300.0),
+            bounds_at((300.0, 300.0), None),
         );
         assert_eq!(canvas_local_origin(&view, (300.0, 300.0)), (0.0, 0.0));
         assert_eq!(view.to_document((0.0, 0.0)), (300.0, 300.0));
@@ -21674,7 +22142,7 @@ mod tests {
             None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
     }
@@ -21697,8 +22165,604 @@ mod tests {
             alt: true,
             ..Modifiers::none()
         };
-        handle_zoom_tool_click(&mut view, (100.0, 100.0), alt_held, (0.0, 0.0));
+        handle_zoom_tool_click(
+            &mut view,
+            (100.0, 100.0),
+            alt_held,
+            bounds_at((0.0, 0.0), None),
+        );
         assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
+    }
+
+    // -- the same bug at the document's *far* edge (0.57.10) --
+    //
+    // The clamps above close the near edge, where
+    // `aurora_gpu::TileResidency::set_origin` clamps the rendered
+    // origin at zero while `CanvasView::to_document` keeps reporting
+    // the true, unbounded position. That same `set_origin` *saturates*
+    // at `TileResidency::MAX_DOC_ORIGIN_PX`, and nothing bounded the
+    // view there -- the identical divergence, in the opposite corner.
+
+    #[test]
+    // `min_doc` is `bounds.x as f32` from an `i64` literal and
+    // `max_doc` is that plus one constant: one addition, not an
+    // accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn the_far_pan_bound_is_the_active_layers_origin_plus_the_document_ceiling() {
+        // The design decision, pinned directly so a later
+        // "simplification" to a bare ceiling constant fails here rather
+        // than silently in the app. It is neither the raw document
+        // ceiling nor the active layer's own width/height, because
+        // `set_origin` is handed a *layer-local* origin
+        // (`canvas_local_origin(view, active_layer_origin(..))`) and
+        // clamps that to `[0, MAX_DOC_ORIGIN_PX]` -- mapping that range
+        // back into document space adds the layer origin to both ends.
+        let (_, layers, _, a, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+
+        let at_origin = pan_bounds(&layers, Some(a), None);
+        assert_eq!(at_origin.min_doc, (0.0, 0.0));
+        assert_eq!(at_origin.max_doc, (ceiling, ceiling));
+
+        // The moved layer's own bounds are (300, 150) -- both ends of
+        // the bound move with it, and the *extent* between them stays
+        // exactly the ceiling.
+        let moved = pan_bounds(&layers, Some(b), None);
+        assert_eq!(moved.min_doc, (300.0, 150.0));
+        assert_eq!(moved.max_doc, (300.0 + ceiling, 150.0 + ceiling));
+        assert_eq!(moved.max_doc.0 - moved.min_doc.0, ceiling);
+        assert_eq!(moved.max_doc.1 - moved.min_doc.1, ceiling);
+    }
+
+    /// **The headline test.** Panning wildly past the document's far
+    /// end must leave render and paint reading the same position — the
+    /// exact property the near-edge clamp already guarantees at the
+    /// other corner.
+    ///
+    /// Asserted by *range membership*, not by calling
+    /// `TileResidency::clamp_doc_origin` (which stays private): that
+    /// crate's own
+    /// `clamp_doc_origin_is_the_identity_across_its_whole_public_range`
+    /// proves every position in `[0, MAX_DOC_ORIGIN_PX]` passes through
+    /// unchanged, so a local origin inside that range is one the
+    /// renderer honours verbatim — which is what "render and paint
+    /// agree" means.
+    #[test]
+    fn panning_far_past_the_document_end_keeps_render_and_paint_in_agreement() {
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+        let canvas = (1_600.0_f32, 900.0_f32);
+
+        let mut view = CanvasView::new();
+        // Panning left/up is what drives `to_document` *up*, toward the
+        // far edge. Far enough to sail past the 300,000 px ceiling
+        // several times over.
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        pan_bounds(&layers, Some(b), Some(canvas)).apply(&mut view);
+
+        // Exactly what `App::redraw` hands `TileResidency::set_origin`.
+        let local = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local.0 >= 0.0 && local.0 <= ceiling && local.1 >= 0.0 && local.1 <= ceiling,
+            "the rendered origin must land inside [0, {ceiling}], the range \
+             `clamp_doc_origin` passes through unchanged; got {local:?}"
+        );
+        // And the canvas area's own far corner is pinned exactly on the
+        // bound, not merely somewhere no-longer-past it.
+        let far = view.to_document(canvas);
+        assert!(
+            (far.0 - (300.0 + ceiling)).abs() <= 1.0 && (far.1 - (150.0 + ceiling)).abs() <= 1.0,
+            "the far corner must be pinned on max_doc; got {far:?}"
+        );
+    }
+
+    #[test]
+    fn the_far_pan_bound_without_the_new_clamp_is_the_divergence_this_prevents() {
+        // The negative control for the test above, spelled the way
+        // `an_active_layer_change_without_the_re_clamp_is_the_divergence_this_prevents`
+        // already spells its own: exactly what this crate did before
+        // 0.57.10 -- the near clamp alone -- and how far outside the
+        // renderer's honoured range it leaves the origin.
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        view.clamp_pan_to_minimum(active_layer_origin(&layers, Some(b)));
+
+        let local = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local.0 > ceiling * 4.0 && local.1 > ceiling * 4.0,
+            "the near clamp alone leaves the rendered origin far past the \
+             {ceiling} px ceiling, where `set_origin` saturates and \
+             `to_document` does not; got {local:?}"
+        );
+    }
+
+    #[test]
+    fn the_far_pan_bound_is_measured_in_logical_canvas_pixels_not_physical() {
+        // `CanvasView`'s pan/`to_document` live in the canvas area's own
+        // *logical* space, so the far bound has to be measured there. A
+        // physical size (the widget bounds times `scale_factor`) would
+        // place the far corner at `scale_factor` times the right
+        // distance on any display where that is not 1.0 -- so this
+        // builds a real laid-out workspace at a 2x scale factor and
+        // confirms the bound lands on the logical size.
+        let (mut workspace, layers, _, _, b) = two_layers_one_moved();
+        workspace.tree.compute_layout(1_600.0, 900.0);
+        let Some(logical) = canvas_area_logical_size(&workspace) else {
+            unreachable!("the canvas area always has bounds once laid out");
+        };
+        let Some(physical) = canvas_area_physical_size(&workspace, 2.0) else {
+            unreachable!("same widget, same bounds");
+        };
+        assert!(
+            logical.0 > 0.0 && logical.1 > 0.0,
+            "setup: a real laid-out canvas area, not a zero rect; got {logical:?}"
+        );
+        assert!(
+            (f64::from(physical.0) - f64::from(logical.0) * 2.0).abs() < 2.0,
+            "setup: the physical size really is the 2x-scaled one, so the two \
+             are distinguishable: logical {logical:?}, physical {physical:?}"
+        );
+
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        pan_bounds(&layers, Some(b), Some(logical)).apply(&mut view);
+
+        let at_logical = view.to_document(logical);
+        assert!(
+            (at_logical.0 - (300.0 + ceiling)).abs() <= 1.0
+                && (at_logical.1 - (150.0 + ceiling)).abs() <= 1.0,
+            "the far corner must land on max_doc at the *logical* canvas size; \
+             got {at_logical:?}"
+        );
+        // And not at the physical one: reading the bound there would
+        // report a document position well past max_doc.
+        let at_physical =
+            view.to_document((f32::from(u16::try_from(physical.0).unwrap_or(0)), 0.0));
+        assert!(
+            at_physical.0 > at_logical.0,
+            "setup: the physical corner is a different, further point; \
+             {at_physical:?} vs {at_logical:?}"
+        );
+    }
+
+    #[test]
+    fn a_scroll_zoom_that_hits_the_far_bound_re_anchors_a_live_brush_drag() {
+        // The exact "spurious dabs painted from a stationary pointer"
+        // failure mode `apply_scroll_zoom`'s own doc comment warns
+        // about, now at the far edge: the far clamp moves the view, and
+        // a `Drag::Brush`'s `last_doc` names the pre-clamp position
+        // while `continue_drag` reads the post-clamp one. This passes
+        // only because `bounds.apply` sits strictly between the two
+        // `to_document(anchor)` measurements.
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let canvas = (1_600.0_f32, 900.0_f32);
+        let bounds = pan_bounds(&layers, Some(b), Some(canvas));
+
+        // Start the view sitting exactly on the far bound.
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        bounds.apply(&mut view);
+
+        let pointer = (40.0, 40.0);
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        let view_before = view.to_document(pointer);
+        let Drag::Brush {
+            last_doc: ref reference_before,
+            ..
+        } = drag
+        else {
+            unreachable!("just built a brush drag");
+        };
+        let reference_before = *reference_before;
+
+        // Zooming *out* while anchored at the pointer pushes the far
+        // corner further into the document -- straight past the bound.
+        apply_scroll_zoom(
+            &mut view,
+            Some(&mut drag),
+            pointer,
+            winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
+            bounds,
+        );
+
+        let view_after = view.to_document(pointer);
+
+        // **The post-condition the placement has to produce, asserted
+        // directly rather than inferred from the re-anchor below.**
+        // Without this, moving `bounds.apply` to *before*
+        // `apply_scroll_zoom`'s own "before" measurement still satisfies
+        // every other assertion in this test: the clamp would fire on
+        // the pre-zoom view, `zoom_at` would then push the far corner
+        // back out with nothing left to catch it, and the measured
+        // delta would be zero -- consistent, and wrong. The two
+        // assertions bracket the placement from both sides: this one
+        // fails if the clamp runs too early (the view ends up out of
+        // bounds), and the `dabs.is_empty()` assertion at the end fails
+        // if it runs too late (after the "after" measurement, so the
+        // correction never reaches the drag).
+        let top_left_after = view.to_document((0.0, 0.0));
+        let far_after = view.to_document(canvas);
+        assert!(
+            far_after.0 <= bounds.max_doc.0 + 1.0 && far_after.1 <= bounds.max_doc.1 + 1.0,
+            "when the call returns the view must be inside the far bound: \
+             far corner {far_after:?} vs max_doc {:?}",
+            bounds.max_doc
+        );
+        assert!(
+            top_left_after.0 >= bounds.min_doc.0 - 1.0
+                && top_left_after.1 >= bounds.min_doc.1 - 1.0,
+            "and inside the near bound: top-left {top_left_after:?} vs min_doc {:?}",
+            bounds.min_doc
+        );
+
+        let Drag::Brush { last_doc, .. } = drag else {
+            unreachable!("still a brush drag");
+        };
+        let view_delta = (view_after.0 - view_before.0, view_after.1 - view_before.1);
+        assert!(
+            view_delta.0.abs() > 1.0 || view_delta.1.abs() > 1.0,
+            "setup: the far clamp really does move the view under the still \
+             pointer: {view_before:?} -> {view_after:?}"
+        );
+        let reference_delta = (
+            last_doc.0 - reference_before.0,
+            last_doc.1 - reference_before.1,
+        );
+        let tolerance = view_delta
+            .0
+            .abs()
+            .max(view_delta.1.abs())
+            .mul_add(1e-3, 1e-2);
+        assert!(
+            (reference_delta.0 - view_delta.0).abs() <= tolerance
+                && (reference_delta.1 - view_delta.1).abs() <= tolerance,
+            "the drag's reference must move by exactly the view's own delta: \
+             view {view_delta:?}, reference {reference_delta:?}"
+        );
+
+        // The property that actually matters, stated as the user would
+        // see it.
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, bounds);
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    #[test]
+    fn growing_the_canvas_area_while_pinned_at_the_far_bound_re_establishes_it() {
+        // The resize scenario -- the one call site in this round that
+        // needed real analysis rather than mirroring a pan-moving path.
+        // The far bound is a statement about the document position at
+        // the canvas area's *bottom-right* corner, so growing that area
+        // violates the bound with neither the active layer nor its
+        // bounds having changed at all, and nothing else on the resize
+        // path catches it.
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+        let small = (800.0_f32, 600.0_f32);
+        let grown = (1_600.0_f32, 1_200.0_f32);
+
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        pan_bounds(&layers, Some(b), Some(small)).apply(&mut view);
+        let pinned = view.to_document(small);
+        assert!(
+            (pinned.0 - (300.0 + ceiling)).abs() <= 1.0,
+            "setup: pinned exactly on the far bound at the small canvas; \
+             got {pinned:?}"
+        );
+
+        // A live stroke held across the resize.
+        let pointer = (40.0, 40.0);
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        // The canvas grows. Without the far clamp on this path the
+        // bound is now violated by the extra 800 x 600 logical pixels
+        // the bottom-right corner just gained.
+        let grown_bounds = pan_bounds(&layers, Some(b), Some(grown));
+        let violation = view.to_document(grown);
+        assert!(
+            violation.0 > grown_bounds.max_doc.0 + 1.0,
+            "setup: growing the canvas really does push the far corner past \
+             the bound: {violation:?} vs max_doc {:?}",
+            grown_bounds.max_doc
+        );
+
+        // The floor is unchanged here, so this isolates the pan half:
+        // whatever moves is the clamp, not the zoom raise.
+        let unchanged_floor = view.min_zoom();
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            Some(pointer),
+            unchanged_floor,
+            grown_bounds,
+        );
+
+        let re_established = view.to_document(grown);
+        assert!(
+            (re_established.0 - grown_bounds.max_doc.0).abs() <= 1.0
+                && (re_established.1 - grown_bounds.max_doc.1).abs() <= 1.0,
+            "the resize path must re-establish the far bound; got \
+             {re_established:?} vs max_doc {:?}",
+            grown_bounds.max_doc
+        );
+        // The near half of the same post-condition -- the far one is
+        // asserted just above. Together they say "the view is inside
+        // both bounds when the call returns", which is what pins
+        // `bounds.apply`'s placement inside the measurement window from
+        // the early side; the `dabs.is_empty()` assertion below pins it
+        // from the late side.
+        let top_left_after = view.to_document((0.0, 0.0));
+        assert!(
+            top_left_after.0 >= grown_bounds.min_doc.0 - 1.0
+                && top_left_after.1 >= grown_bounds.min_doc.1 - 1.0,
+            "the view must also be inside the near bound: top-left \
+             {top_left_after:?} vs min_doc {:?}",
+            grown_bounds.min_doc
+        );
+        let local = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local.0 >= 0.0 && local.0 <= ceiling && local.1 >= 0.0 && local.1 <= ceiling,
+            "and render and paint must agree again; got {local:?}"
+        );
+        // And the live drag was re-anchored, not left measuring against
+        // a view that moved under it.
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, grown_bounds);
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint across a resize: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    // -- RT-04 (0.57.11). The same hazard again, at the one arm of
+    // -- `apply_canvas_min_zoom` that used to skip the correction
+    // -- entirely: a live drag with the pointer *off* the canvas area.
+    //
+    // `pointer_in_canvas` returns `None` whenever the pointer is over a
+    // dock panel, over the rail divider, or off the window -- and none
+    // of those end a drag. A canvas-size change arriving in that state
+    // (a panel toggled by keyboard shortcut, a rail-divider drag, a
+    // window or monitor resize) still moves the view through
+    // `PanBounds::apply`, and the pre-0.57.11 early return left the
+    // live drag's own reference naming the pre-move document position.
+
+    /// RT-04-A. The far bound, with the pointer parked over a dock
+    /// panel: the canvas grows, the far clamp moves the view, and the
+    /// stroke must still come out re-anchored. Before 0.57.11 this
+    /// painted a line of dabs from a pointer that never moved.
+    #[test]
+    fn growing_the_canvas_area_re_anchors_the_stroke_with_the_pointer_off_canvas() {
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+        let small = (800.0_f32, 600.0_f32);
+        let grown = (1_600.0_f32, 1_200.0_f32);
+
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        pan_bounds(&layers, Some(b), Some(small)).apply(&mut view);
+
+        // The stroke's own last event happened while the pointer was
+        // still over the canvas; it has since wandered onto a panel,
+        // which is what makes `pointer` `None` below.
+        let pointer = (40.0, 40.0);
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        let grown_bounds = pan_bounds(&layers, Some(b), Some(grown));
+        let unchanged_floor = view.min_zoom();
+        let view_before = view.to_document((0.0, 0.0));
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            None,
+            unchanged_floor,
+            grown_bounds,
+        );
+        let view_after = view.to_document((0.0, 0.0));
+        assert!(
+            (view_after.0 - view_before.0).abs() > 1.0
+                || (view_after.1 - view_before.1).abs() > 1.0,
+            "setup: the far clamp really does move the view here: \
+             {view_before:?} -> {view_after:?}"
+        );
+        let local = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local.0 >= 0.0 && local.0 <= ceiling && local.1 >= 0.0 && local.1 <= ceiling,
+            "setup: render and paint agree again; got {local:?}"
+        );
+
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, grown_bounds);
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint across a resize it spent over a \
+             dock panel: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// RT-04-B. The *near* bound through the same arm — the older half
+    /// of the hole, and the one whose symptom is the exact bug this
+    /// whole round started from: a stroke held while the pan bound
+    /// moves under it (a layer switch, an undone Move, a redraw after
+    /// either) with the pointer off the canvas, painting a line from
+    /// `(40, 40)` to `(340, 190)` that the user never drew.
+    #[test]
+    fn a_moved_near_bound_re_anchors_the_stroke_with_the_pointer_off_canvas() {
+        let pointer = (40.0, 40.0);
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        // The bound moves to a layer at (300, 150) while the pointer
+        // sits over the Layers panel.
+        let moved = bounds_at((300.0, 150.0), None);
+        let unchanged_floor = view.min_zoom();
+        apply_canvas_min_zoom(&mut view, Some(&mut drag), None, unchanged_floor, moved);
+
+        let top_left = view.to_document((0.0, 0.0));
+        assert!(
+            (top_left.0 - 300.0).abs() <= 1e-3 && (top_left.1 - 150.0).abs() <= 1e-3,
+            "setup: the near clamp really does move the view here: {top_left:?}"
+        );
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, moved);
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint when the near bound moves under it: \
+             {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// RT-04-C. The zoom-floor half of the same arm, which is *not* a
+    /// uniform translation (see
+    /// `raising_the_zoom_floor_shifts_to_document_by_a_different_amount_at_every_point`)
+    /// and so cannot be corrected by measuring at `(0, 0)`. Reachable:
+    /// a window or scale-factor change while a stroke is held and the
+    /// pointer rests on a panel.
+    #[test]
+    fn raising_the_zoom_floor_re_anchors_the_stroke_with_the_pointer_off_canvas() {
+        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        let pointer = (400.0, 300.0);
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        let old_zoom = view.zoom();
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            None,
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
+        assert!(
+            view.zoom() > old_zoom,
+            "setup: the floor really raises this view's zoom: {old_zoom} -> {}",
+            view.zoom()
+        );
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint across a zoom-floor raise it spent \
+             over a dock panel: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// The same arm for a `Drag::Move`, where the stale reference
+    /// teleports the layer instead of painting. The pan clamp is a
+    /// uniform translation, so the correction is exact here whichever
+    /// point it is measured at.
+    #[test]
+    fn a_moved_near_bound_leaves_the_layer_alone_with_the_pointer_off_canvas() {
+        let pointer = (40.0, 40.0);
+        let start_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: view.to_document(pointer),
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+
+        let moved = bounds_at((300.0, 150.0), None);
+        let unchanged_floor = view.min_zoom();
+        apply_canvas_min_zoom(&mut view, Some(&mut drag), None, unchanged_floor, moved);
+        let _ = continue_drag(&mut drag, pointer, &mut view, &mut selection, moved);
+
+        let Drag::Move { current_bounds, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert_eq!(
+            current_bounds, start_bounds,
+            "a still pointer must not move the layer when the pan bound moves \
+             while the pointer is off the canvas"
+        );
+    }
+
+    #[test]
+    // The assertion is that `pan` is byte-identical before and after --
+    // exactly what "no-op" means, not an accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn the_resize_path_leaves_the_near_edge_alone_for_a_view_already_in_bounds() {
+        // `apply_canvas_min_zoom`'s doc comment claims the *near* half
+        // of the bound is provably a no-op on this path, because
+        // `set_min_zoom` raises zoom through `zoom_at((0, 0), ..)`,
+        // which holds `to_document((0, 0))` fixed. Proved rather than
+        // asserted: a view comfortably inside both bounds goes through
+        // the real resize path and comes out with `pan` untouched.
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let canvas = (1_600.0_f32, 900.0_f32);
+        let bounds = pan_bounds(&layers, Some(b), Some(canvas));
+
+        let mut view = CanvasView::new();
+        // `to_document((0, 0))` lands at (1300, 1150) -- well above
+        // min_doc (300, 150) and nowhere near max_doc.
+        view.pan_by((-1_300.0, -1_150.0));
+        assert!(
+            view.to_document((0.0, 0.0)).0 > bounds.min_doc.0
+                && view.to_document(canvas).0 < bounds.max_doc.0,
+            "setup: comfortably inside both bounds"
+        );
+
+        let before = view.pan();
+        let unchanged_floor = view.min_zoom();
+        apply_canvas_min_zoom(&mut view, None, None, unchanged_floor, bounds);
+        assert_eq!(
+            view.pan(),
+            before,
+            "a view already satisfying both bounds must come out of the resize \
+             path with pan untouched"
+        );
     }
 
     // -- a view that moves under a drag that is still live (0.57.7) --
@@ -21734,7 +22798,7 @@ mod tests {
             Some(&mut drag),
             pointer,
             winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         let after = view.to_document(pointer);
         assert!(
@@ -21743,7 +22807,13 @@ mod tests {
              {before:?} -> {after:?}"
         );
 
-        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         assert!(
             dabs.is_empty(),
             "a still pointer must not paint: {} dabs were placed",
@@ -21783,9 +22853,15 @@ mod tests {
             Some(&mut drag),
             pointer,
             winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
-        let _ = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        let _ = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         let Drag::Move { current_bounds, .. } = drag else {
             unreachable!("still a Move drag");
         };
@@ -21811,7 +22887,7 @@ mod tests {
             Some(&mut drag),
             pointer,
             winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         let Drag::Move { start_doc, .. } = drag else {
             unreachable!("still a Move drag");
@@ -21861,14 +22937,26 @@ mod tests {
         let mut view = below_the_floor();
         let mut drag = a_stroke(&view);
         let before = view.to_document(pointer);
-        apply_canvas_min_zoom(&mut view, None, Some(pointer), floor);
+        apply_canvas_min_zoom(
+            &mut view,
+            None,
+            Some(pointer),
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
         let after = view.to_document(pointer);
         assert!(
             (after.0 - before.0).abs() > 100.0 && (after.1 - before.1).abs() > 100.0,
             "setup: raising the floor really does move the document point under \
              a still pointer: {before:?} -> {after:?}"
         );
-        let stale = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        let stale = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         assert!(
             stale.len() > 50,
             "setup: without the re-anchor a still pointer paints a whole line of \
@@ -21879,8 +22967,20 @@ mod tests {
         // (b) The fix.
         let mut view = below_the_floor();
         let mut drag = a_stroke(&view);
-        apply_canvas_min_zoom(&mut view, Some(&mut drag), Some(pointer), floor);
-        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            Some(pointer),
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         assert!(
             dabs.is_empty(),
             "a still pointer must not paint: {} dabs were placed",
@@ -21914,8 +23014,20 @@ mod tests {
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
         let mut drag = a_move(&view);
-        apply_canvas_min_zoom(&mut view, Some(&mut drag), Some(pointer), floor);
-        let _ = continue_drag(&mut drag, pointer, &mut view, &mut selection, (0.0, 0.0));
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            Some(pointer),
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
+        let _ = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         let Drag::Move { current_bounds, .. } = drag else {
             unreachable!("still a Move drag");
         };
@@ -21935,7 +23047,13 @@ mod tests {
         else {
             unreachable!("just built a move drag");
         };
-        apply_canvas_min_zoom(&mut view, Some(&mut drag), Some(pointer), floor);
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            Some(pointer),
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
         let Drag::Move { start_doc, .. } = drag else {
             unreachable!("still a Move drag");
         };
@@ -21963,13 +23081,21 @@ mod tests {
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
         // A non-zero pan too: the identity is not an artefact of the
-        // view starting at the origin.
-        view.pan_by((-37.0, 19.0));
+        // view starting at the origin. Both components negative, so
+        // `to_document((0, 0))` stays positive and the view satisfies
+        // its own pan bound -- since 0.57.10 `apply_canvas_min_zoom`
+        // applies `PanBounds` as well as the zoom floor, and a setup
+        // that started *outside* the bound would have the clamp move
+        // `pan` on top of the zoom raise, which is not the arithmetic
+        // this test is about. (It was `(-37.0, 19.0)` before, which put
+        // `to_document((0, 0)).y` at -76: a violation the old code
+        // simply never noticed.)
+        view.pan_by((-37.0, -19.0));
         let old_zoom = view.zoom();
         let probes = [(0.0, 0.0), (100.0, 40.0), (900.0, 700.0)];
         let before = probes.map(|probe| view.to_document(probe));
 
-        apply_canvas_min_zoom(&mut view, None, None, floor);
+        apply_canvas_min_zoom(&mut view, None, None, floor, bounds_at((0.0, 0.0), None));
 
         let new_zoom = view.zoom();
         assert!(
@@ -22054,7 +23180,13 @@ mod tests {
             current_bounds: start_bounds,
         };
         for point in path {
-            let _ = continue_drag(&mut real, point, &mut real_view, &mut selection, (0.0, 0.0));
+            let _ = continue_drag(
+                &mut real,
+                point,
+                &mut real_view,
+                &mut selection,
+                bounds_at((0.0, 0.0), None),
+            );
         }
         let Drag::Move {
             current_bounds: real_bounds,

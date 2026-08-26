@@ -8644,12 +8644,15 @@ structural design work.
     **Two adjacent residuals, stated rather than absorbed.** (1) When
     the pointer is not over the canvas area (`pointer_in_canvas` returns
     `None` — over a dock panel, or off the window) there is no point to
-    measure at and the floor is applied with no correction. No drag can
-    advance in that state (`App::handle_pointer_moved` returns before
-    `continue_drag`), and a pointer that leaves the canvas area and
-    returns already interpolates across the excursion, so this is a
-    smaller error inside an already-approximate case — but it is not
-    zero. (2) A layout change that moves the canvas *area's own origin*
+    measure at and the floor is applied with no correction. **That
+    reasoning was wrong and this "residual" was a real High-severity bug
+    of its own — RT-04, found by dynamic red-team testing 2026-08-26,
+    fixed in 0.57.11** (see the far-edge item below for the
+    reproduction, the numbers and the fix). "No drag can advance while
+    the pointer is off the canvas" is true and beside the point: the
+    *view* still moves on that arm, so the drag's stored reference goes
+    stale and the next pointer-move event — even one back to the same
+    screen position — pays for it. (2) A layout change that moves the canvas *area's own origin*
     (a rail resize, say) shifts `to_document(pointer)` on its own, since
     the view speaks canvas-relative coordinates; this correction
     brackets `set_min_zoom` only and does not cover that. A rail resize
@@ -8664,18 +8667,206 @@ structural design work.
     manifest can put a layer somewhere the tile store cannot address. The
     pan clamp is not the place to fix it — validation belongs in
     `aurora-doc` (or at the `.aur` reader), where the invariant is owned.
-- [ ] **Panning past the document's *far* edge has no bound matching the
-    origin-side one.** Found 2026-08-25, same review; informational, low.
+- [x] **Panning past the document's *far* edge has no bound matching the
+    origin-side one** — found 2026-08-25, fixed in 0.57.10.
     `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together
-    bound the near edge, but nothing bounds the far one: past the
-    project's 300,000 px ceiling `clamp_doc_origin` saturates the
-    rendered origin at `MAX_DOC_PX` while `CanvasView::to_document` keeps
-    reporting ever-larger values, so render and paint drift apart again —
-    the same shape as the items above, at the opposite corner. Reaching
-    it requires deliberately panning a very long way past the end of the
-    document, so it is recorded rather than fixed; the natural fix is a
-    `clamp_pan_to_maximum` counterpart applied wherever
-    `clamp_pan_to_minimum` already is.
+    bounded the near edge, but nothing bounded the far one: past the
+    project's 300,000 px ceiling `clamp_doc_origin` saturated the
+    rendered origin while `CanvasView::to_document` kept reporting
+    ever-larger values, so render and paint drifted apart again — the
+    same shape as the items above, at the opposite corner.
+
+    **The bound is `active_layer_origin + MAX_DOC_ORIGIN_PX`**, not the
+    raw document ceiling and not the layer's own extent. `set_origin`
+    receives a *layer-local* origin
+    (`canvas_local_origin(view, active_layer_origin(..))`) and clamps it
+    to `[0, MAX_DOC_ORIGIN_PX]`; mapping that range back into document
+    space adds the layer origin to **both** ends, so near and far are
+    both per-active-layer and only the far one's *extent* is the
+    ceiling. `crates/aurora-gpu/src/residency.rs`'s private `MAX_DOC_PX`
+    became the public `TileResidency::MAX_DOC_ORIGIN_PX` to say so
+    across the crate boundary — the same precedent
+    `min_zoom_for_viewport` set for the zoom axis — with
+    `clamp_doc_origin_is_the_identity_across_its_whole_public_range`
+    proving every position in that range passes through untouched, which
+    is what lets an `aurora-app` test assert render/paint agreement by
+    range membership alone (`clamp_doc_origin` itself stays private).
+
+    **Both edges now travel together** as `PanBounds`
+    (`crates/aurora-app/src/lib.rs`), applied by the one
+    `PanBounds::apply`, **maximum first and minimum last so the near
+    bound wins on conflict** — below `min_doc` tile addressing has no
+    representation at all (`TileId`'s fields are unsigned), where past
+    `max_doc` the failure is a saturating clamp. The two cannot actually
+    cross on any path this crate produces; the ordering is pinned anyway
+    by `aurora-ui`'s
+    `applying_the_maximum_then_the_minimum_leaves_the_near_bound_holding`.
+    Bundling them is what makes the centralisation checkable: a
+    `clamp_pan_to_minimum` grep across `crates/aurora-app/` returns
+    exactly one non-comment, non-test hit, inside `apply`.
+
+    **The resize path was the one site that needed real analysis rather
+    than mechanical mirroring.** `apply_canvas_min_zoom` needed the far
+    clamp and provably did *not* need a new near one: `set_min_zoom`
+    raises zoom through `zoom_at((0, 0), ..)`, which holds
+    `to_document((0, 0))` fixed by construction (already pinned by
+    `set_min_zoom_holds_the_top_left_document_position_across_the_raise`),
+    and the near bound is a statement about that point alone. The far
+    bound is a statement about the canvas area's *bottom-right* corner,
+    which a resize moves — so growing the window while pinned at the far
+    bound pushes past it with nothing else on that path to catch it.
+    That makes the canvas area's own size a **third** input the pan
+    bound depends on, alongside which layer is active and that layer's
+    `bounds`; `App::active_layer`'s and `active_layer_origin`'s
+    "what must re-clamp" lists now say so. Both clamps sit strictly
+    inside `apply_canvas_min_zoom`'s and `apply_scroll_zoom`'s
+    before/after measurement windows, so `shift_drag_reference` carries
+    the far clamp's correction into a live drag exactly as it already
+    carried the near one's — `clamp_pan_to_maximum` writes nothing but
+    `pan` at an already-fixed zoom, so it is a uniform translation of
+    `to_document` by the same argument.
+
+    The far bound is measured in **logical** canvas pixels, the space
+    `pan`/`to_document` already use — `canvas_area_logical_size` reads
+    the canvas dock area's laid-out `bounds` straight out of the widget
+    tree rather than dividing `canvas_area_physical_size` back down, so
+    there is one formula and not two answers to the same question. An
+    unknown canvas size degrades to `(0.0, 0.0)`, which bounds the
+    canvas area's *top-left* corner at `max_doc` — exactly the position
+    the renderer clamps, so the divergence is still closed and only the
+    bound's tightness is lost, the stance `reset_canvas_view` already
+    takes on a stale zoom floor.
+
+    Evidence: `panning_far_past_the_document_end_keeps_render_and_paint_in_agreement`
+    (with its negative control,
+    `the_far_pan_bound_without_the_new_clamp_is_the_divergence_this_prevents`,
+    showing the near clamp alone leaves the rendered origin more than 4×
+    the ceiling out),
+    `the_far_pan_bound_is_the_active_layers_origin_plus_the_document_ceiling`
+    (pins the derivation so a later "simplification" to a bare ceiling
+    constant fails),
+    `the_far_pan_bound_is_measured_in_logical_canvas_pixels_not_physical`,
+    `a_scroll_zoom_that_hits_the_far_bound_re_anchors_a_live_brush_drag`,
+    `growing_the_canvas_area_while_pinned_at_the_far_bound_re_establishes_it`,
+    `the_resize_path_leaves_the_near_edge_alone_for_a_view_already_in_bounds`,
+    and eight `clamp_pan_to_maximum_*` tests in
+    `crates/aurora-ui/src/canvas_view.rs`. The first, fourth and fifth
+    were confirmed to fail against the pre-fix behaviour before the fix
+    landed.
+
+    **One residual, stated rather than absorbed.**
+    `clamp_pan_to_maximum` needed an explicit `is_finite` guard on the
+    computed bound that `clamp_pan_to_minimum` does not have: the `if <`
+    comparison absorbs NaN on its own, but `max_doc = -inf` and
+    `canvas_size = +inf` each drive the bound to `+inf`, which every
+    finite `pan` compares below — measured, not assumed. The near clamp
+    has the mirror-image hole (`min_doc = +inf` pins `pan` at `-inf`)
+    and was deliberately left byte-for-byte untouched this round, since
+    existing tests assert its exact float semantics and neither case is
+    reachable from `pan_bounds`, whose inputs are an `i64` layer origin
+    and a laid-out widget rectangle.
+
+    **And a second, stated for the same reason.** `min_doc +
+    MAX_DOC_ORIGIN_PX` is `f32` arithmetic, so the far bound loses the
+    ceiling at extreme layer origins: measured, the sum goes inexact
+    from around 1.0e9 and the ceiling is absorbed *entirely* from around
+    1.6384e13, where `max_doc == min_doc` and the bound degenerates to a
+    single point. The two still never **cross** (round-to-nearest on two
+    positive values cannot land below the larger), so
+    `PanBounds::apply`'s ordering guarantee is unaffected and nothing
+    goes non-finite — the bound just becomes uselessly tight. It is
+    reachable only through the *already-tracked* `set_bounds` validation
+    gap two items above (an `i64` origin; `i64::MAX as f32` ≈ 9.2e18),
+    so it is recorded here as a consequence of that item rather than
+    fixed separately. `PanBounds::apply`'s doc comment carries the same
+    note.
+
+    **A test-setup edit this round made, named so it is not mistaken
+    for noise**:
+    `raising_the_zoom_floor_shifts_to_document_by_a_different_amount_at_every_point`
+    had its pan setup sign-flipped, `(-37.0, 19.0)` → `(-37.0, -19.0)`.
+    The old setup put `to_document((0, 0)).y` at −76, i.e. *outside* the
+    near pan bound — which the pre-0.57.10 code simply never noticed,
+    because `apply_canvas_min_zoom` applied only the zoom floor. Once it
+    applies `PanBounds` as well, the clamp would move `pan` on top of
+    the zoom raise, which is not the arithmetic that test is about. Both
+    components negative keeps `to_document((0, 0))` positive and the
+    view inside its own bound; the identity under test is unchanged.
+
+    **RT-04: `apply_canvas_min_zoom` skipped the drag correction
+    entirely whenever the pointer was off the canvas area** — found
+    2026-08-26 by dynamic red-team testing of this fix, **High**,
+    **pre-existing** (the `pointer: None` arm has had the hole since
+    0.57.8 introduced the function; the far-edge work only made the
+    reachable jump larger). **Fixed in 0.57.11.** The arm applied
+    `bounds` — moving the view — and then returned without re-anchoring,
+    so a live drag kept a reference naming the pre-move document
+    position. `pointer_in_canvas` returns `None` for an ordinary pointer
+    over a dock panel, over the rail divider, or off the window, and
+    none of those end a drag: a keyboard shortcut toggling a panel's
+    collapsed state, a rail-divider drag (the divider branch of
+    `handle_pointer_pressed` returns *before* the `self.drag.take()`
+    below it), and a window or monitor resize all reach that arm
+    mid-stroke.
+
+    **Reproduced independently before fixing, on a still pointer**:
+    **166 dabs** for the far-bound case (canvas grown 800×600 → 1600×1200
+    while pinned at the far bound), **55 dabs** for the near-bound case
+    at exactly `(40, 40) → (340, 190)` — the same numbers and the same
+    shape as the original 0.57.0-era "click a layer row, the canvas
+    jumps, the next click paints somewhere else" bug this whole round
+    started from, reached through a different door — **244 dabs** for a
+    zoom-floor raise, and a `Drag::Move` layer teleported by
+    `(300, 150)` document px.
+
+    **The fix is to find another point to measure at, not to skip the
+    correction**: the anchor falls back to the live drag's own reference
+    point projected back to screen (`drag_reference` +
+    `CanvasView::to_screen`). For `Drag::Brush`/`Eraser` that is exact
+    rather than approximate — `last_doc` *is* `to_document(canvas_point)`
+    from the last move event, so `to_screen(last_doc)` returns that same
+    canvas point, i.e. the very position the pointer-present path would
+    have used. For a pure translation (the pan clamps at an unchanged
+    floor — what a panel toggle or an ordinary resize produces) it is
+    exact for every drag kind, since a translation shifts
+    `to_document(p)` equally at every `p`. `Drag::Pan` and
+    `Drag::Eyedropper` hold no reference and keep the uncorrected path,
+    for the reason `shift_drag_reference` already ignores them.
+
+    **One residual, stated rather than absorbed** — the mistake the
+    entry above made is not repeated: for `Drag::Move`/`Marquee` when
+    the zoom floor *also* raises (not a translation), `start_doc` is not
+    the pointer's own position, so holding it fixed on screen is not
+    identical to the shift at the pointer, and the pointer is not
+    knowable from this arm. The error is bounded by the on-screen drag
+    distance times the relative zoom change, against an *uncorrected*
+    reference that moves by the whole view delta.
+
+    **Four new tests**, all in `crates/aurora-app/src/lib.rs`, each
+    confirmed failing before the fix and passing after:
+    `growing_the_canvas_area_re_anchors_the_stroke_with_the_pointer_off_canvas`
+    (166 dabs → 0),
+    `a_moved_near_bound_re_anchors_the_stroke_with_the_pointer_off_canvas`
+    (55 → 0),
+    `raising_the_zoom_floor_re_anchors_the_stroke_with_the_pointer_off_canvas`
+    (244 → 0), and
+    `a_moved_near_bound_leaves_the_layer_alone_with_the_pointer_off_canvas`
+    (a layer teleport → none).
+
+    **Three accuracy items bundled with it, doc-comment only, no
+    behaviour change.** (a) `CanvasView::clamp_pan_to_minimum` now
+    states its own "`min_doc` must be finite" invariant — it is the half
+    of the pair with *no* guard, relying entirely on every real caller
+    deriving `min_doc` from an `i64` cast (`i64 as f32` rounds and
+    cannot reach infinity), and that was previously documented only on
+    `clamp_pan_to_maximum`, which does guard. (b) `PanBounds::apply` now
+    distinguishes "the two bounds cannot cross" (provable) from "the two
+    bounds cannot be jointly unsatisfiable" (**false**, and reachable
+    whenever the visible span `canvas_size / zoom` exceeds the 300,000 px
+    ceiling): the max-then-min ordering then leaves the near bound
+    holding and the far one unenforced, which is the outcome to want,
+    since render/paint agreement is anchored at the near corner. (c)
+    This entry's own test-setup note, immediately above.
 - [ ] **A non-finite canvas pan is theoretically reachable through
     accumulated drag.** Found 2026-08-25, same review; informational, and
     **essentially unreachable** — `CanvasView::pan_by` accumulates `f32`

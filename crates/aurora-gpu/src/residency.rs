@@ -18,21 +18,6 @@ const UNIFORM_SIZE: u64 = 16;
 /// Bytes one tile upload costs — `f16` samples, `SAMPLES` per tile.
 const TILE_BYTES: usize = SAMPLES * 2;
 
-/// The largest document coordinate [`TileResidency::set_origin`] will
-/// address, in document pixels: [`MAX_DOCUMENT_EXTENT`], the project's
-/// own 300,000 px document ceiling (ADR 0002, matching Adobe PSB).
-///
-/// This is a **safety bound, not a policy**: `origin` is a whole-tile
-/// index and [`TileResidency::write_uniform`] multiplies it back by
-/// [`TILE`], so an unbounded `doc_origin` (`f32::MAX`, `f32::INFINITY`,
-/// or simply a number around 4.295e9 reached by sustained panning at a
-/// very low zoom) overflows that `u32` multiply — a hard panic in debug,
-/// where this workspace denies `panic` precisely because "a panic loses
-/// unsaved work", and a silent wrap addressing the wrong tile in
-/// release. No real document extends past this ceiling, so clamping to
-/// it cannot cost a caller anything it was entitled to.
-const MAX_DOC_PX: f32 = MAX_DOCUMENT_EXTENT as f32;
-
 /// Mip levels the atlas carries: level 0 is full resolution ([`TILE`] ×
 /// [`TILE`]), each level above halves the side length. Fixed at 4 rather
 /// than configurable — nothing needs more, and this crate doesn't depend
@@ -141,6 +126,46 @@ pub struct TileResidency {
 }
 
 impl TileResidency {
+    /// The largest document coordinate [`Self::set_origin`] will
+    /// address, in document pixels: [`MAX_DOCUMENT_EXTENT`], the
+    /// project's own 300,000 px document ceiling (ADR 0002, matching
+    /// Adobe PSB). The bound is on the **layer-local** origin
+    /// `set_origin` receives (`aurora_app`'s own `canvas_local_origin`,
+    /// i.e. the document position at the canvas's top-left corner minus
+    /// the active layer's own origin), not on a raw document
+    /// coordinate — so a caller mirroring it in document space measures
+    /// it *from that layer's own origin*, not from `(0, 0)`.
+    ///
+    /// This is a **safety bound, not a policy**: `origin` is a
+    /// whole-tile index and this type's own internal uniform-buffer
+    /// write multiplies it back
+    /// by [`TILE`], so an unbounded `doc_origin` (`f32::MAX`,
+    /// `f32::INFINITY`, or simply a number around 4.295e9 reached by
+    /// sustained panning at a very low zoom) overflows that `u32`
+    /// multiply — a hard panic in debug, where this workspace denies
+    /// `panic` precisely because "a panic loses unsaved work", and a
+    /// silent wrap addressing the wrong tile in release. No real
+    /// document extends past this ceiling, so clamping to it cannot
+    /// cost a caller anything it was entitled to.
+    ///
+    /// **Public for the same reason [`Self::min_zoom_for_viewport`] is,
+    /// and it is the same bug** (0.57.10). The render path is not the
+    /// only consumer of the canvas transform: `aurora_ui::CanvasView::
+    /// to_document` converts pointer positions to document space for
+    /// painting, and past this ceiling the private `clamp_doc_origin`
+    /// saturates the *rendered* origin while `to_document` keeps
+    /// reporting the true, unbounded position — render and paint
+    /// silently diverge, exactly as they did below zero before
+    /// `CanvasView::clamp_pan_to_minimum` existed. The clamp here is
+    /// the backstop, not the mechanism:
+    /// **`aurora_ui::CanvasView::clamp_pan_to_maximum` is the caller
+    /// responsible for keeping the view inside this bound**, driven
+    /// from `aurora-app`'s own `PanBounds`, which measures it as the
+    /// active layer's origin plus this constant. This crate sits below
+    /// `aurora-ui` in the layering (PRD §7.2) and so cannot reach into
+    /// `CanvasView` itself.
+    pub const MAX_DOC_ORIGIN_PX: f32 = MAX_DOCUMENT_EXTENT as f32;
+
     /// Sizes the atlas to `viewport_px`, rounded up to whole tiles plus
     /// one tile of margin (matches the spike's `ct = viewport/TILE + 1`
     /// exactly), and establishes an initial origin of `(0, 0)`.
@@ -282,7 +307,7 @@ impl TileResidency {
     /// `doc_origin`: the exact, continuous document-local position (e.g.
     /// `aurora_app`'s own `canvas_local_origin`) that should render at
     /// the canvas's own top-left corner — **not** pre-floored to a whole
-    /// tile by the caller. Clamped to `[0, MAX_DOC_PX]` here: to
+    /// tile by the caller. Clamped to `[0, MAX_DOC_ORIGIN_PX]` here: to
     /// non-negative because `TileId`'s own fields are unsigned, so a
     /// negative document position has no tile to point to (the same
     /// "outside the surface" case this atlas has always clamped, now
@@ -291,7 +316,8 @@ impl TileResidency {
     /// `write_uniform` multiplies the whole-tile part back by [`TILE`]
     /// in `u32`, which an unbounded value overflows — a hard panic in
     /// debug, a wrong tile silently addressed in release (this module's
-    /// own private `MAX_DOC_PX` constant carries the full reasoning). A
+    /// own [`Self::MAX_DOC_ORIGIN_PX`] constant carries the full
+    /// reasoning). A
     /// NaN lands on `0.0`, not on NaN (`f32::max` returns the non-NaN
     /// operand, which is why this is spelled `max`/`min` and not
     /// `clamp` — `f32::clamp` propagates NaN). Split into `origin` (the
@@ -566,7 +592,8 @@ impl TileResidency {
         }
     }
 
-    /// [`Self::set_origin`]'s `doc_origin` bound — see [`MAX_DOC_PX`].
+    /// [`Self::set_origin`]'s `doc_origin` bound — see
+    /// [`Self::MAX_DOC_ORIGIN_PX`].
     ///
     /// `max` then `min` rather than `clamp`: `f32::clamp` propagates
     /// NaN, while `f32::max` returns the non-NaN operand, so a NaN
@@ -580,8 +607,8 @@ impl TileResidency {
     #[allow(clippy::manual_clamp)]
     fn clamp_doc_origin(doc_origin: (f32, f32)) -> (f32, f32) {
         (
-            doc_origin.0.max(0.0).min(MAX_DOC_PX),
-            doc_origin.1.max(0.0).min(MAX_DOC_PX),
+            doc_origin.0.max(0.0).min(Self::MAX_DOC_ORIGIN_PX),
+            doc_origin.1.max(0.0).min(Self::MAX_DOC_ORIGIN_PX),
         )
     }
 
@@ -884,7 +911,7 @@ impl std::fmt::Debug for TileResidency {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DOC_PX, TILE_BYTES, TileResidency};
+    use super::{TILE_BYTES, TileResidency};
     use crate::test_support::{real_context, real_tile_store};
     use aurora_tile::{SurfaceId, TILE, TileId};
     use half::f16;
@@ -1554,11 +1581,17 @@ mod tests {
         assert_eq!(TileResidency::clamp_doc_origin((-5.0, -0.5)), (0.0, 0.0));
         assert_eq!(
             TileResidency::clamp_doc_origin((f32::INFINITY, f32::MAX)),
-            (MAX_DOC_PX, MAX_DOC_PX)
+            (
+                TileResidency::MAX_DOC_ORIGIN_PX,
+                TileResidency::MAX_DOC_ORIGIN_PX,
+            )
         );
         assert_eq!(
             TileResidency::clamp_doc_origin((4.3e9, 1e12)),
-            (MAX_DOC_PX, MAX_DOC_PX)
+            (
+                TileResidency::MAX_DOC_ORIGIN_PX,
+                TileResidency::MAX_DOC_ORIGIN_PX,
+            )
         );
         assert_eq!(
             TileResidency::clamp_doc_origin((f32::NEG_INFINITY, 5.0)),
@@ -1574,6 +1607,41 @@ mod tests {
     }
 
     #[test]
+    // Every assertion is an exact identity -- the value goes in and the
+    // same value must come back out, never an accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn clamp_doc_origin_is_the_identity_across_its_whole_public_range() {
+        // What [`TileResidency::MAX_DOC_ORIGIN_PX`] promises a caller
+        // that keeps itself inside the bound, stated as the property
+        // that makes it useful across a crate boundary: every position
+        // in `[0, MAX_DOC_ORIGIN_PX]` passes through untouched. That is
+        // what lets `aurora-app` prove render/paint agreement by
+        // asserting range membership alone -- it never has to reach
+        // this private function, which stays private.
+        let ceiling = TileResidency::MAX_DOC_ORIGIN_PX;
+        for value in [
+            0.0_f32,
+            1.0,
+            TILE as f32,
+            ceiling / 2.0,
+            ceiling - 1.0,
+            ceiling,
+        ] {
+            assert_eq!(
+                TileResidency::clamp_doc_origin((value, value)),
+                (value, value),
+                "{value} is inside the bound and must pass through unchanged"
+            );
+        }
+        // And it really does saturate just past it -- the identity is a
+        // statement about the range, not about the clamp being absent.
+        assert_eq!(
+            TileResidency::clamp_doc_origin((ceiling + 1.0, ceiling * 2.0)),
+            (ceiling, ceiling)
+        );
+    }
+
+    #[test]
     fn set_origin_survives_a_huge_or_non_finite_document_origin() {
         // RT12-07 end to end: the value has to survive the real
         // `u32` multiply inside `write_uniform`, which is where it
@@ -1583,7 +1651,7 @@ mod tests {
         };
         let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let max_tile = (MAX_DOC_PX / (TILE as f32)) as u32;
+        let max_tile = (TileResidency::MAX_DOC_ORIGIN_PX / (TILE as f32)) as u32;
         for doc_origin in [
             (4.3e9_f32, 4.3e9),
             (f32::MAX, f32::MAX),
@@ -1597,8 +1665,9 @@ mod tests {
             assert!(
                 origin.x <= max_tile && origin.y <= max_tile,
                 "doc_origin {doc_origin:?} addressed tile {origin:?}, past the \
-                 {MAX_DOC_PX} px document ceiling -- `origin * TILE` overflows \
-                 `u32` from there"
+                 {} px document ceiling -- `origin * TILE` overflows \
+                 `u32` from there",
+                TileResidency::MAX_DOC_ORIGIN_PX
             );
         }
     }

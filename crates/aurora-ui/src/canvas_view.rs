@@ -245,6 +245,34 @@ impl CanvasView {
     /// *increases* `pan`, matching `to_screen(doc) = doc * zoom + pan`
     /// and `pan_by`'s own "dragging right/down moves the view right/
     /// down" convention).
+    /// **`min_doc` must be finite. There is no guard for it here, and
+    /// that is an invariant on the caller rather than an oversight** —
+    /// it is worth stating on this method rather than only on
+    /// [`Self::clamp_pan_to_maximum`] (which does carry a guard),
+    /// because this is the one of the pair that relies on it entirely.
+    /// The `if >` comparison already covers NaN on its own: every
+    /// comparison against a NaN bound is false, so `pan` keeps the
+    /// value it had. Infinity it does not cover. A `min_doc` of `-inf`
+    /// drives `max_pan_x` to `+inf`, which no finite `pan` exceeds, so
+    /// the clamp silently stops bounding anything; `+inf` drives it to
+    /// `-inf`, which every finite `pan` does exceed, so the clamp pins
+    /// `pan` at `-inf` and poisons every later [`Self::to_document`] —
+    /// and so every dab position — for the rest of the session.
+    /// `clamp_pan_to_maximum` needs its own explicit `is_finite` check
+    /// because *its* bound is arithmetic over two arguments and can go
+    /// non-finite even when both are finite; this bound is just
+    /// `-min_doc * zoom`, which is non-finite only if `min_doc`
+    /// already was.
+    ///
+    /// **Guaranteed by construction today**: every real caller derives
+    /// `min_doc` from a layer's own `i64` origin cast to `f32`
+    /// (`aurora-app`'s `active_layer_origin`), and `i64 as f32` cannot
+    /// produce an infinity — the largest magnitude it can reach,
+    /// `i64::MAX as f32` ≈ 9.2e18, is far inside `f32`'s own range, so
+    /// the conversion rounds and never saturates to `inf`. A future
+    /// caller deriving `min_doc` some other way — parsed from a file, a
+    /// division, an accumulated `f32` — owes it a finiteness check of
+    /// its own before calling this.
     pub fn clamp_pan_to_minimum(&mut self, min_doc: (f32, f32)) {
         let max_pan_x = -min_doc.0 * self.zoom;
         if self.pan.0 > max_pan_x {
@@ -253,6 +281,81 @@ impl CanvasView {
         let max_pan_y = -min_doc.1 * self.zoom;
         if self.pan.1 > max_pan_y {
             self.pan.1 = max_pan_y;
+        }
+    }
+
+    /// Clamps `pan` (per axis, independently) so that
+    /// `self.to_document(canvas_size)` — the document-space point that
+    /// currently renders at the canvas area's own *bottom-right*
+    /// corner — never rises above `max_doc` on either axis.
+    ///
+    /// [`Self::clamp_pan_to_minimum`]'s mirror image, against the same
+    /// bug at the opposite corner. That method closed the near edge:
+    /// the renderer (`aurora_gpu::TileResidency::set_origin`) clamps
+    /// the document position it is handed to `[0, MAX_DOC_ORIGIN_PX]`,
+    /// so a view scrolled past the *low* end froze the render while
+    /// [`Self::to_document`] kept reporting the true, unbounded
+    /// position and paint silently landed elsewhere. The high end of
+    /// that same clamp was left unguarded: past the project's own
+    /// 300,000 px document ceiling
+    /// (`aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX`, ADR 0002,
+    /// matching Adobe PSB) `set_origin` saturates the rendered origin
+    /// exactly as it does at zero, and render and paint diverge again
+    /// — the identical failure, in the opposite corner. So the fix is
+    /// the identical one: bound the view at the source, and every
+    /// downstream consumer reads one already-bounded `pan`.
+    ///
+    /// Derivation: `to_document((w, h)) = ((w - pan.0) / zoom, (h -
+    /// pan.1) / zoom)`. Requiring the x component `<= max_doc.0` gives
+    /// `pan.0 >= w - max_doc.0 * zoom`; symmetrically for y. So this is
+    /// a **lower** bound on `pan` where [`Self::clamp_pan_to_minimum`]
+    /// imposes an upper one, and panning left/up — the direction that
+    /// *decreases* `pan` — is the only one that can violate it.
+    ///
+    /// **`canvas_size` must be in logical pixels**, the same space
+    /// `pan`, [`Self::to_screen`] and [`Self::to_document`] already use
+    /// (see this type's own doc comment), **not** physical ones. This
+    /// crate has no scale factor and cannot tell the two apart, so a
+    /// physical size passed here on a 2× display would bound the far
+    /// corner at twice the distance it should — this is the one place
+    /// in this method a caller is likely to get it wrong. `aurora-app`
+    /// derives it from the canvas dock area's own laid-out logical
+    /// bounds (`canvas_area_logical_size`), never by dividing a
+    /// physical size back down.
+    ///
+    /// A `canvas_size` of `(0.0, 0.0)` is a legitimate, weaker
+    /// argument, not a broken one: it bounds the canvas area's own
+    /// *top-left* corner at `max_doc` instead of its bottom-right,
+    /// which is exactly the position the renderer clamps, so the
+    /// render/paint divergence is still closed while the view is
+    /// allowed slightly further out. `aurora-app` uses it when the
+    /// canvas area has not been laid out yet.
+    ///
+    /// **Degenerate bounds leave `pan` alone rather than poisoning
+    /// it**, and it takes two separate spellings to get that, not one.
+    /// The `if <` comparison (rather than `f32::clamp`/`f32::max`,
+    /// matching [`Self::clamp_pan_to_minimum`]) covers NaN on its own:
+    /// every comparison against a NaN bound is false, so the assignment
+    /// never happens and `pan` keeps exactly the value it had, instead
+    /// of becoming a NaN that would make [`Self::to_document`] — and
+    /// therefore every dab position — NaN for the rest of the session.
+    /// But the comparison alone is *not* enough for the infinities, and
+    /// this was measured rather than assumed: `max_doc = -inf` and
+    /// `canvas_size = +inf` each drive `min_pan_x` to `+inf`, which
+    /// every finite `pan` compares below, so the clamp fires and pins
+    /// `pan` at infinity — the same poisoning by a different route. The
+    /// explicit `is_finite` guard on the computed bound is what closes
+    /// that; it costs nothing on the real path, since `aurora-app`
+    /// derives both arguments from an `i64` layer origin and a
+    /// laid-out widget rectangle, all finite by construction.
+    pub fn clamp_pan_to_maximum(&mut self, max_doc: (f32, f32), canvas_size: (f32, f32)) {
+        let min_pan_x = canvas_size.0 - max_doc.0 * self.zoom;
+        if min_pan_x.is_finite() && self.pan.0 < min_pan_x {
+            self.pan.0 = min_pan_x;
+        }
+        let min_pan_y = canvas_size.1 - max_doc.1 * self.zoom;
+        if min_pan_y.is_finite() && self.pan.1 < min_pan_y {
+            self.pan.1 = min_pan_y;
         }
     }
 }
@@ -452,6 +555,237 @@ mod tests {
         view2.pan_by((900.0, 900.0));
         view2.clamp_pan_to_minimum((100.0, 100.0));
         assert_eq!(view2.to_document((0.0, 0.0)), (100.0, 100.0));
+    }
+
+    // -- `clamp_pan_to_maximum`: the same bug at the opposite corner --
+    //
+    // The near clamp above bounds `to_document((0, 0))` from below; these
+    // bound `to_document(canvas_size)` from above, against the document
+    // ceiling `aurora_gpu::TileResidency::set_origin` saturates at.
+
+    #[test]
+    // `to_document(canvas_size)` after the clamp is
+    // `(canvas_size - min_pan) / zoom` where `min_pan` was itself
+    // computed as `canvas_size - max_doc * zoom` -- an exact round trip
+    // through one multiply and one divide at zoom 1.0, not accumulated
+    // float error.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_maximum_pins_the_boundary_exactly_when_panned_past_it() {
+        // Panning left/up by 500 px puts the canvas area's own
+        // bottom-right corner 500 px further into the document than the
+        // ceiling allows -- past which `TileResidency::set_origin`
+        // saturates the rendered origin while `to_document` keeps
+        // reporting the true, unbounded position. Clamping must land
+        // that corner exactly on `max_doc`.
+        let mut view = CanvasView::new();
+        view.pan_by((-500.0, -500.0));
+        view.clamp_pan_to_maximum((100.0, 100.0), (200.0, 200.0));
+        assert_eq!(view.to_document((200.0, 200.0)), (100.0, 100.0));
+    }
+
+    #[test]
+    // `pan` is asserted unchanged (still the exact value `pan_by` set),
+    // not an accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_maximum_leaves_pan_untouched_when_already_within_bounds() {
+        // Panning right/down (positive delta) only ever moves
+        // `to_document(canvas_size)` further *down* toward the
+        // document's own origin, away from the far boundary -- never
+        // past it -- so the clamp must be a complete no-op here.
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        let before = view.pan();
+        view.clamp_pan_to_maximum((10_000.0, 10_000.0), (200.0, 200.0));
+        assert_eq!(view.pan(), before);
+    }
+
+    #[test]
+    // Same reasoning as
+    // `clamp_pan_to_maximum_pins_the_boundary_exactly_when_panned_past_it`.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_maximum_clamps_each_axis_independently() {
+        // x is panned past the far boundary, y is not -- only x should
+        // move.
+        let mut view = CanvasView::new();
+        view.pan_by((-500.0, 40.0));
+        let y_before = view.pan().1;
+        view.clamp_pan_to_maximum((100.0, 10_000.0), (200.0, 200.0));
+        assert_eq!(view.to_document((200.0, 200.0)).0, 100.0);
+        assert_eq!(
+            view.pan().1,
+            y_before,
+            "the in-bounds axis must be left untouched"
+        );
+    }
+
+    #[test]
+    // Same reasoning as the other `clamp_pan_to_maximum_*` tests above
+    // -- exact round trips through one multiply and one divide.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_maximum_accounts_for_zoom() {
+        // At 4x zoom the same `pan` spans a quarter as much document,
+        // so the `pan` value that puts the far corner exactly on
+        // `max_doc` is a different number -- the clamp must read the
+        // view's current zoom, not just its pan.
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 4.0);
+        view.pan_by((-5_000.0, -5_000.0));
+        view.clamp_pan_to_maximum((100.0, 100.0), (200.0, 200.0));
+        assert_eq!(view.to_document((200.0, 200.0)), (100.0, 100.0));
+
+        // And at a zoom below 1.0, where the same document extent
+        // occupies fewer screen pixels.
+        let mut view2 = CanvasView::new();
+        view2.zoom_at((0.0, 0.0), 0.5);
+        view2.pan_by((-5_000.0, -5_000.0));
+        view2.clamp_pan_to_maximum((100.0, 100.0), (200.0, 200.0));
+        assert_eq!(view2.to_document((200.0, 200.0)), (100.0, 100.0));
+    }
+
+    #[test]
+    // Same reasoning as the other `clamp_pan_to_maximum_*` tests above.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_maximum_uses_a_non_zero_boundary_for_a_moved_layer() {
+        // `aurora-app` measures the far bound per *active layer*, as
+        // `active_layer_origin + MAX_DOC_ORIGIN_PX` -- a layer moved to
+        // (300, 150) shifts the far bound by exactly that much, the
+        // mirror of `clamp_pan_to_minimum_uses_a_non_zero_boundary_for_a_moved_layer`
+        // above. Shaped like that here (a small stand-in ceiling, so
+        // the arithmetic stays exact and readable) rather than reaching
+        // for `aurora-gpu`, which sits *below* this crate in the
+        // layering (PRD §7.2) and cannot be depended on from here.
+        let mut view = CanvasView::new();
+        view.pan_by((-5_000.0, -5_000.0));
+        view.clamp_pan_to_maximum((300.0 + 1_000.0, 150.0 + 1_000.0), (200.0, 200.0));
+        assert_eq!(view.to_document((200.0, 200.0)), (1_300.0, 1_150.0));
+    }
+
+    #[test]
+    // Exact equality on values the clamp either assigned directly or
+    // left completely alone -- not an accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_maximum_ignores_degenerate_bounds() {
+        // A caller can reach this with a canvas area it has not laid
+        // out, or a `max_doc` derived from one. None of these may be
+        // able to poison `pan` -- `to_document` divides by `zoom` and
+        // subtracts `pan`, so a single non-finite `pan` makes every dab
+        // position non-finite for the rest of the session. NaN is
+        // absorbed by the comparison itself; the infinities need the
+        // explicit `is_finite` guard (measured: `max_doc = -inf` and
+        // `canvas_size = +inf` both drive the computed bound to `+inf`,
+        // which every finite `pan` compares below).
+        // **The two MIXED finite/non-finite cases are the ones that
+        // actually motivated the `is_finite` guard**, and the loop above
+        // does not reach them -- it varies both arguments together, so
+        // it only ever tries non-finite against non-finite. These are
+        // the exact pairs measured when the guard was discovered: each
+        // drives `canvas_size - max_doc * zoom` to `+inf`, which every
+        // finite `pan` compares below, so the plain `if <` spelling
+        // would fire the clamp and pin `pan` at infinity. NaN is
+        // absorbed by the comparison; these are not.
+        for (max_doc, canvas) in [
+            (
+                (f32::NEG_INFINITY, f32::NEG_INFINITY),
+                (200.0_f32, 200.0_f32),
+            ),
+            ((1_000.0_f32, 1_000.0_f32), (f32::INFINITY, f32::INFINITY)),
+        ] {
+            let mut view = CanvasView::new();
+            view.pan_by((-500.0, -500.0));
+            view.clamp_pan_to_maximum(max_doc, canvas);
+            assert!(
+                view.pan().0.is_finite() && view.pan().1.is_finite(),
+                "max_doc {max_doc:?} with canvas_size {canvas:?} drives the \
+                 computed bound to +inf and must not poison pan; got {:?}",
+                view.pan()
+            );
+        }
+        // The same two, one axis at a time, so a guard applied to only
+        // one axis cannot pass.
+        for (max_doc, canvas) in [
+            ((f32::NEG_INFINITY, 100.0_f32), (200.0_f32, 200.0_f32)),
+            ((100.0_f32, f32::NEG_INFINITY), (200.0_f32, 200.0_f32)),
+            ((1_000.0_f32, 1_000.0_f32), (f32::INFINITY, 200.0_f32)),
+            ((1_000.0_f32, 1_000.0_f32), (200.0_f32, f32::INFINITY)),
+        ] {
+            let mut view = CanvasView::new();
+            view.pan_by((-500.0, -500.0));
+            view.clamp_pan_to_maximum(max_doc, canvas);
+            assert!(
+                view.pan().0.is_finite() && view.pan().1.is_finite(),
+                "max_doc {max_doc:?} with canvas_size {canvas:?} must not \
+                 poison either axis of pan; got {:?}",
+                view.pan()
+            );
+        }
+
+        // The broad sweep: every non-finite against every non-finite.
+        let bad = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        for max_doc in bad {
+            for canvas in bad {
+                let mut view = CanvasView::new();
+                view.pan_by((-500.0, -500.0));
+                let before = view.pan();
+                view.clamp_pan_to_maximum((max_doc, max_doc), (canvas, canvas));
+                assert!(
+                    view.pan().0.is_finite() && view.pan().1.is_finite(),
+                    "max_doc {max_doc} / canvas_size {canvas} must not poison pan; \
+                     got {:?}",
+                    view.pan()
+                );
+                if max_doc.is_nan() || canvas.is_nan() {
+                    assert_eq!(
+                        view.pan(),
+                        before,
+                        "a NaN bound must leave pan exactly unchanged"
+                    );
+                }
+            }
+        }
+        // And one non-finite axis must not drag the other one with it.
+        let mut view = CanvasView::new();
+        view.pan_by((-500.0, -500.0));
+        view.clamp_pan_to_maximum((f32::NAN, 100.0), (200.0, 200.0));
+        assert_eq!(view.pan().0, -500.0, "the NaN axis is left alone");
+        assert_eq!(view.to_document((200.0, 200.0)).1, 100.0);
+    }
+
+    #[test]
+    // Exact round trip through one multiply and one divide.
+    #[allow(clippy::float_cmp)]
+    fn clamp_pan_to_maximum_with_a_zero_canvas_size_bounds_the_top_left_corner() {
+        // The fallback `aurora-app` uses when the canvas area has not
+        // been laid out yet. With `canvas_size = (0, 0)` the bounded
+        // corner *is* the top-left one -- which is exactly the position
+        // the renderer clamps (`TileResidency::set_origin` receives
+        // `to_document((0, 0))` minus the layer origin), so the
+        // render/paint divergence is still closed. A weaker bound, never
+        // an absent one.
+        let mut view = CanvasView::new();
+        view.pan_by((-5_000.0, -5_000.0));
+        view.clamp_pan_to_maximum((100.0, 100.0), (0.0, 0.0));
+        assert_eq!(view.to_document((0.0, 0.0)), (100.0, 100.0));
+    }
+
+    #[test]
+    // Exact equality: the near clamp's own assignment is the last write
+    // to `pan`, and the assertion reads that exact value back.
+    #[allow(clippy::float_cmp)]
+    fn applying_the_maximum_then_the_minimum_leaves_the_near_bound_holding() {
+        // A contrived, not-really-reachable configuration -- the two
+        // bounds crossing, which `aurora-app` cannot produce (its
+        // `max_doc` is `min_doc` plus a large positive ceiling). It is
+        // pinned anyway because `aurora-app`'s `PanBounds::apply`
+        // *orders* the two clamps deliberately (maximum first, minimum
+        // last) so the near bound wins on conflict, and this is the
+        // property that ordering buys: the near edge holds exactly, and
+        // nothing goes non-finite.
+        let mut view = CanvasView::new();
+        view.pan_by((-5_000.0, -5_000.0));
+        view.clamp_pan_to_maximum((10.0, 10.0), (200.0, 200.0));
+        view.clamp_pan_to_minimum((500.0, 500.0));
+        assert_eq!(view.to_document((0.0, 0.0)), (500.0, 500.0));
+        assert!(view.pan().0.is_finite() && view.pan().1.is_finite());
     }
 
     #[test]
