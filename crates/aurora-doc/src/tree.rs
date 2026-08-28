@@ -472,8 +472,11 @@ fn validate_cross_references(
 /// by them. Unlike the shape defects this module's other validators
 /// refuse, this is not a crash: it is a rendering-correctness one, of the
 /// same "trust a number from an untrusted file" class the rest of this
-/// round has been closing (contrast `Rect`, which `aurora-io` already
-/// bounds on the way in).
+/// round has been closing (contrast `Rect`, whose *extent* `aurora-io`
+/// bounds on the way in, and whose *origin* it now bounds too — the
+/// parenthetical here used to say "`Rect`, which `aurora-io` already
+/// bounds", which overclaimed: only the extent was checked until
+/// `IoError::LayerOriginOutOfRange` landed).
 ///
 /// Rejected rather than clamped, so that the file's own value is what
 /// gets reported and a document never silently renders as something other
@@ -489,6 +492,35 @@ fn validate_opacities(layers: &HashMap<LayerId, LayerEntry>) -> Result<(), DocEr
         }
     }
     Ok(())
+}
+
+/// Refuses a `bounds` whose origin sits further from the document
+/// origin than `aurora_core::MAX_DOCUMENT_ORIGIN` — the shared
+/// predicate is `Rect::origin_in_document_range`; this is only the
+/// mapping from its `false` to this crate's own error.
+///
+/// Called from every public path that stores a caller-supplied `Rect`
+/// (`insert_unchecked` for a pixel layer, `set_bounds`, `add_mask`),
+/// always *before* the value is written, so a refusal changes nothing.
+/// Deliberately not called from `restore`/`restore_mask`: those are
+/// crate-private undo paths putting back a value this function already
+/// passed on the way in, and re-checking there would let an undo fail
+/// on a value the tree itself produced.
+///
+/// Extent is deliberately *not* checked here — see
+/// [`DocError::LayerOriginOutOfRange`] and
+/// `aurora_core::MAX_DOCUMENT_ORIGIN` for why. It is bounded where it
+/// is owned instead (`aurora_core::Size::new`, and `aurora-io`'s own
+/// `tile_grid` for a manifest read off disk).
+fn validate_origin(bounds: Rect) -> Result<(), DocError> {
+    if bounds.origin_in_document_range() {
+        return Ok(());
+    }
+    Err(DocError::LayerOriginOutOfRange {
+        x: bounds.x,
+        y: bounds.y,
+        max: aurora_core::MAX_DOCUMENT_ORIGIN,
+    })
 }
 
 impl LayerTree {
@@ -513,10 +545,15 @@ impl LayerTree {
     /// layer would land deeper than [`MAX_LAYER_TREE_DEPTH`] — a
     /// document nested past that bound cannot be saved at all (see that
     /// constant), so the nest is refused rather than allowed and then
-    /// discovered at save time. Also returns
-    /// [`DocError::LayerIdCollision`] if the id generated for the new
-    /// layer is somehow already in use — see that variant for why it is
-    /// returned rather than asserted away.
+    /// discovered at save time. Returns
+    /// [`DocError::LayerOriginOutOfRange`] if `bounds`' own origin sits
+    /// further than [`aurora_core::MAX_DOCUMENT_ORIGIN`] from the
+    /// document origin on either axis — a negative origin is still
+    /// legal (a layer may sit off the canvas edge); see
+    /// [`Self::set_bounds`], which enforces the same bound for a later
+    /// move. Also returns [`DocError::LayerIdCollision`] if the id
+    /// generated for the new layer is somehow already in use — see that
+    /// variant for why it is returned rather than asserted away.
     ///
     /// Nothing is added when any of these happens. No id is consumed
     /// either — with one exception that cannot be otherwise:
@@ -540,7 +577,11 @@ impl LayerTree {
     ///
     /// # Errors
     ///
-    /// Same as [`Self::add_pixel_layer`].
+    /// Same as [`Self::add_pixel_layer`], except
+    /// [`DocError::LayerOriginOutOfRange`], which this cannot return: a
+    /// group has no `bounds` of its own to be out of range (see
+    /// [`LayerKind::Group`], and [`Self::set_bounds`], which refuses a
+    /// group for the same reason).
     pub fn add_group(
         &mut self,
         name: impl Into<String>,
@@ -653,6 +694,21 @@ impl LayerTree {
         // have to be kept in step with the first.
         self.validate_parent(parent)?;
 
+        // The single call site that covers every insert: `insert` (and
+        // so `add_pixel_layer`, and so `History::add_pixel_layer`) and
+        // the `test-support` `insert_pixel_ignoring_the_depth_limit`
+        // both funnel through here. A group carries no bounds of its
+        // own, so there is nothing to check on that arm.
+        //
+        // Before `next_id`, for the same reason `insert`'s own depth
+        // check is: a refused insert should not even consume an id. An
+        // id burnt here would be invisible in `layers` but would still
+        // move the generator, and "a failed call changes nothing" is
+        // easier to keep true than to keep qualified.
+        if let LayerKind::Pixel { bounds } = &kind {
+            validate_origin(*bounds)?;
+        }
+
         let id = self.ids.next_id();
         // The displaced value is checked, not discarded: a plain
         // `HashMap::insert` here would *silently destroy* whatever layer
@@ -715,8 +771,11 @@ impl LayerTree {
     /// that proves the guard works.
     ///
     /// Every other guard still applies: `parent` must exist, must be a
-    /// group, and the generated id must be unused. Only the depth check
-    /// is skipped.
+    /// group, the generated id must be unused, and `bounds`' own origin
+    /// must be within [`aurora_core::MAX_DOCUMENT_ORIGIN`] — that last
+    /// check lives in `insert_unchecked`, the shared body, precisely so
+    /// this hatch cannot become a second way around it. Only the depth
+    /// check is skipped.
     ///
     /// It builds a [`LayerKind::Pixel`] and nothing else, on purpose.
     /// An earlier draft took an arbitrary [`LayerKind`], which let it
@@ -736,8 +795,9 @@ impl LayerTree {
     ///
     /// # Errors
     ///
-    /// [`DocError::UnknownLayer`], [`DocError::NotAGroup`] and
-    /// [`DocError::LayerIdCollision`], exactly as
+    /// [`DocError::UnknownLayer`], [`DocError::NotAGroup`],
+    /// [`DocError::LayerIdCollision`] and
+    /// [`DocError::LayerOriginOutOfRange`], exactly as
     /// [`Self::add_pixel_layer`] returns them — but never
     /// [`DocError::LayerTreeTooDeep`].
     #[cfg(feature = "test-support")]
@@ -1450,17 +1510,27 @@ impl LayerTree {
     ///
     /// # Errors
     ///
-    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist, or
-    /// [`DocError::NotAPixelLayer`] if it names a group.
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist,
+    /// [`DocError::NotAPixelLayer`] if it names a group, or
+    /// [`DocError::LayerOriginOutOfRange`] if `bounds`' own origin sits
+    /// further than [`aurora_core::MAX_DOCUMENT_ORIGIN`] from the
+    /// document origin on either axis — a *negative* origin is still
+    /// perfectly legal, since moving a layer off the canvas edge is
+    /// what this method is for. The layer's existing `bounds` are left
+    /// exactly as they were when any of these happens.
+    ///
+    /// The two id checks run first on purpose: naming a layer that does
+    /// not exist, or one that is a group, should be reported as that
+    /// rather than as a complaint about a rectangle destined for an
+    /// entry this method could not use anyway.
     pub fn set_bounds(&mut self, id: LayerId, bounds: Rect) -> Result<(), DocError> {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
-        match &mut entry.kind {
-            LayerKind::Pixel { bounds: current } => {
-                *current = bounds;
-                Ok(())
-            }
-            LayerKind::Group { .. } => Err(DocError::NotAPixelLayer(id)),
-        }
+        let LayerKind::Pixel { bounds: current } = &mut entry.kind else {
+            return Err(DocError::NotAPixelLayer(id));
+        };
+        validate_origin(bounds)?;
+        *current = bounds;
+        Ok(())
     }
 
     /// This layer's *own* visibility flag — not whether it actually shows
@@ -1511,14 +1581,21 @@ impl LayerTree {
     ///
     /// # Errors
     ///
-    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist, or
-    /// [`DocError::MaskAlreadyExists`] if it already has a mask. Nothing
-    /// is changed when this happens.
+    /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist,
+    /// [`DocError::MaskAlreadyExists`] if it already has a mask, or
+    /// [`DocError::LayerOriginOutOfRange`] if `bounds`' own origin sits
+    /// further than [`aurora_core::MAX_DOCUMENT_ORIGIN`] from the
+    /// document origin — the same bound (and the same "negative is
+    /// still legal") [`Self::set_bounds`] documents, applied to a
+    /// mask's own rectangle. Nothing is changed when any of these
+    /// happens; in particular a refused origin leaves the layer
+    /// maskless rather than half-masked.
     pub fn add_mask(&mut self, id: LayerId, bounds: Rect) -> Result<(), DocError> {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
         if entry.mask.is_some() {
             return Err(DocError::MaskAlreadyExists(id));
         }
+        validate_origin(bounds)?;
         entry.mask = Some(LayerMask {
             bounds,
             enabled: true,
@@ -3251,6 +3328,152 @@ mod tests {
             Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
             other => unreachable!("expected UnknownLayer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_bounds_rejects_an_origin_past_the_document_range_and_leaves_the_old_bounds() {
+        // Pre-fix this call returned `Ok` and the pathological origin
+        // went straight into the tree -- measured, not assumed. The
+        // "leaves the old bounds" half is the part that matters most: a
+        // refused move must not half-apply.
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let before = tree.bounds(id);
+        let far = Rect {
+            x: i64::MAX,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        match tree.set_bounds(id, far) {
+            Err(DocError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, i64::MAX);
+                assert_eq!(y, 0);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+        assert_eq!(
+            tree.bounds(id),
+            before,
+            "a refused move must leave the layer exactly where it was"
+        );
+    }
+
+    #[test]
+    fn set_bounds_accepts_an_origin_exactly_at_the_document_range() {
+        // The other side of the same check. The limits are legal scope,
+        // and the negative one especially so -- a layer a whole document
+        // extent off the top edge is somewhere a user can still drag it
+        // back from, which is what `Rect`'s signed origin is for.
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let at_limit = Rect {
+            x: aurora_core::MAX_DOCUMENT_ORIGIN,
+            y: -aurora_core::MAX_DOCUMENT_ORIGIN,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = tree.set_bounds(id, at_limit) {
+            unreachable!("an origin exactly at the limit must be accepted: {err:?}");
+        }
+        assert_eq!(tree.bounds(id), Some(at_limit));
+    }
+
+    #[test]
+    fn set_bounds_reports_an_unknown_layer_before_an_out_of_range_origin() {
+        // Pins the precedence decision: both faults are present, and the
+        // id fault is the one reported. Naming a layer that does not
+        // exist should be reported as that rather than as a complaint
+        // about a rectangle destined for an entry the method could not
+        // have used anyway.
+        let mut tree = LayerTree::new();
+        let bogus: super::LayerId = Id::from_raw(999);
+        let far = Rect {
+            x: i64::MAX,
+            y: i64::MIN,
+            width: 10,
+            height: 10,
+        };
+        match tree.set_bounds(bogus, far) {
+            Err(DocError::UnknownLayer(got)) => assert_eq!(got, bogus),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_pixel_layer_rejects_an_origin_past_the_document_range_and_adds_nothing() {
+        // Pre-fix this returned `Ok` and the layer landed. The
+        // "adds nothing" half is what `insert_unchecked`'s check placement
+        // (before `next_id`) buys.
+        let mut tree = LayerTree::new();
+        let far = Rect {
+            x: 0,
+            y: i64::MIN,
+            width: 10,
+            height: 10,
+        };
+        match tree.add_pixel_layer("far", far, None) {
+            Err(DocError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, 0);
+                assert_eq!(y, i64::MIN);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+        assert_eq!(tree.len(), 0, "a refused insert must add nothing");
+        assert!(tree.roots().is_empty());
+    }
+
+    #[test]
+    fn add_mask_rejects_an_origin_past_the_document_range_and_leaves_the_layer_maskless() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let far = Rect {
+            x: -aurora_core::MAX_DOCUMENT_ORIGIN - 1,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        match tree.add_mask(id, far) {
+            Err(DocError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, -aurora_core::MAX_DOCUMENT_ORIGIN - 1);
+                assert_eq!(y, 0);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+        assert!(
+            tree.mask(id).is_none(),
+            "a refused mask must leave the layer maskless, not half-masked"
+        );
+    }
+
+    #[test]
+    fn add_group_is_unaffected_by_the_origin_check() {
+        // A group carries no bounds of its own, so `insert_unchecked`'s
+        // `LayerKind::Pixel` guard must skip it entirely -- including a
+        // group nested under another group, which goes through the exact
+        // same insert path.
+        let mut tree = LayerTree::new();
+        let outer = match tree.add_group("outer", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.add_group("inner", Some(outer)) {
+            unreachable!("a group has no bounds to be out of range: {err:?}");
+        }
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.bounds(outer), None);
     }
 
     #[test]

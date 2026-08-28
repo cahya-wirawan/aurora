@@ -6496,18 +6496,25 @@ structural design work.
     `load_journal`'s own doc comment now says plainly that it
     deserializes without validating, and that `replay` is where the
     shape bar is enforced.
-  - **`Rect.x`/`Rect.y` (`i64`) are unchecked where `width`/`height`
-    now are.** `tile_grid` bounds a layer's extent but not its origin;
-    `read_layer_window` and `Rect::right`/`bottom` do plain
-    add/subtract on it. An extreme `x`/`y` (e.g. near `i64::MIN`)
-    overflows — wraps to a wrong picture in release, panics in debug.
-    Lower severity (wrong output or a debug panic, not an abort or
-    unbounded resource use), and largely pre-existing rather than new
-    this round. Fix: bound `x`/`y` in `tile_grid` the same way
-    `width`/`height` already are, or use checked/saturating arithmetic
-    in the two call sites named above; either way, `aur.rs`'s own
-    comment claiming "layer bounds are checked" should say *extent*,
-    not *bounds*, until it's true.
+  - **`Rect.x`/`Rect.y` (`i64`) were unchecked where `width`/`height`
+    are** — **fixed 2026-08-29 in 0.57.12, completed in 0.57.13**; see
+    the dedicated item at the end of this file for the design and the
+    evidence. `tile_grid`
+    bounded a layer's extent but not its origin; `read_layer_window`
+    and `Rect::right`/`bottom` did plain add/subtract on it. Both
+    halves of the write-up above were reproduced before fixing:
+    `Rect { x: i64::MAX, width: 10 }.right()` panicked with "attempt to
+    add with overflow" in a debug build, and a crafted `.aur` manifest
+    declaring a layer at `x: i64::MAX` was read back as `Ok`. Now:
+    `aurora_core::MAX_DOCUMENT_ORIGIN` + `Rect::origin_in_document_range`
+    bound the origin to ±300,000 on each axis, refused by
+    `DocError::LayerOriginOutOfRange` on the live-edit side and
+    `IoError::LayerOriginOutOfRange` on the `.aur` side — `tile_grid` for a
+    pixel layer's own bounds, `validate_mask_origins` for a layer's mask
+    (pixel or group, a gap the first round missed and a later review
+    found); `right`/`bottom`/`union` saturate rather than overflow.
+    `aur.rs`'s comment now says *extent* where it means extent, and names
+    both origin checks separately.
   - **A crafted `.aur` manifest can hand back an `IdGenerator` counter
     that has already been used** — found while closing the two gaps
     above (2026-08-24, 0.49.1), **and closed in the same round after an
@@ -6904,8 +6911,10 @@ structural design work.
     the manifest's positional encoding — a `.aur` reader change, not a
     `LayerTree` change, and one that touches ADR 0009's wire format
     policy. Worth doing when someone is next in `aur.rs`.
-  - **`Rect.x`/`Rect.y` (`i64`) are unchecked where `width`/`height`
-    now are** — unchanged, see the item above this list.
+  - **`Rect.x`/`Rect.y` (`i64`) were unchecked where `width`/`height`
+    are** — **fixed 2026-08-29 in 0.57.12, completed in 0.57.13**, see
+    the item above this list and the dedicated item at the end of this
+    file.
   - **`aurora-app`'s `resolve_tile` still has no depth or visited-set
     guard of its own** and depends entirely on the tree having been
     validated. Every known way to hand it a cyclic tree is now closed,
@@ -8658,15 +8667,259 @@ structural design work.
     brackets `set_min_zoom` only and does not cover that. A rail resize
     cannot coexist with a canvas drag today (`handle_pointer_pressed`
     starts one or the other, never both), so it is recorded, not fixed.
-- [ ] **`aurora_doc::LayerTree::set_bounds` accepts any `Rect`, including
-    negative and `i64::MAX` origins.** Found 2026-08-26 by the red team
-    while reviewing the pan-clamp fix; informational, low, **unrelated to
-    that fix** and deliberately not addressed by it. There is no ceiling
-    check against the 300,000 × 300,000 px document limit (PRD §7.3.1) and
-    no rejection of a negative origin, so a corrupt or hand-edited `.aur`
-    manifest can put a layer somewhere the tile store cannot address. The
-    pan clamp is not the place to fix it — validation belongs in
-    `aurora-doc` (or at the `.aur` reader), where the invariant is owned.
+- [x] **`aurora_doc::LayerTree::set_bounds` accepted any `Rect`, including
+    `i64::MAX` origins** — found 2026-08-26 by the red team while
+    reviewing the pan-clamp fix (informational, low, **unrelated to that
+    fix**); **fixed 2026-08-29 in 0.57.12, completed in 0.57.13**.
+    Validation went where the original write-up said it belonged: `aurora-doc` for a live edit,
+    the `.aur` reader for a file. Pure headless data validation — no GPU
+    adapter is involved anywhere on this path, so the test results below
+    are unhedged evidence, unlike the canvas work around them.
+  - **Reproduced first, in all three places.** `Rect { x: i64::MAX,
+    width: 10 }.right()` panicked at `geometry.rs:83` with "attempt to
+    add with overflow" in a debug build (release would wrap silently);
+    `LayerTree::set_bounds(id, Rect { x: i64::MAX, .. })` returned `Ok`
+    and stored it; and a hand-crafted `.aur` manifest declaring a layer
+    at `x: i64::MAX` was read back as `Ok`. Each probe was written
+    against the unfixed tree, run, and seen to fail before any fix
+    landed.
+  - **The range is `x, y ∈ [-300_000, +300_000]`, per axis
+    independently** — a new `aurora_core::MAX_DOCUMENT_ORIGIN`, derived
+    from the existing `MAX_DOCUMENT_EXTENT` rather than written as a
+    second literal (`max_document_origin_matches_the_document_extent_ceiling`
+    pins the derivation). Deliberately **not** `x >= 0`: a negative
+    origin is a layer dragged off the canvas edge, which is what
+    `Rect`'s signed `x`/`y` are *for* — the pre-existing
+    `rect_negative_coordinates_are_allowed` passes unmodified, and
+    `read_accepts_a_layer_origin_exactly_at_the_document_range` uses a
+    negative `y` precisely so an `x >= 0` regression would fail it. Also
+    deliberately **not** a joint check against `width`/`height`, which
+    would refuse a legal maximal-width layer nudged one pixel right;
+    extent stays bounded only where it is already owned
+    (`Size::new`, `tile_grid`).
+  - **One constant and one predicate in `aurora-core`
+    (`Rect::origin_in_document_range`), two error types above it.** Both
+    consumers sit above `aurora-core` in the layering map, and each maps
+    a `false` to its own variant — `DocError::LayerOriginOutOfRange`,
+    `IoError::LayerOriginOutOfRange` — rather than sharing an error type
+    or a `#[from]` conversion, keeping each policy boundary local to the
+    crate that owns it.
+  - **Live-edit side** (`aurora-doc`): a private `validate_origin` runs
+    in `insert_unchecked` (the single body shared by `add_pixel_layer`,
+    `insert`, and the `test-support` depth-limit hatch — so the hatch
+    cannot become a second way around it), *before* `next_id`, which
+    preserves the documented "a refused insert does not even consume an
+    id" property; in `set_bounds` after the `UnknownLayer`/
+    `NotAPixelLayer` checks, so an unknown id with a bad rect still
+    reports `UnknownLayer`
+    (`set_bounds_reports_an_unknown_layer_before_an_out_of_range_origin`
+    pins that precedence); and in `add_mask` after `MaskAlreadyExists`.
+    Every one leaves the tree untouched on refusal, asserted rather than
+    claimed. `History`'s `add_pixel_layer`/`set_bounds`/`add_mask`
+    inherit the check with no change of their own — each delegates via
+    `?` before journalling anything. `restore`/`restore_mask` are
+    deliberately not checked: crate-private undo paths putting back a
+    value that already passed on the way in.
+  - **Read side** (`aurora-io`): the check went into `tile_grid` rather
+    than into `read`, so one guard covers `read`, `write` and
+    `write_best_effort` alike, and it runs *before* the extent check —
+    an origin defect corrupts downstream arithmetic, while an oversized
+    extent only makes a loop too long. The new tests hand-craft manifest
+    bytes through mirror structs (the pattern the cyclic-tree test
+    already uses) because after the `aurora-doc` half of this fix
+    `LayerTree`'s public API can no longer build the fixture at all —
+    which is itself the evidence that half works.
+  - **Why `aurora-app`'s `read_layer_window` was left untouched (out of
+    scope, and now safe on every path that actually feeds it).** It
+    subtracts a layer origin from a document origin in `i64` with no
+    check of its own, then multiplies the tile indices it derives from
+    the difference. Two sources feed it today — a live `LayerTree` edit
+    and a `.aur` manifest — and both now refuse an out-of-range value.
+    An earlier draft of this entry called those "exactly two", which
+    overclaimed: `LayerTree` derives `Deserialize` and is `pub`, so
+    `postcard::from_bytes::<aurora_doc::LayerTree>()` is a **third
+    door** that goes through neither `aur::read` nor the live-edit API,
+    and `aurora-doc`'s deserializer deliberately does not bound origin
+    (it validates shape, plus opacity). Scoped accurately: the two-source
+    claim holds for what `read_layer_window` is reached from *today*,
+    not for what the type permits. The third door is not hypothetical —
+    this round's own `write_and_best_effort_write_both_refuse_a_layer_mask_origin_past_the_document_range`
+    uses it deliberately to build a fixture no other API can. It is not
+    a live hole either: in `aurora-app` it appears only at two
+    `#[cfg(test)]` call sites (both inside the test module that starts
+    at `lib.rs:9719`), never in shipping code, and `aurora-io` runs its
+    own checks on any tree that reaches a file. Belt and braces
+    underneath: `Rect::right`/`bottom` now `saturating_add`, and `union`
+    uses `saturating_sub` plus `u32::try_from(..).unwrap_or(u32::MAX)`
+    instead of a bare `as u32` cast, so a `Rect` assembled through that
+    third door is *wrong* but never a panic. No canvas, UI, or
+    pan-clamp code was touched — only a doc comment (see below).
+  - **A layer *mask*'s own `Rect` was missed by the first cut of this
+    fix, and is closed in 0.57.13.** Found by two independent reviewers
+    at once, each reproducing it concretely against the 0.57.12 tree.
+    `tile_grid` is where the read-side origin check went, and
+    `tile_grid` is only ever called on a `LayerKind::Pixel` arm's own
+    `bounds` — so an `aurora_doc::LayerMask`'s separate rectangle was
+    never checked at all, and a **group**, which can carry a mask but
+    has no `bounds`, never reached `tile_grid` in the first place.
+    Reproduced before fixing: a crafted manifest declaring a mask at
+    `i64::MIN`/`i64::MAX`/`300_001` read back as `Ok`, survived a
+    write-then-read round trip unchanged, and would reach
+    `apply_mask_clip` -> `Rect::contains_point` in `aurora-app` — which
+    saturates rather than panicking since 0.57.12, and so renders the
+    **wrong picture** (the masked layer fully hidden, or fully shown
+    when `inverted`) instead of failing loudly. Fixed by
+    `validate_mask_origins`, a walk of its own rather than another line
+    inside `tile_grid`, since no check placed there could see a mask or
+    a group. It reuses `IoError::LayerOriginOutOfRange` — same failure
+    class, and a caller recovering from a refused file has no use for
+    telling a layer's rectangle from its mask's. It is called from
+    `read` and from `write_with_policy`, the shared body behind both
+    `write` and `write_best_effort`, so one call site each covers every
+    path in and out of the format. `pixel_layer_ids` was refactored to
+    sit on top of a new shared `layer_ids` walk (groups included) that
+    keeps the same cycle budget and the same ordering; walking from
+    `roots` reaches every entry because `validate_shape` already
+    refuses orphans. A mask's *extent* is deliberately still unbounded:
+    no mask pixels are stored yet, so it drives no loop.
+  - **Doc-comment overclaims this exposed, all corrected in 0.57.13.**
+    `aurora-doc`'s `DocError::LayerOriginOutOfRange` claimed to cover
+    "every public path that puts a caller-supplied `Rect` into the
+    tree"; it now says "stores ... **in the tree**" and names the one
+    public method that takes a caller-supplied `Rect` and is not
+    covered — `History::record_bounds_change`, which by design never
+    touches the tree, journalling the caller's `old` rectangle for a
+    change the caller already applied. An out-of-range `old` there
+    reaches the journal, not the tree, and the first thing that would
+    put it *in* the tree is an ordinary undo, which goes through
+    `set_bounds` and is refused. `aurora-app`'s only caller passes
+    bounds read back out of the tree. Recorded, not fixed — it is a
+    behaviour change to a public API outside this round's scope.
+  - **The stated reason for keeping origin validation out of
+    `aurora-doc`'s deserializer was internally inconsistent, and is
+    rewritten.** It argued the check belongs in `aurora-io` because an
+    out-of-range origin is "inert to every traversal in this crate" —
+    but `validate_opacities` *is* in the deserializer and is equally
+    inert to every traversal here, endangering only the downstream
+    compositor. The rule as stated did not distinguish them. The real
+    distinction, verified: `LayerTree` is
+    `#[serde(try_from = "LayerTreeRepr")]`, so a `DocError` raised
+    inside it is converted through `Display` into a `serde` error and
+    reaches `aurora-io` as `IoError::ManifestDeserialization(String)` —
+    stringified, no structured fields, which is exactly why
+    `aurora-doc`'s own tests assert those cases against `validate_shape`
+    directly "rather than the deserializer's own message". A check in
+    `aurora-io` returns a typed `IoError::LayerOriginOutOfRange { x, y,
+    max }` a caller can match on, and the same guard covers the *write*
+    path, which a deserializer cannot reach at all. `validate_opacities`
+    stays where it is because it is load-bearing for a second,
+    non-`.aur` entry point (`LayerTree::restore`'s spliced subtree),
+    where there is no `aurora-io` boundary to put it at. No code moved;
+    this was a documentation-accuracy fix.
+  - **`aurora_core::MAX_DOCUMENT_ORIGIN`'s own justification was
+    overstated** and is narrowed: it claimed bounding the origin keeps
+    "every derived coordinate in range", which holds for `right()` and
+    `bottom()` fitting an `i64` and nothing more. Extent is deliberately
+    unbounded by `aurora-doc`'s live-edit API, so a `Rect` that passes
+    `origin_in_document_range` can still be ~14,000 document widths
+    across. Now stated as: keeps every derived **`i64`** coordinate far
+    from overflow; extent is bounded separately where it is owned
+    (`Size::new`, `tile_grid`).
+  - **`Rect::union`'s "smallest rectangle containing both" overclaimed
+    for saturated inputs**, and now carries the caveat. This is
+    reachable through the *validated* API rather than only through a
+    corrupt `Rect`, because origin is bounded and extent is not:
+    `Rect { x: -300_000, width: u32::MAX }` unioned with
+    `Rect { x: 300_000, width: u32::MAX }` spans 4,295,567,295 columns,
+    600,000 past what a `u32` holds. The width saturates to `u32::MAX`
+    and the result no longer contains the right-hand operand's far edge.
+    What the saturated case still guarantees is the weaker, defensive
+    one — true minimum origin, largest representable extent, and no
+    overflow, wrap, or truncation anywhere.
+  - **`aurora-app`'s `pan_bounds` precision caveat is now unreachable,
+    and its doc comment said otherwise** — a doc-only correction
+    (0.57.13), the single edit this round made outside `aurora-core`/
+    `aurora-doc`/`aurora-io`, and verified doc-only: every changed line
+    in `crates/aurora-app/src/lib.rs` begins with `///`. The comment
+    described the pre-fix world, cited this very PLAN.md item as still
+    open, and drew an `f32` caveat from `set_bounds` accepting any
+    `i64`. `min_doc` comes only from `active_layer_origin`, i.e. a
+    layer's own `bounds.x`/`bounds.y`, so with the origin bounded to
+    ±300,000 both operands of `min_doc + MAX_DOC_ORIGIN_PX` are ≤ 6e5 —
+    integers far under `f32`'s 2^24 exactly-representable ceiling, so
+    the addition is exact and the degenerate `max_doc == min_doc` case
+    cannot arise. No `aurora-app` logic was touched.
+  - Tests: 8 new in `aurora-core` (32 pass), 6 in `aurora-doc` (168
+    pass), 6 in `aurora-io` (70 pass) — 20 in total across the round,
+    every one of them seen to fail against the tree before its own fix
+    landed. The existing
+    `read_rejects_a_manifest_declaring_a_layer_past_the_document_ceiling`,
+    `read_accepts_bounds_exactly_at_the_document_ceiling` and
+    `read_rejects_a_manifest_whose_layer_tree_is_cyclic_rather_than_aborting`
+    all pass **unmodified**, which is what shows the extent and origin
+    checks compose rather than shadowing each other. The two added in
+    `aurora-core` for 0.57.13 close a real coverage gap the first cut
+    left: the "unchanged behaviour" test for `right`/`bottom` never
+    exercised a large `width` with an in-range origin, which is the one
+    shape where saturating and plain `+` could have parted company on a
+    rectangle the validated API can still produce.
+- [ ] **The Move tool can now silently stop moving a layer once a drag
+    would push its origin past ±300,000 px.** Disclosed 2026-08-29
+    alongside the 0.57.13 revision of the origin fix above;
+    informational, low, and deliberately **not** fixed — closing it
+    means touching `aurora-app` UI code, which that round was scoped out
+    of. `set_bounds` now returns `DocError::LayerOriginOutOfRange`, and
+    the Move drag handler logs a `tracing::warn!` and drops the move
+    with no user-visible feedback: the layer simply stops following the
+    pointer. Correct refusal, poor affordance. Reaching it needs a drag
+    a whole document extent off the canvas, so it is a rough edge rather
+    than an obstacle. Fix when someone is next in the Move tool: surface
+    the refusal the way other rejected edits are surfaced, rather than
+    only in the log.
+- [ ] **`aur::write_best_effort` hard-fails on a tree carrying an
+    out-of-range origin instead of skipping just that layer.**
+    Disclosed 2026-08-29 alongside the 0.57.13 revision above;
+    informational, low, and deliberately not fixed. The crash-recovery
+    autosave path exists so that one unreadable *tile* never costs a
+    user the whole document, but `UnreadableTile::Skip` is scoped to
+    tiles: an out-of-range layer or mask origin fails the write outright
+    on the reasoning that a bad rectangle says the *tree* is broken, not
+    that one piece of input is unreadable. **Not reachable today** — no
+    producer can build such a tree any more, since both `LayerTree`'s
+    live-edit API and `aur::read` refuse one — so this matters only if a
+    future path (`History::replay()`, or the `Deserialize` third door
+    noted above) reintroduces one. If it ever does, the autosave that
+    was supposed to be the safety net is the thing that stops running.
+    Worth revisiting then, deliberately, rather than defaulting either
+    way now.
+- [ ] **`History::replay()` can still splice an out-of-range origin into
+    a tree, bypassing `set_bounds`.** Disclosed 2026-08-29 alongside the
+    0.57.12 origin fix above, and deliberately **not** fixed in that
+    round. `replay()` is `pub` and applies a journal's `Restore` entries
+    directly, so a crafted `.aur` file's `history` section could
+    theoretically reach a layer origin the `set_bounds`/`tile_grid`
+    checks would have refused. **Not reachable in the live app today**:
+    grep confirms `aurora-app` never calls `replay()` — only
+    `aurora-doc`'s own tests do — and a loaded journal starts with empty
+    undo/redo stacks (`load_journal_starts_with_empty_undo_redo_stacks`).
+    It is a real residual for any *future* caller of `replay()`, which
+    is why it is recorded rather than closed.
+    **Fix when one appears: extend `LayerTree::validate`'s existing
+    walk with an origin check**, covering a pixel layer's own `bounds`
+    and every mask's `bounds` together, which `replay`'s trailing
+    `tree.validate()` then picks up for free. An earlier draft of this
+    entry suggested validating in `apply`'s `Restore`/`RestoreMask`
+    arms instead. **Do not do that** (corrected 2026-08-29): `apply` is
+    the shared body for `replay()` *and* for ordinary
+    `History::undo`/`redo`, and those two arms call
+    `LayerTree::restore`/`restore_mask`, which are deliberately left
+    unvalidated precisely because they put back a value the tree itself
+    produced — `tree.rs`'s own doc comment on `validate_origin` states
+    that contract. A check there would make an ordinary undo able to
+    fail on the tree's own output, which is a worse defect than the one
+    being closed. `LayerTree::validate` is the right seam because it is
+    already the single bar both a deserialized manifest and a replayed
+    journal are held to.
 - [x] **Panning past the document's *far* edge has no bound matching the
     origin-side one** — found 2026-08-25, fixed in 0.57.10.
     `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together

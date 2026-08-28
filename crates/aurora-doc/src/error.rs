@@ -227,4 +227,81 @@ pub enum DocError {
     /// layer. Nothing is inserted when it happens.
     #[error("layer id {0:?} is already in use: refusing to overwrite the layer already under it")]
     LayerIdCollision(LayerId),
+    /// A [`aurora_core::Rect`] handed to this crate's own editing API
+    /// sits further from the document origin than
+    /// [`aurora_core::MAX_DOCUMENT_ORIGIN`] on `x`, `y`, or both.
+    ///
+    /// Returned by [`crate::LayerTree::add_pixel_layer`] (and so by
+    /// [`crate::History::add_pixel_layer`], which delegates to it before
+    /// journalling anything), [`crate::LayerTree::set_bounds`] and
+    /// [`crate::LayerTree::add_mask`] — every public path that stores a
+    /// caller-supplied `Rect` **in the tree**. Nothing is changed when
+    /// it fires: no layer is added, no bounds are replaced, no mask is
+    /// attached, and `add_pixel_layer` does not even consume a
+    /// [`LayerId`], since the check runs before the generator is
+    /// touched.
+    ///
+    /// "In the tree" is the exact scope, stated rather than rounded up
+    /// to "every public path". One public method takes a
+    /// caller-supplied `Rect` and is *not* covered:
+    /// [`crate::History::record_bounds_change`], which by design never
+    /// touches the tree at all — it journals the caller's `old`
+    /// rectangle as an undo entry for a change the caller already
+    /// applied itself. An out-of-range `old` there reaches the journal,
+    /// not the tree, and the first thing that would try to put it *in*
+    /// the tree is an ordinary undo, which goes through
+    /// [`crate::LayerTree::set_bounds`] and so is refused by this same
+    /// variant. `aurora-app`'s only caller passes bounds it read back
+    /// out of the tree, so it cannot produce one; PLAN.md records the
+    /// residual rather than leaving it implied here.
+    ///
+    /// **Negative origins are still legal**, and deliberately so — a
+    /// layer dragged partly or wholly off the canvas is an ordinary
+    /// edit, which is what `Rect`'s signed `x`/`y` are for. What is
+    /// refused is an origin further out than one whole document extent
+    /// (300,000 px, PRD §7.3.1 / ADR 0002) in either direction; see
+    /// [`aurora_core::MAX_DOCUMENT_ORIGIN`] for why the bound is that
+    /// number and why it does not also fold in the rectangle's own
+    /// width/height.
+    ///
+    /// **The `.aur` read-time twin lives in `aurora-io`**, as
+    /// `IoError::LayerOriginOutOfRange`, and not in this crate's own
+    /// deserializer.
+    ///
+    /// An earlier draft of this comment justified that by saying an
+    /// out-of-range origin is "inert to every traversal in this crate",
+    /// unlike [`Self::LayerTreeTooDeep`], which is a property of the
+    /// tree's own shape and so has to be checked here. Half of that is
+    /// sound — depth really does defeat this crate's own walks, which
+    /// is why it is checked at both ends — but the other half does not
+    /// distinguish anything: [`crate::LayerTree`]'s deserializer *also*
+    /// runs `validate_opacities`, which is likewise a pure value-range
+    /// check, likewise inert to every traversal here, and likewise
+    /// endangers only a downstream consumer (the compositor, handed a
+    /// `NaN`). By the stated rule that one belongs in `aurora-io` too,
+    /// and it is not there.
+    ///
+    /// **The real distinction is what error the caller gets.** This
+    /// crate's `Deserialize` is `#[serde(try_from = "LayerTreeRepr")]`,
+    /// so a `DocError` raised inside it is converted through `Display`
+    /// into a `serde` error and reaches `aurora-io` as
+    /// `IoError::ManifestDeserialization(String)` — a stringified
+    /// message with no structured fields, which is exactly why
+    /// `aurora-doc`'s own tests assert those cases against
+    /// `validate_shape` directly "rather than the deserializer's own
+    /// message". A check in `aurora-io` returns a typed
+    /// `IoError::LayerOriginOutOfRange { x, y, max }` instead, which a
+    /// caller can match on and report the file's actual numbers from.
+    /// Origin is checked there for that reason, and because the same
+    /// guard then also covers the *write* path (`tile_grid` and
+    /// `validate_mask_origins` are shared by `read`, `write` and
+    /// `write_best_effort`), which a deserializer cannot reach at all.
+    /// `validate_opacities` stays in the deserializer because it is
+    /// load-bearing for a second, non-`.aur` entry point —
+    /// `LayerTree::restore`'s spliced subtree — where there is no
+    /// `aurora-io` boundary to put it at.
+    #[error(
+        "layer origin ({x}, {y}) is further than {max}px from the document origin on at least one axis"
+    )]
+    LayerOriginOutOfRange { x: i64, y: i64, max: i64 },
 }

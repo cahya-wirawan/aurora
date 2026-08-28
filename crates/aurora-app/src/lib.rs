@@ -4094,22 +4094,25 @@ impl PanBounds {
     /// `applying_the_maximum_then_the_minimum_leaves_the_near_bound_holding`
     /// pins it.
     ///
-    /// **The precision caveat on "cannot cross", stated rather than
-    /// left implicit.** `min_doc + MAX_DOC_ORIGIN_PX` is `f32`
-    /// arithmetic, so at very large layer origins the ceiling stops
-    /// surviving the addition: measured, the sum goes inexact from
-    /// around 1.0e9, and the ceiling is absorbed *entirely* from around
-    /// 1.6384e13, where `max_doc == min_doc` and the two bounds
-    /// degenerate to a single point. They still never **cross** —
+    /// **The `f32` precision caveat this paragraph used to carry is now
+    /// unreachable.** `min_doc + MAX_DOC_ORIGIN_PX` is `f32`
+    /// arithmetic, and at a large enough `min_doc` the ceiling stops
+    /// surviving the addition: the sum goes inexact from around 1.0e9,
+    /// and from around 1.6384e13 the ceiling is absorbed entirely,
+    /// leaving `max_doc == min_doc` — never *crossed*, since
     /// round-to-nearest on two positive values cannot land below the
-    /// larger one — so the ordering guarantee above holds unchanged and
-    /// nothing goes non-finite; the bound merely becomes uselessly
-    /// tight. Reaching it needs a layer origin some eight orders of
-    /// magnitude past the 300,000 px document ceiling, which
-    /// `aurora_doc::LayerTree::set_bounds` will currently accept (an
-    /// `i64` origin; `i64::MAX as f32` ≈ 9.2e18). That missing
-    /// validation is its own tracked PLAN.md item — this is one more
-    /// consequence downstream of it, not a defect in the ordering.
+    /// larger one, but degenerate. That needed a layer origin some
+    /// eight orders of magnitude past the 300,000 px document ceiling,
+    /// which nothing refused at the time. Both producers of a layer
+    /// origin refuse one now:
+    /// `aurora_doc::DocError::LayerOriginOutOfRange` on a live edit and
+    /// `aurora_io::IoError::LayerOriginOutOfRange` on a `.aur` read, to
+    /// ±`aurora_core::MAX_DOCUMENT_ORIGIN` (300,000). So `min_doc` is
+    /// within ±3e5 and the sum within ±6e5, every value there being an
+    /// integer well under `f32`'s own 2^24 exactly-representable
+    /// ceiling — the addition is exact, and the degenerate case cannot
+    /// arise. Recorded rather than deleted because the ordering
+    /// argument above is *why* it was only ever a caveat and not a bug.
     ///
     /// **"The two bounds cannot cross" and "the two bounds cannot be
     /// jointly unsatisfiable" are different claims, and only the first
@@ -4123,9 +4126,10 @@ impl PanBounds {
     /// 300,000 px document ceiling. A wide canvas area at a zoom far
     /// enough out does not fit (3,000 logical px at
     /// `aurora_ui::canvas_view::MIN_ZOOM` already spans exactly the
-    /// ceiling), and the degenerate `max_doc == min_doc` case the
-    /// precision caveat above describes does not fit at any zoom at
-    /// all.
+    /// ceiling). This one is an ordinary condition and is still live,
+    /// unlike the degenerate `max_doc == min_doc` case the paragraph
+    /// above describes — that one would not have fit at any zoom at
+    /// all, and the origin bound has since made it unreachable.
     ///
     /// The max-then-min ordering decides what happens then, and decides
     /// it the right way round: the near bound is applied last and holds

@@ -128,6 +128,58 @@ pub enum IoError {
     /// unbounded one — rejected up front instead.
     #[error(".aur manifest declares a {width}x{height} layer, past the {max}px document ceiling")]
     LayerBoundsTooLarge { width: u32, height: u32, max: u32 },
+    /// [`crate::aur::read`] found a manifest declaring a rectangle
+    /// whose *origin* sits further than
+    /// [`aurora_core::MAX_DOCUMENT_ORIGIN`] from the document origin on
+    /// `x`, `y`, or both — the companion to
+    /// [`IoError::LayerBoundsTooLarge`], which bounds the same
+    /// rectangle's extent.
+    ///
+    /// **Two rectangles per layer are covered, by two different
+    /// guards.** A pixel layer's own `bounds` is checked in
+    /// `tile_grid`, alongside the extent. A `LayerMask`'s own `bounds`
+    /// is checked in `validate_mask_origins`, which has to be a
+    /// separate walk: `tile_grid` is only ever handed a
+    /// `LayerKind::Pixel` arm's `bounds`, so it never sees a mask, and a
+    /// *group* — which carries a mask but no bounds — never reaches it
+    /// at all. Both guards run on [`crate::aur::read`],
+    /// [`crate::aur::write()`] and [`crate::aur::write_best_effort`]
+    /// alike. One variant serves both because it is one failure class,
+    /// and a caller recovering from a refused file has no use for
+    /// telling a layer's rectangle from its mask's.
+    ///
+    /// A negative origin is perfectly legal and stays accepted: a layer
+    /// may sit partly or wholly off the canvas edge, which is what
+    /// `aurora_core::Rect`'s signed `x`/`y` are for. What is refused is
+    /// an origin further out than one whole document extent in either
+    /// direction.
+    ///
+    /// What is unbounded without it: unlike an oversized extent, which
+    /// is a loop-size defect, an out-of-range origin is an *arithmetic*
+    /// one that propagates. `aurora-app`'s own `read_layer_window`
+    /// computes `doc_origin - layer_origin` in `i64` with no check of
+    /// its own and then multiplies the tile indices it derives from
+    /// that difference, and `aurora_core::Rect::right`/`bottom` add the
+    /// extent to the same origin. Those saturate rather than panic now,
+    /// but saturating still yields a wrong picture; refusing the value
+    /// at the file boundary is what keeps it from ever being computed
+    /// on. Together with `aurora_doc::DocError::LayerOriginOutOfRange`
+    /// on the live-edit side, these two checks are what make that
+    /// unguarded subtraction unreachable with a pathological origin in
+    /// practice — `read_layer_window` itself is deliberately left
+    /// unchanged, since with both producers refusing there is no longer
+    /// a path that hands it one.
+    ///
+    /// Within `tile_grid` the origin is checked *before* the extent, on
+    /// the reasoning that an origin defect corrupts downstream
+    /// arithmetic while an oversized extent only makes a loop too long.
+    /// A mask's *extent* is not bounded at all, deliberately: no mask
+    /// pixels are stored yet (see `aurora_doc::LayerMask`), so it
+    /// drives no loop for an oversized value to make unfinishable.
+    #[error(
+        ".aur manifest declares a layer at ({x}, {y}), further than {max}px from the document origin"
+    )]
+    LayerOriginOutOfRange { x: i64, y: i64, max: i64 },
     /// [`crate::aur::read`] found a manifest declaring a canvas larger
     /// than [`aurora_core::MAX_DOCUMENT_EXTENT`] — the same document
     /// ceiling [`IoError::LayerBoundsTooLarge`] enforces for a layer's

@@ -40,11 +40,32 @@
 //! path (crash-recovery autosave) and on its ordinary "open the `.aur`
 //! file a user was sent" path, so neither an unfinishable loop nor an
 //! unbounded allocation is acceptable here: the manifest's declared
-//! layer bounds are checked against `aurora_core::MAX_DOCUMENT_EXTENT`
-//! before any tile grid is derived from them (`tile_grid`), and every
+//! layer *extent* is checked against `aurora_core::MAX_DOCUMENT_EXTENT`
+//! before any tile grid is derived from it (`tile_grid`), and every
 //! entry is read through a per-entry size cap (`read_capped`) rather
 //! than a bare `read_to_end`. Both reject with an [`IoError`]; neither
 //! panics.
+//!
+//! That said "layer bounds" until 2026-08-29, which overclaimed: only
+//! the extent was checked, and a `Rect`'s own *origin* went through
+//! untouched. `tile_grid` now checks that too, against
+//! `aurora_core::MAX_DOCUMENT_ORIGIN`
+//! ([`IoError::LayerOriginOutOfRange`]) — a different class of defect
+//! from the extent one, since an out-of-range origin does not enlarge
+//! any loop here but does propagate into arithmetic downstream:
+//! `aurora-app`'s own `read_layer_window` subtracts a layer origin from
+//! a document origin in `i64` with no check of its own. A negative
+//! origin stays legal; a layer may sit off the canvas edge.
+//!
+//! **A layer's `bounds` is not the only `Rect` a manifest carries**
+//! (0.57.13). A `LayerMask` has one of its own, and `tile_grid` cannot
+//! see it — it is only ever called on a `LayerKind::Pixel` arm's own
+//! `bounds`, so a mask's rectangle went unchecked, and a *group*, which
+//! can carry a mask but has no `bounds`, never reached `tile_grid` at
+//! all. `validate_mask_origins` closes both, from [`read`] and from the
+//! shared body behind [`write()`] and [`write_best_effort`]. It is the
+//! same failure class and reuses [`IoError::LayerOriginOutOfRange`]
+//! rather than adding a variant.
 //!
 //! **A second hardening pass** (also 2026-08-24) closed three more holes
 //! an independent review found in that same untrusted path: the
@@ -183,20 +204,56 @@ fn read_capped(mut file: zip::read::ZipFile<'_>, name: &str, cap: u64) -> Result
     Ok(bytes)
 }
 
-/// How many tiles wide and tall `bounds` is, rejecting bounds past
-/// [`aurora_core::MAX_DOCUMENT_EXTENT`] (PRD §7.3.1's own document
-/// ceiling, the same one `aurora_core::Size::new` already enforces).
+/// How many tiles wide and tall `bounds` is, after checking *both*
+/// halves of that rectangle against the document ceiling (PRD §7.3.1):
+/// its origin against [`aurora_core::MAX_DOCUMENT_ORIGIN`], and its
+/// extent against [`aurora_core::MAX_DOCUMENT_EXTENT`] (the same one
+/// `aurora_core::Size::new` already enforces).
 ///
-/// This is a real safety check, not a tidiness one. [`read`] derives
-/// this grid from a manifest it has just parsed out of an untrusted
-/// file, then loops `tiles_y * tiles_x` times — so an unchecked
-/// `u32::MAX` extent there is not a big loop but an unfinishable one
-/// (~2.8e14 iterations), reached from `aurora-app`'s own pre-window
-/// startup recovery *and* from opening any `.aur` file a user was sent.
-/// Clamping to the ceiling the format already documents bounds the
-/// worst case to something large but finite without newly restricting
-/// any legitimate document.
+/// Both are real safety checks, not tidiness ones, and they guard
+/// different things.
+///
+/// **Extent.** [`read`] derives this grid from a manifest it has just
+/// parsed out of an untrusted file, then loops `tiles_y * tiles_x`
+/// times — so an unchecked `u32::MAX` extent there is not a big loop
+/// but an unfinishable one (~2.8e14 iterations), reached from
+/// `aurora-app`'s own pre-window startup recovery *and* from opening
+/// any `.aur` file a user was sent.
+///
+/// **Origin.** An out-of-range `x`/`y` costs nothing here — the grid
+/// size does not depend on it — but it propagates: `aurora-app`'s own
+/// `read_layer_window` subtracts a layer origin from a document origin
+/// in `i64` with no check of its own, and
+/// `aurora_core::Rect::right`/`bottom` add the extent to it. Refusing
+/// it at the file boundary is what keeps a crafted origin from ever
+/// reaching that arithmetic. A *negative* origin stays accepted: a
+/// layer may legitimately sit off the canvas edge.
+///
+/// The origin is checked first, because an origin defect corrupts
+/// downstream arithmetic while an oversized extent only makes a loop
+/// too long.
+///
+/// Placing both here rather than in [`read`] is deliberate: [`read`],
+/// [`write()`] and [`write_best_effort`] all derive their tile grids
+/// through this one function, so one check covers every path in and
+/// out of the format.
+///
+/// What this function cannot cover, and so does not claim to: a
+/// *mask*'s own rectangle. `bounds` here is always a
+/// `LayerKind::Pixel` arm's, so a mask never arrives, and a group
+/// never calls this at all. [`validate_mask_origins`] is the walk that
+/// covers those, from the same two entry points.
+///
+/// Clamping to the ceilings the format already documents bounds the
+/// worst case without newly restricting any legitimate document.
 fn tile_grid(bounds: aurora_core::Rect) -> Result<(u32, u32), IoError> {
+    if !bounds.origin_in_document_range() {
+        return Err(IoError::LayerOriginOutOfRange {
+            x: bounds.x,
+            y: bounds.y,
+            max: aurora_core::MAX_DOCUMENT_ORIGIN,
+        });
+    }
     if bounds.width > aurora_core::MAX_DOCUMENT_EXTENT
         || bounds.height > aurora_core::MAX_DOCUMENT_EXTENT
     {
@@ -272,9 +329,13 @@ enum ColorSpaceTag {
 /// failure, [`IoError::ManifestSerialization`] if the manifest itself
 /// somehow fails to `postcard`-encode (a plain, already-checked struct —
 /// not expected in practice), [`IoError::Doc`] if `history.save_journal`
-/// fails, [`IoError::Color`] if `profile.to_bytes()` fails, or
-/// [`IoError::Tile`] if paging a touched tile in from the scratch disk
-/// fails.
+/// fails, [`IoError::Color`] if `profile.to_bytes()` fails,
+/// [`IoError::LayerBoundsTooLarge`]/[`IoError::LayerOriginOutOfRange`]
+/// if some layer's own bounds are past the document ceiling in extent
+/// or origin, or some layer's *mask* origin is (`tile_grid` and
+/// `validate_mask_origins` are both shared with [`read`], so the same
+/// checks apply on the way out as on the way in), or [`IoError::Tile`]
+/// if paging a touched tile in from the scratch disk fails.
 ///
 /// That last one aborts the whole write, deliberately: an explicit save
 /// must refuse rather than quietly produce a document with content
@@ -345,9 +406,13 @@ pub struct SkippedTile {
 /// canvas (degrades and repaints) and `composite_document` (refuses).
 ///
 /// Only a tile read is tolerated. A container/I/O failure, a bad
-/// manifest, or a layer whose bounds exceed the document ceiling still
-/// fail the write outright — those say the *output* is broken, not that
-/// one piece of input is unreadable.
+/// manifest, or a layer whose own bounds — or whose mask's bounds —
+/// exceed the document ceiling in extent or origin still fail the write
+/// outright: those say the *tree* is broken, not that one piece of
+/// input is unreadable. Disclosed rather than silently assumed, since
+/// it means this writer can refuse a whole autosave over a rectangle;
+/// no producer can build such a tree any more, so it is unreachable in
+/// practice, and PLAN.md records it.
 ///
 /// # Errors
 ///
@@ -392,6 +457,12 @@ fn write_with_policy<W: Write + Seek>(
     store: &mut TileStore,
     unreadable: UnreadableTile,
 ) -> Result<Vec<SkippedTile>, IoError> {
+    // Before a single byte is written: a refusal here leaves no
+    // half-built container behind. `tile_grid`'s own bounds check
+    // cannot be hoisted the same way (it is what derives the grid the
+    // tile loop walks), but a mask check has no such tie.
+    validate_mask_origins(layers)?;
+
     let mut skipped: Vec<SkippedTile> = Vec::new();
     let mut zip = ZipWriter::new(writer);
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
@@ -497,8 +568,13 @@ type AurDocument = (
 /// bytes fail to parse, [`IoError::Tile`] if a tile entry fails to
 /// decode or doesn't decode to the expected sample count,
 /// [`IoError::LayerBoundsTooLarge`] if the manifest declares a layer
-/// past the document ceiling, [`IoError::CanvasTooLarge`] if it declares
-/// a *canvas* past that same ceiling, [`IoError::TooManyTiles`] if its
+/// whose extent is past the document ceiling,
+/// [`IoError::LayerOriginOutOfRange`] if it declares a layer — or a
+/// layer *mask* — whose *origin* is further from the document origin
+/// than that same ceiling (a negative origin is still legal — see that
+/// variant),
+/// [`IoError::CanvasTooLarge`] if it declares a *canvas* past that same
+/// ceiling, [`IoError::TooManyTiles`] if its
 /// layers together add up to more tiles than any real document has, or
 /// [`IoError::EntryTooLarge`] if an entry holds more bytes than it
 /// legitimately could — see
@@ -542,6 +618,11 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
             max: aurora_core::MAX_DOCUMENT_EXTENT,
         });
     }
+
+    // Every layer's *mask* origin, before any of them is used. The
+    // layer-bounds twin of this lives in `tile_grid` below, which
+    // cannot cover a mask -- see `validate_mask_origins`.
+    validate_mask_origins(&manifest.layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
@@ -649,6 +730,29 @@ fn read_entry<R: Read + Seek>(
 /// report. `budget` bounds the walk at one visit per layer the tree
 /// actually holds, which is all a real tree ever needs.
 fn pixel_layer_ids(layers: &LayerTree) -> Vec<LayerId> {
+    layer_ids(layers)
+        .into_iter()
+        .filter(|id| matches!(layers.kind(*id), Some(LayerKind::Pixel { .. })))
+        .collect()
+}
+
+/// Every layer the tree holds, groups included, in the same order
+/// [`pixel_layer_ids`] yields its own subset — the shared walk, with
+/// the same cycle budget for the same reason (see that function's doc
+/// comment, which this one is the general case of).
+///
+/// Covering *groups* is the whole reason this exists separately.
+/// A group carries no `bounds`, so `pixel_layer_ids` skips it — but it
+/// can carry a mask, and a mask has a `Rect` of its own that reaches
+/// the same downstream arithmetic a pixel layer's bounds do. See
+/// [`validate_mask_origins`].
+///
+/// Walking from `roots` rather than over the `layers` map reaches every
+/// entry regardless: `aurora_doc`'s own deserialize-time `validate_shape`
+/// refuses an orphan (an entry nothing names), so "reachable from
+/// `roots`" and "present in the map" are the same set for any tree that
+/// got this far.
+fn layer_ids(layers: &LayerTree) -> Vec<LayerId> {
     let mut ids = Vec::new();
     // Reversed on the way in so popping yields each sibling list in its
     // own stored order -- the order the recursive walk this replaced
@@ -665,12 +769,55 @@ fn pixel_layer_ids(layers: &LayerTree) -> Vec<LayerId> {
             break;
         }
         budget -= 1;
-        match kind {
-            LayerKind::Pixel { .. } => ids.push(id),
-            LayerKind::Group { children } => stack.extend(children.iter().rev().copied()),
+        ids.push(id);
+        if let LayerKind::Group { children } = kind {
+            stack.extend(children.iter().rev().copied());
         }
     }
     ids
+}
+
+/// Refuses any layer whose *mask* rectangle's origin sits further from
+/// the document origin than [`aurora_core::MAX_DOCUMENT_ORIGIN`] —
+/// [`IoError::LayerOriginOutOfRange`], the same variant `tile_grid`
+/// returns for a layer's own bounds, because it is the same failure
+/// class and a caller has no use for telling them apart.
+///
+/// **This is a separate walk, and it has to be.** A mask's `Rect` is
+/// not the layer's own `bounds`: `tile_grid` is called only on a
+/// `LayerKind::Pixel` arm's `bounds`, so it never sees a mask at all,
+/// and a *group* — which can carry a mask — never reaches `tile_grid`
+/// in the first place. Until 0.57.13 a crafted manifest could therefore
+/// declare a mask at `i64::MIN` and be read back as `Ok`; it then
+/// survived a write-then-read round trip unchanged and reached
+/// `apply_mask_clip` -> `aurora_core::Rect::contains_point` in
+/// `aurora-app`, which saturates rather than panicking and so renders
+/// the *wrong picture* (the masked layer fully hidden, or fully shown
+/// when `inverted`) rather than failing loudly.
+///
+/// Called from [`read`] and from `write_with_policy` — the shared body
+/// behind [`write()`] and [`write_best_effort`] — so one call site each
+/// covers every path in and out of the format, the same property
+/// `tile_grid` gives the bounds check.
+///
+/// A mask's *extent* is deliberately not checked here. Unlike a layer's
+/// own bounds it drives no loop in this module (no mask pixels are
+/// stored yet — see `aurora_doc::LayerMask`), so there is nothing for
+/// an oversized one to make unfinishable.
+fn validate_mask_origins(layers: &LayerTree) -> Result<(), IoError> {
+    for id in layer_ids(layers) {
+        let Some(mask) = layers.mask(id) else {
+            continue;
+        };
+        if !mask.bounds.origin_in_document_range() {
+            return Err(IoError::LayerOriginOutOfRange {
+                x: mask.bounds.x,
+                y: mask.bounds.y,
+                max: aurora_core::MAX_DOCUMENT_ORIGIN,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The ZIP entry name one tile's own encoded bytes live under —
@@ -1131,6 +1278,324 @@ mod tests {
         let (_dir, mut store) = real_tile_store();
         if let Err(err) = read(container_with(&manifest_bytes, &[]), &mut store) {
             unreachable!("bounds at the documented ceiling must still read: {err:?}");
+        }
+    }
+
+    /// Which shape of layer a crafted manifest should carry, and where
+    /// its own rectangle sits.
+    ///
+    /// A group is not a redundant variant. A group carries no `bounds`
+    /// of its own, so it never reaches `tile_grid` — which is exactly
+    /// why a *group's* mask was the half of this check that stayed open
+    /// after 0.57.12: `tile_grid` is only ever called on a
+    /// `LayerKind::Pixel` arm, so a check placed there cannot see one.
+    #[derive(Clone, Copy)]
+    enum CraftedKind {
+        /// A 16x16 pixel layer whose own origin is `(x, y)`.
+        Pixel(i64, i64),
+        /// A childless group, which has no origin of its own at all.
+        Group,
+    }
+
+    /// The mirror structs behind [`crafted_manifest`], hoisted out of it
+    /// so [`crafted_tree_bytes`] can reuse them for the write-side test.
+    /// They match `LayerTree`'s own derived `Serialize` field-for-field.
+    mod mirror {
+        #[derive(serde::Serialize)]
+        pub(super) enum Kind {
+            Pixel { x: i64, y: i64, w: u32, h: u32 },
+            Group { children: Vec<u64> },
+        }
+        #[derive(serde::Serialize)]
+        pub(super) struct Lock {
+            pub(super) transparency: bool,
+            pub(super) pixels: bool,
+            pub(super) position: bool,
+        }
+        /// Mirrors `aurora_doc::LayerMask`: an `aurora_core::Rect`
+        /// (four positional fields) then the two toggles.
+        #[derive(serde::Serialize)]
+        pub(super) struct Mask {
+            pub(super) x: i64,
+            pub(super) y: i64,
+            pub(super) w: u32,
+            pub(super) h: u32,
+            pub(super) enabled: bool,
+            pub(super) inverted: bool,
+        }
+        #[derive(serde::Serialize)]
+        pub(super) struct Entry {
+            pub(super) name: String,
+            pub(super) parent: Option<u64>,
+            pub(super) kind: Kind,
+            pub(super) opacity: f32,
+            pub(super) fill_opacity: f32,
+            pub(super) blend_mode: u32,
+            pub(super) visible: bool,
+            pub(super) lock: Lock,
+            pub(super) mask: Option<Mask>,
+        }
+        #[derive(serde::Serialize)]
+        pub(super) struct Tree {
+            pub(super) ids: u64,
+            pub(super) layers: std::collections::HashMap<u64, Entry>,
+            pub(super) roots: Vec<u64>,
+        }
+        #[derive(serde::Serialize)]
+        pub(super) struct Manifest {
+            pub(super) version: u32,
+            pub(super) canvas_width: u32,
+            pub(super) canvas_height: u32,
+            pub(super) color_space: u32,
+            pub(super) layers: Tree,
+        }
+    }
+
+    /// The one-layer tree every crafted fixture below is built from.
+    fn crafted_tree(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> mirror::Tree {
+        let mut layers = std::collections::HashMap::new();
+        layers.insert(
+            0u64,
+            mirror::Entry {
+                name: "far".to_owned(),
+                parent: None,
+                kind: match kind {
+                    CraftedKind::Pixel(x, y) => mirror::Kind::Pixel { x, y, w: 16, h: 16 },
+                    CraftedKind::Group => mirror::Kind::Group { children: vec![] },
+                },
+                opacity: 1.0,
+                fill_opacity: 1.0,
+                blend_mode: 0,
+                visible: true,
+                lock: mirror::Lock {
+                    transparency: false,
+                    pixels: false,
+                    position: false,
+                },
+                mask: mask_origin.map(|(x, y)| mirror::Mask {
+                    x,
+                    y,
+                    w: 16,
+                    h: 16,
+                    enabled: true,
+                    inverted: false,
+                }),
+            },
+        );
+        mirror::Tree {
+            ids: 1,
+            layers,
+            roots: vec![0],
+        }
+    }
+
+    /// A manifest declaring exactly one layer — hand-crafted rather
+    /// than round-tripped through `LayerTree`'s own API, and that is
+    /// the whole point.
+    ///
+    /// Its neighbour `read_rejects_a_manifest_declaring_a_layer_past_the_document_ceiling`
+    /// *can* still build its fixture through the real API, because
+    /// `aurora-doc` deliberately does not bound a layer's extent. It
+    /// does bound the *origin* now
+    /// (`aurora_doc::DocError::LayerOriginOutOfRange`), so there is no
+    /// longer any path through `LayerTree`'s public API that produces
+    /// an out-of-range one — for a layer's own bounds *or* for a
+    /// mask's, since `add_mask` is checked too. The fixture has to be
+    /// assembled on the wire instead. That the doc API refuses to build
+    /// it is itself the evidence that the live-edit half of this fix
+    /// works; what remains to test here is the *reader's* own
+    /// independent check, which is what stops a file that never went
+    /// through that API.
+    ///
+    /// `mask_origin` attaches a 16x16 mask at that origin, or leaves
+    /// the layer maskless when `None`.
+    ///
+    /// The mirror structs match `LayerTree`'s own derived `Serialize`
+    /// field-for-field, the same trick
+    /// `read_rejects_a_manifest_whose_layer_tree_is_cyclic_rather_than_aborting`
+    /// uses — `postcard`'s wire format is positional, so an identical
+    /// shape encodes to identical bytes. `x`/`y` are `i64` here,
+    /// matching `Rect`'s own types: `postcard` zigzag-varint-encodes
+    /// signed integers by width, so an `i32` mirror could not even
+    /// represent `i64::MAX`.
+    fn crafted_manifest(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> Vec<u8> {
+        let manifest = mirror::Manifest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1,
+            canvas_height: 1,
+            color_space: 0,
+            layers: crafted_tree(kind, mask_origin),
+        };
+        match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// The same one-layer tree on its own, without a manifest around
+    /// it — what the *write*-side test needs, since it has to hand
+    /// `write` a real `LayerTree` and `LayerTree`'s own API refuses to
+    /// build one carrying an out-of-range origin. Its derived
+    /// `Deserialize` does not: origin is a value-range property, and
+    /// this crate is where that range is enforced for a file.
+    fn crafted_tree_bytes(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> Vec<u8> {
+        match postcard::to_allocvec(&crafted_tree(kind, mask_origin)) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// The maskless pixel-layer case, which most of these tests want.
+    fn crafted_origin_manifest(x: i64, y: i64) -> Vec<u8> {
+        crafted_manifest(CraftedKind::Pixel(x, y), None)
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_declaring_a_layer_origin_past_the_document_range() {
+        // Pre-fix this returned `Ok` -- measured against a real crafted
+        // container, not assumed. The origin then flowed on into
+        // `aurora-app`'s own `read_layer_window`, which subtracts it
+        // from a document origin in `i64` with no check of its own.
+        let manifest_bytes = crafted_origin_manifest(i64::MAX, 0);
+        let (_dir, mut store) = real_tile_store();
+        match read(container_with(&manifest_bytes, &[]), &mut store) {
+            Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, i64::MAX);
+                assert_eq!(y, 0);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_accepts_a_layer_origin_exactly_at_the_document_range() {
+        // The other side of the same check, and the one that keeps the
+        // bound honest: a layer a whole document extent off the top
+        // edge is legal scope, not a defect. The negative `y` is the
+        // case that would break if this had been written as `x >= 0`.
+        let manifest_bytes = crafted_origin_manifest(
+            aurora_core::MAX_DOCUMENT_ORIGIN,
+            -aurora_core::MAX_DOCUMENT_ORIGIN,
+        );
+        let (_dir, mut store) = real_tile_store();
+        if let Err(err) = read(container_with(&manifest_bytes, &[]), &mut store) {
+            unreachable!("an origin exactly at the document range must still read: {err:?}");
+        }
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_whose_layer_mask_origin_is_past_the_document_range() {
+        // The gap 0.57.12 left open, and the reason `validate_mask_origins`
+        // exists as a walk of its own rather than another line inside
+        // `tile_grid`: a mask carries a `Rect` that is *not* the layer's
+        // own `bounds`, and `tile_grid` never sees it. Measured against
+        // the 0.57.12 tree before this fix: this manifest read back as
+        // `Ok`, and the origin survived a write-then-read round trip
+        // unchanged, on its way to `apply_mask_clip` ->
+        // `Rect::contains_point` in `aurora-app` -- which saturates
+        // rather than panicking now, and so renders the wrong picture
+        // (the masked layer fully hidden, or fully shown when
+        // `inverted`) instead of failing loudly.
+        for bad in [
+            i64::MAX,
+            i64::MIN,
+            aurora_core::MAX_DOCUMENT_ORIGIN + 1,
+            -aurora_core::MAX_DOCUMENT_ORIGIN - 1,
+        ] {
+            let manifest_bytes = crafted_manifest(CraftedKind::Pixel(0, 0), Some((bad, 0)));
+            let (_dir, mut store) = real_tile_store();
+            match read(container_with(&manifest_bytes, &[]), &mut store) {
+                Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
+                    assert_eq!(x, bad);
+                    assert_eq!(y, 0);
+                    assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+                }
+                other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_whose_group_layer_mask_origin_is_past_the_document_range() {
+        // The half a `tile_grid`-placed check could not reach even in
+        // principle. A group has no `LayerKind::Pixel` arm, so
+        // `pixel_layer_ids` skips it and `tile_grid` is never called for
+        // it at all -- yet a group can carry a mask, and that mask's own
+        // rectangle reaches the same compositing arithmetic a pixel
+        // layer's does.
+        let manifest_bytes = crafted_manifest(CraftedKind::Group, Some((0, i64::MIN)));
+        let (_dir, mut store) = real_tile_store();
+        match read(container_with(&manifest_bytes, &[]), &mut store) {
+            Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, 0);
+                assert_eq!(y, i64::MIN);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_accepts_a_layer_mask_origin_exactly_at_the_document_range() {
+        // The other side of both checks above, for a pixel layer and a
+        // group alike: the limits are legal scope, and a mask a whole
+        // document extent off the top edge is a mask a user can still
+        // drag back.
+        for kind in [CraftedKind::Pixel(0, 0), CraftedKind::Group] {
+            let manifest_bytes = crafted_manifest(
+                kind,
+                Some((
+                    aurora_core::MAX_DOCUMENT_ORIGIN,
+                    -aurora_core::MAX_DOCUMENT_ORIGIN,
+                )),
+            );
+            let (_dir, mut store) = real_tile_store();
+            if let Err(err) = read(container_with(&manifest_bytes, &[]), &mut store) {
+                unreachable!(
+                    "a mask origin exactly at the document range must still read: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_and_best_effort_write_both_refuse_a_layer_mask_origin_past_the_document_range() {
+        // `validate_mask_origins` is called from `write_with_policy`,
+        // the shared body behind both public writers, so this covers
+        // the way *out* of the format as well as the way in — the same
+        // property `tile_grid` already gives the layer-bounds check.
+        //
+        // The tree is deserialized rather than built: `add_mask` now
+        // refuses this origin, so the derived `Deserialize` is the only
+        // way to get one into a `LayerTree` at all.
+        let tree_bytes = crafted_tree_bytes(CraftedKind::Pixel(0, 0), Some((0, i64::MAX)));
+        let layers: LayerTree = match postcard::from_bytes(&tree_bytes) {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("the crafted tree must still deserialize: {err:?}"),
+        };
+        let history = History::new();
+
+        let (_dir, mut store) = real_tile_store();
+        let mut out = Cursor::new(Vec::new());
+        match write(&mut out, &layers, &history, (1, 1), None, &mut store) {
+            Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, 0);
+                assert_eq!(y, i64::MAX);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+
+        // The crash-recovery writer refuses it too rather than skipping
+        // the layer under its `UnreadableTile::Skip` policy. That is
+        // deliberate and disclosed in PLAN.md: `Skip` is scoped to an
+        // unreadable *tile*, and a bad rectangle says the tree itself is
+        // wrong, not that one piece of input is unreadable.
+        let mut out = Cursor::new(Vec::new());
+        match write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store) {
+            Err(super::IoError::LayerOriginOutOfRange { .. }) => {}
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
         }
     }
 
