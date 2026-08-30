@@ -4,6 +4,15 @@
 //! panels" bullet, first slice — Layers only; History and tool-options
 //! panels are separate, still-open work.
 //!
+//! **The row's label is bounded and sanitized.** A layer name on the
+//! `.aur` path comes from the file (`App::open_aur_file` →
+//! `aurora_io::read_aur`), and `aurora_doc::LayerTree` deliberately
+//! stores it unmodified, so this panel puts every name through
+//! [`aurora_doc::sanitize_display_name`] before it becomes an
+//! `accesskit` label — the same bound `History::journal_descriptions`
+//! already applies for the History panel next door. Display-only: the
+//! document itself is untouched.
+//!
 //! **No pixel rendering** — same boundary every widget in this crate
 //! keeps: a row gets a real, correct accessible name and description
 //! (the layer's own name; its kind, blend mode, opacity, and visibility),
@@ -34,7 +43,7 @@
 use std::collections::HashMap;
 
 use accesskit::{Action, Node, Role};
-use aurora_doc::{LayerId, LayerKind, LayerTree};
+use aurora_doc::{LayerId, LayerKind, LayerTree, sanitize_display_name};
 use aurora_theme::Scales;
 use aurora_widgets::widgets::WidgetKind;
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
@@ -108,9 +117,15 @@ fn insert_layer_row(
     id: LayerId,
     rows: &mut HashMap<WidgetId, LayerId>,
 ) -> Result<WidgetId, WidgetError> {
-    let name = layers.name(id).unwrap_or("Untitled Layer");
+    // `LayerTree` stores whatever name the file gave it -- there is no
+    // length or content validation on `LayerTree::name`, deliberately,
+    // so the document round-trips unmodified. That makes sanitizing the
+    // *label* this panel's own job: see `sanitize_display_name`'s own
+    // module doc comment, and the History panel next door, which goes
+    // through the same bound via `History::journal_descriptions`.
+    let name = sanitize_display_name(layers.name(id).unwrap_or("Untitled Layer"));
     let mut node = Node::new(Role::ListItem);
-    node.set_label(name);
+    node.set_label(name.as_ref());
     node.set_description(describe_layer(layers, id));
     node.add_action(Action::Focus);
     node.add_action(Action::Click);
@@ -335,6 +350,96 @@ mod tests {
 
         assert_eq!(rows.get(&group_row), Some(&group));
         assert_eq!(rows.get(&child_row), Some(&glow));
+    }
+
+    /// The sibling of the History panel's own bound. A layer name on
+    /// the `.aur` path is whatever the file said, and `LayerTree` keeps
+    /// it verbatim -- so the *label* is where it has to be bounded, or a
+    /// 500 KB name with an embedded bidi override crosses straight into
+    /// an assistive technology.
+    #[test]
+    fn a_hostile_layer_name_reaches_the_label_bounded_and_sanitized() {
+        let hostile = format!(
+            "safe{}txet{}{}{}{}",
+            '\u{202E}',                                     // bidi override
+            '\u{0007}',                                     // BEL
+            '\u{2028}',                                     // line separator
+            char::from_u32(0xE_0041).unwrap_or('\u{FFFD}'), // Tag 'A'
+            "a".repeat(500_000),
+        );
+        let mut layers = LayerTree::new();
+        if let Err(err) = layers.add_pixel_layer(hostile.clone(), bounds(), None) {
+            unreachable!("{err:?}");
+        }
+
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Layers") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = test_scales();
+        if let Err(err) = populate_layers_panel(&mut tree, panel, &scales, &layers) {
+            unreachable!("{err:?}");
+        }
+
+        let Some(row_ids) = tree.children(panel.body) else {
+            unreachable!("just populated");
+        };
+        let Some(&row) = row_ids.first() else {
+            unreachable!("just added one layer");
+        };
+        let Some(accessibility) = tree.accessibility(row) else {
+            unreachable!("just inserted");
+        };
+        let Some(label) = accessibility.label() else {
+            unreachable!("every row carries a label");
+        };
+        assert!(
+            label.chars().count() <= 129,
+            "{} chars",
+            label.chars().count()
+        );
+        for hostile_char in ['\u{202E}', '\u{0007}', '\u{2028}', '\u{E0041}'] {
+            assert!(!label.contains(hostile_char), "{hostile_char:?} survived");
+        }
+        assert!(label.starts_with("safetxet"), "{label:?}");
+        // Display-only: the document still holds every byte the file
+        // gave it, so a save round-trips the user's own name unchanged.
+        let Some(&id) = layers.roots().first() else {
+            unreachable!("just added one layer");
+        };
+        assert_eq!(layers.name(id), Some(hostile.as_str()));
+    }
+
+    /// The `.unwrap_or` fallback is unchanged by the sanitizing step --
+    /// only the sanitization is new.
+    #[test]
+    fn an_ordinary_name_is_labelled_verbatim() {
+        let mut layers = LayerTree::new();
+        if let Err(err) = layers.add_pixel_layer("Retouch — skin", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Layers") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = test_scales();
+        if let Err(err) = populate_layers_panel(&mut tree, panel, &scales, &layers) {
+            unreachable!("{err:?}");
+        }
+
+        let Some(row_ids) = tree.children(panel.body) else {
+            unreachable!("just populated");
+        };
+        let Some(&row) = row_ids.first() else {
+            unreachable!("just added one layer");
+        };
+        let Some(accessibility) = tree.accessibility(row) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(accessibility.label(), Some("Retouch — skin"));
     }
 
     #[test]

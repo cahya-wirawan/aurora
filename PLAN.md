@@ -9034,9 +9034,11 @@ structural design work.
       is not reachable in production, since that round's audit found the
       only such call sites are inside `aurora-app`'s own `#[cfg(test)]`
       module.
-- [ ] **A journal layer name reaches a screen reader unbounded and
-    unsanitized.** Disclosed 2026-08-30 by a reviewer working the
-    0.57.14 round; **not fixed there**, because it is `aurora-io` /
+- [x] **A file-supplied layer name reaches a screen reader unbounded and
+    unsanitized, on two separate panel paths** — disclosed 2026-08-30,
+    **both paths fixed in 0.57.15**.
+    Disclosed by a reviewer working the
+    0.57.14 round; **not fixed there**, because it looked like `aurora-io` /
     `aurora-ui` scope and that round was constrained to `aurora-doc`.
     `aurora_ui::populate_history_panel`
     (`crates/aurora-ui/src/history_panel.rs`, ~line 41) turns each
@@ -9049,22 +9051,155 @@ structural design work.
     override) and `U+0007` survived into it intact; `aur::read`'s own
     `MAX_METADATA_ENTRY_BYTES` (64 MB, `aur.rs:138`) leaves room for
     hundreds of thousands of such ops in one file.
-    **Low severity today and not reachable**: exactly like `replay()`
-    was before 0.57.14 closed it, `aur::read`'s untrusted journal is not
-    wired into `aurora-app` — the live history panel is fed by a
-    `History` built from the user's own in-session edits. It becomes
-    **medium** the moment a loaded file's journal does reach the panel,
-    since the payload then crosses a process boundary into an assistive
-    technology that did not ask for it, and a bidi override can make a
-    label read as something other than what it is.
-    **Suggested direction when it is picked up** (not implemented, and
-    not a decision made here): cap the count and per-entry length where
-    the journal is loaded (`History::load_journal`) or where the strings
-    are produced (`journal_descriptions`), and strip control and
-    bidi-formatting characters before labelling. The cap belongs
-    upstream of the widget so every consumer of the descriptions gets
-    it, not just this panel. Worth doing **before** wiring `aur::read`'s
-    journal in, not after.
+
+    **Reachability, corrected.** The original disclosure — and this
+    entry's own first version, written when the fix landed — both called
+    this "low severity today and not reachable, medium once `aur::read`'s
+    journal is wired in." **That was wrong, and the correction is the
+    substantive part of this entry.** The journal is wired in *today*:
+    `App::open_aur_file` (`crates/aurora-app/src/lib.rs` ~line 8183)
+    calls `aurora_io::read_aur` (~line 8202), which calls
+    `History::load_journal` (`crates/aurora-io/src/aur.rs` line 628) with
+    no validation of any kind, and hands the resulting `History` straight
+    to `replace_document` (~line 8217), which calls
+    `populate_history_panel` (~line 1040) and `populate_layers_panel`
+    (~line 1038) side by side. That chain is reachable from the command
+    palette's "Open File…" and again from `recover_document`'s
+    crash-recovery path. So the defect was **already medium-or-higher
+    severity before this round**, not a latent one; both earlier
+    statements to the contrary were mistaken about the call graph, not
+    about the mechanism.
+
+    **Two panels, one bound, both closed here.**
+    - **History panel** (closed by the fix as originally landed,
+      unchanged since): the strings are bounded where they are
+      *produced*, in `History::journal_descriptions`, so every consumer
+      gets the bound rather than just this one panel. `history_panel.rs`
+      itself is untouched.
+    - **Layers panel** (found by two independent reviewers after the
+      first fix landed, closed in the same version): `populate_layers_panel`
+      (`crates/aurora-ui/src/layers_panel.rs`) was doing
+      `node.set_label(layers.name(id).unwrap_or("Untitled Layer"))` —
+      the *identical* defect, fed by the same untrusted `.aur` name, on
+      the sibling call one line away in `replace_document`. There is no
+      name-length or name-content validation anywhere in `LayerTree`
+      (deliberately: the document must round-trip a user's own bytes
+      unmodified), so the label is the only place to bound it. A reviewer
+      reproduced the same 500 KB `U+202E` payload surviving intact
+      through this path. Fixed by routing the label through the same
+      sanitizer; the panel's `.unwrap_or("Untitled Layer")` fallback and
+      everything else about it are unchanged.
+
+    Because two crates now need the same bound, the sanitizer moved out
+    of `history.rs` into its own `crates/aurora-doc/src/text_safety.rs`
+    and is public as `aurora_doc::sanitize_display_name` (re-exported from
+    `lib.rs`, the same shape every other item this crate exposes takes).
+    `aurora-ui` already depends on `aurora-doc`, so no layering exception
+    was needed.
+
+    Two bounds, on the two separate axes the disclosure named:
+    - **Per entry.** `sanitize_display_name` runs on the only two
+      `describe()` arms that embed a caller-supplied name
+      (`LayerOp::Restore`, `LayerOp::Rename` — an audit confirmed the
+      other **twelve** of `LayerOp`'s fourteen variants format only ids,
+      verbs, percentages, coordinates, or a `Debug`-formatted
+      `BlendMode`; this entry previously said "nine", which was a
+      miscount), and on every Layers-panel row label. It drops Unicode
+      `Cc`, the bidi *formatting* characters (LRM/RLM/ALM,
+      `U+202A..=U+202E`, `U+2066..=U+2069`), the `Zl`/`Zp` line and
+      paragraph separators (`U+2028`/`U+2029` — **not** caught by
+      `char::is_control()`, which is `Cc` only, and each one injects a
+      hard line break into a one-line label), the invisible `Cf`
+      characters with no linguistic load (`U+00AD`, `U+200B`,
+      `U+2060..=U+2064`, `U+FEFF`, `U+FFF9..=U+FFFB`), and the whole
+      Unicode Tags block (`U+E0000..=U+E007F`, the Standard's own block
+      bounds). The Tags block is the sharpest of these: each character
+      decodes to plain ASCII by `c - 0xE0000`, so a reviewer smuggled a
+      readable hidden instruction string through a layer name and into a
+      formatted description intact. Nothing legitimate puts a Tag
+      character in a layer name, and this project's own roadmap puts
+      AI-assisted editing on the same document model. Then caps at
+      `MAX_NAME_CHARS` = 128 characters with a trailing `…`.
+      Deliberately **not** all of category `Cf`: ZWJ/ZWNJ are
+      load-bearing in real emoji sequences and Indic-script names, as are
+      the Arabic/Syriac prefixed-format marks and the Mongolian vowel
+      separator, and corrupting a legitimate name is the worse failure.
+      Filtering runs *before* counting toward the cap, so invisible
+      padding cannot consume the budget and leave a near-empty label.
+    - **In total.** `journal_descriptions()` returns at most
+      `MAX_DESCRIPTIONS` = 1000 real entries (Photoshop's own
+      History-states maximum, cited as the precedent), keeping the most
+      recent ones, with a synthetic `"… {n} earlier steps omitted"` at
+      index 0 when anything was dropped. `journal_len()` still reports
+      the untruncated count and says so.
+
+    **The worst case is a *character* bound, not a byte bound.** The
+    longest description an arm can produce is
+    `Renamed layer #{u64} to "{name}"` — ~170 characters. Stated in
+    bytes, where a `char` is up to 4 of them, that same case is ~540
+    bytes per description and ~540 KB for a full 1000-entry panel. Both
+    numbers are in the doc comment now; the character count alone read as
+    a tighter guarantee than it is.
+
+    Two safety guarantees worth naming. **Char-boundary safety is
+    structural, not tested-for**: everything works in `chars()`, never a
+    byte index, so a cap landing mid multi-byte character is
+    unrepresentable — which is also what keeps it clear of the
+    workspace's `indexing_slicing` deny. And **the bounds are
+    display-only**: `apply()`, `replay()`, the journal, and
+    `LayerTree::name` are all untouched, so a 500 KB name still
+    round-trips through `replay()` in full. That last one has its own
+    test (`replay_preserves_a_name_that_display_truncates`), because
+    sanitizing one layer too early — inside `apply()` rather than
+    `describe()` — would silently rewrite the user's document.
+    Seventeen new tests across three files: six in
+    `crates/aurora-doc/src/history.rs` for the 500 KB cap on both arms,
+    `U+202E`/`U+0007` stripping, multi-byte truncation (`漢`/emoji
+    repeats), the 1005-op entry cap, replay preservation, and an
+    ordinary-name pass-through, plus two more pinning the exact 128/129
+    character-cap boundary end to end and a 100-character CJK name (300
+    bytes, under the *character* cap) reaching a description
+    byte-identical; nine in the new
+    `crates/aurora-doc/src/text_safety.rs` covering the borrowed fast
+    path, the cap boundary, `U+2028`/`U+2029`, each named invisible `Cf`
+    character, the Tags-block payload at both block ends, the ZWJ/ZWNJ
+    carve-out surviving, and invisible padding not consuming the budget;
+    and two in `crates/aurora-ui/src/layers_panel.rs` proving a hostile
+    name reaches the row label bounded and stripped while the document
+    still holds every original byte, and an ordinary name is labelled
+    verbatim. The existing exact-string assertions in `aurora-doc`,
+    `aurora-ui`'s `history_panel`/`layers_panel`, and `aurora-app`
+    (including `"Added layer \"Retouch — skin\""`, em dash intact) all
+    still pass unmodified. One `aurora-app` assertion was corrected
+    rather than fixed: it compared the panel's row count against
+    `journal_len()`, a relation that now holds only below 1000 entries;
+    it compares against `journal_descriptions().len()` now, which is what
+    the panel is actually built from.
+- [ ] **`describe()`'s `Restore` arm scans an unbounded entry list on the
+    UI thread** — disclosed 2026-08-30, **not fixed; informational**.
+    Found by a reviewer during the round above. `describe()`'s
+    `LayerOp::Restore` arm resolves the subtree's root name with
+    `removed.entries.iter().find(|(entry_id, _)| *entry_id == removed.root)`
+    — a linear scan with no bound on `removed.entries.len()`, because
+    `History::load_journal` deliberately performs zero structural
+    validation (that is `replay()`'s documented job, this crate's own
+    established doctrine, and changing it was explicitly out of scope for
+    that round). Measured by the reviewer: 232 ms on the UI thread for a
+    crafted journal of 1000 `Restore` ops × 50,000 non-matching entries
+    each.
+    **Low severity.** The cost is linear in the file's own size, not
+    quadratic in it — a stall, not an amplification bomb, and a file that
+    large already costs time to read. It is recorded because it
+    contradicts `journal_descriptions()`'s "bounded on both axes" framing
+    in one narrow way: the *output* is capped at 1000 entries and 128
+    name characters, but the *compute per kept entry* is bounded only by
+    the file's own size.
+    **Suggested direction, not implemented**: bound
+    `RemovedSubtree::entries`' length in `load_journal`, or resolve the
+    root by a map or a first-entry convention instead of a linear scan.
+    Either is a real change to a hot, load-bearing type and belongs with
+    whoever next opens `load_journal`'s validation posture deliberately,
+    not as a drive-by.
 - [x] **Panning past the document's *far* edge has no bound matching the
     origin-side one** — found 2026-08-25, fixed in 0.57.10.
     `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together

@@ -11702,9 +11702,15 @@ mod tests {
         let Some(rows) = workspace.tree.children(workspace.history.body) else {
             unreachable!("populate_history_panel always inserts a body");
         };
+        // Compared against `journal_descriptions().len()`, not
+        // `journal_len()`: the panel is built from the former, which
+        // caps at 1000 entries, while the latter is the untruncated
+        // count. They agree for this test's tiny journal, but only for
+        // that reason -- pinning the relation the panel actually has
+        // keeps this correct if a later test builds a longer one.
         assert_eq!(
             rows.len(),
-            history.journal_len(),
+            history.journal_descriptions().len(),
             "the History panel must reflect the undo's own journal entry"
         );
 

@@ -34,6 +34,7 @@ use aurora_core::Rect;
 
 use crate::error::DocError;
 use crate::layer::{BlendMode, LayerEntry, LayerId, LayerKind, LayerLock, LayerMask};
+use crate::text_safety::sanitize_display_name;
 use crate::tree::{LayerTree, RemovedSubtree, validate_origin};
 
 /// One recorded step. On the undo/redo stacks, stored as *how to undo the
@@ -276,10 +277,22 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
     }
 }
 
+/// The most entries [`History::journal_descriptions`] will ever return.
+/// Photoshop's own History-states maximum is 1000; matching that number
+/// keeps the panel's worst case in the same range a professional already
+/// expects, rather than growing with an untrusted file's journal length.
+const MAX_DESCRIPTIONS: usize = 1000;
+
 /// A one-line, human-readable description of one journal entry — see
 /// [`History::journal_descriptions`]'s own doc comment for why this
 /// deliberately doesn't take a `&LayerTree` to resolve names beyond
 /// what an entry itself already captured.
+///
+/// The two arms that embed a caller-supplied name (`Restore`, `Rename`)
+/// put it through [`sanitize_display_name`] first; the other twelve of
+/// [`LayerOp`]'s fourteen variants format only numeric ids, verbs,
+/// percentages, coordinates, or a `Debug`-formatted [`BlendMode`], none
+/// of which carry unbounded text.
 fn describe(op: &LayerOp) -> String {
     match op {
         LayerOp::RemoveById(id) => format!("Removed layer #{}", id.to_raw()),
@@ -289,11 +302,15 @@ fn describe(op: &LayerOp) -> String {
                 .iter()
                 .find(|(entry_id, _)| *entry_id == removed.root)
                 .map_or("layer", |(_, entry)| entry.name.as_str());
-            format!("Added layer \"{name}\"")
+            format!("Added layer \"{}\"", sanitize_display_name(name))
         }
         LayerOp::Reparent { id, .. } => format!("Moved layer #{}", id.to_raw()),
         LayerOp::Rename { id, name } => {
-            format!("Renamed layer #{} to \"{name}\"", id.to_raw())
+            format!(
+                "Renamed layer #{} to \"{}\"",
+                id.to_raw(),
+                sanitize_display_name(name)
+            )
         }
         LayerOp::SetOpacity { id, value } => {
             format!(
@@ -409,7 +426,8 @@ impl History {
 
     /// How many ops the journal has recorded so far — mostly useful for
     /// tests; see [`Self::journal_descriptions`] for reading individual
-    /// entries.
+    /// entries. This is the untruncated count, so it can exceed
+    /// `journal_descriptions().len()`, which caps what it returns.
     #[must_use]
     pub fn journal_len(&self) -> usize {
         self.journal.len()
@@ -434,9 +452,49 @@ impl History {
     /// happened, not retroactively updated later ones — and `History`
     /// deliberately doesn't hold a tree reference of its own; see this
     /// module's own doc comment).
+    ///
+    /// **Bounded on both axes, because these strings become `accesskit`
+    /// labels.** `aurora_ui`'s History panel hands each one straight to
+    /// `node.set_label`, so an unbounded description crosses a process
+    /// boundary into an assistive technology that did not ask for it —
+    /// and layer names on the `.aur` path come from a file.
+    ///
+    /// - **Per entry**: an embedded layer name goes through
+    ///   [`sanitize_display_name`] — control, bidi-formatting,
+    ///   separator, and invisible-format characters removed, then capped
+    ///   at `MAX_NAME_CHARS` (128) characters plus an `…`. The longest
+    ///   description any arm can produce is therefore
+    ///   `Renamed layer #{u64} to "{name}"` — about 15 characters of
+    ///   fixed text, up to 20 digits of id, and 129 characters of name
+    ///   between quotes: roughly 170 characters worst case. **That is a
+    ///   character bound, not a byte bound**: `char`s are up to 4 bytes
+    ///   in UTF-8, so the same worst case is ~540 bytes for one
+    ///   description and ~540 KB for a full, capped panel. That is the
+    ///   honest ceiling — small enough for an `accesskit` label, but not
+    ///   the tighter number the character count alone reads as.
+    /// - **In total**: at most `MAX_DESCRIPTIONS` (1000) real
+    ///   entries, matching Photoshop's own History-states maximum. The
+    ///   *most recent* 1000 are kept; when anything was dropped, index 0
+    ///   is a synthetic `"… {n} earlier steps omitted"` entry (singular
+    ///   `step` when `n == 1`) sitting in the oldest-of-what's-shown
+    ///   position this method's chronological order puts it in.
+    ///
+    /// Both bounds are **display-only**. The journal, the stored layer
+    /// name ([`LayerTree::name`]), and [`Self::replay`] all still carry the
+    /// full, unmodified name and the full op sequence; nothing here
+    /// edits what an undo or a replay will reproduce.
     #[must_use]
     pub fn journal_descriptions(&self) -> Vec<String> {
-        self.journal.iter().map(describe).collect()
+        let omitted = self.journal.len().saturating_sub(MAX_DESCRIPTIONS);
+        let mut out = Vec::new();
+        if omitted > 0 {
+            out.push(format!(
+                "… {omitted} earlier step{} omitted",
+                if omitted == 1 { "" } else { "s" }
+            ));
+        }
+        out.extend(self.journal.iter().skip(omitted).map(describe));
+        out
     }
 
     /// Rebuilds a fresh [`LayerTree`] purely by replaying this history's
@@ -1242,6 +1300,257 @@ mod tests {
             unreachable!("just asserted len() == 5");
         };
         assert_eq!(shown, &format!("Shown layer #{}", id.to_raw()));
+    }
+
+    /// An ordinary short, clean name -- including a non-ASCII em dash,
+    /// which is neither a control nor a bidi-formatting character --
+    /// comes through the sanitizer untouched, so the descriptions a real
+    /// in-session history produces are byte-identical to what they were
+    /// before any capping existed.
+    #[test]
+    fn an_ordinary_name_passes_through_a_description_unchanged() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let id = match history.add_pixel_layer(&mut tree, "Retouch — skin", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_name(&mut tree, id, "Café 😀‍🔥 background") {
+            unreachable!("{err:?}");
+        }
+
+        let descriptions = history.journal_descriptions();
+        assert_eq!(descriptions.len(), 2, "{descriptions:?}");
+        let Some(added) = descriptions.first() else {
+            unreachable!("just asserted len() == 2");
+        };
+        assert_eq!(added, "Added layer \"Retouch — skin\"");
+        let Some(renamed) = descriptions.get(1) else {
+            unreachable!("just asserted len() == 2");
+        };
+        // The zero-width joiner inside the emoji sequence is category
+        // `Cf` but deliberately *not* stripped -- it is load-bearing.
+        assert_eq!(
+            renamed,
+            &format!("Renamed layer #{} to \"Café 😀‍🔥 background\"", id.to_raw())
+        );
+    }
+
+    #[test]
+    fn journal_description_of_a_huge_layer_name_is_capped() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let huge = "a".repeat(500_000);
+        let id = match history.add_pixel_layer(&mut tree, huge.clone(), bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_name(&mut tree, id, huge.clone()) {
+            unreachable!("{err:?}");
+        }
+
+        let descriptions = history.journal_descriptions();
+        assert_eq!(descriptions.len(), 2, "{descriptions:?}");
+        // The `Restore` (added) arm.
+        let Some(added) = descriptions.first() else {
+            unreachable!("just asserted len() == 2");
+        };
+        assert!(
+            added.chars().count() <= 200,
+            "{} chars",
+            added.chars().count()
+        );
+        assert!(added.contains('\u{2026}'), "{added}");
+        // The `Rename` arm.
+        let Some(renamed) = descriptions.get(1) else {
+            unreachable!("just asserted len() == 2");
+        };
+        assert!(
+            renamed.chars().count() <= 200,
+            "{} chars",
+            renamed.chars().count()
+        );
+        assert!(renamed.contains('\u{2026}'), "{renamed}");
+    }
+
+    #[test]
+    fn journal_description_strips_control_and_bidi_characters() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let hostile = "safe\u{202E}txet\u{0007}";
+        let id = match history.add_pixel_layer(&mut tree, hostile, bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_name(&mut tree, id, hostile) {
+            unreachable!("{err:?}");
+        }
+
+        for description in history.journal_descriptions() {
+            assert!(!description.contains('\u{202E}'), "{description:?}");
+            assert!(!description.contains('\u{0007}'), "{description:?}");
+            assert!(description.contains("safe"), "{description:?}");
+            // Nothing here is anywhere near the 128-character cap, so
+            // stripping alone must not add an ellipsis: the `…` means
+            // "visible text was cut", not "something was removed".
+            assert!(!description.contains('\u{2026}'), "{description:?}");
+        }
+    }
+
+    /// The exact character-cap boundary, seen end to end through
+    /// `journal_descriptions` rather than only at `sanitize_display_name`
+    /// (which has its own boundary test): 128 visible characters is not
+    /// truncated, 129 is.
+    #[test]
+    fn journal_description_name_cap_boundary_is_exact() {
+        for (name_chars, wants_ellipsis) in [(128_usize, false), (129, true)] {
+            let mut tree = LayerTree::new();
+            let mut history = History::new();
+            let name = "a".repeat(name_chars);
+            let id = match history.add_pixel_layer(&mut tree, name.clone(), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let descriptions = history.journal_descriptions();
+            let Some(added) = descriptions.first() else {
+                unreachable!("one op was journaled: {descriptions:?}");
+            };
+            assert_eq!(
+                added.contains('\u{2026}'),
+                wants_ellipsis,
+                "{name_chars} chars: {added:?}"
+            );
+            if !wants_ellipsis {
+                assert_eq!(*added, format!("Added layer \"{name}\""));
+            }
+            let _ = id;
+        }
+    }
+
+    /// A legitimate multi-byte name *under* the character cap but well
+    /// over it in bytes must reach the description byte-identical --
+    /// `sanitize_display_name`'s byte-length fast-path check is a
+    /// conservative pre-filter, not the cap itself.
+    #[test]
+    fn a_long_cjk_name_under_the_char_cap_reaches_the_description_intact() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let name = "漢".repeat(100);
+        assert!(name.len() > 128, "{} bytes", name.len());
+        if let Err(err) = history.add_pixel_layer(&mut tree, name.clone(), bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let descriptions = history.journal_descriptions();
+        let Some(added) = descriptions.first() else {
+            unreachable!("one op was journaled: {descriptions:?}");
+        };
+        assert_eq!(*added, format!("Added layer \"{name}\""));
+        assert!(!added.contains('\u{2026}'), "{added:?}");
+    }
+
+    #[test]
+    fn truncating_a_multibyte_name_does_not_panic() {
+        // Each name is far past the 128-character cap, and every cap
+        // boundary lands inside a multi-byte character -- 3 bytes for
+        // the Han ideograph, 4 for the emoji. Reaching the assertions
+        // at all is the "does not panic" half; `String`/`char`
+        // operations throughout are what make the result valid UTF-8.
+        for name in [&"漢".repeat(200), &"🎨".repeat(200)] {
+            let mut tree = LayerTree::new();
+            let mut history = History::new();
+            let id = match history.add_pixel_layer(&mut tree, name.clone(), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = history.set_name(&mut tree, id, name.clone()) {
+                unreachable!("{err:?}");
+            }
+
+            let descriptions = history.journal_descriptions();
+            assert_eq!(descriptions.len(), 2, "{descriptions:?}");
+            for description in descriptions {
+                assert!(
+                    description.chars().count() <= 200,
+                    "{} chars",
+                    description.chars().count()
+                );
+                assert!(description.contains('\u{2026}'), "{description}");
+            }
+        }
+    }
+
+    #[test]
+    fn journal_descriptions_caps_entry_count_with_an_omission_notice() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let id = match history.add_pixel_layer(&mut tree, "Background", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // One `Restore` plus 1004 visibility flips == 1005 journal ops.
+        for step in 0..1004 {
+            if let Err(err) = history.set_visible(&mut tree, id, step % 2 == 0) {
+                unreachable!("{err:?}");
+            }
+        }
+        assert_eq!(history.journal_len(), 1005);
+
+        let descriptions = history.journal_descriptions();
+        assert_eq!(descriptions.len(), 1001, "1000 kept plus the notice");
+        let Some(notice) = descriptions.first() else {
+            unreachable!("just asserted len() == 1001");
+        };
+        assert_eq!(notice, "… 5 earlier steps omitted");
+        // Index 1 is a real op description, not a second notice. The
+        // *most recent* 1000 are what survive, so the five dropped are
+        // the oldest -- which includes the `Restore` that named the
+        // layer.
+        let Some(first_kept) = descriptions.get(1) else {
+            unreachable!("just asserted len() == 1001");
+        };
+        assert!(
+            first_kept.contains(&format!("layer #{}", id.to_raw())),
+            "{first_kept:?}"
+        );
+        assert!(!first_kept.starts_with('…'), "{first_kept:?}");
+    }
+
+    /// The single most important guard here: capping and sanitizing are
+    /// *display-only*. A name that `journal_descriptions` truncates must
+    /// still round-trip through `replay` in full -- proof the sanitizer
+    /// never ran inside `apply`'s `Restore`/`Rename` arms.
+    #[test]
+    fn replay_preserves_a_name_that_display_truncates() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let huge = "a".repeat(500_000);
+        let id = match history.add_pixel_layer(&mut tree, huge.clone(), bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let renamed = format!("{huge}\u{202E}");
+        if let Err(err) = history.set_name(&mut tree, id, renamed.clone()) {
+            unreachable!("{err:?}");
+        }
+
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.name(id), Some(renamed.as_str()));
+        assert_eq!(tree.name(id), Some(renamed.as_str()));
+
+        let descriptions = history.journal_descriptions();
+        let Some(shown) = descriptions.get(1) else {
+            unreachable!("two ops were journaled: {descriptions:?}");
+        };
+        assert!(shown.chars().count() <= 200, "{shown:?}");
+        assert!(!shown.contains('\u{202E}'), "{shown:?}");
     }
 
     #[test]
