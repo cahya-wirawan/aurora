@@ -99,6 +99,12 @@ objc2-app-kit = { workspace = true }
 # is about -- see
 # `aurora_doc::LayerTree::insert_pixel_ignoring_the_depth_limit`.
 aurora-doc = { workspace = true, features = ["test-support"] }
+# Same arrangement, same reasoning, for `aurora-gpu`'s own
+# `test-support` feature: this crate's `real_gpu_context()` defers the
+# "no adapter -- skip, or fail because `AURORA_REQUIRE_GPU` is set"
+# decision to `aurora_gpu::test_support::real_context_or_skip` instead
+# of carrying its own copy.
+aurora-gpu = { workspace = true, features = ["test-support"] }
 accesskit = { workspace = true }
 # Test-only: the autosave file is a real `.aur` ZIP container now
 # (`write_autosave`), so a test can assert its actual archive entries

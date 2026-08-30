@@ -96,6 +96,28 @@ than failing. A dev box with only Mesa llvmpipe still runs them, but in software
 — see "The lesson from the last round" above before treating those numbers, or
 those passes, as evidence about real hardware.
 
+Set `AURORA_REQUIRE_GPU` to turn that self-skip into a hard test failure, so a
+runner that is *supposed* to have a real adapter cannot go green while every
+GPU-gated test silently skips. With it set, two things fail the test: no adapter
+at all, **and** an adapter `wgpu` reports as `DeviceType::Cpu` — llvmpipe here,
+WARP / "Microsoft Basic Render Driver" on Windows — since a software rasterizer
+standing in for hardware is the same gap wearing a different hat. Unset it is a
+complete no-op, `SKIPPED` line included, and a CPU adapter stays perfectly fine
+for ordinary dev-box runs. Parsing: unset is off, and so are the present-but-falsy
+values `` (empty), `0`, `false`, `off`, `no` (trimmed, case-insensitive) —
+GitHub Actions sets a variable to the empty string when a `${{ }}` expression is
+empty, and treating that as "on" would fail a whole matrix for a reason the
+workflow file never states. Any other present value is on.
+
+**No workflow in `.github/workflows/` sets it yet** — which runner, if any,
+should is an open decision. The single implementation is
+`aurora_gpu::test_support::real_context_or_skip` (behind `aurora-gpu`'s
+`test-support` feature); every crate's `real_context()`/`real_gpu_context()`
+helper delegates to it, and it prints the selected adapter's name, backend and
+device type on every successful creation so a CI log records what was actually
+tested. What it asserts is that a real adapter *exists*, not that any particular
+test body ran — an `#[ignore]`d test still contributes a silent pass.
+
 Toolchain is pinned in `rust-toolchain.toml` (1.97, edition 2024 — `cosmic-text` requires ≥1.89, so the text stack sets the floor). CI runs on Linux, macOS, and Windows from the first commit — cross-platform breakage is cheap to fix now and catastrophic in month 30.
 
 ## Lints worth knowing

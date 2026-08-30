@@ -576,27 +576,19 @@ impl std::ops::Deref for GpuTestContext {
 }
 
 /// `None` is an inconclusive skip (no GPU adapter on this machine/CI
-/// runner); any other failure is a real bug and panics.
+/// runner, and `AURORA_REQUIRE_GPU` unset); any other failure — and a
+/// missing adapter with that variable set — is a real bug and panics.
+/// The decision itself lives in
+/// `aurora_gpu::test_support::real_context_or_skip`; only the lock and
+/// the guard-bundling wrapper are local to this test binary.
 fn real_context() -> Option<GpuTestContext> {
     let guard = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match aurora_gpu::GpuContext::new() {
-        Ok(context) => Some(GpuTestContext {
-            _guard: guard,
-            context,
-        }),
-        Err(aurora_gpu::GpuError::NoSuitableAdapter) => {
-            eprintln!("SKIPPED: no GPU adapter available on this machine/CI runner");
-            None
-        }
-        Err(err) => {
-            #[allow(clippy::panic)]
-            {
-                panic!("device request failed with a real adapter present: {err}");
-            }
-        }
-    }
+    aurora_gpu::test_support::real_context_or_skip().map(|context| GpuTestContext {
+        _guard: guard,
+        context,
+    })
 }
 
 fn dark_theme() -> Theme {

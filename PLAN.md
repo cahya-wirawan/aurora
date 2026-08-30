@@ -7734,7 +7734,7 @@ structural design work.
     of its own size, and doing it blind on unconfirmed evidence, with no
     real GPU to check it against, is exactly the mistake CLAUDE.md's own
     "lesson from the last round" warns about.
-- [ ] **GPU-backed tests self-skip silently instead of failing when no
+- [~] **GPU-backed tests self-skip silently instead of failing when no
     adapter is present — a systemic CI gap.** Not introduced by 0.52.0,
     but newly and sharply highlighted by it. Review demonstrated that
     reverting either half of the premultiplied-alpha fix — the GPU
@@ -7755,6 +7755,117 @@ structural design work.
     hatch stays available on a dev box and is impossible on a runner
     where a green run is being treated as evidence. Untouched by the
     0.52.0 round on purpose.
+
+    **Built in 0.60.0.** The escape hatch is now one function, not six
+    copies: `aurora_gpu::test_support::real_context_or_skip()`, exposed
+    through a new `test-support` Cargo feature on `aurora-gpu` (the same
+    shape, and the same "absent from a shipped build, present under
+    `--all-features` and dev-targets" guarantee, as `aurora-doc`'s own
+    `test-support` feature). It returns `None` and prints the unchanged
+    `SKIPPED: no GPU adapter available on this machine/CI runner` line
+    when `GpuContext::new()` reports `NoSuitableAdapter` and
+    `AURORA_REQUIRE_GPU` is off; with that variable on, the same
+    condition panics instead, so a runner that is supposed to have a
+    real adapter fails rather than going green on a suite of skips. Any
+    *other* error still panics regardless, as before. All five
+    previously-duplicated call sites now delegate: `aurora-gpu`'s own
+    `real_context`, `aurora-render`'s and `aurora-widgets`'
+    `src/test_support.rs`, `aurora-widgets/tests/gallery.rs`, and
+    `aurora-app`'s `real_gpu_context`. Each keeps its own
+    `GPU_TEST_LOCK` and its own `GpuTestContext` wrapper — those are
+    per-test-binary and cannot be shared; only the decision moved.
+
+    **Corrected in-round (still 0.60.0), after review.** The first cut
+    had two defects serious enough that the item would have shipped
+    claiming a guarantee it did not provide.
+
+    *An adapter is not the same as a GPU.* The first cut branched only
+    on `GpuContext::new()`'s `Err`, so `AURORA_REQUIRE_GPU=1 cargo test
+    -p aurora-gpu` passed cleanly on this llvmpipe-only sandbox — the
+    exact failure mode this item exists to close (a runner supposed to
+    have hardware whose driver silently fell back to a software
+    rasterizer: llvmpipe on Linux, WARP / "Microsoft Basic Render
+    Driver" on Windows) surviving in its most likely real-world form.
+    `real_context_or_skip` now also checks `adapter_info().device_type`
+    on the success path and fails when it is `wgpu::DeviceType::Cpu` and
+    the variable is on. Only `Cpu` is rejected and only when the
+    variable is on: with it off this is a no-op (a CPU adapter is a fine
+    dev box), and every other `DeviceType` — `Other` included, since
+    some backends report genuine hardware that way — is accepted, so an
+    unrecognised future variant fails open rather than failing a real
+    runner. The adapter's name, backend and device type are now printed
+    on *every* successful creation, so a CI log records what was
+    actually tested rather than only that something was.
+
+    *`AURORA_REQUIRE_GPU=0` meant on.* The first cut parsed by presence
+    (`var_os(..).is_some()`), so `0`, `false` and the empty string all
+    enabled it. Two concrete reasons that is wrong, not merely
+    surprising: `wgpu-types`, a direct dependency of this workspace,
+    documents the opposite convention for its own `WGPU_*` variables
+    ("if the value is `0`, the flag is unset"); and GitHub Actions sets
+    a variable to the **empty string** when a `${{ }}` expression
+    evaluates to empty or null, so a natural `AURORA_REQUIRE_GPU: ${{
+    matrix.gpu }}` would have turned it on for every matrix leg,
+    including the GPU-less ones, failing the whole matrix for a reason
+    the workflow file never states. Parsing is now: unset is off; the
+    present-but-falsy values `` (empty), `0`, `false`, `off`, `no`
+    (trimmed, ASCII-lowercased) are off; anything else present is on. A
+    non-UTF-8 value is on, since it is certainly none of those. The
+    falsy set is pinned by its own test in both directions.
+
+    **Evidence.** The pure decision functions —
+    `gpu_error_action(&GpuError, require_gpu: bool) -> GpuTestAction`,
+    `require_gpu_from_value(Option<&str>) -> bool`, and
+    `adapter_is_software_when_gpu_required(wgpu::DeviceType,
+    require_gpu: bool) -> bool` — take every input as a parameter and
+    are unit-tested directly, with no GPU and no environment mutation
+    involved. That shape is not stylistic: `std::env::set_var` is
+    `unsafe` in edition 2024 and this workspace denies `unsafe_code`
+    workspace-wide, so a test can *only* reach the "required" branch by
+    passing `true`.
+
+    Beyond those unit tests, both hard-fail paths were **observed end to
+    end in this sandbox**, which the first cut said was impossible:
+
+    * *Software-adapter rejection* needs no trick at all — this sandbox
+      only has llvmpipe. `AURORA_REQUIRE_GPU=1 cargo test -p aurora-gpu`
+      now fails with `AURORA_REQUIRE_GPU is set, but the only adapter
+      available is a software rasterizer (llvmpipe (LLVM 21.1.8, 256
+      bits), Cpu), not real GPU hardware`, where before the correction
+      it passed 47/47. Reproduced identically in `aurora-render`,
+      `aurora-widgets` (lib *and* the separate `gallery` test binary),
+      and `aurora-app`.
+    * *No adapter at all* is reproducible by breaking Vulkan ICD
+      discovery: `VK_ICD_FILENAMES=/nonexistent/none.json
+      VK_DRIVER_FILES=/nonexistent/none.json`. Vulkan/lavapipe is this
+      sandbox's only backend, and `GpuContext::new_async` uses
+      `InstanceDescriptor::new_without_display_handle()` (so
+      `WGPU_BACKEND`-style overrides do not apply, but ICD discovery
+      does). With those set and the variable off, tests print `SKIPPED`
+      and pass; with the variable on, they fail with
+      `AURORA_REQUIRE_GPU is set, but no GPU adapter was found: no
+      suitable GPU adapter found`. Re-confirmed across all four crates
+      *after* the device-type check was added, not assumed unaffected
+      by it.
+
+    **What is still open, and why this is `[~]` and not `[x]`.** No file
+    under `.github/workflows/` was touched and nothing sets
+    `AURORA_REQUIRE_GPU` today, so every existing job behaves
+    byte-identically to before. Which runner (if any) genuinely has a
+    real adapter and should therefore set it is a decision about CI
+    infrastructure that needs a human, not a code change — **open
+    follow-up**. Until it is made, the gap this item describes is
+    *closeable* rather than closed: the capability exists and is
+    demonstrated, but nothing is yet using it.
+
+    **A second, narrower limitation, disclosed rather than fixed.** What
+    the mechanism asserts is that a real adapter *exists* — not that any
+    particular GPU-gated test body actually executed. A test marked
+    `#[ignore]`, or one that early-returns for some unrelated reason,
+    still contributes a silent pass with the variable set. Closing that
+    would need per-test accounting (an executed-count assertion, or
+    dropping the `Option` return in favour of an unconditional context),
+    which is a different and larger change than this item.
 - [~] **The live canvas rendered pure checkerboard at zoom 0.5, with all
     tile content invisible across the whole viewport** — found 2026-08-24
     during the 0.52.0 review; **pre-existing and unrelated to that fix**,

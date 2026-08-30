@@ -13467,30 +13467,24 @@ mod tests {
     }
 
     /// `NoSuitableAdapter` is an inconclusive skip (this sandbox/CI
-    /// runner may genuinely have no usable GPU); any other error means
-    /// an adapter *was* found but device/queue creation failed, a real
-    /// bug worth a hard test failure — same distinction
-    /// `aurora-gpu::test_support::real_context` already draws.
+    /// runner may genuinely have no usable GPU) *unless*
+    /// `AURORA_REQUIRE_GPU` is set, in which case a runner that is
+    /// supposed to have an adapter fails instead of going green on a
+    /// suite of skips; any other error means an adapter *was* found but
+    /// device/queue creation failed, a real bug worth a hard test
+    /// failure either way. That whole decision now lives once, in
+    /// `aurora_gpu::test_support::real_context_or_skip` (reached via
+    /// this crate's `test-support` dev-dependency feature); only the
+    /// lock and the guard-bundling wrapper stay local, since this
+    /// crate's tests are their own binary.
     fn real_gpu_context() -> Option<GpuTestContext> {
         let guard = GPU_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match aurora_gpu::GpuContext::new() {
-            Ok(context) => Some(GpuTestContext {
-                _guard: guard,
-                context,
-            }),
-            Err(aurora_gpu::GpuError::NoSuitableAdapter) => {
-                eprintln!("SKIPPED: no GPU adapter available on this machine/CI runner");
-                None
-            }
-            Err(err) => {
-                #[allow(clippy::panic)]
-                {
-                    panic!("device request failed with a real adapter present: {err}");
-                }
-            }
-        }
+        aurora_gpu::test_support::real_context_or_skip().map(|context| GpuTestContext {
+            _guard: guard,
+            context,
+        })
     }
 
     fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
