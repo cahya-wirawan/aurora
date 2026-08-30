@@ -13,5 +13,5 @@ pub mod id;
 
 pub use color::{Channels, ColorSpace, PixelFormat, SampleFormat};
 pub use error::CoreError;
-pub use geometry::{MAX_DOCUMENT_EXTENT, Rect, Size};
+pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
 pub use id::{Id, IdGenerator};

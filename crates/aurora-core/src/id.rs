@@ -128,6 +128,35 @@ impl<T> IdGenerator<T> {
         self.next = self.next.saturating_add(1);
         id
     }
+
+    /// The raw value [`Self::next_id`] would hand out, *without*
+    /// consuming it.
+    ///
+    /// Exists so a holder of already-allocated IDs can check that this
+    /// generator is actually ahead of them. That matters because
+    /// [`IdGenerator`] is `Deserialize`: a counter read back from an
+    /// untrusted file can sit *behind* IDs the same file already uses,
+    /// and the next allocation then silently collides with a live one.
+    /// `aurora_doc::LayerTree`'s own deserialization is the first
+    /// caller — see its `validate_id_allocator`.
+    #[must_use]
+    pub const fn peek_next(&self) -> u64 {
+        self.next
+    }
+
+    /// Moves the counter forward so the next ID handed out is strictly
+    /// greater than `raw`. Never moves it backward, so calling this with
+    /// an ID the generator is already past does nothing.
+    ///
+    /// For re-introducing IDs the generator did not itself allocate —
+    /// `aurora_doc::LayerTree::restore` splices back a subtree carrying
+    /// its original IDs, and (when the tree it splices into was built
+    /// from scratch, as `aurora_doc::History::replay` builds it) those
+    /// IDs can sit ahead of the counter. Saturates at `u64::MAX` for the
+    /// same reason [`Self::next_id`] does.
+    pub fn advance_past(&mut self, raw: u64) {
+        self.next = self.next.max(raw.saturating_add(1));
+    }
 }
 
 impl<T> fmt::Debug for IdGenerator<T> {
@@ -177,6 +206,36 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.to_raw(), 0);
         assert_eq!(b.to_raw(), 1);
+    }
+
+    #[test]
+    fn peek_next_reports_the_next_id_without_consuming_it() {
+        let mut generator: IdGenerator<Layer> = IdGenerator::new();
+        assert_eq!(generator.peek_next(), 0);
+        assert_eq!(generator.peek_next(), 0, "peeking must not consume");
+        assert_eq!(generator.next_id().to_raw(), 0);
+        assert_eq!(generator.peek_next(), 1);
+    }
+
+    #[test]
+    fn advance_past_moves_forward_but_never_backward() {
+        let mut generator: IdGenerator<Layer> = IdGenerator::new();
+        generator.advance_past(7);
+        assert_eq!(generator.peek_next(), 8);
+        generator.advance_past(2);
+        assert_eq!(
+            generator.peek_next(),
+            8,
+            "an id the generator is already past must not rewind it"
+        );
+        assert_eq!(generator.next_id().to_raw(), 8);
+    }
+
+    #[test]
+    fn advance_past_saturates_instead_of_wrapping() {
+        let mut generator: IdGenerator<Node> = IdGenerator::new();
+        generator.advance_past(u64::MAX);
+        assert_eq!(generator.peek_next(), u64::MAX, "must saturate, not wrap");
     }
 
     #[test]

@@ -59,9 +59,18 @@ pub enum IoError {
         expected: usize,
         actual: usize,
     },
-    /// [`crate::import::write_into_store`] failed to page a touched tile
-    /// in from the scratch disk.
-    #[error("failed to write image into the tile store: {0}")]
+    /// A [`aurora_tile::TileError`] surfaced through this crate — most
+    /// often paging a tile in from the scratch disk, from either
+    /// direction: [`crate::import::write_into_store`] hits it while
+    /// *writing* an imported image into the store, and
+    /// [`crate::aur::read`] hits it while *reading* a `.aur` file's own
+    /// tile entries back (a corrupt entry is rejected by
+    /// `aurora_tile::codec::decode` and arrives here). The message is
+    /// therefore deliberately direction-neutral: it used to say "failed
+    /// to write image into the tile store" and was shown to a user whose
+    /// *open* had failed, which is a misleading thing to tell someone
+    /// about their own file.
+    #[error("tile data error: {0}")]
     Tile(#[from] aurora_tile::TileError),
     /// [`crate::import::decode_by_extension`] was given a path whose
     /// extension names a format this crate doesn't decode (or has no
@@ -101,4 +110,120 @@ pub enum IoError {
     /// file, or one truncated/corrupted past recovery.
     #[error(".aur file is missing its own required {0:?} entry")]
     MissingEntry(&'static str),
+    /// [`crate::aur::read`] found a ZIP entry that declares (or really
+    /// does decompress to) more bytes than that entry could legitimately
+    /// hold — a `.aur` file's own tile entries have a known, fixed
+    /// maximum size, and its manifest/history entries a generous but
+    /// finite one. Rejected rather than read, so a hostile or corrupt
+    /// container can't turn a few compressed kilobytes into gigabytes of
+    /// resident memory (the classic DEFLATE zip-bomb shape) on a path
+    /// that runs before the application even has a window.
+    #[error(".aur entry {name:?} holds {size} bytes, past this reader's own {cap}-byte cap")]
+    EntryTooLarge { name: String, size: u64, cap: u64 },
+    /// [`crate::aur::read`] found a manifest declaring a pixel layer
+    /// larger than [`aurora_core::MAX_DOCUMENT_EXTENT`], the documented
+    /// document ceiling (PRD §7.3.1 / ADR 0002). The tile-scan loop
+    /// derives its own iteration count straight from those bounds, so an
+    /// unchecked `u32::MAX` there is not a large read but an effectively
+    /// unbounded one — rejected up front instead.
+    #[error(".aur manifest declares a {width}x{height} layer, past the {max}px document ceiling")]
+    LayerBoundsTooLarge { width: u32, height: u32, max: u32 },
+    /// [`crate::aur::read`] found a manifest declaring a rectangle
+    /// whose *origin* sits further than
+    /// [`aurora_core::MAX_DOCUMENT_ORIGIN`] from the document origin on
+    /// `x`, `y`, or both — the companion to
+    /// [`IoError::LayerBoundsTooLarge`], which bounds the same
+    /// rectangle's extent.
+    ///
+    /// **Two rectangles per layer are covered, by two different
+    /// guards.** A pixel layer's own `bounds` is checked in
+    /// `tile_grid`, alongside the extent. A `LayerMask`'s own `bounds`
+    /// is checked in `validate_mask_origins`, which has to be a
+    /// separate walk: `tile_grid` is only ever handed a
+    /// `LayerKind::Pixel` arm's `bounds`, so it never sees a mask, and a
+    /// *group* — which carries a mask but no bounds — never reaches it
+    /// at all. Both guards run on [`crate::aur::read`],
+    /// [`crate::aur::write()`] and [`crate::aur::write_best_effort`]
+    /// alike. One variant serves both because it is one failure class,
+    /// and a caller recovering from a refused file has no use for
+    /// telling a layer's rectangle from its mask's.
+    ///
+    /// A negative origin is perfectly legal and stays accepted: a layer
+    /// may sit partly or wholly off the canvas edge, which is what
+    /// `aurora_core::Rect`'s signed `x`/`y` are for. What is refused is
+    /// an origin further out than one whole document extent in either
+    /// direction.
+    ///
+    /// What is unbounded without it: unlike an oversized extent, which
+    /// is a loop-size defect, an out-of-range origin is an *arithmetic*
+    /// one that propagates. `aurora-app`'s own `read_layer_window`
+    /// computes `doc_origin - layer_origin` in `i64` with no check of
+    /// its own and then multiplies the tile indices it derives from
+    /// that difference, and `aurora_core::Rect::right`/`bottom` add the
+    /// extent to the same origin. Those saturate rather than panic now,
+    /// but saturating still yields a wrong picture; refusing the value
+    /// at the file boundary is what keeps it from ever being computed
+    /// on. Together with `aurora_doc::DocError::LayerOriginOutOfRange`
+    /// on the live-edit side, these two checks are what make that
+    /// unguarded subtraction unreachable with a pathological origin in
+    /// practice — `read_layer_window` itself is deliberately left
+    /// unchanged, since with both producers refusing there is no longer
+    /// a path that hands it one.
+    ///
+    /// Within `tile_grid` the origin is checked *before* the extent, on
+    /// the reasoning that an origin defect corrupts downstream
+    /// arithmetic while an oversized extent only makes a loop too long.
+    /// A mask's *extent* is not bounded at all, deliberately: no mask
+    /// pixels are stored yet (see `aurora_doc::LayerMask`), so it
+    /// drives no loop for an oversized value to make unfinishable.
+    #[error(
+        ".aur manifest declares a layer at ({x}, {y}), further than {max}px from the document origin"
+    )]
+    LayerOriginOutOfRange { x: i64, y: i64, max: i64 },
+    /// [`crate::aur::read`] found a manifest declaring a canvas larger
+    /// than [`aurora_core::MAX_DOCUMENT_EXTENT`] — the same document
+    /// ceiling [`IoError::LayerBoundsTooLarge`] enforces for a layer's
+    /// own bounds, applied to the document-level canvas size the
+    /// manifest carries alongside them. `aurora-app` puts that value
+    /// straight into its own live canvas size and later allocates
+    /// `width * height * 4` samples from it, so an unchecked
+    /// `u32::MAX` there is an allocation no machine can serve (and, on a
+    /// 32-bit target, an arithmetic overflow first).
+    #[error(".aur manifest declares a {width}x{height} canvas, past the {max}px document ceiling")]
+    CanvasTooLarge { width: u32, height: u32, max: u32 },
+    /// [`crate::aur::read`] found a manifest whose pixel layers add up
+    /// to more tiles than any real document has. Each layer's own bounds
+    /// are separately checked against the document ceiling
+    /// ([`IoError::LayerBoundsTooLarge`]), but *layer count* has no
+    /// ceiling of its own — this project promises unlimited layers — so
+    /// without this check a manifest could declare many ceiling-sized
+    /// layers, each individually legal, and multiply the tile scan out
+    /// to an effectively unbounded loop from a file only kilobytes long.
+    #[error(
+        ".aur manifest's layers add up to {total} tiles, past this reader's own {max}-tile budget"
+    )]
+    TooManyTiles { total: u64, max: u64 },
+    /// A flat, composited export (`aurora-app`'s own `composite_document`)
+    /// could not read every tile it needed out of the tile store, so the
+    /// image it assembled is missing content — the skipped layers
+    /// contributed nothing at all rather than their real pixels.
+    ///
+    /// This is refused rather than written. The live canvas deliberately
+    /// degrades instead: one unreadable tile logs a warning and paints
+    /// what it can, because hard-failing every repaint over one corrupt
+    /// scratch file would be far worse to use. A *file* is different —
+    /// CLAUDE.md's own rule is that silently degrading a professional's
+    /// file is the worst failure this project can have — so the export
+    /// path turns the same condition into a real `Err` and writes
+    /// nothing.
+    ///
+    /// `first` is the message of the first underlying
+    /// [`aurora_tile::TileError`] seen; `skipped` counts every skip
+    /// across the whole export, which is why the error carries a count
+    /// rather than the error value itself.
+    #[error(
+        "refusing to export a document with missing content: {skipped} layer tile read(s) failed \
+         (first: {first})"
+    )]
+    IncompleteComposite { skipped: usize, first: String },
 }

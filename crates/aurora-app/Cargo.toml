@@ -45,16 +45,31 @@ half = { workspace = true }
 taffy = { workspace = true }
 # The persisted workspace layout's own encoding -- the same
 # serde-derive-plus-`postcard` shape `aurora_doc::History::save_journal`/
-# `load_journal` already use for the autosave journal (`write_autosave`/
-# `recover_document`, this crate's own established pattern), reused
-# directly rather than hand-rolling a second, ad hoc binary format for
-# a payload this small.
+# `load_journal` and `.aur`'s own manifest (ADR 0009) already use,
+# reused directly rather than hand-rolling a second, ad hoc binary
+# format for a payload this small. This is now the *only* direct
+# `postcard` use in this crate: the autosave file itself is a real
+# `.aur` container (`write_autosave`/`recover_document`), which reaches
+# `postcard` through `aurora-io` rather than here.
 serde = { workspace = true }
 postcard = { workspace = true }
 # Where the layout preference lives -- see `layout_path`'s own doc
 # comment for why this is a real per-platform app-support directory,
 # not `std::env::temp_dir()`.
 directories = { workspace = true }
+# This session's own tile scratch directory (`create_tile_store_scratch_dir`)
+# -- was dev-only until 0.53.0, when the fix for the fixed, shared
+# `aurora-tiles` path needed a randomly *named*, exclusively *created*
+# directory in production code, not just in tests: a predictable name in a
+# world-writable temp directory can be pre-created or symlinked into place
+# by another local user, and `create_dir_all` would happily adopt it.
+# What this move does and does not change: nothing new enters the graph
+# `cargo deny` checks (`deny.toml`, `all-features = true` already covered
+# dev-dependencies, so the whole `tempfile` subtree was already resolved
+# and licence-checked), so there is no new licence or advisory surface.
+# The *shipped binary* genuinely does gain that subtree, though -- it is
+# linked into `aurora-app` now rather than only into its test harness.
+tempfile = { workspace = true }
 
 # macOS only -- see the workspace `Cargo.toml`'s own comment on `muda`
 # for why Windows/Linux aren't included here. `objc2-app-kit` is already
@@ -69,8 +84,29 @@ muda = { workspace = true }
 objc2-app-kit = { workspace = true }
 
 [dev-dependencies]
+# The same `aurora-doc` already in `[dependencies]` above, with its
+# `test-support` feature on -- Cargo allows a package in both positions
+# with different feature sets, and a dev-dependency's features only
+# reach the graph when dev-targets are actually built: `cargo test`,
+# `cargo nextest run`, `cargo clippy --all-targets`, `cargo build
+# --all-targets`. Not in a plain `cargo build`/`cargo check`, which is
+# what `verify.yml`'s default-feature step exists to keep true. Note
+# `--all-features` turns it on by itself, independently of this line.
+# Needed by exactly one fixture:
+# `nested_group_chain_over_a_white_background`, which builds the
+# deliberately over-deep tree that
+# `composite_document_drops_the_branch_that_nests_one_level_past_the_maximum_tree_depth`
+# is about -- see
+# `aurora_doc::LayerTree::insert_pixel_ignoring_the_depth_limit`.
+aurora-doc = { workspace = true, features = ["test-support"] }
 accesskit = { workspace = true }
-tempfile = { workspace = true }
+# Test-only: the autosave file is a real `.aur` ZIP container now
+# (`write_autosave`), so a test can assert its actual archive entries
+# (`mimetype`/`manifest`/`history`) directly rather than only via
+# `aurora_io::read_aur`'s own round-trip. The same workspace `zip`
+# entry `aurora-io` itself already builds `.aur` files with -- not a
+# second, independently versioned copy.
+zip = { workspace = true }
 
 [[bin]]
 name = "aurora-app"

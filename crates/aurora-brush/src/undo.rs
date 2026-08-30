@@ -17,11 +17,32 @@
 //! *both* stacks have something to offer — see its own doc comment for
 //! what that policy is and why unifying them for real is separate,
 //! still-open follow-on work.
+//!
+//! **Capture happens where the write happens** (0.55.0, corrected in
+//! 0.56.0). [`StrokeSnapshot::record_content`] takes a tile's bytes from
+//! a caller that is already holding that tile, rather than paging it in
+//! a second time the way [`StrokeSnapshot::record_touch`] does. That is
+//! what keeps "captured" and "painted" the same set:
+//! [`crate::stamp_dab`]/[`crate::erase_dab`] capture from the tile they
+//! already hold, in the instant before that tile's *first actual texel
+//! write*. So a tile whose page-in failed is never captured; a tile the
+//! dab acquired but then changed nothing in — an off-surface dab, a dab
+//! landing entirely on already-maximal alpha, an erase over
+//! already-transparent pixels — is never captured either; and a stroke
+//! that changed no pixel anywhere pushes no undo entry
+//! ([`PixelHistory::push`]'s own empty-snapshot rule).
+//!
+//! 0.55.0 captured on the success arm of the `get_mut` itself, one step
+//! too early: acquiring a tile is not the same as writing to it, and
+//! each of the three cases above produced a real undo entry for pixels
+//! nothing had changed. [`crate::DabOutcome::painted`] moved with it, so
+//! the two are still the same set by construction — see
+//! [`StrokeSnapshot::captured`] for the direct assertion.
 
 use std::collections::HashMap;
 
 use aurora_core::Rect;
-use aurora_tile::{SurfaceId, TILE, TileError, TileId, TileStore};
+use aurora_tile::{SAMPLES, SurfaceId, TILE, TileError, TileId, TileStore};
 use half::f16;
 
 /// The whole-tile dirty rectangle every [`StrokeSnapshot::apply`] write
@@ -39,8 +60,10 @@ const fn full_tile_rect() -> Rect {
 /// Which tiles one brush/eraser stroke touched on a single
 /// [`aurora_tile::SurfaceId`], and their content from just before this
 /// snapshot's own [`Self::apply`] would touch them. Built once per
-/// stroke via [`Self::record_touch`] (called before each dab actually
-/// writes), then handed to [`crate::PixelHistory::push`] once the
+/// stroke — via [`Self::record_content`] for the brush/eraser dab path
+/// (each dab captures the tiles it actually acquires, as it acquires
+/// them), or [`Self::record_touch`] for a caller with no tile already
+/// in hand — then handed to [`crate::PixelHistory::push`] once the
 /// stroke ends.
 #[derive(Debug, Clone)]
 pub struct StrokeSnapshot {
@@ -81,6 +104,15 @@ impl StrokeSnapshot {
     /// overwrite the stroke's own starting point with a mid-stroke
     /// state. A no-op (not an error) if `tile` is already captured.
     ///
+    /// **Not what the brush/eraser dab path uses any more** (0.55.0).
+    /// A caller that has to page `tile` in *itself*, before the write
+    /// that will page it in again, can capture a tile the write then
+    /// fails to touch — which is exactly the phantom undo entry
+    /// [`Self::record_content`] exists to make impossible.
+    /// [`crate::stamp_dab`]/[`crate::erase_dab`] capture through that
+    /// method instead, from the tile they already hold. This one
+    /// remains for a caller that genuinely has no tile in hand.
+    ///
     /// # Errors
     ///
     /// Returns [`TileError`] if paging `tile` in from the scratch disk
@@ -94,6 +126,81 @@ impl StrokeSnapshot {
         Ok(())
     }
 
+    /// Captures `texels` as `tile`'s own pre-stroke content, if that
+    /// tile hasn't already been captured — the same once-per-stroke rule
+    /// [`Self::record_touch`] follows, for a caller that is already
+    /// holding the tile it is about to write
+    /// ([`crate::stamp_dab`]/[`crate::erase_dab`], which capture in the
+    /// instant before a tile's first actual texel write, so a captured
+    /// tile and a painted tile are the same set by construction).
+    /// Infallible: nothing is paged in, because the content is already
+    /// in hand.
+    ///
+    /// **First capture wins.** A later dab in the same stroke touching
+    /// the same tile must not overwrite the stroke's own starting point
+    /// with a mid-stroke state — that is what makes undo restore a
+    /// multi-dab stroke to where it began rather than to where its first
+    /// dab left off.
+    ///
+    /// `texels` must be one whole tile's worth of samples
+    /// (`aurora_tile::SAMPLES`, which is by definition the length of
+    /// every `aurora_tile::Tile::texels()` slice). Anything else is a
+    /// caller bug: it is refused and logged (`tracing::error!`) rather
+    /// than stored, because a stored short or long slice would reach
+    /// [`Self::apply`]'s own `copy_from_slice` and *panic* there — and
+    /// this workspace denies panics precisely because one loses a
+    /// professional's unsaved work. Both real callers pass
+    /// `Tile::texels()` directly, so this branch is unreachable today;
+    /// it exists so that a future one cannot reopen the panic.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `tile`'s pre-stroke content is captured after this call
+    /// — including the case where an earlier call in the same stroke
+    /// already captured it — and `false` only on the refusal above.
+    ///
+    /// **The `bool` is the point** (0.57.0). Refusing used to return
+    /// `()`, and the callers had already decided to write by the time
+    /// they asked: they wrote the tile, counted it painted, and reported
+    /// the dab a success with no undo entry covering it — a silent loss
+    /// of undo coverage for a real edit, which is strictly worse than
+    /// the panic the refusal replaced (a panic at least loses nothing
+    /// already committed). `#[must_use]` so a caller cannot go back to
+    /// ignoring it; [`crate::stamp_dab`]/[`crate::erase_dab`] now
+    /// abandon the tile before its first write and report it in
+    /// [`crate::DabOutcome::failed`] instead.
+    #[must_use]
+    pub fn record_content(&mut self, tile: TileId, texels: &[f16]) -> bool {
+        if texels.len() != SAMPLES {
+            tracing::error!(
+                got = texels.len(),
+                expected = SAMPLES,
+                surface = ?self.surface,
+                ?tile,
+                "refusing to capture a stroke snapshot from something that is not one whole \
+                 tile's worth of texels; this tile will not be painted either"
+            );
+            return false;
+        }
+        self.tiles.entry(tile).or_insert_with(|| texels.to_vec());
+        true
+    }
+
+    /// Every tile this snapshot has captured, in no particular order —
+    /// exactly the tiles [`Self::apply`] would restore, and (for a
+    /// snapshot the brush/eraser dab path built) exactly the union of
+    /// every [`crate::DabOutcome::painted`] along the stroke.
+    ///
+    /// Exists so a test can assert *what* was captured directly rather
+    /// than inferring it from whether a later `apply` happened to
+    /// succeed.
+    ///
+    /// No `#[must_use]`: `impl Iterator` already carries one, and
+    /// `clippy::double_must_use` (denied here) rejects the second.
+    pub fn captured(&self) -> impl Iterator<Item = TileId> + '_ {
+        self.tiles.keys().copied()
+    }
+
     /// Writes every captured tile's own content back into `store`,
     /// marking each dirty so a later GPU upload picks up the restored
     /// content, and returns a fresh snapshot capturing what was just
@@ -103,24 +210,118 @@ impl StrokeSnapshot {
     /// straight to each other ([`crate::PixelHistory::undo`]/
     /// [`Self::apply`]'s own callers).
     ///
+    /// **All or nothing** (0.52.2, second review round). Every tile is
+    /// read into the inverse snapshot *first*, and only once all of them
+    /// have been read is a single byte written. A read that fails
+    /// therefore leaves the store completely untouched, which is what
+    /// makes a later retry correct rather than merely possible.
+    ///
+    /// It was not always so, and the failure was subtle enough to be
+    /// worth recording. This used to read and write one tile at a time,
+    /// capturing each tile's inverse just before overwriting it. A
+    /// failure partway through left some tiles restored and some not —
+    /// tolerable while a store read failed at most once, but 0.52.2 made
+    /// a broken tile fail *every* time, and
+    /// [`crate::PixelHistory::undo`] correctly began retrying. The retry
+    /// then recaptured its inverse from the half-restored state, so the
+    /// inverse recorded the *restored* content for tiles the first
+    /// attempt had already rewritten — and the matching redo silently
+    /// put those tiles back to where they already were, losing the
+    /// stroke on a nondeterministic subset of tiles (`HashMap` iteration
+    /// order) while returning `Ok`. An independent review reproduced
+    /// exactly that: 2–6 of 8 tiles losing their stroke, every run, with
+    /// no error anywhere.
+    ///
+    /// The write phase can still fail in one narrow case — a tile
+    /// evicted between the two phases whose page-in then fails — and it
+    /// is handled rather than ignored: whatever was already written is
+    /// rolled back from the inverse just captured, so the store returns
+    /// to its pre-`apply` state and the retry stays correct. A rollback
+    /// write that itself fails is logged (`tracing::error!`) and the
+    /// original error is still returned; nothing better than "report it
+    /// loudly" exists at that point, and it takes a scratch disk failing
+    /// mid-rollback to reach.
+    ///
     /// # Errors
     ///
-    /// Returns [`TileError`] if restoring a captured tile fails (the
-    /// same scratch-disk-I/O class of failure every other
-    /// `TileStore`-touching call in this crate can raise). A failure
-    /// partway through leaves whichever tiles were already restored in
-    /// their new state — the same no-larger-transaction guarantee
-    /// `stamp_stroke`/`erase_stroke` already have for a mid-stroke
-    /// failure, not a new risk this type introduces.
+    /// Returns [`TileError`] if reading or restoring a captured tile
+    /// fails (the same scratch-disk-I/O class of failure every other
+    /// `TileStore`-touching call in this crate can raise).
     pub fn apply(&self, store: &mut TileStore) -> Result<Self, TileError> {
+        // Phase one: read every tile, write nothing. `?` here is safe to
+        // return on precisely because nothing has been modified yet.
         let mut inverse = Self::new(self.surface);
+        for &tile in self.tiles.keys() {
+            let content = store.get(self.surface, tile)?.texels().to_vec();
+            inverse.tiles.insert(tile, content);
+        }
+
+        // Phase two: write. Every tile was resident a moment ago, so the
+        // only way this fails is an eviction between the phases whose
+        // page-in then fails -- narrow, but not impossible, so it rolls
+        // back rather than leaving a half-applied restore behind.
+        let mut written: Vec<TileId> = Vec::with_capacity(self.tiles.len());
         for (&tile, content) in &self.tiles {
-            let current = store.get_mut(self.surface, tile)?;
-            inverse.tiles.insert(tile, current.texels().to_vec());
-            current.texels_mut().copy_from_slice(content);
-            current.mark_dirty(full_tile_rect());
+            if let Err(err) = Self::restore_tile(store, self.surface, tile, content) {
+                for done in &written {
+                    let Some(previous) = inverse.tiles.get(done) else {
+                        continue;
+                    };
+                    if let Err(rollback) = Self::restore_tile(store, self.surface, *done, previous)
+                    {
+                        tracing::error!(
+                            ?rollback,
+                            surface = ?self.surface,
+                            tile = ?done,
+                            "failed to roll back a partially applied stroke restore; this tile is \
+                             left restored while others are not"
+                        );
+                    }
+                }
+                return Err(err);
+            }
+            written.push(tile);
         }
         Ok(inverse)
+    }
+
+    /// Overwrites one tile with `content` and marks it fully dirty — the
+    /// single write both [`Self::apply`]'s write phase and its rollback
+    /// are built from, so the two cannot drift apart.
+    ///
+    /// The length check is not dead weight. `copy_from_slice` panics on
+    /// a length mismatch, in either direction, and this crate has one
+    /// `pub`, infallible door through which content enters a snapshot
+    /// ([`Self::record_content`]). That door already refuses anything
+    /// that isn't `aurora_tile::SAMPLES` long, so a mismatch here is
+    /// structurally unreachable — this is the second lock on the same
+    /// door, because the cost of being wrong is a panic that loses
+    /// unsaved work, and the cost of the check is one integer compare
+    /// per tile on the undo path (not the brush hot path). It refuses
+    /// the tile rather than half-writing it: a partially overwritten
+    /// tile is worse than an unrestored one.
+    fn restore_tile(
+        store: &mut TileStore,
+        surface: SurfaceId,
+        tile: TileId,
+        content: &[f16],
+    ) -> Result<(), TileError> {
+        let current = store.get_mut(surface, tile)?;
+        let texels = current.texels_mut();
+        if texels.len() != content.len() {
+            tracing::error!(
+                got = content.len(),
+                expected = texels.len(),
+                ?surface,
+                ?tile,
+                "refusing to restore a tile from a snapshot that is not one whole tile long; \
+                 this tile is left as it is"
+            );
+            return Ok(());
+        }
+        texels.copy_from_slice(content);
+        current.mark_dirty(full_tile_rect());
+        Ok(())
     }
 }
 
@@ -185,30 +386,57 @@ impl PixelHistory {
     /// an error) when there was nothing to undo — check
     /// [`Self::can_undo`] first if the distinction matters.
     ///
+    /// **A failed undo keeps the entry.** The stroke is popped only once
+    /// [`StrokeSnapshot::apply`] has actually succeeded. Until 0.52.2 it
+    /// was popped first, so a failing `apply` — which since 0.52.2 is
+    /// what a permanently unreadable tile produces on *every* attempt,
+    /// rather than only the first — dropped that snapshot on the floor:
+    /// not pushed to redo, not put back on undo, simply gone, taking the
+    /// only record of what those pixels used to be with it. Peeking first
+    /// is the same "hold a real replacement before letting go of the only
+    /// copy" rule `aurora_tile::TileStore::ensure_resident` follows for a
+    /// failed page-in.
+    ///
+    /// Retrying really is safe, and that took a second fix to be true:
+    /// [`StrokeSnapshot::apply`] is now all-or-nothing, so a failed undo
+    /// leaves the store exactly as it was. The first shape of this fix
+    /// made a failed undo *retryable* while `apply` was still writing
+    /// tile by tile, and a retry then captured its inverse from the
+    /// half-restored state — which silently lost the stroke on part of
+    /// the following redo. See `apply`'s own doc comment for the full
+    /// account.
+    ///
     /// # Errors
     ///
     /// Returns [`TileError`] if restoring the stroke's own captured
-    /// tiles fails.
+    /// tiles fails. The undo stack is unchanged in that case.
     pub fn undo(&mut self, store: &mut TileStore) -> Result<bool, TileError> {
-        let Some(stroke) = self.undo.pop() else {
+        let Some(stroke) = self.undo.last() else {
             return Ok(false);
         };
+        // Borrowed, not removed: `apply` is fallible, and `?` below
+        // returns before the `pop` that commits to this undo actually
+        // having happened.
         let inverse = stroke.apply(store)?;
+        let _ = self.undo.pop();
         self.redo.push(inverse);
         Ok(true)
     }
 
     /// Redoes the most recently undone stroke, if any. Same `Ok(false)`
-    /// shape as [`Self::undo`] for nothing to redo.
+    /// shape as [`Self::undo`] for nothing to redo, and the same
+    /// peek-apply-then-commit ordering: a redo whose `apply` fails leaves
+    /// the redo stack exactly as it was rather than discarding the entry.
     ///
     /// # Errors
     ///
     /// Same as [`Self::undo`].
     pub fn redo(&mut self, store: &mut TileStore) -> Result<bool, TileError> {
-        let Some(stroke) = self.redo.pop() else {
+        let Some(stroke) = self.redo.last() else {
             return Ok(false);
         };
         let inverse = stroke.apply(store)?;
+        let _ = self.redo.pop();
         self.undo.push(inverse);
         Ok(true)
     }
@@ -217,7 +445,8 @@ impl PixelHistory {
 #[cfg(test)]
 mod tests {
     use super::{PixelHistory, StrokeSnapshot};
-    use aurora_tile::{SurfaceId, TileId};
+    use crate::test_support::{break_the_only_scratch_file, surface};
+    use aurora_tile::TileId;
     use half::f16;
     use std::num::NonZeroUsize;
 
@@ -234,10 +463,6 @@ mod tests {
             Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
         };
         (dir, store)
-    }
-
-    fn surface() -> SurfaceId {
-        SurfaceId::from_raw(0)
     }
 
     /// Fills every texel of `tile` with `value` — a cheap, distinctive
@@ -260,6 +485,77 @@ mod tests {
             unreachable!("a real tile always has at least one sample");
         };
         sample.to_f32()
+    }
+
+    /// The scratch file `dir`'s single store paged `tile` out to.
+    ///
+    /// Found by scanning rather than by rebuilding the name: since
+    /// 0.53.0 `aurora_tile::TileStore` prefixes every scratch file with
+    /// a per-store instance token (so two stores sharing a directory
+    /// cannot collide), and that token is deliberately private to that
+    /// crate. The `(surface, x, y)` tail is still the stable,
+    /// addressable part, and exactly one file in a single-store
+    /// directory ends with it.
+    fn evicted_tile_file(dir: &std::path::Path, tile: TileId) -> std::path::PathBuf {
+        let suffix = format!("_{}_{}_{}.tile", surface().to_raw(), tile.x, tile.y);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let matches: Vec<std::path::PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .collect();
+        match matches.as_slice() {
+            [only] => only.clone(),
+            other => unreachable!("exactly one evicted file names this tile, found {other:?}"),
+        }
+    }
+
+    /// A refused capture has to be *visible* to the caller (0.57.0).
+    ///
+    /// Returning `()` on refusal meant the caller — which had already
+    /// decided to write by the time it asked — wrote the tile anyway,
+    /// counted it painted, and reported the dab a success with no undo
+    /// entry covering it: a silent loss of undo coverage for a real
+    /// edit, and strictly worse than the panic the refusal replaced. The
+    /// `bool` is what lets `stamp_dab`/`erase_dab` abandon the tile
+    /// before its first write instead.
+    #[test]
+    fn record_content_reports_whether_it_actually_captured() {
+        let tile = TileId { x: 3, y: 4 };
+        let mut stroke = StrokeSnapshot::new(surface());
+
+        assert!(
+            !stroke.record_content(tile, &[f16::from_f32(1.0); 7]),
+            "a slice that is not one whole tile must be refused, and say so"
+        );
+        assert!(
+            stroke.is_empty(),
+            "and must not have captured anything either"
+        );
+
+        let whole = vec![f16::from_f32(0.25); aurora_tile::SAMPLES];
+        assert!(
+            stroke.record_content(tile, &whole),
+            "one whole tile's worth of samples must be captured, and say so"
+        );
+        assert_eq!(stroke.captured().collect::<Vec<_>>(), [tile]);
+        assert!(
+            stroke.record_content(tile, &whole),
+            "an already-captured tile is still captured after this call, so this reports \
+             success too -- `false` means `this tile is not undoable`, not `nothing was \
+             stored just now`"
+        );
+        assert_eq!(
+            stroke.captured().collect::<Vec<_>>(),
+            [tile],
+            "first capture still wins"
+        );
     }
 
     #[test]
@@ -434,6 +730,253 @@ mod tests {
             first_sample(&mut store, tile),
             0.25,
             "the untouched undo entry must still restore correctly"
+        );
+    }
+
+    /// Red-team's own reproduction, as a regression test: an eight-tile
+    /// stroke, one tile transiently unreadable, an undo that fails, the
+    /// tile repaired, the undo retried — and then a **redo that must
+    /// restore all eight tiles**, not the nondeterministic two-to-six of
+    /// them the pre-0.52.2 `apply` managed.
+    ///
+    /// The mechanism it guards: `apply` used to capture each tile's
+    /// inverse immediately before overwriting that tile, so a failure
+    /// partway through left the store half-restored, and the retry then
+    /// captured its inverse from *that* state — recording the restored
+    /// content as if it were the pre-undo content for every tile the
+    /// first attempt had already rewritten. The redo built from that
+    /// inverse put those tiles back where they already were and returned
+    /// `Ok`, silently losing the stroke on them. Two-phase `apply` closes
+    /// it: nothing is written until every tile has been read.
+    ///
+    /// The store's budget is exactly the stroke's tile count, and eight
+    /// unrelated "filler" tiles are touched in between to push the whole
+    /// stroke out to the scratch disk. That is what makes the broken tile
+    /// genuinely read from disk (a budget larger than the document never
+    /// evicts anything, so no read could fail) **without** any tile being
+    /// evicted twice: a smaller budget would churn tiles in and out
+    /// during `apply` itself and expose the separate, still-open
+    /// stale-write race (`PLAN.md`, "write jobs carry no sequence
+    /// number"), which made an earlier draft of this test intermittent
+    /// for a reason that had nothing to do with what it is testing.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_retried_undo_restores_every_tile_and_its_redo_puts_every_stroke_back() {
+        const TILES: u32 = 8;
+        const BEFORE: f32 = 0.25;
+        const AFTER: f32 = 0.75;
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = NonZeroUsize::new(TILES as usize) else {
+            unreachable!("8 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+        let tiles: Vec<TileId> = (0..TILES).map(|x| TileId { x, y: 0 }).collect();
+
+        let mut stroke = StrokeSnapshot::new(surface());
+        for &tile in &tiles {
+            fill(&mut store, tile, BEFORE);
+            if let Err(err) = stroke.record_touch(&mut store, tile) {
+                unreachable!("{err:?}");
+            }
+        }
+        for &tile in &tiles {
+            fill(&mut store, tile, AFTER);
+        }
+
+        let mut history = PixelHistory::new();
+        assert!(history.push(stroke));
+
+        // Touch `TILES` unrelated tiles: with a budget of exactly
+        // `TILES`, this evicts the whole stroke to the scratch disk and
+        // nothing else. `flush` then confirms those writes, so `pending`
+        // is empty and a later read genuinely reaches the file below.
+        for x in 100..100 + TILES {
+            if let Err(err) = store.get_mut(surface(), TileId { x, y: 0 }) {
+                unreachable!("a first touch always succeeds: {err:?}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        // Break the *first* tile's scratch file, keeping the real bytes
+        // so it can be repaired again.
+        let Some(&broken) = tiles.first() else {
+            unreachable!("eight tiles were just built");
+        };
+        let victim = evicted_tile_file(dir.path(), broken);
+        let victim = victim.as_path();
+        let Ok(original) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = original.get(..original.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        match history.undo(&mut store) {
+            Err(aurora_tile::TileError::CorruptFile(_)) => {}
+            other => unreachable!("expected the restore to fail, got {other:?}"),
+        }
+        assert!(history.can_undo(), "the entry must survive a failed undo");
+        // Atomicity, stated directly: not one readable tile was touched
+        // by the attempt that failed.
+        for &tile in tiles.iter().skip(1) {
+            assert_eq!(
+                first_sample(&mut store, tile),
+                AFTER,
+                "a failed undo must not restore *any* tile, not even partially"
+            );
+        }
+
+        if let Err(err) = std::fs::write(victim, &original) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        match history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("the retry must succeed once the tile is readable: {other:?}"),
+        }
+        for &tile in &tiles {
+            assert_eq!(
+                first_sample(&mut store, tile),
+                BEFORE,
+                "the retried undo must restore every tile"
+            );
+        }
+
+        match history.redo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        for &tile in &tiles {
+            assert_eq!(
+                first_sample(&mut store, tile),
+                AFTER,
+                "redo must put the stroke back on every tile -- the inverse must have been \
+                 captured from the pre-undo state, not from a half-restored one"
+            );
+        }
+    }
+
+    /// A `TileStore` whose scratch budget is one tile, so touching a
+    /// second tile evicts the first to disk — the setup
+    /// [`break_the_only_scratch_file`] needs to manufacture a tile that
+    /// genuinely cannot be read back.
+    fn one_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+        (dir, store)
+    }
+
+    /// An undo whose restore fails must not consume the undo entry
+    /// (0.52.2). `PixelHistory::undo` used to pop first and apply second,
+    /// so a failing `apply` dropped the popped snapshot entirely — never
+    /// pushed to redo, never put back — and with it the only record of
+    /// what those pixels were before the stroke. Harmless while a store
+    /// read failed at most once; not harmless since 0.52.2 made an
+    /// unreadable tile fail on every read, which turns "one failed undo"
+    /// into "that stroke is unundoable forever, silently".
+    #[test]
+    fn an_undo_whose_restore_fails_keeps_the_entry_instead_of_destroying_it() {
+        let (dir, mut store) = one_tile_store();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        fill(&mut store, a, 0.25);
+
+        let mut stroke = StrokeSnapshot::new(surface());
+        if let Err(err) = stroke.record_touch(&mut store, a) {
+            unreachable!("{err:?}");
+        }
+        fill(&mut store, a, 0.75);
+
+        let mut history = PixelHistory::new();
+        assert!(history.push(stroke));
+
+        // Evict `a` to the scratch disk, make the write real, then
+        // corrupt the file it landed in: `a` is now permanently
+        // unreadable, so the undo below cannot complete.
+        fill(&mut store, b, 0.0);
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_file(&dir);
+
+        match history.undo(&mut store) {
+            Err(aurora_tile::TileError::CorruptFile(_)) => {}
+            other => unreachable!("expected the restore to fail, got {other:?}"),
+        }
+
+        assert!(
+            history.can_undo(),
+            "a failed undo must leave the stroke on the undo stack -- dropping it destroys the \
+             only record of what those pixels were"
+        );
+        assert!(
+            !history.can_redo(),
+            "and must not push a redo entry for an undo that never happened"
+        );
+    }
+
+    /// The mirror of the test above for [`PixelHistory::redo`], which had
+    /// the identical pop-then-apply shape and the identical consequence.
+    #[test]
+    fn a_redo_whose_restore_fails_keeps_the_entry_instead_of_destroying_it() {
+        let (dir, mut store) = one_tile_store();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+        fill(&mut store, a, 0.25);
+
+        let mut stroke = StrokeSnapshot::new(surface());
+        if let Err(err) = stroke.record_touch(&mut store, a) {
+            unreachable!("{err:?}");
+        }
+        fill(&mut store, a, 0.75);
+
+        let mut history = PixelHistory::new();
+        assert!(history.push(stroke));
+        match history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(history.can_redo());
+
+        fill(&mut store, b, 0.0);
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_file(&dir);
+
+        match history.redo(&mut store) {
+            Err(aurora_tile::TileError::CorruptFile(_)) => {}
+            other => unreachable!("expected the restore to fail, got {other:?}"),
+        }
+
+        assert!(
+            history.can_redo(),
+            "a failed redo must leave the stroke on the redo stack"
+        );
+        assert!(
+            !history.can_undo(),
+            "and must not push an undo entry for a redo that never happened"
         );
     }
 

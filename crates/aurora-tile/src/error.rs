@@ -32,10 +32,31 @@ pub enum TileError {
         source: std::io::Error,
     },
     /// A tile file on disk didn't parse as a valid tile (bad magic,
-    /// unsupported version, truncated payload, or a decompressed length
-    /// that doesn't match a whole number of texels).
+    /// unsupported version, truncated payload, or a decoded length that
+    /// isn't exactly one whole tile (`aurora_tile::SAMPLES` samples)).
     #[error("corrupt tile file: {0}")]
     CorruptFile(String),
+    /// A resident tile's own texel slice was not exactly one whole
+    /// tile's worth of samples (`aurora_tile::SAMPLES`) — a malformed
+    /// tile *in memory*, distinct from [`TileError::CorruptFile`],
+    /// which is always about bytes read back off the scratch disk.
+    ///
+    /// Nothing in this crate constructs it: `Tile` allocates `SAMPLES`
+    /// samples and never resizes, so every tile this store hands out is
+    /// the right length. It exists for the layers above, which take a
+    /// texel slice as a *parameter* and so cannot rely on that —
+    /// `aurora-brush`'s dab path refuses to paint a tile whose pre-dab
+    /// content it could not capture for undo, and needs a truthful
+    /// error to report it with rather than a borrowed one.
+    #[error(
+        "surface {surface:?} tile {id:?} holds {samples} samples, not one whole tile's {expected}"
+    )]
+    MalformedTile {
+        surface: SurfaceId,
+        id: TileId,
+        samples: usize,
+        expected: usize,
+    },
     /// Propagated from `aurora-core` (e.g. an invalid `Size`).
     #[error(transparent)]
     Core(#[from] aurora_core::CoreError),

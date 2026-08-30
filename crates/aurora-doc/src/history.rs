@@ -34,7 +34,8 @@ use aurora_core::Rect;
 
 use crate::error::DocError;
 use crate::layer::{BlendMode, LayerEntry, LayerId, LayerKind, LayerLock, LayerMask};
-use crate::tree::{LayerTree, RemovedSubtree};
+use crate::text_safety::sanitize_display_name;
+use crate::tree::{LayerTree, RemovedSubtree, validate_origin};
 
 /// One recorded step. On the undo/redo stacks, stored as *how to undo the
 /// step that's currently on top* — never "what the user did," which
@@ -276,10 +277,22 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
     }
 }
 
+/// The most entries [`History::journal_descriptions`] will ever return.
+/// Photoshop's own History-states maximum is 1000; matching that number
+/// keeps the panel's worst case in the same range a professional already
+/// expects, rather than growing with an untrusted file's journal length.
+const MAX_DESCRIPTIONS: usize = 1000;
+
 /// A one-line, human-readable description of one journal entry — see
 /// [`History::journal_descriptions`]'s own doc comment for why this
 /// deliberately doesn't take a `&LayerTree` to resolve names beyond
 /// what an entry itself already captured.
+///
+/// The two arms that embed a caller-supplied name (`Restore`, `Rename`)
+/// put it through [`sanitize_display_name`] first; the other twelve of
+/// [`LayerOp`]'s fourteen variants format only numeric ids, verbs,
+/// percentages, coordinates, or a `Debug`-formatted [`BlendMode`], none
+/// of which carry unbounded text.
 fn describe(op: &LayerOp) -> String {
     match op {
         LayerOp::RemoveById(id) => format!("Removed layer #{}", id.to_raw()),
@@ -289,11 +302,15 @@ fn describe(op: &LayerOp) -> String {
                 .iter()
                 .find(|(entry_id, _)| *entry_id == removed.root)
                 .map_or("layer", |(_, entry)| entry.name.as_str());
-            format!("Added layer \"{name}\"")
+            format!("Added layer \"{}\"", sanitize_display_name(name))
         }
         LayerOp::Reparent { id, .. } => format!("Moved layer #{}", id.to_raw()),
         LayerOp::Rename { id, name } => {
-            format!("Renamed layer #{} to \"{name}\"", id.to_raw())
+            format!(
+                "Renamed layer #{} to \"{}\"",
+                id.to_raw(),
+                sanitize_display_name(name)
+            )
         }
         LayerOp::SetOpacity { id, value } => {
             format!(
@@ -409,7 +426,8 @@ impl History {
 
     /// How many ops the journal has recorded so far — mostly useful for
     /// tests; see [`Self::journal_descriptions`] for reading individual
-    /// entries.
+    /// entries. This is the untruncated count, so it can exceed
+    /// `journal_descriptions().len()`, which caps what it returns.
     #[must_use]
     pub fn journal_len(&self) -> usize {
         self.journal.len()
@@ -434,26 +452,83 @@ impl History {
     /// happened, not retroactively updated later ones — and `History`
     /// deliberately doesn't hold a tree reference of its own; see this
     /// module's own doc comment).
+    ///
+    /// **Bounded on both axes, because these strings become `accesskit`
+    /// labels.** `aurora_ui`'s History panel hands each one straight to
+    /// `node.set_label`, so an unbounded description crosses a process
+    /// boundary into an assistive technology that did not ask for it —
+    /// and layer names on the `.aur` path come from a file.
+    ///
+    /// - **Per entry**: an embedded layer name goes through
+    ///   [`sanitize_display_name`] — control, bidi-formatting,
+    ///   separator, and invisible-format characters removed, then capped
+    ///   at `MAX_NAME_CHARS` (128) characters plus an `…`. The longest
+    ///   description any arm can produce is therefore
+    ///   `Renamed layer #{u64} to "{name}"` — about 15 characters of
+    ///   fixed text, up to 20 digits of id, and 129 characters of name
+    ///   between quotes: roughly 170 characters worst case. **That is a
+    ///   character bound, not a byte bound**: `char`s are up to 4 bytes
+    ///   in UTF-8, so the same worst case is ~540 bytes for one
+    ///   description and ~540 KB for a full, capped panel. That is the
+    ///   honest ceiling — small enough for an `accesskit` label, but not
+    ///   the tighter number the character count alone reads as.
+    /// - **In total**: at most `MAX_DESCRIPTIONS` (1000) real
+    ///   entries, matching Photoshop's own History-states maximum. The
+    ///   *most recent* 1000 are kept; when anything was dropped, index 0
+    ///   is a synthetic `"… {n} earlier steps omitted"` entry (singular
+    ///   `step` when `n == 1`) sitting in the oldest-of-what's-shown
+    ///   position this method's chronological order puts it in.
+    ///
+    /// Both bounds are **display-only**. The journal, the stored layer
+    /// name ([`LayerTree::name`]), and [`Self::replay`] all still carry the
+    /// full, unmodified name and the full op sequence; nothing here
+    /// edits what an undo or a replay will reproduce.
     #[must_use]
     pub fn journal_descriptions(&self) -> Vec<String> {
-        self.journal.iter().map(describe).collect()
+        let omitted = self.journal.len().saturating_sub(MAX_DESCRIPTIONS);
+        let mut out = Vec::new();
+        if omitted > 0 {
+            out.push(format!(
+                "… {omitted} earlier step{} omitted",
+                if omitted == 1 { "" } else { "s" }
+            ));
+        }
+        out.extend(self.journal.iter().skip(omitted).map(describe));
+        out
     }
 
     /// Rebuilds a fresh [`LayerTree`] purely by replaying this history's
     /// own journal from empty, in the exact order every op was actually
     /// applied — see this module's own doc comment.
     ///
+    /// The rebuilt tree is checked before it is handed back, with the
+    /// *same* validator `LayerTree`'s own `Deserialize` runs on a `.aur`
+    /// manifest (`LayerTree::validate`). To be clear about what that
+    /// does and does not close today: **nothing outside this crate's own
+    /// tests calls `replay` yet**, so this is not a currently-live hole
+    /// being plugged. It will matter as soon as undo/redo can be seeded
+    /// from a file — a journal loaded by [`Self::load_journal`] is
+    /// untrusted bytes from exactly the same file the manifest came
+    /// from, and replay reaches a live `LayerTree` *without* going
+    /// through that `Deserialize` impl (it starts from
+    /// [`LayerTree::new`] and applies recorded ops), so validating only
+    /// the manifest would leave that second door open. The bar is set
+    /// now, while the path is still short, rather than retrofitted onto
+    /// the first caller.
+    ///
     /// # Errors
     ///
-    /// Returns an error if replaying the journal fails — should not
-    /// happen for a `History` only ever mutated through its own methods
-    /// (see this type's own doc comment about mixing in direct
-    /// `LayerTree` calls).
+    /// Returns an error if replaying the journal fails, or if the tree
+    /// it produces is not structurally a tree — neither should happen
+    /// for a `History` only ever mutated through its own methods (see
+    /// this type's own doc comment about mixing in direct `LayerTree`
+    /// calls); both are reachable from a crafted journal.
     pub fn replay(&self) -> Result<LayerTree, DocError> {
         let mut tree = LayerTree::new();
         for op in self.journal.clone() {
             apply(&mut tree, op)?;
         }
+        tree.validate()?;
         Ok(tree)
     }
 
@@ -494,6 +569,14 @@ impl History {
     /// applications already have after crash recovery — with the
     /// recovered journal itself intact for [`Self::replay`]/
     /// [`Self::journal_descriptions`].
+    ///
+    /// **This deserializes, it does not validate.** `bytes` are
+    /// untrusted — a `.aur` file's own `history` entry, from whoever
+    /// sent the file — and the ops they decode into are taken at face
+    /// value here; nothing checks that replaying them yields a coherent
+    /// tree. [`Self::replay`] is where that bar is enforced, so a
+    /// caller that loads a journal and never replays it has checked
+    /// nothing beyond "these bytes are well-formed `postcard`".
     ///
     /// # Errors
     ///
@@ -728,7 +811,23 @@ impl History {
     /// # Errors
     ///
     /// Returns [`DocError::UnknownLayer`] if `id` doesn't currently name
-    /// a real layer in `tree`.
+    /// a real layer in `tree`, or [`DocError::LayerOriginOutOfRange`] if
+    /// `old`'s own origin is one [`LayerTree::set_bounds`] would refuse.
+    /// Nothing is recorded when either happens — neither the journal nor
+    /// the undo stack is touched.
+    ///
+    /// **Why `old` is range-checked here even though this method never
+    /// writes to `tree`.** Until 0.57.14 it was not, on the argument
+    /// that the value reaches the journal rather than the tree, and that
+    /// the first thing to put it *in* the tree would be an ordinary
+    /// [`Self::undo`], which delegates to [`LayerTree::set_bounds`] and
+    /// is refused there. The premise held; the conclusion did not. That
+    /// refusal happens *after* the entry is on the undo stack and with
+    /// nothing popping it, so the same `undo()` fails the same way on
+    /// every attempt while [`Self::can_undo`] keeps reporting `true` —
+    /// undo permanently wedged, and every step beneath it unreachable.
+    /// Checking up front, with the same predicate `set_bounds` uses,
+    /// turns that into an ordinary rejected call.
     pub fn record_bounds_change(
         &mut self,
         tree: &LayerTree,
@@ -736,6 +835,9 @@ impl History {
         old: Rect,
     ) -> Result<(), DocError> {
         let current = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
+        // Before the first push, so a refusal records nothing at all --
+        // the same "all or nothing" discipline `set_bounds` follows.
+        validate_origin(old)?;
         self.journal.push(LayerOp::SetBounds { id, value: current });
         self.push(LayerOp::SetBounds { id, value: old });
         Ok(())
@@ -869,7 +971,22 @@ impl History {
             return Ok(None);
         };
         let forward = op.clone();
-        let (inverse, dirty) = apply(tree, op)?;
+        // A failed `apply` puts the step back where it came from. The
+        // `?` this replaced dropped it from the undo stack *and* never
+        // pushed it to the redo stack, so a single refused undo silently
+        // cost the user that step forever -- and this round adds several
+        // new ways for `apply` to refuse (see `LayerTree::reparent`'s
+        // and `restore`'s own error lists), which widens a window that
+        // was previously only reachable by mixing direct `LayerTree`
+        // calls into a `History`-managed tree. Every `LayerTree` call
+        // `apply` makes is all-or-nothing, so the tree is untouched too.
+        let (inverse, dirty) = match apply(tree, op) {
+            Ok(applied) => applied,
+            Err(err) => {
+                self.undo_stack.push(forward);
+                return Err(err);
+            }
+        };
         self.journal.push(forward);
         self.redo_stack.push(inverse);
         Ok(dirty)
@@ -887,7 +1004,14 @@ impl History {
             return Ok(None);
         };
         let forward = op.clone();
-        let (inverse, dirty) = apply(tree, op)?;
+        // Same restore-on-failure as `undo` above, for the same reason.
+        let (inverse, dirty) = match apply(tree, op) {
+            Ok(applied) => applied,
+            Err(err) => {
+                self.redo_stack.push(forward);
+                return Err(err);
+            }
+        };
         self.journal.push(forward);
         self.undo_stack.push(inverse);
         Ok(dirty)
@@ -914,7 +1038,7 @@ impl std::fmt::Debug for History {
 mod tests {
     use super::History;
     use crate::DocError;
-    use crate::layer::{BlendMode, LayerKind, LayerLock};
+    use crate::layer::{BlendMode, LayerKind, LayerLock, LayerMask};
     use crate::tree::LayerTree;
     use aurora_core::{Id, Rect};
 
@@ -1176,6 +1300,257 @@ mod tests {
             unreachable!("just asserted len() == 5");
         };
         assert_eq!(shown, &format!("Shown layer #{}", id.to_raw()));
+    }
+
+    /// An ordinary short, clean name -- including a non-ASCII em dash,
+    /// which is neither a control nor a bidi-formatting character --
+    /// comes through the sanitizer untouched, so the descriptions a real
+    /// in-session history produces are byte-identical to what they were
+    /// before any capping existed.
+    #[test]
+    fn an_ordinary_name_passes_through_a_description_unchanged() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let id = match history.add_pixel_layer(&mut tree, "Retouch — skin", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_name(&mut tree, id, "Café 😀‍🔥 background") {
+            unreachable!("{err:?}");
+        }
+
+        let descriptions = history.journal_descriptions();
+        assert_eq!(descriptions.len(), 2, "{descriptions:?}");
+        let Some(added) = descriptions.first() else {
+            unreachable!("just asserted len() == 2");
+        };
+        assert_eq!(added, "Added layer \"Retouch — skin\"");
+        let Some(renamed) = descriptions.get(1) else {
+            unreachable!("just asserted len() == 2");
+        };
+        // The zero-width joiner inside the emoji sequence is category
+        // `Cf` but deliberately *not* stripped -- it is load-bearing.
+        assert_eq!(
+            renamed,
+            &format!("Renamed layer #{} to \"Café 😀‍🔥 background\"", id.to_raw())
+        );
+    }
+
+    #[test]
+    fn journal_description_of_a_huge_layer_name_is_capped() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let huge = "a".repeat(500_000);
+        let id = match history.add_pixel_layer(&mut tree, huge.clone(), bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_name(&mut tree, id, huge.clone()) {
+            unreachable!("{err:?}");
+        }
+
+        let descriptions = history.journal_descriptions();
+        assert_eq!(descriptions.len(), 2, "{descriptions:?}");
+        // The `Restore` (added) arm.
+        let Some(added) = descriptions.first() else {
+            unreachable!("just asserted len() == 2");
+        };
+        assert!(
+            added.chars().count() <= 200,
+            "{} chars",
+            added.chars().count()
+        );
+        assert!(added.contains('\u{2026}'), "{added}");
+        // The `Rename` arm.
+        let Some(renamed) = descriptions.get(1) else {
+            unreachable!("just asserted len() == 2");
+        };
+        assert!(
+            renamed.chars().count() <= 200,
+            "{} chars",
+            renamed.chars().count()
+        );
+        assert!(renamed.contains('\u{2026}'), "{renamed}");
+    }
+
+    #[test]
+    fn journal_description_strips_control_and_bidi_characters() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let hostile = "safe\u{202E}txet\u{0007}";
+        let id = match history.add_pixel_layer(&mut tree, hostile, bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_name(&mut tree, id, hostile) {
+            unreachable!("{err:?}");
+        }
+
+        for description in history.journal_descriptions() {
+            assert!(!description.contains('\u{202E}'), "{description:?}");
+            assert!(!description.contains('\u{0007}'), "{description:?}");
+            assert!(description.contains("safe"), "{description:?}");
+            // Nothing here is anywhere near the 128-character cap, so
+            // stripping alone must not add an ellipsis: the `…` means
+            // "visible text was cut", not "something was removed".
+            assert!(!description.contains('\u{2026}'), "{description:?}");
+        }
+    }
+
+    /// The exact character-cap boundary, seen end to end through
+    /// `journal_descriptions` rather than only at `sanitize_display_name`
+    /// (which has its own boundary test): 128 visible characters is not
+    /// truncated, 129 is.
+    #[test]
+    fn journal_description_name_cap_boundary_is_exact() {
+        for (name_chars, wants_ellipsis) in [(128_usize, false), (129, true)] {
+            let mut tree = LayerTree::new();
+            let mut history = History::new();
+            let name = "a".repeat(name_chars);
+            let id = match history.add_pixel_layer(&mut tree, name.clone(), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let descriptions = history.journal_descriptions();
+            let Some(added) = descriptions.first() else {
+                unreachable!("one op was journaled: {descriptions:?}");
+            };
+            assert_eq!(
+                added.contains('\u{2026}'),
+                wants_ellipsis,
+                "{name_chars} chars: {added:?}"
+            );
+            if !wants_ellipsis {
+                assert_eq!(*added, format!("Added layer \"{name}\""));
+            }
+            let _ = id;
+        }
+    }
+
+    /// A legitimate multi-byte name *under* the character cap but well
+    /// over it in bytes must reach the description byte-identical --
+    /// `sanitize_display_name`'s byte-length fast-path check is a
+    /// conservative pre-filter, not the cap itself.
+    #[test]
+    fn a_long_cjk_name_under_the_char_cap_reaches_the_description_intact() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let name = "漢".repeat(100);
+        assert!(name.len() > 128, "{} bytes", name.len());
+        if let Err(err) = history.add_pixel_layer(&mut tree, name.clone(), bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let descriptions = history.journal_descriptions();
+        let Some(added) = descriptions.first() else {
+            unreachable!("one op was journaled: {descriptions:?}");
+        };
+        assert_eq!(*added, format!("Added layer \"{name}\""));
+        assert!(!added.contains('\u{2026}'), "{added:?}");
+    }
+
+    #[test]
+    fn truncating_a_multibyte_name_does_not_panic() {
+        // Each name is far past the 128-character cap, and every cap
+        // boundary lands inside a multi-byte character -- 3 bytes for
+        // the Han ideograph, 4 for the emoji. Reaching the assertions
+        // at all is the "does not panic" half; `String`/`char`
+        // operations throughout are what make the result valid UTF-8.
+        for name in [&"漢".repeat(200), &"🎨".repeat(200)] {
+            let mut tree = LayerTree::new();
+            let mut history = History::new();
+            let id = match history.add_pixel_layer(&mut tree, name.clone(), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = history.set_name(&mut tree, id, name.clone()) {
+                unreachable!("{err:?}");
+            }
+
+            let descriptions = history.journal_descriptions();
+            assert_eq!(descriptions.len(), 2, "{descriptions:?}");
+            for description in descriptions {
+                assert!(
+                    description.chars().count() <= 200,
+                    "{} chars",
+                    description.chars().count()
+                );
+                assert!(description.contains('\u{2026}'), "{description}");
+            }
+        }
+    }
+
+    #[test]
+    fn journal_descriptions_caps_entry_count_with_an_omission_notice() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let id = match history.add_pixel_layer(&mut tree, "Background", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // One `Restore` plus 1004 visibility flips == 1005 journal ops.
+        for step in 0..1004 {
+            if let Err(err) = history.set_visible(&mut tree, id, step % 2 == 0) {
+                unreachable!("{err:?}");
+            }
+        }
+        assert_eq!(history.journal_len(), 1005);
+
+        let descriptions = history.journal_descriptions();
+        assert_eq!(descriptions.len(), 1001, "1000 kept plus the notice");
+        let Some(notice) = descriptions.first() else {
+            unreachable!("just asserted len() == 1001");
+        };
+        assert_eq!(notice, "… 5 earlier steps omitted");
+        // Index 1 is a real op description, not a second notice. The
+        // *most recent* 1000 are what survive, so the five dropped are
+        // the oldest -- which includes the `Restore` that named the
+        // layer.
+        let Some(first_kept) = descriptions.get(1) else {
+            unreachable!("just asserted len() == 1001");
+        };
+        assert!(
+            first_kept.contains(&format!("layer #{}", id.to_raw())),
+            "{first_kept:?}"
+        );
+        assert!(!first_kept.starts_with('…'), "{first_kept:?}");
+    }
+
+    /// The single most important guard here: capping and sanitizing are
+    /// *display-only*. A name that `journal_descriptions` truncates must
+    /// still round-trip through `replay` in full -- proof the sanitizer
+    /// never ran inside `apply`'s `Restore`/`Rename` arms.
+    #[test]
+    fn replay_preserves_a_name_that_display_truncates() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+
+        let huge = "a".repeat(500_000);
+        let id = match history.add_pixel_layer(&mut tree, huge.clone(), bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let renamed = format!("{huge}\u{202E}");
+        if let Err(err) = history.set_name(&mut tree, id, renamed.clone()) {
+            unreachable!("{err:?}");
+        }
+
+        let replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.name(id), Some(renamed.as_str()));
+        assert_eq!(tree.name(id), Some(renamed.as_str()));
+
+        let descriptions = history.journal_descriptions();
+        let Some(shown) = descriptions.get(1) else {
+            unreachable!("two ops were journaled: {descriptions:?}");
+        };
+        assert!(shown.chars().count() <= 200, "{shown:?}");
+        assert!(!shown.contains('\u{202E}'), "{shown:?}");
     }
 
     #[test]
@@ -1604,6 +1979,70 @@ mod tests {
         }
     }
 
+    // Before 0.57.14 this call succeeded, and the entry it pushed made
+    // undo permanently unusable: `undo` delegates to
+    // `LayerTree::set_bounds`, which refuses the out-of-range origin,
+    // but the refusal happens with the entry still on the stack and
+    // nothing popping it -- so every later `undo()` failed identically
+    // while `can_undo()` kept saying `true`. Checking `old` before the
+    // first push is what turns that into an ordinary rejected call.
+    #[test]
+    fn record_bounds_change_rejects_an_old_origin_outside_the_document_range() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        // Built on the tree directly, so the undo stack starts genuinely
+        // empty and `can_undo()` is a clean signal for the wedge.
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let journal_len_before = history.journal_len();
+        assert!(!history.can_undo(), "nothing to undo before the bad call");
+
+        match history.record_bounds_change(&tree, id, out_of_range_origin()) {
+            Err(DocError::LayerOriginOutOfRange { x, y: _, max }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+
+        assert_eq!(
+            history.journal_len(),
+            journal_len_before,
+            "a refused call must record nothing in the journal"
+        );
+        assert!(
+            !history.can_undo(),
+            "a refused call must leave the undo stack untouched -- the wedge this closes"
+        );
+        assert!(!history.can_redo());
+
+        // And the tree, which this method never writes to anyway, is
+        // still exactly where the caller left it.
+        assert_eq!(tree.bounds(id), Some(bounds()));
+
+        // The layer is still perfectly editable afterwards: a legitimate
+        // `record_bounds_change` on the same id still works, and its undo
+        // succeeds -- proving nothing was left half-recorded.
+        let moved = Rect {
+            x: 100,
+            y: 100,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = tree.set_bounds(id, moved) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.record_bounds_change(&tree, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.bounds(id), Some(bounds()));
+    }
+
     #[test]
     fn journal_describes_set_bounds_distinctly_from_reparent() {
         let mut tree = LayerTree::new();
@@ -1991,5 +2430,386 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(recovered.journal_len(), 0);
+    }
+
+    // --- a crafted journal is untrusted input too ---------------------
+    //
+    // `LayerTree`'s own `Deserialize` validates a `.aur` manifest, but a
+    // journal never goes through it: `replay` starts from
+    // `LayerTree::new()` and applies recorded ops, so a crafted
+    // `history` entry in the same file was a second, unvalidated way to
+    // reach a live `LayerTree`. These craft the journals that used to
+    // get through.
+    //
+    // None of this is reachable from the app today -- nothing in the UI
+    // calls `remove`/`reparent` yet -- so this closes a latent gap
+    // before it goes live rather than fixing an active exploit.
+
+    fn pixel_entry(name: &str, parent: Option<super::LayerId>) -> super::LayerEntry {
+        super::LayerEntry::new(
+            name.to_owned(),
+            parent,
+            LayerKind::Pixel { bounds: bounds() },
+        )
+    }
+
+    fn group_entry(
+        name: &str,
+        parent: Option<super::LayerId>,
+        children: Vec<super::LayerId>,
+    ) -> super::LayerEntry {
+        super::LayerEntry::new(name.to_owned(), parent, LayerKind::Group { children })
+    }
+
+    /// Encodes `journal` exactly as `save_journal` would, loads it back
+    /// through the real public entry point, and replays it.
+    fn replay_crafted_journal(journal: &[super::LayerOp]) -> Result<LayerTree, DocError> {
+        let bytes = match postcard::to_allocvec(journal) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let recovered = match History::load_journal(&bytes) {
+            Ok(history) => history,
+            Err(err) => unreachable!("a well-formed postcard journal must load: {err:?}"),
+        };
+        recovered.replay()
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_root_records_the_wrong_parent_errors() {
+        let root: super::LayerId = Id::from_raw(0);
+        let elsewhere: super::LayerId = Id::from_raw(7);
+        // The op says "put this back at the top level", the entry says
+        // "I live inside layer 7". `remove_capturing` would later look
+        // for it among layer 7's children.
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![(root, pixel_entry("a", Some(elsewhere)))],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, root),
+            other => unreachable!("expected InconsistentLayerParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_subtree_hides_an_unreachable_entry_errors() {
+        let root: super::LayerId = Id::from_raw(0);
+        let stowaway: super::LayerId = Id::from_raw(1);
+        // `stowaway` rides along in `entries` but no `children` list
+        // names it: it would land in the tree's map while being
+        // invisible to every traversal.
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![
+                (root, group_entry("g", None, Vec::new())),
+                (stowaway, pixel_entry("stowaway", None)),
+            ],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::OrphanedLayer(id)) => assert_eq!(id, stowaway),
+            other => unreachable!("expected OrphanedLayer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_subtree_carries_the_same_id_twice_errors() {
+        let root: super::LayerId = Id::from_raw(0);
+        let twice: super::LayerId = Id::from_raw(1);
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![
+                (root, group_entry("g", None, vec![twice])),
+                (twice, pixel_entry("first", Some(root))),
+                (twice, pixel_entry("second", Some(root))),
+            ],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, twice),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_subtree_is_missing_its_own_root_errors() {
+        let root: super::LayerId = Id::from_raw(0);
+        let only: super::LayerId = Id::from_raw(1);
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![(only, pixel_entry("only", None))],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, root),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_ops_are_each_valid_but_whose_result_is_not_errors() {
+        // Each op here is internally coherent, and the damage only shows
+        // up in the *merged* tree: the second subtree's `children` names
+        // a layer the first op already placed at the top level, so once
+        // the two are merged that layer is reachable from two parents.
+        //
+        // `restore` used to walk only the incoming subtree, where that
+        // id looks like a harmless dangling reference, and this case was
+        // caught solely by `replay`'s own closing `tree.validate()`.
+        // `restore` now checks the incoming `children` against the
+        // *live* map before merging, so it is refused one op earlier and
+        // the live tree is never in the broken state at all -- which is
+        // what matters for `undo`/`redo`, which call `restore` directly
+        // and have no closing validate of their own. `replay`'s
+        // `tree.validate()` stays as the outer net for anything a
+        // pre-merge check cannot see.
+        let stolen: super::LayerId = Id::from_raw(0);
+        let thief: super::LayerId = Id::from_raw(1);
+        let journal = vec![
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: stolen,
+                parent: None,
+                index: 0,
+                entries: vec![(stolen, pixel_entry("stolen", None))],
+            }),
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: thief,
+                parent: None,
+                index: 0,
+                entries: vec![(thief, group_entry("thief", None, vec![stolen]))],
+            }),
+        ];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, stolen),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_restoring_an_id_the_tree_already_holds_errors() {
+        // The `MalformedRemovedSubtree` branch the other crafted-journal
+        // tests here miss: a second `Restore` naming an id the first one
+        // already made live. Merging it would replace that layer
+        // outright.
+        let clash: super::LayerId = Id::from_raw(0);
+        let subtree = |name: &str| {
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: clash,
+                parent: None,
+                index: 0,
+                entries: vec![(clash, pixel_entry(name, None))],
+            })
+        };
+        let journal = vec![subtree("first"), subtree("second")];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, clash),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    /// An origin one step past `aurora_core::MAX_DOCUMENT_ORIGIN`, with
+    /// a small extent so only the origin is at fault.
+    fn out_of_range_origin() -> Rect {
+        Rect {
+            x: aurora_core::MAX_DOCUMENT_ORIGIN + 1,
+            y: 0,
+            width: 10,
+            height: 10,
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_layer_sits_outside_the_document_range_errors() {
+        // `set_bounds` and `insert_unchecked` both run `validate_origin`
+        // on a caller-supplied `Rect`, but `restore` deliberately does
+        // not (it puts back a value the tree already accepted), so a
+        // crafted `Restore` op was a way to splice an origin past
+        // `MAX_DOCUMENT_ORIGIN` into a live tree. `replay`'s closing
+        // `tree.validate()` is what refuses it now.
+        let root: super::LayerId = Id::from_raw(0);
+        let entry = super::LayerEntry::new(
+            "far".to_owned(),
+            None,
+            LayerKind::Pixel {
+                bounds: out_of_range_origin(),
+            },
+        );
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![(root, entry)],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+                assert_eq!(y, 0);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_mask_sits_outside_the_document_range_errors() {
+        // The mask half of the same door: `add_mask` runs
+        // `validate_origin`, `restore_mask` does not. The layer this
+        // mask lands on is itself in range, so only the mask is at
+        // fault.
+        let root: super::LayerId = Id::from_raw(0);
+        let journal = vec![
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root,
+                parent: None,
+                index: 0,
+                entries: vec![(root, pixel_entry("host", None))],
+            }),
+            super::LayerOp::RestoreMask(
+                root,
+                LayerMask {
+                    bounds: out_of_range_origin(),
+                    enabled: true,
+                    inverted: false,
+                },
+            ),
+        ];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::LayerOriginOutOfRange { x, max, .. }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_replayed_document_keeps_allocating_ids_past_the_ones_it_restored() {
+        // `replay` rebuilds from `LayerTree::new()`, whose counter starts
+        // at 0, while every layer it restores keeps its original id.
+        // Unless something advances the counter, the next edit on a
+        // recovered document hands out an id a restored layer already
+        // holds -- silently aliasing two layers and (via
+        // `LayerTree::surface_id`, which reuses the raw id) their tile
+        // storage with it. `LayerTree::restore` is where that is closed.
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let mut existing = Vec::new();
+        for name in ["a", "b", "c"] {
+            match history.add_pixel_layer(&mut tree, name, bounds(), None) {
+                Ok(id) => existing.push(id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let mut replayed = match history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let fresh = match replayed.add_pixel_layer("fresh", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            !existing.contains(&fresh),
+            "a recovered document must not re-issue an id it already restored: \
+             {fresh:?} collides with one of {existing:?}"
+        );
+        assert_eq!(replayed.len(), 4, "nothing may have been overwritten");
+    }
+
+    #[test]
+    fn a_refused_undo_keeps_the_step_on_the_undo_stack() {
+        // `undo` pops before it applies. When `apply` then fails, the
+        // step used to be gone from both stacks -- silently costing the
+        // user that step forever. Reached here the documented way (see
+        // `History`'s own doc comment): a direct `LayerTree` call mixed
+        // into a `History`-managed tree, so the recorded inverse no
+        // longer matches reality.
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "layer", bounds(), None) {
+            Ok(added) => added,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Behind `History`'s back, so undoing the add cannot work.
+        if let Err(err) = tree.remove(id) {
+            unreachable!("{err:?}");
+        }
+        assert!(history.can_undo());
+        match history.undo(&mut tree) {
+            Err(DocError::UnknownLayer(missing)) => assert_eq!(missing, id),
+            other => unreachable!("expected UnknownLayer, got {other:?}"),
+        }
+        assert!(
+            history.can_undo(),
+            "a refused undo must leave the step where it was, not consume it"
+        );
+        assert!(!history.can_redo(), "and must not half-move it to redo");
+    }
+
+    #[test]
+    fn a_refused_redo_keeps_the_step_on_the_redo_stack() {
+        // The mirror of the test above.
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "layer", bounds(), None) {
+            Ok(added) => added,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(history.can_redo());
+        // Behind `History`'s back again: something else now occupies the
+        // id the pending redo wants to restore.
+        let mut clash = LayerTree::new();
+        std::mem::swap(&mut tree, &mut clash);
+        if let Err(err) = tree.add_pixel_layer("squatter", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.roots().first().copied(), Some(id));
+        match history.redo(&mut tree) {
+            Err(DocError::MalformedRemovedSubtree(clashing)) => assert_eq!(clashing, id),
+            other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+        assert!(
+            history.can_redo(),
+            "a refused redo must leave the step where it was, not consume it"
+        );
+    }
+
+    #[test]
+    fn replaying_an_honest_crafted_journal_still_succeeds() {
+        // The positive control for the five above: a hand-built journal
+        // that *is* coherent must still replay, so the new checks are
+        // not simply refusing every journal that did not come from
+        // `save_journal`.
+        let group: super::LayerId = Id::from_raw(0);
+        let child: super::LayerId = Id::from_raw(1);
+        let journal = vec![
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: group,
+                parent: None,
+                index: 0,
+                entries: vec![(group, group_entry("g", None, Vec::new()))],
+            }),
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root: child,
+                parent: Some(group),
+                index: 0,
+                entries: vec![(child, pixel_entry("c", Some(group)))],
+            }),
+        ];
+        let tree = match replay_crafted_journal(&journal) {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("a coherent journal must still replay: {err:?}"),
+        };
+        assert_eq!(tree.roots(), &[group]);
+        assert_eq!(tree.children(group), Some([child].as_slice()));
     }
 }

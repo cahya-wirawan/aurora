@@ -9,7 +9,7 @@ exclude = ["spike"]
 # See CLAUDE.md's "Versioning" section: SemVer, minor bumped per PLAN.md
 # step, patch bumped per bug fix. A release is a `vX.Y.Z` tag matching
 # this exact value, pushed once the bump is committed.
-version = "0.47.1"
+version = "0.59.0"
 # Not published: `aurora-core` and `aurora` are taken on crates.io by unrelated
 # projects (PRD §12 Q2b), and nothing needs publishing to build or ship the
 # application. This also lets cargo-deny's allow-wildcard-paths exempt the
@@ -95,7 +95,13 @@ lyon = "1"
 # Correct Unicode word-boundary motion for the text field widget, not a
 # hand-rolled whitespace heuristic.
 unicode-segmentation = "1"
-tempfile = "3"
+# 3.20 is the real floor, not "3": `Builder::permissions` (used to make
+# the tile scratch directory `0o700` at `mkdir` time) arrived in 3.10.0,
+# and `TempDir::keep` (the un-deprecated `into_path`, used to hand the
+# session scratch directory's path over to the `OnceLock` that outlives
+# the guard) in 3.20.0. Left at "3", a `-Z minimal-versions` resolve
+# picks 3.0 and neither compiles.
+tempfile = "3.20"
 criterion = "0.5"
 # PRD §8.5's "image-diff golden tests for render correctness" (aurora-testkit):
 # encode/decode for golden/actual/diff PNGs. image-rs's own PNG-only crate --

@@ -80,11 +80,17 @@
 //! `PinLight`/`HardMix`), the 4-mode non-separable HSL family
 //! (`Hue`/`Saturation`/`Color`/`Luminosity`), and the 2-mode
 //! whole-colour-selection family (`DarkerColor`/`LighterColor`) are
-//! real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`
-//! — this family's own explicit, now sole boundary) still silently
-//! falls back to `Normal`
-//! — a real, still-open gap. Layer groups recurse at any depth
-//! (ancestor-visibility-gated: an invisible group hides its whole
+//! real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`)
+//! is real too, but not via this translation — `resolve_tile` intercepts
+//! it before `translate_blend_mode` ever runs and applies its own
+//! stochastic `dissolve_gate` instead, since Dissolve's per-pixel
+//! keep-or-drop decision isn't expressible as a per-pixel-colour blend
+//! function the way every other mode is (see `resolve_tile`'s own doc
+//! comment for the full account). Layer groups recurse at any depth
+//! `aurora-doc` will accept (bounded, as its own second line of
+//! defence, by `aurora_doc::MAX_LAYER_TREE_DEPTH` and a per-tile node
+//! budget — see `resolve_tile`'s own doc comment) and are
+//! ancestor-visibility-gated (an invisible group hides its whole
 //! subtree), so a layer nested inside a group does composite and export
 //! now; a group's own `opacity`/`blend_mode` **are** now aggregated
 //! into its children's effective compositing too, via `resolve_tile`'s
@@ -152,17 +158,38 @@
 //! Document recovery is now real, not just detected: `aurora-doc`'s
 //! `History::save_journal`/`load_journal` (ADR 0009) give this crate an
 //! on-disk journal encoding to write and read, so `App::new` writes the
-//! current document's journal to a second small file
-//! (`std::env::temp_dir()` again) every startup, and — if a previous
-//! run's marker is there *and* that autosave file parses and replays —
-//! opens with the recovered document instead of the fake demo one.
+//! current document to a second file (`std::env::temp_dir()` again) at
+//! startup, and — if a previous run's marker is there *and* that
+//! autosave file parses — opens with the recovered document instead of
+//! the fake demo one (in which case there is nothing to write back:
+//! the file already holds exactly that document).
+//!
+//! **That autosave file is a real `.aur` container now**, not the raw
+//! `postcard` journal it started as: `write_autosave` builds it with
+//! `aurora_io::write_aur` (mimetype sentinel, manifest carrying the
+//! whole `LayerTree` and the document's own canvas size, the history
+//! journal, and one entry per non-blank tile) and `recover_document`
+//! reads it back with `aurora_io::read_aur` straight into the live
+//! `aurora_tile::TileStore`. So a crash now recovers real painted
+//! pixels and the real canvas size, where before it recovered only
+//! structural `LayerOp`s and lost every painted pixel.
+//!
 //! **Scope, stated honestly**: still just one dialog action ("Continue"
 //! — its message changes depending on whether recovery actually
 //! happened), because recovery itself is unconditional and automatic
-//! rather than a user choice, and autosave is written once at startup,
-//! not on a repeating timer or after edits, since there is no live
-//! editing loop yet to re-trigger it from. See this module's own "crash
-//! recovery" section for the full reasoning.
+//! rather than a user choice. And autosave now happens **only at
+//! lifecycle boundaries** — a fresh session's startup document, and
+//! each document replacement (`App::open_file`/`App::open_aur_file`).
+//! Live per-edit re-triggering was removed in 0.49.0: building a `.aur`
+//! container walks the whole tile grid, which measured 687 ms on a
+//! modest document and has to run on the thread that owns the tile
+//! store (the UI thread), so re-triggering it from stroke commit —
+//! even rate-gated — was a real violation of §7.3.4 against a
+//! 10 ms brush budget. A crash therefore recovers the document as of
+//! the last such boundary, with its real pixels; mid-session edits
+//! since then are not autosaved at all. See this module's own "crash
+//! recovery" section for the full reasoning and what would lift the
+//! restriction.
 //!
 //! **Basic tools, brush painting, and eraser** (PLAN.md M1.9): this
 //! crate's first pointer input at all
@@ -178,9 +205,9 @@
 //! into a real, live document for the first time in this project.
 //! **Eraser followed the same day**: the same drag/dab-spacing
 //! machinery, a new `Drag::Eraser` variant alongside `Drag::Brush`, and
-//! `aurora_brush::erase_dab`/`erase_stroke` (subtractive — reduces
-//! existing alpha instead of blending a colour) in place of
-//! `stamp_dab`/`stamp_stroke`; bound to `e`, matching `b` for Brush.
+//! `aurora_brush::erase_dab` (subtractive — reduces existing alpha
+//! instead of blending a colour) in place of `stamp_dab`; bound to `e`,
+//! matching `b` for Brush.
 //! **Active-layer selection followed the brush milestone**:
 //! `aurora_ui::layers_panel`'s own rows are now real, non-zero-sized,
 //! clickable widgets (`aurora_widgets::WidgetTree::hit_test`, new for
@@ -210,6 +237,25 @@
 //! module's "brush painting"/"layer selection" sections for the full
 //! reasoning.
 //!
+//! **Eyedropper corrected to sample the composite, 2026-08-13**: the
+//! paragraph above described the eyedropper's *original* behaviour, and
+//! it was wrong — it read one texel straight out of the *active layer's
+//! own* tile store surface, so a different, non-active visible layer
+//! sitting above it (any opacity/blend mode), or an active layer that
+//! was simply transparent at the clicked point, made it pick up the
+//! wrong colour: not what the user was actually looking at and clicking
+//! on. `App::sample_eyedropper` now reads `composite_surface_id()`
+//! instead — the same reserved surface `App::redraw`'s own
+//! `recomposite_visible_tiles` keeps current with the real, merged,
+//! bottom-to-top blended document every frame — via the same
+//! document-space -> surface-local conversion, since
+//! `recomposite_visible_tiles`'s own `reference_origin` and
+//! `active_layer_origin` share the identical active-layer-bounds-or-
+//! `(0, 0)` fallback. That shared fallback also means the eyedropper no
+//! longer requires an active layer at all: with none selected, it now
+//! samples the merged document directly at `doc_point`, matching
+//! `Drag::Eyedropper` itself, which never had that precondition.
+//!
 //! **Undo/Redo** (PLAN.md's Undo/Redo bullet): `App` now keeps a live
 //! `history: aurora_doc::History` alongside `layers` (previously built
 //! once in `App::new`, used only to populate the History panel and
@@ -237,10 +283,13 @@
 //! wording, applied to raw pixel data instead of a layer's own scalar
 //! properties) has no home in `aurora_doc::LayerOp`, and `aurora-brush`
 //! can't depend on `aurora-doc` to add one anyway (PRD §7.2's own
-//! layering). `Self::paint_dab`/`Self::erase_dab` now call
-//! `aurora_brush::touched_tiles` before each real write and record the
-//! result into the active `Drag::Brush`/`Drag::Eraser`'s own `stroke`
-//! field; `Self::handle_pointer_released` pushes the completed stroke
+//! layering). `Self::paint_dab`/`Self::erase_dab` hand the active
+//! `Drag::Brush`/`Drag::Eraser`'s own `stroke` field to
+//! `aurora_brush::stamp_dab`/`erase_dab`, which captures each tile as
+//! it acquires it (since 0.55.0 — before that, `App` captured every
+//! tile `aurora_brush::touched_tiles` listed *before* stamping, so a
+//! dab whose paint then failed still left a real but useless undo
+//! entry); `Self::handle_pointer_released` pushes the completed stroke
 //! onto `Self::pixel_history` once the drag ends. `Ctrl+Z`/
 //! `Ctrl+Shift+Z` (`run_command`) checked `pixel_history` first and
 //! fell back to `history` at the time — a real, useful default, but not
@@ -298,8 +347,10 @@
 //! `history`/`undo_order` entirely and calls `LayerTree::set_bounds`
 //! directly, purely for live visual feedback while the pointer is still
 //! down; the actual undo entry is recorded once, retroactively, by a new
-//! `Self::finish_move`, called from `Self::handle_pointer_released` when
-//! the drag ends, via `aurora_doc::History::record_bounds_change` (the
+//! `finish_move`, called (from 0.57.0) through `commit_ending_drag` on
+//! every path that ends a drag rather than only from
+//! `Self::handle_pointer_released`, via
+//! `aurora_doc::History::record_bounds_change` (the
 //! start bounds captured when the drag began, the tree's own current
 //! bounds as the end point) and `UndoOrder::record`, the same coalescing
 //! shape `Self::handle_pointer_released` already used for a completed
@@ -442,7 +493,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aurora_gpu::{GpuContext, GpuSurface};
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
@@ -756,9 +807,9 @@ fn is_aur_path(path: &Path) -> bool {
 /// `layers`' own topmost pixel layer's `bounds` (`(width, height)`), or
 /// `(0, 0)` if there isn't one — the *fallback* [`App::canvas_size`] is
 /// seeded from when nothing else names a real, independent canvas size
-/// for a document (a freshly built [`demo_document`], or one recovered
-/// from an autosave, whose journal has no canvas-size concept of its
-/// own). Once a document is live, `App::canvas_size` is the real source
+/// for a document (a freshly built [`demo_document`]; a recovered
+/// autosave no longer needs it, since its `.aur` manifest carries a
+/// real one). Once a document is live, `App::canvas_size` is the real source
 /// of truth — this is deliberately *not* called again on every save;
 /// see that field's own doc comment for the bug re-deriving it used to
 /// cause.
@@ -771,13 +822,128 @@ fn document_canvas_size(layers: &aurora_doc::LayerTree) -> (u32, u32) {
 
 /// Where a `.aur` export's own "verify by reading it back"
 /// ([`verify_aur`]) keeps its throwaway `aurora_tile::TileStore`
-/// scratch files — deliberately separate from [`tile_store_scratch_dir`]
-/// (the live document's own store): verifying a fresh export must never
-/// touch the live document's real tiles. Not a proper per-platform
-/// app-support directory yet, the same scope this crate's other
-/// `std::env::temp_dir()`-based paths already accept.
-fn aur_verify_scratch_dir() -> PathBuf {
-    std::env::temp_dir().join("aurora-aur-verify")
+/// scratch files: a fresh directory *per call*, created inside
+/// [`tile_store_scratch_dir`]'s per-session one, and returned as the
+/// owning `tempfile::TempDir` so that dropping it deletes the whole
+/// directory and every tile the verification paged into it.
+///
+/// **Per call, not per session, and that is the point.** Verifying an
+/// export builds a brand-new store, whose per-instance filename token
+/// ([`aurora_tile::TileStore`], 0.53.0) makes every tile it writes a
+/// *new* file. A directory shared across calls would therefore
+/// accumulate one full set of paged-out tiles per save, for the life of
+/// the session, with nothing ever deleting them — `TileStore` has no
+/// `Drop` that removes its own files. Returning the `TempDir` binds
+/// that cleanup to the verification's own stack frame instead, so it
+/// happens on every return path, success and failure alike, without
+/// this having to enumerate them.
+///
+/// **Nested under the session directory, not beside it.** Until 0.53.0
+/// this was a *second* fixed, world-readable, cross-process path
+/// (`std::env::temp_dir().join("aurora-aur-verify")`) with exactly the
+/// collision and confidentiality problems the live store's own fixed
+/// path had. Being a child of the session directory means it inherits
+/// its `0o700` mode, its unpredictable name, and its clean-shutdown
+/// removal; verifying a fresh export still never touches the live
+/// document's real tiles.
+///
+/// **It never returns `None` merely because the session directory went
+/// away.** The session directory is a memoized *path*, not a guaranteed
+/// directory: a temp cleaner or a user clearing `/tmp` can delete it
+/// mid-run. This recreates it (owner-only) and, if even that fails,
+/// falls back to an independent temp directory rather than failing —
+/// because failing here reaches [`App::save_aur_file`] as "the export
+/// did not verify", which *deletes the export*. Silently discarding a
+/// professional's save is the worst thing this project can do, so the
+/// degraded case gives up the nesting, not the save.
+fn aur_verify_scratch_dir() -> Option<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("aur-verify-");
+    // Same reasoning as `create_tile_store_scratch_dir`'s own call:
+    // `tempfile` gives temp *directories* plain umask-derived
+    // permissions. The parent is already `0o700`, so this is
+    // belt-and-braces rather than load-bearing -- but it costs one line
+    // and does not depend on the parent for its own correctness.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+
+    if let Some(session) = tile_store_scratch_dir() {
+        // Recreate the session directory if it is gone. It is a *path*
+        // that is memoized, not a directory that is guaranteed to exist:
+        // a temp cleaner sweeping `/tmp`, or a user clearing temp files,
+        // removes it out from under a running session, and
+        // `tempdir_in` against a missing parent just fails. That failure
+        // used to reach `App::save_aur_file` as "verification failed",
+        // which deletes the export it has just written -- so a swept
+        // temp directory silently discarded every subsequent save for
+        // the rest of the run. `recursive(true)` makes this a no-op in
+        // the overwhelmingly common case where the directory is still
+        // there. The live tile store already self-heals this way
+        // (`aurora_tile::TileStore::new` creates its directory on every
+        // open); this is the same property for the verifier.
+        if let Err(err) = create_dir_owner_only(session) {
+            tracing::warn!(
+                ?err,
+                path = %session.display(),
+                "could not recreate this session's scratch directory for .aur verification"
+            );
+        }
+        match builder.tempdir_in(session) {
+            Ok(dir) => return Some(dir),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    path = %session.display(),
+                    "could not nest the .aur verification scratch directory under this session's; \
+                     falling back to an independent one"
+                );
+            }
+        }
+    }
+
+    // Degraded, but never silently: an independent temp directory,
+    // still randomly named, still exclusively created, still `0o700`.
+    // It gives up inheriting the session directory's clean-shutdown
+    // removal -- but this call's own `TempDir` guard is what actually
+    // deletes it, and a verification that cannot run at all is far
+    // worse than one running a directory further out.
+    match builder.tempdir() {
+        Ok(dir) => Some(dir),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to create any scratch directory for the .aur verification store"
+            );
+            None
+        }
+    }
+}
+
+/// Creates `dir` (and any missing parent) owner-only on Unix, and
+/// accepts one that already exists — `aurora_tile`'s own
+/// `create_private_dir` without the hardening checks, which is all this
+/// needs: the only caller ([`aur_verify_scratch_dir`]) is recreating a
+/// directory this process itself created under a random name, not
+/// adopting an arbitrary caller-supplied path.
+///
+/// Windows gets the parent's inherited ACL, the same gap
+/// [`create_autosave_temp`] already discloses.
+#[cfg(unix)]
+fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Non-Unix counterpart of the above — see its doc comment.
+#[cfg(not(unix))]
+fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 /// Reads `path` back as a `.aur` file, against a fresh, throwaway
@@ -789,6 +955,14 @@ fn aur_verify_scratch_dir() -> PathBuf {
 /// manifest, history, and every tile entry it names is itself the
 /// check). `false` (logged) if the scratch store fails to open or
 /// `aurora_io::read_aur` itself fails for any reason.
+///
+/// The scratch directory is a `tempfile::TempDir` bound for the whole
+/// body: it is declared *before* `store`, so on every return path the
+/// store drops first (joining its background writer thread, so no write
+/// can still be in flight) and the directory's own `Drop` then removes
+/// it and everything the verification paged into it. Verifying a large
+/// document evicts real tiles, and before 0.53.0 those files were never
+/// deleted at all.
 #[must_use]
 fn verify_aur(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
@@ -798,7 +972,11 @@ fn verify_aur(path: &Path) -> bool {
     let Some(budget) = std::num::NonZeroUsize::new(16) else {
         unreachable!("16 is non-zero");
     };
-    let mut store = match aurora_tile::TileStore::new(aur_verify_scratch_dir(), budget) {
+    let Some(scratch_dir) = aur_verify_scratch_dir() else {
+        tracing::warn!("no scratch directory for the .aur verification store");
+        return false;
+    };
+    let mut store = match aurora_tile::TileStore::new(scratch_dir.path().to_path_buf(), budget) {
         Ok(store) => store,
         Err(err) => {
             tracing::warn!(?err, "failed to open the .aur verification scratch store");
@@ -881,47 +1059,90 @@ fn replace_document(
 // PLAN.md M1.9's "autosave and recovery" bullet closes that gap: ADR
 // 0009 picked `postcard` for `.aur`'s manifest/history encoding, and
 // `History::save_journal`/`load_journal` now use it. So this section now
-// does two things: writes the current document's journal to a small
-// autosave file every startup ([`write_autosave`]), and — if a previous
-// run's marker is present — tries to read that file back and replay it
+// does two things: writes this session's own document to an autosave
+// file at startup ([`write_autosave`], skipped when recovery just
+// succeeded — see [`startup_document`]), and — if a previous run's
+// marker is present — tries to read that file back
 // ([`recover_document`]), falling back to the fake demo document if
 // there's nothing to recover or it doesn't parse.
 //
 // Still deliberately narrow: recovery is unconditional (there is no
 // "Recover Document" vs. "Discard" choice — the dialog just reports
-// what already happened). A real `.aur` file (ADR 0009's ZIP container,
-// with a manifest and tile data) is separate follow-on work — there's
-// still nothing but the journal to put in one.
+// what already happened).
 //
-// **Re-triggered on live edits, off the calling thread, as of the
-// M1.9 addendum below**: the gap this section used to name here ("no
-// live editing loop yet to re-trigger it") closed once `App` started
-// keeping `history`/`pixel_history` alive and mutating them for real
-// (Undo/Redo, a completed Move, a committed Brush/Eraser stroke — see
-// `App::trigger_autosave`'s own call sites). Re-running [`write_autosave`]
-// itself on every such action would violate CLAUDE.md §7.3.4 (the UI
-// thread never blocks on rendering, extended here to input generally):
-// `history.save_journal()` postcard-serializes an ever-growing journal
-// and `write_autosave` then does a *synchronous* `std::fs::write` of it —
-// direct on the stroke-commit path, that's a growing, unbounded disk-I/O
-// cost stacked on top of a stroke-latency budget already measured at
-// 9.1 ms p99 against a 10 ms ceiling (spike/FINDINGS.md). So live
-// re-triggering goes through [`AutosaveQueue`] instead: the journal is
-// still serialized on the calling thread (cheap, CPU-bound `postcard`
-// encoding, not the I/O the invariant is actually about), but the actual
-// `std::fs::write` happens on `aurora_render::Executor`'s dedicated
-// background thread, and a fast flurry of edits (undo-spamming, a quick
-// brush flurry) coalesces down to one eventual write of the *freshest*
-// journal rather than one queued write per edit — see that type's own
-// doc comment for the coalescing mechanism. [`write_autosave`] itself is
-// unchanged and still used for the one-shot, pre-window-visible startup
-// write and the sail-through document-replacement writes in
-// `App::open_file`/`App::open_aur_file`, neither of which is on a
-// latency-budgeted input path.
+// **The autosave file is a real `.aur` container now** (ADR 0009's ZIP
+// archive: `mimetype` sentinel, `postcard` manifest carrying the whole
+// `LayerTree` *and* the document's own canvas size, the history
+// journal, and one entry per non-blank tile) — written by
+// [`write_autosave`] through `aurora_io::write_aur` and read back by
+// [`recover_document`] through `aurora_io::read_aur`, straight into the
+// live `aurora_tile::TileStore`. Before this, the autosave was raw
+// `postcard` journal bytes: a `LayerOp` sequence and nothing else, so a
+// crash recovered a document's *structure* (layers, bounds, opacity,
+// blend modes) and lost 100% of its actual painted pixels, since
+// nothing in the journal has ever described pixel content
+// (`aurora_brush::PixelHistory`'s own doc comment). Recovery now
+// restores the real painted tiles and the real canvas size too.
+//
+// **Written at lifecycle boundaries only, and that is a deliberate
+// scope reduction.** Between 0.41.0 and 0.48.1 this crate re-triggered
+// the autosave after every committed edit (`App::trigger_autosave`),
+// which was affordable while the file held nothing but a `postcard`
+// journal: encoding it was pure, cheap CPU, and the write itself went
+// to a background thread. Making the file a real `.aur` container
+// changed that completely. `aurora_io::write_aur` walks every pixel
+// layer's own tile grid and calls `TileStore::get` on each in-bounds
+// tile, which can page a tile in from the scratch disk *and* evict
+// another to stay inside the store's budget — real I/O and real LRU
+// churn against the live document's own store, measured at **687 ms**
+// for a 4000x3000, three-layer document on this dev box, and unbounded
+// at the 300,000 x 300,000 px ceiling (§7.3.1). That work cannot be
+// moved off the calling thread: `TileStore` is owned outright by `App`
+// and every tile-touching call site in this crate runs on the UI
+// thread. Making it shareable is the separate, parked
+// `TileStore`-threading redesign (PLAN.md's own "Next action"), not
+// something to do as a side effect here.
+//
+// Rate-gating the trigger was tried first and rejected on review: a
+// gate bounds *how often* a 687 ms stall happens, not whether one ever
+// lands on a stroke-commit path measured at 9.1 ms p99 against a 10 ms
+// budget (spike/FINDINGS.md), and the eviction it causes degrades the
+// *next* strokes too, since a full grid walk pushes exactly the tiles
+// the user is painting on out of the LRU. So the live trigger is gone
+// entirely. `write_autosave` is called at real lifecycle boundaries and
+// nowhere else: a fresh session's startup document (`App::new`, skipped
+// when recovery just succeeded — the file already holds that document)
+// and each document replacement (`App::open_file`/`App::open_aur_file`).
+//
+// **The named limitation, stated plainly**: a crash loses every edit
+// made since the last boundary — every painted pixel *and* every
+// structural change. Against 0.48.1 this is better in one direction
+// (a recovered document now has its real pixels, which it never did
+// before) and worse in another (0.48.1 re-saved structure on every
+// edit, cheaply, because structure was all it saved). Calling it a
+// clean win would be dishonest. What would lift it is the same
+// still-open work either way: an incremental, dirty-tile-only autosave,
+// or a tile store readable from a background thread.
 //
 // Both the marker and the autosave file live in `std::env::temp_dir()`
 // under fixed names — deliberately not a proper per-platform app-support
-// directory (no `directories`-style crate is a dependency yet).
+// directory, a pre-existing choice from when both files held only
+// structure. **That is now a real, if narrow, confidentiality
+// limitation, and it is only half-fixed**: since 0.49.0 the autosave
+// holds the user's actual painted pixels at a predictable path in a
+// world-readable directory. The file itself is created `0o600` on Unix
+// ([`create_autosave_temp`]) and deleted on a clean shutdown
+// ([`remove_autosave`]), which closes the read side there; Windows ACLs
+// are *not* addressed, and neither is the directory choice itself. The
+// real fix for both is the same move to a per-user app-support
+// directory (`directories::ProjectDirs`, already a dependency for
+// [`layout_path`]), which is separate, still-open work rather than
+// something to fold into this change. The *tile scratch directory*, the
+// third temp-directory path this crate used to keep at a fixed name, is
+// no longer one of them: 0.53.0 moved it to a randomly named, `0o700`,
+// per-session directory ([`create_tile_store_scratch_dir`]) removed on a
+// clean shutdown. The marker and the autosave still use fixed temp
+// paths.
 
 /// Where this run's own "I'm still running" marker lives.
 fn marker_path() -> PathBuf {
@@ -959,204 +1180,500 @@ fn clear_session_marker(path: &Path) {
     }
 }
 
-/// Where this run's own autosave journal lives — analogous to
+/// Where this run's own autosave document lives — analogous to
 /// [`marker_path`], and for the same reason not a proper per-platform
-/// app-support directory yet.
+/// app-support directory yet. A real `.aur` container (ADR 0009), not
+/// the raw `postcard` journal this used to be — see this section's own
+/// doc comment.
 fn autosave_path() -> PathBuf {
-    std::env::temp_dir().join("aurora-autosave.postcard")
+    std::env::temp_dir().join("aurora-autosave.aur")
 }
 
-/// Writes `history`'s journal to `path` — call once, early, the same
-/// "errors are logged, not fatal" shape [`write_session_marker`] already
-/// uses: failing to autosave must never stop the application starting.
-fn write_autosave(path: &Path, history: &aurora_doc::History) {
-    match history.save_journal() {
-        Ok(bytes) => {
-            if let Err(err) = std::fs::write(path, bytes) {
-                tracing::warn!(?err, path = %path.display(), "failed to write the autosave journal");
-            }
-        }
-        Err(err) => {
-            tracing::warn!(?err, "failed to serialize the autosave journal");
-        }
-    }
-}
-
-/// Reads and replays the autosave journal at `path`, if one is present
-/// and usable. Returns `None` — not an error — for anything that keeps
-/// this from producing a usable document (no file, unreadable bytes, a
-/// journal `postcard` can't parse, or a journal that fails to replay):
-/// a missing or corrupt autosave means falling back to
-/// [`demo_document`], not failing to start.
-fn recover_document(path: &Path) -> Option<(aurora_doc::LayerTree, aurora_doc::History)> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(?err, path = %path.display(), "failed to read the autosave journal");
-            }
-            return None;
-        }
-    };
-    let history = match aurora_doc::History::load_journal(&bytes) {
-        Ok(history) => history,
-        Err(err) => {
-            tracing::warn!(?err, "failed to deserialize the autosave journal");
-            return None;
-        }
-    };
-    let layers = match history.replay() {
-        Ok(layers) => layers,
-        Err(err) => {
-            tracing::warn!(?err, "failed to replay the recovered autosave journal");
-            return None;
-        }
-    };
-    Some((layers, history))
-}
-
-/// The freshest-not-yet-written state behind [`AutosaveQueue`] — see
-/// that type's own doc comment for how [`AutosaveQueue::enqueue`] uses
-/// it to coalesce a burst of edits into one background write.
-#[derive(Default)]
-struct AutosaveQueueState {
-    /// The most recently serialized journal not yet on disk — `Some`
-    /// means a write is still owed. Each new [`AutosaveQueue::enqueue`]
-    /// call *overwrites* this rather than appending, which is the whole
-    /// coalescing mechanism: only the freshest state a caller ever asked
-    /// to save actually needs to land on disk.
-    pending: Option<Vec<u8>>,
-    /// Whether a background drain closure is currently alive and will
-    /// eventually notice `pending` — guards against
-    /// [`AutosaveQueue::enqueue`] spawning a second one while one is
-    /// already running.
-    draining: bool,
-}
-
-/// Rewrites [`App`]'s autosave journal after a live, document-mutating
-/// action (a completed Move, Undo/Redo, a committed Brush/Eraser stroke)
-/// without adding synchronous disk I/O to whichever call path just
-/// mutated `self.history`/`self.pixel_history` — see this module's own
-/// "crash recovery" section for why that matters (CLAUDE.md §7.3.4, and
-/// the measured 9.1 ms p99 stroke-latency budget in spike/FINDINGS.md).
+/// Writes a complete `.aur` autosave container to `path` — `layers`,
+/// `history`, `canvas_size`, and every non-blank tile currently in
+/// `store` (`aurora_io::write_aur`). Call at a real lifecycle boundary
+/// (startup with a fresh demo document, a document replacement), and
+/// **only** there: this walks every pixel layer's own tile grid and can
+/// page tiles in from the scratch disk, evicting others from `store`'s
+/// LRU to stay inside its budget — measured at 687 ms for a 4000x3000,
+/// three-layer document on this dev box, and unbounded at the
+/// 300,000 px document ceiling. See this section's own doc comment for
+/// why that measurement is exactly what took the live per-edit
+/// re-trigger back out.
 ///
-/// [`Self::enqueue`] always overwrites `state.pending` with the latest
-/// bytes and only spawns a background drain closure
-/// (`aurora_render::Executor::submit`) if one isn't already running.
-/// That closure keeps taking whatever is in `pending` and writing it
-/// until it finds nothing left, so a burst of edits arriving while a
-/// write is already in flight collapses into exactly one more write
-/// after it finishes, not one queued write per edit — the "only the
-/// freshest write matters" coalescing this crate's own M1.9 PLAN.md
-/// bullet calls for, without a separate debounce timer.
+/// Streamed straight into the temp `File` rather than built in memory
+/// first: `aurora_io::write_aur` is generic over `W: Write + Seek`
+/// precisely so a caller need not hold a whole document's compressed
+/// pixel payload as a `Vec<u8>`, which at the documented ceiling is
+/// exactly the "assumes a document fits in memory" that CLAUDE.md
+/// §7.3.1 forbids.
 ///
-/// `Clone`, deliberately: the shared `state` is an `Arc<Mutex<_>>`, so
-/// cloning this is just cloning that handle, not the queued bytes
-/// themselves — [`App`] only ever keeps one, but a test can clone it to
-/// observe `state` after handing the original to a queue-driving call.
-#[derive(Clone)]
-struct AutosaveQueue {
-    /// Always this queue's own fixed autosave path — the same one
-    /// [`write_autosave`]'s callers already pass around, just captured
-    /// once here instead of threaded through every call.
-    path: PathBuf,
-    state: Arc<Mutex<AutosaveQueueState>>,
-}
-
-impl AutosaveQueue {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            state: Arc::new(Mutex::new(AutosaveQueueState::default())),
-        }
-    }
-
-    /// Queues `bytes` (an already-serialized journal — see
-    /// [`App::trigger_autosave`]) to be written to this queue's own
-    /// path on `executor`'s background thread. Never blocks the
-    /// caller: the lock below is only ever held for a short, non-I/O
-    /// critical section (an `Option` swap and a `bool` check/set), and
-    /// [`aurora_render::Executor::submit`] itself doesn't block either.
-    fn enqueue(&self, executor: &mut aurora_render::Executor, bytes: Vec<u8>) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(err) => {
-                // A previous drain closure panicked mid-write and
-                // poisoned the lock -- the same "a panicking submitted
-                // task silently kills the background thread's loop"
-                // limitation `Executor`'s own doc comment already
-                // accepts, not new failure machinery this queue invents.
-                tracing::warn!(?err, "autosave queue lock poisoned; dropping this write");
-                return;
-            }
-        };
-        state.pending = Some(bytes);
-        if state.draining {
-            // A drain closure is already alive and will pick up these
-            // fresher bytes itself once it loops back around -- see the
-            // closure body below.
-            return;
-        }
-        state.draining = true;
-        // Dropped before `executor.submit` below so the background
-        // closure's own first lock attempt can't deadlock against this
-        // one.
-        drop(state);
-
-        let path = self.path.clone();
-        let state_handle = Arc::clone(&self.state);
-        executor.submit(move || {
-            loop {
-                let bytes = {
-                    let Ok(mut state) = state_handle.lock() else {
-                        return;
-                    };
-                    let Some(bytes) = state.pending.take() else {
-                        // Nothing arrived while the last write was in
-                        // flight -- this drain loop is done; the next
-                        // `enqueue` call will see `draining == false`
-                        // and start a fresh one.
-                        state.draining = false;
-                        return;
-                    };
-                    bytes
-                };
-                if let Err(err) = std::fs::write(&path, bytes) {
-                    tracing::warn!(?err, path = %path.display(), "failed to write the autosave journal");
-                }
-            }
-        });
-    }
-}
-
-/// Re-serializes `history`'s journal and re-queues it on `queue` — the
-/// live-editing counterpart to [`write_autosave`]'s one-shot write. A
-/// free function, deliberately, the same "pure logic, no `App`/window
-/// needed" shape every other free function in this crate's command-
-/// dispatch section already uses (see that section's own doc comment):
-/// [`App::trigger_autosave`] is its real, `self`-based caller, but
-/// keeping the actual work here lets a test exercise the exact same
-/// code path with a locally built [`aurora_render::Executor`]/
-/// [`AutosaveQueue`]/[`aurora_doc::History`] instead of a live `App`,
-/// which this sandbox has no window/`EventLoopProxy`/display server to
-/// construct (see the "Command dispatch" section's own doc comment for
-/// why that constraint already shapes every other testable function
-/// here). A serialization failure is logged, not fatal, the same
-/// discipline [`write_autosave`] already applies to its own
-/// `save_journal` call.
-fn queue_autosave(
-    executor: &mut aurora_render::Executor,
-    queue: &AutosaveQueue,
+/// Written to a **unique** sibling temp path and `rename`d into place,
+/// so a crash *during* an autosave can't leave a half-written container
+/// where the previous, complete one used to be — the same
+/// write-to-temp-then-swap discipline [`write_verified`]/
+/// [`App::save_aur_file`] already apply to a user's real file.
+/// (`std::fs::rename` replaces an existing destination file on Windows
+/// as well as on Unix — `MOVEFILE_REPLACE_EXISTING` — so the swap is
+/// the same one operation on every platform this ships to.)
+/// Deliberately *not* verified by reopening the way an explicit "Save
+/// As" is ([`verify_aur`]): that roughly doubles a cost this path is
+/// already trying to keep off the user's way, and is the right trade
+/// for a file the user asked for, not for a background autosave.
+///
+/// Errors are logged, never fatal — the same shape
+/// [`write_session_marker`] already uses: failing to autosave must
+/// never stop the application starting or interrupt an edit.
+///
+/// **A knowingly incomplete result never lands on `path`.** A write that
+/// had to skip tiles is renamed to [`partial_autosave_path`] instead, and
+/// whatever complete autosave already exists is left exactly where it is;
+/// a complete write lands on `path` and deletes any partial left over
+/// from before. Crash-recovery protection is therefore monotonic — a
+/// snapshot is only ever replaced by one at least as good — which the
+/// first shape of the best-effort change got wrong: it renamed the
+/// degraded result over the single fixed [`autosave_path`], so a document
+/// that already had a complete autosave lost it the moment the scratch
+/// disk went bad.
+///
+/// **One unreadable tile no longer costs the whole document its
+/// crash-recovery protection** (0.52.2). This goes through
+/// `aurora_io::write_aur_best_effort`, which leaves a tile it cannot page
+/// in out of the container and names it, rather than `write_aur`, which
+/// refuses the entire write. The explicit Save/Export path
+/// ([`App::save_aur_file`], `composite_document`) still refuses, and that
+/// difference is deliberate: a deliberate user action on a user's own
+/// file must not quietly write incomplete content, while an automatic
+/// background snapshot the user never asked for and cannot see fail has
+/// nothing better to offer than "protect what is still readable". It is
+/// the same split `recomposite_visible_tiles` (degrades, repaints) and
+/// `composite_document` (refuses) already draw for the live canvas.
+/// Since 0.52.2 an unreadable tile fails on *every* read rather than
+/// healing into a blank one, so without this one bad tile would have
+/// aborted every autosave for the rest of the session — every other
+/// layer, every subsequent edit, silently unprotected.
+fn write_autosave(
+    path: &Path,
+    layers: &aurora_doc::LayerTree,
     history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    store: &mut aurora_tile::TileStore,
 ) {
-    match history.save_journal() {
-        Ok(bytes) => queue.enqueue(executor, bytes),
-        Err(err) => {
+    let temp_path = autosave_temp_path(path);
+    let Some(mut file) = create_autosave_temp(&temp_path) else {
+        return;
+    };
+    // `profile: None`, the same reason [`App::save_aur_file`] already
+    // passes it: no colour-management UI exists to have set a document
+    // profile in the first place, so there is nothing real to embed.
+    //
+    // `write_aur_best_effort`, not `write_aur` -- see this function's own
+    // doc comment for why an autosave is the one caller that degrades
+    // rather than refusing.
+    // Where this write is allowed to land, decided by whether it turned
+    // out to be complete -- see this function's own doc comment.
+    let destination;
+    match aurora_io::write_aur_best_effort(&mut file, layers, history, canvas_size, None, store) {
+        Ok(skipped) if skipped.is_empty() => {
+            destination = path.to_path_buf();
+        }
+        Ok(skipped) => {
+            // Loud, and every time: the file about to be written is
+            // knowingly incomplete, which is exactly the thing that must
+            // never be silent. The first one is named in full; the count
+            // covers the rest without turning a broken scratch disk into
+            // an unbounded log.
+            let first = skipped
+                .first()
+                .map_or_else(String::new, |tile| format!("{tile:?}"));
+            destination = partial_autosave_path(path);
             tracing::warn!(
-                ?err,
-                "failed to serialize the autosave journal for a live edit"
+                skipped = skipped.len(),
+                %first,
+                path = %destination.display(),
+                "autosaving with tiles missing to the *partial* autosave path; the last complete \
+                 autosave is left in place"
             );
         }
+        Err(err) => {
+            tracing::warn!(?err, path = %temp_path.display(), "failed to write the autosave container");
+            drop(file);
+            remove_autosave_temp(&temp_path);
+            return;
+        }
+    }
+    // Before the rename, not after: a `rename` of a file whose contents
+    // are still only in the page cache is exactly how a power loss
+    // leaves a correctly named, empty autosave in place of the real one.
+    if let Err(err) = file.sync_all() {
+        tracing::warn!(?err, path = %temp_path.display(), "failed to flush the autosave container");
+        drop(file);
+        remove_autosave_temp(&temp_path);
+        return;
+    }
+    drop(file);
+    if let Err(err) = std::fs::rename(&temp_path, &destination) {
+        tracing::warn!(?err, path = %destination.display(), "failed to swap the autosave container into place");
+        remove_autosave_temp(&temp_path);
+        return;
+    }
+    // A complete snapshot supersedes any partial one: leaving a stale
+    // partial around is how an *older*, lossy snapshot could later
+    // resurface as if it were current.
+    if destination == path {
+        remove_partial_autosave(path);
+    }
+}
+
+/// Where a *knowingly incomplete* autosave goes — a sibling of `path`,
+/// never `path` itself.
+///
+/// The distinction is the whole point (0.52.2, second review round).
+/// Best-effort autosaving means a write can succeed while quietly
+/// dropping tiles the scratch disk could no longer supply, and the
+/// original shape of that change renamed the result over the single
+/// fixed [`autosave_path`] regardless — so a document that already had a
+/// **complete** autosave lost it to a degraded one the moment the
+/// scratch disk went bad, with nothing left to recover the dropped
+/// content from. Crash-recovery protection has to be monotonic: a
+/// snapshot may only ever be replaced by one at least as good.
+fn partial_autosave_path(path: &Path) -> PathBuf {
+    path.with_extension("partial.aur")
+}
+
+/// Deletes the partial autosave beside `path`, if there is one. A
+/// missing file is not an error; anything else is logged, never fatal.
+fn remove_partial_autosave(path: &Path) {
+    let partial = partial_autosave_path(path);
+    if let Err(err) = std::fs::remove_file(&partial)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %partial.display(), "failed to remove the partial autosave");
+    }
+}
+
+/// A temp path beside `path`, unique per process **and** per call —
+/// `<name>.<pid>.<n>.tmp`.
+///
+/// Not cosmetic: a single fixed `.tmp` name is shared state between
+/// every writer that exists, and two writers landing on it interleave
+/// their bytes and destroy the crash-recovery file with no crash
+/// involved. Two Aurora processes are enough on their own (both use the
+/// same fixed [`autosave_path`]), and any future concurrent writer
+/// inside one process would be too — cheaper to make impossible here
+/// than to re-derive the argument every time a call site moves.
+fn autosave_temp_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("aurora-autosave.aur"),
+        std::ffi::OsStr::to_os_string,
+    );
+    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Creates `temp_path` for a fresh autosave write, owner-only where the
+/// platform lets this crate say so. `None` (logged) if it can't be
+/// created — including because it already exists, which
+/// [`autosave_temp_path`]'s own uniqueness makes a real signal rather
+/// than an expected collision.
+///
+/// **The permissions matter here.** Both this file and the autosave it
+/// becomes live in `std::env::temp_dir()`, a world-readable directory
+/// on a shared Unix machine, at a predictable name — and since 0.49.0
+/// they hold the document's real painted pixels, not just its layer
+/// structure. `0o600` closes the read side of that on Unix. Windows
+/// ACLs are *not* addressed here: `OpenOptions` has no portable
+/// equivalent, and the real fix for both is the same one — moving this
+/// file out of the temp directory into a proper per-user app-support
+/// directory, the pre-existing pattern [`marker_path`] shares and
+/// separate, still-open work.
+fn create_autosave_temp(temp_path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(temp_path) {
+        Ok(file) => Some(file),
+        Err(err) => {
+            tracing::warn!(?err, path = %temp_path.display(), "failed to create the autosave temp file");
+            None
+        }
+    }
+}
+
+/// Removes a leftover autosave temp file after a failed write/rename —
+/// a missing one is not an error (the write may never have created it),
+/// and any other failure is logged rather than propagated, since this
+/// is already the cleanup path of something that failed.
+fn remove_autosave_temp(temp_path: &Path) {
+    if let Err(err) = std::fs::remove_file(temp_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %temp_path.display(), "failed to remove the autosave temp file");
+    }
+}
+
+/// Deletes this session's own autosave container on a clean shutdown —
+/// the same lifecycle point [`clear_session_marker`] runs at, and for
+/// the same reason: once this run has ended cleanly there is nothing
+/// left to recover, and leaving a file full of the user's real pixels
+/// sitting at a predictable path in a shared temp directory is a
+/// confidentiality cost with no remaining benefit. A missing file is
+/// not an error; any other failure is logged, never fatal.
+fn remove_autosave(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %path.display(), "failed to remove this session's autosave");
+    }
+    // Both files, for the same confidentiality reason and so a partial
+    // snapshot from this session can never resurface in a later one.
+    remove_partial_autosave(path);
+}
+
+/// Reads the `.aur` autosave container at `path`, if one is present and
+/// usable, writing its tiles straight into `store` and returning the
+/// restored `LayerTree`/`History` plus the document's own real canvas
+/// size. Returns `None` — not an error — for anything that keeps this
+/// from producing a usable document (no file, unreadable bytes, a
+/// truncated or corrupt ZIP, a missing manifest/history entry, an
+/// unsupported manifest version, or a tile entry that won't decode): a
+/// missing or corrupt autosave means falling back to [`demo_document`],
+/// not failing to start.
+///
+/// **Startup-only, in practice.** The one caller is [`App::new`], before
+/// any painting has happened, so writing recovered tiles directly into
+/// the live store can't clobber pixels the user is working on. Calling
+/// this mid-session would need more thought than just a fresh call site
+/// — the recovered surfaces would overwrite whatever those same
+/// `SurfaceId`s currently hold.
+fn recover_document(
+    path: &Path,
+    store: &mut aurora_tile::TileStore,
+) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+    // A complete autosave always wins, even if a partial one is newer
+    // (0.52.2, second review round). The partial file exists only for
+    // the case where the scratch disk went bad before any complete
+    // snapshot could be written; preferring it over a complete one would
+    // trade known-good content for a few more recent edits on the layers
+    // that still happened to be readable, which is the wrong side of
+    // that trade for a crash-recovery file. `write_autosave` deletes any
+    // partial as soon as a complete write lands, and
+    // [`remove_autosave`] deletes both on a clean shutdown, so a stale
+    // partial cannot linger to be picked up here later.
+    //
+    // A canonical file that exists but does not read back is handled one
+    // level up, by [`recover_partial_after_a_failed_read`] -- it needs
+    // the tile store replaced between the two attempts, which needs the
+    // slot this function does not have.
+    if !path.exists() {
+        let partial = partial_autosave_path(path);
+        if !partial.exists() {
+            return None;
+        }
+        tracing::warn!(
+            path = %partial.display(),
+            "no complete autosave; recovering from a partial one, which is missing whatever tiles \
+             the scratch disk could not supply when it was written"
+        );
+        return read_autosave_container(&partial, store);
+    }
+    read_autosave_container(path, store)
+}
+
+/// Reads the partial autosave beside `path` after the canonical
+/// container was found and *failed* to read back — corruption, a
+/// missing entry, an unsupported version, an undecodable tile. Without
+/// this, keeping a partial snapshot protected nothing in precisely the
+/// case it exists for: [`recover_document`] only reaches the partial
+/// when the canonical file is absent, so a corrupt one shadowed it
+/// completely.
+///
+/// **The store is replaced first**, the same reopen (and for the same
+/// reason) [`startup_document`] already performs after a failed
+/// recovery: `aurora_io::read_aur` writes each tile into the store as it
+/// goes, so an attempt that fails partway through leaves real pixels
+/// behind on surfaces the partial container's own layers are about to
+/// claim. Recovering *into* those leftovers would show fragments of the
+/// container that failed to read, mixed into the document that
+/// succeeded. This takes `&mut Option<_>` for exactly that reason —
+/// `None` from [`open_tile_store`] means the session simply continues
+/// without painting, which is what `None` already means everywhere else
+/// on this path.
+fn recover_partial_after_a_failed_read(
+    path: &Path,
+    store_slot: &mut Option<aurora_tile::TileStore>,
+) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+    let partial = partial_autosave_path(path);
+    if !partial.exists() {
+        return None;
+    }
+    *store_slot = open_tile_store();
+    let store = store_slot.as_mut()?;
+    tracing::warn!(
+        path = %partial.display(),
+        "the complete autosave could not be read; falling back to the partial one, which is \
+         missing whatever tiles the scratch disk could not supply when it was written"
+    );
+    read_autosave_container(&partial, store)
+}
+
+/// [`recover_document`]'s own single-file half: opens and reads one
+/// `.aur` container, with every failure answered by `None` rather than
+/// an error. Split out so the complete-vs-partial choice above reads as
+/// the policy it is.
+fn read_autosave_container(
+    path: &Path,
+    store: &mut aurora_tile::TileStore,
+) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(?err, path = %path.display(), "failed to open the autosave container");
+            }
+            return None;
+        }
+    };
+    // The profile (4th element) is discarded for the same honest reason
+    // `App::open_aur_file` discards its own: nothing in this crate yet
+    // tracks a "current document profile" to restore it into, because no
+    // colour-management UI exists to have set one -- and an autosave this
+    // crate wrote always carries `None` anyway ([`write_autosave`]).
+    match aurora_io::read_aur(file, store) {
+        Ok((layers, history, canvas_size, _profile)) => Some((layers, history, canvas_size)),
+        Err(err) => {
+            tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
+            None
+        }
+    }
+}
+
+/// What [`App::new`] starts this session with — see
+/// [`startup_document`], which is the only thing that builds one.
+struct StartupDocument {
+    layers: aurora_doc::LayerTree,
+    history: aurora_doc::History,
+    /// The recovered document's own real canvas size (its `.aur`
+    /// manifest carries one), or [`document_canvas_size`]'s fallback for
+    /// a [`demo_document`], which has none of its own.
+    canvas_size: (u32, u32),
+    /// Whether this really came from an autosave — what the
+    /// crash-recovery dialog's own message reports
+    /// ([`crash_recovery_dialog_message`]).
+    was_recovered: bool,
+}
+
+/// Resolves the document [`App::new`] opens with: a crash-recovered one
+/// if the previous run left a marker behind *and* its autosave container
+/// reads back ([`recover_document`]), otherwise [`demo_document`].
+/// A *fresh* document is written straight back out as this session's
+/// own autosave ([`write_autosave`]), so the next run has something
+/// real to recover to; a *recovered* one is not, since the file it came
+/// from already holds exactly those bytes.
+///
+/// A clean shutdown never needs its own autosave read back, and skipping
+/// the attempt means an autosave file left over from a much older,
+/// already-recovered-from crash can't resurface later — hence
+/// `had_previous_marker` gating the read.
+///
+/// `store_slot` empty (no live tile store — painting is already
+/// disabled for the session, see [`open_tile_store`]) skips both
+/// halves, logged: there would be nowhere to put recovered pixels and
+/// nothing real to put in a container, and a structure-only autosave is
+/// exactly what this path stopped writing. It is taken as
+/// `&mut Option<_>` rather than `Option<&mut _>` so a *failed* recovery
+/// can replace the store outright — see the reopen below for why that
+/// matters.
+fn startup_document(
+    had_previous_marker: bool,
+    autosave_path: &Path,
+    store_slot: &mut Option<aurora_tile::TileStore>,
+) -> StartupDocument {
+    let fresh = || {
+        let (layers, history) = demo_document();
+        let canvas_size = document_canvas_size(&layers);
+        (layers, history, canvas_size)
+    };
+    if store_slot.is_none() {
+        tracing::warn!("no live tile store; skipping crash recovery and this session's autosave");
+        let (layers, history, canvas_size) = fresh();
+        return StartupDocument {
+            layers,
+            history,
+            canvas_size,
+            was_recovered: false,
+        };
+    }
+    let recovered = match (had_previous_marker, store_slot.as_mut()) {
+        (true, Some(store)) => recover_document(autosave_path, store),
+        _ => None,
+    };
+    // A canonical container that *exists* but does not read back is
+    // exactly the case a partial snapshot is kept for -- corruption --
+    // and [`recover_document`] cannot try it on its own, because
+    // recovering from the partial needs the store replaced first and only
+    // this function owns the slot to replace. When the canonical file is
+    // simply absent, `recover_document` has already tried the partial and
+    // this must not re-read it.
+    let recovered = match recovered {
+        Some(document) => Some(document),
+        None if had_previous_marker && autosave_path.exists() => {
+            recover_partial_after_a_failed_read(autosave_path, store_slot)
+        }
+        None => None,
+    };
+    if let Some((layers, history, canvas_size)) = recovered {
+        // Nothing written back out: the file on disk *is* this
+        // document, read back a few lines ago and not touched since.
+        // Rewriting it here would be a full container rebuild (see
+        // [`write_autosave`]'s own measured cost) for a byte-identical
+        // result, on the pre-window startup path, against a <3 s startup
+        // budget (PRD §6). The fresh-document case below still writes,
+        // because there the file either doesn't exist or describes some
+        // older session's document. Even that one could move off the
+        // pre-window path in later work if startup measurement ever says
+        // it needs to; it isn't turned into a background task now on
+        // speculation.
+        return StartupDocument {
+            layers,
+            history,
+            canvas_size,
+            was_recovered: true,
+        };
+    }
+    if had_previous_marker {
+        // A recovery attempt that failed can still have committed real
+        // pixels: `aurora_io::read_aur` writes each tile into the store
+        // as it goes, so a container whose central directory is intact
+        // but whose *last* tile entry is corrupt leaves earlier
+        // surfaces already populated before it returns `Err`. Those are
+        // the same `SurfaceId`s [`demo_document`]'s own fresh layers are
+        // about to claim, so keeping the store would show the user
+        // fragments of the document that failed to recover, painted
+        // into a document that has nothing to do with it. A fresh store
+        // starts with no resident and no paged-out tiles, which is the
+        // whole fix; if reopening itself fails, the session simply
+        // continues without painting, exactly as
+        // [`open_tile_store`]'s own `None` already means.
+        *store_slot = open_tile_store();
+    }
+    let (layers, history, canvas_size) = fresh();
+    if let Some(store) = store_slot.as_mut() {
+        write_autosave(autosave_path, &layers, &history, canvas_size, store);
+    } else {
+        tracing::warn!("no live tile store; skipping this session's autosave");
+    }
+    StartupDocument {
+        layers,
+        history,
+        canvas_size,
+        was_recovered: false,
     }
 }
 
@@ -2468,6 +2985,14 @@ fn handle_key(
         // Only Undo/Redo can change what a composite tile shows -- see
         // `App::run_undo_redo`'s own matching bump for the command-
         // palette/menu path to the same two commands.
+        //
+        // And that split is a disclosed, still-open gap, not a detail:
+        // `Ctrl+Z`/`Ctrl+Shift+Z` runs Undo/Redo *here*, inline, so it
+        // reaches neither half of `perform_undo_redo` -- no commit of a
+        // live stroke before the undo, and no pan re-clamp after an
+        // undone Move. See PLAN.md's own residual disclosure (0.57.7)
+        // before editing this branch; closing it is a change to this
+        // function's contract, not a line here.
         if matches!(command, AppCommand::Undo | AppCommand::Redo) {
             composite_cache.bump();
         }
@@ -2765,12 +3290,25 @@ enum Drag {
         /// honesty rather than picking an arbitrary placeholder
         /// `SurfaceId`.
         stroke: Option<aurora_brush::StrokeSnapshot>,
+        /// Tiles this stroke has already logged a page-in failure for.
+        ///
+        /// A corrupt tile fails *every* dab for the rest of the drag, so
+        /// collapsing the log to one line per dab (0.55.0) still left a
+        /// ~600 px drag across one broken tile emitting ~100 identical
+        /// warnings. This dedupes across the whole stroke instead: one
+        /// line per broken tile, per stroke. It lives on the drag rather
+        /// than on `App` so its lifetime is exactly the stroke's by
+        /// construction — a new drag cannot inherit a stale set, and no
+        /// caller has to remember to clear it.
+        warned: std::collections::HashSet<aurora_tile::TileId>,
     },
     Eraser {
         last_doc: (f32, f32),
         carry: f32,
         /// Same as `Drag::Brush`'s own `stroke` field, above.
         stroke: Option<aurora_brush::StrokeSnapshot>,
+        /// Same as `Drag::Brush`'s own `warned` field, above.
+        warned: std::collections::HashSet<aurora_tile::TileId>,
     },
     Move {
         layer_id: aurora_doc::LayerId,
@@ -2779,6 +3317,230 @@ enum Drag {
         current_bounds: aurora_core::Rect,
     },
     Eyedropper,
+}
+
+/// The active `Drag::Brush`'s own accumulated stroke snapshot, if there
+/// is one — `None` for any other drag (including a `Drag::Eraser`, which
+/// has its own snapshot and its own accessor), for a `Drag::Brush` that
+/// began with no real active pixel layer to paint into, and for no drag
+/// at all.
+///
+/// A free function over `&mut Option<Drag>` rather than an `&mut self`
+/// method on purpose: [`App::paint_dab`] needs this *and* `self.tile_store`
+/// borrowed at the same time, and a `&mut self` helper would borrow all
+/// of `App`. Extracted in 0.56.0 so the variant-matching itself is
+/// testable headlessly, with no `App` (and therefore no GPU) to build.
+fn brush_stroke_mut(drag: &mut Option<Drag>) -> Option<&mut aurora_brush::StrokeSnapshot> {
+    match drag {
+        Some(Drag::Brush { stroke, .. }) => stroke.as_mut(),
+        _ => None,
+    }
+}
+
+/// [`brush_stroke_mut`]'s eraser counterpart, on exactly the same terms:
+/// a `Drag::Eraser`'s own snapshot only, never a `Drag::Brush`'s.
+fn eraser_stroke_mut(drag: &mut Option<Drag>) -> Option<&mut aurora_brush::StrokeSnapshot> {
+    match drag {
+        Some(Drag::Eraser { stroke, .. }) => stroke.as_mut(),
+        _ => None,
+    }
+}
+
+/// The failures in `outcome` this stroke hasn't already logged, marking
+/// each one logged as it goes — so one permanently broken tile costs one
+/// warning per stroke rather than one per dab.
+///
+/// 0.55.0 collapsed the log from one line per failing *tile* to one per
+/// *dab*, which is not where the flood actually comes from: a corrupt
+/// tile fails every dab for the rest of the drag, so a ~600 px drag
+/// across one still emitted ~100 identical lines. Nothing is dropped —
+/// the *first* failure on each tile is always reported, and a second
+/// broken tile later in the same stroke gets its own line.
+///
+/// Allocates nothing on the overwhelmingly common path (a dab that
+/// failed on no tile at all returns an empty `Vec`, which does not
+/// allocate).
+fn unwarned_failures<'a>(
+    drag: &mut Option<Drag>,
+    outcome: &'a aurora_brush::DabOutcome,
+) -> Vec<(aurora_tile::TileId, &'a aurora_tile::TileError)> {
+    if outcome.is_complete() {
+        return Vec::new();
+    }
+    let all = || {
+        outcome
+            .failed()
+            .iter()
+            .map(|(tile, err)| (*tile, err))
+            .collect()
+    };
+    let Some(Drag::Brush { warned, .. } | Drag::Eraser { warned, .. }) = drag else {
+        // No stroke to remember them in. Unreachable in practice (only
+        // a brush/eraser drag reaches a dab at all), but under-reporting
+        // a scratch-disk failure is the wrong way to be wrong about it.
+        return all();
+    };
+    outcome
+        .failed()
+        .iter()
+        .filter(|(tile, _)| warned.insert(*tile))
+        .map(|(tile, err)| (*tile, err))
+        .collect()
+}
+
+/// Records a completed `Drag::Move` as a single undo step, from
+/// `start_bounds` to wherever `layer_id` actually ended up — already
+/// applied, live, by every [`App::apply_move`] call during the drag —
+/// via `aurora_doc::History::record_bounds_change`, which journals the
+/// move without re-applying it (the tree already reflects it). Called
+/// once, from [`commit_ending_drag`], when the drag that just ended was
+/// a `Drag::Move`.
+///
+/// A no-op if the layer never actually ended up anywhere different
+/// (`start_bounds` still matches its current bounds — e.g. a click that
+/// started and ended a drag with no real pointer movement, or `layer_id`
+/// no longer exists at all): nothing for a later undo to meaningfully
+/// reverse. A real, logged failure otherwise is worth a warning, the
+/// same discipline [`App::apply_move`] already uses.
+///
+/// A free function over the four pieces of state it actually needs
+/// rather than an `&mut self` method (0.57.0), for the same reason
+/// [`brush_stroke_mut`] is one: it makes the behaviour testable without
+/// an `App`, which needs a real window and GPU surface to construct.
+fn finish_move(
+    layers: &aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+    layer_id: aurora_doc::LayerId,
+    start_bounds: aurora_core::Rect,
+) {
+    if layers.bounds(layer_id) == Some(start_bounds) {
+        return;
+    }
+    match history.record_bounds_change(layers, layer_id, start_bounds) {
+        Ok(()) => undo_order.record(UndoKind::Structural, history, pixel_history),
+        Err(err) => tracing::warn!(?err, "failed to record the completed move"),
+    }
+}
+
+/// Commits a drag that is ending — for whatever reason — into the undo
+/// state its own kind belongs in: a `Drag::Brush`/`Drag::Eraser`
+/// carrying a real `stroke` becomes a `PixelHistory` entry (and, if
+/// `PixelHistory::push` reports it recorded something, an entry in
+/// `undo_order`'s own unified sequence); a `Drag::Move` is coalesced
+/// into one structural entry by [`finish_move`]. Every other variant,
+/// and `None`, is a no-op — a pan, a marquee, an eyedropper sample and
+/// "no drag at all" have nothing to commit.
+///
+/// **The only place a stroke becomes undoable, and it is called from
+/// every path that ends one** (0.57.0). This logic used to live inside
+/// [`App::handle_pointer_released`], which is not the only way a drag
+/// ends: [`App::handle_pointer_pressed`] overwrote `App::drag`
+/// unconditionally, and the `CursorLeft` handler cleared it outright.
+/// So pressing the middle button to pan mid-stroke, pressing the right
+/// button mid-stroke, or simply dragging the cursor off the window edge
+/// — all routine gestures — dropped a live `Drag::Brush` whose pixels
+/// were already on the layer, and no undo entry was ever pushed for
+/// them. The next `Ctrl+Z` then undid the *previous* stroke: strictly
+/// worse than the phantom entry 0.56.0 removed, because a phantom entry
+/// at least did nothing, while this silently mis-targeted a real edit.
+///
+/// `Drag::Move` is handled here too, not only in the release path. It
+/// is the same extraction, not extra scope: leaving it behind would
+/// have left `handle_pointer_pressed` and `CursorLeft` dropping a live
+/// `Drag::Move`'s coalesced undo entry in exactly the way this function
+/// exists to stop, with the layer already repositioned on screen.
+///
+/// The two document-replacement sites (`App::open_file`'s flat-image
+/// path and `App::open_aur_file`) deliberately do *not* call this. They
+/// clear `drag` as part of replacing `layers`/`history`/`pixel_history`
+/// wholesale with the newly opened document's own; committing the
+/// outgoing stroke there would push an entry onto a `PixelHistory` that
+/// is discarded two lines later, and — worse — one whose captured tiles
+/// name a surface belonging to a document that is no longer open.
+/// Dropping it is correct there, and it is the only place dropping one
+/// is.
+///
+/// **Takes `view`/`active_layer` because committing a `Drag::Move` is
+/// one of the two ways the pan boundary moves** (the other is the
+/// active layer itself changing — [`select_layer`]). A Move rewrites
+/// the layer's own `bounds` (`App::apply_move`), and the pan bound is
+/// measured against exactly that origin ([`active_layer_origin`]), so a
+/// finished Move can leave a pan that never moved sitting outside its
+/// own bound — the same `(-300, -150)` `canvas_local_origin` divergence
+/// [`clamp_pan_to_active_layer`] describes. Re-establishing it *here*,
+/// rather than in each of the three callers, is what stops the next
+/// path that ends a drag from silently reopening it — the same reason
+/// the commit itself lives in one shared place.
+///
+/// Only at the commit, deliberately not per pointer-move event:
+/// `continue_drag`'s own `Drag::Move` arm derives its delta from a
+/// *fixed* `start_doc` through `view.to_document`, so clamping the view
+/// mid-drag would feed the moved view back into the next event's delta
+/// and chase itself. At the commit there is no drag left in progress,
+/// so there is no loop to close. The cost is a transient violation for
+/// the duration of the drag itself: the canvas can render clamped while
+/// `to_document` does not agree, which is a visual artefact under the
+/// pointer that is *not* being used to paint (a `Drag::Move` is not a
+/// `Drag::Brush`), and it is resolved by this clamp the moment the drag
+/// ends.
+#[allow(clippy::too_many_arguments)]
+fn commit_ending_drag(
+    drag: Option<Drag>,
+    layers: &aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+    view: &mut aurora_ui::CanvasView,
+    active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(f32, f32)>,
+) {
+    match drag {
+        Some(
+            Drag::Brush {
+                stroke: Some(stroke),
+                ..
+            }
+            | Drag::Eraser {
+                stroke: Some(stroke),
+                ..
+            },
+        ) => {
+            // `push`'s own `bool` is what tells "a real stroke happened"
+            // apart from "a click that never touched a tile" without
+            // asking the snapshot itself.
+            if pixel_history.push(stroke) {
+                undo_order.record(UndoKind::Pixel, history, pixel_history);
+            }
+        }
+        Some(Drag::Move {
+            layer_id,
+            start_bounds,
+            ..
+        }) => {
+            finish_move(
+                layers,
+                history,
+                pixel_history,
+                undo_order,
+                layer_id,
+                start_bounds,
+            );
+            // The move is over, `layers` already carries the new
+            // bounds, and no drag is in progress -- see this function's
+            // own doc comment for why the clamp belongs at exactly this
+            // point and nowhere earlier. Clamped against the *active*
+            // layer, not this drag's own `layer_id`: the pan bound is
+            // defined by whichever layer is active, and those are the
+            // same layer for every move a user can actually start
+            // (`begin_drag` takes `Move`'s id from `active_pixel_layer`)
+            // -- so this is the definition, spelled out, rather than a
+            // second source of truth that could drift from it.
+            clamp_pan_to_active_layer(view, layers, active_layer, canvas_size);
+        }
+        _ => {}
+    }
 }
 
 /// Starts a drag for `tool`/`button` at `canvas_point` (already
@@ -2790,8 +3552,10 @@ enum Drag {
 ///
 /// `Brush`/`Eraser`/`Eyedropper` start unconditionally on a primary
 /// click, regardless of whether there's actually anywhere to
-/// paint/erase/sample (a live store, an active layer) — that check
-/// happens where the real pixel work does
+/// paint/erase/sample (a live store, and — for `Brush`/`Eraser` only —
+/// an active pixel layer; `Eyedropper` samples the composited document
+/// and needs no active layer at all) — that check happens where the
+/// real pixel work does
 /// (`App::paint_dab`/`App::erase_dab`/`App::sample_eyedropper`),
 /// keeping this function pure and not needing to know about either.
 /// `Move` is the one drag that *does* need to know up front —
@@ -2822,12 +3586,14 @@ fn begin_drag(
             carry: 0.0,
             stroke: active_pixel_layer
                 .map(|(id, _)| aurora_brush::StrokeSnapshot::new(surface_id_for(id))),
+            warned: std::collections::HashSet::new(),
         }),
         (aurora_ui::Tool::Eraser, PointerButton::Primary) => Some(Drag::Eraser {
             last_doc: view.to_document(canvas_point),
             carry: 0.0,
             stroke: active_pixel_layer
                 .map(|(id, _)| aurora_brush::StrokeSnapshot::new(surface_id_for(id))),
+            warned: std::collections::HashSet::new(),
         }),
         (aurora_ui::Tool::Move, PointerButton::Primary) => {
             let (layer_id, bounds) = active_pixel_layer?;
@@ -2877,26 +3643,30 @@ fn begin_drag(
 /// always returns an empty `Vec` too; the caller samples directly at
 /// `canvas_point` itself (`App::sample_eyedropper`).
 ///
-/// `min_doc` is the active layer's own document-space origin
-/// (`active_layer_origin`) — after `Drag::Pan`'s own `pan_by` call,
-/// this clamps the view (`CanvasView::clamp_pan_to_minimum`) so it can
-/// never scroll past that edge. Without this, panning right/down kept
-/// moving `view`'s pan arbitrarily far, making `to_document` (used both
-/// here, for `Marquee`/`Brush`/`Eraser`/`Move`, and by the caller for
+/// `bounds` is the whole canvas pan bound ([`PanBounds`], built by
+/// [`pan_bounds`] from the active layer and the canvas area's own
+/// logical size) — after `Drag::Pan`'s own `pan_by` call, this applies
+/// it so the view can never scroll past *either* edge. Without the near
+/// half, panning right/down kept moving `view`'s pan arbitrarily far,
+/// making `to_document` (used both here, for
+/// `Marquee`/`Brush`/`Eraser`/`Move`, and by the caller for
 /// `Eyedropper`) report a true, unbounded — eventually negative —
 /// document position, while the renderer (`canvas_local_origin` /
 /// `aurora_gpu::TileResidency::set_origin`) silently pinned the
 /// *drawn* view at the document's own top-left tile forever, since
 /// `aurora_tile::TileId`'s unsigned fields have no way to represent a
-/// negative tile. Paint and render then silently disagreed. Clamping
-/// here keeps both reading the same, already-bounded `view` instead.
+/// negative tile. Paint and render then silently disagreed. Without the
+/// far half the identical thing happened past the document's own
+/// 300,000 px ceiling, where that same `set_origin` saturates instead.
+/// Applying both here keeps render and paint reading the same,
+/// already-bounded `view`.
 #[must_use]
 fn continue_drag(
     drag: &mut Drag,
     canvas_point: (f32, f32),
     view: &mut aurora_ui::CanvasView,
     selection: &mut aurora_doc::SelectionSet,
-    min_doc: (f32, f32),
+    bounds: PanBounds,
 ) -> Vec<(f32, f32)> {
     match drag {
         Drag::Pan { last_screen } => {
@@ -2905,7 +3675,7 @@ fn continue_drag(
                 canvas_point.1 - last_screen.1,
             );
             view.pan_by(delta);
-            view.clamp_pan_to_minimum(min_doc);
+            bounds.apply(view);
             *last_screen = canvas_point;
             Vec::new()
         }
@@ -2994,22 +3764,125 @@ fn zoom_steps_for_scroll(delta: winit::event::MouseScrollDelta) -> f32 {
 /// gesture that works regardless of which tool is active, matching
 /// every professional raster editor's own convention.
 ///
-/// `min_doc` is the active layer's own document-space origin
-/// (`active_layer_origin`), passed to `CanvasView::clamp_pan_to_minimum`
+/// `bounds` is the whole canvas pan bound ([`PanBounds`]), applied
 /// after `zoom_at` — `zoom_at` recomputes `pan` from scratch to keep
 /// `anchor` fixed, and that new `pan` can land past the document's own
-/// top-left edge just as easily as a plain `pan_by` can (see
-/// `continue_drag`'s own doc comment for why that must never happen).
+/// top-left edge, or past its far one, just as easily as a plain
+/// `pan_by` can (see `continue_drag`'s own doc comment for why that
+/// must never happen).
+///
+/// **`bounds.apply` sits strictly between the two `to_document(anchor)`
+/// measurements**, and that placement is the whole correctness of the
+/// re-anchor below: whatever the clamp moves — near edge or far — is
+/// inside the window [`shift_drag_reference`] measures, so the live
+/// drag is corrected for it. Moving the call either side of that window
+/// silently reopens the "dabs painted from a stationary pointer" bug at
+/// whichever edge got left outside.
+///
+/// **Takes the live `drag`, if there is one, because that clamp moves
+/// the view** (0.57.7) — and a drag in progress is holding a
+/// document-space reference point fixed from the moment it began. The
+/// two are paired here, in the one function, rather than left to each
+/// caller to remember: see [`shift_drag_reference`] for why re-anchoring
+/// is the right answer for *this* gesture where ending the drag is the
+/// right answer for a layer-row click ([`press_layer_row`]) or an undo
+/// ([`perform_undo_redo`]).
 fn apply_scroll_zoom(
     view: &mut aurora_ui::CanvasView,
+    drag: Option<&mut Drag>,
     anchor: (f32, f32),
     delta: winit::event::MouseScrollDelta,
-    min_doc: (f32, f32),
+    bounds: PanBounds,
 ) {
+    let before = view.to_document(anchor);
     let steps = zoom_steps_for_scroll(delta);
     let factor = ZOOM_WHEEL_BASE.powf(steps);
     view.zoom_at(anchor, view.zoom() * factor);
-    view.clamp_pan_to_minimum(min_doc);
+    bounds.apply(view);
+    let after = view.to_document(anchor);
+    if let Some(drag) = drag {
+        shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+    }
+}
+
+/// Moves every document-space reference point a live `drag` is holding
+/// by `delta`, after something moved `view` out from under it.
+///
+/// **Why a drag survives this at all, unlike the ones
+/// [`press_layer_row`] and [`perform_undo_redo`] end outright**
+/// (0.57.7). Clicking a Layers-panel row, or invoking Undo, is a
+/// gesture that says "I am done with this drag"; scrolling to zoom
+/// while painting is not — it is an ordinary thing to do mid-stroke,
+/// and forcibly ending the stroke would be worse than the bug. So this
+/// path keeps the drag and re-anchors it instead.
+///
+/// **Why a single uniform `delta` is the exact correction.**
+/// [`aurora_ui::CanvasView::zoom_at`] holds the document point under
+/// its own anchor fixed, and a stored document-space reference *is* a
+/// document position, so a pure zoom leaves every one of them still
+/// naming the same place: nothing to correct. The clamps that follow it
+/// ([`PanBounds::apply`]) are what actually bite — and they only ever
+/// change `pan`, at a zoom now fixed, so each shifts `to_document(p)`
+/// by the same amount for every `p`. Measuring that shift at the zoom
+/// anchor (where the zoom's own contribution is exactly zero)
+/// therefore yields the whole correction, for reference points
+/// anywhere on the canvas.
+///
+/// **That reasoning covers the far clamp exactly as it covers the near
+/// one** (0.57.10), which is why the far edge needed no second
+/// mechanism here: [`aurora_ui::CanvasView::clamp_pan_to_maximum`]
+/// writes nothing but `pan`, at a zoom the preceding `zoom_at` has
+/// already fixed, so it is a uniform translation of `to_document` by
+/// construction — the same statement, in the opposite direction. Both
+/// clamps run inside the one before/after window the caller measures,
+/// so a `delta` computed there carries whichever of them fired, or
+/// both.
+///
+/// Without it, a scroll-zoom that hits the pan bound left a live
+/// `Drag::Brush`'s own `last_doc` naming the pre-clamp document
+/// position while `continue_drag` read the post-clamp one from the
+/// moved view — and the next pointer-move event interpolated a whole
+/// segment of dabs between them, paint the user never drew. The same
+/// stale reference shifts a `Drag::Move`'s layer and a
+/// `Drag::Marquee`'s rect by the same jump.
+///
+/// `Drag::Pan` and `Drag::Eyedropper` are deliberately untouched, not
+/// overlooked: a pan's own `last_screen` is a *screen* position, which a
+/// view move does not invalidate (and its arm re-clamps on its own next
+/// event), and an eyedropper holds no reference point at all — it
+/// samples wherever the pointer currently is.
+fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
+    match drag {
+        Drag::Marquee { start_doc } | Drag::Move { start_doc, .. } => {
+            start_doc.0 += delta.0;
+            start_doc.1 += delta.1;
+        }
+        Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => {
+            last_doc.0 += delta.0;
+            last_doc.1 += delta.1;
+        }
+        Drag::Pan { .. } | Drag::Eyedropper => {}
+    }
+}
+
+/// The document-space reference point `drag` holds fixed, if it holds
+/// one at all — the read counterpart of [`shift_drag_reference`]'s own
+/// write, and deliberately the same `match` in the same order so the
+/// two cannot drift apart: a `Drag` variant that gains a reference has
+/// to be handled in both or in neither.
+///
+/// The one caller is [`apply_canvas_min_zoom`], which projects this
+/// back to screen (`aurora_ui::CanvasView::to_screen`) to recover a
+/// point to measure a view move at when the pointer is not over the
+/// canvas area. `Drag::Pan` and `Drag::Eyedropper` return `None` for
+/// the reason `shift_drag_reference` ignores them.
+#[must_use]
+fn drag_reference(drag: &Drag) -> Option<(f32, f32)> {
+    match drag {
+        Drag::Marquee { start_doc } | Drag::Move { start_doc, .. } => Some(*start_doc),
+        Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
+        Drag::Pan { .. } | Drag::Eyedropper => None,
+    }
 }
 
 /// How much one Zoom-tool click zooms in (or, with `Alt` held, out) —
@@ -3022,16 +3895,16 @@ const ZOOM_CLICK_FACTOR: f32 = 2.0;
 /// out), distinct from [`apply_scroll_zoom`], which works with any tool
 /// active.
 ///
-/// `min_doc` is the active layer's own document-space origin
-/// (`active_layer_origin`) — same reasoning as `apply_scroll_zoom`'s own
-/// doc comment: `zoom_at` recomputes `pan` to keep `canvas_point` fixed
-/// on screen, and that new `pan` needs the same post-hoc
-/// `clamp_pan_to_minimum` call to stay within the document's own edge.
+/// `bounds` is the whole canvas pan bound ([`PanBounds`]) — same
+/// reasoning as `apply_scroll_zoom`'s own doc comment: `zoom_at`
+/// recomputes `pan` to keep `canvas_point` fixed on screen, and that new
+/// `pan` needs the same post-hoc [`PanBounds::apply`] to stay within
+/// both of the document's own edges.
 fn handle_zoom_tool_click(
     view: &mut aurora_ui::CanvasView,
     canvas_point: (f32, f32),
     modifiers: Modifiers,
-    min_doc: (f32, f32),
+    bounds: PanBounds,
 ) {
     let factor = if modifiers.alt {
         1.0 / ZOOM_CLICK_FACTOR
@@ -3039,20 +3912,20 @@ fn handle_zoom_tool_click(
         ZOOM_CLICK_FACTOR
     };
     view.zoom_at(canvas_point, view.zoom() * factor);
-    view.clamp_pan_to_minimum(min_doc);
+    bounds.apply(view);
 }
 
 // -- Brush painting, eraser, and layer selection: a live document, a
 // -- live tile store, and a way to pick which layer is active --
 //
 // PLAN.md M1.9's "basic brush and eraser" bullet, picking up exactly
-// where `aurora_brush::stamp_dab`/`stamp_stroke` (ADR 0010) left off:
+// where `aurora_brush::stamp_dab` (ADR 0010) left off:
 // this crate's first *live* document (`App::layers`, kept alive instead
 // of being discarded after populating the panels, as it was through
 // M1.8/M1.9 until now) and first real `aurora_tile::TileStore`. Eraser
 // (`App::erase_dab`, `Drag::Eraser`) reuses that same live store and
-// active layer, calling `aurora_brush::erase_dab`/`erase_stroke` instead
-// of `stamp_dab`/`stamp_stroke` -- the bullet's other named half, now
+// active layer, calling `aurora_brush::erase_dab` instead of
+// `stamp_dab` -- the bullet's other named half, now
 // closed. `select_layer` closes the layer-selection half: `active_layer`
 // no longer just defaults to the topmost pixel layer and stays there
 // forever -- a real click on a real, clickable Layers-panel row
@@ -3101,6 +3974,25 @@ fn active_pixel_layer(
 /// surface-local space, now that a layer can actually sit somewhere
 /// other than the document's own origin (`aurora_doc::LayerTree::set_bounds`,
 /// the Move tool's own document-model support).
+///
+/// **This value is also the canvas pan boundary**, both edges of it
+/// ([`pan_bounds`], [`clamp_pan_to_active_layer`]) — the near one is
+/// this origin and the far one is this origin plus the document
+/// ceiling. So the bound moves when *either* of this function's two
+/// inputs does: a different layer becoming active, or the active
+/// layer's own `bounds` changing under it.
+///
+/// **And since 0.57.10 there is a third input that is not one of
+/// this function's own**: the canvas area's own logical size
+/// ([`canvas_area_logical_size`]). The far bound is a statement about
+/// the document position at the canvas area's *bottom-right* corner,
+/// so growing that area violates the bound with neither the active
+/// layer nor its `bounds` having changed at all — a window resize is a
+/// pan-bound-moving event in its own right, which is why
+/// [`apply_canvas_min_zoom`] re-applies [`PanBounds`] and not only the
+/// zoom floor. Any new code path that changes any of the three must
+/// re-clamp — see [`App::active_layer`]'s own doc comment for the full
+/// list of the ones that already do.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 fn active_layer_origin(
@@ -3109,6 +4001,308 @@ fn active_layer_origin(
 ) -> (f32, f32) {
     active_pixel_layer(layers, active_layer)
         .map_or((0.0, 0.0), |(_, bounds)| (bounds.x as f32, bounds.y as f32))
+}
+
+/// The whole canvas pan bound, both edges, as one value — what every
+/// path that can move the view (or move the boundary out from under a
+/// view that never moved) applies via [`Self::apply`].
+///
+/// **Why one struct rather than two loose tuples.** The near edge was
+/// closed first (`aurora_ui::CanvasView::clamp_pan_to_minimum`, 0.57.8
+/// and before) and the far edge only afterwards (0.57.10), and every
+/// round of that work found the same failure: a call site that moved
+/// the view and forgot one of the clamps. Bundling the bound with the
+/// one function that applies it means a new pan-moving path takes a
+/// `PanBounds` and cannot silently apply half of it — the grep for
+/// `clamp_pan_to_minimum` across this crate is supposed to return
+/// exactly one hit, inside [`Self::apply`], and that is the check that
+/// makes the centralisation real rather than aspirational.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PanBounds {
+    /// The lowest document-space position the canvas area's own
+    /// top-left corner may show — [`active_layer_origin`].
+    min_doc: (f32, f32),
+    /// The highest document-space position the canvas area's own
+    /// bottom-right corner may show — `min_doc` plus
+    /// [`aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX`].
+    max_doc: (f32, f32),
+    /// The canvas area's own size in **logical** pixels
+    /// ([`canvas_area_logical_size`]) — the space `CanvasView`'s own
+    /// `pan`/`to_document` work in. `(0.0, 0.0)` when it is not known
+    /// yet; see [`pan_bounds`].
+    canvas_size: (f32, f32),
+}
+
+/// The pan bound for `active_layer` in `layers`, at a canvas area of
+/// `canvas_size` logical pixels.
+///
+/// **Both edges are measured from the active layer's own origin, and
+/// the far one's *extent* is the document ceiling** — not the ceiling
+/// itself, and not the layer's own width/height. That is not a choice;
+/// it is what the render path already does.
+/// `aurora_gpu::TileResidency::set_origin` is handed
+/// [`canvas_local_origin`]`(view, `[`active_layer_origin`]`(..))`, a
+/// **layer-local** position, and clamps it to
+/// `[0, `[`aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX`]`]`. Mapping
+/// that range back into document space by adding the layer origin gives
+/// exactly `[min_doc, min_doc + MAX_DOC_ORIGIN_PX]`, so a view held
+/// inside these bounds is a view whose `to_document` and whose rendered
+/// origin agree — which is the entire property both clamps exist for.
+///
+/// **`canvas_size: None` degrades to `(0.0, 0.0)` rather than skipping
+/// the far clamp**, deliberately. With a zero canvas size the far clamp
+/// bounds the canvas area's own *top-left* corner at `max_doc` instead
+/// of its bottom-right — and the top-left corner is precisely the
+/// position `set_origin` receives, so the minimal render/paint
+/// divergence condition is still closed; the view is merely allowed
+/// further out than a known canvas size would allow. An unknown canvas
+/// size weakens the bound and never removes it, the same stance
+/// [`reset_canvas_view`] already takes on a stale zoom floor (a bound
+/// from the last known canvas size is still a bound, and having none is
+/// the one outcome that must not happen).
+#[must_use]
+fn pan_bounds(
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(f32, f32)>,
+) -> PanBounds {
+    let min_doc = active_layer_origin(layers, active_layer);
+    PanBounds {
+        min_doc,
+        max_doc: (
+            min_doc.0 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
+            min_doc.1 + aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX,
+        ),
+        canvas_size: canvas_size.unwrap_or((0.0, 0.0)),
+    }
+}
+
+impl PanBounds {
+    /// Applies both edges to `view`.
+    ///
+    /// **The order is load-bearing: the near bound is applied last, so
+    /// it wins on conflict.** The two cannot actually cross on any path
+    /// this crate can produce — [`pan_bounds`] builds `max_doc` as
+    /// `min_doc` plus a large positive ceiling — but if they ever did
+    /// (a future bound derived some other way), the near edge is the
+    /// one to keep: below `min_doc` the *tile addressing itself* has no
+    /// representation, since `aurora_tile::TileId`'s fields are
+    /// unsigned, whereas past `max_doc` the failure is a saturating
+    /// clamp inside `aurora_gpu::TileResidency::set_origin`. Applying
+    /// maximum first and minimum last makes that the outcome without
+    /// needing a conditional, and `aurora-ui`'s own
+    /// `applying_the_maximum_then_the_minimum_leaves_the_near_bound_holding`
+    /// pins it.
+    ///
+    /// **The `f32` precision caveat this paragraph used to carry is now
+    /// unreachable.** `min_doc + MAX_DOC_ORIGIN_PX` is `f32`
+    /// arithmetic, and at a large enough `min_doc` the ceiling stops
+    /// surviving the addition: the sum goes inexact from around 1.0e9,
+    /// and from around 1.6384e13 the ceiling is absorbed entirely,
+    /// leaving `max_doc == min_doc` — never *crossed*, since
+    /// round-to-nearest on two positive values cannot land below the
+    /// larger one, but degenerate. That needed a layer origin some
+    /// eight orders of magnitude past the 300,000 px document ceiling,
+    /// which nothing refused at the time. Both producers of a layer
+    /// origin refuse one now:
+    /// `aurora_doc::DocError::LayerOriginOutOfRange` on a live edit and
+    /// `aurora_io::IoError::LayerOriginOutOfRange` on a `.aur` read, to
+    /// ±`aurora_core::MAX_DOCUMENT_ORIGIN` (300,000). So `min_doc` is
+    /// within ±3e5 and the sum within ±6e5, every value there being an
+    /// integer well under `f32`'s own 2^24 exactly-representable
+    /// ceiling — the addition is exact, and the degenerate case cannot
+    /// arise. Recorded rather than deleted because the ordering
+    /// argument above is *why* it was only ever a caveat and not a bug.
+    ///
+    /// **"The two bounds cannot cross" and "the two bounds cannot be
+    /// jointly unsatisfiable" are different claims, and only the first
+    /// is true.** They never cross, for the reason above. They can
+    /// still both be unsatisfiable at once, and by an ordinary
+    /// condition rather than a degenerate one: the far bound
+    /// constrains `to_document(canvas_size)` and the near bound
+    /// constrains `to_document((0, 0))`, so a `pan` satisfying both at
+    /// once exists only while the *visible document span* —
+    /// `canvas_size / zoom` — fits inside `max_doc - min_doc`, the
+    /// 300,000 px document ceiling. A wide canvas area at a zoom far
+    /// enough out does not fit (3,000 logical px at
+    /// `aurora_ui::canvas_view::MIN_ZOOM` already spans exactly the
+    /// ceiling). This one is an ordinary condition and is still live,
+    /// unlike the degenerate `max_doc == min_doc` case the paragraph
+    /// above describes — that one would not have fit at any zoom at
+    /// all, and the origin bound has since made it unreachable.
+    ///
+    /// The max-then-min ordering decides what happens then, and decides
+    /// it the right way round: the near bound is applied last and holds
+    /// exactly, and the far bound is silently left unenforced. That is
+    /// the outcome to want, not a second bug — what these clamps exist
+    /// for is render/paint *agreement*, and the renderer's own origin
+    /// (`aurora_gpu::TileResidency::set_origin`) is anchored at the
+    /// canvas area's top-left corner, the very position the near bound
+    /// pins. A view held there agrees with what is drawn no matter how
+    /// far past `max_doc` its bottom-right corner reaches; a view
+    /// pinned at the far bound instead would not.
+    fn apply(self, view: &mut aurora_ui::CanvasView) {
+        view.clamp_pan_to_maximum(self.max_doc, self.canvas_size);
+        view.clamp_pan_to_minimum(self.min_doc); // last: the near bound wins on conflict
+    }
+}
+
+/// Re-establishes the pan bound after the *boundary* moved rather than
+/// the pan.
+///
+/// [`PanBounds`] bounds the view against the active layer's own origin
+/// ([`active_layer_origin`], the value [`canvas_local_origin`]
+/// subtracts) on the near edge and that origin plus the document
+/// ceiling on the far one, and every gesture that moves the *pan*
+/// already applies it ([`continue_drag`], [`apply_scroll_zoom`],
+/// [`handle_zoom_tool_click`]). This is the
+/// counterpart for the other way the same invariant breaks: the active
+/// layer's own origin changing moves the boundary out from under a pan
+/// that never moved. Switching from a layer at document `(0, 0)` to one
+/// at `(300, 150)` leaves `canvas_local_origin` at `(-300, -150)` with
+/// no clamp ever running — and a negative local origin is precisely the
+/// render/paint divergence `clamp_pan_to_minimum`'s own doc comment
+/// describes (`aurora_gpu::TileResidency::set_origin` clamps it to the
+/// layer's own corner; `CanvasView::to_document`, which turns a click
+/// into the document point a dab lands on, does not).
+///
+/// The active layer's own origin is not the only way this breaks:
+/// *that layer's own `bounds` changing* moves the same boundary without
+/// the active layer changing at all (the Move tool, and an undo/redo of
+/// one). See [`App::active_layer`]'s own doc comment for the full list
+/// of paths that have to re-clamp and where each does it.
+///
+/// **Ordering matters**: this must run *after* any
+/// [`reset_canvas_view`] call, since that resets the pan to `(0, 0)` —
+/// which is not within a moved layer's own bound. Callers do not get to
+/// choose: [`load_document_view`] is the two of them as one step, and
+/// is what the document-open paths call.
+///
+/// `canvas_size` is the canvas area's own **logical** size
+/// ([`canvas_area_logical_size`]), which the far half of the bound
+/// needs and the near half does not; `None` weakens the far bound
+/// rather than dropping it — see [`pan_bounds`].
+fn clamp_pan_to_active_layer(
+    view: &mut aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(f32, f32)>,
+) {
+    pan_bounds(layers, active_layer, canvas_size).apply(view);
+}
+
+/// Everything an `Undo`/`Redo` invalidates *outside* the document model
+/// itself — run after [`run_command`] has already applied the command.
+///
+/// Both halves are here for the same reason: either command can
+/// revert/reapply a `LayerOp::SetBounds` (`aurora_doc::History::undo`
+/// and `::redo` both return the dirtied `Rect`), so the active layer's
+/// own origin can move without [`App::active_layer`] itself changing.
+/// That invalidates the composite cache (a moved layer's content lands
+/// at different composite tiles) *and* the pan bound (which is measured
+/// against exactly that origin — [`clamp_pan_to_active_layer`]). The
+/// cache half was already unconditional for precisely this reason; the
+/// pan half was the missing counterpart, and an undone Move reproduced
+/// the same `canvas_local_origin` divergence a layer *switch* does.
+///
+/// Unconditional rather than "only when the command really was a
+/// structural one": both are idempotent no-ops when nothing moved (the
+/// clamp leaves a pan already within its bound untouched), and
+/// `run_command` deliberately reports nothing back about what it ran.
+/// Kept a free function so the pairing is testable with no `App` — and
+/// therefore no GPU adapter — to build.
+fn after_undo_redo(
+    view: &mut aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    composite_cache: &mut CompositeCache,
+    canvas_size: Option<(f32, f32)>,
+) {
+    composite_cache.bump();
+    clamp_pan_to_active_layer(view, layers, active_layer, canvas_size);
+}
+
+/// One `Undo`/`Redo` activation, whole: end whatever drag was still
+/// live ([`commit_ending_drag`]), *then* run the command
+/// ([`run_command`]), *then* re-establish everything it invalidated
+/// outside the document model ([`after_undo_redo`]).
+///
+/// **The order is the point, which is why this is a function** — the
+/// same reason [`press_layer_row`] is one, closing the same hazard at
+/// the second site it turned up at (0.57.7). `after_undo_redo` clamps
+/// the pan, i.e. it moves the view. A drag in progress holds a
+/// document-space reference point fixed at the moment it began
+/// (`Drag::Brush`/`Drag::Eraser`'s own `last_doc`, `Drag::Move`/
+/// `Drag::Marquee`'s own `start_doc`), so clamping the view out from
+/// under one makes the next pointer-move event compute its delta
+/// against a view that moved for reasons the drag knows nothing about.
+/// For a `Drag::Brush` that is not a cosmetic glitch: undoing while a
+/// stroke is still held moved the view `(40, 40)` -> `(340, 190)` and
+/// the very next event interpolated **55 dabs across a 335 px line
+/// with the pointer completely still** — real paint the user never
+/// drew.
+///
+/// Committing first also closes the same second, older hole
+/// `press_layer_row` found in its own branch: the live stroke's pixels
+/// were already on the layer with no undo entry naming them, so the
+/// very `Undo` that triggered this reached *past* them into the
+/// previous step — [`commit_ending_drag`]'s own 0.57.0 bug, at a fourth
+/// site. With the commit in place the mid-stroke `Undo` undoes the
+/// stroke the user is actually drawing, which is what pressing it means.
+///
+/// Committing **before** `run_command`, not after, is what makes that
+/// true: the commit is what turns the in-progress stroke into the
+/// entry the command is then free to reverse. Reversed, the command
+/// would undo the step underneath a stroke whose pixels are still
+/// live, and the commit would then push an entry whose captured tiles
+/// describe content the undo had already replaced.
+///
+/// Every path that reaches `Undo`/`Redo` with a `Drag` to worry about
+/// goes through here ([`App::run_undo_redo`], the `&mut self` wrapper
+/// [`App::commit_drag`] is for `commit_ending_drag`). Calling
+/// `after_undo_redo` directly instead is what "clamp without first
+/// ending any live drag" now costs.
+#[allow(clippy::too_many_arguments)]
+fn perform_undo_redo(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+    tool: &mut aurora_ui::Tool,
+    layers: &mut aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    store: Option<&mut aurora_tile::TileStore>,
+    undo_order: &mut UndoOrder,
+    composite_cache: &mut CompositeCache,
+    view: &mut aurora_ui::CanvasView,
+    active_layer: Option<aurora_doc::LayerId>,
+    drag: &mut Option<Drag>,
+    command: AppCommand,
+) {
+    let canvas_size = canvas_area_logical_size(workspace);
+    commit_ending_drag(
+        drag.take(),
+        layers,
+        history,
+        pixel_history,
+        undo_order,
+        view,
+        active_layer,
+        canvas_size,
+    );
+    run_command(
+        workspace,
+        focus,
+        palette,
+        tool,
+        layers,
+        history,
+        pixel_history,
+        store,
+        undo_order,
+        command,
+    );
+    after_undo_redo(view, layers, active_layer, composite_cache, canvas_size);
 }
 
 /// The reserved `aurora_tile::SurfaceId` this crate uses for its own
@@ -3385,8 +4579,10 @@ fn hash_to_unit_f32(hash: u64) -> f32 {
 /// `texels`; any chunk that isn't a full `CHANNELS`-length texel (should
 /// never happen for a real tile buffer, but this function has no way to
 /// prove that of its caller) is skipped, left fully transparent in the
-/// output, the same defensive shape the un-premultiply step just above
-/// already uses for its own `chunks_exact_mut` loop.
+/// output, the same defensive shape
+/// `aurora_render::un_premultiply_in_place` (the un-premultiply step
+/// `resolve_tile`'s `Group` arm calls) already uses for its own
+/// `chunks_exact_mut` loop.
 ///
 /// `resolve_tile` calls this from both its `Pixel` and `Group` arms, so a
 /// `Dissolve`-mode group containing a `Dissolve`-mode child is possible.
@@ -3465,8 +4661,9 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
 /// `resolve_tile`'s own call sites, which only call this when
 /// `mask.enabled` is true). Any chunk that isn't a full
 /// `CHANNELS`-length texel is skipped, left fully transparent in the
-/// output — the same defensive shape [`dissolve_gate`] and the
-/// un-premultiply loop in `resolve_tile`'s `Group` arm both already use.
+/// output — the same defensive shape [`dissolve_gate`] and
+/// `aurora_render::un_premultiply_in_place` (the un-premultiply step
+/// `resolve_tile`'s `Group` arm calls) both already use.
 fn apply_mask_clip(
     texels: &[half::f16],
     mask: &aurora_doc::LayerMask,
@@ -3506,6 +4703,149 @@ fn apply_mask_clip(
     clipped
 }
 
+/// The shared, per-composite-pass half of [`resolve_tile`]'s recursion
+/// bounds: a monotone node budget, plus a one-shot "already reported"
+/// flag. `depth`, the other half, stays a plain by-value parameter,
+/// because depth has to unwind as the recursion returns where these two
+/// deliberately must not — what bounds a fan-out cycle is what has
+/// already been spent, not what is on the stack right now.
+///
+/// **Why the budget is the document's own layer count.** In any tree
+/// `aurora-doc` accepts, every layer is reachable from
+/// `aurora_doc::LayerTree::roots` at most once — `validate_shape`
+/// rejects an id named by two parents, or twice by one — so a whole
+/// tile's composite (every root walked, every descendant visited)
+/// enters [`resolve_tile`] at most `aurora_doc::LayerTree::len()`
+/// times. The budget is exactly that count, which makes it both
+/// impossible for a well-formed document to be truncated by it and
+/// tight enough that a duplicate-reachability cycle runs out almost
+/// immediately. A fixed constant was the alternative and is the wrong
+/// tool here: PRD §6 promises *unlimited* layers, so any constant is
+/// either a real ceiling on a legitimate document or so far above one
+/// that it stops bounding anything. (Contrast `AUTOSAVE_EDIT_THRESHOLD`
+/// and the other tuned constants in this crate, which trade off two
+/// costs and have no derivable right answer. This one does.)
+///
+/// The node count is recomputed per tile, via [`Self::next_tile`] —
+/// it bounds one tile's work, not a whole pass's. `reported` is
+/// deliberately *not* reset with it: [`recomposite_visible_tiles`]
+/// calls [`resolve_tile`] once per invalidated tile per frame, so a
+/// per-breach `tracing::warn!` on a malformed document would fire at
+/// interactive-rate frequency on a path already over its latency
+/// budget (CLAUDE.md's own measurements). One report per pass is all
+/// the signal there is anyway — every tile after the first is
+/// re-reporting the same broken tree.
+#[derive(Debug)]
+struct CompositeBudget {
+    /// How many more times [`resolve_tile`] may be entered for the tile
+    /// currently being composited. Charged on entry, never refunded.
+    nodes: usize,
+    /// Whether either bound has already been reported during this
+    /// composite pass. See the type's own doc comment for why this
+    /// survives [`Self::next_tile`].
+    reported: bool,
+    /// How many layer tiles this whole pass skipped because
+    /// `aurora_tile::TileStore::get` failed — see [`Self::note_store_error`]
+    /// for why this rides along here. Per *pass*, so like `reported` it
+    /// deliberately survives [`Self::next_tile`].
+    store_errors: usize,
+    /// The first such failure's own message, kept because
+    /// `aurora_tile::TileError` is neither `Clone` nor cheap to hold on
+    /// to while the store it borrows from is still being mutated.
+    first_store_error: Option<String>,
+}
+
+impl CompositeBudget {
+    /// A budget for the first tile of a fresh composite pass over
+    /// `layers`, with nothing reported yet.
+    fn for_pass(layers: &aurora_doc::LayerTree) -> Self {
+        Self {
+            nodes: layers.len(),
+            reported: false,
+            store_errors: 0,
+            first_store_error: None,
+        }
+    }
+
+    /// Recharges the node budget for the next tile of the same pass.
+    /// Leaves `reported` alone on purpose — that is what keeps the
+    /// warning to once per pass rather than once per tile.
+    fn next_tile(&mut self, layers: &aurora_doc::LayerTree) {
+        self.nodes = layers.len();
+    }
+
+    /// Charges one visited node, returning `false` once the budget for
+    /// this tile is spent. `checked_sub` rather than a comparison plus a
+    /// decrement so that exhaustion and underflow are the same branch.
+    fn charge_node(&mut self) -> bool {
+        match self.nodes.checked_sub(1) {
+            Some(remaining) => {
+                self.nodes = remaining;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `true` exactly once per composite pass, for the first bound
+    /// breach it sees; `false` for every breach after that.
+    fn should_report(&mut self) -> bool {
+        let first = !self.reported;
+        self.reported = true;
+        first
+    }
+
+    /// Records that one layer's tile could not be read out of the store
+    /// and was therefore skipped — that layer contributed *nothing* to
+    /// the tile being composited, rather than its real pixels.
+    ///
+    /// **Why this lives on the budget.** It is the one piece of state
+    /// already threaded, by `&mut`, through every frame of
+    /// [`resolve_tile`]'s recursion and back out to both of its
+    /// top-level callers, and it is already the pass's diagnostics
+    /// carrier (`reported`), not purely a bound. Giving the skip count a
+    /// second `&mut` parameter of its own would have meant the same
+    /// thread-through with two things to keep in step.
+    ///
+    /// The two callers then do deliberately different things with it.
+    /// [`recomposite_visible_tiles`] ignores it: the live canvas must
+    /// keep painting what it can, because hard-failing every repaint
+    /// over one corrupt scratch-disk tile is far worse to use than a
+    /// visibly missing layer plus a log line, and that graceful-degrade
+    /// behaviour long predates this. [`composite_document`] — the
+    /// export/save path — checks it and refuses to hand back an
+    /// `aurora_io::Image` that is quietly missing content, because a
+    /// *file* written that way is the failure CLAUDE.md names as the
+    /// worst this project can have.
+    fn note_store_error(&mut self, err: &aurora_tile::TileError) {
+        self.store_errors = self.store_errors.saturating_add(1);
+        if self.first_store_error.is_none() {
+            self.first_store_error = Some(err.to_string());
+        }
+    }
+
+    /// `Some((how many skips, the first one's message))` if any layer
+    /// tile was skipped during this pass because the store could not
+    /// read it; `None` if every tile read cleanly. See
+    /// [`Self::note_store_error`].
+    fn store_error(&self) -> Option<(usize, &str)> {
+        let first = self.first_store_error.as_deref()?;
+        Some((self.store_errors, first))
+    }
+
+    /// Whether this tile's node budget is already spent. Lets a sibling
+    /// loop stop calling [`resolve_tile`] once every remaining call would
+    /// just re-fail [`Self::charge_node`] — without this, a group whose
+    /// `children` names far more entries than the tree actually holds
+    /// (the exact shape [`resolve_tile`]'s own doc comment names as the
+    /// thing this budget exists to bound) still costs one no-op call per
+    /// listed child rather than stopping at the first one, quadratic
+    /// rather than linear in a crafted tree's own size.
+    fn is_exhausted(&self) -> bool {
+        self.nodes == 0
+    }
+}
+
 /// Resolves `id`'s own composited texels for one `aurora_tile::TILE`-
 /// sized window at document-space `doc_origin` (`tile_id`'s own meaning
 /// once converted out of `reference_origin`'s frame — see
@@ -3528,12 +4868,80 @@ fn apply_mask_clip(
 /// [`aurora_doc::LayerTree::paint_order`] — a nested group's own
 /// contents stay scoped to their own immediate parent's compositing
 /// pass rather than unpacking into a grandparent's), bottom-to-top,
-/// each recursively resolved by this same function, into a fresh
-/// buffer starting fully transparent via the same
-/// `aurora_render::composite_tile_cpu` this function's own caller uses
-/// one level up. A child that is itself a group is resolved by
-/// recursing into this branch again, so nesting to any depth falls out
-/// for free.
+/// each recursively resolved by this same function and folded, one at
+/// a time, into a single running buffer that starts fully transparent
+/// (`aurora_render::transparent_tile`) via
+/// `aurora_render::composite_layer_into` — the same per-layer primitive
+/// this function's own caller folds *this* result into one level up.
+/// Folding in place rather than collecting every child's own full
+/// 512 KiB tile buffer first is what keeps a group's peak memory
+/// proportional to the tree's *depth* instead of to one group's sibling
+/// count; it is bit-identical to the batch
+/// `aurora_render::composite_tile_cpu` call it replaces, because that
+/// primitive's own loop body reads no state beyond the accumulator, the
+/// source, the opacity and the mode — so N folds and one batch call are
+/// the same computation by construction (see the `Group` arm's own
+/// comment below, and `composite_layer_into`'s doc comment, for what
+/// does and does not count as evidence for that). A child that is
+/// itself a group is resolved by
+/// recursing into this branch again, so nesting falls out for free (up
+/// to the two bounds below — every tree `aurora-doc` will accept stays
+/// inside both, so no well-formed document is affected).
+///
+/// **`depth` and `budget`, the two recursion bounds — defence in
+/// depth, not a duplicate of `aurora-doc`'s validation.** They bound
+/// two different things, and neither alone is enough, which is why both
+/// are here.
+///
+/// `depth` bounds how *deep* the recursion goes. Callers pass `1` for a
+/// root-level entry, the same seed `aurora_doc`'s own `validate_shape`
+/// uses for a manifest's `roots` ("these roots really are the top
+/// level, so the depth budget starts from scratch"), and each recursive
+/// step below adds one. The check is
+/// `depth > `[`aurora_doc::MAX_LAYER_TREE_DEPTH`] — strictly greater,
+/// matching that validator's own comparison exactly, so a legitimately
+/// 256-deep tree still composites its deepest layer. What that bounds
+/// is stack frames, and nothing else.
+///
+/// `budget` bounds how much *total work* one tile's composite may do,
+/// which `depth` provably does not. The recursive call below sits
+/// inside a loop over a group's `children`, so a node's own call count
+/// is `children.len()`, not one. A group whose `children` names the
+/// same id more than once — exactly the duplicate-reachability shape
+/// `aurora-doc`'s `validate_shape` checks for, and the shape three
+/// successive review rounds found real bugs in — therefore *branches*
+/// rather than walks: at fan-out two the visit count doubles per level,
+/// `2^slack` visits from however far above the bound the cycle is
+/// entered, which finishes at no realistic slack. `depth` does still
+/// terminate that traversal in the formal sense, but "terminates" would
+/// mean a hang on the compositing thread that cannot be interrupted
+/// from inside, rather than the stack-overflow abort this guard exists
+/// to prevent — no better for a user holding unsaved work. So
+/// [`CompositeBudget`] charges one node per entry into this function
+/// and never refunds it on return, bounding total visits per tile
+/// outright whatever shape the tree has.
+///
+/// Both bounds return `None` when breached, which the caller already
+/// treats as "this contributor is absent from the composite" (the same
+/// contract an invisible layer or a failed tile load already uses), so
+/// an over-deep or over-budget branch is dropped rather than the tile
+/// being aborted.
+///
+/// This exists **independently** of `aurora-doc`'s shape validation
+/// rather than trusting it: that validator has had real, separately
+/// exploitable gaps found in it across successive review rounds, and a
+/// cycle reaching this function would otherwise recurse until the stack
+/// overflows — an abort, which for an image editor holding unsaved work
+/// is the worst possible failure.
+///
+/// Two monotone counters rather than a visited set, still: a set would
+/// need correct remove-on-return discipline (get it wrong and
+/// legitimate sibling subtrees silently vanish) and would allocate per
+/// branch in the hot compositing path. A monotone budget is strictly
+/// cheaper than that and terminates just as hard; the one thing it
+/// gives up is telling a cycle apart from a legitimately enormous
+/// document, and sizing it from the document itself is what pays that
+/// back — see [`CompositeBudget`].
 ///
 /// **No "Pass Through" mode**: `aurora_doc::BlendMode`'s 27 variants
 /// have no such variant — Photoshop's real distinction between an
@@ -3549,7 +4957,7 @@ fn apply_mask_clip(
 /// unapplied** — the caller (whichever level actually contains `id`:
 /// the document root, or a parent group's own recursive call into this
 /// function) is the one that applies them, via its own
-/// `aurora_render::composite_tile_cpu` call.
+/// `aurora_render::composite_layer_into` call.
 ///
 /// **[`aurora_doc::BlendMode::Dissolve`] is the one exception to "this
 /// function never applies anything itself"**: for a
@@ -3621,7 +5029,7 @@ fn apply_mask_clip(
 /// `(0.0, 0.0, 1.0, 1.0)` at reduced alpha. Handing that premultiplied
 /// buffer back up as if it were straight-alpha texels — what every
 /// other branch of this function actually returns, and what the
-/// caller's own `composite_tile_cpu` call one level up actually expects
+/// caller's own `composite_layer_into` call one level up actually expects
 /// — would double-attenuate the colour on the next pass. **Fixed**: the
 /// code below this doc comment un-premultiplies the isolated buffer
 /// (dividing `r`/`g`/`b` by `a`, guarded against `a == 0.0`) before
@@ -3650,8 +5058,8 @@ fn apply_mask_clip(
 /// accumulate-in-place design, not something fixable from `resolve_tile`
 /// alone). `composite_tile_cpu` itself now recovers the backdrop's true
 /// straight-alpha colour — dividing the running accumulator's `r`/`g`/`b`
-/// by its own `a`, guarded against `a == 0.0` the same way the
-/// un-premultiply loop above already is — before ever handing it to
+/// by its own `a`, guarded against `a == 0.0` the same way
+/// `aurora_render::un_premultiply_in_place` already is — before ever handing it to
 /// `blend_rgb` as `Cb`, so every blend mode now reacts to the correct
 /// backdrop colour regardless of how translucent the accumulator is
 /// partway through a group's isolation pass. See `composite_tile_cpu`'s
@@ -3675,6 +5083,17 @@ fn apply_mask_clip(
 /// `(tile_id, doc_origin, reference_origin)` are threaded through every
 /// recursive call completely unchanged; no new origin logic is needed
 /// beyond what a `Pixel` layer's own branch already had.
+// Eight arguments, and the alternative is worse: the seven that were
+// here before are all genuinely per-call, and `budget` is genuinely
+// shared, so bundling any of them into a struct would only move the
+// same values behind a name that explains less than they do.
+//
+// Over 100 lines by three, since the two bound checks went in. Splitting
+// the `Pixel` and `Group` arms into their own functions would mean
+// threading the same eight arguments through two more signatures and
+// separating each arm from the doc comment that explains it; the length
+// here is one `match` with two arms, not accumulated logic.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn resolve_tile(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
@@ -3682,7 +5101,45 @@ fn resolve_tile(
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
 ) -> Option<(Vec<half::f16>, f32, aurora_render::BlendMode)> {
+    // Both bounds are checked before anything else this function does,
+    // including the visibility test below: `aurora-doc`'s own shape
+    // validator is the primary guarantee that this recursion terminates,
+    // and these are the independent second one. See this function's own
+    // doc comment for the depth convention, and why bounding depth alone
+    // is not enough to bound the work.
+    if depth > aurora_doc::MAX_LAYER_TREE_DEPTH {
+        if budget.should_report() {
+            tracing::warn!(
+                ?id,
+                depth,
+                max = aurora_doc::MAX_LAYER_TREE_DEPTH,
+                "layer nesting past the tree depth bound; skipping this branch for this \
+                 composite tile"
+            );
+        }
+        return None;
+    }
+    // Charged after the depth check, not before it: a call refused for
+    // depth does no work worth charging, and the number of such refused
+    // calls is still bounded, because every one of them is issued by a
+    // call that *was* charged. Charging here also means the budget
+    // counts entries into this function, which is exactly the quantity a
+    // duplicate-child fan-out inflates.
+    if !budget.charge_node() {
+        if budget.should_report() {
+            tracing::warn!(
+                ?id,
+                depth,
+                nodes = layers.len(),
+                "composite recursion visited more layers than this document has; skipping \
+                 this branch for this composite tile"
+            );
+        }
+        return None;
+    }
     if layers.visible(id) != Some(true) {
         return None;
     }
@@ -3699,12 +5156,33 @@ fn resolve_tile(
                 match store.get(surface, tile_id) {
                     Ok(tile) => tile.texels().to_vec(),
                     Err(err) => {
-                        tracing::warn!(?err, ?tile_id, "skipping layer for this composite tile");
+                        // Recorded, not just logged: the live canvas is
+                        // content to skip this layer and repaint, but the
+                        // export path must be able to tell that it did.
+                        // See `CompositeBudget::note_store_error`.
+                        budget.note_store_error(&err);
+                        // Gated like both bound warnings above, and for a
+                        // reason 0.52.2 made concrete: a tile whose
+                        // page-in fails now fails on *every* touch rather
+                        // than healing into a blank one, so an ungated
+                        // warning here is one log line per layer per tile
+                        // per frame for as long as the scratch file stays
+                        // broken. The count still reaches the caller
+                        // exactly (`note_store_error`), which is what the
+                        // export refusal is built on -- only the logging
+                        // is rate-limited.
+                        if budget.should_report() {
+                            tracing::warn!(
+                                ?err,
+                                ?tile_id,
+                                "skipping layer for this composite tile"
+                            );
+                        }
                         return None;
                     }
                 }
             } else {
-                read_layer_window(store, surface, origin, doc_origin)
+                read_layer_window(store, surface, origin, doc_origin, budget)
             };
             // Mask clip runs first, ahead of `Dissolve` below: it
             // restricts which pixels are even in play before any blend
@@ -3733,8 +5211,50 @@ fn resolve_tile(
             Some((texels, opacity, blend_mode))
         }
         aurora_doc::LayerKind::Group { children } => {
-            let mut child_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> = Vec::new();
+            // Folded in place, one child at a time, rather than collected
+            // into a `Vec` of every child's own full tile buffer for a
+            // single batch `aurora_render::composite_tile_cpu` call: each
+            // child's `Vec<f16>` (512 KiB, `aurora_tile::SAMPLES` `f16`s)
+            // is dropped at the end of its own loop iteration, before the
+            // next child recurses. Peak memory is therefore bounded by
+            // the layer tree's *depth*, not by any one group's sibling
+            // count -- it is not constant, just no longer proportional to
+            // how many layers a user happened to put in one group. See
+            // `aurora_doc::MAX_LAYER_TREE_DEPTH`'s own doc comment for
+            // why the bound is `depth + 1` buffers rather than `2 *
+            // depth`: only the frame just returned into ever holds an
+            // accumulator and a child buffer at the same time.
+            //
+            // Bit-identical to the batch `composite_tile_cpu` call it
+            // replaces **by construction**, not by test:
+            // `composite_layer_into`'s loop body reads no state beyond
+            // `dst`/`src`/`opacity`/`mode`, so there is nothing a batch
+            // call could carry across layers that N separate calls
+            // could not. (The `aurora-render` test named
+            // `composite_layer_into_folded_one_at_a_time_matches_the_batch_composite`
+            // used to be cited here as proof of that; it is not one --
+            // `composite_tile_cpu` is now defined as this same fold, so
+            // both of its sides are the same calls. The math itself is
+            // pinned by
+            // `composite_layer_into_folded_matches_hand_computed_golden_values`.)
+            let mut isolated = aurora_render::transparent_tile();
             for &child_id in children.iter().rev() {
+                // Stop as soon as the budget is spent rather than still
+                // making one no-op `resolve_tile` call per remaining
+                // listed child -- see `CompositeBudget::is_exhausted`'s
+                // own doc comment for why this matters for a crafted
+                // tree, not just a well-formed one (where this never
+                // fires, since every child that gets this far is real).
+                if budget.is_exhausted() {
+                    break;
+                }
+                // `saturating_add` rather than plain `+`, mirroring
+                // `aurora-doc`'s own `validate_shape`: the guard at the
+                // top of this function makes an overflow structurally
+                // unreachable (`depth` can never get past
+                // `MAX_LAYER_TREE_DEPTH + 1` here), so this is about
+                // matching the validator's style, not about a real
+                // wrap this code could hit.
                 if let Some(resolved) = resolve_tile(
                     child_id,
                     layers,
@@ -3742,16 +5262,19 @@ fn resolve_tile(
                     tile_id,
                     doc_origin,
                     reference_origin,
+                    depth.saturating_add(1),
+                    budget,
                 ) {
-                    child_texels.push(resolved);
+                    let (child, child_opacity, child_blend_mode) = resolved;
+                    aurora_render::composite_layer_into(
+                        &mut isolated,
+                        &child,
+                        child_opacity,
+                        child_blend_mode,
+                    );
                 }
             }
-            let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = child_texels
-                .iter()
-                .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
-                .collect();
-            let mut isolated = aurora_render::composite_tile_cpu(&refs);
-            // Un-premultiply: `composite_tile_cpu` accumulates straight-
+            // Un-premultiply: `composite_layer_into` accumulates straight-
             // alpha "over" math onto a starting-*transparent* destination,
             // which yields a *premultiplied* result whenever the
             // accumulated alpha ends up fractional (see this function's
@@ -3759,26 +5282,25 @@ fn resolve_tile(
             // child alone on transparent gives `(0, 0, 0.5, 0.5)`, not the
             // straight `(0, 0, 1.0, 0.5)`). Every other branch of this
             // function returns true straight-alpha texels, and the
-            // caller's own `composite_tile_cpu` call one level up expects
-            // straight-alpha inputs too -- so divide `r`/`g`/`b` by `a`
+            // caller's own `composite_layer_into` call one level up
+            // expects straight-alpha inputs too -- so divide `r`/`g`/`b`
+            // by `a`
             // here to convert this group's own isolated buffer back to
             // straight alpha before handing it back as `id`'s own
             // pseudo-layer texels. Guarded against `a == 0.0` (fully
             // transparent texels have no meaningful colour to recover;
             // leave them at `0.0` rather than dividing by zero).
-            for texel in isolated.chunks_exact_mut(aurora_tile::CHANNELS) {
-                let [r, g, b, a] = texel else { continue };
-                let alpha = a.to_f32();
-                if alpha > 0.0 {
-                    *r = half::f16::from_f32(r.to_f32() / alpha);
-                    *g = half::f16::from_f32(g.to_f32() / alpha);
-                    *b = half::f16::from_f32(b.to_f32() / alpha);
-                } else {
-                    *r = half::f16::from_f32(0.0);
-                    *g = half::f16::from_f32(0.0);
-                    *b = half::f16::from_f32(0.0);
-                }
-            }
+            //
+            // The loop itself lives in
+            // `aurora_render::un_premultiply_in_place` — this arm was
+            // the only place it existed until `composite_roots_into_tile`
+            // and the GPU compositing path's own readback
+            // (`finish_tile_readback`) were found to be missing the
+            // identical step; see that function's own doc comment for
+            // the invariant (straighten exactly once, at the top of an
+            // accumulation, never inside `composite_layer_into`'s own
+            // fold).
+            aurora_render::un_premultiply_in_place(&mut isolated);
             // A group's own mask clips its *whole* isolated composite as
             // one unit, ahead of `Dissolve` below -- the same "group's
             // own opacity/blend mode apply one level up, to the isolated
@@ -3813,6 +5335,94 @@ fn resolve_tile(
             Some((isolated, opacity, blend_mode))
         }
     }
+}
+
+/// Composites one tile of `layers`' **root level** on the CPU: every
+/// root layer resolved by [`resolve_tile`] in paint order (bottom-to-top
+/// — [`aurora_doc::LayerTree::roots`] is newest-first) and folded, one
+/// at a time, into a single running accumulator.
+///
+/// Extracted because the two callers that need it —
+/// [`recomposite_visible_tiles`]' own CPU path and
+/// [`composite_document`]'s export loop — had the identical loop written
+/// out twice, and 0.51.0's fold-in-place change had to be made in both
+/// places independently (a third copy, over a *group's* children rather
+/// than the document's roots, stays inline in [`resolve_tile`]'s own
+/// `Group` arm: it also has the depth increment, the per-child budget
+/// exhaustion break, and the un-premultiply/mask/`Dissolve` tail, so
+/// unifying it here would take more than it gave). Keeping one copy also
+/// meant the premultiplied-alpha gap PLAN.md tracked — the un-premultiply
+/// step that ran in the `Group` arm and was missing from both of these
+/// paths — had exactly one place to be fixed, which is where 0.52.0
+/// fixed it (below).
+///
+/// The accumulator starts fully transparent
+/// (`aurora_render::transparent_tile`) and each resolved child buffer is
+/// dropped at the end of its own iteration, so peak memory here is one
+/// tile buffer plus whatever the recursion below it holds, rather than
+/// one full [`aurora_tile::SAMPLES`]-length buffer per root layer —
+/// see `composite_document_composites_five_hundred_root_level_sibling_layers`
+/// for the regression test, and `MAX_LAYER_TREE_DEPTH`'s own doc comment
+/// in `aurora-doc` for what does still bound it.
+///
+/// **Returns straight-alpha texels.** The fold itself
+/// (`aurora_render::composite_layer_into` onto a transparent start)
+/// leaves a *premultiplied* result whenever the accumulated alpha ends
+/// up fractional — a lone opaque-white root layer at 50% opacity folds
+/// to `(0.5, 0.5, 0.5, 0.5)` — so this function runs
+/// `aurora_render::un_premultiply_in_place` on the finished accumulator
+/// before returning it, recovering the true `(1.0, 1.0, 1.0, 0.5)`. That
+/// is the same step `resolve_tile`'s `Group` arm has always run on a
+/// group's isolated buffer, and it was missing here (and from the GPU
+/// compositing path, which now reaches the identical call through
+/// [`finish_tile_readback`]) until 0.52.0: every exported
+/// PNG/TIFF/`.aur` file with translucent content, and every eyedropper
+/// read of a translucent pixel, carried premultiplied values. See
+/// `composite_document_un_premultiplies_a_translucent_root_level_layer`
+/// for the regression test and
+/// `aurora_render::un_premultiply_in_place`'s own doc comment for why
+/// the straightening belongs here, at the top of the accumulation,
+/// rather than inside the per-layer fold.
+///
+/// Placement is last, on the finished root accumulator: unlike
+/// `resolve_tile`'s `Group` arm there is no mask-clip or `Dissolve`
+/// tail to order against here (both are per-layer, inside
+/// `resolve_tile`), so there is nothing after this step.
+///
+/// Charging the tile against `budget` (`CompositeBudget::next_tile`) is
+/// the caller's job, kept at the call site where the per-tile loop
+/// itself is visible. `1` is the depth passed to [`resolve_tile`], the
+/// same depth `aurora-doc`'s own validator starts its budget at for a
+/// root-level layer.
+fn composite_roots_into_tile(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    budget: &mut CompositeBudget,
+) -> Vec<half::f16> {
+    let mut composited = aurora_render::transparent_tile();
+    for &id in layers.roots().iter().rev() {
+        if let Some((texels, opacity, blend_mode)) = resolve_tile(
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            1,
+            budget,
+        ) {
+            aurora_render::composite_layer_into(&mut composited, &texels, opacity, blend_mode);
+        }
+    }
+    // The accumulator has stopped being an accumulator and is now this
+    // tile's finished composite, handed to callers (export, the
+    // eyedropper, the canvas atlas) that all expect straight alpha --
+    // see this function's own doc comment above.
+    aurora_render::un_premultiply_in_place(&mut composited);
+    composited
 }
 
 /// Whether every visible root-level layer in `layers` is a `Normal`-blend
@@ -3991,6 +5601,33 @@ fn begin_tile_readback(
 /// same "one bad tile shouldn't abort the rest" discipline
 /// [`resolve_tile`]'s own callers already use for a failed
 /// [`aurora_tile::TileStore::get`].
+///
+/// **Straightens the decoded samples** (`aurora_render::un_premultiply_in_place`)
+/// before returning them, and this is the single place the GPU
+/// compositing path's premultiplied → straight conversion happens.
+/// [`begin_gpu_composite_tile`]'s render target holds *premultiplied*
+/// alpha once its fold is done — the fixed-function `AlphaBlending` unit
+/// accumulating onto a cleared, fully transparent target leaves exactly
+/// the state `aurora_render::composite_layer_into` leaves on the CPU
+/// side (a lone opaque-white layer at 50% opacity gives
+/// `(0.5, 0.5, 0.5, 0.5)`, not the straight `(1.0, 1.0, 1.0, 0.5)`) —
+/// and that is `composite_over_with_opacity`'s own correct, unchanged
+/// contract, not something to fix on the GPU. The buffer stops being an
+/// accumulator and becomes a finished tile exactly here, at the decode,
+/// which is where the same "straighten exactly once, at the top of an
+/// accumulation" rule [`composite_roots_into_tile`] and `resolve_tile`'s
+/// `Group` arm already follow puts the step.
+///
+/// Doing it on the CPU, on the `Vec<half::f16>` the readback already
+/// produces, rather than as an extra GPU render pass, is deliberate and
+/// was 0.52.0's second shape: the first ran a WGSL sibling of that loop
+/// into a *second* per-tile `Rgba16Float` texture (a texture cannot be
+/// sampled and rendered to in one pass), which cost a per-tile
+/// allocation and an extra queue submission on a path already measured
+/// well over its frame budget, and — measured — the two implementations
+/// did not agree at very small alphas. One implementation, called from
+/// both paths, makes them agree by construction; see
+/// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document`.
 fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
     let PendingGpuReadback {
         tile_id,
@@ -4019,7 +5656,15 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
     let decoded = decode_f16_samples(&data);
     drop(data);
     buffer.unmap();
-    decoded
+    // Straighten once, here: what came back is the GPU fold's finished
+    // *premultiplied* accumulator, and everything downstream of this
+    // point -- the tile store, export, the eyedropper, the canvas atlas
+    // -- is straight alpha. See this function's own doc comment above
+    // for why this is the CPU's job on both paths.
+    decoded.map(|mut texels| {
+        aurora_render::un_premultiply_in_place(&mut texels);
+        texels
+    })
 }
 
 /// GPU-accelerated compositing for one visible composite tile, for the
@@ -4045,8 +5690,28 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// (`TEXTURE_BINDING | COPY_DST`), then
 /// `aurora_render::TileCompositor::composite_over_with_opacity` blends it
 /// onto one shared destination texture (`RENDER_ATTACHMENT | COPY_SRC`,
-/// cleared to fully transparent black first, since `composite_over_with_opacity`
-/// always uses `LoadOp::Load`).
+/// cleared to fully transparent black first, since
+/// `composite_over_with_opacity` always uses `LoadOp::Load`).
+///
+/// **Leaves a premultiplied accumulator behind, on purpose**: once the
+/// fold is done that shared destination holds *premultiplied* alpha —
+/// the fixed-function `AlphaBlending` unit accumulating onto a cleared,
+/// fully transparent target leaves exactly the state
+/// `aurora_render::composite_layer_into` leaves on the CPU side (a lone
+/// opaque-white layer at 50% opacity gives `(0.5, 0.5, 0.5, 0.5)`, not
+/// the straight `(1.0, 1.0, 1.0, 0.5)`), which is
+/// `composite_over_with_opacity`'s own correct and unchanged contract.
+/// Converting that back to the straight alpha the tile store and
+/// everything downstream of it expect is
+/// [`finish_tile_readback`]'s job, on the CPU, on the `Vec<half::f16>`
+/// its readback decode already produces — one
+/// `aurora_render::un_premultiply_in_place` call shared with
+/// [`composite_roots_into_tile`], so the GPU and CPU paths cannot
+/// disagree about that division by construction (see
+/// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document`).
+/// Before 0.52.0 neither top-level path ran this step at all, so every
+/// translucent composite tile — and so every export and every eyedropper
+/// read — carried premultiplied values.
 ///
 /// **Issues the readback, does not wait for it**: the destination texture's
 /// GPU→CPU copy is *started* via [`begin_tile_readback`] — which itself
@@ -4082,6 +5747,7 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// already use. A real GPU-side failure (a lost device, a bad map) can no
 /// longer be detected here — resolving the map is [`finish_tile_readback`]'s
 /// job now, in phase 3, once this function has already returned.
+#[allow(clippy::too_many_arguments)]
 fn begin_gpu_composite_tile(
     gpu: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
@@ -4090,12 +5756,25 @@ fn begin_gpu_composite_tile(
     tile_id: aurora_tile::TileId,
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
+    budget: &mut CompositeBudget,
 ) -> Option<PendingGpuReadback> {
     let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::new();
     for &id in layers.roots().iter().rev() {
-        if let Some((texels, opacity, _blend_mode)) =
-            resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
-        {
+        // `1`: a root-level layer, the same depth `aurora-doc`'s own
+        // validator starts its budget at. One `budget` for all of this
+        // tile's roots, not one each: in a well-formed tree their
+        // subtrees are disjoint, so the sum of their node counts is
+        // still bounded by the tree's own length.
+        if let Some((texels, opacity, _blend_mode)) = resolve_tile(
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            1,
+            budget,
+        ) {
             layer_texels.push((texels, opacity));
         }
     }
@@ -4117,6 +5796,9 @@ fn begin_gpu_composite_tile(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
+        // `RENDER_ATTACHMENT` for the per-layer blend passes, `COPY_SRC`
+        // for the readback below -- nothing samples this texture, so it
+        // needs no `TEXTURE_BINDING`.
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
@@ -4185,6 +5867,17 @@ fn begin_gpu_composite_tile(
         compositor.composite_over_with_opacity(gpu, &dst_view, &src_view, *opacity);
     }
 
+    // `dst_texture` now holds this tile's finished composite in
+    // *premultiplied* alpha -- the fixed-function `AlphaBlending` fold
+    // onto a cleared, fully transparent target leaves exactly the state
+    // `aurora_render::composite_layer_into` leaves on the CPU side (a
+    // lone opaque-white layer at 50% opacity gives (0.5, 0.5, 0.5, 0.5),
+    // not the straight (1.0, 1.0, 1.0, 0.5)). That is left as it is:
+    // `finish_tile_readback` straightens the decoded samples on the CPU,
+    // in the one shared `aurora_render::un_premultiply_in_place` the CPU
+    // path also goes through, rather than this function spending a
+    // second per-tile texture and an extra queue submission on a GPU
+    // pass to do the same division a different way.
     Some(begin_tile_readback(device, queue, &dst_texture, tile_id))
 }
 
@@ -4314,6 +6007,12 @@ fn begin_gpu_composite_tile(
 /// far) is unaffected in practice either way: `composite_tile_cpu`
 /// reproduces a single full-opacity layer's own texels exactly, and (once
 /// GPU-tractable) so does the batched GPU path.
+// Over 100 lines by six, since the per-pass composite budget went in.
+// The body is three named, commented phases (issue, poll, drain) that
+// share `pending_gpu`, `budget` and two closures; splitting them apart
+// would mean passing all four across the seam for no gain in
+// readability.
+#[allow(clippy::too_many_lines)]
 fn recomposite_visible_tiles(
     residency: &aurora_gpu::TileResidency,
     layers: &aurora_doc::LayerTree,
@@ -4355,6 +6054,18 @@ fn recomposite_visible_tiles(
     // exactly: a `TileStore::get_mut` failure leaves the tile un-cached
     // so a later redraw retries it, rather than silently marking a
     // never-written tile "done".
+    //
+    // The length guard before `copy_from_slice` is this function's own,
+    // deliberately not delegated: `copy_from_slice` *panics* on a
+    // mismatch, and this crate holds a professional's unsaved work, so a
+    // panic here loses it. Every producer of `composited` is
+    // `SAMPLES`-long today (`aurora_render::transparent_tile` via
+    // `composite_roots_into_tile`, or `decode_f16_samples`, which
+    // enforces its own length) -- but that is an argument about other
+    // functions, and `aurora_io::aur::read` already sets the precedent
+    // of checking a length itself rather than trusting one. Skipping
+    // leaves the tile un-cached, exactly as a `get_mut` failure does, so
+    // a later redraw retries it.
     let write_composited = |store: &mut aurora_tile::TileStore,
                             cache: &mut CompositeCache,
                             tile_id: aurora_tile::TileId,
@@ -4362,6 +6073,15 @@ fn recomposite_visible_tiles(
         let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
             return;
         };
+        if dest.texels().len() != composited.len() {
+            tracing::warn!(
+                ?tile_id,
+                composited = composited.len(),
+                expected = dest.texels().len(),
+                "composited tile is not one whole tile; skipping this tile's write"
+            );
+            return;
+        }
         dest.texels_mut().copy_from_slice(composited);
         dest.mark_dirty(full_tile);
         cache.mark_current(tile_id);
@@ -4369,21 +6089,10 @@ fn recomposite_visible_tiles(
     let composite_tile_cpu_path = |layers: &aurora_doc::LayerTree,
                                    store: &mut aurora_tile::TileStore,
                                    tile_id: aurora_tile::TileId,
-                                   doc_origin: (i64, i64)| {
-        let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
-            Vec::with_capacity(layers.roots().len());
-        for &id in layers.roots().iter().rev() {
-            if let Some(resolved) =
-                resolve_tile(id, layers, store, tile_id, doc_origin, reference_origin)
-            {
-                layer_texels.push(resolved);
-            }
-        }
-        let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
-            .iter()
-            .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
-            .collect();
-        aurora_render::composite_tile_cpu(&refs)
+                                   doc_origin: (i64, i64),
+                                   budget: &mut CompositeBudget| {
+        budget.next_tile(layers);
+        composite_roots_into_tile(layers, store, tile_id, doc_origin, reference_origin, budget)
     };
 
     // Phase 1: issue every GPU-qualifying, not-yet-current tile's GPU
@@ -4394,6 +6103,11 @@ fn recomposite_visible_tiles(
     // composited on the CPU path immediately, right here, since that
     // path never blocks on the GPU.
     let mut pending_gpu: Vec<PendingGpuReadback> = Vec::new();
+    // One budget for the whole pass: its node count is recharged per
+    // tile (by `next_tile`, on both paths below), but its "already
+    // reported" flag deliberately is not, so a malformed document warns
+    // once per pass rather than once per invalidated tile per frame.
+    let mut budget = CompositeBudget::for_pass(layers);
     for tile_id in residency.visible_tiles() {
         if cache.is_current(tile_id) {
             continue;
@@ -4402,15 +6116,19 @@ fn recomposite_visible_tiles(
 
         let issued = if gpu_qualifies {
             match (gpu, compositor.as_deref_mut()) {
-                (Some(gpu), Some(compositor)) => begin_gpu_composite_tile(
-                    gpu,
-                    compositor,
-                    layers,
-                    store,
-                    tile_id,
-                    doc_origin,
-                    reference_origin,
-                ),
+                (Some(gpu), Some(compositor)) => {
+                    budget.next_tile(layers);
+                    begin_gpu_composite_tile(
+                        gpu,
+                        compositor,
+                        layers,
+                        store,
+                        tile_id,
+                        doc_origin,
+                        reference_origin,
+                        &mut budget,
+                    )
+                }
                 _ => None,
             }
         } else {
@@ -4420,7 +6138,8 @@ fn recomposite_visible_tiles(
         if let Some(pending) = issued {
             pending_gpu.push(pending);
         } else {
-            let composited = composite_tile_cpu_path(layers, store, tile_id, doc_origin);
+            let composited =
+                composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget);
             write_composited(store, cache, tile_id, &composited);
         }
     }
@@ -4447,7 +6166,7 @@ fn recomposite_visible_tiles(
             texels
         } else {
             let doc_origin = doc_origin_for(tile_id);
-            composite_tile_cpu_path(layers, store, tile_id, doc_origin)
+            composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget)
         };
         write_composited(store, cache, tile_id, &composited);
     }
@@ -4471,10 +6190,10 @@ fn recomposite_visible_tiles(
 /// origin every `TileId` is measured from, shifting every tile's own
 /// meaning at once). [`Self::invalidate`] is the precise counterpart: a
 /// brush/eraser dab (`App::paint_dab`/`App::erase_dab`) knows exactly
-/// which tiles it touched (`aurora_brush::touched_tiles`, in the same
-/// document-space-relative-to-the-active-layer's-own-origin frame
-/// `reference_origin` already uses — see those functions' own call
-/// sites) and invalidates only those, since a full bump on every dab of
+/// which tiles it really wrote (`aurora_brush::DabOutcome::painted`, in
+/// the same document-space-relative-to-the-active-layer's-own-origin
+/// frame `reference_origin` already uses — see those functions' own
+/// call sites) and invalidates only those, since a full bump on every dab of
 /// a stroke would mean recompositing the *entire* visible grid on every
 /// dab rather than just the tile(s) the dab actually changed.
 ///
@@ -4517,8 +6236,9 @@ impl CompositeCache {
     /// Invalidates just `id`, leaving every other cached tile untouched —
     /// the single-tile analog of [`Self::bump`], for a caller that knows
     /// precisely which tile(s) an edit actually touched (a brush/eraser
-    /// dab, via `aurora_brush::touched_tiles`) rather than needing to
-    /// distrust the whole cache. Safe to call with an `id` that isn't
+    /// dab, via `aurora_brush::DabOutcome::painted` — what the dab
+    /// really wrote, not merely what its bounding box covered) rather
+    /// than needing to distrust the whole cache. Safe to call with an `id` that isn't
     /// currently cached at all — `HashSet::remove` is a no-op then.
     fn invalidate(&mut self, id: aurora_tile::TileId) {
         self.current.remove(&id);
@@ -4556,6 +6276,7 @@ fn read_layer_window(
     surface: aurora_tile::SurfaceId,
     layer_origin: (i64, i64),
     doc_origin: (i64, i64),
+    budget: &mut CompositeBudget,
 ) -> Vec<half::f16> {
     let tile_size = i64::from(aurora_tile::TILE);
     let window_x = doc_origin.0 - layer_origin.0;
@@ -4590,14 +6311,36 @@ fn read_layer_window(
             if col_lo >= col_hi {
                 continue;
             }
-            let Ok(src) = store.get(
+            let src = match store.get(
                 surface,
                 aurora_tile::TileId {
                     x: tile_col,
                     y: tile_row,
                 },
-            ) else {
-                continue;
+            ) {
+                Ok(src) => src,
+                Err(err) => {
+                    // Same reason as `resolve_tile`'s own direct
+                    // `store.get`: skipping leaves this part of the
+                    // window transparent, which is silent content loss
+                    // unless somebody upstream is told. See
+                    // `CompositeBudget::note_store_error`.
+                    budget.note_store_error(&err);
+                    // Gated for the same reason as `resolve_tile`'s own
+                    // sibling warning, and doubly so here: a moved
+                    // layer's window reads up to four source tiles per
+                    // composite tile, so one broken file is up to four
+                    // log lines per tile per frame.
+                    if budget.should_report() {
+                        tracing::warn!(
+                            ?err,
+                            tile_x = tile_col,
+                            tile_y = tile_row,
+                            "skipping a moved layer's source tile for this composite tile"
+                        );
+                    }
+                    continue;
+                }
             };
             let texels = src.texels().to_vec();
             for src_row in row_lo..row_hi {
@@ -4666,10 +6409,13 @@ fn read_layer_window(
 /// `PinLight`/`HardMix`), the 4-mode non-separable HSL family
 /// (`Hue`/`Saturation`/`Color`/`Luminosity`), and the 2-mode
 /// whole-colour-selection family (`DarkerColor`/`LighterColor`) are
-/// real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`
-/// — this family's own explicit, now sole boundary) still silently
-/// falls back to `Normal` at that same translation boundary — a real,
-/// still-open gap. Layer groups are recursed into at any depth via
+/// real; the one remaining `aurora_doc::BlendMode` variant (`Dissolve`)
+/// is real too, but [`resolve_tile`] intercepts it before this
+/// translation ever runs and applies its own stochastic `dissolve_gate`
+/// instead — see [`resolve_tile`]'s own doc comment for why. Layer
+/// groups are recursed into at any depth `aurora-doc` will accept
+/// (bounded independently by `aurora_doc::MAX_LAYER_TREE_DEPTH` and a
+/// per-tile node budget — see [`resolve_tile`]'s own doc comment) via
 /// [`resolve_tile`] (walking `aurora_doc::LayerTree::roots`/
 /// `LayerTree::children`, not `LayerTree::paint_order`, which stays a
 /// flat list for other, non-compositing callers), ancestor-visibility-
@@ -4691,12 +6437,31 @@ fn read_layer_window(
 /// A layer whose own tile fails to load for a given output tile is
 /// logged and skipped for that tile only, the same "one bad tile
 /// shouldn't abort the rest" discipline [`recomposite_visible_tiles`]
-/// already uses — not grounds to abort the whole export.
+/// already uses — the *walk* is not aborted. **The export is**, at the
+/// end: see `# Errors` below. That split is deliberate and is the whole
+/// point of 0.52.1's second half — the live canvas may degrade
+/// gracefully, a file may not.
 ///
 /// # Errors
 ///
-/// Returns [`aurora_io::IoError`] if the assembled buffer doesn't come
-/// out to exactly `width * height * 4` samples — structurally
+/// Returns [`aurora_io::IoError::IncompleteComposite`] if any layer tile
+/// could not be read out of `store` during the walk. Every such layer
+/// contributed nothing at all to its tile rather than its real pixels,
+/// so the assembled image is quietly missing content — a corrupted
+/// scratch-disk tile (a crash mid-write, a full disk, another process in
+/// the scratch directory) is exactly how that happens to a document that
+/// is open and being edited. Until 0.52.1 this returned `Ok` with the
+/// holes in it and [`App::save_file`] wrote that straight to the user's
+/// file: silent, unannounced content loss, the failure CLAUDE.md names
+/// as the worst this project can have. It is refused instead.
+///
+/// The caller's obligation stops at *not writing the file*. Turning this
+/// into the itemized, user-visible warning FR-001's lossy-save rule
+/// calls for is real, separate, still-open work — tracked in PLAN.md,
+/// not done here.
+///
+/// Also returns [`aurora_io::IoError`] if the assembled buffer doesn't
+/// come out to exactly `width * height * 4` samples — structurally
 /// unreachable given this function's own tile walk, but surfaced
 /// through the same `aurora_io::Image::new` contract
 /// [`aurora_io::read_from_store`] already goes through, rather than
@@ -4711,6 +6476,11 @@ fn composite_document(
         vec![half::f16::from_f32(0.0); width as usize * height as usize * aurora_tile::CHANNELS];
 
     if width > 0 && height > 0 {
+        // One budget for the whole export, recharged per tile below --
+        // same shape as `recomposite_visible_tiles`', and for the same
+        // reason (a malformed document should warn once, not once per
+        // tile of a large export).
+        let mut budget = CompositeBudget::for_pass(layers);
         let tile_size = aurora_tile::TILE;
         let tiles_x = width.div_ceil(tile_size);
         let tiles_y = height.div_ceil(tile_size);
@@ -4723,20 +6493,18 @@ fn composite_document(
                     i64::from(ty) * i64::from(tile_size),
                 );
 
-                let mut layer_texels: Vec<(Vec<half::f16>, f32, aurora_render::BlendMode)> =
-                    Vec::with_capacity(layers.roots().len());
-                for &id in layers.roots().iter().rev() {
-                    if let Some(resolved) =
-                        resolve_tile(id, layers, store, tile_id, doc_origin, (0, 0))
-                    {
-                        layer_texels.push(resolved);
-                    }
-                }
-                let refs: Vec<(&[half::f16], f32, aurora_render::BlendMode)> = layer_texels
-                    .iter()
-                    .map(|(texels, opacity, blend_mode)| (texels.as_slice(), *opacity, *blend_mode))
-                    .collect();
-                let composited = aurora_render::composite_tile_cpu(&refs);
+                budget.next_tile(layers);
+                // `(0, 0)` as the reference origin: an export always
+                // measures from the document's own origin, unlike the
+                // on-screen path, which measures from the viewport.
+                let composited = composite_roots_into_tile(
+                    layers,
+                    store,
+                    tile_id,
+                    doc_origin,
+                    (0, 0),
+                    &mut budget,
+                );
 
                 let origin_x = tx * tile_size;
                 let origin_y = ty * tile_size;
@@ -4757,27 +6525,115 @@ fn composite_document(
                 }
             }
         }
+
+        // Checked once for the whole export, after the tile walk rather
+        // than inside it: one unreadable tile does not abort the other
+        // thousands (the CPU cost of finishing is trivial next to
+        // getting the answer wrong), but it does mean this function has
+        // no honest `Image` to return. See this function's own `# Errors`
+        // section and `CompositeBudget::note_store_error`.
+        if let Some((skipped, first)) = budget.store_error() {
+            tracing::error!(
+                skipped,
+                first,
+                "refusing to export a document with tiles that could not be read"
+            );
+            return Err(aurora_io::IoError::IncompleteComposite {
+                skipped,
+                first: first.to_owned(),
+            });
+        }
     }
 
     aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples)
 }
 
-/// Selects `layer_id` as the active layer: sets `*active_layer` and
-/// marks its own Layers-panel row (`layer_rows` —
+/// One press on a Layers-panel row, whole: end whatever drag was still
+/// live ([`commit_ending_drag`]) and *then* select the row's layer
+/// ([`select_layer`]).
+///
+/// **The order is the point, which is why this is a function.**
+/// `select_layer` re-establishes the pan bound against the newly active
+/// layer, i.e. it moves the view. A drag in progress holds a reference
+/// point fixed at the moment it began — `Drag::Pan`'s own `last_screen`,
+/// `Drag::Move`/`Drag::Marquee`'s own `start_doc` — so clamping the view
+/// out from under one makes the next pointer-move event compute its
+/// delta against a view that moved for reasons the drag knows nothing
+/// about. `Drag::Pan` happens to recover on its own next event (its arm
+/// re-clamps), but that is a coincidence of one variant, not an
+/// invariant: `Drag::Marquee`, `Drag::Brush`, `Drag::Eraser` and
+/// `Drag::Eyedropper` never clamp at all. Not having a live drag here is
+/// the invariant.
+///
+/// [`perform_undo_redo`] is the same shape for the same reason, at the
+/// second site the hazard turned up at (0.57.7).
+///
+/// Ending it via the shared commit rather than dropping it also closes a
+/// second, older hole in this branch, which used to `return` before ever
+/// reaching `handle_pointer_pressed`'s own "a second press ends the live
+/// drag" commit: a brush stroke interrupted by a layer-row click lost
+/// its whole undo entry, exactly the 0.57.0 bug
+/// [`commit_ending_drag`]'s own doc comment describes for the other
+/// gestures.
+///
+/// Pushing the updated accessibility tree and bumping the composite
+/// cache stay the caller's job — the same split [`select_layer`] itself
+/// already documents.
+#[allow(clippy::too_many_arguments)]
+fn press_layer_row(
+    workspace: &mut aurora_ui::Workspace,
+    layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+    drag: &mut Option<Drag>,
+    layer_id: aurora_doc::LayerId,
+) {
+    commit_ending_drag(
+        drag.take(),
+        layers,
+        history,
+        pixel_history,
+        undo_order,
+        view,
+        *active_layer,
+        canvas_area_logical_size(workspace),
+    );
+    select_layer(workspace, layer_rows, active_layer, view, layers, layer_id);
+}
+
+/// Selects `layer_id` as the active layer: sets `*active_layer`, marks
+/// its own Layers-panel row (`layer_rows` —
 /// `aurora_ui::populate_layers_panel`'s own return value) as accessibly
 /// selected (`accesskit::Node::set_selected`), clearing that state from
-/// every other row. Pushing the updated accessibility tree to the
-/// platform is the caller's job (`App::push_accessibility`) — this
-/// function only touches `workspace`/`active_layer`, the same "pure
-/// dispatch, caller owns the one real platform side-effect" split every
-/// other function in this crate already uses
-/// (`open_crash_recovery_dialog`, `begin_drag`, ...).
+/// every other row, and re-establishes `view`'s own pan bound against
+/// the newly active layer ([`clamp_pan_to_active_layer`]). Pushing the
+/// updated accessibility tree to the platform is still the caller's job
+/// (`App::push_accessibility`), the same "pure dispatch, caller owns the
+/// one real platform side-effect" split every other function in this
+/// crate already uses (`open_crash_recovery_dialog`, `begin_drag`, ...).
+///
+/// The pan clamp is **not** an unrelated extra. The pan bound is
+/// `view`'s own pan measured against the *active layer's* own origin, so
+/// this function moving `*active_layer` is itself what can violate it —
+/// see [`clamp_pan_to_active_layer`]. Taking `view`/`layers` rather than
+/// leaving the clamp to the caller is what stops the next new call site
+/// from silently reopening the bug.
 fn select_layer(
     workspace: &mut aurora_ui::Workspace,
     layer_rows: &HashMap<WidgetId, aurora_doc::LayerId>,
     active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
     layer_id: aurora_doc::LayerId,
 ) {
+    // Read before the row loop below takes `workspace.tree` mutably --
+    // the value itself is independent of the loop, but the borrow is
+    // not.
+    let canvas_size = canvas_area_logical_size(workspace);
     *active_layer = Some(layer_id);
     for (&row, &id) in layer_rows {
         let Some(node) = workspace.tree.accessibility(row) else {
@@ -4789,13 +6645,185 @@ fn select_layer(
             tracing::warn!(?err, "failed to update a layer row's selection state");
         }
     }
+    // After the row loop, not before: nothing here depends on the
+    // ordering, but keeping the accessibility work untouched and the
+    // new bound re-established at the end keeps this function's two
+    // jobs readable as two jobs.
+    clamp_pan_to_active_layer(view, layers, Some(layer_id), canvas_size);
 }
 
-/// Where this session's shared tile store keeps its scratch files —
-/// analogous to [`marker_path`]/[`autosave_path`], and for the same
-/// reason not a proper per-platform app-support directory yet.
-fn tile_store_scratch_dir() -> PathBuf {
-    std::env::temp_dir().join("aurora-tiles")
+/// Creates a fresh scratch directory for one session's tile store,
+/// under the platform temp directory, and returns its path. `None`
+/// (logged) if it cannot be created.
+///
+/// **Why not a fixed path.** Until 0.53.0 this was
+/// `std::env::temp_dir().join("aurora-tiles")`: one directory, shared by
+/// every process, every document and every *user* on the machine,
+/// holding files named only `{surface}_{x}_{y}.tile` — where
+/// `SurfaceId` restarts from 0 for each fresh document. Two documents
+/// open at once addressed the same files and silently corrupted each
+/// other's unsaved pixels, and the directory was world-readable. The
+/// name is now random (so it cannot be pre-created or symlinked into
+/// place by another local user), the creation is exclusive (`tempfile`
+/// retries on `EEXIST` rather than adopting somebody else's directory),
+/// and `aurora_tile::TileStore::new` makes it `0o700` on Unix.
+///
+/// Still under `std::env::temp_dir()`, deliberately: scratch tiles are
+/// the definition of ephemeral, run to gigabytes, and are already
+/// removed on a clean shutdown ([`clean_shutdown_cleanup`]).
+/// Where they *should* live on a given machine is a still-open,
+/// user-facing scratch-disk preference (FR-026), not something to decide
+/// here by silently redirecting a document's paging traffic into
+/// `directories::ProjectDirs`' data directory.
+fn create_tile_store_scratch_dir() -> Option<PathBuf> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("aurora-scratch-");
+    // `tempfile` creates a *directory* with the process's default
+    // permissions (a plain `DirBuilder::create`, so umask-derived and
+    // typically `0o755`/`0o775`) -- unlike its temp *files*, which are
+    // `0o600`. Saying `0o700` here makes the mode part of the `mkdir`
+    // itself, so the directory is never world-readable for even an
+    // instant. `aurora_tile::TileStore::new` re-asserts `0o700` when it
+    // opens a store here, but that is not a substitute: the store may be
+    // opened on a *child* of this directory (`aur_verify_scratch_dir`)
+    // and never on this one, in which case nothing else would ever fix
+    // the parent's mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    match builder.tempdir() {
+        Ok(dir) => Some(dir.keep()),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to create this session's tile scratch directory"
+            );
+            None
+        }
+    }
+}
+
+/// This process's own scratch directory — created once, on first use,
+/// and reused by every [`open_tile_store`] call for the rest of the run.
+///
+/// Memoized rather than recreated per call because the store is
+/// legitimately reopened mid-run ([`startup_document`],
+/// [`recover_partial_after_a_failed_read`]): a fresh directory per call
+/// would strand the previous one on disk with nothing left holding its
+/// path to delete it. `None` means no scratch directory could be created
+/// at all, which [`open_tile_store`] turns into its existing "painting
+/// is disabled this session" degradation, not a crash.
+///
+/// Two acknowledged edge cases, neither fixed here and neither with a
+/// demonstrated practical impact: a `None` memoizes, so a single
+/// transient failure at first use disables paging for the whole run
+/// rather than being retried; and a run that creates the directory but
+/// never opens a store in it still creates it (and still deletes it at
+/// shutdown), so the cost of the memoization is one empty directory in
+/// the case where nothing needed one.
+fn tile_store_scratch_dir() -> Option<&'static Path> {
+    static SCRATCH_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SCRATCH_DIR
+        .get_or_init(create_tile_store_scratch_dir)
+        .as_deref()
+}
+
+/// Everything a clean shutdown has to undo, in one directly callable
+/// place: clear this run's own "I'm still running" marker so the *next*
+/// run's `previous_session_left_a_marker` reads false, delete the
+/// autosave (nothing is left to recover once the run has ended
+/// cleanly), and delete this session's tile scratch directory and every
+/// unsaved pixel paged into it.
+///
+/// **Why a function and not three statements in the event handler.**
+/// The `WindowEvent::CloseRequested` arm needs a real `winit` event
+/// loop to reach, so nothing in this crate's test module can execute
+/// it; a review round demonstrated that deleting the scratch-directory
+/// cleanup from that arm entirely left all 1101 tests green. The state
+/// arrives through [`ShutdownState`] precisely so a test *can* call
+/// this — against throwaway paths, not the live session's, which
+/// deleting would pull the scratch disk out from under every other test
+/// sharing this binary. See that trait for why it is a trait and not
+/// four parameters.
+///
+/// **The store is taken and dropped before the directory is removed.**
+/// Dropping a `aurora_tile::TileStore` joins its background writer
+/// thread (its `BackgroundWriter`'s own `Drop` calls `flush`, which
+/// drops the sender and joins), so once that line has returned no
+/// eviction can still be in flight. This is not a fix for a race
+/// anyone has reproduced: whether `remove_dir_all` can actually lose to
+/// a writer creating a file mid-walk (`ENOTEMPTY`, orphaned unsaved
+/// pixels) depends on the filesystem, and no one has demonstrated it
+/// here. Rust's drop semantics are deterministic and blocking, so
+/// ordering it this way removes the question at zero cost rather than
+/// answering it.
+///
+/// **Crash leftovers are not covered** — see PLAN.md's own follow-up
+/// item. A run that never reaches this leaves its directory behind for
+/// the platform's temp cleaner, and that includes clean quits that
+/// bypass `WindowEvent::CloseRequested` (macOS's own menu Quit,
+/// [`App::fail`]), not only crashes. The marker and the autosave have
+/// exactly the same gap.
+fn clean_shutdown_cleanup(state: &mut impl ShutdownState) {
+    clear_session_marker(state.marker_path());
+    remove_autosave(&state.autosave_path());
+    // Taken and dropped *before* the directory goes: dropping a
+    // `aurora_tile::TileStore` joins its background writer thread (its
+    // `BackgroundWriter`'s own `Drop` calls `flush`, which drops the
+    // sender and joins), so no eviction can still be in flight against
+    // a directory that is being deleted. Deterministic by construction
+    // rather than a race this has to win.
+    drop(state.take_tile_store());
+    if let Some(dir) = state.scratch_dir() {
+        remove_scratch_dir(dir);
+    }
+}
+
+/// Everything [`clean_shutdown_cleanup`] needs from the running
+/// application, as one source of truth rather than four arguments.
+///
+/// **Why a trait and not four parameters.** A review round showed that
+/// changing the single production call site to pass `None` for the
+/// store and `None` for the scratch directory compiled, ran, and passed
+/// the entire gate — a plausible slip with no protection whatsoever,
+/// and one `dead_code` would not catch either, since the function still
+/// had callers. With the state behind a trait the call site is
+/// `clean_shutdown_cleanup(self)`: there is no argument left to get
+/// wrong, and what remains is a four-line `impl` for [`App`] whose
+/// bodies are each a single field or function reference.
+///
+/// It is also what keeps the function testable. The real
+/// implementation resolves the live session directory and the live
+/// store; a test supplies throwaway paths instead, because removing the
+/// live session directory from a test would pull the scratch disk out
+/// from under every other test sharing this binary.
+trait ShutdownState {
+    /// This run's own "I'm still running" marker.
+    fn marker_path(&self) -> &Path;
+    /// Where the autosave this run has been writing lives.
+    fn autosave_path(&self) -> PathBuf;
+    /// Takes the live tile store out of the application, so dropping it
+    /// joins its writer thread. Leaves nothing behind.
+    fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore>;
+    /// This session's scratch directory, or `None` if one was never
+    /// created (painting disabled for the run).
+    fn scratch_dir(&self) -> Option<&Path>;
+}
+
+/// [`clean_shutdown_cleanup`]'s scratch-directory step, split out so it
+/// can also be called on its own against a *throwaway* directory: the
+/// caller in the event handler passes the one live, memoized session
+/// directory ([`tile_store_scratch_dir`]), and deleting that from a
+/// test would pull the scratch disk out from under every other test
+/// sharing the binary.
+fn remove_scratch_dir(dir: &Path) {
+    if let Err(err) = std::fs::remove_dir_all(dir)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?err, path = %dir.display(), "failed to remove this session's tile scratch directory");
+    }
 }
 
 /// A practical resident-tile budget for this crate's first live store —
@@ -4809,12 +6837,19 @@ const TILE_BUDGET: usize = 256;
 /// Errors are logged, not fatal -- the same "must never stop the
 /// application starting" shape [`write_session_marker`]'s own I/O
 /// already uses; a store that fails to open just means painting is
-/// silently disabled for the session, not a crash.
+/// silently disabled for the session, not a crash. Since 0.53.0 a
+/// scratch directory that could not be *created* at all takes that same
+/// path (it is already logged by [`create_tile_store_scratch_dir`]),
+/// rather than falling back to a shared one.
 fn open_tile_store() -> Option<aurora_tile::TileStore> {
     let Some(budget) = std::num::NonZeroUsize::new(TILE_BUDGET) else {
         unreachable!("TILE_BUDGET is a fixed, non-zero constant");
     };
-    match aurora_tile::TileStore::new(tile_store_scratch_dir(), budget) {
+    let Some(scratch_dir) = tile_store_scratch_dir() else {
+        tracing::warn!("no tile scratch directory; painting is disabled this session");
+        return None;
+    };
+    match aurora_tile::TileStore::new(scratch_dir.to_path_buf(), budget) {
         Ok(store) => Some(store),
         Err(err) => {
             tracing::warn!(
@@ -4873,6 +6908,30 @@ fn sample_pixel(
     let b = texels.get(index + 2)?.to_f32();
     let a = texels.get(index + 3)?.to_f32();
     Some([r, g, b, a])
+}
+
+/// The pure core of [`App::sample_eyedropper`], factored out so it's
+/// testable without a real `App` (which needs a live window/GPU surface
+/// to construct at all): converts `doc_point` (document space) into
+/// [`composite_surface_id`]'s own local space using `origin`
+/// (`doc_point` minus `origin`, the same subtraction
+/// [`layer_local_point`] does against a layer's own `bounds` — here
+/// against [`active_layer_origin`]'s return instead, since the composite
+/// surface is anchored to that same reference point, not any one
+/// layer's own surface), then reads the already-composited RGB back via
+/// [`sample_pixel`]. `None` — "nothing to pick" — for a fully
+/// transparent texel (no visible layer painted there) exactly as before,
+/// and for the same out-of-bounds/paging-failure cases [`sample_pixel`]
+/// itself already returns `None` for.
+#[must_use]
+fn eyedropper_sample(
+    store: &mut aurora_tile::TileStore,
+    origin: (f32, f32),
+    doc_point: (f32, f32),
+) -> Option<[f32; 3]> {
+    let local = (doc_point.0 - origin.0, doc_point.1 - origin.1);
+    let [r, g, b, a] = sample_pixel(store, composite_surface_id(), local)?;
+    (a > 0.0).then_some([r, g, b])
 }
 
 /// The Brush tool's fixed radius — a real default, not a placeholder,
@@ -4980,6 +7039,40 @@ fn canvas_area_physical_size(
     ))
 }
 
+/// The canvas dock area's own size in **logical** pixels — the canvas
+/// area's laid-out `bounds`, read straight out of the widget tree with
+/// no scaling applied at all.
+///
+/// [`canvas_area_physical_size`]'s counterpart, and deliberately **not**
+/// derived from it. `WidgetTree::compute_layout` is fed a *logical*
+/// window size ([`logical_size`]) precisely so widget padding/spacing
+/// stay DPI-independent, so `bounds` is already logical and this is one
+/// cast, not a round trip; dividing the physical size back down by
+/// `scale_factor` would reintroduce the rounding
+/// `canvas_area_physical_size` deliberately applies (`round().max(1.0)`)
+/// and give a second, subtly different answer to the same question.
+///
+/// [`PanBounds`] is the consumer: `CanvasView`'s `pan`/`to_document`
+/// are defined in the canvas area's own logical space (see that type's
+/// own doc comment), and
+/// [`aurora_ui::CanvasView::clamp_pan_to_maximum`] bounds the document
+/// position at `canvas_size` — so a physical size here would place the
+/// far bound at `scale_factor` times the right distance on any display
+/// where that is not 1.0.
+///
+/// `None` only for a genuinely unknown widget id, which
+/// `workspace.canvas_area` never actually is — **not** before the first
+/// layout, where `bounds` reports a zero rect rather than `None` (the
+/// same real finding [`canvas_area_physical_rect`]'s own doc comment
+/// records). A zero size is a legitimate weaker bound, not a failure —
+/// see [`pan_bounds`].
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn canvas_area_logical_size(workspace: &aurora_ui::Workspace) -> Option<(f32, f32)> {
+    let bounds = workspace.tree.bounds(workspace.canvas_area)?;
+    Some((bounds.width as f32, bounds.height as f32))
+}
+
 /// Converts [`aurora_ui::CanvasView::zoom`]'s own logical-pixel zoom
 /// into the *effective* zoom `redraw`'s real
 /// [`aurora_gpu::TileResidency::set_origin`] call site must pass
@@ -5014,14 +7107,314 @@ fn canvas_area_physical_size(
 /// `1.0` (no scaling) rather than propagating NaN/zero/negative into
 /// the GPU uniform.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
 fn effective_residency_zoom(canvas_zoom: f32, scale_factor: f64) -> f32 {
-    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
+    canvas_zoom * guarded_scale_factor(scale_factor)
+}
+
+/// `winit`'s reported `scale_factor` as an `f32`, with the degenerate
+/// values it should never actually report folded to `1.0` (no scaling)
+/// rather than propagating NaN/zero/negative into everything derived
+/// from it.
+///
+/// Factored out of [`effective_residency_zoom`] so [`canvas_min_zoom`]
+/// divides by *exactly* the number that function multiplies by. Two
+/// spellings of the same guard would be two chances for the two to
+/// disagree, which is the whole class of bug this round is closing.
+///
+/// **The guard runs on the `f32`, after the cast, not on the `f64`
+/// before it** — that ordering is the whole point and 0.57.3 had it the
+/// wrong way round. `f64 as f32` is a lossy narrowing that can *create*
+/// exactly the degenerate values this rejects: an `f64` above
+/// `f32::MAX` (~3.4e38) casts to `f32::INFINITY`, and one below
+/// `f32::MIN_POSITIVE` (~1.2e-38) casts to `0.0`. Both pass an
+/// `is_finite() && > 0.0` test applied to the `f64`, so validating
+/// first and casting second let precisely the values the guard names
+/// through — `inf` into a multiply and `0.0` into
+/// [`canvas_min_zoom`]'s own division. `winit` will report such a
+/// scale factor when `WINIT_X11_SCALE_FACTOR` or `Xft.dpi` is
+/// misconfigured, so this is reachable, not theoretical.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn guarded_scale_factor(scale_factor: f64) -> f32 {
+    let scale = scale_factor as f32;
+    if scale.is_finite() && scale > 0.0 {
+        scale
     } else {
         1.0
-    };
-    canvas_zoom * scale_factor as f32
+    }
+}
+
+/// The lower bound `App`'s own [`aurora_ui::CanvasView`] must be held
+/// to, in the *logical*-pixel zoom that view speaks, so that the atlas
+/// renders exactly the zoom the view reports.
+///
+/// [`aurora_gpu::TileResidency::min_zoom_for_viewport`] is the single
+/// source of truth for the floor itself; it is expressed against the
+/// **physical** viewport the atlas is sized in, so converting it into
+/// `CanvasView`'s logical zoom is a division by the same
+/// [`guarded_scale_factor`] [`effective_residency_zoom`] multiplies by.
+/// The identity that has to hold is
+/// `effective_residency_zoom(canvas_min_zoom(v, s), s) >=
+/// TileResidency::min_zoom_for_viewport(v)` — i.e. once the view is
+/// clamped here, the atlas never clamps again, so the scale it renders
+/// at and the scale [`aurora_ui::CanvasView::to_document`] divides by
+/// are the same number and a click cannot paint anywhere but under the
+/// cursor.
+///
+/// The `next_up` loop is what makes that an *exact* identity rather than
+/// an approximate one: `floor / scale * scale` can land one ulp below
+/// `floor`, which would put the atlas's own clamp back in play for that
+/// last ulp. Stepping the returned value up until the round trip lands
+/// at or above the floor costs at most a few ulps of zoom and removes
+/// the whole edge case; the bound is a guard against a much larger
+/// number being one, so rounding it up is always the safe direction.
+#[must_use]
+fn canvas_min_zoom(canvas_size: (u32, u32), scale_factor: f64) -> f32 {
+    let floor = aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_size);
+    let scale = guarded_scale_factor(scale_factor);
+    let mut min_zoom = floor / scale;
+    let mut steps = 0;
+    while min_zoom * scale < floor && steps < 8 {
+        min_zoom = min_zoom.next_up();
+        steps += 1;
+    }
+    min_zoom
+}
+
+/// Applies [`canvas_min_zoom`]'s own floor to `view`, re-anchoring a
+/// live `drag` against the view move that floor can cause (0.57.8).
+///
+/// **`aurora_ui::CanvasView::set_min_zoom` moves the view**, which is
+/// easy to miss because it reads as a bounds setter. When the current
+/// zoom is below a newly raised floor it raises it through `zoom_at`
+/// anchored at the canvas area's own top-left corner, and that rewrites
+/// `pan` too — so `to_document(p)`, the conversion that turns the
+/// pointer into the document point a dab lands on, names a different
+/// place for every `p` but the anchor itself. A live drag holds a
+/// *document-space* reference point fixed from the moment it began, so
+/// this is the same hazard [`apply_scroll_zoom`] closes for
+/// scroll-to-zoom, reached from `App::apply_resize` and `App::redraw`:
+/// a window resize, a dock layout change, or a scale-factor change
+/// while a stroke is still held. Resizing a window mid-stroke is no
+/// more "I am done dragging" than scrolling is, so this re-anchors the
+/// drag ([`shift_drag_reference`]) rather than ending it, and pairs the
+/// two in one function for the same reason `apply_scroll_zoom` does:
+/// so moving the view without dealing with the live drag means
+/// bypassing a shared function rather than skipping an optional step.
+///
+/// **Why the correction is measured at the pointer, and why the
+/// scroll-zoom argument does not simply transfer.** There, the only
+/// thing that moves the view is a pan clamp at an already-fixed zoom,
+/// which shifts `to_document(p)` by the *same* amount for every `p` —
+/// so any measuring point does, and the zoom anchor is the convenient
+/// one. That reasoning does **not** hold here, and assuming it did
+/// would correct by the wrong amount: this path changes the *zoom*.
+/// Raising `z0` to `z1` anchored at `(0, 0)` leaves `pan` at
+/// `p0 * z1 / z0`, so
+///
+/// ```text
+/// to_document_after(x) - to_document_before(x) = x * (1/z1 - 1/z0)
+/// ```
+///
+/// — exactly zero at the anchor and growing linearly away from it, not
+/// one shift for the whole canvas. The pointer is the point that makes
+/// a single shift right anyway, because every live drag's reference is
+/// derived from it and compared against it: `Drag::Brush`/`Eraser`'s
+/// `last_doc` *is* `to_document(pointer)` as of the last move event, so
+/// shifting it by the change measured there leaves the next event's
+/// segment exactly the pointer's own travel (nothing, for a still
+/// pointer); `Drag::Move`/`Drag::Marquee`'s `start_doc` enters only as
+/// `to_document(pointer) - start_doc`, and shifting both ends by the
+/// same amount leaves that difference untouched, so the layer does not
+/// teleport.
+///
+/// `pointer` is the pointer's canvas-area-relative position
+/// ([`pointer_in_canvas`]) — `None` when it is over a dock panel, over
+/// the rail divider, off the window, or before the first layout.
+///
+/// **That arm used to skip the correction entirely, and that was a bug
+/// in its own right — RT-04, found by dynamic testing and fixed in
+/// 0.57.11.** None of those four states ends a live drag: a keyboard
+/// shortcut toggling a panel's collapsed state, a rail-divider drag
+/// (`App::handle_pointer_pressed`'s divider branch returns *before*
+/// the `self.drag.take()` below it), and a window or monitor resize
+/// all reach here mid-stroke with the pointer parked outside the
+/// canvas area. The old early return still applied `bounds` — moving
+/// the view — and then returned without re-anchoring, so the live
+/// drag's own reference kept naming the *pre*-move document position
+/// and the next pointer-move event, even one back to the very same
+/// screen position, interpolated a whole segment of dabs across the
+/// difference: measured at 166 dabs from a still pointer for the far
+/// clamp and 55 for the near one, the latter being exactly the "click
+/// a layer row, the canvas jumps, the next click paints somewhere
+/// else" symptom this round of work started from. Having no measuring
+/// point is not a reason to skip the correction; it is a reason to
+/// find another point to measure at.
+///
+/// **The point it falls back to is the drag's own reference, projected
+/// back to screen** ([`drag_reference`] and
+/// `aurora_ui::CanvasView::to_screen`). For `Drag::Brush`/`Eraser`
+/// that is exact, not approximate: their `last_doc` *is*
+/// `to_document(canvas_point)` as of the last move event, so
+/// `to_screen(last_doc)` is that same canvas point back again — the
+/// very position the correction would have been measured at had the
+/// pointer stayed over the canvas. For a *pure translation* it is
+/// exact for every drag kind, because a translation shifts
+/// `to_document(p)` by the same amount at every `p`
+/// ([`shift_drag_reference`]'s own doc comment makes that argument for
+/// both clamps) — and a pure translation is what the reachable cases
+/// mostly are: a panel toggle or an ordinary resize moves the pan
+/// bound without the floor ever biting, since the floor only bites on
+/// a view zoomed further out than the atlas can render.
+///
+/// The one residual is `Drag::Move`/`Drag::Marquee` when the floor
+/// *also* raises, which is not a translation (see the formula above):
+/// their `start_doc` is not the pointer's own position, so holding it
+/// fixed on screen is not identical to the shift at the pointer, and
+/// the pointer is not knowable from here. The error is bounded by the
+/// on-screen drag distance times the relative zoom change, against an
+/// uncorrected reference — which moves by the *whole* view delta and
+/// is certainly wrong. Correcting by the best reference available
+/// beats leaving a known-stale one in place.
+///
+/// `Drag::Pan` and `Drag::Eyedropper` yield no reference and so still
+/// take the uncorrected path. That is correct rather than a gap, for
+/// exactly the reason [`shift_drag_reference`] already gives: a pan
+/// holds a *screen* position (which a view move does not invalidate)
+/// and an eyedropper holds nothing at all.
+///
+/// **`bounds` is applied here too, and the far half of it is not
+/// ceremony** (0.57.10). A resize changes the canvas area's own size,
+/// and the far bound is a statement about the document position at the
+/// canvas area's *bottom-right* corner — so growing the window while
+/// the view sits exactly on that bound pushes it past, with nothing
+/// else on this path to catch it. That is the one call site in this
+/// round that needed real analysis rather than mechanical mirroring of
+/// the pan-moving sites.
+///
+/// The **near** half is applied for uniformity, not necessity, and that
+/// is worth stating rather than leaving a reader to wonder: it is
+/// provably a no-op here. `set_min_zoom` raises zoom through
+/// `zoom_at((0, 0), ..)`, which holds `to_document((0, 0))` fixed by
+/// construction (`aurora-ui`'s own
+/// `set_min_zoom_holds_the_top_left_document_position_across_the_raise`
+/// pins exactly that), and the near bound is a statement about
+/// `to_document((0, 0))` alone. Going through the one shared
+/// [`PanBounds::apply`] rather than reaching for
+/// `clamp_pan_to_maximum` directly is what keeps this crate's single
+/// `clamp_pan_to_minimum` call site single.
+///
+/// Both clamps run **inside** the before/after measurement window, for
+/// the same reason [`apply_scroll_zoom`]'s does: whatever they move is
+/// then carried by [`shift_drag_reference`] into a live drag, instead
+/// of moving the view out from under one. A resize arriving mid-stroke
+/// is exactly the case this path exists for.
+fn apply_canvas_min_zoom(
+    view: &mut aurora_ui::CanvasView,
+    drag: Option<&mut Drag>,
+    pointer: Option<(f32, f32)>,
+    min_zoom: f32,
+    bounds: PanBounds,
+) {
+    // The canvas-area point to measure the view's own move at: the
+    // pointer when it is over the canvas, and otherwise the live drag's
+    // own reference point projected back to screen -- never "nowhere",
+    // which is what left a stale reference behind before 0.57.11 (see
+    // this function's own doc comment). `None` only when there is no
+    // drag to correct, or a drag that holds no reference at all.
+    let anchor = drag.as_deref().and_then(|drag| {
+        pointer.or_else(|| drag_reference(drag).map(|reference| view.to_screen(reference)))
+    });
+    let before = anchor.map(|anchor| view.to_document(anchor));
+    view.set_min_zoom(min_zoom);
+    bounds.apply(view);
+    if let (Some(drag), Some(anchor), Some(before)) = (drag, anchor, before) {
+        let after = view.to_document(anchor);
+        shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+    }
+}
+
+/// A freshly reset [`aurora_ui::CanvasView`] for a newly opened
+/// document — default pan and zoom, but **never** a lapsed zoom floor.
+///
+/// `CanvasView::default()` resets `min_zoom` to `aurora_ui::canvas_view::MIN_ZOOM`,
+/// and the document-open paths assign one directly. That left a real
+/// window — from the assignment until the *next* `redraw`/`apply_resize`
+/// re-applied the floor — in which the view held no floor at all, and
+/// any scroll or click processed in that window went through
+/// `to_document` dividing by a zoom the atlas would decline to render:
+/// the exact render/paint divergence [`canvas_min_zoom`] and
+/// [`aurora_ui::CanvasView::set_min_zoom`] exist to close, reopened by
+/// the reset itself (measured at up to ~2,000 document px of offset at
+/// `MIN_ZOOM` on a 1920 px viewport). Resetting through this function
+/// closes it: the floor is re-derived from the live canvas area in the
+/// same statement that clears the view, so it is never absent, not even
+/// transiently.
+///
+/// `canvas_size` is [`canvas_area_physical_size`]'s own value (`None`
+/// only when the canvas-area widget id is unknown, which does not
+/// happen for `workspace.canvas_area` in practice). In that case
+/// `previous`'s floor is carried across rather than dropped — a stale
+/// floor from the last known canvas size is still a bound, and dropping
+/// to `MIN_ZOOM` is the one outcome this must not have.
+#[must_use]
+fn reset_canvas_view(
+    previous: &aurora_ui::CanvasView,
+    canvas_size: Option<(u32, u32)>,
+    scale_factor: f64,
+) -> aurora_ui::CanvasView {
+    let min_zoom = canvas_size.map_or_else(
+        || previous.min_zoom(),
+        |canvas_size| canvas_min_zoom(canvas_size, scale_factor),
+    );
+    let mut view = aurora_ui::CanvasView::default();
+    view.set_min_zoom(min_zoom);
+    view
+}
+
+/// The whole canvas-view half of adopting a freshly loaded document:
+/// [`reset_canvas_view`] and then [`clamp_pan_to_active_layer`], in that
+/// order, as one indivisible step.
+///
+/// **The order is the entire point, which is why this is a function and
+/// not two statements at each call site.** `reset_canvas_view` returns
+/// a pan of `(0, 0)`, and `(0, 0)` is only *within* the pan bound when
+/// the newly active layer's own origin is `(0, 0)` too. A document
+/// whose active layer sits elsewhere — a `.aur` file saved after a Move,
+/// since `aurora_core::Rect`'s own `x`/`y` round-trip through the
+/// manifest and `App::apply_move` never bakes the offset into pixels —
+/// would otherwise start with `canvas_local_origin` negative on its very
+/// first frame, no panning needed to trigger it. Clamping *before* the
+/// reset is worse than useless: the reset would throw the clamp away.
+///
+/// Every document-adopting path goes through here — [`App::open_file`]'s
+/// own flat-image path, [`App::open_aur_file`], and [`App::new`] (which
+/// has no window yet, so it passes `canvas_size: None` and leans on
+/// `reset_canvas_view`'s own documented "carry `previous`'s floor
+/// across" branch, with a default `previous`). Before this existed the
+/// sequence was open-coded at each of them and the ordering was
+/// enforced only by a comment, which no test could fail.
+///
+/// `canvas_size` is the *canvas area's* own physical size
+/// ([`canvas_area_physical_size`]), not the document's — see
+/// [`reset_canvas_view`], whose parameter this is passed straight
+/// through to. `canvas_logical_size` is the same area measured in
+/// **logical** pixels ([`canvas_area_logical_size`]), which is what the
+/// pan bound's far half needs; the two are separate parameters rather
+/// than one derived from the other for the reason
+/// [`canvas_area_logical_size`]'s own doc comment gives.
+#[must_use]
+fn load_document_view(
+    previous: &aurora_ui::CanvasView,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    canvas_size: Option<(u32, u32)>,
+    canvas_logical_size: Option<(f32, f32)>,
+    scale_factor: f64,
+) -> aurora_ui::CanvasView {
+    let mut view = reset_canvas_view(previous, canvas_size, scale_factor);
+    clamp_pan_to_active_layer(&mut view, layers, active_layer, canvas_logical_size);
+    view
 }
 
 /// The active pixel layer's own *surface-local, continuous* document
@@ -5109,22 +7502,11 @@ struct App {
     /// preferences aren't being persisted this run," not an error.
     /// Applied once, at construction ([`load_workspace_layout`]); saved
     /// once, on a clean shutdown ([`save_workspace_layout`],
-    /// `WindowEvent::CloseRequested`) — the same "write once, at a real
-    /// lifecycle boundary" discipline [`write_autosave`] already uses,
-    /// not a reactive save on every resize/collapse.
+    /// `WindowEvent::CloseRequested`) — the same "write at a real
+    /// lifecycle boundary" discipline [`write_autosave`]'s own direct
+    /// callers already use, not a reactive save on every
+    /// resize/collapse.
     layout_path: Option<PathBuf>,
-    /// Runs [`AutosaveQueue`]'s background disk writes (and, in a fuller
-    /// build, real GPU render work — see that type's own doc comment) on
-    /// a dedicated thread away from every input handler in this crate.
-    /// Built once, in [`App::new`], alongside `autosave_queue` below.
-    executor: aurora_render::Executor,
-    /// Coalesces this session's live re-triggered autosaves — see
-    /// [`Self::trigger_autosave`] and [`AutosaveQueue`]'s own doc
-    /// comment. Always the same fixed path [`autosave_path`] returns;
-    /// `App::new`'s own one-shot startup [`write_autosave`] call and
-    /// this queue deliberately target the same file, since they're both
-    /// just different *triggers* for saving the same journal.
-    autosave_queue: AutosaveQueue,
     /// The window's current DPI scale factor (`Window::scale_factor`) —
     /// read once the real window exists (`resumed`) and kept current via
     /// `WindowEvent::ScaleFactorChanged`, e.g. when the window moves to a
@@ -5167,13 +7549,15 @@ struct App {
     /// deleted or resized) — a real editor's canvas can be larger,
     /// smaller, or offset from any single layer it contains. Set once
     /// from [`document_canvas_size`] for a document built without a
-    /// real, independent canvas size of its own ([`demo_document`], a
-    /// recovered autosave — the crash-recovery journal doesn't persist
-    /// one either, a real, honest, separate limitation from the `.aur`
-    /// case below), from a decoded image's own real dimensions
+    /// real, independent canvas size of its own ([`demo_document`] —
+    /// a recovered autosave used to be in that same boat, since the
+    /// raw crash-recovery journal persisted no canvas size, but the
+    /// autosave file is a real `.aur` container now and its manifest
+    /// carries one), from a decoded image's own real dimensions
     /// ([`Self::open_file`]), or from a `.aur` file's own manifest
     /// (`aurora_io::read_aur`'s own third return value,
-    /// [`Self::open_aur_file`]) — the one case this was actually wrong
+    /// [`Self::open_aur_file`] and [`recover_document`]) — the one case
+    /// this was actually wrong
     /// before: re-saving a `.aur` file whose real canvas size differed
     /// from its topmost layer's own bounds used to silently shrink (or
     /// grow) the canvas to match that layer instead of preserving it.
@@ -5222,6 +7606,67 @@ struct App {
     /// clicked that turns out to be a group (groups are never inserted
     /// into `layer_rows` at all, so this can't actually happen via a
     /// click — only via never having a pixel layer to begin with).
+    ///
+    /// **The canvas pan boundary is a function of this field, of this
+    /// layer's own `bounds`, and of the canvas area's own size.** The
+    /// bound ([`PanBounds`]) is measured against the active layer's
+    /// document-space origin ([`active_layer_origin`], what
+    /// [`canvas_local_origin`] subtracts) on the near edge, and against
+    /// that origin plus the document ceiling
+    /// ([`aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX`]) on the far
+    /// one — so it moves when *any* of the three inputs moves, and a pan
+    /// that never moved is then outside it, reopening the render/paint
+    /// divergence the clamps exist to close. Writing this field is
+    /// therefore only one third of what has to re-clamp.
+    ///
+    /// All three, and where each re-establishes the bound:
+    ///
+    /// - *Which layer is active.* [`Self::new`], [`Self::open_file`] and
+    ///   [`Self::open_aur_file`] set it and then build the view through
+    ///   [`load_document_view`], which clamps as part of the same step.
+    ///   [`select_layer`] takes the view and clamps itself.
+    /// - *That layer's own bounds.* [`Self::apply_move`] rewrites them
+    ///   live, per pointer-move event, and deliberately does **not**
+    ///   clamp there (it would feed back into `continue_drag`'s own
+    ///   fixed `start_doc` — see [`commit_ending_drag`]); the clamp
+    ///   happens once, at the commit, in [`commit_ending_drag`]'s own
+    ///   `Drag::Move` arm. [`Self::run_undo_redo`] can revert or reapply
+    ///   a recorded bounds change without this field changing at all,
+    ///   and clamps via [`perform_undo_redo`]'s own [`after_undo_redo`]
+    ///   step.
+    /// - *The canvas area's own size* (0.57.10), which only the **far**
+    ///   half of the bound depends on: the document position at the
+    ///   canvas area's bottom-right corner moves when that area grows,
+    ///   with neither this field nor any layer's `bounds` changing.
+    ///   [`App::apply_resize`] and [`App::redraw`] both re-apply
+    ///   [`PanBounds`] through [`apply_canvas_min_zoom`], which is why
+    ///   that function takes one at all. The near half is provably
+    ///   unaffected by a resize — see its doc comment.
+    ///
+    /// A new writer of any of the three that skips the clamp is a bug
+    /// with no visible symptom until someone paints.
+    ///
+    /// **And a clamp that runs while a drag is still live is its own
+    /// bug** (0.57.7), in the opposite direction: the drag holds a
+    /// document-space reference point fixed from the moment it began,
+    /// so a view that moves under it makes the next pointer-move event
+    /// measure against a view the drag knows nothing about — for a
+    /// `Drag::Brush`, a line of dabs the user never drew. Every path
+    /// that moves the view has to say which it does: end the drag first
+    /// ([`press_layer_row`], [`perform_undo_redo`], and the Zoom-tool
+    /// click branch of [`Self::handle_pointer_pressed`], all through
+    /// [`commit_ending_drag`]), or re-anchor it
+    /// ([`shift_drag_reference`], for [`apply_scroll_zoom`] and
+    /// [`apply_canvas_min_zoom`], where the gesture is not "I am done
+    /// dragging").
+    ///
+    /// The second of those two was the rule's own first exception, and
+    /// is worth knowing about as a shape rather than a one-off:
+    /// `aurora_ui::CanvasView::set_min_zoom` moves the view without
+    /// reading like it does (0.57.8), so `App::apply_resize`/
+    /// `App::redraw` broke the rule for a whole round while stating it.
+    /// A "setter" that ends up in `zoom_at` or `pan_by` is a path that
+    /// moves the view.
     active_layer: Option<aurora_doc::LayerId>,
     /// The colour `Brush` paints with — [`DEFAULT_COLOUR`] until the
     /// Eyedropper tool samples a real pixel and changes it
@@ -5330,6 +7775,24 @@ struct App {
     needs_redraw: bool,
 }
 
+impl ShutdownState for App {
+    fn marker_path(&self) -> &Path {
+        &self.marker_path
+    }
+
+    fn autosave_path(&self) -> PathBuf {
+        autosave_path()
+    }
+
+    fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore> {
+        self.tile_store.take()
+    }
+
+    fn scratch_dir(&self) -> Option<&Path> {
+        tile_store_scratch_dir()
+    }
+}
+
 impl App {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -5347,16 +7810,16 @@ impl App {
         if let Some(layout_path) = layout_path.as_deref() {
             load_workspace_layout(layout_path, &mut workspace);
         }
-        // Only even try reading an autosave if the previous run left a
-        // marker behind -- a clean shutdown never needs its own autosave
-        // read back, and skipping the attempt means an autosave file left
-        // over from a much older, already-recovered-from crash can't
-        // resurface later.
-        let recovered = had_previous_marker
-            .then(|| recover_document(autosave_path))
-            .flatten();
-        let was_recovered = recovered.is_some();
-        let (layers, history) = recovered.unwrap_or_else(demo_document);
+        // Opened *before* recovery, not after: `recover_document` writes
+        // the autosave's own tiles straight into a live store, so the
+        // store has to exist first.
+        let mut tile_store = open_tile_store();
+        let StartupDocument {
+            layers,
+            history,
+            canvas_size,
+            was_recovered,
+        } = startup_document(had_previous_marker, autosave_path, &mut tile_store);
         let layer_rows = match aurora_ui::populate_layers_panel(
             &mut workspace.tree,
             workspace.layers,
@@ -5386,19 +7849,40 @@ impl App {
         ) {
             unreachable!("workspace.properties was just built by build_workspace above: {err:?}");
         }
-        // Written unconditionally, whether this session opened the demo
-        // document or a recovered one -- either way, it's the current
-        // document, and is what the *next* run should recover to if this
-        // one doesn't shut down cleanly.
-        write_autosave(autosave_path, &history);
         let active_layer = topmost_pixel_layer(&layers);
-        // Neither `demo_document` nor a recovered autosave carries a
-        // real, independent canvas size (the crash-recovery journal is
-        // just a `LayerOp` sequence, see `Self::canvas_size`'s own doc
-        // comment) -- derived from the topmost layer here, the same
-        // fallback `document_canvas_size` has always been.
-        let canvas_size = document_canvas_size(&layers);
-        let tile_store = open_tile_store();
+        // The pan bound, established before the first frame. Crash
+        // recovery reopens a real `.aur` container
+        // (`recover_document`/`read_autosave_container`), so this
+        // document's own active layer can already sit away from
+        // `(0, 0)` — the same `.aur` round-trip `Self::open_aur_file`
+        // has to clamp for, just reached at startup instead.
+        //
+        // Clamped here at zoom 1.0, before any zoom floor exists (there
+        // is no window yet, so no canvas size to derive one from --
+        // hence `canvas_size: None`, `load_document_view`'s own
+        // "carry `previous`'s floor across" branch, with a default
+        // `previous` whose floor is `MIN_ZOOM`; identical to the bare
+        // `CanvasView::default()` this used to build, minus the missing
+        // clamp). That is sound rather than merely early: the floor is
+        // applied later by `set_min_zoom` (from `redraw`/`apply_resize`),
+        // which raises zoom through `zoom_at((0.0, 0.0), ..)`, and
+        // `zoom_at` sets `pan = anchor - to_document(anchor) * new_zoom`
+        // — at the `(0, 0)` anchor that holds `to_document((0, 0))`
+        // fixed across the raise. So a view satisfying the bound here
+        // still satisfies it after the floor lands; the raise cannot
+        // undo this clamp.
+        let canvas_view = load_document_view(
+            &aurora_ui::CanvasView::default(),
+            &layers,
+            active_layer,
+            None,
+            // No window and no layout yet, so no canvas area to
+            // measure -- the same `None` this call already passes for
+            // the physical size, and `pan_bounds` weakens the far bound
+            // rather than dropping it.
+            None,
+            1.0,
+        );
 
         let mut focus = FocusManager::default();
         let mut crash_recovery_dialog = None;
@@ -5426,13 +7910,11 @@ impl App {
             crash_recovery_dialog,
             marker_path,
             layout_path,
-            executor: aurora_render::Executor::spawn(),
-            autosave_queue: AutosaveQueue::new(autosave_path.to_path_buf()),
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
             tool: aurora_ui::Tool::default(),
-            canvas_view: aurora_ui::CanvasView::default(),
+            canvas_view,
             selection: aurora_doc::SelectionSet::new(),
             layers,
             canvas_size,
@@ -5482,23 +7964,6 @@ impl App {
         adapter.update_if_active(|| tree.accessibility_update(focused));
     }
 
-    /// Re-serializes `self.history`'s journal and re-queues it on
-    /// `self.autosave_queue` — the live-editing half of this crate's
-    /// "crash recovery" section, called after every real, completed
-    /// document mutation (a completed Move, Undo/Redo, a committed
-    /// Brush/Eraser stroke; see each call site's own comment). Never
-    /// blocks the calling thread on disk I/O: `history.save_journal()`
-    /// is cheap, CPU-bound `postcard` encoding, and
-    /// [`AutosaveQueue::enqueue`] itself only ever does a short,
-    /// non-I/O critical section before handing the actual
-    /// `std::fs::write` to `self.executor`'s background thread — see
-    /// that method's own doc comment. A serialization failure is
-    /// logged, not fatal, the same discipline [`write_autosave`] already
-    /// applies to its own `save_journal` call.
-    fn trigger_autosave(&mut self) {
-        queue_autosave(&mut self.executor, &self.autosave_queue, &self.history);
-    }
-
     /// A real `winit::event::KeyEvent`'s full handling: ignores key-up
     /// (only a press should trigger a shortcut or type a character —
     /// otherwise every binding would fire twice), translates it into
@@ -5519,23 +7984,6 @@ impl App {
         let Some(key) = translate_key(&event.logical_key) else {
             return;
         };
-        // Mirrors `handle_key`'s own dispatch guard (dialog first, then
-        // palette, then a resolved shortcut) so this can tell, from out
-        // here, whether the call below is about to run Undo/Redo
-        // directly against `self.history`/`self.pixel_history` --
-        // `handle_key` itself has no way to report that back other than
-        // the narrower `ActivatedCommand` it already returns (which only
-        // covers the command-palette path, handled below). Computed
-        // *before* the call so it reflects the same
-        // `crash_recovery_dialog`/`command_palette` state `handle_key`
-        // itself is about to see.
-        let chord = KeyChord::new(self.modifiers, key);
-        let direct_shortcut_will_undo_redo = self.crash_recovery_dialog.is_none()
-            && self.command_palette.is_none()
-            && matches!(
-                self.shortcuts.resolve(chord),
-                Some(&(AppCommand::Undo | AppCommand::Redo))
-            );
         let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
@@ -5558,21 +8006,9 @@ impl App {
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
             Some(ActivatedCommand::SaveFile(path)) => self.save_file(&path),
-            // `run_undo_redo` itself re-triggers the autosave -- see its
-            // own doc comment -- so nothing further is needed here for
-            // the command-palette/menu path.
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             None => {}
-        }
-        // The direct `Ctrl+Z`/`Ctrl+Shift+Z` path: `handle_key` already
-        // ran Undo/Redo against `self.history`/`self.pixel_history`
-        // above (it doesn't surface that as an `ActivatedCommand` the
-        // way the palette/menu path does), so re-trigger here instead --
-        // see `direct_shortcut_will_undo_redo`'s own comment for why
-        // this is computed separately from `picked`.
-        if direct_shortcut_will_undo_redo {
-            self.trigger_autosave();
         }
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -5581,16 +8017,26 @@ impl App {
         self.push_accessibility();
     }
 
-    /// Runs `command` (`AppCommand::Undo` or `::Redo`) via
-    /// [`run_command`] against this app's own live state — what the
-    /// command palette's and (macOS) native menu's own Undo/Redo
-    /// entries fall back to once `activate_command` hands the bare
-    /// command back up (deliberately kept free of `layers`/`history`/
-    /// `pixel_history`/the tile store — see [`ActivatedCommand`]'s own
-    /// doc comment for why), the same path `Ctrl+Z`/`Ctrl+Shift+Z`
-    /// themselves already run through.
+    /// Runs `command` (`AppCommand::Undo` or `::Redo`) against this
+    /// app's own live state — [`perform_undo_redo`] against `App`'s own
+    /// fields. A `&mut self` wrapper so the two call sites can spell it
+    /// in one line; the real logic (**and the order the three steps
+    /// have to run in** — commit the live drag, run the command, then
+    /// re-establish the composite cache and the pan bound) is the free
+    /// function, which needs no `App` (and therefore no GPU adapter) to
+    /// test, the same split [`Self::commit_drag`] already uses.
+    ///
+    /// What the command palette's and (macOS) native menu's own
+    /// Undo/Redo entries fall back to once `activate_command` hands the
+    /// bare command back up (deliberately kept free of `layers`/
+    /// `history`/`pixel_history`/the tile store — see
+    /// [`ActivatedCommand`]'s own doc comment for why). **Not** the
+    /// `Ctrl+Z`/`Ctrl+Shift+Z` path, which [`handle_key`] resolves and
+    /// runs through [`run_command`] itself without ever returning an
+    /// `ActivatedCommand` — see PLAN.md's own residual disclosure for
+    /// what that costs and why closing it is its own change.
     fn run_undo_redo(&mut self, command: AppCommand) {
-        run_command(
+        perform_undo_redo(
             &mut self.workspace,
             &mut self.focus,
             &mut self.command_palette,
@@ -5600,23 +8046,12 @@ impl App {
             &mut self.pixel_history,
             self.tile_store.as_mut(),
             &mut self.undo_order,
+            &mut self.composite_cache,
+            &mut self.canvas_view,
+            self.active_layer,
+            &mut self.drag,
             command,
         );
-        // Either command could revert/reapply a bounds change (Move) as
-        // well as a pixel edit -- coarse but safe, matching
-        // `CompositeCache`'s own documented "any edit invalidates
-        // everything" scoping.
-        self.composite_cache.bump();
-        // `command` is always `AppCommand::Undo`/`::Redo` here (this
-        // method's own doc comment) -- re-trigger the autosave
-        // unconditionally, same "safe to over-trigger, not safe to
-        // under-trigger" reasoning `App::trigger_autosave` itself
-        // documents. A no-op `undo`/`redo` (nothing left to undo/redo)
-        // just re-serializes and re-queues the same bytes already on
-        // disk -- harmless, and cheaper to accept than to thread
-        // `run_command`'s own success/failure back out through another
-        // parameter.
-        self.trigger_autosave();
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -5674,22 +8109,29 @@ impl App {
                 }
             };
 
-        if let Some(store) = self.tile_store.as_mut()
-            && let Some(surface) = layers.surface_id(layer_id)
-            && let Err(err) = aurora_io::write_into_store(&image, store, surface)
-        {
-            tracing::warn!(
-                ?err,
-                "failed to write the opened image's pixels into the tile store"
-            );
-        }
-        write_autosave(&autosave_path(), &history);
-
-        self.layers = layers;
         // The image's own real, decoded dimensions -- known exactly
         // here, rather than derived back out of the one layer just
         // built from it (`document_canvas_size`'s own fallback role).
-        self.canvas_size = (image.width(), image.height());
+        let canvas_size = (image.width(), image.height());
+        if let Some(store) = self.tile_store.as_mut() {
+            if let Some(surface) = layers.surface_id(layer_id)
+                && let Err(err) = aurora_io::write_into_store(&image, store, surface)
+            {
+                tracing::warn!(
+                    ?err,
+                    "failed to write the opened image's pixels into the tile store"
+                );
+            }
+            // After the pixels land in the store, not before: the
+            // autosave container carries this document's real tiles now,
+            // so writing it first would persist an empty one.
+            write_autosave(&autosave_path(), &layers, &history, canvas_size, store);
+        } else {
+            tracing::warn!("no live tile store; skipping the opened document's autosave");
+        }
+
+        self.layers = layers;
+        self.canvas_size = canvas_size;
         self.history = history;
         // A freshly opened document has no relationship to the previous
         // one's own undo state either -- `self.history` above is a
@@ -5703,8 +8145,27 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
-        self.canvas_view = aurora_ui::CanvasView::default();
+        // Through `load_document_view`, never `reset_canvas_view` or
+        // `CanvasView::default()` directly: the default drops the
+        // atlas's zoom floor, and the reset on its own drops the pan
+        // bound. `load_document_view` is both, in the one order that is
+        // correct -- see its own doc comment. Assigned after
+        // `self.active_layer`/`self.layers` above, since it reads them.
+        self.canvas_view = load_document_view(
+            &self.canvas_view,
+            &self.layers,
+            self.active_layer,
+            canvas_area_physical_size(&self.workspace, self.scale_factor),
+            canvas_area_logical_size(&self.workspace),
+            self.scale_factor,
+        );
         self.selection = aurora_doc::SelectionSet::new();
+        // Dropped, deliberately not committed through `commit_drag`:
+        // `pixel_history` was replaced wholesale a few lines up, so an
+        // entry pushed here would be discarded immediately -- and it
+        // would capture tiles on a surface belonging to a document that
+        // is no longer open. This is the one place dropping a live drag
+        // is right; see `commit_ending_drag`.
         self.drag = None;
         self.push_accessibility();
     }
@@ -5763,7 +8224,15 @@ impl App {
                     return;
                 }
             };
-        write_autosave(&autosave_path(), &history);
+        // Re-borrowed rather than reusing the `store` binding above:
+        // that borrow of `self.tile_store` has to end before
+        // `replace_document`'s own `&mut self.workspace` above, and
+        // `read_aur` has already populated the store by now, so the
+        // container this writes carries the opened document's real
+        // tiles.
+        if let Some(store) = self.tile_store.as_mut() {
+            write_autosave(&autosave_path(), &layers, &history, canvas_size, store);
+        }
 
         self.layers = layers;
         // The file's own real, saved canvas size -- restored directly,
@@ -5778,8 +8247,27 @@ impl App {
         self.composite_cache.bump();
         self.active_layer = active_layer;
         self.layer_rows = layer_rows;
-        self.canvas_view = aurora_ui::CanvasView::default();
+        // Through `load_document_view`, never `reset_canvas_view` or
+        // `CanvasView::default()` directly: the default drops the
+        // atlas's zoom floor, and the reset on its own drops the pan
+        // bound. `load_document_view` is both, in the one order that is
+        // correct -- see its own doc comment. Assigned after
+        // `self.active_layer`/`self.layers` above, since it reads them.
+        self.canvas_view = load_document_view(
+            &self.canvas_view,
+            &self.layers,
+            self.active_layer,
+            canvas_area_physical_size(&self.workspace, self.scale_factor),
+            canvas_area_logical_size(&self.workspace),
+            self.scale_factor,
+        );
         self.selection = aurora_doc::SelectionSet::new();
+        // Dropped, deliberately not committed through `commit_drag`:
+        // `pixel_history` was replaced wholesale a few lines up, so an
+        // entry pushed here would be discarded immediately -- and it
+        // would capture tiles on a surface belonging to a document that
+        // is no longer open. This is the one place dropping a live drag
+        // is right; see `commit_ending_drag`.
         self.drag = None;
         self.push_accessibility();
     }
@@ -5815,7 +8303,9 @@ impl App {
     /// variant (`Dissolve` — this family's own explicit, now sole
     /// boundary) still
     /// silently falling back to `Normal` — a real, still-open gap. Layer
-    /// groups are recursed into at any depth, ancestor-visibility-gated
+    /// groups are recursed into at any depth `aurora-doc` will accept
+    /// (bounded independently by `aurora_doc::MAX_LAYER_TREE_DEPTH` —
+    /// see `resolve_tile`'s own doc comment), ancestor-visibility-gated
     /// (`resolve_tile`'s own shared recursion, walking
     /// `aurora_doc::LayerTree::roots`/`LayerTree::children`) — a
     /// group's own `opacity`/`blend_mode` **are** now aggregated into
@@ -5839,6 +8329,16 @@ impl App {
     /// absent-precondition honesty [`Self::paint_dab`] already uses. A
     /// real, logged failure (compositing the pixels, encoding, or
     /// writing the file) is worth a warning, though.
+    ///
+    /// **Nothing is written if the composite came out incomplete.**
+    /// [`composite_document`] returns
+    /// [`aurora_io::IoError::IncompleteComposite`] when a layer tile
+    /// could not be read out of the store (a corrupted scratch-disk
+    /// tile, say), and this function then returns without touching
+    /// `path` at all — no partial file, no overwrite of whatever was
+    /// there. That refusal is currently log-only: surfacing it as the
+    /// itemized, user-visible warning FR-001 wants is separate, still-
+    /// open work tracked in PLAN.md.
     fn save_file(&mut self, path: &Path) {
         if is_aur_path(path) {
             self.save_aur_file(path);
@@ -5851,7 +8351,14 @@ impl App {
         let image = match composite_document(&self.layers, store, width, height) {
             Ok(image) => image,
             Err(err) => {
-                tracing::warn!(?err, "failed to composite the document for export");
+                // Includes `IoError::IncompleteComposite` -- the export
+                // refused because one or more layer tiles could not be
+                // read (see `composite_document`'s own `# Errors`). The
+                // *file* is safe either way: nothing is written, and
+                // whatever was already at `path` is untouched. What is
+                // still missing is telling the user, rather than only the
+                // log -- tracked in PLAN.md, not solved here.
+                tracing::error!(?err, "refusing to export: could not composite the document");
                 return;
             }
         };
@@ -5990,7 +8497,11 @@ impl App {
                 canvas_point,
                 &mut self.canvas_view,
                 &mut self.selection,
-                active_layer_origin(&self.layers, self.active_layer),
+                pan_bounds(
+                    &self.layers,
+                    self.active_layer,
+                    canvas_area_logical_size(&self.workspace),
+                ),
             );
             for doc_point in dabs {
                 if erasing {
@@ -6026,6 +8537,17 @@ impl App {
     /// erases/samples its own starting point immediately
     /// ([`Self::paint_dab`]/[`Self::erase_dab`]/[`Self::sample_eyedropper`]),
     /// so a plain click (no drag at all) still does something.
+    ///
+    /// **Every branch that reaches the canvas ends whatever drag was
+    /// still live first** — the layer-row branch through
+    /// [`press_layer_row`], the Zoom-tool and drag branches through the
+    /// shared `self.commit_drag(self.drag.take())` (moved above the
+    /// Zoom-tool branch in 0.57.7, which used to `return` past it). A
+    /// press is a second gesture, and the two things it would otherwise
+    /// do to a live drag — drop its undo entry, and move the view out
+    /// from under its fixed reference point — are exactly the pair
+    /// [`commit_ending_drag`] and [`Self::active_layer`]'s own doc
+    /// comment describe.
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
         let Some(button) = translate_pointer_button(button) else {
             return;
@@ -6057,10 +8579,19 @@ impl App {
             && let Some(hit) = self.workspace.tree.hit_test(position)
             && let Some(&layer_id) = self.layer_rows.get(&hit)
         {
-            select_layer(
+            // Through `press_layer_row`, never `select_layer` alone:
+            // the selection moves the pan bound, and no drag may still
+            // be live under it. See that function's own doc comment.
+            press_layer_row(
                 &mut self.workspace,
                 &self.layer_rows,
                 &mut self.active_layer,
+                &mut self.canvas_view,
+                &self.layers,
+                &mut self.history,
+                &mut self.pixel_history,
+                &mut self.undo_order,
+                &mut self.drag,
                 layer_id,
             );
             // Changes `recomposite_visible_tiles`'s own reference origin
@@ -6092,12 +8623,36 @@ impl App {
             return;
         };
 
+        // A second press while a drag is still in progress -- the middle
+        // button to pan mid-stroke, the right button, a stylus barrel
+        // button -- ends that drag as surely as a release does, and the
+        // assignment below is about to drop it. Commit it first, or the
+        // pixels it already painted stay on the layer with no undo entry
+        // naming them and the next Ctrl+Z reaches past them into the
+        // previous stroke (`commit_ending_drag`).
+        //
+        // Ahead of the Zoom-tool branch below, not after it (0.57.7):
+        // that branch `return`s, so it used to reach neither this commit
+        // nor any other -- and it *also* moves the view
+        // (`handle_zoom_tool_click` clamps the pan), out from under a
+        // drag still holding a fixed document-space reference point.
+        // Both halves are exactly what `press_layer_row` was written to
+        // fix, one branch further down this same function, and a live
+        // `Drag::Brush` really can reach here: `z` switches to the Zoom
+        // tool mid-stroke without ending the stroke.
+        let interrupted = self.drag.take();
+        self.commit_drag(interrupted);
+
         if self.tool == aurora_ui::Tool::Zoom && button == PointerButton::Primary {
             handle_zoom_tool_click(
                 &mut self.canvas_view,
                 canvas_point,
                 self.modifiers,
-                active_layer_origin(&self.layers, self.active_layer),
+                pan_bounds(
+                    &self.layers,
+                    self.active_layer,
+                    canvas_area_logical_size(&self.workspace),
+                ),
             );
             return;
         }
@@ -6137,16 +8692,37 @@ impl App {
     /// e.g. the scratch disk failing mid-session) is worth a warning,
     /// though, unlike those absent-precondition cases.
     ///
-    /// Before the real write, captures every tile this dab is about to
-    /// touch ([`aurora_brush::touched_tiles`]) into the active
-    /// `Drag::Brush`'s own `stroke` snapshot
-    /// ([`aurora_brush::StrokeSnapshot::record_touch`]), if there is
-    /// one — the pixel-edit half of `Self::history`'s own Undo/Redo,
-    /// closed by [`Self::handle_pointer_released`] once the stroke
-    /// completes. A no-op for that half specifically (still paints)
-    /// when `self.drag` isn't actually a `Drag::Brush` with a real
-    /// `stroke` — shouldn't happen given how this is always called, but
-    /// this doesn't assume it.
+    /// The active `Drag::Brush`'s own `stroke` snapshot, if there is
+    /// one ([`brush_stroke_mut`]), is handed *to*
+    /// [`aurora_brush::stamp_dab`] rather than filled in beforehand —
+    /// the pixel-edit half of `Self::history`'s own Undo/Redo, closed by
+    /// [`Self::handle_pointer_released`] once the stroke completes. A
+    /// no-op for that half specifically (still paints) when `self.drag`
+    /// isn't actually a `Drag::Brush` with a real `stroke` — shouldn't
+    /// happen given how this is always called, but this doesn't assume
+    /// it.
+    ///
+    /// **Capture happens inside the dab now, not before it** (0.55.0).
+    /// This used to call [`aurora_brush::touched_tiles`] first and
+    /// [`aurora_brush::StrokeSnapshot::record_touch`] on every listed
+    /// tile, *then* stamp. A stroke whose paint subsequently failed
+    /// therefore still got a captured snapshot and a real — but
+    /// useless — undo entry, covering pixels nothing had changed.
+    /// `stamp_dab` now captures each tile in the instant before it first
+    /// writes to that tile
+    /// ([`aurora_brush::StrokeSnapshot::record_content`]), so captured
+    /// and painted are the same set — and, since 0.56.0, that set
+    /// excludes a tile the dab acquired but then changed nothing in, so
+    /// neither an undo entry nor the invalidation loop below names a
+    /// tile that still looks exactly as it did. The loop walks
+    /// [`aurora_brush::DabOutcome::painted`] — what the dab really
+    /// wrote — instead of what it merely aimed at.
+    ///
+    /// **One warning per broken tile per stroke** (0.56.0), via
+    /// [`unwarned_failures`]: a permanently corrupt tile fails every dab
+    /// for the rest of the drag, and 0.55.0's own one-line-per-dab
+    /// collapse still left a long drag across one emitting ~100
+    /// identical lines.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
         let Some(layer_id) = self.active_layer else {
             return;
@@ -6162,33 +8738,51 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
-        let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
-        if let Some(Drag::Brush {
-            stroke: Some(stroke),
-            ..
-        }) = self.drag.as_mut()
-        {
-            for &tile in &touched {
-                if let Err(err) = stroke.record_touch(store, tile) {
-                    tracing::warn!(?err, ?tile, "failed to capture a pixel-undo snapshot");
-                }
-            }
-        }
-        if let Err(err) =
-            aurora_brush::stamp_dab(store, surface, local, BRUSH_RADIUS, self.current_colour)
-        {
-            tracing::warn!(?err, "failed to stamp a brush dab");
-        }
-        for tile in touched {
+        // Both borrows are of distinct fields of `self`, so they
+        // coexist. This is why the accessor is a free function over
+        // `&mut Option<Drag>` and not a `&mut self` helper method: that
+        // would borrow all of `self` and conflict with `self.tile_store`
+        // above.
+        let snapshot = brush_stroke_mut(&mut self.drag);
+        let outcome = aurora_brush::stamp_dab(
+            store,
+            surface,
+            local,
+            BRUSH_RADIUS,
+            self.current_colour,
+            snapshot,
+        );
+        for &tile in outcome.painted() {
             self.composite_cache.invalidate(tile);
+        }
+        // One line per broken tile per *stroke*, not per dab and not per
+        // tile per dab -- see `unwarned_failures`. Every fresh failure
+        // gets its own line (0.57.0): a radius-24 dab spans up to four
+        // tiles, and logging only `fresh.first()` marked tiles #2..#n
+        // warned while never printing their own `TileId`/`TileError` --
+        // not on this dab, and never again for the rest of the stroke,
+        // flatly contradicting `unwarned_failures`' own promise that
+        // the first failure on each tile is always reported.
+        let fresh = unwarned_failures(&mut self.drag, &outcome);
+        for (tile, err) in &fresh {
+            tracing::warn!(
+                ?err,
+                ?tile,
+                first_failures = fresh.len(),
+                failed = outcome.failed().len(),
+                painted = outcome.painted().len(),
+                "failed to stamp part of a brush dab"
+            );
         }
     }
 
     /// Erases one dab at `doc_point` (document space) from the active
     /// layer's own surface in the live tile store — `aurora_brush::erase_dab`,
     /// [`Self::paint_dab`]'s subtractive counterpart, sharing every one
-    /// of its preconditions, silent-no-op cases, and undo-snapshot
-    /// capture (against `Drag::Eraser`'s own `stroke` field instead).
+    /// of its preconditions, silent-no-op cases, partial-failure
+    /// reporting, per-stroke warning dedupe, and in-dab undo-snapshot
+    /// capture (against `Drag::Eraser`'s own `stroke` field instead,
+    /// via [`eraser_stroke_mut`]).
     fn erase_dab(&mut self, doc_point: (f32, f32)) {
         let Some(layer_id) = self.active_layer else {
             return;
@@ -6204,23 +8798,24 @@ impl App {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
-        let touched = aurora_brush::touched_tiles(local, ERASER_RADIUS);
-        if let Some(Drag::Eraser {
-            stroke: Some(stroke),
-            ..
-        }) = self.drag.as_mut()
-        {
-            for &tile in &touched {
-                if let Err(err) = stroke.record_touch(store, tile) {
-                    tracing::warn!(?err, ?tile, "failed to capture a pixel-undo snapshot");
-                }
-            }
-        }
-        if let Err(err) = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS) {
-            tracing::warn!(?err, "failed to erase a dab");
-        }
-        for tile in touched {
+        // Same distinct-field borrow pair `Self::paint_dab` relies on.
+        let snapshot = eraser_stroke_mut(&mut self.drag);
+        let outcome = aurora_brush::erase_dab(store, surface, local, ERASER_RADIUS, snapshot);
+        for &tile in outcome.painted() {
             self.composite_cache.invalidate(tile);
+        }
+        // One line per broken tile per stroke, every one of them --
+        // `Self::paint_dab`'s own reasoning, mirrored.
+        let fresh = unwarned_failures(&mut self.drag, &outcome);
+        for (tile, err) in &fresh {
+            tracing::warn!(
+                ?err,
+                ?tile,
+                first_failures = fresh.len(),
+                failed = outcome.failed().len(),
+                painted = outcome.painted().len(),
+                "failed to erase part of a dab"
+            );
         }
     }
 
@@ -6231,7 +8826,7 @@ impl App {
     /// ([`Self::handle_pointer_moved`]), for live visual feedback only.
     /// Deliberately bypasses `self.history`/`self.undo_order` — the
     /// whole point of coalescing a drag into one undo step
-    /// ([`Self::finish_move`]) is *not* recording an entry for every
+    /// ([`finish_move`]) is *not* recording an entry for every
     /// intermediate position a fast drag passes through. A real, logged
     /// failure (an unknown or non-pixel `layer_id`) shouldn't happen in
     /// practice — `layer_id` always comes from `Drag::Move` itself, set
@@ -6248,72 +8843,78 @@ impl App {
         self.composite_cache.bump();
     }
 
-    /// Records a completed `Drag::Move` as a single undo step, from
-    /// `start_bounds` to wherever `layer_id` actually ended up — already
-    /// applied, live, by every [`Self::apply_move`] call during the drag
-    /// — via `aurora_doc::History::record_bounds_change`, which journals
-    /// the move without re-applying it (the tree already reflects it).
-    /// Called once, from [`Self::handle_pointer_released`], when the
-    /// drag that just ended was a `Drag::Move`.
-    ///
-    /// A no-op if the layer never actually ended up anywhere different
-    /// (`start_bounds` still matches its current bounds — e.g. a click
-    /// that started and ended a drag with no real pointer movement, or
-    /// `layer_id` no longer exists at all): nothing for a later undo to
-    /// meaningfully reverse. A real, logged failure otherwise is worth a
-    /// warning, the same discipline [`Self::apply_move`] already uses.
-    fn finish_move(&mut self, layer_id: aurora_doc::LayerId, start_bounds: aurora_core::Rect) {
-        if self.layers.bounds(layer_id) == Some(start_bounds) {
-            return;
-        }
-        match self
-            .history
-            .record_bounds_change(&self.layers, layer_id, start_bounds)
-        {
-            Ok(()) => {
-                self.undo_order.record(
-                    UndoKind::Structural,
-                    &mut self.history,
-                    &mut self.pixel_history,
-                );
-                self.trigger_autosave();
-            }
-            Err(err) => tracing::warn!(?err, "failed to record the completed move"),
-        }
+    /// Commits `drag`, whatever it turns out to be, into this
+    /// application's own undo state — [`commit_ending_drag`] against
+    /// `App`'s own fields. A `&mut self` wrapper so every call site can
+    /// spell it `self.commit_drag(self.drag.take())`; the real logic is
+    /// the free function, which needs no `App` (and therefore no GPU
+    /// adapter) to test.
+    fn commit_drag(&mut self, drag: Option<Drag>) {
+        commit_ending_drag(
+            drag,
+            &self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.undo_order,
+            &mut self.canvas_view,
+            self.active_layer,
+            canvas_area_logical_size(&self.workspace),
+        );
     }
 
-    /// Samples the active layer's own pixel at `doc_point` (document
-    /// space) and, if it's actually painted (alpha `> 0.0`), sets it as
-    /// the new [`Self::current_colour`] — what the Eyedropper tool does
-    /// on a click or while dragging. A fully transparent texel (never
-    /// painted, or painted then erased down to nothing — `Self::erase_dab`
-    /// leaves RGB untouched even at zero alpha) is treated as "nothing
-    /// to pick," not a valid sample, the same way a real image editor's
-    /// eyedropper has nothing meaningful to pick from empty canvas. A
-    /// silent no-op if there's no live store, no active layer, that
-    /// layer isn't a pixel layer, or `doc_point` falls outside the
-    /// surface entirely — the same absent-precondition honesty
-    /// [`Self::paint_dab`] already uses.
+    /// Samples the live, **composited** document at `doc_point` (document
+    /// space) — every visible layer, in its own real blend order and
+    /// opacity, exactly what's on screen — and, if the sampled texel is
+    /// actually painted (alpha `> 0.0`), sets it as the new
+    /// [`Self::current_colour`] — what the Eyedropper tool does on a
+    /// click or while dragging. Reads [`composite_surface_id`] rather
+    /// than the active layer's own surface: `App::redraw`'s own
+    /// [`recomposite_visible_tiles`] call keeps that reserved surface's
+    /// tiles current with the merged document every frame (both its GPU
+    /// and CPU paths write there via `write_composited`), so this is the
+    /// same content the user is actually looking at — a different,
+    /// non-active visible layer sitting above the active one (any
+    /// opacity/blend mode), or an active layer that's simply transparent
+    /// at that point, used to make the old active-layer-only sample
+    /// wrong. A fully transparent texel (no visible layer painted there)
+    /// is treated as "nothing to pick," not a valid sample, the same way
+    /// a real image editor's eyedropper has nothing meaningful to pick
+    /// from empty canvas.
+    ///
+    /// The document-space -> composite-surface-local conversion uses
+    /// [`active_layer_origin`], **not** a `None`-returns-early guard on
+    /// [`Self::active_layer`]: [`recomposite_visible_tiles`]'s own
+    /// `reference_origin` (the document-space point composite `TileId
+    /// (0, 0)` corresponds to) is exactly the active layer's own
+    /// `bounds.(x, y)`, falling back to `(0, 0)` — the document's own
+    /// origin — with no active layer selected or a group active
+    /// ([`active_pixel_layer`]'s own contract, which both functions
+    /// share); `active_layer_origin` already implements that identical
+    /// fallback. So with no active layer, `doc_point` needs no
+    /// subtraction at all and this still samples the merged document
+    /// correctly at its own coordinates — the more honest reading of
+    /// "sample what's on screen," which doesn't stop being true just
+    /// because nothing happens to be selected in the Layers panel (and
+    /// matches `Drag::Eyedropper` itself, which `begin_drag` already
+    /// starts unconditionally with no active-pixel-layer precondition —
+    /// see that function's own doc comment). A silent no-op only if
+    /// there's no live store, or `doc_point` falls outside the
+    /// composited surface entirely — the same absent-precondition
+    /// honesty [`Self::paint_dab`] already uses.
+    ///
+    /// The actual sampling is [`eyedropper_sample`], a free function
+    /// taking the store, origin, and point directly rather than `&mut
+    /// self` — this method only supplies those three from live `App`
+    /// state, which needs a real window/GPU surface to construct at all
+    /// and so can't be built directly in a unit test; `eyedropper_sample`
+    /// can, and that's what this crate's own tests exercise.
     fn sample_eyedropper(&mut self, doc_point: (f32, f32)) {
-        let Some(layer_id) = self.active_layer else {
-            return;
-        };
-        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.layers.kind(layer_id).cloned()
-        else {
-            return;
-        };
-        let Some(surface) = self.layers.surface_id(layer_id) else {
-            return;
-        };
         let Some(store) = self.tile_store.as_mut() else {
             return;
         };
-        let local = layer_local_point(bounds, doc_point);
-        let Some([r, g, b, a]) = sample_pixel(store, surface, local) else {
-            return;
-        };
-        if a > 0.0 {
-            self.current_colour = [r, g, b];
+        let origin = active_layer_origin(&self.layers, self.active_layer);
+        if let Some(colour) = eyedropper_sample(store, origin, doc_point) {
+            self.current_colour = colour;
         }
     }
 
@@ -6323,58 +8924,38 @@ impl App {
     /// which button a drag actually started with, and a single active
     /// window only ever has one drag in progress at a time.
     ///
-    /// If the ending drag was a `Drag::Brush`/`Drag::Eraser` with a real
-    /// `stroke`, pushes it onto [`Self::pixel_history`] and, if that
-    /// actually recorded something, into [`Self::undo_order`] too — a
-    /// completed stroke becomes a real, `Ctrl+Z`-undoable step in the
-    /// unified order. `PixelHistory::push`'s own `bool` return (`false`
-    /// for an empty snapshot) is exactly what lets this tell "a real
-    /// stroke happened" apart from "a click/drag that never actually
-    /// touched a tile" (e.g. a zero-radius brush, or no active layer at
-    /// all) without checking `stroke.is_empty()` itself. If the ending
-    /// drag was a `Drag::Move`, [`Self::finish_move`] records the whole
-    /// gesture as one coalesced undo step, from wherever it started.
+    /// Whatever the ending drag turns out to be, committing it is
+    /// [`commit_ending_drag`]'s job, not this method's (0.57.0): a
+    /// `Drag::Brush`/`Drag::Eraser` with a real `stroke` becomes a
+    /// `Ctrl+Z`-undoable step in the unified order, a `Drag::Move` is
+    /// coalesced into one structural entry, everything else is a no-op.
+    /// **This is no longer the only path that ends a drag** — a second
+    /// pointer press and `CursorLeft` end one too, and used to end it by
+    /// silently dropping a live stroke's whole undo entry; see
+    /// [`commit_ending_drag`] for the bug that shape caused and why the
+    /// commit now lives in one shared place.
+    ///
     /// Also ends any in-progress rail resize ([`RailResize`]) — nothing
     /// further to record for that one; `aurora_ui::set_rail_width` has
     /// already applied every intermediate width live, on each move
     /// event, not just the final one.
     fn handle_pointer_released(&mut self) {
         self.rail_resize = None;
-        match self.drag.take() {
-            Some(
-                Drag::Brush {
-                    stroke: Some(stroke),
-                    ..
-                }
-                | Drag::Eraser {
-                    stroke: Some(stroke),
-                    ..
-                },
-            ) => {
-                if self.pixel_history.push(stroke) {
-                    self.undo_order.record(
-                        UndoKind::Pixel,
-                        &mut self.history,
-                        &mut self.pixel_history,
-                    );
-                    self.trigger_autosave();
-                }
-            }
-            Some(Drag::Move {
-                layer_id,
-                start_bounds,
-                ..
-            }) => {
-                self.finish_move(layer_id, start_bounds);
-            }
-            _ => {}
-        }
+        let ending = self.drag.take();
+        self.commit_drag(ending);
     }
 
     /// A real `WindowEvent::MouseWheel`: zooms around the pointer's last
     /// known position ([`apply_scroll_zoom`]) if it's over the canvas
     /// area — a no-op otherwise (e.g. scrolling while the pointer is
     /// over a dock panel must not zoom the canvas).
+    ///
+    /// Hands the live drag, if any, straight to `apply_scroll_zoom`
+    /// (0.57.7). Zooming while a stroke is held is an ordinary thing to
+    /// do, so unlike the gestures that mean "I am done dragging" this
+    /// one keeps the drag and re-anchors it against the moved view —
+    /// see [`shift_drag_reference`] for why the pan clamp inside that
+    /// zoom would otherwise paint a line the user never drew.
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
         let Some(position) = self.pointer_position else {
             return;
@@ -6384,9 +8965,14 @@ impl App {
         };
         apply_scroll_zoom(
             &mut self.canvas_view,
+            self.drag.as_mut(),
             canvas_point,
             delta,
-            active_layer_origin(&self.layers, self.active_layer),
+            pan_bounds(
+                &self.layers,
+                self.active_layer,
+                canvas_area_logical_size(&self.workspace),
+            ),
         );
     }
 
@@ -6459,10 +9045,38 @@ impl App {
         };
         surface.resize(gpu.device(), physical_size);
 
-        if let Some(residency) = self.residency.as_mut()
-            && let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor)
-        {
-            residency.resize(gpu.device(), gpu.queue(), canvas_size);
+        if let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor) {
+            // The atlas's own zoom floor moves with the canvas size, and
+            // a pointer event can arrive before the next frame -- see
+            // `redraw`'s own call for the full reasoning. Through
+            // `apply_canvas_min_zoom` because raising the floor moves
+            // the view, and a resize arriving mid-stroke must not move
+            // it out from under the live drag (0.57.8).
+            let pointer = self
+                .pointer_position
+                .and_then(|position| pointer_in_canvas(&self.workspace, position));
+            // Read *after* the `compute_layout` above, deliberately:
+            // the canvas dock area's own bounds only reflect the new
+            // window size once layout has re-run, and the far pan bound
+            // is measured against exactly that size -- deriving it from
+            // stale pre-resize bounds would leave the bound one resize
+            // behind, which is the same shape of staleness the atlas
+            // resize just below already guards against.
+            let bounds = pan_bounds(
+                &self.layers,
+                self.active_layer,
+                canvas_area_logical_size(&self.workspace),
+            );
+            apply_canvas_min_zoom(
+                &mut self.canvas_view,
+                self.drag.as_mut(),
+                pointer,
+                canvas_min_zoom(canvas_size, self.scale_factor),
+                bounds,
+            );
+            if let Some(residency) = self.residency.as_mut() {
+                residency.resize(gpu.device(), gpu.queue(), canvas_size);
+            }
         }
     }
 
@@ -6475,6 +9089,22 @@ impl App {
     /// ([`collect_widget_paints`]/[`draw_widget_paints`]) on top —
     /// canvas and UI in the same pass, the same frame, invariant §7.3.8
     /// (they never become separate surfaces composited together).
+    ///
+    /// **Straight alpha, all the way to the shader**: what
+    /// [`recomposite_visible_tiles`] leaves in the composite surface,
+    /// what `TileResidency::sync` uploads to the atlas (a plain `f16`
+    /// texel copy, no alpha conversion of its own), and what
+    /// `aurora-gpu`'s own `fs_canvas` samples are all straight-alpha
+    /// texels — `fs_canvas` is the single place in the codebase that
+    /// converts, multiplying by alpha as it blends the canvas over its
+    /// checkerboard. Before 0.52.0 that was not true and two bugs
+    /// cancelled here: the compositing entry points left premultiplied
+    /// texels behind and `fs_canvas` used the matching premultiplied
+    /// "over" formula, so the screen looked approximately right while
+    /// every export and every eyedropper read carried the wrong colour.
+    /// Both halves were fixed together; see
+    /// `composite_roots_into_tile`'s own doc comment and that shader's
+    /// own comment.
     // One linear per-frame flow (build widget paints, sync the canvas
     // atlas, one shared render pass drawing both) -- splitting further
     // would just relocate lines across more functions without reducing
@@ -6483,6 +9113,37 @@ impl App {
     // analogous reason.
     #[allow(clippy::too_many_lines)]
     fn redraw(&mut self) {
+        // Before anything reads `canvas_view`: hold its zoom to the
+        // floor the atlas can actually render at this canvas size
+        // (`canvas_min_zoom`). This is the one place guaranteed to run
+        // whenever what is on screen can have changed -- a window
+        // resize, a scale-factor change, or a dock layout that resized
+        // the canvas area without either -- so the view can never be
+        // holding a zoom the frame below is about to not honour, which
+        // is what made `to_document` (pointer -> document, i.e. where a
+        // brush dab lands) disagree with what was drawn. `apply_resize`
+        // does it too, so a pointer event arriving between a resize and
+        // the next frame is bounded as well. Through
+        // `apply_canvas_min_zoom`, because raising the floor moves the
+        // view: a live drag has to be re-anchored against it, not left
+        // measuring against a view it knows nothing about (0.57.8).
+        if let Some(canvas_size) = canvas_area_physical_size(&self.workspace, self.scale_factor) {
+            let pointer = self
+                .pointer_position
+                .and_then(|position| pointer_in_canvas(&self.workspace, position));
+            let bounds = pan_bounds(
+                &self.layers,
+                self.active_layer,
+                canvas_area_logical_size(&self.workspace),
+            );
+            apply_canvas_min_zoom(
+                &mut self.canvas_view,
+                self.drag.as_mut(),
+                pointer,
+                canvas_min_zoom(canvas_size, self.scale_factor),
+                bounds,
+            );
+        }
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -6843,7 +9504,20 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
                 // (see the "persisted workspace layout" section's own
                 // doc comment for why this is the one point this crate
                 // writes it).
-                clear_session_marker(&self.marker_path);
+                // All three cleanups -- the marker, the autosave
+                // (nothing is left to recover once this run has ended
+                // cleanly, and the file holds real pixel content at a
+                // predictable path in a shared temp directory; see
+                // [`remove_autosave`]'s own doc comment), and this
+                // session's paged-out tiles, which are its unsaved
+                // pixels and which nothing recovers after a clean exit
+                // -- go through one function so a test can execute them
+                // as a unit; this arm itself needs a real event loop
+                // to reach. `self` is the only argument on purpose --
+                // an earlier four-argument shape let this call site
+                // silently pass `None` for the store and the scratch
+                // directory and still pass the whole gate.
+                clean_shutdown_cleanup(self);
                 if let Some(layout_path) = self.layout_path.as_deref() {
                     save_workspace_layout(layout_path, &self.workspace);
                 }
@@ -6894,7 +9568,12 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_position = None;
-                self.drag = None;
+                // Dragging off the window edge ends the drag, and used
+                // to end it by simply dropping it -- losing a live
+                // stroke's whole undo entry along with it. Commit it the
+                // same way a release would (`commit_ending_drag`).
+                let interrupted = self.drag.take();
+                self.commit_drag(interrupted);
             }
             _ => {}
         }
@@ -7040,28 +9719,33 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivatedCommand, AppCommand, AutosaveQueue, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY,
-        COMMAND_CLOSE_LAYERS, COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE,
-        COMMAND_FOCUS_HISTORY, COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO,
-        COMMAND_TOGGLE_HISTORY, COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
-        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeCache, Drag, ERASER_RADIUS,
-        FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, UndoKind, UndoOrder, activate_command,
-        apply_mask_clip, apply_scroll_zoom, autosave_path, background_color_from_theme, begin_drag,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin,
-        clear_session_marker, close_command_palette, close_crash_recovery_dialog,
-        collect_widget_paints, composite_document, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, default_shortcuts, demo_document, dissolve_gate,
+        ActivatedCommand, AppCommand, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_LAYERS,
+        COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
+        COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
+        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
+        ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess,
+        Key, KeyChord, Modifiers, NamedKey, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE,
+        RailResize, ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin,
+        after_undo_redo, apply_canvas_min_zoom, apply_mask_clip, apply_scroll_zoom,
+        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette,
+        close_crash_recovery_dialog, collect_widget_paints, commit_ending_drag, composite_document,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
         document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, handle_dialog_key, handle_dialog_pointer, handle_key,
-        handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path,
-        layer_local_point, load_scales, load_theme, logical_point, logical_size,
+        effective_residency_zoom, eraser_stroke_mut, eyedropper_sample, guarded_scale_factor,
+        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
+        handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
         open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pointer_in_canvas, pointer_on_rail_divider,
-        previous_session_left_a_marker, queue_autosave, recomposite_visible_tiles,
-        recover_document, replace_document, resized_rail_width, run_command, sample_pixel,
-        select_layer, splitmix64, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
+        resized_rail_width, resolve_tile, run_command, sample_pixel, select_layer, shift_bounds,
+        splitmix64, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
+        translate_key, translate_modifiers, translate_pointer_button, unwarned_failures,
         verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
@@ -7267,7 +9951,15 @@ mod tests {
         };
         let mut active_layer = None;
 
-        select_layer(&mut workspace, &layer_rows, &mut active_layer, a);
+        let mut view = CanvasView::new();
+        select_layer(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            a,
+        );
         assert_eq!(active_layer, Some(a));
         let Some(node_a) = workspace.tree.accessibility(row_a) else {
             unreachable!("just populated");
@@ -7280,7 +9972,14 @@ mod tests {
 
         // Selecting the other layer must flip both rows, not just add
         // to whatever was already selected.
-        select_layer(&mut workspace, &layer_rows, &mut active_layer, b);
+        select_layer(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            b,
+        );
         assert_eq!(active_layer, Some(b));
         let Some(node_a) = workspace.tree.accessibility(row_a) else {
             unreachable!("just populated");
@@ -7290,6 +9989,915 @@ mod tests {
             unreachable!("just populated");
         };
         assert_eq!(node_b.is_selected(), Some(true));
+    }
+
+    // -- the pan bound and a *changing* active layer --
+    //
+    // `CanvasView::clamp_pan_to_minimum` bounds the view against the
+    // active layer's own origin, and every pan-moving gesture calls it.
+    // These cover the other half: the boundary itself moving, because
+    // the active layer changed. See `clamp_pan_to_active_layer`.
+
+    /// A layer deliberately away from the document origin — the shape a
+    /// `.aur` file saved after a Move actually round-trips (`Rect`'s own
+    /// `x`/`y` are serialized, and `App::apply_move` never bakes the
+    /// offset into pixels).
+    fn moved_layer_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 300,
+            y: 150,
+            width: 10,
+            height: 10,
+        }
+    }
+
+    /// [`pan_bounds`] for a synthetic one-layer document whose active
+    /// layer sits at `min_doc`, at an unknown canvas size — what the
+    /// many pan-clamping tests below want when what they care about is
+    /// the near edge and not which document produced it.
+    ///
+    /// Goes through the real `pan_bounds` rather than building a
+    /// `PanBounds` literal, deliberately: a literal here would be a
+    /// second copy of the `min_doc + MAX_DOC_ORIGIN_PX` derivation, and
+    /// a test that pins a far bound the production path would not
+    /// actually produce is worse than no test.
+    #[allow(clippy::cast_possible_truncation)]
+    fn bounds_at(min_doc: (f32, f32), canvas_size: Option<(f32, f32)>) -> PanBounds {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: min_doc.0 as i64,
+            y: min_doc.1 as i64,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("bound", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        pan_bounds(&layers, Some(id), canvas_size)
+    }
+
+    /// A `LayerTree` with `a` at the document origin and `b` moved to
+    /// `(300, 150)`, plus the populated Layers-panel rows `select_layer`
+    /// needs.
+    fn two_layers_one_moved() -> (
+        aurora_ui::Workspace,
+        aurora_doc::LayerTree,
+        std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+    ) {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut layers = aurora_doc::LayerTree::new();
+        let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match layers.add_pixel_layer("b", moved_layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (workspace, layers, layer_rows, a, b)
+    }
+
+    #[test]
+    fn changing_the_active_layer_re_establishes_the_pan_bound() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut active_layer = Some(a);
+        // Panned right/down past `a`'s own boundary and clamped back to
+        // it — the state any real session is in after a hand-tool drag
+        // toward the top-left of the document.
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
+
+        select_layer(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            b,
+        );
+
+        assert_eq!(active_layer, Some(b));
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(
+            local_x >= -1e-3,
+            "the surface-local origin must not go negative on x: {local_x}"
+        );
+        assert!(
+            local_y >= -1e-3,
+            "the surface-local origin must not go negative on y: {local_y}"
+        );
+        // Equivalently, in document space: the canvas area's own
+        // top-left corner cannot show anything before `b`'s own corner.
+        let (doc_x, doc_y) = view.to_document((0.0, 0.0));
+        assert!(doc_x >= 300.0 - 1e-3, "{doc_x}");
+        assert!(doc_y >= 150.0 - 1e-3, "{doc_y}");
+    }
+
+    /// The negative control for the test above: the same active-layer
+    /// change with only the *old* layer's bound ever applied — which is
+    /// exactly what this crate did before `clamp_pan_to_active_layer`
+    /// existed. Asserts the divergence is large, not marginal, so this
+    /// cannot pass by a coincidence of small numbers.
+    #[test]
+    fn an_active_layer_change_without_the_re_clamp_is_the_divergence_this_prevents() {
+        let (_workspace, layers, _layer_rows, a, b) = two_layers_one_moved();
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        // Clamped against `a` only — the boundary as it was *before* the
+        // active layer changed.
+        clamp_pan_to_active_layer(&mut view, &layers, Some(a), None);
+
+        // The active layer becomes `b`, and nothing re-clamps.
+        let (local_x, local_y) = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local_x < -100.0,
+            "without the re-clamp the local origin is far negative on x: {local_x}"
+        );
+        assert!(
+            local_y < -50.0,
+            "without the re-clamp the local origin is far negative on y: {local_y}"
+        );
+    }
+
+    /// The evidence that the *open* paths are genuinely exposed, not
+    /// hypothetically: a `.aur` container written from a document whose
+    /// topmost layer sits at `(300, 150)` reopens with that origin
+    /// intact. `App::open_aur_file` and `App::new`'s own crash-recovery
+    /// branch both go through this reader, and `reset_canvas_view`
+    /// zeroes the pan — so without the clamp those documents start with
+    /// a negative surface-local origin on their very first frame, with
+    /// no panning needed to trigger it.
+    #[test]
+    fn an_aur_round_trip_preserves_a_moved_layers_origin_so_the_open_paths_need_the_clamp() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (_scratch, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let base = match history.add_pixel_layer(&mut layers, "base", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _painted = paint_one_texel(&mut store, &layers, base);
+        // Added last, so it is the topmost root — what
+        // `topmost_pixel_layer` (and therefore `active_layer`) picks.
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _painted = paint_one_texel(&mut store, &layers, moved);
+
+        let path = dir.path().join("aurora-autosave.aur");
+        write_autosave(&path, &layers, &history, (320, 160), &mut store);
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let Some((recovered, _history, _canvas)) = recover_document(&path, &mut fresh_store) else {
+            unreachable!("the autosave just written must reopen");
+        };
+        let Some(active) = topmost_pixel_layer(&recovered) else {
+            unreachable!("the recovered document has pixel layers");
+        };
+        match recovered.kind(active) {
+            Some(aurora_doc::LayerKind::Pixel { bounds }) => {
+                assert_eq!(
+                    *bounds,
+                    moved_layer_bounds(),
+                    "a moved layer's own origin must survive the .aur round trip"
+                );
+            }
+            other => unreachable!("expected a pixel layer, got {other:?}"),
+        }
+        // And that is exactly the state the open paths hand to
+        // `reset_canvas_view`.
+        assert_eq!(
+            active_layer_origin(&recovered, Some(active)),
+            (300.0, 150.0)
+        );
+    }
+
+    /// The autosave pair above is what `App::new`'s own crash-recovery
+    /// branch reaches; this is the *user-facing* one — the exact
+    /// `aurora_io::write_aur`/`read_aur` pair `App::save_aur_file` and
+    /// `App::open_aur_file` themselves call. Same conclusion, on the
+    /// path a user actually takes: File > Save As a `.aur`, reopen it,
+    /// and the topmost layer is still at `(300, 150)`, so
+    /// `load_document_view`'s clamp is load-bearing on the very first
+    /// frame.
+    #[test]
+    fn a_user_facing_aur_save_and_open_preserves_a_moved_layers_origin() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (_scratch, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let base = match history.add_pixel_layer(&mut layers, "base", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _painted = paint_one_texel(&mut store, &layers, base);
+        // Added last, so it is the topmost root -- what
+        // `topmost_pixel_layer` (and therefore `active_layer`) picks.
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _painted = paint_one_texel(&mut store, &layers, moved);
+
+        let path = dir.path().join("moved.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err}"),
+        };
+        if let Err(err) =
+            aurora_io::write_aur(file, &layers, &history, (320, 160), None, &mut store)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (reopened, _history, _canvas, _profile) =
+            match aurora_io::read_aur(file, &mut fresh_store) {
+                Ok(result) => result,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let Some(active) = topmost_pixel_layer(&reopened) else {
+            unreachable!("the reopened document has pixel layers");
+        };
+        assert_eq!(
+            active_layer_origin(&reopened, Some(active)),
+            (300.0, 150.0),
+            "a moved layer's own origin must survive the user-facing .aur round trip"
+        );
+
+        // And that origin, fed through the very step the open path runs,
+        // is what the clamp is for.
+        let view = load_document_view(
+            &CanvasView::new(),
+            &reopened,
+            Some(active),
+            Some((750, 800)),
+            None,
+            1.0,
+        );
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&reopened, Some(active)));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+    }
+
+    /// `App` itself is not constructible under test (it needs a real
+    /// `EventLoopProxy`), so no test can call `App::open_file`/
+    /// `App::open_aur_file`/`App::new` themselves. This calls the one
+    /// thing all three of them *delegate* the whole canvas-view step to
+    /// — [`load_document_view`] — rather than re-spelling its two
+    /// statements here, which is what this test used to do and why
+    /// deleting the clamp from either open path left the suite green.
+    /// Reordering or removing the clamp inside `load_document_view` now
+    /// fails right here.
+    ///
+    /// The ordering is the point: the reset returns a pan of `(0, 0)`,
+    /// which is outside a moved layer's own bound, so the clamp has to
+    /// come second.
+    #[test]
+    fn loading_a_documents_view_leaves_a_moved_layers_origin_non_negative() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let moved = match layers.add_pixel_layer("moved", moved_layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+
+        // A view left panned somewhere by the previous document, exactly
+        // as `App` would have it on entry.
+        let mut previous = CanvasView::new();
+        previous.pan_by((-500.0, -500.0));
+        let view = load_document_view(
+            &previous,
+            &layers,
+            active_layer,
+            Some((750, 800)),
+            None,
+            1.0,
+        );
+
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+        // The reset's own half still happened too -- this is both
+        // statements as one unit, not the clamp having replaced the
+        // reset. `canvas_min_zoom` for this canvas is the floor a bare
+        // `CanvasView::default()` would have dropped (0.57.4).
+        assert!(
+            (view.min_zoom() - canvas_min_zoom((750, 800), 1.0)).abs() < 1e-6,
+            "the zoom floor must be re-derived, not carried from `previous`: {}",
+            view.min_zoom()
+        );
+    }
+
+    /// [`App::new`]'s own spelling of the call above: no window yet, so
+    /// no canvas size to derive a floor from. Covers the branch
+    /// separately because it is the one that used to be a bare
+    /// `aurora_ui::CanvasView::default()` — the exact spelling
+    /// `reset_canvas_view` exists to ban — and because `canvas_size:
+    /// None` takes `reset_canvas_view`'s other, less-travelled path.
+    #[test]
+    fn loading_a_documents_view_with_no_window_yet_still_clamps() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let moved = match layers.add_pixel_layer("moved", moved_layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+
+        let view = load_document_view(
+            &CanvasView::default(),
+            &layers,
+            active_layer,
+            None,
+            None,
+            1.0,
+        );
+
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+        assert!(
+            (view.min_zoom() - CanvasView::default().min_zoom()).abs() < 1e-6,
+            "with no canvas size the previous view's own floor is carried across"
+        );
+    }
+
+    /// Turns "these two construction paths are safe today" into an
+    /// executable check rather than a claim in a comment: `open_file`'s
+    /// own flat-image path and `App::new`'s own fresh-document path both
+    /// build their layers at the document origin, so their clamp is a
+    /// no-op. If either ever stops being true, this breaks here instead
+    /// of silently in the canvas.
+    #[test]
+    fn the_flat_image_and_demo_documents_active_layer_is_always_at_the_document_origin() {
+        let image = fake_image(64, 48);
+        let (layers, _history, id) = document_from_image("photo", &image);
+        assert_eq!(topmost_pixel_layer(&layers), Some(id));
+        assert_eq!(active_layer_origin(&layers, Some(id)), (0.0, 0.0));
+
+        let (demo, _history) = demo_document();
+        let Some(active) = topmost_pixel_layer(&demo) else {
+            unreachable!("demo_document has pixel layers");
+        };
+        assert_eq!(active_layer_origin(&demo, Some(active)), (0.0, 0.0));
+    }
+
+    /// The pan bound (this round) and the zoom floor (0.57.4) are two
+    /// clamps on the same view, applied from different call sites in an
+    /// order nothing guarantees — `App::new` clamps the pan before any
+    /// floor exists, while `redraw`/`apply_resize` raise the floor
+    /// later. They have to commute. They do, because `set_min_zoom`
+    /// raises zoom through `zoom_at((0, 0), ..)`, which holds
+    /// `to_document((0, 0))` fixed across the raise. Asserted here
+    /// rather than assumed, and without touching `canvas_view.rs`.
+    #[test]
+    fn the_pan_bound_and_the_zoom_floor_compose_in_either_order() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let moved = match layers.add_pixel_layer("moved", moved_layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+        let floor = 2.0;
+
+        let start = || {
+            let mut view = CanvasView::new();
+            view.zoom_at((0.0, 0.0), 0.5);
+            view.pan_by((80.0, 80.0));
+            view
+        };
+
+        let mut pan_first = start();
+        clamp_pan_to_active_layer(&mut pan_first, &layers, active_layer, None);
+        pan_first.set_min_zoom(floor);
+
+        let mut zoom_first = start();
+        zoom_first.set_min_zoom(floor);
+        clamp_pan_to_active_layer(&mut zoom_first, &layers, active_layer, None);
+
+        for (label, view) in [("pan first", &pan_first), ("zoom first", &zoom_first)] {
+            let (local_x, local_y) =
+                canvas_local_origin(view, active_layer_origin(&layers, active_layer));
+            assert!(local_x >= -1e-3, "{label}: {local_x}");
+            assert!(local_y >= -1e-3, "{label}: {local_y}");
+        }
+        let (pan_first_x, pan_first_y) = pan_first.to_document((0.0, 0.0));
+        let (zoom_first_x, zoom_first_y) = zoom_first.to_document((0.0, 0.0));
+        assert!(
+            (pan_first_x - zoom_first_x).abs() < 1e-3,
+            "the two orders must agree on x: {pan_first_x} vs {zoom_first_x}"
+        );
+        assert!(
+            (pan_first_y - zoom_first_y).abs() < 1e-3,
+            "the two orders must agree on y: {pan_first_y} vs {zoom_first_y}"
+        );
+    }
+
+    /// The *other* way the boundary moves: the active layer stays the
+    /// same and its own `bounds` change under it. `App::apply_move`
+    /// rewrites them on every pointer-move event of a `Drag::Move` and
+    /// deliberately does not clamp there (it would feed back into
+    /// `continue_drag`'s own fixed `start_doc`); the clamp happens once,
+    /// at the commit. This asserts both halves — the violation really is
+    /// live while the drag is (its own negative control, inline) and
+    /// really is closed by the commit.
+    #[test]
+    fn committing_a_move_re_establishes_the_pan_bound() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let dragged = match layers.add_pixel_layer("dragged", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let active_layer = Some(dragged);
+
+        // Panned to the document's own corner and clamped there against
+        // the layer's starting origin of (0, 0).
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
+
+        // The drag itself: `App::apply_move`'s own `set_bounds`, with no
+        // clamp, exactly as the live handler runs it.
+        if let Err(err) = layers.set_bounds(dragged, moved_layer_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (mid_x, mid_y) = canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(
+            mid_x < -100.0 && mid_y < -50.0,
+            "setup: mid-drag the bound really is violated, which is what the commit has to close: ({mid_x}, {mid_y})"
+        );
+
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: dragged,
+                start_doc: (0.0, 0.0),
+                start_bounds: layer_bounds(),
+                current_bounds: moved_layer_bounds(),
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            active_layer,
+            None,
+        );
+
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Structural],
+            "setup: the move still records its one structural step"
+        );
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(
+            local_x >= -1e-3,
+            "the commit must re-establish the bound on x: {local_x}"
+        );
+        assert!(
+            local_y >= -1e-3,
+            "the commit must re-establish the bound on y: {local_y}"
+        );
+    }
+
+    /// And the third way: an `Undo`. It restores a recorded
+    /// `LayerOp::SetBounds` without [`App::active_layer`] changing at
+    /// all, so the boundary moves with nothing else in the app aware of
+    /// it. (Reached from the command palette and the macOS menu, via
+    /// [`App::run_undo_redo`]. The `Ctrl+Z` chord itself resolves and
+    /// runs inside [`handle_key`] and never gets here — PLAN.md's own
+    /// residual disclosure covers what that still costs.) The sequence is an ordinary session — move a layer to the
+    /// document's own corner, pan all the way into that corner (which
+    /// the relaxed bound now allows), then undo the move.
+    ///
+    /// Goes through the real [`run_command`] and the real
+    /// [`after_undo_redo`], not a re-spelling of either, so deleting the
+    /// clamp from `after_undo_redo` fails here.
+    #[test]
+    fn undoing_a_move_re_establishes_the_pan_bound() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+        let mut view = CanvasView::new();
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
+
+        // Drag it back to the document origin and let go.
+        if let Err(err) = layers.set_bounds(moved, layer_bounds()) {
+            unreachable!("{err:?}");
+        }
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: moved,
+                start_doc: (0.0, 0.0),
+                start_bounds: moved_layer_bounds(),
+                current_bounds: layer_bounds(),
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            active_layer,
+            None,
+        );
+        assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
+
+        // Now pan up/left into the corner the move just freed up.
+        view.pan_by((1000.0, 1000.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
+        let (corner_x, corner_y) = view.to_document((0.0, 0.0));
+        assert!(
+            corner_x.abs() < 1e-3 && corner_y.abs() < 1e-3,
+            "setup: the view really is at the document's own corner: ({corner_x}, {corner_y})"
+        );
+
+        cache.mark_current(aurora_tile::TileId { x: 0, y: 0 });
+        run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            AppCommand::Undo,
+        );
+        assert_eq!(
+            layers.bounds(moved),
+            Some(moved_layer_bounds()),
+            "setup: the undo really did restore the moved bounds"
+        );
+        // The state `run_undo_redo` is in between the two statements:
+        // the boundary has moved and nothing has re-clamped yet.
+        let (before_x, before_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(
+            before_x < -100.0 && before_y < -50.0,
+            "setup: the undo really does reopen the divergence: ({before_x}, {before_y})"
+        );
+
+        after_undo_redo(&mut view, &layers, active_layer, &mut cache, None);
+
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+        assert!(
+            !cache.is_current(aurora_tile::TileId { x: 0, y: 0 }),
+            "the composite cache half of `after_undo_redo` must still run too"
+        );
+    }
+
+    /// **RT-01 (0.57.7).** The same clamp, reached while a brush stroke
+    /// is still live — the hazard `press_layer_row` was written to close
+    /// at the *other* site, never audited at this one. `run_undo_redo`
+    /// moved the view out from under a `Drag::Brush` whose own
+    /// `last_doc` was fixed when the stroke began, and the very next
+    /// pointer-move event then interpolated a full segment between the
+    /// stale reference and the moved view: a line of dabs the user
+    /// never drew, painted with the pointer completely still. Worse,
+    /// the live stroke's own pixels were left on the layer with no undo
+    /// entry naming them, so the `Undo` that caused it reached past
+    /// them into the previous step (`commit_ending_drag`'s own 0.57.0
+    /// bug, at a fourth site).
+    ///
+    /// Drives the real [`perform_undo_redo`] and the real
+    /// [`continue_drag`], not a re-spelling of either, so removing the
+    /// commit from `perform_undo_redo` fails here.
+    #[test]
+    // One linear scenario -- build a real document, start a real stroke,
+    // undo mid-stroke, then feed one more still-pointer move event --
+    // driven end to end through the real `perform_undo_redo` and
+    // `continue_drag`. Splitting it would relocate lines across more
+    // functions without making the sequence it exists to pin any
+    // shorter, the same call the surrounding tests already make. (It
+    // crossed the 100-line limit in 0.57.10 only because
+    // `commit_ending_drag` gained a `canvas_size` argument.)
+    #[allow(clippy::too_many_lines)]
+    fn an_undo_during_a_live_stroke_commits_it_instead_of_painting_a_line_the_user_never_drew() {
+        let (_dir, mut store) = commit_test_store();
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut selection = aurora_doc::SelectionSet::new();
+
+        // Exactly `undoing_a_move_re_establishes_the_pan_bound`'s own
+        // setup: a layer moved to (300, 150), dragged back to the
+        // document origin, with the view panned into the corner that
+        // move freed up. Undoing the move is what moves the boundary.
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+        let mut view = CanvasView::new();
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
+        if let Err(err) = layers.set_bounds(moved, layer_bounds()) {
+            unreachable!("{err:?}");
+        }
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: moved,
+                start_doc: (0.0, 0.0),
+                start_bounds: moved_layer_bounds(),
+                current_bounds: layer_bounds(),
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            active_layer,
+            None,
+        );
+        view.pan_by((1000.0, 1000.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
+        assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
+
+        // The stroke still in progress when the Undo arrives, with real
+        // pixels already on the layer and its own reference point at
+        // the pointer's current document position.
+        let pointer = (40.0, 40.0);
+        let mut drag = Some(a_brush_drag_that_painted(&mut store, (30.5, 30.5)));
+        match drag.as_mut() {
+            Some(Drag::Brush { last_doc, .. }) => *last_doc = view.to_document(pointer),
+            _ => unreachable!("just built a brush drag"),
+        }
+        assert!(commit_test_alpha(&mut store, 30, 30) > 0.5, "setup");
+
+        perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            active_layer,
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert!(
+            drag.is_none(),
+            "no drag may still be live once the undo has clamped the view under it"
+        );
+        // The pointer has not moved at all. Whatever the view did, the
+        // next move event must not paint.
+        let dabs = match drag.as_mut() {
+            Some(live) => continue_drag(
+                live,
+                pointer,
+                &mut view,
+                &mut selection,
+                pan_bounds(&layers, active_layer, None),
+            ),
+            None => Vec::new(),
+        };
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint: {} dabs were placed",
+            dabs.len()
+        );
+        // And the Undo has to have reached the live stroke, not past it
+        // into the move underneath.
+        assert_eq!(
+            undo_order.redo,
+            vec![UndoKind::Pixel],
+            "the undo must have undone the interrupted stroke's own entry"
+        );
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Structural],
+            "and must have left the move underneath it alone"
+        );
+        assert!(
+            commit_test_alpha(&mut store, 30, 30) < 0.01,
+            "the interrupted stroke's own pixels are what the undo removes"
+        );
+        assert_eq!(
+            layers.bounds(moved),
+            Some(layer_bounds()),
+            "the move underneath must still be applied"
+        );
+    }
+
+    /// Selecting a Layers-panel row now moves the pan bound
+    /// ([`select_layer`]), and that branch of `handle_pointer_pressed`
+    /// used to `return` before ever reaching the shared "a second press
+    /// ends the live drag" commit — so a middle-button pan held down
+    /// while left-clicking a row left the view being clamped out from
+    /// under a drag that still holds a fixed reference point. Ending the
+    /// drag first is the fix; this is the sequence that branch now runs.
+    #[test]
+    fn selecting_a_layer_row_during_a_live_drag_ends_the_drag_before_the_view_moves() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+        view.pan_by((40.0, 40.0));
+        clamp_pan_to_active_layer(&mut view, &layers, active_layer, None);
+
+        // The middle button goes down over the canvas and stays down.
+        let mut drag = begin_drag(
+            Tool::Brush,
+            PointerButton::Middle,
+            (10.0, 10.0),
+            &view,
+            None,
+        );
+        assert!(
+            matches!(drag, Some(Drag::Pan { .. })),
+            "setup: the middle button really starts a pan"
+        );
+
+        // The left button then clicks a Layers-panel row.
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut drag,
+            b,
+        );
+
+        assert!(
+            drag.is_none(),
+            "no drag may still be live once the selection has clamped the view under it"
+        );
+        assert_eq!(active_layer, Some(b));
+        let (local_x, local_y) =
+            canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
+        assert!(local_x >= -1e-3, "{local_x}");
+        assert!(local_y >= -1e-3, "{local_y}");
+    }
+
+    /// The ordering *within* [`press_layer_row`], made observable: a
+    /// `Drag::Move` interrupted by a layer-row click has to be committed
+    /// against the layer that was active while it was being dragged, not
+    /// against the one the click is about to select. Both orders leave
+    /// the same undo entry, so only the resulting pan tells them apart —
+    /// which it does whenever the dragged layer ends up further from the
+    /// document origin than the newly selected one.
+    #[test]
+    fn a_layer_row_click_commits_a_move_against_the_outgoing_layer_not_the_incoming_one() {
+        let (mut workspace, mut layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+
+        // `a` is dragged well past `b`'s own origin -- far enough that
+        // the two clamps disagree.
+        let dragged_to = aurora_core::Rect {
+            x: 500,
+            y: 500,
+            ..layer_bounds()
+        };
+        if let Err(err) = layers.set_bounds(a, dragged_to) {
+            unreachable!("{err:?}");
+        }
+        let mut drag = Some(Drag::Move {
+            layer_id: a,
+            start_doc: (0.0, 0.0),
+            start_bounds: layer_bounds(),
+            current_bounds: dragged_to,
+        });
+
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut drag,
+            b,
+        );
+
+        assert_eq!(active_layer, Some(b));
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Structural],
+            "setup: the interrupted move still records its own step"
+        );
+        let (doc_x, doc_y) = view.to_document((0.0, 0.0));
+        assert!(
+            (doc_x - 500.0).abs() < 1e-3 && (doc_y - 500.0).abs() < 1e-3,
+            "the move must be committed against `a`'s own dragged origin (500, 500) before the \
+             selection relaxes the bound to `b`'s (300, 150); selecting first would leave this at \
+             (300, 150): ({doc_x}, {doc_y})"
+        );
+    }
+
+    /// The same branch's other, pre-existing casualty, now fixed by the
+    /// same line: a live brush stroke interrupted by a layer-row click
+    /// used to be dropped outright, losing its whole undo entry the way
+    /// `commit_ending_drag`'s own doc comment describes for the gestures
+    /// 0.57.0 already covered.
+    #[test]
+    fn a_stroke_interrupted_by_a_layer_row_click_still_becomes_its_own_undo_entry() {
+        let (_dir, mut store) = commit_test_store();
+        let (mut workspace, layers, layer_rows, _a, b) = two_layers_one_moved();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut active_layer = None;
+        let mut view = CanvasView::new();
+
+        let mut drag = Some(a_brush_drag_that_painted(&mut store, (30.5, 30.5)));
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut drag,
+            b,
+        );
+
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel],
+            "the interrupted stroke must have its own entry in the unified order"
+        );
+        assert!(pixel_history.can_undo());
     }
 
     /// `demo_document`'s whole point (unlike a plain `LayerTree` built
@@ -7495,6 +11103,14 @@ mod tests {
 
     #[test]
     fn verify_aur_accepts_a_real_written_file_and_rejects_garbage() {
+        // Shared with `repeated_aur_verification_does_not_accumulate_
+        // scratch_tiles`, which counts what verification leaves in the
+        // session scratch directory and cannot do so while another
+        // verification is in flight.
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err:?}"),
@@ -8064,7 +11680,7 @@ mod tests {
             unreachable!("{err:?}");
         }
         assert_eq!(layers.bounds(id), Some(moved));
-        // Simulates what `App::finish_move` itself does after a
+        // Simulates what `finish_move` itself does after a
         // successful `history.record_bounds_change` call, since this
         // test drives `history` directly rather than through `App`.
         let mut undo_order = UndoOrder::default();
@@ -8086,9 +11702,15 @@ mod tests {
         let Some(rows) = workspace.tree.children(workspace.history.body) else {
             unreachable!("populate_history_panel always inserts a body");
         };
+        // Compared against `journal_descriptions().len()`, not
+        // `journal_len()`: the panel is built from the former, which
+        // caps at 1000 entries, while the latter is the untruncated
+        // count. They agree for this test's tiny journal, but only for
+        // that reason -- pinning the relation the panel actually has
+        // keeps this correct if a later test builds a longer one.
         assert_eq!(
             rows.len(),
-            history.journal_len(),
+            history.journal_descriptions().len(),
             "the History panel must reflect the undo's own journal entry"
         );
 
@@ -9238,7 +12860,14 @@ mod tests {
 
     #[test]
     fn tile_store_scratch_dir_is_distinct_from_the_marker_and_autosave_paths() {
-        let scratch = tile_store_scratch_dir();
+        // Since 0.53.0 the scratch directory is per-session and randomly
+        // named rather than the fixed `aurora-tiles`, so this can no
+        // longer collide by construction -- still asserted, because all
+        // three still live under `std::env::temp_dir()` and the marker
+        // and autosave paths *are* still fixed.
+        let Some(scratch) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
         assert_ne!(scratch, super::marker_path());
         assert_ne!(scratch, autosave_path());
     }
@@ -9246,13 +12875,553 @@ mod tests {
     #[test]
     fn open_tile_store_succeeds_against_the_real_scratch_directory() {
         // A real, if unremarkable, assertion: this crate's own scratch
-        // directory is always writable in a real environment (the same
+        // directory (per-session since 0.53.0, created on first use) is
+        // always creatable and writable in a real environment (the same
         // assumption `write_session_marker`'s own `std::env::temp_dir()`
         // use already makes) -- confirms `open_tile_store` doesn't
         // always return `None` in ordinary conditions, not this
         // function's own I/O error path (real disk-failure injection is
         // not something this sandbox can do).
         assert!(open_tile_store().is_some());
+    }
+
+    /// Two calls must not hand back the same directory -- the whole
+    /// point of 0.53.0's change away from the one fixed `aurora-tiles`
+    /// path every process and every user shared.
+    #[test]
+    fn each_scratch_directory_is_a_new_one() {
+        let (Some(first), Some(second)) = (
+            create_tile_store_scratch_dir(),
+            create_tile_store_scratch_dir(),
+        ) else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        assert_ne!(first, second);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+        let fixed = std::env::temp_dir().join("aurora-tiles");
+        assert_ne!(first, fixed);
+        assert_ne!(second, fixed);
+        // These two are deliberately *not* the memoized session
+        // directory, so nothing else is using them -- clean up rather
+        // than leaving two directories behind per test run.
+        for dir in [first, second] {
+            if let Err(err) = std::fs::remove_dir_all(&dir) {
+                unreachable!("a directory this test just created must be removable: {err}");
+            }
+        }
+    }
+
+    /// A freshly created scratch directory must *already* be owner-only,
+    /// before any `aurora_tile::TileStore` has been opened in it.
+    ///
+    /// Not redundant with
+    /// [`the_session_scratch_directory_is_owner_only`]: `tempfile`
+    /// creates directories with default (umask-derived, typically
+    /// world-readable) permissions, and this was observed on disk at
+    /// `0o775` when the only store opened during a run was the `.aur`
+    /// verifier's, which lives in a *child* of this directory and so
+    /// never re-asserts the parent's mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_scratch_directory_is_owner_only_before_any_store_opens() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(dir) = create_tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let mode = match std::fs::metadata(&dir) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the directory was just created: {err}"),
+        };
+        if let Err(err) = std::fs::remove_dir_all(&dir) {
+            unreachable!("a directory this test just created must be removable: {err}");
+        }
+        // The security property, not the exact mode. This directory's
+        // permissions come from `tempfile`'s `mkdir` mode argument,
+        // which *is* masked by the process umask -- unlike
+        // `set_permissions`, which is not, and which is why
+        // [`the_session_scratch_directory_is_owner_only`] can afford an
+        // exact `0o700`. Under a umask that clears owner bits (`umask
+        // 0177`, say) this would land at `0o500` and an `assert_eq!`
+        // would fail on a directory that is *more* private than
+        // required, not less.
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a fresh scratch directory must grant nothing to group or other (mode {mode:o})"
+        );
+    }
+
+    /// The directory holds the document's real unsaved pixels, in a
+    /// world-readable temp directory. `aurora_tile::TileStore::new` is
+    /// what re-asserts the mode when a store opens directly in it; this
+    /// asserts the app actually gets that benefit end to end.
+    ///
+    /// Takes `AUR_VERIFY_SCRATCH_LOCK` because
+    /// `aur_verification_survives_the_session_scratch_directory_being_swept_away`
+    /// deletes this same live, memoized session directory under that
+    /// lock -- without it, `cargo test --workspace`'s shared-binary,
+    /// multi-threaded run (unlike `cargo nextest`'s process-per-test
+    /// isolation, which CI actually uses) can observe the directory gone
+    /// between this test's own `open_tile_store()` and `metadata()`.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_scratch_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(open_tile_store().is_some());
+        let Some(dir) = tile_store_scratch_dir() else {
+            unreachable!("open_tile_store just succeeded against it");
+        };
+        let mode = match std::fs::metadata(dir) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the directory was just used by a live store: {err}"),
+        };
+        assert_eq!(mode, 0o700);
+    }
+
+    /// Load-bearing, not a tautology: the store is legitimately reopened
+    /// mid-run (`startup_document`,
+    /// `recover_partial_after_a_failed_read`), and each reopen must land
+    /// in the *same* directory -- a fresh one per call would strand the
+    /// previous one on disk with nothing left holding its path.
+    #[test]
+    fn tile_store_scratch_dir_is_stable_within_one_process() {
+        assert_eq!(tile_store_scratch_dir(), tile_store_scratch_dir());
+    }
+
+    #[test]
+    fn removing_the_session_scratch_directory_removes_its_tiles_too() {
+        // Deliberately a throwaway directory, not the live memoized
+        // session one: removing the real one would pull the scratch
+        // disk out from under every other test sharing this binary.
+        let Some(dir) = create_tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let tile = dir.join("0-0-0_0_0_0.tile");
+        if let Err(err) = std::fs::write(&tile, [0_u8; 4]) {
+            unreachable!("a fresh scratch directory must be writable: {err}");
+        }
+        super::remove_scratch_dir(&dir);
+        assert!(!tile.exists(), "the paged-out tiles go with the directory");
+        assert!(!dir.exists());
+
+        // And it tolerates an absent directory -- the "shutting down
+        // twice" / "never created one" case, the same shape
+        // `clear_session_marker` and `remove_autosave` already accept.
+        // Called for its (lack of) panic, not a value.
+        super::remove_scratch_dir(&dir);
+    }
+
+    /// Serializes the tests that count what `.aur` verification leaves
+    /// behind in the session scratch directory. `verify_aur` creates its
+    /// directory *inside* the one live, memoized session directory, so
+    /// two verifications running concurrently in this binary would see
+    /// each other's in-flight directory and make the count
+    /// non-deterministic.
+    static AUR_VERIFY_SCRATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `(subdirectories, files under them)` sitting in the session
+    /// scratch directory right now.
+    ///
+    /// Deliberately every *subdirectory*, not just ones matching some
+    /// `aur-verify-` name: `.aur` verification is the only thing that
+    /// ever nests a directory inside the session directory, so this
+    /// counts what verification left behind however that directory
+    /// comes to be named — including the pre-0.53.0 shape, a single
+    /// fixed child reused by every save, whose file count is what grows
+    /// there. The session directory's own top-level `*.tile` files
+    /// belong to the live store other tests share and are not counted.
+    fn aur_verify_leftovers() -> (usize, usize) {
+        fn count_files(dir: &std::path::Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .map(|entry| {
+                    if entry.path().is_dir() {
+                        count_files(&entry.path())
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+
+        let Some(session) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let entries = match std::fs::read_dir(session) {
+            Ok(entries) => entries,
+            Err(err) => unreachable!("the session scratch directory is readable: {err}"),
+        };
+        let mut dirs = 0;
+        let mut files = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            dirs += 1;
+            files += count_files(&path);
+        }
+        (dirs, files)
+    }
+
+    /// The `.aur` verifier's scratch store must not leak its paged-out
+    /// tiles across saves.
+    ///
+    /// Every `verify_aur` call builds a fresh `aurora_tile::TileStore`,
+    /// and since 0.53.0 every store folds a per-instance token into
+    /// every filename it writes. A directory shared across calls would
+    /// therefore gain a *new* full set of evicted tiles per save, with
+    /// nothing ever deleting them (`TileStore` has no `Drop` that
+    /// removes its own files) — a document saved repeatedly in one
+    /// session would grow an unbounded pile of full-resolution
+    /// compressed pixel data until the whole session directory went
+    /// away at shutdown.
+    ///
+    /// The document here is deliberately larger than the verifier's own
+    /// 16-tile budget (1280 × 1280 px is 5 × 5 = 25 tiles at ADR 0005's
+    /// 256 px tile), so verification really does evict to disk. A test
+    /// on a small document would pass against the leaking version and
+    /// prove nothing.
+    #[test]
+    fn repeated_aur_verification_does_not_accumulate_scratch_tiles() {
+        /// 5 x 5 = 25 tiles at ADR 0005's 256 px tile, against
+        /// `verify_aur`'s own 16-tile budget.
+        const SIDE: u32 = 1280;
+
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_store_dir, mut store) = real_tile_store();
+        let image = fake_image(SIDE, SIDE);
+        let (layers, history, id) = document_from_image("big", &image);
+        // Real painted tiles, not just a layer of the right size:
+        // `document_from_image` only adds the layer, and a `.aur` whose
+        // manifest names no tiles pages nothing in when it is read back,
+        // so the store under test would never evict and the leak would
+        // not reproduce.
+        let surface = super::surface_id_for(id);
+        let tiles = SIDE.div_ceil(aurora_tile::TILE);
+        for y in 0..tiles {
+            for x in 0..tiles {
+                let tile_id = aurora_tile::TileId { x, y };
+                let tile = match store.get_mut(surface, tile_id) {
+                    Ok(tile) => tile,
+                    Err(err) => unreachable!("touching a blank tile cannot fail: {err:?}"),
+                };
+                let Some(sample) = tile.texels_mut().first_mut() else {
+                    unreachable!("a full tile has texels");
+                };
+                *sample = half::f16::from_f32(0.5);
+            }
+        }
+        assert!(
+            tiles * tiles > 16,
+            "the document must exceed the verifier's own tile budget"
+        );
+        let path = dir.path().join("big.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) =
+            aurora_io::write_aur(file, &layers, &history, (SIDE, SIDE), None, &mut store)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let baseline = aur_verify_leftovers();
+        assert_eq!(
+            baseline,
+            (0, 0),
+            "nothing else may be mid-verification while this test holds the lock"
+        );
+
+        let mut after = Vec::new();
+        for _ in 0..3 {
+            assert!(
+                verify_aur(&path),
+                "a real, just-written .aur file must verify"
+            );
+            after.push(aur_verify_leftovers());
+        }
+        assert_eq!(
+            after,
+            vec![(0, 0), (0, 0), (0, 0)],
+            "each verification must take its own scratch directory with it; leftovers that grow \
+             per save are the leak this test exists for"
+        );
+    }
+
+    /// The `.aur` verifier's scratch directory must live *under* the
+    /// per-session one, and must not be the pre-0.53.0 fixed,
+    /// cross-process path.
+    ///
+    /// Not a tautology: a review round demonstrated that reverting this
+    /// half of the fix — putting the verifier back on
+    /// `std::env::temp_dir().join("aurora-aur-verify")`, a second fixed,
+    /// world-readable directory shared by every process and every user
+    /// on the machine — passed the entire gate with nothing failing.
+    /// This is the assertion that would have caught it, and it mirrors
+    /// [`each_scratch_directory_is_a_new_one`]'s own `assert_ne!`
+    /// against the live store's old fixed path.
+    #[test]
+    fn the_aur_verify_scratch_directory_is_nested_and_not_the_old_fixed_path() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let Some(session) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(first) = aur_verify_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(second) = aur_verify_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let fixed = std::env::temp_dir().join("aurora-aur-verify");
+        for dir in [first.path(), second.path()] {
+            assert!(dir.is_dir());
+            assert!(
+                dir.starts_with(session),
+                "the verifier's scratch directory must be a child of the session directory \
+                 ({}), not a sibling or a fixed path of its own: {}",
+                session.display(),
+                dir.display()
+            );
+            assert_ne!(dir, fixed);
+        }
+        // Per call, not per session -- the whole reason the leak above
+        // cannot come back by sharing one directory across saves.
+        assert_ne!(first.path(), second.path());
+
+        // And the `TempDir` guard is what deletes it: dropping must
+        // leave nothing behind.
+        let path = first.path().to_path_buf();
+        drop(first);
+        assert!(!path.exists(), "dropping the guard removes the directory");
+        drop(second);
+    }
+
+    /// The three things a clean shutdown must undo, exercised as a unit.
+    ///
+    /// The `WindowEvent::CloseRequested` arm that calls this needs a
+    /// real `winit` event loop, so no test can execute the arm itself —
+    /// a review round showed that deleting the scratch-directory
+    /// cleanup from it left every test green. Each step is asserted here
+    /// against throwaway paths (never the live session's, which every
+    /// other test in this binary shares), so only the single call in the
+    /// handler is left to inspection.
+    #[test]
+    fn clean_shutdown_cleanup_removes_the_marker_the_autosave_and_the_scratch_tiles() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let marker = dir.path().join("aurora-session.marker");
+        if let Err(err) = std::fs::write(&marker, b"") {
+            unreachable!("a fresh tempdir must be writable: {err}");
+        }
+        let autosave = dir.path().join("aurora-autosave.aur");
+        if let Err(err) = std::fs::write(&autosave, b"") {
+            unreachable!("a fresh tempdir must be writable: {err}");
+        }
+
+        // A real, live store with a real paged-out tile in a real
+        // scratch directory -- not an empty directory, which would pass
+        // even if the removal never ran against anything.
+        let Some(scratch) = create_tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(scratch.clone(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("a fresh scratch directory must be usable: {err}"),
+        };
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for id in [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+        ] {
+            if let Err(err) = store.get_mut(surface, id) {
+                unreachable!("touching a blank tile cannot fail: {err}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("a test-local scratch disk must accept the write: {err}");
+        }
+        let tiles = match std::fs::read_dir(&scratch) {
+            Ok(entries) => entries.flatten().count(),
+            Err(err) => unreachable!("the scratch directory is readable: {err}"),
+        };
+        assert!(
+            tiles > 0,
+            "this test's premise is a scratch directory with real paged-out tiles in it"
+        );
+
+        let mut state = FakeShutdownState {
+            marker: marker.clone(),
+            autosave: autosave.clone(),
+            store: Some(store),
+            scratch: Some(scratch.clone()),
+        };
+        clean_shutdown_cleanup(&mut state);
+        assert!(
+            state.store.is_none(),
+            "the store must be taken out of the slot and dropped, not left alive holding a \
+             writer thread against a directory that is being deleted"
+        );
+
+        assert!(!marker.exists(), "the session marker must be cleared");
+        assert!(!autosave.exists(), "the autosave must be removed");
+        assert!(
+            !scratch.exists(),
+            "the session's scratch directory and its unsaved pixels must be removed"
+        );
+    }
+
+    /// [`ShutdownState`]'s test double — the four things a clean
+    /// shutdown reads out of the running application, backed by
+    /// throwaway paths instead of the live session's.
+    struct FakeShutdownState {
+        marker: PathBuf,
+        autosave: PathBuf,
+        store: Option<aurora_tile::TileStore>,
+        scratch: Option<PathBuf>,
+    }
+
+    impl ShutdownState for FakeShutdownState {
+        fn marker_path(&self) -> &std::path::Path {
+            &self.marker
+        }
+
+        fn autosave_path(&self) -> PathBuf {
+            self.autosave.clone()
+        }
+
+        fn take_tile_store(&mut self) -> Option<aurora_tile::TileStore> {
+            self.store.take()
+        }
+
+        fn scratch_dir(&self) -> Option<&std::path::Path> {
+            self.scratch.as_deref()
+        }
+    }
+
+    /// A session scratch directory swept out from under a running
+    /// process must not silently discard every save for the rest of the
+    /// run.
+    ///
+    /// `tile_store_scratch_dir` memoizes a *path*, not a directory that
+    /// is guaranteed to still exist: a temp cleaner sweeping `/tmp`, or
+    /// a user clearing temp files, deletes it mid-session. Nesting the
+    /// verifier's scratch directory under it (0.53.0) made
+    /// `tempdir_in` fail in that state, `verify_aur` return `false`,
+    /// and `App::save_aur_file` respond by deleting the export it had
+    /// just written — the save gone, with nothing but a `tracing::warn!`
+    /// to show for it, for every save afterwards too. CLAUDE.md names
+    /// silently degrading a professional's file as the worst failure
+    /// this project can have.
+    #[test]
+    fn aur_verification_survives_the_session_scratch_directory_being_swept_away() {
+        // Deliberately removes the one live session directory, so it
+        // takes the same lock the other verification tests do. The
+        // directory is recreated by the very call under test, so the
+        // window in which it is absent is a single `verify_aur` call.
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_store_dir, mut store) = real_tile_store();
+        let image = fake_image(4, 4);
+        let (layers, history, _id) = document_from_image("photo", &image);
+        let path = dir.path().join("real.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), None, &mut store) {
+            unreachable!("{err:?}");
+        }
+
+        let Some(session) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        super::remove_scratch_dir(session);
+        assert!(
+            !session.exists(),
+            "this test's premise is a session directory that has been swept away"
+        );
+
+        assert!(
+            verify_aur(&path),
+            "a real, just-written .aur file must still verify after the session scratch \
+             directory has been swept away -- returning false here deletes the user's export"
+        );
+        assert!(
+            session.is_dir(),
+            "the session directory must be recreated, not merely worked around once"
+        );
+        // And it is owner-only again, not whatever the umask says.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = match std::fs::metadata(session) {
+                Ok(meta) => meta.permissions().mode() & 0o777,
+                Err(err) => unreachable!("the directory was just recreated: {err}"),
+            };
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "a recreated session directory holds the same unsaved pixels the original did \
+                 (mode {mode:o})"
+            );
+        }
+    }
+
+    /// The "nothing to clean up" shape, which a clean shutdown really
+    /// can reach: no scratch directory was ever created (painting was
+    /// disabled for the session), and the marker/autosave are already
+    /// gone. Called for its lack of panic, and to pin that an absent
+    /// path is not treated as an error.
+    #[test]
+    fn clean_shutdown_cleanup_tolerates_having_nothing_to_remove() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let marker = dir.path().join("never-written.marker");
+        let autosave = dir.path().join("never-written.aur");
+        let mut state = FakeShutdownState {
+            marker: marker.clone(),
+            autosave: autosave.clone(),
+            store: None,
+            scratch: None,
+        };
+        clean_shutdown_cleanup(&mut state);
+        assert!(!marker.exists());
+        assert!(!autosave.exists());
     }
 
     #[test]
@@ -9848,6 +14017,226 @@ mod tests {
         }
     }
 
+    /// The actual regression proof for "Eyedropper only samples the
+    /// active layer, not the merged document" (PLAN.md's Basic-tools
+    /// bullet): a non-active, visible `top` layer sits above the active
+    /// `bottom` layer with its own real 50% opacity, so the two real,
+    /// different colours blend to a third, distinct one
+    /// (`recomposite_visible_tiles_blends_visible_layers_bottom_to_top_and_skips_hidden_ones`'s
+    /// own exact combo: opaque red under 50%-opacity opaque blue ->
+    /// `(0.5, 0.0, 0.5, 1.0)`). The old, pre-fix implementation read
+    /// `bottom`'s own surface directly and would have returned its plain
+    /// opaque red -- this asserts [`eyedropper_sample`] returns the real
+    /// composited purple instead, proven against `bottom`'s own surface
+    /// sampled directly as the sanity check for what the bug used to
+    /// return.
+    #[test]
+    fn eyedropper_sample_reads_the_composited_colour_not_the_active_layers_own() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let Some(bottom_surface) = layers.surface_id(bottom) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(&mut store, bottom_surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+        let Some(top_surface) = layers.surface_id(top) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(&mut store, top_surface, tile_id, [0.0, 0.0, 1.0, 1.0]);
+
+        // Sanity check: `bottom`'s own surface, sampled directly, really
+        // is plain opaque red -- exactly what the old, pre-fix
+        // `sample_eyedropper` would have picked, and the wrong answer.
+        let bottoms_own = sample_pixel(&mut store, bottom_surface, (5.0, 5.0)).unwrap_or([-1.0; 4]);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(bottoms_own, [1.0, 0.0, 0.0, 1.0]);
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        // `bottom` is the active layer; `top`, non-active but visible,
+        // sits above it in real stacking order with its own real 50%
+        // opacity -- the exact scenario the old code got wrong.
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(bottom),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        let origin = active_layer_origin(&layers, Some(bottom));
+        let sampled = eyedropper_sample(&mut store, origin, (5.0, 5.0));
+        assert_eq!(
+            sampled,
+            Some([0.5, 0.0, 0.5]),
+            "must pick up the real composited blend (opaque red bottom under 50%-opacity \
+             opaque blue top), not bottom's own opaque red"
+        );
+    }
+
+    /// The other half of "the active layer, not the merged document":
+    /// here `active` (the active layer) is never painted at all --
+    /// fully transparent everywhere -- while a non-active, visible layer
+    /// above it has real opaque content at the same point. The old
+    /// code's `alpha > 0.0` guard, checked against `active`'s own
+    /// surface, would have found nothing to pick at all; the composited
+    /// surface has the real visible colour.
+    #[test]
+    fn eyedropper_sample_reads_the_composited_colour_when_the_active_layer_itself_is_transparent_there()
+     {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let active = match layers.add_pixel_layer("active", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let visible_above = match layers.add_pixel_layer("visible-above", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(above_surface) = layers.surface_id(visible_above) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        fill_solid(&mut store, above_surface, tile_id, [0.0, 1.0, 0.0, 1.0]);
+
+        // Sanity check: `active`'s own surface really is transparent at
+        // this point -- never painted at all.
+        let Some(active_surface) = layers.surface_id(active) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let actives_own = sample_pixel(&mut store, active_surface, (5.0, 5.0)).unwrap_or([-1.0; 4]);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(actives_own, [0.0, 0.0, 0.0, 0.0]);
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(active),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        let origin = active_layer_origin(&layers, Some(active));
+        let sampled = eyedropper_sample(&mut store, origin, (5.0, 5.0));
+        assert_eq!(
+            sampled,
+            Some([0.0, 1.0, 0.0]),
+            "must pick up the visible layer above, not report nothing just because the \
+             active layer itself is transparent here"
+        );
+    }
+
+    /// The no-active-layer design decision this fix made: with no
+    /// active layer selected at all, [`active_layer_origin`]'s own
+    /// fallback is `(0.0, 0.0)` -- the document's own origin, not any
+    /// layer's -- so [`eyedropper_sample`] must sample the merged
+    /// document directly at `doc_point`, with no subtraction. `only`'s
+    /// own bounds are deliberately *not* at the document origin (`(40,
+    /// 40)`, mirroring
+    /// `recomposite_visible_tiles_blends_a_layer_at_a_different_origin_than_the_active_layer`'s
+    /// own offset): if this incorrectly subtracted `only`'s own bounds
+    /// instead of using the document's origin, it would sample the wrong
+    /// composite location and this would fail.
+    #[test]
+    fn eyedropper_sample_reads_the_merged_document_with_no_active_layer_selected() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 40,
+            y: 40,
+            width: 10,
+            height: 10,
+        };
+        let only = match layers.add_pixel_layer("only", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(only) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        // Exact powers of two (unlike e.g. 0.2/0.4/0.6), so the `f16`
+        // round trip through the tile store is bit-exact and this can
+        // assert equality against the same literals written, not an
+        // approximation.
+        fill_solid(&mut store, surface, tile_id, [0.25, 0.5, 0.75, 1.0]);
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        // No active layer at all -- `reference_origin` (and
+        // `active_layer_origin`, below) both fall back to the document's
+        // own origin, `(0, 0)`.
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+
+        let origin = active_layer_origin(&layers, None);
+        assert_eq!(origin, (0.0, 0.0));
+        let sampled = eyedropper_sample(&mut store, origin, (45.0, 45.0));
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(sampled, Some([0.25, 0.5, 0.75]));
+        }
+    }
+
     /// `image`'s own real RGBA sample at document-space `(x, y)`, read
     /// straight out of `aurora_io::Image::samples`' own row-major
     /// layout -- the flat-buffer counterpart to `read_first_texel`/
@@ -9931,6 +14320,140 @@ mod tests {
                 [0.5, 0.0, 0.5, 1.0],
                 "opaque red bottom under opaque blue top at 50% opacity"
             );
+        }
+    }
+
+    /// The export half of 0.52.1. `aurora-tile`'s own exact-length check
+    /// turns a corrupted scratch-disk tile into a real `TileError`
+    /// instead of a short buffer -- but `resolve_tile` *catches* that
+    /// error, logs it, and skips the layer, which on the export path
+    /// meant `composite_document` returned `Ok` with that layer's pixels
+    /// silently missing and `App::save_file` wrote the result straight
+    /// over the user's file. Unannounced content loss in a saved file is
+    /// the failure CLAUDE.md names as the worst this project can have,
+    /// so the export refuses. Extended in 0.52.2 with the *retry*: the
+    /// refusal is only worth anything if pressing Save again refuses
+    /// too, which it did not until `TileStore::ensure_resident` stopped
+    /// dropping the paged-out mapping of a tile whose page-in failed.
+    ///
+    /// Deliberately *not* changed, and therefore not asserted here: the
+    /// live canvas (`recomposite_visible_tiles`) still skips-and-repaints,
+    /// because failing every frame over one bad tile is worse to use than
+    /// a visibly missing layer.
+    ///
+    /// The corruption is real, not mocked: a budget-of-1 store evicts the
+    /// bottom layer's tile to the scratch directory, `flush` confirms the
+    /// write, and the file is then truncated the way a crash mid-write or
+    /// a full disk leaves it. Every sibling `composite_document_*` test
+    /// here is the positive control -- they run against an uncorrupted
+    /// store and get `Ok`.
+    #[test]
+    fn composite_document_refuses_to_export_when_a_layer_tile_cannot_be_read() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // One resident tile at a time, so the second layer's first touch
+        // evicts the first layer's tile to disk.
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        // `bottom`'s tile is now evicted and in flight; `flush` makes the
+        // write real so the file below is the one `page_in` will read.
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        let mut scratch_files: Vec<std::path::PathBuf> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        for entry in entries.flatten() {
+            scratch_files.push(entry.path());
+        }
+        assert_eq!(
+            scratch_files.len(),
+            1,
+            "exactly one tile should have been evicted: {scratch_files:?}"
+        );
+        let Some(victim) = scratch_files.first() else {
+            unreachable!("just asserted there is exactly one");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        match composite_document(&layers, &mut store, 10, 10) {
+            Err(aurora_io::IoError::IncompleteComposite { skipped, first }) => {
+                assert_eq!(skipped, 1, "exactly one layer tile was unreadable");
+                assert!(
+                    first.contains("corrupt tile file"),
+                    "the refusal must carry the real underlying tile error: {first}"
+                );
+            }
+            Ok(_) => unreachable!(
+                "exporting a document whose bottom layer cannot be read must not quietly \
+                 succeed with that layer missing"
+            ),
+            Err(other) => unreachable!("expected IncompleteComposite, got {other:?}"),
+        }
+
+        // The retry, and the point of this addition (0.52.2): before
+        // `aurora_tile::TileStore::ensure_resident` stopped forgetting a
+        // tile whose page-in failed, this second call returned
+        // `Ok(Image)` with the bottom layer silently blank -- so a user
+        // who hit the refusal above and simply pressed Save again got
+        // exactly the quietly-incomplete file the first refusal exists to
+        // prevent. Nothing in this crate changed to fix that; the store
+        // returning a real `Err` on every read is the whole of it.
+        match composite_document(&layers, &mut store, 10, 10) {
+            Err(aurora_io::IoError::IncompleteComposite { skipped, .. }) => {
+                assert_eq!(
+                    skipped, 1,
+                    "the retry must refuse for the same one unreadable tile"
+                );
+            }
+            Ok(_) => unreachable!(
+                "a retried export of a still-corrupt document must not quietly succeed with the \
+                 layer blank"
+            ),
+            Err(other) => unreachable!("expected IncompleteComposite, got {other:?}"),
         }
     }
 
@@ -11408,6 +15931,178 @@ mod tests {
     }
 
     #[test]
+    // The root-level sibling of the group test above, and AC-1's own
+    // regression test: the identical un-premultiply step that arm has
+    // always run was missing from `composite_roots_into_tile`, the
+    // shared root-level fold that both `composite_document` (export)
+    // and `recomposite_visible_tiles`' own CPU path go through.
+    //
+    // Fixture: one opaque-white pixel layer at layer opacity 0.5,
+    // root-level, over nothing (an otherwise empty document, so the
+    // accumulator it folds onto is `transparent_tile`'s own fully
+    // transparent black -- exactly the case that makes the fold's
+    // premultiplied-out contract visible).
+    //
+    // Hand-computed, straight-alpha "over" onto transparent black:
+    // `as = src_a * opacity = 1.0 * 0.5 = 0.5`, so each colour channel
+    // is `0.5*0.0 + 0.5*1.0 = 0.5` and alpha is `0.5 + 0.0*0.5 = 0.5`
+    // -- a premultiplied `(0.5, 0.5, 0.5, 0.5)`. Straightened, that is
+    // `(1.0, 1.0, 1.0, 0.5)`: the layer really is opaque white, shown at
+    // half opacity, and the colour channels must say so.
+    //
+    // This is the value that reaches an exported PNG/TIFF/`.aur` file
+    // and the eyedropper, so the pre-fix `(0.5, 0.5, 0.5, 0.5)` was a
+    // real, user-visible wrong colour in every export with translucent
+    // content -- asserted against explicitly below so this test would
+    // have failed before the fix rather than merely not covering it.
+    //
+    // Fully headless: no GPU adapter needed, unlike the
+    // `recomposite_visible_tiles` sibling below.
+    fn composite_document_un_premultiplies_a_translucent_root_level_layer() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let layer = match layers.add_pixel_layer("translucent", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(layer, 0.5) {
+            unreachable!("{err:?}");
+        }
+        let Some(surface) = layers.surface_id(layer) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [1.0, 1.0, 1.0, 1.0],
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            let result = image_pixel(&image, 0, 0);
+            assert_eq!(
+                result,
+                [1.0, 1.0, 1.0, 0.5],
+                "an opaque-white layer at 50% opacity is straight-alpha white at half alpha"
+            );
+            assert_ne!(
+                result,
+                [0.5, 0.5, 0.5, 0.5],
+                "the premultiplied value the root-level fold leaves behind -- what every \
+                 export of translucent content carried before 0.52.0"
+            );
+        }
+    }
+
+    #[test]
+    // Both levels of straightening in one fixture -- the case neither of
+    // the two tests above covers, because each exercises only one of
+    // them: `resolve_tile`'s `Group` arm straightens a group's isolated
+    // buffer, `composite_roots_into_tile` straightens the finished root
+    // accumulator, and only a document that ends fractional at *both*
+    // levels can tell a double-straighten (or a straighten at the wrong
+    // level) from correct behaviour.
+    //
+    // Fixture: one group at opacity 0.5, holding a single opaque-blue
+    // (0, 0, 1, 1) child pixel layer, as the document's only root-level
+    // layer, over nothing (a transparent background).
+    //
+    // Hand-computed, level by level:
+    //   * the group's isolated buffer: one full-opacity `Normal` child
+    //     folded onto transparent black reproduces the child exactly, so
+    //     the accumulator is (0, 0, 1, 1) -- already opaque, so the
+    //     `Group` arm's own straightening divides by one and is an exact
+    //     identity here, leaving (0, 0, 1, 1).
+    //   * folded into the root at the group's own opacity 0.5, onto
+    //     transparent black: `as = 1.0 * 0.5 = 0.5`, so
+    //     b = 0.5*0 + 0.5*1 = 0.5 and a = 0.5 + 0*0.5 = 0.5 -- a
+    //     premultiplied root accumulator of (0, 0, 0.5, 0.5).
+    //   * `composite_roots_into_tile`'s own straightening: 0.5 / 0.5 =
+    //     1.0, giving the finished (0, 0, 1.0, 0.5).
+    //
+    // The two wrong answers are asserted against by name, because each
+    // is a distinguishable failure signature: (0, 0, 2.0, 0.5) is what a
+    // *double* straighten produces (the group's buffer divided by the
+    // root's 0.5 alpha as well as its own), and (0, 0, 0.5, 0.5) is what
+    // a *missing* root-level straighten produces -- the premultiplied
+    // value the fold leaves behind.
+    fn composite_document_straightens_a_fractional_group_and_a_fractional_root_fold_exactly_once() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match layers.add_pixel_layer("child", bounds, Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(group, 0.5) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            layers.roots(),
+            [group],
+            "the group must be the document's only root-level layer, so the root fold ends \
+             at the group's own fractional alpha rather than on top of an opaque backdrop"
+        );
+
+        let Some(surface) = layers.surface_id(child) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            let result = image_pixel(&image, 0, 0);
+            assert_eq!(
+                result,
+                [0.0, 0.0, 1.0, 0.5],
+                "an opaque-blue child in a 50%-opacity group is straight-alpha pure blue at \
+                 half alpha"
+            );
+            assert_ne!(
+                result,
+                [0.0, 0.0, 2.0, 0.5],
+                "a blue channel above 1.0 would mean the buffer was straightened twice"
+            );
+            assert_ne!(
+                result,
+                [0.0, 0.0, 0.5, 0.5],
+                "the premultiplied value would mean the root-level straightening is missing"
+            );
+        }
+    }
+
+    #[test]
     // The blend-mode counterpart to
     // `composite_document_applies_a_groups_own_opacity_to_its_isolated_children`:
     // `group` (opacity 1.0, `Multiply`) contains one opaque pure-blue
@@ -11715,6 +16410,695 @@ mod tests {
                  with each level's own isolated buffer correctly un-premultiplied"
             );
         }
+    }
+    /// How many ordinary sibling pixel layers the many-sibling group
+    /// test below puts inside one group — the exact count PLAN.md's own
+    /// diagnosis measured at ~1 GB RSS before `resolve_tile` folded its
+    /// children in one at a time instead of collecting every sibling's
+    /// full tile buffer first.
+    const SIBLINGS: usize = 2_000;
+
+    /// How many ordinary *root-level* pixel layers the no-group version
+    /// of that test below uses. Deliberately a quarter of `SIBLINGS`:
+    /// this one covers a second, separate pair of fold sites
+    /// (`recomposite_visible_tiles`' CPU path and `composite_document`'s
+    /// export loop, which had the identical collect-all-first shape and
+    /// now share `composite_roots_into_tile`), and 500 is already an
+    /// unmistakable separation — the same binary, this test alone,
+    /// measured at **~264 MiB** peak RSS with the export loop reverted
+    /// to its collect-all-first form and **~15 MiB** with the fold in
+    /// place, independently across two separate reviewers' runs (264.3 /
+    /// 15.1, then 264.2 / 15.3 on re-verification) — the exact figure
+    /// moves by a fraction of a megabyte between runs (RSS measurement
+    /// noise, not a regression signal), the two-orders-of-magnitude drop
+    /// does not — without paying a second time for 2,000 real scratch-tile
+    /// writes on every CI platform. The 2,000 figure is kept for the
+    /// group test alone, where it matches the scenario PLAN.md actually
+    /// measured.
+    const ROOT_SIBLINGS: usize = 500;
+
+    #[test]
+    // The regression test for the *other* two fold sites: no group is
+    // involved at all. `resolve_tile`'s `Group` arm was not the only
+    // place that collected one full `aurora_tile::SAMPLES`-length `f16`
+    // buffer (512 KiB) per contributor before a single batch composite —
+    // `recomposite_visible_tiles`' own CPU closure and
+    // `composite_document`'s export loop both did it over
+    // `layers.roots()`, so a flat document with no groups at all reached
+    // the same peak-memory shape. Review 2026-08-24 noted the original
+    // memory test exercised only the `Group` arm; this one goes through
+    // `composite_document` directly, which is the export path and always
+    // runs on the CPU whatever the GPU situation is.
+    //
+    // Same construction and same reasoning as the group test below: only
+    // the bottom-most and top-most of the `ROOT_SIBLINGS` layers are
+    // filled, and the untouched ones still materialise a real, full,
+    // blank tile through `TileStore::get`, so all `ROOT_SIBLINGS`
+    // buffers are genuinely resolved and folded while contributing
+    // nothing (an `alpha = 0` source is an exact identity in
+    // `aurora_render::composite_layer_into`).
+    //
+    // Hand-computed: roots fold bottom-to-top (`roots().iter().rev()`,
+    // and `roots()` is newest-first, so the first-added layer is
+    // bottom-most). Opaque blue lands first over the transparent start
+    // and reproduces itself exactly; the 498 blank layers are exact
+    // no-ops; opaque green at layer opacity 0.5 folds last over an
+    // opaque blue backdrop, where straight-alpha "over" reduces to
+    // `alpha*src + (1-alpha)*dst`: r = 0.5*0 + 0.5*0 = 0.0,
+    // g = 0.5*1 + 0.5*0 = 0.5, b = 0.5*0 + 0.5*1 = 0.5,
+    // a = 0.5 + 1*0.5 = 1.0 -> (0.0, 0.5, 0.5, 1.0). The accumulator
+    // ends fully opaque, so `composite_roots_into_tile`'s own
+    // un-premultiply step (0.52.0) divides by one and is an exact
+    // identity here -- which is why this expectation is unchanged across
+    // that fix, and equally why an opaque-only fixture like this one
+    // could never have caught the gap it closed. The fractional-alpha
+    // sibling that does catch it is
+    // `composite_document_un_premultiplies_a_translucent_root_level_layer`.
+    fn composite_document_composites_five_hundred_root_level_sibling_layers() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let mut roots = Vec::with_capacity(ROOT_SIBLINGS);
+        for i in 0..ROOT_SIBLINGS {
+            let id = match layers.add_pixel_layer(format!("root {i}"), bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            roots.push(id);
+        }
+        let (Some(&bottom), Some(&top)) = (roots.first(), roots.last()) else {
+            unreachable!("ROOT_SIBLINGS is a non-zero constant");
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+        // Nothing but the root layers themselves, and `CompositeBudget`
+        // is seeded to exactly `layers.len()` with no slack — so a
+        // future edit that changes this fixture's shape fails here
+        // loudly rather than silently truncating the walk partway.
+        assert_eq!(layers.len(), ROOT_SIBLINGS);
+        assert_eq!(layers.roots().len(), ROOT_SIBLINGS);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [0.0, 0.0, 1.0, 1.0]), (top, [0.0, 1.0, 0.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [0.0, 0.5, 0.5, 1.0],
+                "{ROOT_SIBLINGS} root-level sibling layers, no group involved, must still \
+                 composite to the exact hand-computed blend of the two filled ones"
+            );
+        }
+    }
+
+    #[test]
+    // The direct regression test for `resolve_tile`'s own peak-memory
+    // shape: one group holding `SIBLINGS` ordinary pixel-layer children,
+    // on a trivial 10x10 document. Before the fold-in-place fix, the
+    // `Group` arm collected one full `aurora_tile::SAMPLES`-length `f16`
+    // buffer (512 KiB) per child before compositing them all in a single
+    // batch call, so peak memory scaled with sibling count rather than
+    // with nesting depth — reachable by nothing more exotic than adding
+    // a lot of layers.
+    //
+    // This is a *correctness* test that happens to exercise that shape:
+    // it passes against the pre-fix code too (the fix is bit-identical
+    // code motion, not a behaviour change), and what it guards is that
+    // folding children in one at a time still produces the exact same
+    // pixel. Only two of the `SIBLINGS` children are filled; the rest
+    // are left untouched, which is deliberate — `TileStore::get` returns
+    // a real, full, blank tile for an untouched surface, so all
+    // `SIBLINGS` real buffers are genuinely materialised and folded,
+    // while an `alpha = 0` source is an exact identity in
+    // `aurora_render::composite_layer_into` (`alpha = 0` makes
+    // `inverse = 1`, so every channel writes back its own current value
+    // and the alpha accumulation is `0 + da * 1`) and contributes
+    // nothing to the expected value.
+    //
+    // Hand-computed, following `resolve_tile`'s own isolate-then-apply
+    // semantic (same style as
+    // `composite_document_applies_a_groups_own_opacity_to_its_isolated_children`):
+    // children fold bottom-up, so the first-added child (opaque blue)
+    // lands first, reproducing itself exactly over the transparent
+    // start; the 1,998 blank children are exact no-ops; the last-added
+    // child (opaque green at layer opacity 0.5) folds last over an
+    // opaque blue backdrop, and straight-alpha "over" an opaque backdrop
+    // reduces to `alpha*src + (1-alpha)*dst` per channel:
+    // r = 0.5*0 + 0.5*0 = 0.0, g = 0.5*1 + 0.5*0 = 0.5,
+    // b = 0.5*0 + 0.5*1 = 0.5, a = 0.5 + 1*0.5 = 1.0 -> the group's own
+    // isolated buffer is (0.0, 0.5, 0.5, 1.0). It is already opaque, so
+    // both un-premultiply steps it passes through (the `Group` arm's own
+    // and, one level up, `composite_roots_into_tile`'s) are the
+    // identity, and the group's own
+    // documented defaults (opacity 1.0, `Normal`) composite that fully
+    // opaque buffer over the opaque red background unchanged.
+    fn composite_document_composites_two_thousand_sibling_layers_in_one_group() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // `group` is added after `background`, so it sits above it.
+        assert_eq!(layers.roots(), [group, background]);
+
+        let mut children = Vec::with_capacity(SIBLINGS);
+        for i in 0..SIBLINGS {
+            let child = match layers.add_pixel_layer(format!("child {i}"), bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            children.push(child);
+        }
+        let (Some(&bottom), Some(&top)) = (children.first(), children.last()) else {
+            unreachable!("SIBLINGS is a non-zero constant");
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+        // Every layer this document has: the background, the group, and
+        // its children. `CompositeBudget` is seeded to exactly
+        // `layers.len()` nodes with no slack, so a future edit that
+        // changes the fixture's shape must fail here loudly rather than
+        // silently truncating the walk partway through the siblings.
+        assert_eq!(layers.len(), SIBLINGS + 2);
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [1.0, 0.0, 0.0, 1.0]),
+            (bottom, [0.0, 0.0, 1.0, 1.0]),
+            (top, [0.0, 1.0, 0.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [0.0, 0.5, 0.5, 1.0],
+                "a group with {SIBLINGS} ordinary sibling children must still composite to \
+                 the exact hand-computed blend of the two filled ones"
+            );
+        }
+    }
+
+    /// Builds `layers` into: an opaque white full-coverage background
+    /// pixel layer at root level, plus a chain of `groups` nested groups
+    /// (the outermost at root level, i.e. depth 1, so the innermost sits
+    /// at depth `groups`) with one opaque red full-coverage pixel layer
+    /// inside the innermost group, at depth `groups + 1`. Both pixel
+    /// layers are filled in `store`. Returns nothing but the filled
+    /// tree/store — the caller composites and inspects the result.
+    ///
+    /// Shared by the two depth-bound tests below so the *only*
+    /// difference between them is the one extra level of nesting.
+    fn nested_group_chain_over_a_white_background(
+        layers: &mut aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        groups: usize,
+    ) {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let background = match layers.add_pixel_layer("background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        // Depth 1 is the outermost group (`parent: None`), matching the
+        // seed every real `resolve_tile` call site passes for a root.
+        let mut parent = None;
+        for level in 0..groups {
+            parent = match layers.add_group(format!("group-{level}"), parent) {
+                Ok(id) => Some(id),
+                Err(err) => unreachable!("{err:?}"),
+            };
+        }
+        // For every legal `groups` the innermost pixel layer lands at
+        // `groups + 1 <= MAX_LAYER_TREE_DEPTH`, so the real, guarded API
+        // builds it. Only the over-deep caller below asks for a layer at
+        // `MAX_LAYER_TREE_DEPTH + 1`, which `add_pixel_layer` now
+        // rightly refuses (0.50.0) -- that one branch goes through
+        // `aurora-doc`'s `test-support` escape hatch instead, which is
+        // the only way left to build the genuinely over-deep tree
+        // `resolve_tile`'s own independent depth guard is defence
+        // against. The group chain itself stays on the real API in both
+        // cases: even at `groups == MAX_LAYER_TREE_DEPTH` every group
+        // lands at depth <= 256.
+        let deepest_result = if groups < aurora_doc::MAX_LAYER_TREE_DEPTH {
+            layers.add_pixel_layer("deepest", bounds, parent)
+        } else {
+            layers.insert_pixel_ignoring_the_depth_limit("deepest", bounds, parent)
+        };
+        let deepest = match deepest_result {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [
+            (background, [1.0, 1.0, 1.0, 1.0]),
+            (deepest, [1.0, 0.0, 0.0, 1.0]),
+        ] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(store, surface, tile_id, rgba);
+        }
+    }
+
+    #[test]
+    // The boundary itself, isolated from any nesting: one ordinary
+    // visible pixel layer, resolved twice at two adjacent depths. This
+    // pins the exact comparison operator (`>`, not `>=`) — the one
+    // thing most likely to silently drift from `aurora-doc`'s own
+    // `validate_shape`, which rejects with `depth > MAX_LAYER_TREE_DEPTH`
+    // after seeding roots at 1.
+    fn resolve_tile_refuses_to_recurse_past_the_layer_tree_depth_bound() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let id = match layers.add_pixel_layer(
+            "solo",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(&mut store, surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+
+        assert!(
+            resolve_tile(
+                id,
+                &layers,
+                &mut store,
+                tile_id,
+                (0, 0),
+                (0, 0),
+                aurora_doc::MAX_LAYER_TREE_DEPTH,
+                &mut CompositeBudget::for_pass(&layers),
+            )
+            .is_some(),
+            "a layer sitting exactly at the maximum tree depth is still a legitimate \
+             contributor and must resolve"
+        );
+        assert!(
+            resolve_tile(
+                id,
+                &layers,
+                &mut store,
+                tile_id,
+                (0, 0),
+                (0, 0),
+                aurora_doc::MAX_LAYER_TREE_DEPTH + 1,
+                &mut CompositeBudget::for_pass(&layers),
+            )
+            .is_none(),
+            "one level past the maximum tree depth must be refused outright"
+        );
+    }
+
+    #[test]
+    // The "no regression" half of the depth bound, end to end through a
+    // real composite: 255 nested groups (depths 1..=255) with an opaque
+    // red pixel layer at depth 256 — exactly `MAX_LAYER_TREE_DEPTH`, the
+    // deepest a tree `aurora-doc` accepts can legitimately go. The red
+    // must survive to the composited image.
+    fn composite_document_still_includes_a_layer_at_exactly_the_maximum_tree_depth() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        // `- 1` groups, because the pixel layer inside them occupies the
+        // last level of the budget itself.
+        nested_group_chain_over_a_white_background(
+            &mut layers,
+            &mut store,
+            aurora_doc::MAX_LAYER_TREE_DEPTH - 1,
+        );
+
+        // This is what proves `resolve_tile`'s bound and `aurora-doc`'s
+        // bound actually agree, rather than that a number was picked
+        // that happens to work: the very same tree must round-trip
+        // through `LayerTree`'s own `#[serde(try_from = "LayerTreeRepr")]`
+        // validation, which is where `validate_shape` runs.
+        let bytes = match postcard::to_allocvec(&layers) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            postcard::from_bytes::<aurora_doc::LayerTree>(&bytes).is_ok(),
+            "a tree this deep is accepted by `aurora-doc`'s own validator, so `resolve_tile` \
+             must not be stricter than it"
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [1.0, 0.0, 0.0, 1.0],
+                "the layer at exactly the maximum tree depth must still be composited, \
+                 covering the white background with its own opaque red"
+            );
+        }
+    }
+
+    #[test]
+    // The other half: one more level of nesting than the maximum. The
+    // over-deep branch must be dropped — the assertion is on the *white*
+    // background showing through untouched, not merely on the call
+    // returning, so this proves the branch was treated as absent rather
+    // than that nothing crashed.
+    fn composite_document_drops_the_branch_that_nests_one_level_past_the_maximum_tree_depth() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        // One more group than the test above, so the red pixel layer
+        // lands at `MAX_LAYER_TREE_DEPTH + 1`.
+        nested_group_chain_over_a_white_background(
+            &mut layers,
+            &mut store,
+            aurora_doc::MAX_LAYER_TREE_DEPTH,
+        );
+
+        // The mirror of the round trip above: `aurora-doc` refuses this
+        // tree, which is exactly why `resolve_tile` must refuse it too.
+        // `postcard`'s own error type discards the underlying
+        // `DocError`, so only `is_err()` can be asserted here — the
+        // specific `LayerTreeTooDeep` variant is pinned by
+        // `aurora-doc`'s own tests instead.
+        let bytes = match postcard::to_allocvec(&layers) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            postcard::from_bytes::<aurora_doc::LayerTree>(&bytes).is_err(),
+            "a tree one level past the maximum is rejected by `aurora-doc`'s own validator"
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                image_pixel(&image, 0, 0),
+                [1.0, 1.0, 1.0, 1.0],
+                "the over-deep branch must be dropped from the composite entirely, leaving \
+                 the white background untouched"
+            );
+        }
+    }
+
+    /// Builds a perfect binary tree of groups `levels` deep under one
+    /// new root group, with one opaque full-coverage pixel layer at
+    /// every leaf, and returns that root's id. `levels = 3` gives 7
+    /// groups and 8 pixel layers, i.e. 15 nodes reachable from the root
+    /// and nothing else in the tree.
+    ///
+    /// The shape matters: this is the *fan-out* direction, the one the
+    /// depth counter alone says nothing about, so it is what the node
+    /// budget's own tests are built on.
+    fn balanced_group_tree(
+        layers: &mut aurora_doc::LayerTree,
+        store: &mut aurora_tile::TileStore,
+        levels: usize,
+    ) -> aurora_doc::LayerId {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let root = match layers.add_group("root", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut frontier = vec![root];
+        for level in 1..levels {
+            let mut next = Vec::new();
+            for parent in frontier {
+                for branch in 0..2 {
+                    match layers.add_group(format!("g-{level}-{branch}"), Some(parent)) {
+                        Ok(id) => next.push(id),
+                        Err(err) => unreachable!("{err:?}"),
+                    }
+                }
+            }
+            frontier = next;
+        }
+        for (leaf, parent) in frontier.into_iter().enumerate() {
+            for branch in 0..2 {
+                let id = match layers.add_pixel_layer(
+                    format!("leaf-{leaf}-{branch}"),
+                    bounds,
+                    Some(parent),
+                ) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let Some(surface) = layers.surface_id(id) else {
+                    unreachable!("just created as a pixel layer");
+                };
+                fill_solid(
+                    store,
+                    surface,
+                    aurora_tile::TileId { x: 0, y: 0 },
+                    [0.0, 1.0, 0.0, 1.0],
+                );
+            }
+        }
+        root
+    }
+
+    #[test]
+    // The node budget's "no false positives" half, and the reason it is
+    // sized from the document rather than from a constant: a legitimate
+    // tree that is *wide* as well as deep must composite in full, and
+    // must fit the budget exactly rather than merely comfortably. 15
+    // nodes, 15 charges, nothing left over and nothing dropped -- which
+    // is only true because every layer in a tree `aurora-doc` accepts is
+    // reachable from the roots at most once.
+    fn resolve_tile_spends_exactly_one_budget_node_per_layer_of_a_well_formed_tree() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let root = balanced_group_tree(&mut layers, &mut store, 3);
+        assert_eq!(layers.len(), 15, "7 groups plus 8 leaf pixel layers");
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let before = budget.nodes;
+        assert_eq!(before, layers.len(), "the budget is the tree's own size");
+
+        let resolved = resolve_tile(
+            root,
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            1,
+            &mut budget,
+        );
+        assert!(
+            resolved.is_some(),
+            "a well-formed 15-layer tree must composite in full, not be truncated by its \
+             own budget"
+        );
+        assert_eq!(
+            before - budget.nodes,
+            layers.len(),
+            "every layer is entered exactly once, so the budget lands exactly at zero -- \
+             one node tighter and this well-formed document would lose a layer"
+        );
+    }
+
+    #[test]
+    // The half that actually bounds the attack. The doubling red-team
+    // demonstrated -- a group whose `children` names the same id twice,
+    // costing `2^slack` visits from a shallow entry point -- inflates
+    // exactly one quantity: how many times `resolve_tile` is entered for
+    // one tile. That quantity is what this budget caps, monotonically
+    // and without refund on return, so the cap holds whatever shape the
+    // tree has.
+    //
+    // The malformed tree itself cannot be built from this crate:
+    // `aurora-doc`'s public API refuses to create a duplicate child, and
+    // its `Deserialize` refuses to accept one -- which is the whole
+    // premise of this guard being *defence in depth* rather than the
+    // primary check. So the budget is exercised the way the depth
+    // bound's own unit test exercises the depth counter: by handing
+    // `resolve_tile` a starting value directly. Burning one node up
+    // front leaves room for the group and the lower of its two children
+    // and nothing else, and the assertion is on the upper child being
+    // *absent from the composited result* -- not merely on the call
+    // returning -- so this pins that an over-budget branch is dropped
+    // the same way an over-deep one is.
+    fn resolve_tile_drops_the_branch_it_has_no_budget_left_for() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let group = match layers.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Added lower first: every add lands at index 0, so `children`
+        // ends up `[upper, lower]` and the bottom-to-top walk in
+        // `resolve_tile` reaches `lower` first.
+        for (name, rgba) in [
+            ("lower", [1.0, 1.0, 1.0, 1.0]),
+            ("upper", [1.0, 0.0, 0.0, 1.0]),
+        ] {
+            let id = match layers.add_pixel_layer(name, bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(
+                &mut store,
+                surface,
+                aurora_tile::TileId { x: 0, y: 0 },
+                rgba,
+            );
+        }
+
+        let group_texel =
+            |store: &mut aurora_tile::TileStore, budget: &mut CompositeBudget| -> [f32; 4] {
+                let resolved = resolve_tile(
+                    group,
+                    &layers,
+                    store,
+                    aurora_tile::TileId { x: 0, y: 0 },
+                    (0, 0),
+                    (0, 0),
+                    1,
+                    budget,
+                );
+                let Some((texels, _, _)) = resolved else {
+                    unreachable!("the group itself is inside every budget used here");
+                };
+                let Some([r, g, b, a]) = texels.get(..aurora_tile::CHANNELS) else {
+                    unreachable!("a resolved tile is at least one texel wide");
+                };
+                [r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]
+            };
+
+        let mut full = CompositeBudget::for_pass(&layers);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                group_texel(&mut store, &mut full),
+                [1.0, 0.0, 0.0, 1.0],
+                "with the real budget both children composite, so the upper (red) one wins"
+            );
+        }
+
+        let mut short = CompositeBudget::for_pass(&layers);
+        assert!(short.charge_node(), "burn one of the three nodes up front");
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                group_texel(&mut store, &mut short),
+                [1.0, 1.0, 1.0, 1.0],
+                "one node short, the upper child is dropped from the composite entirely -- \
+                 the white lower one shows through untouched"
+            );
+        }
+        assert_eq!(
+            short.nodes, 0,
+            "and the traversal stopped there rather than continuing to charge"
+        );
+    }
+
+    #[test]
+    // The throttle. `recomposite_visible_tiles` resolves once per
+    // invalidated tile per frame, so a per-breach warning on a malformed
+    // document would fire thousands of times a second on a path that is
+    // already over its latency budget. The node count is per tile; the
+    // "already said so" flag is per pass.
+    fn composite_budget_reports_a_breach_once_per_pass_and_recharges_per_tile() {
+        let mut layers = aurora_doc::LayerTree::new();
+        if let Err(err) = layers.add_group("group", None) {
+            unreachable!("{err:?}");
+        }
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        assert!(
+            budget.should_report(),
+            "the first breach of a pass is worth saying"
+        );
+        assert!(
+            !budget.should_report(),
+            "the second is the same broken tree"
+        );
+
+        assert!(budget.charge_node());
+        budget.next_tile(&layers);
+        assert_eq!(
+            budget.nodes,
+            layers.len(),
+            "the next tile gets its own full node budget"
+        );
+        assert!(
+            !budget.should_report(),
+            "but not its own warning -- one report per composite pass, not per tile"
+        );
     }
 
     #[test]
@@ -12277,9 +17661,11 @@ mod tests {
     // that `App::paint_dab`/`App::erase_dab` now use instead of a full
     // `bump()` on every dab. `App` itself can't be constructed headlessly
     // (it needs a real `winit` window), so these tests replicate the
-    // exact sequence those two methods run -- `aurora_brush::touched_tiles`
-    // computed once, `aurora_brush::stamp_dab`, then `cache.invalidate`
-    // per touched tile -- directly against a real `TileStore` and a real
+    // exact sequence those two methods run -- `aurora_brush::stamp_dab`,
+    // then `cache.invalidate` per tile in its returned
+    // `aurora_brush::DabOutcome::painted` (they keep a
+    // `aurora_brush::touched_tiles` assertion alongside it only to state
+    // the geometry each dab is aimed at) -- directly against a real `TileStore` and a real
     // `CompositeCache`, the same technique `measure_pan_and_paint_frames`
     // above already uses to exercise `App::redraw`'s own frame loop
     // without a real `App`.
@@ -12374,12 +17760,19 @@ mod tests {
             vec![aurora_tile::TileId { x: 0, y: 0 }],
             "setup: this dab must touch exactly tile (0, 0)"
         );
-        if let Err(err) =
-            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
-        {
-            unreachable!("{err:?}");
-        }
-        for tile in touched {
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            local,
+            BRUSH_RADIUS,
+            [0.8, 0.1, 0.05],
+            None,
+        );
+        assert!(
+            outcome.is_complete(),
+            "a healthy store must paint every tile this dab covers"
+        );
+        for &tile in outcome.painted() {
             cache.invalidate(tile);
         }
 
@@ -12410,13 +17803,24 @@ mod tests {
         };
 
         let local = (50.0, 50.0);
-        let touched = aurora_brush::touched_tiles(local, BRUSH_RADIUS);
-        if let Err(err) =
-            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
-        {
-            unreachable!("{err:?}");
-        }
-        for &tile in &touched {
+        assert_eq!(
+            aurora_brush::touched_tiles(local, BRUSH_RADIUS),
+            vec![aurora_tile::TileId { x: 0, y: 0 }],
+            "setup: this dab must be aimed at exactly tile (0, 0)"
+        );
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            local,
+            BRUSH_RADIUS,
+            [0.8, 0.1, 0.05],
+            None,
+        );
+        assert!(
+            outcome.is_complete(),
+            "a healthy store must paint every tile this dab covers"
+        );
+        for &tile in outcome.painted() {
             cache.invalidate(tile);
         }
 
@@ -12513,12 +17917,19 @@ mod tests {
             ]),
             "setup: a corner dab must touch all four visible tiles"
         );
-        if let Err(err) =
-            aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
-        {
-            unreachable!("{err:?}");
-        }
-        for tile in touched {
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            local,
+            BRUSH_RADIUS,
+            [0.8, 0.1, 0.05],
+            None,
+        );
+        assert!(
+            outcome.is_complete(),
+            "a healthy store must paint every tile this dab covers"
+        );
+        for &tile in outcome.painted() {
             cache.invalidate(tile);
         }
 
@@ -12553,12 +17964,19 @@ mod tests {
                 vec![aurora_tile::TileId { x: 0, y: 0 }],
                 "setup: every dab in this stroke must stay within tile (0, 0)"
             );
-            if let Err(err) =
-                aurora_brush::stamp_dab(&mut store, surface, local, BRUSH_RADIUS, [0.8, 0.1, 0.05])
-            {
-                unreachable!("{err:?}");
-            }
-            for tile in touched {
+            let outcome = aurora_brush::stamp_dab(
+                &mut store,
+                surface,
+                local,
+                BRUSH_RADIUS,
+                [0.8, 0.1, 0.05],
+                None,
+            );
+            assert!(
+                outcome.is_complete(),
+                "a healthy store must paint every tile this dab covers"
+            );
+            for &tile in outcome.painted() {
                 cache.invalidate(tile);
             }
         }
@@ -12801,6 +18219,213 @@ mod tests {
         //     b = 0.75*0.0 + 0.25*1.0 = 0.25,
         //     a = 0.25 + 1.0*0.75 = 1.0 -> (0.375, 0.375, 0.25, 1.0).
         assert_eq!(gpu_result, (0.375, 0.375, 0.25, 1.0));
+    }
+
+    /// AC-2's own regression test: the same fixture as
+    /// `composite_document_un_premultiplies_a_translucent_root_level_layer`
+    /// (one opaque-white root-level pixel layer at layer opacity 0.5,
+    /// over nothing), but reaching `composite_roots_into_tile` through
+    /// the *live canvas* entry point rather than the export one — the
+    /// two callers that shared the missing un-premultiply step. The
+    /// expected value and its hand-computation are identical; see that
+    /// test's own comment.
+    ///
+    /// **Honest note about the harness**: this exercises the CPU
+    /// compositing fallback (`gpu`/`compositor` both `None`, the same
+    /// technique
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_real_multi_layer_document`
+    /// already uses for its second run), yet it still needs a real
+    /// `aurora_gpu::TileResidency` — and therefore a real `GpuContext` —
+    /// because `recomposite_visible_tiles` takes the residency to learn
+    /// which tiles are visible. That is a harness constraint of this
+    /// entry point's signature, not evidence about the CPU math, and it
+    /// means this test self-skips where no adapter exists. The
+    /// always-headless proof of the same math is the `composite_document`
+    /// sibling above.
+    #[test]
+    fn recomposite_visible_tiles_un_premultiplies_a_translucent_root_level_layer() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let layer = match layers.add_pixel_layer("translucent", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(layer, 0.5) {
+            unreachable!("{err:?}");
+        }
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let Some(surface) = layers.surface_id(layer) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(&mut store, surface, tile_id, [1.0, 1.0, 1.0, 1.0]);
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency, &layers, None, &mut store, &mut cache, None, None,
+        );
+
+        let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+        assert_eq!(
+            result,
+            (1.0, 1.0, 1.0, 0.5),
+            "the live canvas composite must hold straight alpha, the same as an export"
+        );
+        assert_ne!(
+            result,
+            (0.5, 0.5, 0.5, 0.5),
+            "the premultiplied value the root-level fold leaves behind -- what the composite \
+             surface (and so the eyedropper) carried before 0.52.0"
+        );
+    }
+
+    /// AC-4's own sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_real_multi_layer_document`,
+    /// which stays deliberately unchanged: that test's fixture ends at
+    /// `alpha = 1.0`, where un-premultiplying divides by one and is an
+    /// exact identity on both paths — which is precisely why it kept
+    /// passing across 0.52.0 (real evidence of no regression) *and* why
+    /// it could never have caught the bug in the first place. This one
+    /// ends at a **fractional** final alpha, where the straightening
+    /// step 0.52.0 added is the only thing that can make the two paths
+    /// agree.
+    ///
+    /// Both paths reach that step through the *same* implementation:
+    /// `aurora_render::un_premultiply_in_place`, called by
+    /// `composite_roots_into_tile` on the CPU path and by
+    /// `finish_tile_readback` on the GPU path's readback decode. So this
+    /// test proves the two paths' *compositing* agrees; it can no longer
+    /// diverge on the division itself, which is by construction now
+    /// rather than by two implementations happening to match. (0.52.0's
+    /// first shape did run a separate WGSL division as an extra GPU
+    /// pass, and that pair was measured not to agree at very small
+    /// alphas.)
+    ///
+    /// Fixture: two root-level `Normal`-blend pixel layers, both filled
+    /// opaque red `(1, 0, 0, 1)`, both at layer opacity 0.5, no groups
+    /// (so the whole document is GPU-tractable — asserted below, so a
+    /// future change that silently routed this to the CPU would fail
+    /// loudly rather than pass vacuously).
+    ///
+    /// Hand-computed, bottom to top, straight-alpha "over"
+    /// (`Co = (1-as)*Cb + as*Cs`, `Ca = as + Cb.a*(1-as)`,
+    /// `as = src_a * opacity`), onto a transparent start:
+    ///   bottom: `as = 0.5`, `r = 0.5*0 + 0.5*1 = 0.5`,
+    ///     `a = 0.5 + 0*0.5 = 0.5` -> premultiplied `(0.5, 0, 0, 0.5)`.
+    ///   top: `as = 0.5`, `r = 0.5*0.5 + 0.5*1 = 0.75`,
+    ///     `a = 0.5 + 0.5*0.5 = 0.75` -> premultiplied `(0.75, 0, 0, 0.75)`.
+    /// Straightened: `0.75 / 0.75 = 1.0`, so the finished tile is
+    /// `(1.0, 0.0, 0.0, 0.75)` — two half-opacity opaque-red layers stack
+    /// to three-quarters-opaque *fully saturated* red, which is what an
+    /// export and the eyedropper must report.
+    ///
+    /// **Exact equality, not a tolerance**, on both paths and between
+    /// them: every value here (0.5, 0.25, 0.75, 1.0) is an exact binary
+    /// fraction, so the ~2.5-ULP latitude Vulkan permits an `f32`
+    /// multiply-add cannot move the GPU fold's result off the CPU's, and
+    /// the one division (`0.75 / 0.75`) is the same CPU code on both
+    /// paths. If this ever does diverge, that is a finding to report,
+    /// not a reason to loosen the assertion.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for id in [bottom, top] {
+            if let Err(err) = layers.set_opacity(id, 0.5) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for id in [bottom, top] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "two Normal-blend, non-grouped pixel layers must qualify for the GPU path -- \
+             otherwise this test would compare the CPU path against itself"
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        // Run 1: the real GPU path.
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        // Run 2: the CPU fallback, forced by passing no GPU/compositor.
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        assert_eq!(
+            gpu_result, cpu_result,
+            "the GPU and CPU paths must agree on a fractional-final-alpha document too, not \
+             only on the fully-opaque one the sibling test covers"
+        );
+        for (result, path) in [(gpu_result, "GPU"), (cpu_result, "CPU")] {
+            assert_eq!(
+                result,
+                (1.0, 0.0, 0.0, 0.75),
+                "{path} path: two half-opacity opaque-red layers straighten to fully \
+                 saturated red at 0.75 alpha"
+            );
+            assert_ne!(
+                result,
+                (0.75, 0.0, 0.0, 0.75),
+                "{path} path: the premultiplied value both paths produced before 0.52.0"
+            );
+        }
     }
 
     /// The batched-poll restructuring's own correctness proof: the
@@ -13097,14 +18722,21 @@ mod tests {
             // budget or a `flush()` call this loop's real counterpart
             // (`App::redraw`) never makes either.
             let dab_center = (x as f32 + 300.0, y as f32 + 300.0);
-            if let Err(err) = aurora_brush::stamp_dab(
+            let outcome = aurora_brush::stamp_dab(
                 store,
                 surface,
                 dab_center,
                 BRUSH_RADIUS,
                 [0.95, 0.62, 0.25],
-            ) {
-                tracing::warn!(?err, "failed to stamp a brush dab this frame");
+                None,
+            );
+            if let Some(err) = outcome.first_error() {
+                tracing::warn!(
+                    ?err,
+                    failed = outcome.failed().len(),
+                    painted = outcome.painted().len(),
+                    "failed to stamp part of a brush dab this frame"
+                );
             }
             cache.bump();
 
@@ -13493,11 +19125,18 @@ mod tests {
     fn sample_pixel_reads_back_a_real_stamped_dab() {
         let (_dir, mut store) = real_tile_store();
         let surface = aurora_tile::SurfaceId::from_raw(0);
-        if let Err(err) =
-            aurora_brush::stamp_dab(&mut store, surface, (10.5, 10.5), 20.0, [1.0, 0.0, 0.0])
-        {
-            unreachable!("{err:?}");
-        }
+        assert!(
+            aurora_brush::stamp_dab(
+                &mut store,
+                surface,
+                (10.5, 10.5),
+                20.0,
+                [1.0, 0.0, 0.0],
+                None
+            )
+            .is_complete(),
+            "a healthy store must paint every tile this dab covers"
+        );
         let Some([r, g, b, a]) = sample_pixel(&mut store, surface, (10.5, 10.5)) else {
             unreachable!("a dab was just stamped exactly here");
         };
@@ -13525,271 +19164,704 @@ mod tests {
         assert_eq!(sample_pixel(&mut store, surface, (5.0, -1.0)), None);
     }
 
+    /// A deliberately tiny one-pixel-layer document for the autosave
+    /// tests — a single 10x10 layer is one tile, where
+    /// [`demo_document`]'s own 4000x3000 canvas is 192 tiles *per
+    /// layer*, all of which `aurora_io::write_aur` would page into (and
+    /// evict out of) the store on every single write. Small on purpose,
+    /// not by accident: these tests are about the autosave path, not
+    /// about tile paging throughput.
+    fn small_autosave_document() -> (
+        aurora_doc::LayerTree,
+        aurora_doc::History,
+        aurora_doc::LayerId,
+    ) {
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "Background", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (layers, history, id)
+    }
+
+    /// Paints one genuinely non-zero texel into `id`'s own surface —
+    /// the whole point of the `.aur`-based autosave, and the thing an
+    /// all-blank test document could never prove, since
+    /// `aurora_io::write_aur` skips every all-zero tile. Returns the
+    /// `(surface, texel index, value)` a recovery assertion can check.
+    fn paint_one_texel(
+        store: &mut aurora_tile::TileStore,
+        layers: &aurora_doc::LayerTree,
+        id: aurora_doc::LayerId,
+    ) -> (aurora_tile::SurfaceId, usize, f32) {
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("id was built as a pixel layer");
+        };
+        let tile = match store.get_mut(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Index 3 is texel (0, 0)'s own alpha channel -- a real,
+        // non-default value, so the tile is genuinely not all-zero.
+        let Some(sample) = tile.texels_mut().get_mut(3) else {
+            unreachable!("index 3 is in bounds for a full tile");
+        };
+        *sample = half::f16::from_f32(0.75);
+        (surface, 3, 0.75)
+    }
+
     #[test]
     fn recovering_a_missing_autosave_returns_none() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        assert!(recover_document(&path).is_none());
+        let (_store_dir, mut store) = real_tile_store();
+        let path = dir.path().join("aurora-autosave.aur");
+        assert!(recover_document(&path, &mut store).is_none());
     }
 
     #[test]
     fn recovering_garbage_bytes_returns_none() {
+        // Garbage now fails at the *ZIP* layer (`ZipArchive::new` can't
+        // find a central directory), not at `postcard` journal parsing
+        // the way it did when the autosave was raw journal bytes -- a
+        // different `aurora_io::IoError` variant reaching the same
+        // "fall back to `demo_document`, don't fail to start" answer.
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        if let Err(err) = std::fs::write(&path, b"not a postcard journal") {
+        let (_store_dir, mut store) = real_tile_store();
+        let path = dir.path().join("aurora-autosave.aur");
+        if let Err(err) = std::fs::write(&path, b"not a .aur container") {
             unreachable!("{err}");
         }
-        assert!(recover_document(&path).is_none());
+        assert!(recover_document(&path, &mut store).is_none());
     }
 
     #[test]
-    fn writing_then_recovering_an_autosave_round_trips_the_same_journal_descriptions() {
+    fn recovering_a_truncated_autosave_container_returns_none() {
+        // A crash *during* a write is the realistic way an autosave
+        // file goes bad, and a half-written ZIP has no readable central
+        // directory. Must still be a silent fall back to
+        // `demo_document`, not a panic or a failed start.
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let (_layers, history) = demo_document();
-        let original_descriptions = history.journal_descriptions();
+        let (_store_dir, mut store) = real_tile_store();
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        let _painted = paint_one_texel(&mut store, &layers, id);
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
 
-        write_autosave(&path, &history);
-        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
-            unreachable!("just wrote a real autosave");
+        let full_len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(err) => unreachable!("{err}"),
         };
+        assert!(full_len > 0, "the autosave must have written real bytes");
+        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err}"),
+        };
+        if let Err(err) = file.set_len(full_len / 2) {
+            unreachable!("{err}");
+        }
+        drop(file);
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        assert!(
+            recover_document(&path, &mut fresh_store).is_none(),
+            "a truncated container must fall back, not panic or half-recover"
+        );
+    }
+
+    /// Red-team's own reproduction, as a regression test: a complete
+    /// autosave exists, the scratch disk then goes bad, and the next
+    /// autosave — which now succeeds best-effort with tiles missing —
+    /// must **not** replace it. Crash-recovery protection has to be
+    /// monotonic: a snapshot may only ever be replaced by one at least as
+    /// good. The first shape of the best-effort change renamed the
+    /// degraded result straight over the single fixed `autosave_path`, so
+    /// the complete snapshot was gone and its dropped tiles were
+    /// unrecoverable from anywhere.
+    #[test]
+    fn a_degraded_autosave_never_overwrites_a_complete_one() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let scratch = match tempfile::tempdir() {
+            Ok(scratch) => scratch,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(scratch.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        for name in ["first", "second"] {
+            let id = match history.add_pixel_layer(&mut layers, name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let _painted = paint_one_texel(&mut store, &layers, id);
+        }
+
+        // Autosave #1, with every tile readable: complete, and it lands
+        // on the canonical path.
+        let path = dir.path().join("aurora-autosave.aur");
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let Ok(complete) = std::fs::read(&path) else {
+            unreachable!("the complete autosave must have been written");
+        };
+        assert!(!complete.is_empty());
+        assert!(!partial_autosave_path(&path).exists());
+
+        // The scratch disk goes bad: one tile is now permanently
+        // unreadable.
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        let Ok(entries) = std::fs::read_dir(scratch.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        assert!(
+            !files.is_empty(),
+            "at least one tile should have been evicted"
+        );
+        // Every scratch file, not just one: with a one-tile budget
+        // exactly one tile is resident and served from memory, and which
+        // one that is depends on the order `write_aur_best_effort`
+        // happened to walk the layers in. Corrupting all of them makes
+        // "at least one tile is unreadable" true without depending on
+        // that order.
+        for victim in &files {
+            let Ok(bytes) = std::fs::read(victim) else {
+                unreachable!("the evicted tile file must be readable");
+            };
+            let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+                unreachable!("half of a slice's own length is always in range");
+            };
+            if let Err(err) = std::fs::write(victim, truncated) {
+                unreachable!("test-local scratch disk must accept the write: {err:?}");
+            }
+        }
+
+        // Autosave #2, degraded.
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+
+        let Ok(after) = std::fs::read(&path) else {
+            unreachable!("the complete autosave must still be there");
+        };
+        assert_eq!(
+            after, complete,
+            "a degraded autosave must leave the complete one byte-for-byte untouched"
+        );
+        assert!(
+            partial_autosave_path(&path).exists(),
+            "the degraded snapshot must still be kept, beside the complete one"
+        );
+        // And recovery still prefers the complete snapshot.
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let Some((recovered, ..)) = recover_document(&path, &mut fresh_store) else {
+            unreachable!("the complete autosave must reopen");
+        };
+        assert_eq!(recovered.len(), 2);
+    }
+
+    /// A tile that cannot be read back must cost the autosave that
+    /// *tile*, not the whole document (0.52.2). Since this round made an
+    /// unreadable tile fail on every read rather than healing into a
+    /// blank one, `write_autosave` calling the refusing `write_aur` would
+    /// have meant one bad tile permanently ending crash-recovery
+    /// protection for every layer and every later edit in the session,
+    /// with nothing visible to the user. It calls
+    /// `aurora_io::write_aur_best_effort` instead — see its own doc
+    /// comment for why autosave and an explicit Save deliberately differ.
+    ///
+    /// Two layers, a one-tile store budget: touching the second layer
+    /// evicts the first's tile, `flush` makes that write real, and
+    /// truncating the file it landed in leaves a tile whose every
+    /// subsequent read fails.
+    #[test]
+    fn write_autosave_still_protects_the_rest_of_the_document_when_one_tile_is_unreadable() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let scratch = match tempfile::tempdir() {
+            Ok(scratch) => scratch,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(scratch.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let mut painted = Vec::new();
+        for name in ["broken", "intact"] {
+            let id = match history.add_pixel_layer(&mut layers, name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            painted.push(paint_one_texel(&mut store, &layers, id));
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        // Corrupt the one evicted tile file: "broken"'s own tile.
+        let Ok(entries) = std::fs::read_dir(scratch.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let [victim] = files.as_slice() else {
+            unreachable!("exactly one tile should have been evicted: {files:?}");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        let path = dir.path().join("aurora-autosave.aur");
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+
+        // Nothing complete was ever written here, so the salvaged
+        // snapshot is all there is -- and it lands on the *partial* path,
+        // never on the canonical one.
+        assert!(
+            !path.exists(),
+            "a knowingly incomplete autosave must not claim the canonical path"
+        );
+        assert!(
+            partial_autosave_path(&path).exists(),
+            "one unreadable tile must not leave the document with no autosave at all"
+        );
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let Some((recovered_layers, ..)) = recover_document(&path, &mut fresh_store) else {
+            unreachable!("the salvaged autosave must reopen from the partial path");
+        };
+        assert_eq!(recovered_layers.len(), 2, "no layer was dropped");
+        // The readable layer's own painted texel survived; the
+        // unreadable one's tile is simply absent, which reads back
+        // blank -- lost either way, since its pixels are gone from the
+        // scratch disk, but everything else is still protected.
+        let [
+            (broken_surface, index, _),
+            (intact_surface, intact_index, intact_value),
+        ] = painted.as_slice()
+        else {
+            unreachable!("two layers were just painted");
+        };
+        for (surface, index, expected) in [
+            (*broken_surface, *index, 0.0),
+            (*intact_surface, *intact_index, *intact_value),
+        ] {
+            let tile = match fresh_store.get(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(&sample) = tile.texels().get(index) else {
+                unreachable!("index 3 is in bounds for a full tile");
+            };
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(sample.to_f32(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn write_autosave_produces_a_real_aur_container_with_its_own_archive_entries() {
+        // Asserts the container's *actual* ZIP structure (ADR 0009),
+        // independent of `aurora_io::read_aur` -- so this test would
+        // still catch the autosave path silently going back to writing
+        // raw journal bytes even if the reader were changed to match.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (_store_dir, mut store) = real_tile_store();
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        let _painted = paint_one_texel(&mut store, &layers, id);
+
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("the autosave was just written: {err}"),
+        };
+        let mut archive = match zip::ZipArchive::new(file) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("the autosave must be a real ZIP container: {err}"),
+        };
+        let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        for entry in ["mimetype", "manifest", "history"] {
+            assert!(
+                names.iter().any(|name| name == entry),
+                "the autosave container must hold a `{entry}` entry; found {names:?}"
+            );
+        }
+        // The whole point of the format change: a real painted texel
+        // (`paint_one_texel` above) must appear as a real tile entry.
+        // Without this the test would still pass on a container that
+        // persisted structure only -- exactly the pre-0.49.0 behaviour
+        // this path exists to replace.
+        assert!(
+            names.iter().any(|name| name.starts_with("tiles/")),
+            "a painted document's autosave must hold at least one tile entry; found {names:?}"
+        );
+
+        let mut mimetype = match archive.by_name("mimetype") {
+            Ok(entry) => entry,
+            Err(err) => unreachable!("just asserted the entry exists: {err}"),
+        };
+        assert_eq!(
+            mimetype.compression(),
+            zip::CompressionMethod::Stored,
+            "the mimetype sentinel must be stored uncompressed so a magic-byte sniff can find it"
+        );
+        let mut contents = String::new();
+        if let Err(err) = std::io::Read::read_to_string(&mut mimetype, &mut contents) {
+            unreachable!("{err}");
+        }
+        assert_eq!(contents, "application/vnd.aurora.document");
+        drop(mimetype);
+
+        for entry in ["manifest", "history"] {
+            let mut bytes = Vec::new();
+            let mut read = match archive.by_name(entry) {
+                Ok(read) => read,
+                Err(err) => unreachable!("just asserted the entry exists: {err}"),
+            };
+            if let Err(err) = std::io::Read::read_to_end(&mut read, &mut bytes) {
+                unreachable!("{err}");
+            }
+            assert!(
+                !bytes.is_empty(),
+                "the `{entry}` entry must hold real, non-empty encoded bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn writing_then_recovering_an_autosave_restores_real_painted_pixels_and_canvas_size() {
+        // The gap this whole path exists to close: before the autosave
+        // was a real `.aur` container it held structural `LayerOp`s
+        // only, so a crash lost every painted pixel. A *fresh* store in
+        // a *fresh* scratch directory below is what makes this a real
+        // recovery test rather than the original store happening to
+        // still hold the tile.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        let original_descriptions = history.journal_descriptions();
+        let (surface, index, painted) = {
+            let (_store_dir, mut store) = real_tile_store();
+            let painted = paint_one_texel(&mut store, &layers, id);
+            // A canvas size deliberately unequal to the layer's own
+            // 10x10 bounds, so this proves the manifest's own value came
+            // back rather than `document_canvas_size` re-deriving it.
+            write_autosave(&path, &layers, &history, (37, 21), &mut store);
+            painted
+        };
+        drop(layers);
+        drop(history);
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let Some((recovered_layers, recovered_history, canvas_size)) =
+            recover_document(&path, &mut fresh_store)
+        else {
+            unreachable!("just wrote a real autosave container");
+        };
+        assert_eq!(canvas_size, (37, 21), "the manifest's own canvas size");
         assert_eq!(
             recovered_history.journal_descriptions(),
             original_descriptions
         );
-    }
+        assert_eq!(recovered_layers.name(id), Some("Background"));
 
-    // -- Live re-triggered autosave (`AutosaveQueue`/`queue_autosave`) --
-    //
-    // `App::trigger_autosave`/`App::finish_move`/
-    // `App::handle_pointer_released`/`App::run_undo_redo` can't be
-    // exercised directly here -- `App::new` needs a real
-    // `EventLoopProxy`, which needs a real event loop, which this
-    // sandbox has none of (see this crate's own "Command dispatch"
-    // section doc comment for the same constraint on every other
-    // App-adjacent free function). `queue_autosave` is the free function
-    // both `App::trigger_autosave` and these tests call, so this
-    // exercises the exact same code path a live session would, just fed
-    // by a locally built `History`/`Executor`/`AutosaveQueue` instead of
-    // a live `App` -- the same substitution every other test in this
-    // module already makes for `run_command`/`handle_key`.
-
-    #[test]
-    fn queue_autosave_after_a_completed_move_lands_it_on_disk() {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err}"),
-        };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let mut executor = aurora_render::Executor::spawn();
-        let queue = AutosaveQueue::new(path.clone());
-
-        let mut layers = aurora_doc::LayerTree::new();
-        let mut history = aurora_doc::History::new();
-        let bounds = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 10,
-        };
-        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
-            Ok(id) => id,
+        let tile = match fresh_store.get(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
             Err(err) => unreachable!("{err:?}"),
         };
-        // Mirrors what `App::apply_move`/`App::finish_move` do together
-        // for a real completed drag: the live bounds change is applied
-        // directly to `layers` first, then journaled as one step once
-        // the gesture ends.
-        let moved = aurora_core::Rect {
-            x: 5,
-            y: 5,
-            ..bounds
+        let Some(&sample) = tile.texels().get(index) else {
+            unreachable!("index is in bounds for a full tile");
         };
-        if let Err(err) = layers.set_bounds(id, moved) {
-            unreachable!("{err:?}");
-        }
-        if let Err(err) = history.record_bounds_change(&layers, id, bounds) {
-            unreachable!("{err:?}");
-        }
-
-        // The call `App::finish_move` itself makes, at the end of its
-        // own `Ok(())` branch.
-        queue_autosave(&mut executor, &queue, &history);
-        // Deterministic, not sleep-and-hope: blocks until the
-        // background drain closure this enqueue spawned has actually
-        // run and returned -- `Executor::join`'s own doc comment.
-        executor.join();
-
-        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
-            unreachable!("queue_autosave must have written a real, recoverable autosave");
-        };
-        assert_eq!(
-            recovered_history.journal_descriptions(),
-            history.journal_descriptions(),
-            "the recovered journal must reflect the completed move"
-        );
-    }
-
-    #[test]
-    fn queue_autosave_after_a_committed_stroke_still_writes_the_current_journal() {
-        // What "reflects the edit" honestly means for a stroke commit:
-        // `aurora_doc::History`'s own journal has no `LayerOp` for raw
-        // pixel content (`PixelHistory`'s own doc comment, `App`'s own
-        // `pixel_history` field doc) -- a stroke's actual pixels live
-        // only in the tile store, which persists separately from this
-        // journal. What this proves is that the Pixel-kind trigger path
-        // (`App::handle_pointer_released`) really does run the write
-        // pipeline end to end and lands whatever *is* in `history` right
-        // now (here, the layer this stroke painted onto) on disk -- not
-        // that the stroke's own pixels appear in the journal, which
-        // nothing in this crate claims.
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err}"),
-        };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let mut executor = aurora_render::Executor::spawn();
-        let queue = AutosaveQueue::new(path.clone());
-
-        let mut layers = aurora_doc::LayerTree::new();
-        let mut history = aurora_doc::History::new();
-        let mut pixel_history = aurora_brush::PixelHistory::new();
-        let mut undo_order = UndoOrder::default();
-        let (_dir, mut store) = real_tile_store();
-
-        let bounds = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 10,
-        };
-        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-
-        // Mirrors `App::handle_pointer_released`'s
-        // `Drag::Brush`/`Drag::Eraser` branch: a real, non-empty
-        // `StrokeSnapshot` gets pushed onto `pixel_history` and, since
-        // that actually recorded something, into `undo_order` too.
-        let surface = aurora_tile::SurfaceId::from_raw(id.to_raw());
-        let tile = aurora_tile::TileId { x: 0, y: 0 };
-        let mut stroke = aurora_brush::StrokeSnapshot::new(surface);
-        if let Err(err) = stroke.record_touch(&mut store, tile) {
-            unreachable!("{err:?}");
-        }
         assert!(
-            pixel_history.push(stroke),
-            "a real, touched stroke must record something"
-        );
-        undo_order.record(UndoKind::Pixel, &mut history, &mut pixel_history);
-
-        // The call `App::handle_pointer_released` itself makes, inside
-        // that same `if self.pixel_history.push(stroke)` branch.
-        queue_autosave(&mut executor, &queue, &history);
-        executor.join();
-
-        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
-            unreachable!("queue_autosave must have written a real, recoverable autosave");
-        };
-        assert_eq!(
-            recovered_history.journal_descriptions(),
-            history.journal_descriptions(),
-            "a stroke-commit trigger must still land the layer structure current at commit time"
+            (sample.to_f32() - painted).abs() < f32::EPSILON,
+            "the recovered store must hold the painted texel, not a blank tile"
         );
     }
 
     #[test]
-    fn queue_autosave_burst_coalesces_to_the_freshest_state_on_disk() {
+    fn write_autosave_uses_a_unique_temp_path_and_leaves_none_behind() {
+        // Two writes in a row must never reuse one fixed `.tmp` name:
+        // that name is shared state between every writer that exists
+        // (two Aurora processes are enough), and two writers on it
+        // interleave their bytes into the crash-recovery file. Also
+        // asserts the successful path cleans up after itself -- the
+        // temp file is renamed, not left as litter.
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let mut executor = aurora_render::Executor::spawn();
-        let queue = AutosaveQueue::new(path.clone());
-
-        let mut layers = aurora_doc::LayerTree::new();
-        let mut history = aurora_doc::History::new();
-        let bounds = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 10,
-        };
-        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-
-        // A rapid burst of ten real edits, each re-triggering the queue
-        // without waiting for the previous write to land first -- the
-        // same shape a fast flurry of undo-spamming or brush-stroke
-        // commits has from `AutosaveQueue`'s own point of view (see its
-        // doc comment). No `executor.join()` between iterations on
-        // purpose: coalescing is the property under test, not "each
-        // write happens to finish before the next edit."
-        for step in 0..10u8 {
-            let opacity = f32::from(step) / 10.0;
-            if let Err(err) = history.set_opacity(&mut layers, id, opacity) {
-                unreachable!("{err:?}");
-            }
-            queue_autosave(&mut executor, &queue, &history);
-        }
-        let final_descriptions = history.journal_descriptions();
-
-        executor.join();
-
-        let Some((_recovered_layers, recovered_history)) = recover_document(&path) else {
-            unreachable!("queue_autosave must have written a real, recoverable autosave");
-        };
-        assert_eq!(
-            recovered_history.journal_descriptions(),
-            final_descriptions,
-            "coalescing must land the freshest state from the burst, not an earlier one"
+        let path = dir.path().join("aurora-autosave.aur");
+        let first = super::autosave_temp_path(&path);
+        let second = super::autosave_temp_path(&path);
+        assert_ne!(
+            first, second,
+            "each write must claim its own temp path, not share one fixed name"
         );
-    }
+        assert_eq!(first.parent(), path.parent(), "the temp file is a sibling");
 
-    #[test]
-    fn autosave_queue_enqueue_never_blocks_even_under_a_rapid_burst() {
-        // Mirrors `aurora_render::executor::tests::\
-        // submit_never_blocks_even_before_the_executor_drains`: proves
-        // the non-blocking half of `AutosaveQueue::enqueue`'s own
-        // contract directly, with synthetic bytes rather than a real
-        // `History`, so this measures the queue's own overhead
-        // (a mutex lock plus an `Option` swap) in isolation from
-        // `postcard` serialization cost.
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
+        let (_store_dir, mut store) = real_tile_store();
+        let (layers, history, id) = small_autosave_document();
+        let _painted = paint_one_texel(&mut store, &layers, id);
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+
+        let leftovers: Vec<String> = match std::fs::read_dir(dir.path()) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| {
+                    std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext == "tmp")
+                })
+                .collect(),
             Err(err) => unreachable!("{err}"),
         };
-        let path = dir.path().join("aurora-autosave.postcard");
-        let mut executor = aurora_render::Executor::spawn();
-        let queue = AutosaveQueue::new(path.clone());
-
-        let start = std::time::Instant::now();
-        for step in 0..200u32 {
-            queue.enqueue(&mut executor, vec![step.to_le_bytes()[0]; 64]);
-        }
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "enqueue must return immediately regardless of how many writes are still in flight, \
-             not block the calling thread on disk I/O"
+            leftovers.is_empty(),
+            "a successful autosave must rename its temp file away, not leave it: {leftovers:?}"
         );
+        assert!(path.exists(), "the autosave itself must be in place");
+    }
 
-        executor.join();
+    #[cfg(unix)]
+    #[test]
+    fn write_autosave_creates_an_owner_only_file() {
+        // The autosave lives at a predictable name in a world-readable
+        // temp directory and now holds the document's real pixels, not
+        // just its layer structure -- so the file's own mode is the
+        // only thing keeping another local user from reading it. (The
+        // directory itself, and Windows ACLs, are the separate
+        // app-support-directory move `create_autosave_temp` names.)
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (_store_dir, mut store) = real_tile_store();
+        let (layers, history, _id) = small_autosave_document();
+        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mode = match std::fs::metadata(&path) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert_eq!(mode, 0o600, "the autosave must be owner-only");
+    }
+
+    /// A canonical autosave that exists but cannot be read must not
+    /// shadow a usable partial one (0.52.2, final review round).
+    /// Corruption is precisely the case the partial snapshot is kept for,
+    /// and `recover_document` alone reaches the partial only when the
+    /// canonical file is *absent* — so before this, a corrupt canonical
+    /// container defeated the fallback entirely.
+    #[test]
+    fn startup_recovers_from_the_partial_autosave_when_the_complete_one_is_corrupt() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        {
+            let (_store_dir, mut store) = real_tile_store();
+            let _painted = paint_one_texel(&mut store, &layers, id);
+            write_autosave(&path, &layers, &history, (37, 21), &mut store);
+        }
+        // A good partial snapshot beside a canonical file that is then
+        // corrupted -- a half-written ZIP, the realistic shape.
+        let partial = partial_autosave_path(&path);
+        if let Err(err) = std::fs::copy(&path, &partial) {
+            unreachable!("{err}");
+        }
+        let full_len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(err) => unreachable!("{err}"),
+        };
+        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err}"),
+        };
+        if let Err(err) = file.set_len(full_len / 2) {
+            unreachable!("{err}");
+        }
+        drop(file);
+
+        let (_fresh_dir, fresh_store) = real_tile_store();
+        let mut slot = Some(fresh_store);
+        let startup = super::startup_document(true, &path, &mut slot);
+
+        assert!(
+            startup.was_recovered,
+            "a corrupt complete autosave must fall back to the partial one, not to a demo document"
+        );
+        assert_eq!(
+            startup.canvas_size,
+            (37, 21),
+            "the recovered document must be the partial container's own, not a fresh one"
+        );
+    }
+
+    #[test]
+    fn startup_document_leaves_a_recovered_autosave_untouched() {
+        // The startup write is skipped when recovery succeeded: the
+        // file already *is* this document, so rebuilding the container
+        // would be a full tile-grid walk (measured in hundreds of ms)
+        // on the pre-window path for a byte-identical result. Compares
+        // the real bytes, not a timestamp, so it can't pass by
+        // coincidence of clock granularity.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (layers, history, id) = small_autosave_document();
+        {
+            let (_store_dir, mut store) = real_tile_store();
+            let _painted = paint_one_texel(&mut store, &layers, id);
+            write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        }
+        let before = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err}"),
+        };
+
+        let (_fresh_dir, fresh_store) = real_tile_store();
+        let mut slot = Some(fresh_store);
+        let startup = super::startup_document(true, &path, &mut slot);
+        assert!(
+            startup.was_recovered,
+            "the container just written must read back"
+        );
+        let after = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert_eq!(
+            before, after,
+            "a successful recovery must not rewrite the file it just read"
+        );
+    }
+
+    #[test]
+    fn startup_document_writes_a_fresh_documents_autosave() {
+        // The other half: with nothing to recover, the session's own
+        // document does get written out, so the *next* run has
+        // something real to recover to.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        let (_store_dir, store) = real_tile_store();
+        let mut slot = Some(store);
+        let startup = super::startup_document(false, &path, &mut slot);
+        assert!(!startup.was_recovered);
         assert!(
             path.exists(),
-            "the coalesced burst must still have produced a real file by the time join() returns"
+            "a fresh session must leave a recoverable autosave behind"
+        );
+    }
+
+    #[test]
+    fn startup_document_reopens_the_store_after_a_failed_recovery() {
+        // A recovery attempt that fails part-way can leave real pixels
+        // committed to surfaces the fallback document is about to
+        // reuse. The store is replaced rather than reused, so those
+        // fragments can't show up painted into a document they have
+        // nothing to do with.
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let path = dir.path().join("aurora-autosave.aur");
+        if let Err(err) = std::fs::write(&path, b"not a .aur container") {
+            unreachable!("{err}");
+        }
+        let (_store_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        {
+            let tile = match store.get_mut(surface, tile_id) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(sample) = tile.texels_mut().get_mut(0) else {
+                unreachable!("index is in bounds for a full tile");
+            };
+            *sample = half::f16::from_f32(0.5);
+        }
+        let mut slot = Some(store);
+        let startup = super::startup_document(true, &path, &mut slot);
+        assert!(!startup.was_recovered, "garbage must not read back");
+        let Some(store) = slot.as_mut() else {
+            unreachable!("reopening a real scratch directory must succeed here");
+        };
+        let tile = match store.get(surface, tile_id) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            tile.texels().iter().all(|sample| sample.to_f32() == 0.0),
+            "the fallback document must start from a blank store, not one holding \
+             fragments of a document that failed to recover"
         );
     }
 
@@ -14271,6 +20343,300 @@ mod tests {
         assert_eq!(effective_residency_zoom(2.5, f64::INFINITY), 2.5);
     }
 
+    // -- The render path and the pointer path must read one zoom --
+    //
+    // RT12-04. `redraw` hands the atlas
+    // `effective_residency_zoom(canvas_view.zoom(), scale_factor)`, and
+    // `aurora_gpu::TileResidency` will not render below its own
+    // `min_zoom_for_viewport`; `CanvasView::to_document` -- what turns a
+    // click into the document position a brush dab lands on -- divides
+    // by `canvas_view.zoom()`. If those two numbers can differ, paint
+    // lands somewhere other than the pixel under the cursor, and nothing
+    // reports it. Measured before the fix, at canvas zoom 0.25 on a
+    // 1920 px viewport: a click at screen x = 960 converted to document
+    // x = 3840 while the pixel drawn there was document x ~= 1152; at
+    // `MIN_ZOOM` the two were ~83x apart. It is the same failure shape
+    // `CanvasView::clamp_pan_to_minimum` already documents on the pan
+    // axis, and the fix is the same: one bound, applied at the source.
+
+    /// Every canvas size and scale factor these tests sweep — a 1x and a
+    /// 2x display, tile-aligned and not, wide and tall.
+    const CANVAS_CASES: [((u32, u32), f64); 6] = [
+        ((1920, 1080), 1.0),
+        ((1920, 1080), 2.0),
+        ((3840, 2160), 2.0),
+        ((1366, 768), 1.0),
+        ((1024, 1024), 1.0),
+        ((777, 333), 1.25),
+    ];
+
+    #[test]
+    fn canvas_min_zoom_leaves_the_atlas_with_nothing_left_to_clamp() {
+        // The identity the whole fix rests on: once `CanvasView` is held
+        // at `canvas_min_zoom`, the zoom `redraw` passes the atlas is
+        // one the atlas renders *unchanged*. `TileResidency::
+        // effective_zoom` is that crate's own statement of what it will
+        // actually render, so comparing against it -- rather than
+        // re-deriving the floor here -- is what keeps the two crates
+        // from drifting apart on some later change.
+        for (canvas, scale_factor) in CANVAS_CASES {
+            let floor = canvas_min_zoom(canvas, scale_factor);
+            let passed = effective_residency_zoom(floor, scale_factor);
+            let rendered = aurora_gpu::TileResidency::effective_zoom(canvas, passed);
+            assert!(
+                (rendered - passed).abs() <= f32::EPSILON * passed,
+                "canvas {canvas:?} at scale factor {scale_factor}: the view's \
+                 own floor {floor} reaches the atlas as {passed}, which it \
+                 renders at {rendered}. Any gap here is a gap between where a \
+                 click paints and where the pixel under it was drawn"
+            );
+        }
+    }
+
+    #[test]
+    fn the_render_path_and_the_pointer_path_agree_on_scale_when_zoomed_out() {
+        // The reproduction itself, through the real helpers `redraw` and
+        // the pointer handlers use: `canvas_local_origin` (what the
+        // renderer is told is at the canvas's top-left corner),
+        // `effective_residency_zoom` (the zoom it is told to draw at),
+        // and `CanvasView::to_document` (where a click lands).
+        for (canvas, scale_factor) in CANVAS_CASES {
+            for requested in [0.01_f32, 0.25, 0.5, 1.0, 4.0] {
+                let mut view = CanvasView::new();
+                view.set_min_zoom(canvas_min_zoom(canvas, scale_factor));
+                view.zoom_at((0.0, 0.0), requested);
+                // An arbitrary, deliberately fractional pan, then the
+                // pan bound the real handlers apply.
+                view.pan_by((-137.75, -42.5));
+                view.clamp_pan_to_minimum((0.0, 0.0));
+
+                let layer_origin = (300.0, 150.0);
+                let doc_origin = canvas_local_origin(&view, layer_origin);
+                let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+                    canvas,
+                    effective_residency_zoom(view.zoom(), scale_factor),
+                );
+
+                #[allow(clippy::cast_precision_loss)]
+                let width_logical = canvas.0 as f32 / scale_factor as f32;
+                for screen_x in [0.0_f32, 1.0, width_logical / 2.0, width_logical - 1.0] {
+                    // Where the renderer actually draws: the atlas
+                    // covers `1 / rendered_zoom` document pixels per
+                    // *physical* pixel, starting at `doc_origin`.
+                    let physical_x = screen_x * scale_factor as f32;
+                    let drawn_here = doc_origin.0 + physical_x / rendered_zoom;
+                    // Where a click at the same place paints, in the
+                    // same layer-local space.
+                    let painted_here = view.to_document((screen_x, 0.0)).0 - layer_origin.0;
+                    assert!(
+                        (drawn_here - painted_here).abs() <= 0.05 + drawn_here.abs() * 1e-4,
+                        "canvas {canvas:?} at scale factor {scale_factor}, zoom \
+                         requested {requested} (held at {}): a click at canvas \
+                         x = {screen_x} paints document x = {painted_here}, but \
+                         the pixel actually drawn there is document x = \
+                         {drawn_here}",
+                        view.zoom()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn applying_the_zoom_floor_cannot_push_the_view_past_a_moved_layers_edge() {
+        // The ordering hazard: a view can already be zoomed out and
+        // panned to a moved layer's own top-left edge before the floor
+        // is known (the first frame of a session, or a scale-factor
+        // change). Raising the zoom then must not move
+        // `canvas_local_origin` negative -- `TileResidency::set_origin`
+        // clamps a negative document origin to zero while
+        // `CanvasView::to_document` would not, which is the pan-axis
+        // half of this same divergence and the one
+        // `clamp_pan_to_minimum` already exists to prevent.
+        let canvas = (1920, 1080);
+        let layer_origin = (300.0, 150.0);
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        view.pan_by((-90.0, -30.0));
+        view.clamp_pan_to_minimum(layer_origin);
+
+        view.set_min_zoom(canvas_min_zoom(canvas, 1.0));
+
+        let local = canvas_local_origin(&view, layer_origin);
+        assert!(
+            local.0 >= -1e-3 && local.1 >= -1e-3,
+            "after the floor was applied the renderer would be told to draw \
+             from layer-local {local:?}, which it clamps to (0, 0) while \
+             `to_document` keeps reporting the negative value -- render and \
+             paint disagreeing again, on the pan axis this time"
+        );
+    }
+
+    #[test]
+    fn a_view_left_unbounded_is_exactly_the_divergence_this_prevents() {
+        // The negative control: the same arithmetic with the floor *not*
+        // applied is the measured pre-fix report. Without this, the test
+        // above could pass because the numbers happen to be small rather
+        // than because anything is bounded.
+        let canvas = (1920, 1080);
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
+        let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+            canvas,
+            effective_residency_zoom(view.zoom(), 1.0),
+        );
+        let drawn_here = doc_origin.0 + 960.0 / rendered_zoom;
+        let painted_here = view.to_document((960.0, 0.0)).0;
+        assert!(
+            (drawn_here - painted_here).abs() > 1000.0,
+            "an unbounded 0.25 zoom must still diverge by thousands of \
+             document pixels ({painted_here} painted vs {drawn_here} drawn) -- \
+             if it no longer does, the test above has stopped proving anything"
+        );
+    }
+
+    #[test]
+    // Exact: the re-derived floor must be bit-identical to the one
+    // `canvas_min_zoom` produced, not merely close to it -- an
+    // approximate match here would hide exactly the lapse this covers.
+    #[allow(clippy::float_cmp)]
+    fn resetting_the_canvas_view_never_leaves_the_zoom_floor_absent() {
+        // `CanvasView::default()` resets `min_zoom` to `MIN_ZOOM`, and
+        // `open_file`/`open_aur_file` reset the view on every document
+        // open. Before this went through `reset_canvas_view`, the floor
+        // was simply gone until the next `redraw` re-applied it.
+        for (canvas, scale_factor) in CANVAS_CASES {
+            let mut previous = CanvasView::new();
+            previous.set_min_zoom(canvas_min_zoom(canvas, scale_factor));
+
+            let reset = reset_canvas_view(&previous, Some(canvas), scale_factor);
+            assert!(
+                reset.min_zoom() > aurora_ui::canvas_view::MIN_ZOOM,
+                "canvas {canvas:?} at scale factor {scale_factor}: a reset view \
+                 came back at the bare MIN_ZOOM {}, i.e. with no atlas floor at \
+                 all",
+                reset.min_zoom()
+            );
+            assert_eq!(
+                reset.min_zoom(),
+                previous.min_zoom(),
+                "canvas {canvas:?} at scale factor {scale_factor}: the re-derived \
+                 floor must be the same number the view already held"
+            );
+
+            // And with no canvas area to re-derive from, the previous
+            // floor is carried rather than dropped.
+            let carried = reset_canvas_view(&previous, None, scale_factor);
+            assert_eq!(carried.min_zoom(), previous.min_zoom());
+        }
+    }
+
+    #[test]
+    fn the_paths_still_agree_immediately_after_a_document_open_reset() {
+        // The reproduction for the reset window itself: open a document,
+        // then take a pointer position through the real conversion
+        // *before* any redraw has run. With `CanvasView::default()` in
+        // place of `reset_canvas_view` this diverges by hundreds to
+        // thousands of document pixels, because the view accepts a zoom
+        // the atlas will not render.
+        for (canvas, scale_factor) in CANVAS_CASES {
+            let mut previous = CanvasView::new();
+            previous.set_min_zoom(canvas_min_zoom(canvas, scale_factor));
+
+            let mut view = reset_canvas_view(&previous, Some(canvas), scale_factor);
+            // The scroll event that arrives before the next frame.
+            view.zoom_at((0.0, 0.0), aurora_ui::canvas_view::MIN_ZOOM);
+
+            let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
+            let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+                canvas,
+                effective_residency_zoom(view.zoom(), scale_factor),
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            let scale = scale_factor as f32;
+            #[allow(clippy::cast_precision_loss)]
+            let width_logical = canvas.0 as f32 / scale;
+            for screen_x in [0.0_f32, width_logical / 2.0, width_logical - 1.0] {
+                let drawn_here = doc_origin.0 + screen_x * scale / rendered_zoom;
+                let painted_here = view.to_document((screen_x, 0.0)).0;
+                assert!(
+                    (drawn_here - painted_here).abs() <= 0.05 + drawn_here.abs() * 1e-4,
+                    "canvas {canvas:?} at scale factor {scale_factor}: a click at \
+                     canvas x = {screen_x} immediately after a document-open reset \
+                     paints document x = {painted_here} while the pixel drawn there \
+                     is document x = {drawn_here}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    // Exact: the guard's whole contract is that it returns literally
+    // `1.0` for a degenerate input.
+    #[allow(clippy::float_cmp)]
+    fn the_scale_factor_guard_catches_values_that_only_degenerate_on_the_cast() {
+        // `f64 as f32` can *create* the degenerate values the guard
+        // rejects: above `f32::MAX` casts to infinity, below
+        // `f32::MIN_POSITIVE` casts to zero. Validating the `f64` first
+        // and casting second let both straight through.
+        for bad in [1e39_f64, -1e39, 1e-320, f64::MAX, f64::MIN_POSITIVE] {
+            assert!(
+                bad.is_finite(),
+                "this case is meant to be finite as an f64 -- the point is that \
+                 only the cast makes it degenerate"
+            );
+            let guarded = guarded_scale_factor(bad);
+            assert_eq!(
+                guarded, 1.0,
+                "scale factor {bad} degenerates on the cast to f32 and must fall \
+                 back to 1.0, not reach the zoom arithmetic as {guarded}"
+            );
+        }
+        // And a floor derived through it stays a real, usable number
+        // rather than 0 or infinity.
+        let floor = canvas_min_zoom((1920, 1080), 1e39);
+        assert!(
+            floor.is_finite() && floor > 0.0,
+            "a floor derived from an extreme scale factor came back as {floor}"
+        );
+    }
+
+    #[test]
+    fn the_ulp_correction_keeps_the_round_trip_at_or_above_the_atlas_floor() {
+        // The `next_up` loop in `canvas_min_zoom` fires only when
+        // `floor / scale * scale` lands one ulp below `floor`; no
+        // `CANVAS_CASES` entry reaches it. Sweeping real viewport and
+        // scale-factor combinations does, and the property asserted is
+        // the one the loop exists for.
+        let mut corrected = 0_u32;
+        for width in [1280_u32, 1366, 1440, 1600, 1920, 2560, 3440, 3840] {
+            for height in [720_u32, 768, 800, 900, 1080, 1440, 1600, 2160] {
+                for scale_factor in [1.0_f64, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
+                    let canvas = (width, height);
+                    let atlas_floor = aurora_gpu::TileResidency::min_zoom_for_viewport(canvas);
+                    let min_zoom = canvas_min_zoom(canvas, scale_factor);
+                    let round_trip = effective_residency_zoom(min_zoom, scale_factor);
+                    assert!(
+                        round_trip >= atlas_floor,
+                        "canvas {canvas:?} at scale factor {scale_factor}: the \
+                         view's floor {min_zoom} reaches the atlas as \
+                         {round_trip}, below its own floor {atlas_floor} -- the \
+                         last ulp where render and paint can still disagree"
+                    );
+                    if min_zoom > atlas_floor / guarded_scale_factor(scale_factor) {
+                        corrected += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            corrected > 0,
+            "no combination in this sweep needed the ulp correction, so this test \
+             is not exercising the loop it exists to cover"
+        );
+    }
+
     fn laid_out_workspace() -> aurora_ui::Workspace {
         let mut workspace = aurora_ui::build_workspace();
         workspace.tree.compute_layout(1000.0, 800.0);
@@ -14541,12 +20907,17 @@ mod tests {
                 last_doc,
                 carry,
                 stroke,
+                warned,
             }) => {
                 assert_eq!(last_doc, (10.0, 20.0));
                 assert_eq!(carry, 0.0);
                 assert!(
                     stroke.is_none(),
                     "no active pixel layer means nothing to snapshot"
+                );
+                assert!(
+                    warned.is_empty(),
+                    "a fresh stroke has warned about nothing yet"
                 );
             }
             other => unreachable!("{other:?}"),
@@ -14568,6 +20939,7 @@ mod tests {
                 last_doc,
                 carry,
                 stroke,
+                warned,
             }) => {
                 assert_eq!(last_doc, (10.0, 20.0));
                 assert_eq!(carry, 0.0);
@@ -14575,9 +20947,761 @@ mod tests {
                     stroke.is_none(),
                     "no active pixel layer means nothing to snapshot"
                 );
+                assert!(
+                    warned.is_empty(),
+                    "a fresh stroke has warned about nothing yet"
+                );
             }
             other => unreachable!("{other:?}"),
         }
+    }
+
+    /// A `Drag::Brush` for a real active pixel layer, and the two
+    /// accessors that pull its snapshot out. Headless by construction:
+    /// `Drag` is a plain enum, so none of this needs an `App` (and
+    /// therefore no GPU adapter) to exercise.
+    fn brush_drag_with_a_stroke() -> Drag {
+        Drag::Brush {
+            last_doc: (0.0, 0.0),
+            carry: 0.0,
+            stroke: Some(aurora_brush::StrokeSnapshot::new(
+                aurora_tile::SurfaceId::from_raw(7),
+            )),
+            warned: std::collections::HashSet::new(),
+        }
+    }
+
+    fn eraser_drag_with_a_stroke() -> Drag {
+        Drag::Eraser {
+            last_doc: (0.0, 0.0),
+            carry: 0.0,
+            stroke: Some(aurora_brush::StrokeSnapshot::new(
+                aurora_tile::SurfaceId::from_raw(7),
+            )),
+            warned: std::collections::HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn brush_stroke_mut_finds_an_active_brush_strokes_own_snapshot() {
+        let mut drag = Some(brush_drag_with_a_stroke());
+        let Some(stroke) = brush_stroke_mut(&mut drag) else {
+            unreachable!("a Drag::Brush carrying a real stroke must yield it");
+        };
+        assert_eq!(stroke.surface(), aurora_tile::SurfaceId::from_raw(7));
+        assert!(
+            brush_stroke_mut(&mut Some(Drag::Brush {
+                last_doc: (0.0, 0.0),
+                carry: 0.0,
+                stroke: None,
+                warned: std::collections::HashSet::new(),
+            }))
+            .is_none(),
+            "a brush drag that began with no active pixel layer has no snapshot to find"
+        );
+    }
+
+    #[test]
+    fn the_two_stroke_accessors_never_cross_tools() {
+        let mut eraser = Some(eraser_drag_with_a_stroke());
+        assert!(
+            brush_stroke_mut(&mut eraser).is_none(),
+            "an eraser stroke must never be handed to `stamp_dab` -- it would capture the \
+             right tiles for the wrong operation"
+        );
+        assert!(eraser_stroke_mut(&mut eraser).is_some());
+
+        let mut brush = Some(brush_drag_with_a_stroke());
+        assert!(
+            eraser_stroke_mut(&mut brush).is_none(),
+            "and the mirror of the same"
+        );
+        assert!(brush_stroke_mut(&mut brush).is_some());
+    }
+
+    #[test]
+    fn neither_stroke_accessor_finds_anything_in_another_drag_or_in_no_drag() {
+        let mut pan = Some(Drag::Pan {
+            last_screen: (0.0, 0.0),
+        });
+        assert!(brush_stroke_mut(&mut pan).is_none());
+        assert!(eraser_stroke_mut(&mut pan).is_none());
+
+        let mut none: Option<Drag> = None;
+        assert!(brush_stroke_mut(&mut none).is_none());
+        assert!(eraser_stroke_mut(&mut none).is_none());
+    }
+
+    /// One permanently broken tile must cost one warning for the whole
+    /// stroke, not one per dab. 0.55.0 collapsed per-tile to per-dab,
+    /// which is not where the flood is: the tile fails *every* dab for
+    /// the rest of the drag, so a ~600 px drag across it emitted ~100
+    /// identical lines.
+    #[test]
+    fn a_broken_tile_is_reported_once_per_stroke_not_once_per_dab() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // Budget 2, three tiles touched: the dab's own tile (0, 0) is the
+        // LRU victim the third touch evicts, so exactly one scratch file
+        // exists to corrupt.
+        let Some(budget) = std::num::NonZeroUsize::new(2) else {
+            unreachable!("2 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for tile in [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 50, y: 50 },
+        ] {
+            if let Err(err) = store.get_mut(surface, tile) {
+                unreachable!("a fresh store must accept a first touch of {tile:?}: {err:?}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let [victim] = files.as_slice() else {
+            unreachable!("exactly one tile should have been evicted: {files:?}");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        let mut drag = Some(brush_drag_with_a_stroke());
+        // Ten dabs, all landing on the same permanently broken tile --
+        // the shape of a drag crossing one.
+        let mut reported = 0;
+        for _ in 0..10 {
+            let outcome = aurora_brush::stamp_dab(
+                &mut store,
+                surface,
+                (128.0, 128.0),
+                BRUSH_RADIUS,
+                [1.0, 0.0, 0.0],
+                None,
+            );
+            assert_eq!(
+                outcome.failed().len(),
+                1,
+                "setup: the tile really is broken"
+            );
+            reported += unwarned_failures(&mut drag, &outcome).len();
+        }
+        assert_eq!(
+            reported, 1,
+            "one broken tile must produce exactly one warning across the whole stroke"
+        );
+
+        // A *new* stroke starts from a clean slate -- the set lives on
+        // the drag, so it cannot outlive the stroke it belongs to.
+        let mut next = Some(brush_drag_with_a_stroke());
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            (128.0, 128.0),
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert_eq!(
+            unwarned_failures(&mut next, &outcome).len(),
+            1,
+            "a new stroke must report the failure again rather than inheriting a stale set"
+        );
+    }
+
+    /// A scratch store in which `broken` are all permanently unreadable
+    /// and every other tile is fine — the only portable way to make a
+    /// `TileStore` read fail on demand from outside `aurora-tile`, in
+    /// the multi-tile form `a_dab_failing_on_several_tiles...` needs.
+    ///
+    /// Budget `broken.len()`, so touching one filler tile per broken
+    /// tile after them evicts exactly the broken ones and leaves exactly
+    /// that many scratch files to truncate.
+    fn store_with_broken_tiles(
+        broken: &[aurora_tile::TileId],
+    ) -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(broken.len()) else {
+            unreachable!("at least one tile must be asked for");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => {
+                unreachable!("scratch dir just created by tempfile must be usable: {err:?}")
+            }
+        };
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for tile in broken {
+            if let Err(err) = store.get_mut(surface, *tile) {
+                unreachable!("a fresh store must accept a first touch of {tile:?}: {err:?}");
+            }
+        }
+        // One filler per broken tile, far away, so each broken tile is
+        // in turn the LRU victim and gets written out.
+        for (n, _) in broken.iter().enumerate() {
+            let filler = aurora_tile::TileId {
+                x: 50 + u32::try_from(n).unwrap_or(0),
+                y: 50,
+            };
+            if let Err(err) = store.get_mut(surface, filler) {
+                unreachable!("a fresh store must accept a first touch of {filler:?}: {err:?}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        assert_eq!(
+            files.len(),
+            broken.len(),
+            "exactly the broken tiles should have been evicted: {files:?}"
+        );
+        for victim in &files {
+            let Ok(bytes) = std::fs::read(victim) else {
+                unreachable!("the evicted tile file must be readable");
+            };
+            let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+                unreachable!("half of a slice's own length is always in range");
+            };
+            if let Err(err) = std::fs::write(victim, truncated) {
+                unreachable!("test-local scratch disk must accept the write: {err:?}");
+            }
+        }
+        (dir, store)
+    }
+
+    /// **Every** fresh failure has to reach the caller, not just the
+    /// first (0.57.0). `unwarned_failures` marks every failing tile
+    /// warned as it goes, so a caller that logged only `fresh.first()`
+    /// — which both `App::paint_dab` and `App::erase_dab` did —
+    /// permanently swallowed tiles #2..#n: marked as already reported,
+    /// never actually printed, this stroke or ever. A radius-24 dab
+    /// spans up to four tiles, so a failing scratch directory hits that
+    /// case immediately, and the doc comment on `unwarned_failures`
+    /// explicitly promises the opposite ("the first failure on each tile
+    /// is always reported").
+    #[test]
+    fn a_dab_failing_on_several_tiles_reports_every_one_of_them_exactly_once() {
+        let first = aurora_tile::TileId { x: 0, y: 0 };
+        let second = aurora_tile::TileId { x: 1, y: 0 };
+        let (_dir, mut store) = store_with_broken_tiles(&[first, second]);
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        // Centred on the boundary between them, so one dab spans both.
+        let spanning = (256.5, 128.5);
+
+        let mut drag = Some(brush_drag_with_a_stroke());
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            spanning,
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert_eq!(
+            outcome.failed().len(),
+            2,
+            "setup: one dab, two permanently broken tiles"
+        );
+
+        let fresh = unwarned_failures(&mut drag, &outcome);
+        let mut reported: Vec<aurora_tile::TileId> = fresh.iter().map(|(tile, _)| *tile).collect();
+        reported.sort_unstable_by_key(|tile| (tile.y, tile.x));
+        assert_eq!(
+            reported,
+            [first, second],
+            "both broken tiles must be handed to the caller, each with its own error -- the \
+             call sites log one line per entry, so this is exactly what gets printed"
+        );
+
+        // And the once-per-stroke dedupe still holds for both of them.
+        let again = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            spanning,
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert_eq!(again.failed().len(), 2, "setup: still broken");
+        assert!(
+            unwarned_failures(&mut drag, &again).is_empty(),
+            "a second dab across the same two tiles must report nothing further"
+        );
+    }
+
+    /// The surface `brush_drag_with_a_stroke`/`eraser_drag_with_a_stroke`
+    /// already build their snapshots for — the one every drag-commit
+    /// test below paints into.
+    fn commit_test_surface() -> aurora_tile::SurfaceId {
+        aurora_tile::SurfaceId::from_raw(7)
+    }
+
+    fn commit_test_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(16) else {
+            unreachable!("16 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+        (dir, store)
+    }
+
+    /// Tile-local texel `(lx, ly)`'s alpha in tile (0, 0) — how the
+    /// drag-commit tests tell "this stroke's pixels" apart from "some
+    /// other stroke's pixels" rather than merely counting undo entries.
+    fn commit_test_alpha(store: &mut aurora_tile::TileStore, lx: u32, ly: u32) -> f32 {
+        let tile = match store.get(commit_test_surface(), aurora_tile::TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let index = (ly * aurora_tile::TILE + lx) as usize * aurora_tile::CHANNELS;
+        let Some(&alpha) = tile.texels().get(index + 3) else {
+            unreachable!("index is in bounds for a full tile");
+        };
+        alpha.to_f32()
+    }
+
+    /// One real dab painted through a fresh brush drag — the state `App`
+    /// holds mid-stroke, with pixels genuinely on the layer and the
+    /// pre-dab content genuinely captured in the drag's own snapshot.
+    fn a_brush_drag_that_painted(store: &mut aurora_tile::TileStore, centre: (f32, f32)) -> Drag {
+        let mut drag = Some(brush_drag_with_a_stroke());
+        let outcome = aurora_brush::stamp_dab(
+            store,
+            commit_test_surface(),
+            centre,
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            brush_stroke_mut(&mut drag),
+        );
+        assert!(
+            !outcome.painted().is_empty(),
+            "setup: the dab must really have painted"
+        );
+        match drag {
+            Some(drag) => drag,
+            None => unreachable!("just built"),
+        }
+    }
+
+    /// `a_brush_drag_that_painted`'s eraser counterpart, over pixels it
+    /// paints first (erasing transparent pixels is a documented no-op).
+    fn an_eraser_drag_that_erased(store: &mut aurora_tile::TileStore, centre: (f32, f32)) -> Drag {
+        assert!(
+            !aurora_brush::stamp_dab(
+                store,
+                commit_test_surface(),
+                centre,
+                BRUSH_RADIUS,
+                [1.0, 0.0, 0.0],
+                None,
+            )
+            .painted()
+            .is_empty(),
+            "setup: there must be paint to erase"
+        );
+        let mut drag = Some(eraser_drag_with_a_stroke());
+        let outcome = aurora_brush::erase_dab(
+            store,
+            commit_test_surface(),
+            centre,
+            ERASER_RADIUS,
+            eraser_stroke_mut(&mut drag),
+        );
+        assert!(
+            !outcome.painted().is_empty(),
+            "setup: the erase must really have erased"
+        );
+        match drag {
+            Some(drag) => drag,
+            None => unreachable!("just built"),
+        }
+    }
+
+    /// **RT-08.** Press the middle button to pan without releasing the
+    /// brush first — an ordinary gesture — and until 0.57.0 the live
+    /// `Drag::Brush` was simply overwritten. Its pixels stayed on the
+    /// layer and no undo entry was ever pushed for them, so the next
+    /// `Ctrl+Z` reached past them and undid the *previous* stroke:
+    /// worse than the phantom entry 0.56.0 removed, because a phantom
+    /// entry at least did nothing.
+    ///
+    /// The load-bearing assertion is the last pair: the entry that
+    /// exists has to be the interrupted stroke's own, not just *an*
+    /// entry.
+    #[test]
+    fn a_stroke_interrupted_by_a_second_press_becomes_its_own_undo_entry() {
+        let (_dir, mut store) = commit_test_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        // An earlier, properly released stroke -- the one a mis-targeted
+        // Ctrl+Z would reach into.
+        let earlier = a_brush_drag_that_painted(&mut store, (30.5, 30.5));
+        commit_ending_drag(
+            Some(earlier),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut CanvasView::new(),
+            None,
+            None,
+        );
+
+        // The stroke still in progress when the middle button goes down.
+        let mut drag = Some(a_brush_drag_that_painted(&mut store, (200.5, 200.5)));
+        assert!(commit_test_alpha(&mut store, 30, 30) > 0.5, "setup");
+        assert!(commit_test_alpha(&mut store, 200, 200) > 0.5, "setup");
+
+        // Exactly the sequence `App::handle_pointer_pressed` now runs:
+        // take the in-progress drag, commit it, then start the new one.
+        let interrupted = drag.take();
+        commit_ending_drag(
+            interrupted,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut CanvasView::new(),
+            None,
+            None,
+        );
+        drag = begin_drag(
+            Tool::Brush,
+            PointerButton::Middle,
+            (1.0, 1.0),
+            &CanvasView::new(),
+            None,
+        );
+        assert!(
+            matches!(drag, Some(Drag::Pan { .. })),
+            "setup: the interrupting press really does start its own drag"
+        );
+
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel, UndoKind::Pixel],
+            "the interrupted stroke must have its own entry in the unified order"
+        );
+        match pixel_history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(
+            commit_test_alpha(&mut store, 200, 200) < 0.01,
+            "Ctrl+Z must remove the interrupted stroke's own pixels"
+        );
+        assert!(
+            commit_test_alpha(&mut store, 30, 30) > 0.5,
+            "and must not have reached past them into the earlier stroke"
+        );
+    }
+
+    /// **RT-02 (0.57.7).** The Zoom tool's own click branch in
+    /// [`App::handle_pointer_pressed`] `return`ed before ever reaching
+    /// that same shared commit — and it *also* moves the view
+    /// ([`handle_zoom_tool_click`] clamps the pan) out from under
+    /// whatever drag was still live. That is the identical pair of bugs
+    /// [`press_layer_row`] was written to fix, one branch further down
+    /// the same function, and a live `Drag::Brush` really does reach
+    /// it: `z` switches to the Zoom tool mid-stroke without ending the
+    /// stroke.
+    ///
+    /// The branch now runs the commit first, exactly this sequence.
+    #[test]
+    fn a_stroke_interrupted_by_a_zoom_tool_click_still_becomes_its_own_undo_entry() {
+        let (_dir, mut store) = commit_test_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut view = CanvasView::new();
+
+        // An earlier, properly released stroke -- the one a mis-targeted
+        // Ctrl+Z would reach into.
+        let earlier = a_brush_drag_that_painted(&mut store, (30.5, 30.5));
+        commit_ending_drag(
+            Some(earlier),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            None,
+            None,
+        );
+        let mut drag = Some(a_brush_drag_that_painted(&mut store, (200.5, 200.5)));
+
+        // Exactly the sequence that branch now runs.
+        let interrupted = drag.take();
+        commit_ending_drag(
+            interrupted,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            None,
+            None,
+        );
+        handle_zoom_tool_click(
+            &mut view,
+            (100.0, 100.0),
+            Modifiers::none(),
+            bounds_at((0.0, 0.0), None),
+        );
+
+        assert!(
+            drag.is_none(),
+            "no drag may still be live once the zoom has clamped the view under it"
+        );
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel, UndoKind::Pixel],
+            "the interrupted stroke must have its own entry in the unified order"
+        );
+        match pixel_history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(
+            commit_test_alpha(&mut store, 200, 200) < 0.01,
+            "Ctrl+Z must remove the interrupted stroke's own pixels"
+        );
+        assert!(
+            commit_test_alpha(&mut store, 30, 30) > 0.5,
+            "and must not have reached past them into the earlier stroke"
+        );
+    }
+
+    /// The same, for dragging the cursor off the window edge
+    /// (`WindowEvent::CursorLeft`), which used to do `self.drag = None`
+    /// outright. An eraser drag here, so both stroke-carrying variants
+    /// are covered across the two tests.
+    #[test]
+    fn a_stroke_interrupted_by_the_cursor_leaving_becomes_its_own_undo_entry() {
+        let (_dir, mut store) = commit_test_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        // Paint something elsewhere first and leave it alone: whatever
+        // the undo does, it must not touch this.
+        assert!(
+            !aurora_brush::stamp_dab(
+                &mut store,
+                commit_test_surface(),
+                (30.5, 30.5),
+                BRUSH_RADIUS,
+                [1.0, 0.0, 0.0],
+                None,
+            )
+            .painted()
+            .is_empty(),
+            "setup"
+        );
+
+        let mut drag = Some(an_eraser_drag_that_erased(&mut store, (200.5, 200.5)));
+        assert!(
+            commit_test_alpha(&mut store, 200, 200) < 0.01,
+            "setup: really erased"
+        );
+
+        // Exactly the sequence the `CursorLeft` arm now runs.
+        let interrupted = drag.take();
+        commit_ending_drag(
+            interrupted,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut CanvasView::new(),
+            None,
+            None,
+        );
+        assert!(drag.is_none(), "setup: the drag really is gone");
+
+        assert_eq!(undo_order.undo, vec![UndoKind::Pixel]);
+        match pixel_history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(
+            commit_test_alpha(&mut store, 200, 200) > 0.5,
+            "Ctrl+Z must put the interrupted eraser stroke's own pixels back"
+        );
+        assert!(
+            commit_test_alpha(&mut store, 30, 30) > 0.5,
+            "and must have left the untouched paint alone"
+        );
+    }
+
+    /// The ordinary path has to behave exactly as it always did — one
+    /// entry per released stroke, nothing at all for a drag with no
+    /// stroke, a drag that painted nothing, a non-painting drag, or no
+    /// drag — and `Drag::Move` must still coalesce into one structural
+    /// entry now that `finish_move` is reached through the same shared
+    /// commit rather than from `handle_pointer_released` directly.
+    // Four commits, each now carrying the view and active layer
+    // `commit_ending_drag` re-establishes the pan bound against (0.57.6)
+    // -- eight lines of parameters past the 100-line lint, with the
+    // assertions themselves unchanged. Splitting the four cases apart
+    // would lose the "one released drag of each kind, in sequence"
+    // shape that is the point of the test.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn the_ordinary_release_path_commits_exactly_what_it_always_did() {
+        let (_dir, mut store) = commit_test_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+
+        // (a) A released stroke: one entry, and it undoes its own paint.
+        let released = a_brush_drag_that_painted(&mut store, (30.5, 30.5));
+        commit_ending_drag(
+            Some(released),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut CanvasView::new(),
+            None,
+            None,
+        );
+        assert_eq!(undo_order.undo, vec![UndoKind::Pixel]);
+        assert!(pixel_history.can_undo());
+
+        // (b) Nothing to commit: a brush drag that began with no active
+        // pixel layer, a brush drag whose snapshot is empty, a pan, and
+        // no drag at all.
+        for nothing in [
+            Some(Drag::Brush {
+                last_doc: (0.0, 0.0),
+                carry: 0.0,
+                stroke: None,
+                warned: std::collections::HashSet::new(),
+            }),
+            Some(brush_drag_with_a_stroke()),
+            Some(Drag::Pan {
+                last_screen: (0.0, 0.0),
+            }),
+            Some(Drag::Eyedropper),
+            None,
+        ] {
+            commit_ending_drag(
+                nothing,
+                &layers,
+                &mut history,
+                &mut pixel_history,
+                &mut undo_order,
+                &mut CanvasView::new(),
+                None,
+                None,
+            );
+            assert_eq!(
+                undo_order.undo,
+                vec![UndoKind::Pixel],
+                "nothing here changed a pixel, so nothing may become an undo step"
+            );
+        }
+
+        // (c) A move still coalesces into exactly one structural entry.
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let layer = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let moved = aurora_core::Rect {
+            x: 5,
+            y: 5,
+            ..bounds
+        };
+        if let Err(err) = layers.set_bounds(layer, moved) {
+            unreachable!("{err:?}");
+        }
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: layer,
+                start_doc: (0.0, 0.0),
+                start_bounds: bounds,
+                current_bounds: moved,
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut CanvasView::new(),
+            None,
+            None,
+        );
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel, UndoKind::Structural],
+            "a completed move must still record one structural step"
+        );
+
+        // (d) A move that ended where it started records nothing.
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: layer,
+                start_doc: (0.0, 0.0),
+                start_bounds: moved,
+                current_bounds: moved,
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut CanvasView::new(),
+            None,
+            None,
+        );
+        assert_eq!(
+            undo_order.undo,
+            vec![UndoKind::Pixel, UndoKind::Structural],
+            "a move that ended where it started has nothing to reverse"
+        );
     }
 
     #[test]
@@ -14656,7 +21780,7 @@ mod tests {
             (15.0, 8.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(view.pan(), (-45.0, -52.0));
         match drag {
@@ -14682,7 +21806,7 @@ mod tests {
             (30.0, 25.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         let Some(active) = selection.active() else {
             unreachable!("must select something");
@@ -14700,7 +21824,7 @@ mod tests {
             (50.0, 5.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         let Some(active) = selection.active() else {
             unreachable!("must still be selected");
@@ -14716,6 +21840,7 @@ mod tests {
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
+            warned: std::collections::HashSet::new(),
         };
         // radius 24, DEFAULT_SPACING 0.25 -> step 6; a 12-unit segment
         // lands dabs at 6 and 12 (the segment's own start, 0, is not
@@ -14726,7 +21851,7 @@ mod tests {
             (12.0, 0.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
         match drag {
@@ -14751,8 +21876,15 @@ mod tests {
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
+            warned: std::collections::HashSet::new(),
         };
-        let first = continue_drag(&mut drag, (3.0, 0.0), &mut view, &mut selection, (0.0, 0.0));
+        let first = continue_drag(
+            &mut drag,
+            (3.0, 0.0),
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         // Segment shorter than one step (6): no new dab yet, but the 3
         // units already travelled must carry forward, not reset to 0 --
         // the exact bug a fresh `dabs_along_path` call each event would
@@ -14769,7 +21901,13 @@ mod tests {
         // so exactly one dab lands (at the 6-unit mark, i.e. 3 units
         // into *this* segment) -- proving the carry from the first,
         // sub-step event was not lost.
-        let second = continue_drag(&mut drag, (7.0, 0.0), &mut view, &mut selection, (0.0, 0.0));
+        let second = continue_drag(
+            &mut drag,
+            (7.0, 0.0),
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
         assert_eq!(second, vec![(6.0, 0.0)]);
     }
 
@@ -14781,6 +21919,7 @@ mod tests {
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
+            warned: std::collections::HashSet::new(),
         };
         // Same radius/spacing as Brush (ERASER_RADIUS == BRUSH_RADIUS ==
         // 24, DEFAULT_SPACING 0.25 -> step 6), so the same dab positions
@@ -14790,7 +21929,7 @@ mod tests {
             (12.0, 0.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, vec![(6.0, 0.0), (12.0, 0.0)]);
         match drag {
@@ -14828,7 +21967,7 @@ mod tests {
             (15.0, -8.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(dabs, Vec::new(), "Move must never produce dabs to paint");
         let Drag::Move { current_bounds, .. } = drag else {
@@ -14856,7 +21995,7 @@ mod tests {
             (15.0, -8.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(
             dabs,
@@ -14874,9 +22013,10 @@ mod tests {
         let mut view = CanvasView::new();
         apply_scroll_zoom(
             &mut view,
+            None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert!(view.zoom() > 1.0, "zoom was {}", view.zoom());
     }
@@ -14886,9 +22026,10 @@ mod tests {
         let mut view = CanvasView::new();
         apply_scroll_zoom(
             &mut view,
+            None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, -1.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert!(view.zoom() < 1.0, "zoom was {}", view.zoom());
     }
@@ -14900,7 +22041,12 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn handle_zoom_tool_click_zooms_in_without_alt() {
         let mut view = CanvasView::new();
-        handle_zoom_tool_click(&mut view, (50.0, 50.0), Modifiers::none(), (0.0, 0.0));
+        handle_zoom_tool_click(
+            &mut view,
+            (50.0, 50.0),
+            Modifiers::none(),
+            bounds_at((0.0, 0.0), None),
+        );
         assert_eq!(view.zoom(), 2.0);
     }
 
@@ -14914,7 +22060,12 @@ mod tests {
             alt: true,
             ..Modifiers::none()
         };
-        handle_zoom_tool_click(&mut view, (50.0, 50.0), alt_held, (0.0, 0.0));
+        handle_zoom_tool_click(
+            &mut view,
+            (50.0, 50.0),
+            alt_held,
+            bounds_at((0.0, 0.0), None),
+        );
         assert_eq!(view.zoom(), 0.5);
     }
 
@@ -14944,7 +22095,7 @@ mod tests {
             (5_000.0, 5_000.0),
             &mut view,
             &mut selection,
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         // Render: the continuous position `redraw` feeds
         // `TileResidency::set_origin` must stay pinned at the document's
@@ -14976,7 +22127,7 @@ mod tests {
             (5_000.0, 5_000.0),
             &mut view,
             &mut selection,
-            (300.0, 300.0),
+            bounds_at((300.0, 300.0), None),
         );
         assert_eq!(canvas_local_origin(&view, (300.0, 300.0)), (0.0, 0.0));
         assert_eq!(view.to_document((0.0, 0.0)), (300.0, 300.0));
@@ -14998,9 +22149,10 @@ mod tests {
         let mut view = CanvasView::new();
         apply_scroll_zoom(
             &mut view,
+            None,
             (100.0, 100.0),
             winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
-            (0.0, 0.0),
+            bounds_at((0.0, 0.0), None),
         );
         assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
     }
@@ -15023,7 +22175,1069 @@ mod tests {
             alt: true,
             ..Modifiers::none()
         };
-        handle_zoom_tool_click(&mut view, (100.0, 100.0), alt_held, (0.0, 0.0));
+        handle_zoom_tool_click(
+            &mut view,
+            (100.0, 100.0),
+            alt_held,
+            bounds_at((0.0, 0.0), None),
+        );
         assert_eq!(view.to_document((0.0, 0.0)), (0.0, 0.0));
+    }
+
+    // -- the same bug at the document's *far* edge (0.57.10) --
+    //
+    // The clamps above close the near edge, where
+    // `aurora_gpu::TileResidency::set_origin` clamps the rendered
+    // origin at zero while `CanvasView::to_document` keeps reporting
+    // the true, unbounded position. That same `set_origin` *saturates*
+    // at `TileResidency::MAX_DOC_ORIGIN_PX`, and nothing bounded the
+    // view there -- the identical divergence, in the opposite corner.
+
+    #[test]
+    // `min_doc` is `bounds.x as f32` from an `i64` literal and
+    // `max_doc` is that plus one constant: one addition, not an
+    // accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn the_far_pan_bound_is_the_active_layers_origin_plus_the_document_ceiling() {
+        // The design decision, pinned directly so a later
+        // "simplification" to a bare ceiling constant fails here rather
+        // than silently in the app. It is neither the raw document
+        // ceiling nor the active layer's own width/height, because
+        // `set_origin` is handed a *layer-local* origin
+        // (`canvas_local_origin(view, active_layer_origin(..))`) and
+        // clamps that to `[0, MAX_DOC_ORIGIN_PX]` -- mapping that range
+        // back into document space adds the layer origin to both ends.
+        let (_, layers, _, a, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+
+        let at_origin = pan_bounds(&layers, Some(a), None);
+        assert_eq!(at_origin.min_doc, (0.0, 0.0));
+        assert_eq!(at_origin.max_doc, (ceiling, ceiling));
+
+        // The moved layer's own bounds are (300, 150) -- both ends of
+        // the bound move with it, and the *extent* between them stays
+        // exactly the ceiling.
+        let moved = pan_bounds(&layers, Some(b), None);
+        assert_eq!(moved.min_doc, (300.0, 150.0));
+        assert_eq!(moved.max_doc, (300.0 + ceiling, 150.0 + ceiling));
+        assert_eq!(moved.max_doc.0 - moved.min_doc.0, ceiling);
+        assert_eq!(moved.max_doc.1 - moved.min_doc.1, ceiling);
+    }
+
+    /// **The headline test.** Panning wildly past the document's far
+    /// end must leave render and paint reading the same position — the
+    /// exact property the near-edge clamp already guarantees at the
+    /// other corner.
+    ///
+    /// Asserted by *range membership*, not by calling
+    /// `TileResidency::clamp_doc_origin` (which stays private): that
+    /// crate's own
+    /// `clamp_doc_origin_is_the_identity_across_its_whole_public_range`
+    /// proves every position in `[0, MAX_DOC_ORIGIN_PX]` passes through
+    /// unchanged, so a local origin inside that range is one the
+    /// renderer honours verbatim — which is what "render and paint
+    /// agree" means.
+    #[test]
+    fn panning_far_past_the_document_end_keeps_render_and_paint_in_agreement() {
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+        let canvas = (1_600.0_f32, 900.0_f32);
+
+        let mut view = CanvasView::new();
+        // Panning left/up is what drives `to_document` *up*, toward the
+        // far edge. Far enough to sail past the 300,000 px ceiling
+        // several times over.
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        pan_bounds(&layers, Some(b), Some(canvas)).apply(&mut view);
+
+        // Exactly what `App::redraw` hands `TileResidency::set_origin`.
+        let local = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local.0 >= 0.0 && local.0 <= ceiling && local.1 >= 0.0 && local.1 <= ceiling,
+            "the rendered origin must land inside [0, {ceiling}], the range \
+             `clamp_doc_origin` passes through unchanged; got {local:?}"
+        );
+        // And the canvas area's own far corner is pinned exactly on the
+        // bound, not merely somewhere no-longer-past it.
+        let far = view.to_document(canvas);
+        assert!(
+            (far.0 - (300.0 + ceiling)).abs() <= 1.0 && (far.1 - (150.0 + ceiling)).abs() <= 1.0,
+            "the far corner must be pinned on max_doc; got {far:?}"
+        );
+    }
+
+    #[test]
+    fn the_far_pan_bound_without_the_new_clamp_is_the_divergence_this_prevents() {
+        // The negative control for the test above, spelled the way
+        // `an_active_layer_change_without_the_re_clamp_is_the_divergence_this_prevents`
+        // already spells its own: exactly what this crate did before
+        // 0.57.10 -- the near clamp alone -- and how far outside the
+        // renderer's honoured range it leaves the origin.
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        view.clamp_pan_to_minimum(active_layer_origin(&layers, Some(b)));
+
+        let local = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local.0 > ceiling * 4.0 && local.1 > ceiling * 4.0,
+            "the near clamp alone leaves the rendered origin far past the \
+             {ceiling} px ceiling, where `set_origin` saturates and \
+             `to_document` does not; got {local:?}"
+        );
+    }
+
+    #[test]
+    fn the_far_pan_bound_is_measured_in_logical_canvas_pixels_not_physical() {
+        // `CanvasView`'s pan/`to_document` live in the canvas area's own
+        // *logical* space, so the far bound has to be measured there. A
+        // physical size (the widget bounds times `scale_factor`) would
+        // place the far corner at `scale_factor` times the right
+        // distance on any display where that is not 1.0 -- so this
+        // builds a real laid-out workspace at a 2x scale factor and
+        // confirms the bound lands on the logical size.
+        let (mut workspace, layers, _, _, b) = two_layers_one_moved();
+        workspace.tree.compute_layout(1_600.0, 900.0);
+        let Some(logical) = canvas_area_logical_size(&workspace) else {
+            unreachable!("the canvas area always has bounds once laid out");
+        };
+        let Some(physical) = canvas_area_physical_size(&workspace, 2.0) else {
+            unreachable!("same widget, same bounds");
+        };
+        assert!(
+            logical.0 > 0.0 && logical.1 > 0.0,
+            "setup: a real laid-out canvas area, not a zero rect; got {logical:?}"
+        );
+        assert!(
+            (f64::from(physical.0) - f64::from(logical.0) * 2.0).abs() < 2.0,
+            "setup: the physical size really is the 2x-scaled one, so the two \
+             are distinguishable: logical {logical:?}, physical {physical:?}"
+        );
+
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        pan_bounds(&layers, Some(b), Some(logical)).apply(&mut view);
+
+        let at_logical = view.to_document(logical);
+        assert!(
+            (at_logical.0 - (300.0 + ceiling)).abs() <= 1.0
+                && (at_logical.1 - (150.0 + ceiling)).abs() <= 1.0,
+            "the far corner must land on max_doc at the *logical* canvas size; \
+             got {at_logical:?}"
+        );
+        // And not at the physical one: reading the bound there would
+        // report a document position well past max_doc.
+        let at_physical =
+            view.to_document((f32::from(u16::try_from(physical.0).unwrap_or(0)), 0.0));
+        assert!(
+            at_physical.0 > at_logical.0,
+            "setup: the physical corner is a different, further point; \
+             {at_physical:?} vs {at_logical:?}"
+        );
+    }
+
+    #[test]
+    fn a_scroll_zoom_that_hits_the_far_bound_re_anchors_a_live_brush_drag() {
+        // The exact "spurious dabs painted from a stationary pointer"
+        // failure mode `apply_scroll_zoom`'s own doc comment warns
+        // about, now at the far edge: the far clamp moves the view, and
+        // a `Drag::Brush`'s `last_doc` names the pre-clamp position
+        // while `continue_drag` reads the post-clamp one. This passes
+        // only because `bounds.apply` sits strictly between the two
+        // `to_document(anchor)` measurements.
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let canvas = (1_600.0_f32, 900.0_f32);
+        let bounds = pan_bounds(&layers, Some(b), Some(canvas));
+
+        // Start the view sitting exactly on the far bound.
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        bounds.apply(&mut view);
+
+        let pointer = (40.0, 40.0);
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        let view_before = view.to_document(pointer);
+        let Drag::Brush {
+            last_doc: ref reference_before,
+            ..
+        } = drag
+        else {
+            unreachable!("just built a brush drag");
+        };
+        let reference_before = *reference_before;
+
+        // Zooming *out* while anchored at the pointer pushes the far
+        // corner further into the document -- straight past the bound.
+        apply_scroll_zoom(
+            &mut view,
+            Some(&mut drag),
+            pointer,
+            winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
+            bounds,
+        );
+
+        let view_after = view.to_document(pointer);
+
+        // **The post-condition the placement has to produce, asserted
+        // directly rather than inferred from the re-anchor below.**
+        // Without this, moving `bounds.apply` to *before*
+        // `apply_scroll_zoom`'s own "before" measurement still satisfies
+        // every other assertion in this test: the clamp would fire on
+        // the pre-zoom view, `zoom_at` would then push the far corner
+        // back out with nothing left to catch it, and the measured
+        // delta would be zero -- consistent, and wrong. The two
+        // assertions bracket the placement from both sides: this one
+        // fails if the clamp runs too early (the view ends up out of
+        // bounds), and the `dabs.is_empty()` assertion at the end fails
+        // if it runs too late (after the "after" measurement, so the
+        // correction never reaches the drag).
+        let top_left_after = view.to_document((0.0, 0.0));
+        let far_after = view.to_document(canvas);
+        assert!(
+            far_after.0 <= bounds.max_doc.0 + 1.0 && far_after.1 <= bounds.max_doc.1 + 1.0,
+            "when the call returns the view must be inside the far bound: \
+             far corner {far_after:?} vs max_doc {:?}",
+            bounds.max_doc
+        );
+        assert!(
+            top_left_after.0 >= bounds.min_doc.0 - 1.0
+                && top_left_after.1 >= bounds.min_doc.1 - 1.0,
+            "and inside the near bound: top-left {top_left_after:?} vs min_doc {:?}",
+            bounds.min_doc
+        );
+
+        let Drag::Brush { last_doc, .. } = drag else {
+            unreachable!("still a brush drag");
+        };
+        let view_delta = (view_after.0 - view_before.0, view_after.1 - view_before.1);
+        assert!(
+            view_delta.0.abs() > 1.0 || view_delta.1.abs() > 1.0,
+            "setup: the far clamp really does move the view under the still \
+             pointer: {view_before:?} -> {view_after:?}"
+        );
+        let reference_delta = (
+            last_doc.0 - reference_before.0,
+            last_doc.1 - reference_before.1,
+        );
+        let tolerance = view_delta
+            .0
+            .abs()
+            .max(view_delta.1.abs())
+            .mul_add(1e-3, 1e-2);
+        assert!(
+            (reference_delta.0 - view_delta.0).abs() <= tolerance
+                && (reference_delta.1 - view_delta.1).abs() <= tolerance,
+            "the drag's reference must move by exactly the view's own delta: \
+             view {view_delta:?}, reference {reference_delta:?}"
+        );
+
+        // The property that actually matters, stated as the user would
+        // see it.
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, bounds);
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    #[test]
+    fn growing_the_canvas_area_while_pinned_at_the_far_bound_re_establishes_it() {
+        // The resize scenario -- the one call site in this round that
+        // needed real analysis rather than mirroring a pan-moving path.
+        // The far bound is a statement about the document position at
+        // the canvas area's *bottom-right* corner, so growing that area
+        // violates the bound with neither the active layer nor its
+        // bounds having changed at all, and nothing else on the resize
+        // path catches it.
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+        let small = (800.0_f32, 600.0_f32);
+        let grown = (1_600.0_f32, 1_200.0_f32);
+
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        pan_bounds(&layers, Some(b), Some(small)).apply(&mut view);
+        let pinned = view.to_document(small);
+        assert!(
+            (pinned.0 - (300.0 + ceiling)).abs() <= 1.0,
+            "setup: pinned exactly on the far bound at the small canvas; \
+             got {pinned:?}"
+        );
+
+        // A live stroke held across the resize.
+        let pointer = (40.0, 40.0);
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        // The canvas grows. Without the far clamp on this path the
+        // bound is now violated by the extra 800 x 600 logical pixels
+        // the bottom-right corner just gained.
+        let grown_bounds = pan_bounds(&layers, Some(b), Some(grown));
+        let violation = view.to_document(grown);
+        assert!(
+            violation.0 > grown_bounds.max_doc.0 + 1.0,
+            "setup: growing the canvas really does push the far corner past \
+             the bound: {violation:?} vs max_doc {:?}",
+            grown_bounds.max_doc
+        );
+
+        // The floor is unchanged here, so this isolates the pan half:
+        // whatever moves is the clamp, not the zoom raise.
+        let unchanged_floor = view.min_zoom();
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            Some(pointer),
+            unchanged_floor,
+            grown_bounds,
+        );
+
+        let re_established = view.to_document(grown);
+        assert!(
+            (re_established.0 - grown_bounds.max_doc.0).abs() <= 1.0
+                && (re_established.1 - grown_bounds.max_doc.1).abs() <= 1.0,
+            "the resize path must re-establish the far bound; got \
+             {re_established:?} vs max_doc {:?}",
+            grown_bounds.max_doc
+        );
+        // The near half of the same post-condition -- the far one is
+        // asserted just above. Together they say "the view is inside
+        // both bounds when the call returns", which is what pins
+        // `bounds.apply`'s placement inside the measurement window from
+        // the early side; the `dabs.is_empty()` assertion below pins it
+        // from the late side.
+        let top_left_after = view.to_document((0.0, 0.0));
+        assert!(
+            top_left_after.0 >= grown_bounds.min_doc.0 - 1.0
+                && top_left_after.1 >= grown_bounds.min_doc.1 - 1.0,
+            "the view must also be inside the near bound: top-left \
+             {top_left_after:?} vs min_doc {:?}",
+            grown_bounds.min_doc
+        );
+        let local = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local.0 >= 0.0 && local.0 <= ceiling && local.1 >= 0.0 && local.1 <= ceiling,
+            "and render and paint must agree again; got {local:?}"
+        );
+        // And the live drag was re-anchored, not left measuring against
+        // a view that moved under it.
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, grown_bounds);
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint across a resize: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    // -- RT-04 (0.57.11). The same hazard again, at the one arm of
+    // -- `apply_canvas_min_zoom` that used to skip the correction
+    // -- entirely: a live drag with the pointer *off* the canvas area.
+    //
+    // `pointer_in_canvas` returns `None` whenever the pointer is over a
+    // dock panel, over the rail divider, or off the window -- and none
+    // of those end a drag. A canvas-size change arriving in that state
+    // (a panel toggled by keyboard shortcut, a rail-divider drag, a
+    // window or monitor resize) still moves the view through
+    // `PanBounds::apply`, and the pre-0.57.11 early return left the
+    // live drag's own reference naming the pre-move document position.
+
+    /// RT-04-A. The far bound, with the pointer parked over a dock
+    /// panel: the canvas grows, the far clamp moves the view, and the
+    /// stroke must still come out re-anchored. Before 0.57.11 this
+    /// painted a line of dabs from a pointer that never moved.
+    #[test]
+    fn growing_the_canvas_area_re_anchors_the_stroke_with_the_pointer_off_canvas() {
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let ceiling = aurora_gpu::TileResidency::MAX_DOC_ORIGIN_PX;
+        let small = (800.0_f32, 600.0_f32);
+        let grown = (1_600.0_f32, 1_200.0_f32);
+
+        let mut view = CanvasView::new();
+        view.pan_by((-1_500_000.0, -1_500_000.0));
+        pan_bounds(&layers, Some(b), Some(small)).apply(&mut view);
+
+        // The stroke's own last event happened while the pointer was
+        // still over the canvas; it has since wandered onto a panel,
+        // which is what makes `pointer` `None` below.
+        let pointer = (40.0, 40.0);
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        let grown_bounds = pan_bounds(&layers, Some(b), Some(grown));
+        let unchanged_floor = view.min_zoom();
+        let view_before = view.to_document((0.0, 0.0));
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            None,
+            unchanged_floor,
+            grown_bounds,
+        );
+        let view_after = view.to_document((0.0, 0.0));
+        assert!(
+            (view_after.0 - view_before.0).abs() > 1.0
+                || (view_after.1 - view_before.1).abs() > 1.0,
+            "setup: the far clamp really does move the view here: \
+             {view_before:?} -> {view_after:?}"
+        );
+        let local = canvas_local_origin(&view, active_layer_origin(&layers, Some(b)));
+        assert!(
+            local.0 >= 0.0 && local.0 <= ceiling && local.1 >= 0.0 && local.1 <= ceiling,
+            "setup: render and paint agree again; got {local:?}"
+        );
+
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, grown_bounds);
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint across a resize it spent over a \
+             dock panel: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// RT-04-B. The *near* bound through the same arm — the older half
+    /// of the hole, and the one whose symptom is the exact bug this
+    /// whole round started from: a stroke held while the pan bound
+    /// moves under it (a layer switch, an undone Move, a redraw after
+    /// either) with the pointer off the canvas, painting a line from
+    /// `(40, 40)` to `(340, 190)` that the user never drew.
+    #[test]
+    fn a_moved_near_bound_re_anchors_the_stroke_with_the_pointer_off_canvas() {
+        let pointer = (40.0, 40.0);
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        // The bound moves to a layer at (300, 150) while the pointer
+        // sits over the Layers panel.
+        let moved = bounds_at((300.0, 150.0), None);
+        let unchanged_floor = view.min_zoom();
+        apply_canvas_min_zoom(&mut view, Some(&mut drag), None, unchanged_floor, moved);
+
+        let top_left = view.to_document((0.0, 0.0));
+        assert!(
+            (top_left.0 - 300.0).abs() <= 1e-3 && (top_left.1 - 150.0).abs() <= 1e-3,
+            "setup: the near clamp really does move the view here: {top_left:?}"
+        );
+        let dabs = continue_drag(&mut drag, pointer, &mut view, &mut selection, moved);
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint when the near bound moves under it: \
+             {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// RT-04-C. The zoom-floor half of the same arm, which is *not* a
+    /// uniform translation (see
+    /// `raising_the_zoom_floor_shifts_to_document_by_a_different_amount_at_every_point`)
+    /// and so cannot be corrected by measuring at `(0, 0)`. Reachable:
+    /// a window or scale-factor change while a stroke is held and the
+    /// pointer rests on a panel.
+    #[test]
+    fn raising_the_zoom_floor_re_anchors_the_stroke_with_the_pointer_off_canvas() {
+        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        let pointer = (400.0, 300.0);
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        let old_zoom = view.zoom();
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            None,
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
+        assert!(
+            view.zoom() > old_zoom,
+            "setup: the floor really raises this view's zoom: {old_zoom} -> {}",
+            view.zoom()
+        );
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint across a zoom-floor raise it spent \
+             over a dock panel: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// The same arm for a `Drag::Move`, where the stale reference
+    /// teleports the layer instead of painting. The pan clamp is a
+    /// uniform translation, so the correction is exact here whichever
+    /// point it is measured at.
+    #[test]
+    fn a_moved_near_bound_leaves_the_layer_alone_with_the_pointer_off_canvas() {
+        let pointer = (40.0, 40.0);
+        let start_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: view.to_document(pointer),
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+
+        let moved = bounds_at((300.0, 150.0), None);
+        let unchanged_floor = view.min_zoom();
+        apply_canvas_min_zoom(&mut view, Some(&mut drag), None, unchanged_floor, moved);
+        let _ = continue_drag(&mut drag, pointer, &mut view, &mut selection, moved);
+
+        let Drag::Move { current_bounds, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert_eq!(
+            current_bounds, start_bounds,
+            "a still pointer must not move the layer when the pan bound moves \
+             while the pointer is off the canvas"
+        );
+    }
+
+    #[test]
+    // The assertion is that `pan` is byte-identical before and after --
+    // exactly what "no-op" means, not an accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn the_resize_path_leaves_the_near_edge_alone_for_a_view_already_in_bounds() {
+        // `apply_canvas_min_zoom`'s doc comment claims the *near* half
+        // of the bound is provably a no-op on this path, because
+        // `set_min_zoom` raises zoom through `zoom_at((0, 0), ..)`,
+        // which holds `to_document((0, 0))` fixed. Proved rather than
+        // asserted: a view comfortably inside both bounds goes through
+        // the real resize path and comes out with `pan` untouched.
+        let (_, layers, _, _, b) = two_layers_one_moved();
+        let canvas = (1_600.0_f32, 900.0_f32);
+        let bounds = pan_bounds(&layers, Some(b), Some(canvas));
+
+        let mut view = CanvasView::new();
+        // `to_document((0, 0))` lands at (1300, 1150) -- well above
+        // min_doc (300, 150) and nowhere near max_doc.
+        view.pan_by((-1_300.0, -1_150.0));
+        assert!(
+            view.to_document((0.0, 0.0)).0 > bounds.min_doc.0
+                && view.to_document(canvas).0 < bounds.max_doc.0,
+            "setup: comfortably inside both bounds"
+        );
+
+        let before = view.pan();
+        let unchanged_floor = view.min_zoom();
+        apply_canvas_min_zoom(&mut view, None, None, unchanged_floor, bounds);
+        assert_eq!(
+            view.pan(),
+            before,
+            "a view already satisfying both bounds must come out of the resize \
+             path with pan untouched"
+        );
+    }
+
+    // -- a view that moves under a drag that is still live (0.57.7) --
+    //
+    // RT-02. The clamp above is the whole hazard `press_layer_row` and
+    // `perform_undo_redo` end a drag to avoid, reached from a gesture
+    // that is *not* "I am done dragging": scrolling to zoom while
+    // painting is an ordinary thing to do mid-stroke. So this path
+    // re-anchors the drag instead of ending it
+    // (`shift_drag_reference`), and these are the two halves of that.
+
+    /// The bug, with the pointer completely still: zooming out hard
+    /// against the document's own top-left edge makes the clamp move
+    /// the view, and a `Drag::Brush`'s own `last_doc` then names the
+    /// pre-clamp document position while `continue_drag` reads the
+    /// post-clamp one. Without the re-anchor the next move event
+    /// interpolates a whole segment between them.
+    #[test]
+    fn scroll_zooming_mid_stroke_re_anchors_the_stroke_instead_of_painting_a_line_never_drawn() {
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let pointer = (40.0, 40.0);
+        let mut drag = Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+
+        let before = view.to_document(pointer);
+        apply_scroll_zoom(
+            &mut view,
+            Some(&mut drag),
+            pointer,
+            winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
+            bounds_at((0.0, 0.0), None),
+        );
+        let after = view.to_document(pointer);
+        assert!(
+            (after.0 - before.0).abs() > 50.0 && (after.1 - before.1).abs() > 50.0,
+            "setup: the clamp really does move the document point under the still pointer: \
+             {before:?} -> {after:?}"
+        );
+
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// The same re-anchor for a `Drag::Move`, where a stale `start_doc`
+    /// does not paint but does teleport the layer: `current_bounds` is
+    /// `start_bounds` plus `current_doc - start_doc`, so a view that
+    /// moved under it shifts the layer by the clamp's own jump on the
+    /// next event. Also the negative control for the other half — a
+    /// zoom that never reaches the bound must leave the reference
+    /// exactly alone, since `zoom_at` already holds it valid.
+    #[test]
+    fn scroll_zooming_mid_move_leaves_the_layer_where_the_pointer_put_it() {
+        let start_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        let pointer = (40.0, 40.0);
+        let a_move = |view: &aurora_ui::CanvasView| Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: view.to_document(pointer),
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+
+        // (a) A zoom that hits the bound.
+        let mut view = CanvasView::new();
+        let mut selection = SelectionSet::new();
+        let mut drag = a_move(&view);
+        apply_scroll_zoom(
+            &mut view,
+            Some(&mut drag),
+            pointer,
+            winit::event::MouseScrollDelta::LineDelta(0.0, -10.0),
+            bounds_at((0.0, 0.0), None),
+        );
+        let _ = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
+        let Drag::Move { current_bounds, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert_eq!(
+            current_bounds, start_bounds,
+            "a still pointer must not move the layer"
+        );
+
+        // (b) A zoom nowhere near it: nothing to correct, and nothing
+        // corrected.
+        let mut view = CanvasView::new();
+        view.pan_by((-400.0, -400.0));
+        let mut drag = a_move(&view);
+        let Drag::Move {
+            start_doc: start_doc_before,
+            ..
+        } = drag
+        else {
+            unreachable!("just built a move drag")
+        };
+        apply_scroll_zoom(
+            &mut view,
+            Some(&mut drag),
+            pointer,
+            winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+            bounds_at((0.0, 0.0), None),
+        );
+        let Drag::Move { start_doc, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert!(
+            (start_doc.0 - start_doc_before.0).abs() < 1e-3
+                && (start_doc.1 - start_doc_before.1).abs() < 1e-3,
+            "a zoom that never reaches the bound must not shift the reference: \
+             {start_doc_before:?} -> {start_doc:?}"
+        );
+    }
+
+    // RT-02c (0.57.8). The same hazard again, at the one kind of path
+    // neither `apply_scroll_zoom` nor `commit_ending_drag` covers:
+    // `aurora_ui::CanvasView::set_min_zoom`, which reads like a plain
+    // bounds setter and *moves the view*. `App::apply_resize` and
+    // `App::redraw` both call it on every canvas-size or scale-factor
+    // change, neither of which is a "I am done dragging" gesture -- so
+    // a window resize while a stroke is held is the trigger, with the
+    // pointer completely still.
+
+    /// The bug and the fix over the same still pointer. Part (a) is the
+    /// pre-0.57.8 behaviour, spelled by handing
+    /// [`apply_canvas_min_zoom`] no drag to re-anchor, and measures what
+    /// it costs; part (b) is the same raise with the live drag passed.
+    #[test]
+    fn resizing_mid_stroke_re_anchors_the_stroke_instead_of_painting_a_line_never_drawn() {
+        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        let pointer = (400.0, 300.0);
+        // A view below the floor is exactly what a freshly opened
+        // document plus a zoom-out leaves behind, until the next
+        // frame -- or a resize -- re-applies the floor.
+        let below_the_floor = || {
+            let mut view = CanvasView::new();
+            view.zoom_at((0.0, 0.0), 0.25);
+            view
+        };
+        let a_stroke = |view: &CanvasView| Drag::Brush {
+            last_doc: view.to_document(pointer),
+            carry: 0.0,
+            stroke: None,
+            warned: std::collections::HashSet::new(),
+        };
+        let mut selection = SelectionSet::new();
+
+        // (a) No re-anchor.
+        let mut view = below_the_floor();
+        let mut drag = a_stroke(&view);
+        let before = view.to_document(pointer);
+        apply_canvas_min_zoom(
+            &mut view,
+            None,
+            Some(pointer),
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
+        let after = view.to_document(pointer);
+        assert!(
+            (after.0 - before.0).abs() > 100.0 && (after.1 - before.1).abs() > 100.0,
+            "setup: raising the floor really does move the document point under \
+             a still pointer: {before:?} -> {after:?}"
+        );
+        let stale = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
+        assert!(
+            stale.len() > 50,
+            "setup: without the re-anchor a still pointer paints a whole line of \
+             dabs; got {}",
+            stale.len()
+        );
+
+        // (b) The fix.
+        let mut view = below_the_floor();
+        let mut drag = a_stroke(&view);
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            Some(pointer),
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
+        assert!(
+            dabs.is_empty(),
+            "a still pointer must not paint: {} dabs were placed",
+            dabs.len()
+        );
+    }
+
+    /// The same re-anchor for a `Drag::Move`, where a stale `start_doc`
+    /// does not paint but does teleport the layer — and the negative
+    /// control: a floor the view already satisfies moves nothing, so it
+    /// must correct nothing.
+    #[test]
+    fn resizing_mid_move_leaves_the_layer_where_the_pointer_put_it() {
+        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        let pointer = (400.0, 300.0);
+        let start_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        let a_move = |view: &CanvasView| Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: view.to_document(pointer),
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+        let mut selection = SelectionSet::new();
+
+        // (a) A raise that really moves the view.
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        let mut drag = a_move(&view);
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            Some(pointer),
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
+        let _ = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            bounds_at((0.0, 0.0), None),
+        );
+        let Drag::Move { current_bounds, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert_eq!(
+            current_bounds, start_bounds,
+            "a still pointer must not move the layer"
+        );
+
+        // (b) A view already above the floor: nothing to correct, and
+        // nothing corrected.
+        let mut view = CanvasView::new();
+        let mut drag = a_move(&view);
+        let Drag::Move {
+            start_doc: start_doc_before,
+            ..
+        } = drag
+        else {
+            unreachable!("just built a move drag");
+        };
+        apply_canvas_min_zoom(
+            &mut view,
+            Some(&mut drag),
+            Some(pointer),
+            floor,
+            bounds_at((0.0, 0.0), None),
+        );
+        let Drag::Move { start_doc, .. } = drag else {
+            unreachable!("still a Move drag");
+        };
+        assert!(
+            (start_doc.0 - start_doc_before.0).abs() < 1e-3
+                && (start_doc.1 - start_doc_before.1).abs() < 1e-3,
+            "a floor the view already satisfies must not shift the reference: \
+             {start_doc_before:?} -> {start_doc:?}"
+        );
+    }
+
+    /// **Why the correction is measured at the pointer**, and why
+    /// `apply_scroll_zoom`'s own "one uniform shift, measured anywhere"
+    /// argument does not transfer to this path (0.57.8). There, a pan
+    /// clamp at an already-fixed zoom shifts `to_document(p)` by the
+    /// same amount for every `p`. Here the *zoom* changes, and raising
+    /// `z0` to `z1` anchored at `(0, 0)` shifts `to_document(x)` by
+    /// `x * (1/z1 - 1/z0)` — exactly zero at the anchor, and different
+    /// at every other point. Measuring anywhere but the point each
+    /// drag's own reference is derived from would correct by the wrong
+    /// amount; measuring at the anchor would correct by nothing at all.
+    #[test]
+    fn raising_the_zoom_floor_shifts_to_document_by_a_different_amount_at_every_point() {
+        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        let mut view = CanvasView::new();
+        view.zoom_at((0.0, 0.0), 0.25);
+        // A non-zero pan too: the identity is not an artefact of the
+        // view starting at the origin. Both components negative, so
+        // `to_document((0, 0))` stays positive and the view satisfies
+        // its own pan bound -- since 0.57.10 `apply_canvas_min_zoom`
+        // applies `PanBounds` as well as the zoom floor, and a setup
+        // that started *outside* the bound would have the clamp move
+        // `pan` on top of the zoom raise, which is not the arithmetic
+        // this test is about. (It was `(-37.0, 19.0)` before, which put
+        // `to_document((0, 0)).y` at -76: a violation the old code
+        // simply never noticed.)
+        view.pan_by((-37.0, -19.0));
+        let old_zoom = view.zoom();
+        let probes = [(0.0, 0.0), (100.0, 40.0), (900.0, 700.0)];
+        let before = probes.map(|probe| view.to_document(probe));
+
+        apply_canvas_min_zoom(&mut view, None, None, floor, bounds_at((0.0, 0.0), None));
+
+        let new_zoom = view.zoom();
+        assert!(
+            new_zoom > old_zoom,
+            "setup: the floor really raises this view's zoom: \
+             {old_zoom} -> {new_zoom}"
+        );
+        let scale = 1.0 / new_zoom - 1.0 / old_zoom;
+        for (probe, was) in probes.iter().zip(before.iter()) {
+            let now = view.to_document(*probe);
+            let shift = (now.0 - was.0, now.1 - was.1);
+            let expected = (probe.0 * scale, probe.1 * scale);
+            assert!(
+                (shift.0 - expected.0).abs() <= expected.0.abs().mul_add(1e-3, 1e-3)
+                    && (shift.1 - expected.1).abs() <= expected.1.abs().mul_add(1e-3, 1e-3),
+                "at {probe:?} the shift must be x * (1/z1 - 1/z0): expected \
+                 {expected:?}, got {shift:?}"
+            );
+        }
+        // The two halves of "not uniform", stated as assertions rather
+        // than left to the formula above: nothing moves at the anchor,
+        // and something very much does elsewhere.
+        let anchor_now = view.to_document((0.0, 0.0));
+        let Some(anchor_was) = before.first() else {
+            unreachable!("three probes");
+        };
+        assert!(
+            (anchor_now.0 - anchor_was.0).abs() < 1e-3
+                && (anchor_now.1 - anchor_was.1).abs() < 1e-3,
+            "the (0, 0) anchor is held fixed across the raise: \
+             {anchor_was:?} -> {anchor_now:?}"
+        );
+        let Some(far_was) = before.last() else {
+            unreachable!("three probes");
+        };
+        let far_now = view.to_document((900.0, 700.0));
+        assert!(
+            (far_now.0 - far_was.0).abs() > 100.0,
+            "and a point far from it is not: {far_was:?} -> {far_now:?}"
+        );
+    }
+
+    /// **The negative control for `continue_drag`'s own `Drag::Move`
+    /// arm** (RT-06). `commit_ending_drag`'s doc comment argues that
+    /// arm must *not* clamp — the clamp would feed the moved view back
+    /// into the next event's delta, which is derived from a fixed
+    /// `start_doc` through `to_document`, and the drag would chase
+    /// itself. Until now that argument was defended only by prose:
+    /// adding the clamp there passed the whole suite.
+    ///
+    /// So this re-spells the arm both ways over the same pointer path —
+    /// the real [`continue_drag`], and a local copy with exactly the
+    /// clamp the design bans (against the moving layer's own origin,
+    /// which is what `active_layer_origin` reports once
+    /// `App::apply_move` has written `current_bounds` back) — and
+    /// asserts they disagree. The real one tracks the pointer exactly;
+    /// the fed-back one runs away from it.
+    #[test]
+    fn clamping_inside_the_move_arm_would_feed_back_into_its_own_delta() {
+        let start_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
+        // Panned right/down, so a clamp against a layer origin at or
+        // past the document origin really does have something to bite.
+        let start_view = || {
+            let mut view = CanvasView::new();
+            view.pan_by((40.0, 40.0));
+            view
+        };
+        let path = [(60.0, 60.0), (80.0, 80.0), (100.0, 100.0), (120.0, 120.0)];
+
+        let mut real_view = start_view();
+        let mut selection = SelectionSet::new();
+        let start_doc = real_view.to_document((40.0, 40.0));
+        let mut real = Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc,
+            start_bounds,
+            current_bounds: start_bounds,
+        };
+        for point in path {
+            let _ = continue_drag(
+                &mut real,
+                point,
+                &mut real_view,
+                &mut selection,
+                bounds_at((0.0, 0.0), None),
+            );
+        }
+        let Drag::Move {
+            current_bounds: real_bounds,
+            ..
+        } = real
+        else {
+            unreachable!("still a Move drag");
+        };
+
+        // The same arm, with the clamp added.
+        let mut fed_back_view = start_view();
+        let mut fed_back = start_bounds;
+        for point in path {
+            let current_doc = fed_back_view.to_document(point);
+            fed_back = shift_bounds(
+                start_bounds,
+                (current_doc.0 - start_doc.0, current_doc.1 - start_doc.1),
+            );
+            // What `App::apply_move` writes back, and what a clamp in
+            // this arm would then measure against.
+            #[allow(clippy::cast_precision_loss)]
+            fed_back_view.clamp_pan_to_minimum((fed_back.x as f32, fed_back.y as f32));
+        }
+
+        assert_eq!(
+            real_bounds,
+            aurora_core::Rect {
+                x: 80,
+                y: 80,
+                ..start_bounds
+            },
+            "the real arm tracks the pointer's own (80, 80) delta exactly"
+        );
+        assert_ne!(
+            fed_back, real_bounds,
+            "a clamp in this arm has to visibly diverge, or the design rationale for leaving it \
+             out is untested"
+        );
+        assert!(
+            fed_back.x > real_bounds.x && fed_back.y > real_bounds.y,
+            "and it diverges by running away from the pointer: {fed_back:?} vs {real_bounds:?}"
+        );
     }
 }

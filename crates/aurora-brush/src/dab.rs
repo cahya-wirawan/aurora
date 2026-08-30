@@ -19,7 +19,7 @@
 //! [`crate::stamp`] is where a dab position actually becomes pixels
 //! (`aurora_tile::TileStore`, addressed by `SurfaceId` per [ADR
 //! 0010](../../../docs/adr/0010-layer-pixel-storage.md)); this module
-//! only produces the positions `stamp::stamp_stroke` consumes.
+//! only produces the positions `stamp::stamp_dab` consumes.
 
 /// Dab spacing as a fraction of brush radius — `spike/vertical-slice`'s
 /// own proven default (a dab every quarter-radius travelled).

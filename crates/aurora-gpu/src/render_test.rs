@@ -10,7 +10,7 @@
 
 use crate::test_support::real_context;
 use crate::{CanvasPipeline, TileResidency};
-use aurora_tile::{SurfaceId, TILE, TileId, TileStore};
+use aurora_tile::{CHANNELS, SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 use std::num::NonZeroUsize;
 
@@ -18,6 +18,33 @@ use std::num::NonZeroUsize;
 /// whole rendered output and the expected pixel colour is unconditional
 /// (no partial-tile/checkerboard-edge cases to account for).
 const VIEWPORT: (u32, u32) = (256, 256);
+
+/// A 300×300 viewport — **the viewport every minification test below
+/// has to use**, and the reason is worth stating once here.
+///
+/// The atlas is sized `viewport.div_ceil(TILE) + 1` tiles, so
+/// `TileResidency::min_zoom_for_viewport` (the floor below which the
+/// canvas renders at the floor rather than shrinking further) is
+/// `viewport / (viewport rounded up to whole tiles)`. For [`VIEWPORT`],
+/// a whole number of tiles, that is exactly **1.0** — minification is
+/// unreachable there, and a test that asks for zoom 0.5 on it is
+/// silently testing zoom 1.0 instead. 300 px rounds up to two tiles, so
+/// the floor is `300 / 512 = 0.5859`, and everything from there up to
+/// 1.0 genuinely minifies (up to 1.7 atlas texels per screen pixel,
+/// LOD 0.77 — comfortably past the LOD-0.5 boundary where the sampler
+/// used to cross into an unwritten mip level).
+const MINIFYING_VIEWPORT: (u32, u32) = (300, 300);
+
+/// [`MINIFYING_VIEWPORT`]'s own zoom floor, `300 / 512`, spelled out so
+/// the tests below can say which side of it a zoom sits on.
+const MINIFYING_FLOOR: f32 = 300.0 / 512.0;
+
+/// Eight evenly spaced sample points across [`MINIFYING_VIEWPORT`], each
+/// the centre of its own eighth of the frame and all far from any tile
+/// boundary at the scales these tests render at.
+fn eight_columns_across() -> Vec<(u32, u32)> {
+    (0..8).map(|i| (18 + i * 37, 64)).collect()
+}
 
 fn tile_store() -> (tempfile::TempDir, TileStore) {
     let dir = match tempfile::tempdir() {
@@ -223,6 +250,31 @@ fn render_and_sample_pixel(
     target_size: (u32, u32),
     sample: (u32, u32),
 ) -> [u8; 4] {
+    let sampled =
+        render_and_sample_pixels(device, queue, canvas, residency, target_size, &[sample]);
+    match sampled.first() {
+        Some(&pixel) => pixel,
+        None => unreachable!("exactly one sample point was requested"),
+    }
+}
+
+/// The many-points form of [`render_and_sample_pixel`]: renders **one**
+/// frame and reads several pixels out of it.
+///
+/// This exists because a single centre-pixel check is structurally blind
+/// to a whole class of bug — anything where the canvas shows real,
+/// plausible content at the centre while the content *across* the
+/// viewport is wrong (duplicated, mis-ordered, or clamped). Reading many
+/// points from the same frame is also the only way to compare them
+/// meaningfully: separate renders would each be a separate frame.
+fn render_and_sample_pixels(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    canvas: &mut CanvasPipeline,
+    residency: &TileResidency,
+    target_size: (u32, u32),
+    samples: &[(u32, u32)],
+) -> Vec<[u8; 4]> {
     let bind_group = canvas.bind_group(device, residency);
     let pipeline = canvas.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
 
@@ -267,7 +319,15 @@ fn render_and_sample_pixel(
         pass.draw(0..3, 0..1);
     }
 
-    let bytes_per_row = target_size.0 * 4;
+    // Padded up to `COPY_BYTES_PER_ROW_ALIGNMENT` (256): wgpu rejects a
+    // texture-to-buffer copy whose row stride is not a multiple of it,
+    // and a viewport width that is not a multiple of 64 pixels
+    // (64 * 4 bytes) has one. Every offset below is computed from this
+    // padded stride, so the padding is invisible to callers -- it is
+    // what lets a test pick a viewport for its *geometry* (e.g. 300 px,
+    // the only way to reach a minifying zoom now that the atlas clamps
+    // zoom to whole-tile coverage) rather than for its row alignment.
+    let bytes_per_row = (target_size.0 * 4).div_ceil(256) * 256;
     let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
         size: u64::from(bytes_per_row) * u64::from(target_size.1),
@@ -312,18 +372,103 @@ fn render_and_sample_pixel(
     let Ok(data) = slice.get_mapped_range() else {
         unreachable!("the buffer was just confirmed mapped successfully above");
     };
-    let (sx, sy) = sample;
-    let offset = (sy as usize) * (bytes_per_row as usize) + (sx as usize) * 4;
-    let Some(pixel) = data.get(offset..offset + 4) else {
-        unreachable!("sample is well within the readback buffer's own bounds");
-    };
-    let result = match pixel {
-        &[r, g, b, a] => [r, g, b, a],
-        _ => unreachable!("sliced exactly 4 bytes"),
-    };
+    let mut results = Vec::with_capacity(samples.len());
+    for &(sx, sy) in samples {
+        let offset = (sy as usize) * (bytes_per_row as usize) + (sx as usize) * 4;
+        let Some(pixel) = data.get(offset..offset + 4) else {
+            unreachable!("every sample point is well within the readback buffer's own bounds");
+        };
+        results.push(match pixel {
+            &[r, g, b, a] => [r, g, b, a],
+            _ => unreachable!("sliced exactly 4 bytes"),
+        });
+    }
     drop(data);
     readback_buffer.unmap();
-    result
+    results
+}
+
+/// The test that catches "the compositing paths were straightened but
+/// `fs_canvas` was left on the premultiplied formula" — the single most
+/// likely way 0.52.0's three-layer premultiplied-alpha fix could have
+/// gone wrong.
+///
+/// Until 0.52.0 two bugs cancelled out on screen: `aurora-app`'s
+/// top-level compositing entry points left the composite surface in
+/// *premultiplied* alpha, and this shader's own final line was the
+/// premultiplied "over" formula (`c.rgb + bg * (1 - c.a)`), so the live
+/// canvas looked approximately right while every export and every
+/// eyedropper read carried the wrong colour. Straightening the
+/// compositing paths without also fixing the shader would have made
+/// translucent content render *too bright* — here, clipping to a fully
+/// saturated 255 — so this test pins the shader half specifically.
+///
+/// Fixture: a solid 50%-alpha white tile, `(1.0, 1.0, 1.0, 0.5)` in
+/// straight alpha, which is exactly what `composite_roots_into_tile` now
+/// produces for one opaque-white layer at 50% opacity. Expected at the
+/// sampled centre pixel: the straight-alpha "over" of white onto the
+/// checkerboard's own lighter square (`check = 0.24`, since
+/// `floor(128.5 / 8) = 16` on both axes and `(16 + 16) % 2 == 0`):
+/// `1.0 * 0.5 + 0.24 * 0.5 = 0.62`, i.e. `round(0.62 * 255) = 158` in
+/// the `Rgba8Unorm` render target. The pre-fix formula would give
+/// `1.0 + 0.24 * 0.5 = 1.12`, clamped to `255` — asserted against
+/// explicitly below.
+///
+/// A tolerance of 1 (out of 255), not exact equality: unlike the
+/// fully-opaque fixtures the tests around this one use, `0.24` is not an
+/// exact binary fraction, so the last unit of the 8-bit quantization is
+/// genuinely at the mercy of the driver's own rounding. The two
+/// candidate values here differ by ~97 units, so a tolerance of 1
+/// discriminates them with enormous margin.
+#[test]
+fn canvas_pipeline_blends_a_translucent_tile_against_the_checkerboard() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    paint(
+        &mut store,
+        surface,
+        TileId { x: 0, y: 0 },
+        [1.0, 1.0, 1.0, 0.5],
+    );
+
+    let mut residency = TileResidency::new(device, queue, VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+    let pixel = render_and_sample_pixel(
+        device,
+        queue,
+        &mut canvas,
+        &residency,
+        VIEWPORT,
+        (VIEWPORT.0 / 2, VIEWPORT.1 / 2),
+    );
+
+    let [r, g, b, a] = pixel;
+    // 0.5 * 1.0 + 0.5 * 0.24 = 0.62 -> 158/255.
+    let expected = 158_i32;
+    for (channel, label) in [(r, "red"), (g, "green"), (b, "blue")] {
+        let delta = i32::from(channel) - expected;
+        assert!(
+            delta.abs() <= 1,
+            "{label} channel: expected ~{expected} (straight-alpha white over the 0.24 \
+             checkerboard square), got {channel}"
+        );
+        assert!(
+            channel < 250,
+            "{label} channel clipped to {channel}: fs_canvas is still using the \
+             premultiplied \"over\" formula, which now double-counts alpha and renders \
+             translucent content far too bright"
+        );
+    }
+    assert_eq!(a, 255, "the canvas shader always writes an opaque result");
 }
 
 #[test]
@@ -598,4 +743,737 @@ fn canvas_pipeline_a_small_sub_tile_pan_visibly_moves_the_content() {
         "a sub-tile pan must visibly change the rendered pixel, not leave \
          it snapped to the pre-pan tile boundary"
     );
+}
+
+/// The money test for "the canvas goes pure checkerboard when you zoom
+/// out" — reported as "zoom 0.5 renders pure checkerboard", but the real
+/// boundary is not 0.5 at all.
+///
+/// `write_uniform` sets `uv_scale = viewport_px / zoom / tex_size`, so
+/// the atlas covers `1/zoom` texels per screen pixel and the hardware's
+/// own computed LOD is `log2(1/zoom) = -log2(zoom)`. The sampler rounds
+/// that to the nearest whole mip level, so it crossed from level 0 to
+/// level 1 at LOD 0.5 — `zoom = 2^-0.5 ≈ 0.7071`. *Every* zoom below
+/// ~71% was affected, not 0.5 specifically. The atlas carries
+/// `MIP_LEVELS` = 4 levels but only level 0 is ever written live
+/// (`sync` writes `mip_level: 0`; `upload_mip` has no call site in
+/// `aurora-app`), and wgpu lazily zero-initializes what was never
+/// written — so the sampler read `(0, 0, 0, 0)`, `fs_canvas`'s
+/// straight-alpha "over" collapsed to pure background, and the user saw
+/// checkerboard where their document should be.
+///
+/// Runs on [`MINIFYING_VIEWPORT`], not [`VIEWPORT`]: since 0.57.3 the
+/// atlas clamps zoom to `min_zoom_for_viewport`, which for a
+/// whole-number-of-tiles viewport is exactly 1.0 — on `VIEWPORT` this
+/// sweep would silently render every entry at zoom 1.0 and prove
+/// nothing about minification. On a 300 px viewport the floor is
+/// 0.5859, so the entries below it render at 0.5859 (1.7 texels per
+/// pixel, LOD 0.77) and the entries above it render at themselves;
+/// either way every one of them is genuinely minified and still past
+/// the LOD-0.5 boundary this test exists to guard.
+///
+/// All nine tiles of the 3×3 slot grid are painted, not just `(0, 0)`:
+/// at these zooms the window spans more than one tile, and
+/// `min_filter: Linear` can pull from any neighbouring slot, so a
+/// single painted tile would make the result depend on slot-boundary
+/// filtering rather than on the bug under test.
+#[test]
+fn canvas_pipeline_shows_tile_content_at_minifying_zoom_levels() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    let green = [0.0, 1.0, 0.0, 1.0];
+    for y in 0..3 {
+        for x in 0..3 {
+            paint(&mut store, surface, TileId { x, y }, green);
+        }
+    }
+
+    let mut residency = TileResidency::new(device, queue, MINIFYING_VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(
+        stats.uploaded, 9,
+        "a 300x300 viewport needs a 3x3 slot grid"
+    );
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+    let centre = (MINIFYING_VIEWPORT.0 / 2, MINIFYING_VIEWPORT.1 / 2);
+
+    // 1.0/0.99/0.75 sit above the LOD-0.5 rounding boundary and always
+    // worked; everything from 0.7071 down sits on or below it and
+    // rendered pure checkerboard. `2^-0.5` and `0.70` bracket the
+    // boundary itself as tightly as f32 usefully allows -- the exact
+    // crossing point is the one value a coarse sweep would step over.
+    // `0.01` is `aurora_ui::CanvasView::MIN_ZOOM` (spelled as a literal:
+    // `aurora-ui` sits *above* this crate in the layering, so this crate
+    // cannot depend on it -- PRD 7.2), the extreme end of the range a
+    // user can actually reach.
+    for zoom in [
+        1.0_f32,
+        0.99,
+        0.75,
+        2.0_f32.powf(-0.5),
+        0.70,
+        0.6,
+        0.5,
+        0.25,
+        0.01,
+    ] {
+        residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, zoom);
+        let pixel = render_and_sample_pixel(
+            device,
+            queue,
+            &mut canvas,
+            &residency,
+            MINIFYING_VIEWPORT,
+            centre,
+        );
+        assert_eq!(
+            pixel,
+            [0, 255, 0, 255],
+            "at zoom {zoom} (rendered at {}) the canvas must show the painted \
+             opaque green tile. A value near [61, 61, 61, 255] is the \
+             checkerboard's lighter square at this pixel, i.e. *no content at \
+             all* rather than a wrong colour -- that is the pre-fix symptom of \
+             the sampler selecting an unwritten, zero-initialized mip level",
+            TileResidency::effective_zoom(MINIFYING_VIEWPORT, zoom)
+        );
+    }
+}
+
+/// The mechanism-discriminating half of the pair above: positive proof
+/// that at zoom 0.5 the sampler was reading mip level *1*, rather than
+/// some other source of transparency (a missed upload, a bad slot
+/// address, a wrong `uv_offset`).
+///
+/// Level 0 is painted green by `sync`; level 1 is then filled magenta by
+/// hand via `upload_mip`. Before the fix this sampled magenta — the
+/// sampler really was selecting level 1. After the fix it samples green,
+/// because the view bound for sampling exposes level 0 and nothing else
+/// (`mip_level_count: Some(1)`), so level selection has nowhere to go.
+///
+/// On [`MINIFYING_VIEWPORT`] for the reason that constant documents: a
+/// zoom of 0.5 on [`VIEWPORT`] is clamped to 1.0, which magnifies, and
+/// a magnifying access never selects a lower level at all — the test
+/// would pass with the bug fully present.
+///
+/// This deliberately pins *today's policy* — the atlas is sampled at mip
+/// 0 only, because mips 1-3 are never populated in the live app. If
+/// progressive/LOD rendering is ever wired in (PLAN.md M1.3), this test
+/// is expected to fail, and that failure is the signal to widen the
+/// view's `mip_level_count` and choose a `mipmap_filter` deliberately
+/// rather than by accident.
+#[test]
+fn canvas_pipeline_samples_mip_level_zero_not_a_lower_level() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    let mut ids = Vec::new();
+    for y in 0..3 {
+        for x in 0..3 {
+            ids.push(TileId { x, y });
+        }
+    }
+    for id in &ids {
+        paint(&mut store, surface, *id, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    let mut residency = TileResidency::new(device, queue, MINIFYING_VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.uploaded, 9);
+    assert_eq!(stats.errors, 0);
+
+    // Mip level 1 is a half-size tile: (TILE/2)^2 texels, CHANNELS each.
+    let half = (TILE as usize) / 2;
+    let mut magenta = Vec::with_capacity(half * half * CHANNELS);
+    for i in 0..(half * half * CHANNELS) {
+        let channel = match i % 4 {
+            1 => 0.0,
+            _ => 1.0,
+        };
+        magenta.push(f16::from_f32(channel));
+    }
+    for id in &ids {
+        if let Err(err) = residency.upload_mip(queue, *id, 1, &magenta) {
+            unreachable!("a level-1 upload of the exact expected size must succeed: {err}");
+        }
+    }
+
+    let mut canvas = CanvasPipeline::new(device);
+    residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, 0.5);
+    let pixel = render_and_sample_pixel(
+        device,
+        queue,
+        &mut canvas,
+        &residency,
+        MINIFYING_VIEWPORT,
+        (MINIFYING_VIEWPORT.0 / 2, MINIFYING_VIEWPORT.1 / 2),
+    );
+    assert_eq!(
+        pixel,
+        [0, 255, 0, 255],
+        "at zoom 0.5 the sampler must read mip level 0 (green). \
+         [255, 0, 255, 255] means it selected level 1 (the magenta this test \
+         wrote there), which is the exact mechanism behind the pure-checkerboard \
+         bug -- live, level 1 is never written and reads as transparent black"
+    );
+}
+
+/// Paints tile `id` a colour that *encodes its own document position*,
+/// so a rendered pixel can be traced back to the tile it came from:
+/// red = `x / 8`, green = `y / 8`, blue = 1, alpha = 1.
+///
+/// Blue is pinned at full for every tile so it doubles as an
+/// unambiguous "this pixel is real content" marker: `fs_canvas`'s
+/// empty-canvas checkerboard is a low, neutral grey on every channel, so
+/// a blue channel near 255 cannot be checkerboard no matter how the two
+/// checkerboard shades happen to quantize.
+///
+/// Every existing canvas test in this file paints one uniform colour
+/// across every tile, which makes them all structurally incapable of
+/// seeing *which* tile a pixel came from — the exact blind spot the
+/// duplication test below exists to close.
+fn paint_position_encoded(store: &mut TileStore, surface: SurfaceId, id: TileId) {
+    #[allow(clippy::cast_precision_loss)]
+    let rgba = [(id.x as f32) / 8.0, (id.y as f32) / 8.0, 1.0, 1.0];
+    paint(store, surface, id, rgba);
+}
+
+/// Recovers the tile x index a sampled pixel's red channel encodes, the
+/// inverse of [`paint_position_encoded`]. Distinct tiles land 32 8-bit
+/// levels apart, far more than any rounding or filtering slop.
+fn decode_tile_x(pixel: [u8; 4]) -> u32 {
+    let Some(&red) = pixel.first() else {
+        unreachable!("a sampled pixel always has four channels");
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let index = (f32::from(red) / 255.0 * 8.0).round() as u32;
+    index
+}
+
+/// The canvas must never show the *same* document region twice across
+/// one frame — the "zoomed out and the document is tiled/duplicated"
+/// bug, which is a different defect from the mip-level checkerboard the
+/// tests above cover, and one the checkerboard was previously hiding.
+///
+/// Mechanism: `TileResidency`'s atlas grid is sized from the viewport
+/// alone (`viewport.div_ceil(TILE) + 1`), never from zoom, while
+/// `write_uniform`'s `uv_scale = viewport_px / zoom / tex_size` grows
+/// without bound as zoom falls. Once `uv_scale` exceeds the atlas's own
+/// coverage the sampler's `AddressMode::Repeat` wraps and re-samples the
+/// *same* resident slots, so the canvas showed a convincing, seamless,
+/// completely wrong duplicate of a sub-region of the document. `sync`
+/// reported `uploaded = 0, errors = 0` throughout: nothing anywhere
+/// signalled that content was missing.
+///
+/// The threshold is `zoom < viewport_px / atlas_px`, which for a real
+/// 1920 px canvas is `zoom < 0.833` — *higher* than the 0.7071 mip
+/// boundary, so this was already reachable in the 0.71-0.83 band before
+/// the mip fix, and would have become visible across the whole
+/// zoomed-out range after it.
+///
+/// What this asserts is deliberately weaker than "every sample shows the
+/// tile whose document position belongs there": the atlas genuinely does
+/// not hold the whole document at a minifying zoom, and making it hold
+/// it means sizing the atlas from zoom or wiring progressive/LOD
+/// rendering — separate, larger, already-tracked M1.3 work. What it does
+/// assert is the property that distinguishes an honest limitation from a
+/// lie: the tile shown must be **non-decreasing** left to right, and
+/// must actually advance (a frame showing one tile everywhere satisfies
+/// "non-decreasing" vacuously). Real content may run out; it must never
+/// wrap around and start over.
+#[test]
+fn canvas_pipeline_does_not_duplicate_document_content_when_zoomed_out() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    // The document has six tiles across; the 300x300 viewport's atlas
+    // holds three of them, and the frame at the zoom floor shows two.
+    for y in 0..3 {
+        for x in 0..6 {
+            paint_position_encoded(&mut store, surface, TileId { x, y });
+        }
+    }
+
+    let mut residency = TileResidency::new(device, queue, MINIFYING_VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.uploaded, 9, "a 3x3 slot grid, fully uploaded");
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+    residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, 0.25);
+
+    let samples = eight_columns_across();
+    let pixels = render_and_sample_pixels(
+        device,
+        queue,
+        &mut canvas,
+        &residency,
+        MINIFYING_VIEWPORT,
+        &samples,
+    );
+    let seen: Vec<u32> = pixels.iter().map(|&p| decode_tile_x(p)).collect();
+
+    assert!(
+        seen.is_sorted(),
+        "tile indices across the viewport must never go backwards; \
+         got {seen:?} at zoom 0.25. A repeating pattern (e.g. \
+         [0, 0, 1, 1, 0, 0, 1, 1]) is the atlas UV wrapping around and \
+         showing the same document region a second time -- a seamless, \
+         convincing duplicate of content that is not there"
+    );
+    assert!(
+        seen.contains(&0),
+        "the document's own top-left tile must still be visible at the \
+         left edge; got {seen:?}"
+    );
+    assert!(
+        seen.contains(&1),
+        "the frame must actually span more than one tile, or \
+         `is_sorted` above is satisfied by a frame that shows a single \
+         tile everywhere and proves nothing; got {seen:?}"
+    );
+}
+
+/// Positive proof that `min_filter: FilterMode::Linear` is genuinely in
+/// effect when the canvas is minified — i.e. that pinning the sampler to
+/// a single mip level did not silently turn filtering off.
+///
+/// This matters because the two obvious ways to pin a sampler to level 0
+/// are *not* equivalent. `lod_max_clamp: 0.0` clamps the computed LOD to
+/// zero, and both the Vulkan and OpenGL specs make the
+/// magnification/minification decision on the LOD **after** that clamp —
+/// so a clamped LOD can never be positive, every access classifies as
+/// magnification, and `mag_filter` (`Nearest`) is used for every sample,
+/// `min_filter` never. Restricting the texture *view* to one mip level
+/// instead (`mip_level_count: Some(1)`) leaves the LOD alone: the access
+/// still classifies as minification, `min_filter` still applies, and
+/// there is simply no other level for level selection to reach.
+///
+/// Every other canvas test in this file paints uniform colours, under
+/// which `Nearest` and `Linear` are indistinguishable by construction —
+/// which is exactly why this needed its own fixture.
+///
+/// Fixture: a hard black/white edge down the middle of the atlas, viewed
+/// at zoom 0.6 (1.667 atlas texels per screen pixel, so the LOD is
+/// `log2(1.667) ≈ 0.74`, unambiguously minification). `Nearest` can only
+/// ever return the two source values; `Linear` must produce at least one
+/// intermediate pixel somewhere along the edge.
+///
+/// On [`MINIFYING_VIEWPORT`], whose zoom floor is 0.5859: zoom 0.6 is
+/// just above it, so it is rendered as asked. On [`VIEWPORT`] the floor
+/// is 1.0, the same request would be rendered at 1.0, and *nothing*
+/// would be minified — this test would then be asserting a property of
+/// `mag_filter` while claiming to test `min_filter`.
+#[test]
+fn canvas_pipeline_min_filter_linear_still_applies_when_minified() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    // Column 0 black, columns 1-2 white -- a vertical edge, so the
+    // vertical axis contributes nothing and only horizontal filtering
+    // shows up.
+    for y in 0..3 {
+        paint(
+            &mut store,
+            surface,
+            TileId { x: 0, y },
+            [0.0, 0.0, 0.0, 1.0],
+        );
+        for x in 1..3 {
+            paint(&mut store, surface, TileId { x, y }, [1.0, 1.0, 1.0, 1.0]);
+        }
+    }
+
+    let mut residency = TileResidency::new(device, queue, MINIFYING_VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.uploaded, 9);
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+    // Zoom 0.6 has to sit above this viewport's own zoom floor
+    // (`MINIFYING_FLOOR`, 0.5859), or it is not the zoom being rendered
+    // and the LOD reasoning above does not describe this frame.
+    assert!(
+        (TileResidency::effective_zoom(MINIFYING_VIEWPORT, 0.6) - 0.6).abs() < 1e-6,
+        "this viewport must render zoom 0.6 as asked; its floor is \
+         {MINIFYING_FLOOR}"
+    );
+    residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, 0.6);
+
+    // The atlas's own black/white boundary (document texel x = 256)
+    // lands at screen x = 256 * 0.6 ~= 153.6; scan generously either
+    // side of it rather than betting on one exact pixel.
+    let samples: Vec<(u32, u32)> = (130..180).map(|x| (x, 64)).collect();
+    let pixels = render_and_sample_pixels(
+        device,
+        queue,
+        &mut canvas,
+        &residency,
+        MINIFYING_VIEWPORT,
+        &samples,
+    );
+    let reds: Vec<u8> = pixels
+        .iter()
+        .map(|&p| match p.first() {
+            Some(&red) => red,
+            None => unreachable!("a sampled pixel always has four channels"),
+        })
+        .collect();
+
+    assert!(
+        reds.iter().any(|&r| (10..=245).contains(&r)),
+        "sampling across a hard black/white edge under minification must \
+         produce at least one blended pixel; got only the two source \
+         values {reds:?}, which is what `mag_filter: Nearest` returns -- \
+         i.e. `min_filter: Linear` is not actually being used"
+    );
+}
+
+/// A degenerate `zoom` must not corrupt the canvas.
+///
+/// `write_uniform` divides by `zoom`. `set_origin`'s doc comment used to
+/// argue no guard was needed because `aurora_ui::CanvasView` clamps zoom
+/// to `[MIN_ZOOM, MAX_ZOOM]` — but the value `aurora-app` actually
+/// passes is `effective_residency_zoom(canvas_zoom, scale_factor)`, a
+/// product formed in a *different* crate, and that helper only guards
+/// `scale_factor`. Zero, negative, infinite, denormal, and NaN zooms all
+/// reach here, and each poisons `uv_scale`.
+///
+/// The fallback is `1.0`, matching `effective_residency_zoom`'s own
+/// existing pattern for a bad `scale_factor`, so each degenerate value
+/// must render *exactly* the frame zoom 1.0 renders.
+///
+/// Position-encoded tiles and eight sample points, not one uniform
+/// colour at the centre: with a single flat green fixture every texel in
+/// the atlas is identical, so any sample at all — including one taken at
+/// a wildly wrong UV — returns the expected pixel and the test proves
+/// nothing.
+///
+/// On [`MINIFYING_VIEWPORT`] so that "renders the same frame as zoom
+/// 1.0" is a real claim: on [`VIEWPORT`] every zoom in this test — good
+/// or degenerate — is clamped to 1.0 and *every* frame matches, so the
+/// equality assertions would hold with the guard removed entirely. The
+/// `assert_ne!` below pins that distinction directly.
+#[test]
+fn canvas_pipeline_survives_a_degenerate_zoom() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    for y in 0..3 {
+        for x in 0..3 {
+            paint_position_encoded(&mut store, surface, TileId { x, y });
+        }
+    }
+
+    let mut residency = TileResidency::new(device, queue, MINIFYING_VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.uploaded, 9);
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+    let samples = eight_columns_across();
+    let render = |canvas: &mut CanvasPipeline, residency: &TileResidency| {
+        render_and_sample_pixels(
+            device,
+            queue,
+            canvas,
+            residency,
+            MINIFYING_VIEWPORT,
+            &samples,
+        )
+    };
+
+    residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, 1.0);
+    let baseline = render(&mut canvas, &residency);
+
+    for zoom in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, zoom);
+        let pixels = render(&mut canvas, &residency);
+        assert_eq!(
+            pixels, baseline,
+            "zoom {zoom} must fall back to 1.0 and render the identical \
+             frame. Anything else means the degenerate value reached \
+             `uv_scale` and the canvas is showing something that \
+             corresponds to no part of the document, with no error \
+             reported anywhere"
+        );
+    }
+
+    // A denormal is *not* one of these cases, and deliberately does not
+    // take the fallback: it is finite and positive, so it is a real (if
+    // absurd) zoom, and the zoom floor absorbs it exactly as it absorbs
+    // `MIN_ZOOM` -- both render at `min_zoom_for_viewport`. Substituting
+    // 1.0 here would be the wrong answer, not a safer one, so this pins
+    // the behaviour that it renders exactly as the smallest zoom a user
+    // can actually reach does.
+    residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, 0.01);
+    let at_min_zoom = render(&mut canvas, &residency);
+    residency.set_origin(
+        queue,
+        (0.0, 0.0),
+        MINIFYING_VIEWPORT,
+        f32::MIN_POSITIVE / 2.0,
+    );
+    let at_denormal = render(&mut canvas, &residency);
+    assert_eq!(
+        at_denormal, at_min_zoom,
+        "a denormal zoom must saturate to this viewport's own zoom floor \
+         exactly as MIN_ZOOM does, not poison `uv_scale`"
+    );
+    assert_ne!(
+        at_min_zoom, baseline,
+        "the floor frame and the zoom-1.0 frame have to actually differ, or \
+         every equality above is satisfied by a viewport on which no zoom \
+         changes anything -- which is exactly what this test looked like on \
+         a 256 px viewport, whose floor is 1.0"
+    );
+}
+
+/// `resize` rebuilds the atlas through `Self::new`, so it inherits both
+/// the single-mip-level view and the atlas-coverage clamp — today, and
+/// only incidentally. This pins that: a future `resize` that stops
+/// delegating to `new` (or grows its own texture/view construction)
+/// would otherwise silently reintroduce the pure-checkerboard bug on
+/// every window resize, with every other test in this file still green
+/// because none of them resize before rendering.
+#[test]
+fn canvas_pipeline_after_a_resize_still_shows_content_when_zoomed_out() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    for y in 0..3 {
+        for x in 0..4 {
+            paint_position_encoded(&mut store, surface, TileId { x, y });
+        }
+    }
+
+    let mut residency = TileResidency::new(device, queue, (128, 128));
+    residency.resize(device, queue, MINIFYING_VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(
+        stats.uploaded, 9,
+        "the post-resize 3x3 grid, freshly filled"
+    );
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+    let samples = eight_columns_across();
+    for zoom in [0.6_f32, 0.5, 0.25, 0.01] {
+        residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, zoom);
+        let pixels = render_and_sample_pixels(
+            device,
+            queue,
+            &mut canvas,
+            &residency,
+            MINIFYING_VIEWPORT,
+            &samples,
+        );
+        let seen: Vec<u32> = pixels.iter().map(|&p| decode_tile_x(p)).collect();
+        assert!(
+            pixels
+                .iter()
+                .all(|&p| matches!(p, [_, _, blue, _] if blue >= 200)),
+            "a resized atlas must still show real content when minified; \
+             at zoom {zoom} the full-blue content marker was missing \
+             ({pixels:?}), i.e. the canvas fell back to the empty-canvas \
+             checkerboard -- the pure-checkerboard bug returning"
+        );
+        assert!(
+            seen.is_sorted(),
+            "a resized atlas must inherit the zoom floor too; at zoom \
+             {zoom} the tile indices across the viewport went backwards \
+             ({seen:?}), i.e. the UV wrapped and duplicated document \
+             content"
+        );
+        assert!(
+            seen.contains(&1),
+            "the frame must actually span more than one tile at zoom \
+             {zoom}, or `is_sorted` is vacuous; got {seen:?}"
+        );
+    }
+}
+
+/// The atlas's UV wrap is **load-bearing**, and must survive any fix
+/// aimed at the duplication bug above.
+///
+/// `TileResidency` is a toroidal sliding window: slot `tx % grid.0`
+/// holds tile `tx`, and `write_uniform` wraps the scroll offset into
+/// `[0, 1)`. So whenever the visible window straddles the atlas's own
+/// right or bottom edge — which happens for most pan positions, at every
+/// zoom, because a 1920 px viewport's atlas is only 2304 px wide and
+/// `uv_scale` is already 0.833 at 100% — the right-hand part of the
+/// screen legitimately samples `uv > 1.0` and *must* wrap around to slot
+/// 0 to find the tile that belongs there.
+///
+/// That makes `AddressMode::ClampToEdge` the wrong tool for the
+/// duplication bug, even though it superficially describes the desired
+/// "stop at the edge" behaviour: it cannot distinguish this legitimate
+/// wrap from an out-of-coverage one, and would smear the atlas's edge
+/// column across the right half of the canvas during ordinary panning at
+/// 100% zoom. Here, origin `1.5 * TILE` puts the window at
+/// `uv ∈ [0.75, 1.25]`, so the right half of the frame is served
+/// entirely by the wrap; `ClampToEdge` renders tile 1 twice.
+#[test]
+fn canvas_pipeline_wraps_to_the_toroidal_slot_when_the_window_straddles_the_atlas_edge() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    for y in 0..3 {
+        for x in 0..3 {
+            paint_position_encoded(&mut store, surface, TileId { x, y });
+        }
+    }
+
+    let mut residency = TileResidency::new(device, queue, VIEWPORT);
+    // Half a tile past tile 1: the window covers document x 384..640,
+    // i.e. the right half of tile 1 followed by the left half of tile 2,
+    // and tile 2 lives in slot 0 (2 % 2), reachable only through the wrap.
+    let origin = 1.5 * f64::from(TILE) as f32;
+    residency.set_origin(queue, (origin, 0.0), VIEWPORT, 1.0);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.uploaded, 4);
+    assert_eq!(stats.errors, 0);
+
+    let mut canvas = CanvasPipeline::new(device);
+    let samples: Vec<(u32, u32)> = (0..8).map(|i| (16 + i * 32, 64)).collect();
+    let pixels =
+        render_and_sample_pixels(device, queue, &mut canvas, &residency, VIEWPORT, &samples);
+    let seen: Vec<u32> = pixels.iter().map(|&p| decode_tile_x(p)).collect();
+
+    assert_eq!(
+        seen,
+        vec![1, 1, 1, 1, 2, 2, 2, 2],
+        "the left half of the frame must show tile 1 and the right half \
+         tile 2, which is only reachable by wrapping past the atlas's own \
+         right edge into slot 0. `[1, 1, 1, 1, 1, 1, 1, 1]` means the wrap \
+         was replaced with edge clamping and half the canvas is now a \
+         duplicate of the wrong tile"
+    );
+}
+
+/// **RT12-02, end to end through a real render pass**: panning at a
+/// constant zoom must not change the scale the canvas is drawn at.
+///
+/// The regression this pins was real and measured. `uv_scale` used to be
+/// clamped per axis to `tex_size - sub_tile`, and `sub_tile` — the
+/// fractional part of the pan position within the top-left tile — sweeps
+/// `[0, TILE)` continuously as the user pans. So the clamp, and with it
+/// the rendered scale, ramped smoothly across one tile of panning and
+/// then snapped back: measured 0.500 → 0.889 (a 1.78× change) at a
+/// *constant* user zoom of 0.5. The document visibly breathed while the
+/// user dragged it.
+///
+/// Mechanism of the test: tile 0 is black and every tile right of it is
+/// white, so the document has exactly one vertical edge, at document
+/// x = `TILE`. Wherever that edge lands on screen tells us the scale
+/// directly — `screen_x = (TILE - doc_origin_x) * rendered_zoom` — and
+/// the frame is re-rendered at nine pan positions spanning one whole
+/// tile. If the scale is pan-independent, every one of those nine edge
+/// positions falls on the same straight line; if it ramps, they do not.
+///
+/// Both a zoom below this viewport's floor (0.5, rendered at the floor)
+/// and one above it (0.75, rendered as asked) are checked, so the test
+/// also confirms the *value* being held constant is the right one and
+/// not merely constant.
+#[test]
+fn canvas_pipeline_keeps_one_scale_while_panning_a_whole_tile() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+
+    for y in 0..3 {
+        paint(
+            &mut store,
+            surface,
+            TileId { x: 0, y },
+            [0.0, 0.0, 0.0, 1.0],
+        );
+        for x in 1..5 {
+            paint(&mut store, surface, TileId { x, y }, [1.0, 1.0, 1.0, 1.0]);
+        }
+    }
+
+    let mut residency = TileResidency::new(device, queue, MINIFYING_VIEWPORT);
+    let mut canvas = CanvasPipeline::new(device);
+    let row: Vec<(u32, u32)> = (0..MINIFYING_VIEWPORT.0).map(|x| (x, 150)).collect();
+
+    for zoom in [0.5_f32, 0.75] {
+        let rendered = TileResidency::effective_zoom(MINIFYING_VIEWPORT, zoom);
+        for step in 0..=8 {
+            let doc_origin_x = (step as f32) * (TILE as f32) / 8.0;
+            residency.set_origin(queue, (doc_origin_x, 0.0), MINIFYING_VIEWPORT, zoom);
+            let _ = residency.sync(queue, &mut store, surface, false, usize::MAX);
+            let pixels = render_and_sample_pixels(
+                device,
+                queue,
+                &mut canvas,
+                &residency,
+                MINIFYING_VIEWPORT,
+                &row,
+            );
+            // The first column that is unambiguously the white half of
+            // the document: `min_filter: Linear` blends across roughly
+            // one pixel at the edge, so this lands within a pixel of the
+            // true boundary rather than exactly on it.
+            let Some(edge) = pixels
+                .iter()
+                .position(|&p| matches!(p, [red, _, _, _] if red > 200))
+            else {
+                unreachable!("the white half of the document is always in frame");
+            };
+            let expected = ((TILE as f32) - doc_origin_x) * rendered;
+            #[allow(clippy::cast_precision_loss)]
+            let seen = edge as f32;
+            assert!(
+                (seen - expected).abs() <= 2.0,
+                "at a constant zoom of {zoom} (rendered at {rendered}), panning \
+                 to document x {doc_origin_x} put the document's own black/white \
+                 edge at screen x {seen} where {expected} is where that scale \
+                 puts it. An edge that drifts as the pan advances -- and snaps \
+                 back once per tile -- means the rendered scale is a function of \
+                 the pan position, which is the regression this test exists for"
+            );
+        }
+    }
 }

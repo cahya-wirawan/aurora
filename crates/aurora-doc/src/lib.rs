@@ -14,15 +14,21 @@
 //! [`LayerTree`], plus an in-memory crash-recovery journal
 //! ([`History::replay`]) — see that module's own doc comment for the
 //! durable-persistence half deliberately not yet built.
+//!
+//! [`sanitize_display_name`] is the one shared, display-only bound both
+//! panels that turn a file-supplied layer name into an `accesskit` label
+//! go through; see its module's own doc comment.
 
 mod error;
 mod history;
 mod layer;
 mod selection;
+mod text_safety;
 mod tree;
 
 pub use error::DocError;
 pub use history::History;
 pub use layer::{BlendMode, Layer, LayerId, LayerKind, LayerLock, LayerMask};
 pub use selection::{Selection, SelectionSet};
-pub use tree::LayerTree;
+pub use text_safety::sanitize_display_name;
+pub use tree::{LayerTree, MAX_LAYER_TREE_DEPTH};

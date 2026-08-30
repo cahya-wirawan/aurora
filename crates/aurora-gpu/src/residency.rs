@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use aurora_core::MAX_DOCUMENT_EXTENT;
 use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 
@@ -22,6 +23,53 @@ const TILE_BYTES: usize = SAMPLES * 2;
 /// than configurable — nothing needs more, and this crate doesn't depend
 /// on `aurora-render`'s `MipLevel` enum, but the correspondence is exact
 /// by convention: 0 = Full, 1 = Half, 2 = Quarter, 3 = Eighth.
+///
+/// **Levels 1-3 are allocated but structurally unreachable today** —
+/// this is the one place that rationale is written down; everything else
+/// points here.
+///
+/// Nothing in the live frame loop populates them: [`TileResidency::sync`]
+/// uploads `mip_level: 0` only, and [`TileResidency::upload_mip`] (which
+/// can write the rest) has no call site in `aurora-app`. wgpu lazily
+/// zero-initializes what was never written, so a sample that landed on
+/// one of those levels read `(0, 0, 0, 0)`, `fs_canvas`'s straight-alpha
+/// "over" collapsed to pure background, and the canvas rendered as pure
+/// checkerboard.
+///
+/// It *did* land on them. `write_uniform` makes the atlas cover `1/zoom`
+/// texels per screen pixel, so the hardware's computed LOD is
+/// `-log2(zoom)`; the default `MipmapFilterMode::Nearest` rounds that to
+/// a whole level and crosses into level 1 at LOD 0.5 — `zoom = 2^-0.5 ≈
+/// 0.7071`. Every zoom below ~71% showed the user nothing at all.
+///
+/// The fix is at the *view*, not the sampler: [`TileResidency::new`]
+/// builds its sampled view with `mip_level_count: Some(1)`, so level 0
+/// is the only level that exists as far as sampling is concerned and
+/// level selection has nowhere else to go. The obvious alternative,
+/// `lod_max_clamp: 0.0` on the sampler, is **not** equivalent and was
+/// measured not to be: both the Vulkan and OpenGL specs make the
+/// magnification/minification decision on the LOD *after* the clamp, so
+/// a clamped LOD is never positive, every access classifies as
+/// magnification, and `mag_filter` (`Nearest`) silently replaces
+/// `min_filter` (`Linear`) for every sample —
+/// `canvas_pipeline_min_filter_linear_still_applies_when_minified` in
+/// `render_test.rs` was measured failing with that spelling and passing
+/// with this one **on this sandbox's Mesa llvmpipe *software* Vulkan
+/// adapter** (`llvmpipe (LLVM 21.1.8, 256 bits) (Vulkan, Cpu)`), the
+/// only adapter available here. No real GPU has been asked; the claim
+/// this comment used to make -- that it "fails on real hardware" -- was
+/// never measured on any.
+///
+/// **The cost of keeping four levels is accepted, not overlooked**: the
+/// unreachable levels are about 33% extra atlas VRAM (`1/4 + 1/16 +
+/// 1/64`). They stay allocated because [`TileResidency::upload_mip`] and
+/// its tests are real, working infrastructure for the progressive/LOD
+/// rendering PLAN.md tracks under M1.3, and deleting them to reclaim
+/// memory during a bug-fix round would trade tested groundwork for a
+/// saving nothing has asked for. Wiring that path means widening the
+/// view's `mip_level_count` and choosing a `mipmap_filter` deliberately,
+/// in the same change that starts filling the chain — not as a side
+/// effect.
 const MIP_LEVELS: u32 = 4;
 
 /// The result of one [`TileResidency::sync`] call.
@@ -78,20 +126,61 @@ pub struct TileResidency {
 }
 
 impl TileResidency {
+    /// The largest document coordinate [`Self::set_origin`] will
+    /// address, in document pixels: [`MAX_DOCUMENT_EXTENT`], the
+    /// project's own 300,000 px document ceiling (ADR 0002, matching
+    /// Adobe PSB). The bound is on the **layer-local** origin
+    /// `set_origin` receives (`aurora_app`'s own `canvas_local_origin`,
+    /// i.e. the document position at the canvas's top-left corner minus
+    /// the active layer's own origin), not on a raw document
+    /// coordinate — so a caller mirroring it in document space measures
+    /// it *from that layer's own origin*, not from `(0, 0)`.
+    ///
+    /// This is a **safety bound, not a policy**: `origin` is a
+    /// whole-tile index and this type's own internal uniform-buffer
+    /// write multiplies it back
+    /// by [`TILE`], so an unbounded `doc_origin` (`f32::MAX`,
+    /// `f32::INFINITY`, or simply a number around 4.295e9 reached by
+    /// sustained panning at a very low zoom) overflows that `u32`
+    /// multiply — a hard panic in debug, where this workspace denies
+    /// `panic` precisely because "a panic loses unsaved work", and a
+    /// silent wrap addressing the wrong tile in release. No real
+    /// document extends past this ceiling, so clamping to it cannot
+    /// cost a caller anything it was entitled to.
+    ///
+    /// **Public for the same reason [`Self::min_zoom_for_viewport`] is,
+    /// and it is the same bug** (0.57.10). The render path is not the
+    /// only consumer of the canvas transform: `aurora_ui::CanvasView::
+    /// to_document` converts pointer positions to document space for
+    /// painting, and past this ceiling the private `clamp_doc_origin`
+    /// saturates the *rendered* origin while `to_document` keeps
+    /// reporting the true, unbounded position — render and paint
+    /// silently diverge, exactly as they did below zero before
+    /// `CanvasView::clamp_pan_to_minimum` existed. The clamp here is
+    /// the backstop, not the mechanism:
+    /// **`aurora_ui::CanvasView::clamp_pan_to_maximum` is the caller
+    /// responsible for keeping the view inside this bound**, driven
+    /// from `aurora-app`'s own `PanBounds`, which measures it as the
+    /// active layer's origin plus this constant. This crate sits below
+    /// `aurora-ui` in the layering (PRD §7.2) and so cannot reach into
+    /// `CanvasView` itself.
+    pub const MAX_DOC_ORIGIN_PX: f32 = MAX_DOCUMENT_EXTENT as f32;
+
     /// Sizes the atlas to `viewport_px`, rounded up to whole tiles plus
     /// one tile of margin (matches the spike's `ct = viewport/TILE + 1`
     /// exactly), and establishes an initial origin of `(0, 0)`.
     #[must_use]
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, viewport_px: (u32, u32)) -> Self {
-        let grid = (
-            viewport_px.0.div_ceil(TILE) + 1,
-            viewport_px.1.div_ceil(TILE) + 1,
-        );
+        let grid = Self::grid_for(viewport_px);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tile-residency"),
             size: wgpu::Extent3d {
-                width: grid.0 * TILE,
-                height: grid.1 * TILE,
+                // Saturating for the same reason [`Self::grid_for`]
+                // is: an absurd viewport must reach wgpu's own size
+                // validation as an error, not panic on the multiply
+                // first.
+                width: grid.0.saturating_mul(TILE),
+                height: grid.1.saturating_mul(TILE),
                 depth_or_array_layers: 1,
             },
             mip_level_count: MIP_LEVELS,
@@ -107,9 +196,35 @@ impl TileResidency {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // **Sampling sees mip level 0 and nothing else.** Restricting the
+        // view rather than clamping the sampler's LOD is deliberate and
+        // measured -- see [`MIP_LEVELS`] for the full rationale, the bug
+        // this fixes, and why the sampler-side spelling is not
+        // equivalent. `upload_mip` still writes through `texture`
+        // directly, so the other levels remain writable and readable.
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("tile-residency"),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            ..wgpu::TextureViewDescriptor::default()
+        });
         // The wraparound is the hardware sampler's job, not WGSL's --
         // matches the spike exactly (`AddressMode::Repeat` both axes).
+        //
+        // `Repeat` is load-bearing and must stay: slot addressing is
+        // toroidal (`tile index modulo grid size`), so whenever the
+        // visible window straddles the atlas's own right or bottom edge
+        // -- most pan positions, at *every* zoom, since `uv_scale` is
+        // already 0.833 at 100% on a 1920 px viewport -- the far side of
+        // the screen legitimately samples `uv > 1.0` and has to wrap
+        // around to slot 0 to find the tile that belongs there.
+        // `ClampToEdge` cannot tell that wrap apart from an
+        // out-of-coverage one and was measured to smear the atlas's edge
+        // column across half the canvas during ordinary 100%-zoom
+        // panning (`render_test.rs`'s
+        // `canvas_pipeline_wraps_to_the_toroidal_slot_when_the_window_straddles_the_atlas_edge`).
+        // Keeping the sampled window inside the atlas's real coverage is
+        // `write_uniform`'s job instead.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("tile-residency"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -192,11 +307,20 @@ impl TileResidency {
     /// `doc_origin`: the exact, continuous document-local position (e.g.
     /// `aurora_app`'s own `canvas_local_origin`) that should render at
     /// the canvas's own top-left corner — **not** pre-floored to a whole
-    /// tile by the caller. Clamped to non-negative here (`TileId`'s own
-    /// fields are unsigned, so a negative document position has no tile
-    /// to point to — the same "outside the surface" case this atlas has
-    /// always clamped, now made explicit at this one boundary instead of
-    /// happening inside every caller). Split into `origin` (the
+    /// tile by the caller. Clamped to `[0, MAX_DOC_ORIGIN_PX]` here: to
+    /// non-negative because `TileId`'s own fields are unsigned, so a
+    /// negative document position has no tile to point to (the same
+    /// "outside the surface" case this atlas has always clamped, now
+    /// made explicit at this one boundary instead of happening inside
+    /// every caller), and to the document ceiling at the top because
+    /// `write_uniform` multiplies the whole-tile part back by [`TILE`]
+    /// in `u32`, which an unbounded value overflows — a hard panic in
+    /// debug, a wrong tile silently addressed in release (this module's
+    /// own [`Self::MAX_DOC_ORIGIN_PX`] constant carries the full
+    /// reasoning). A
+    /// NaN lands on `0.0`, not on NaN (`f32::max` returns the non-NaN
+    /// operand, which is why this is spelled `max`/`min` and not
+    /// `clamp` — `f32::clamp` propagates NaN). Split into `origin` (the
     /// whole-tile part, via floor-division by [`TILE`] — still exactly
     /// what [`Self::sync`]/[`Self::visible_tiles`]/slot addressing need)
     /// and `sub_tile` (the fractional remainder within that tile,
@@ -213,10 +337,29 @@ impl TileResidency {
     /// viewport, magnifying them — the shader-side scaling this
     /// texture-sliding-window design needs instead of an actual bigger
     /// upload (the atlas itself is still sized in document pixels, one
-    /// tile of margin at 100%, unrelated to `zoom`). Callers must pass a
-    /// positive `zoom`; `aurora_ui::CanvasView` already clamps to
-    /// `[MIN_ZOOM, MAX_ZOOM]`, both comfortably positive, so there is no
-    /// zero/negative case to guard against here.
+    /// tile of margin at 100%, unrelated to `zoom`).
+    ///
+    /// Callers should pass a positive, finite `zoom`, but a bad one is
+    /// *handled* rather than merely forbidden: this type's own
+    /// uniform-buffer write substitutes `1.0` for zero, negative,
+    /// infinite and NaN. This used
+    /// to claim no guard was needed because `aurora_ui::CanvasView`
+    /// clamps to `[MIN_ZOOM, MAX_ZOOM]`, which was wrong — `aurora-app`
+    /// passes `effective_residency_zoom(canvas_zoom, scale_factor)`, a
+    /// product formed in another crate whose own guard covers
+    /// `scale_factor` and not `canvas_zoom`, so the clamped value is not
+    /// what arrives here.
+    ///
+    /// Zooming *out* saturates rather than continuing indefinitely: the
+    /// atlas is sized from the viewport alone and holds only what that
+    /// viewport needs at 100%, so a `zoom` below
+    /// [`Self::min_zoom_for_viewport`] renders at that floor instead of
+    /// shrinking further. **Callers that also convert pointer positions
+    /// to document space must clamp their own zoom to that same value**
+    /// — [`Self::min_zoom_for_viewport`]'s doc comment explains why, and
+    /// `aurora-app`/`aurora_ui::CanvasView::set_min_zoom` is the real
+    /// caller doing it. The clamp here is the backstop, not the
+    /// mechanism.
     pub fn set_origin(
         &mut self,
         queue: &wgpu::Queue,
@@ -224,7 +367,7 @@ impl TileResidency {
         viewport_px: (u32, u32),
         zoom: f32,
     ) {
-        let (x, y) = (doc_origin.0.max(0.0), doc_origin.1.max(0.0));
+        let (x, y) = Self::clamp_doc_origin(doc_origin);
         let tile_size = TILE as f32;
         #[allow(clippy::cast_sign_loss)]
         let origin = TileId {
@@ -253,8 +396,15 @@ impl TileResidency {
     /// visible tile fresh rather than trusting stale bookkeeping.
     ///
     /// The document-space `origin` (which tile is top-left) carries over
-    /// unchanged — a resize changes how much of the document is
-    /// visible, not *which* part is being viewed. `zoom` isn't carried
+    /// unchanged, and so does `sub_tile`, the fractional position within
+    /// that tile — a resize changes how much of the document is
+    /// visible, not *which* part is being viewed, and that applies just
+    /// as much to a sub-tile pan offset as to the whole-tile part. (Only
+    /// `origin` used to be restored, so a resize silently snapped the
+    /// view back to the nearest tile boundary; the doc comment listed
+    /// what carried over and did not mention that `sub_tile` didn't.)
+    /// `slots` is the one thing that deliberately does *not* carry over,
+    /// for the reason above. `zoom` isn't carried
     /// over (this method has no way to know the caller's current value,
     /// and `TileResidency` doesn't store it between calls), so the
     /// uniform is rewritten at `zoom = 1.0` same as [`Self::new`]; a
@@ -272,15 +422,244 @@ impl TileResidency {
             return;
         }
         let origin = self.origin;
+        let sub_tile = self.sub_tile;
         *self = Self::new(device, queue, viewport_px);
         self.origin = origin;
+        self.sub_tile = sub_tile;
         self.write_uniform(queue, viewport_px, 1.0);
     }
 
-    fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32), zoom: f32) {
-        let tex_w = (self.grid.0 * TILE) as f32;
-        let tex_h = (self.grid.1 * TILE) as f32;
-        // Absolute scroll (origin in texels, now a genuinely fractional
+    /// The atlas grid — slots across, slots down — for a viewport:
+    /// `viewport.div_ceil(TILE) + 1` on each axis (the spike's own
+    /// `ct = viewport/TILE + 1`; the `+ 1` is one tile of margin, which
+    /// is exactly what a sub-tile pan offset consumes).
+    ///
+    /// Shared by [`Self::new`] and [`Self::min_zoom_for_viewport`] so
+    /// the atlas's real size and the zoom floor derived from that size
+    /// can never be computed from two different formulas.
+    ///
+    /// **Saturating, not wrapping.** A viewport within one tile of
+    /// `u32::MAX` makes `div_ceil(TILE) + 1` overflow, and every caller
+    /// then multiplies the result back up by `TILE` — which overflows
+    /// well before that, from a viewport of about 4.295e9 px. Both are a
+    /// hard `panic` in debug (this workspace denies `panic` precisely
+    /// because a panic loses unsaved work) and a silently wrong atlas
+    /// size in release. No real window reports such a viewport, but
+    /// `min_zoom_for_viewport` is now reached from `aurora-app`'s own
+    /// `redraw` on **every** frame, before the GPU/surface early-return
+    /// and with no GPU involved at all, so a bad viewport no longer has
+    /// to survive wgpu's own validation to get here. This is exactly the
+    /// defect class [`Self::clamp_doc_origin`] already guards on the
+    /// document axis; guarding one and not the other would be an
+    /// inconsistency, not a judgement call. Saturating leaves
+    /// [`Self::zoom_floor`] computing `viewport / (u32::MAX - TILE)` ≈
+    /// 1.0 — a sane, conservative floor, not garbage.
+    fn grid_for(viewport_px: (u32, u32)) -> (u32, u32) {
+        (
+            viewport_px.0.div_ceil(TILE).saturating_add(1),
+            viewport_px.1.div_ceil(TILE).saturating_add(1),
+        )
+    }
+
+    /// The smallest zoom an atlas of `tex_w` × `tex_h` texels can render
+    /// `viewport_px` at without either fabricating content or distorting
+    /// it. One scalar, both axes.
+    ///
+    /// Derivation: at `zoom`, the window wants `viewport_px / zoom`
+    /// document pixels per axis. The atlas covers `tex_size` texels
+    /// starting at `origin * TILE`, and the window starts `sub_tile`
+    /// into that, so `tex_size - sub_tile` are genuinely resident ahead
+    /// of it. `wanted <= tex_size - sub_tile` for every reachable
+    /// `sub_tile ∈ [0, TILE)` therefore means `wanted <= tex_size -
+    /// TILE`, i.e. `zoom >= viewport_px / (tex_size - TILE)`.
+    ///
+    /// **`tex_size - TILE`, not the current frame's `tex_size -
+    /// sub_tile`.** Using the live `sub_tile` makes the bound — and with
+    /// it the rendered scale — move continuously as the user pans, at a
+    /// constant user zoom, then snap back once per tile of panning
+    /// (measured: 0.500 → 0.889, a 1.78× scale change across one tile
+    /// of pan at zoom 0.5). Taking the worst case instead makes the
+    /// bound pan-independent by construction: nothing here reads
+    /// `sub_tile` at all.
+    ///
+    /// **One scalar for both axes, not a floor per axis.** The atlas is
+    /// not viewport-proportional (each axis is rounded up to whole tiles
+    /// separately), so the two axes saturate at different zooms;
+    /// clamping them independently leaves one axis still shrinking while
+    /// the other has stopped, which stretches the image — measured at up
+    /// to 33.6% on a 512 × 256 viewport, ~18.5% permanent horizontal
+    /// stretch on 1920 × 1080. Circles rendered as ellipses. Applying
+    /// the larger of the two floors to `zoom` itself keeps both axes at
+    /// exactly the same scale by construction.
+    fn zoom_floor(viewport_px: (u32, u32), tex_w: f32, tex_h: f32) -> f32 {
+        let tile = TILE as f32;
+        // `.max(tile)`: a zero-sized viewport gives a one-tile atlas, so
+        // `tex - TILE` is `0.0` and the division would be `0/0` (NaN) or
+        // `n/0` (infinity). One tile is the smallest coverage that can
+        // exist, so it is the right stand-in.
+        let fx = viewport_px.0 as f32 / (tex_w - tile).max(tile);
+        let fy = viewport_px.1 as f32 / (tex_h - tile).max(tile);
+        fx.max(fy)
+    }
+
+    /// **The zoom floor every consumer of this atlas's geometry must
+    /// clamp to.** Below it, [`Self::set_origin`] renders at this value
+    /// instead of the zoom it was given.
+    ///
+    /// This is public because the *render* path is not the only consumer
+    /// of the canvas transform: `aurora_ui::CanvasView::to_document`
+    /// converts pointer positions to document space for painting, and if
+    /// it divides by a zoom this atlas silently declined to honour, a
+    /// click paints somewhere other than where the pixel under the
+    /// cursor is drawn. That is not hypothetical — it was measured at
+    /// canvas zoom 0.25 on a 1920 px viewport (a click at screen x = 960
+    /// converting to document x ≈ 3840 while the pixel drawn there was
+    /// document x ≈ 1152) and it is the same failure shape
+    /// `CanvasView::clamp_pan_to_minimum` already exists to prevent on
+    /// the pan axis. The fix is the same one that method documents:
+    /// clamp at the source, so every downstream consumer reads one
+    /// already-bounded value and none of them computes its own.
+    ///
+    /// `aurora-app` is the real caller (`canvas_min_zoom` →
+    /// `CanvasView::set_min_zoom`); this crate sits below `aurora-ui` in
+    /// the layering (PRD §7.2) and so cannot reach into `CanvasView`
+    /// itself.
+    ///
+    /// **What it costs, stated plainly.** The value is
+    /// `viewport_px / (viewport_px rounded up to whole tiles)`, which
+    /// for any viewport at least one tile (256 px) across is in
+    /// `(0.5, 1.0]` — 0.9375 for a 1920 px axis, exactly 1.0 when the
+    /// viewport is a whole number of tiles. (A viewport *smaller* than
+    /// one tile has genuine room to zoom out, since the atlas's own
+    /// minimum is two tiles; nothing a real window reaches.) So on a 1×
+    /// display
+    /// zooming out is currently a no-op, and on a 2× display it stops at
+    /// about 50% canvas zoom (the atlas is sized in physical pixels).
+    /// The atlas is a 1:1 sliding window over the document with exactly
+    /// one tile of margin, and one tile of margin is exactly what a
+    /// sub-tile pan consumes — it has never had the coverage to render
+    /// minified, and the two previous attempts to paper over that
+    /// (wrapping the sampler, then clamping the sampled window per axis)
+    /// each traded the missing coverage for something worse: duplicated
+    /// content, then a pan-dependent, anisotropic scale. Real zoom-out
+    /// needs the atlas sized from zoom, or progressive/LOD rendering —
+    /// both M1.3 work, both larger than a bug fix.
+    #[must_use]
+    pub fn min_zoom_for_viewport(viewport_px: (u32, u32)) -> f32 {
+        let grid = Self::grid_for(viewport_px);
+        Self::zoom_floor(
+            viewport_px,
+            grid.0.saturating_mul(TILE) as f32,
+            grid.1.saturating_mul(TILE) as f32,
+        )
+    }
+
+    /// The zoom an atlas sized for `viewport_px` will *actually* render
+    /// `zoom` at: the degenerate-value guard and
+    /// [`Self::min_zoom_for_viewport`] applied, exactly as
+    /// [`Self::set_origin`] applies them internally.
+    ///
+    /// A caller that has already clamped its own zoom to
+    /// [`Self::min_zoom_for_viewport`] gets its own value back unchanged
+    /// — which is the property worth testing across a crate boundary,
+    /// because it is precisely what "the render path and the pointer
+    /// path agree" means.
+    #[must_use]
+    pub fn effective_zoom(viewport_px: (u32, u32), zoom: f32) -> f32 {
+        Self::guard_zoom(zoom).max(Self::min_zoom_for_viewport(viewport_px))
+    }
+
+    /// Defensive, not decorative. [`Self::uniform_values`] divides by
+    /// `zoom`, and [`Self::set_origin`]'s contract used to argue no
+    /// guard was needed because `aurora_ui::CanvasView` clamps zoom to
+    /// `[MIN_ZOOM, MAX_ZOOM]`. What `aurora-app` actually passes is
+    /// `effective_residency_zoom(canvas_zoom, scale_factor)` — a product
+    /// formed in a different crate, whose own guard covers
+    /// `scale_factor` and not `canvas_zoom` — so zero, negative,
+    /// infinite and NaN all reach here, and each poisons `uv_scale` into
+    /// a value that samples nothing recognisable. The fallback matches
+    /// `effective_residency_zoom`'s own pattern for a bad
+    /// `scale_factor`: treat it as 1.0 rather than render garbage.
+    ///
+    /// A **denormal** is deliberately not one of these cases: it is
+    /// finite and positive, so it is a real (if absurd) zoom, and the
+    /// zoom floor absorbs it exactly as it absorbs `MIN_ZOOM`.
+    fn guard_zoom(zoom: f32) -> f32 {
+        if zoom.is_finite() && zoom > 0.0 {
+            zoom
+        } else {
+            1.0
+        }
+    }
+
+    /// [`Self::set_origin`]'s `doc_origin` bound — see
+    /// [`Self::MAX_DOC_ORIGIN_PX`].
+    ///
+    /// `max` then `min` rather than `clamp`: `f32::clamp` propagates
+    /// NaN, while `f32::max` returns the non-NaN operand, so a NaN
+    /// `doc_origin` lands on `0.0` (the document's own top-left corner)
+    /// instead of poisoning every derived value.
+    // `f32::clamp` is exactly what this must *not* be: it propagates
+    // NaN, and a NaN document origin has to land on the document's own
+    // top-left corner rather than poison `origin`, `sub_tile`, and the
+    // UV offset derived from them. `max` then `min` is the spelling that
+    // does that (`f32::max` returns the non-NaN operand).
+    #[allow(clippy::manual_clamp)]
+    fn clamp_doc_origin(doc_origin: (f32, f32)) -> (f32, f32) {
+        (
+            doc_origin.0.max(0.0).min(Self::MAX_DOC_ORIGIN_PX),
+            doc_origin.1.max(0.0).min(Self::MAX_DOC_ORIGIN_PX),
+        )
+    }
+
+    /// The four floats `canvas.wgsl`'s `Canvas` uniform expects —
+    /// `uv_offset.xy`, `uv_scale.xy` — as a pure function of the atlas's
+    /// own state, so the geometry can be tested exactly, without a GPU
+    /// adapter, at arbitrary pan positions.
+    ///
+    /// `uv_scale` is computed from **one** clamped zoom for both axes
+    /// (see [`Self::zoom_floor`]), never per axis and never from the
+    /// current `sub_tile`. That is what makes the rendered scale
+    /// isotropic and pan-independent, and it is why there is no
+    /// remaining `min` against the atlas's coverage here: `zoom >=
+    /// zoom_floor` already implies `viewport_px / zoom <= tex_size -
+    /// TILE <= tex_size - sub_tile` on both axes, so no sample can reach
+    /// past the atlas's real coverage into the toroidal wrap and
+    /// duplicate document content. `uv_scale_never_reaches_past_the_atlas_coverage`
+    /// asserts that implication directly rather than leaving it to a
+    /// clamp that would then be both untested and, if it ever did fire,
+    /// pan-dependent again.
+    fn uniform_values(
+        grid: (u32, u32),
+        origin: TileId,
+        sub_tile: (f32, f32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+    ) -> [f32; 4] {
+        let tex_w = grid.0.saturating_mul(TILE) as f32;
+        let tex_h = grid.1.saturating_mul(TILE) as f32;
+        // The floor is taken against whichever atlas is *smaller*: the
+        // one this instance really has, or the one `viewport_px` would
+        // build. They are identical in every real call (`aurora-app`
+        // resizes the atlas and passes the viewport from the same
+        // `canvas_area_physical_size` call), but a caller that grew its
+        // viewport without calling `resize` first would otherwise get a
+        // floor its actual atlas cannot back, and duplication is the one
+        // outcome this must never have.
+        //
+        // `saturating_mul` here matches `grid_for`/`min_zoom_for_viewport`:
+        // `grid`/`capped` are already bounded by `grid_for`'s own
+        // `saturating_add`, but re-deriving `tex_w`/`tex_h` from them is
+        // still a `u32` multiply and must not reintroduce the overflow
+        // panic those two functions exist to close.
+        let capped = Self::grid_for(viewport_px);
+        let floor = Self::zoom_floor(
+            viewport_px,
+            grid.0.min(capped.0).saturating_mul(TILE) as f32,
+            grid.1.min(capped.1).saturating_mul(TILE) as f32,
+        );
+        let zoom = Self::guard_zoom(zoom).max(floor);
+        // Absolute scroll (origin in texels, a genuinely fractional
         // position -- `origin * TILE` plus the sub-tile remainder), then
         // wrapped into [0, tex_w)/[0, tex_h) for the repeat sampler --
         // slot addressing is toroidal, so the texture is a sliding
@@ -298,17 +677,21 @@ impl TileResidency {
         // negative remainder, wrapping the sample into the wrong texel
         // entirely) -- the safer default this comment says explicitly.
         let scroll = (
-            (self.origin.x * TILE) as f32 + self.sub_tile.0,
-            (self.origin.y * TILE) as f32 + self.sub_tile.1,
+            (origin.x * TILE) as f32 + sub_tile.0,
+            (origin.y * TILE) as f32 + sub_tile.1,
         );
-        let u = scroll.0.rem_euclid(tex_w) / tex_w;
-        let v = scroll.1.rem_euclid(tex_h) / tex_h;
-        let uv_scale = [
-            viewport_px.0 as f32 / zoom / tex_w,
-            viewport_px.1 as f32 / zoom / tex_h,
-        ];
-        let mut bytes = Vec::with_capacity(16);
-        for value in [u, v, uv_scale[0], uv_scale[1]] {
+        [
+            scroll.0.rem_euclid(tex_w) / tex_w,
+            scroll.1.rem_euclid(tex_h) / tex_h,
+            (viewport_px.0 as f32 / zoom) / tex_w,
+            (viewport_px.1 as f32 / zoom) / tex_h,
+        ]
+    }
+
+    fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32), zoom: f32) {
+        let values = Self::uniform_values(self.grid, self.origin, self.sub_tile, viewport_px, zoom);
+        let mut bytes = Vec::with_capacity(UNIFORM_SIZE as usize);
+        for value in values {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         queue.write_buffer(&self.uniform_buffer, 0, &bytes);
@@ -437,6 +820,16 @@ impl TileResidency {
     /// catch-up loop. Real callers should keep using [`Self::sync`] for
     /// full-resolution (mip level 0) uploads and this only for the lower
     /// levels progressive rendering needs.
+    ///
+    /// **What lands here is not currently visible on the canvas.** The
+    /// view [`Self::new`] builds for sampling exposes mip level 0 only
+    /// (`mip_level_count: Some(1)`), so bytes written to levels 1-3 are
+    /// stored and can be read back through [`Self::texture`], but are
+    /// unreachable from `canvas.wgsl`. That is deliberate, and this
+    /// module's private `MIP_LEVELS` constant carries the full reasoning
+    /// — including why this is done at the view rather than with
+    /// `lod_max_clamp`, and what wiring progressive rendering would
+    /// actually take.
     ///
     /// # Errors
     ///
@@ -850,6 +1243,485 @@ mod tests {
             residency.origin(),
             TileId { x: 5, y: 9 },
             "resize changes how much of the document is visible, not which part"
+        );
+    }
+
+    // -- Canvas geometry: the scale the atlas actually renders at --
+    //
+    // Every test below drives `TileResidency::uniform_values` directly.
+    // That is deliberate: it is the exact function `write_uniform` feeds
+    // to the GPU, it is a pure function of the atlas's own state, and
+    // driving it needs no adapter -- so these run everywhere, including
+    // on the CI runners where every `real_context()` test self-skips.
+    // `render_test.rs` covers the same properties end to end through a
+    // real render pass, where an adapter exists.
+
+    /// The zoom the atlas renders at, per axis, recovered from the
+    /// uniform exactly as the shader consumes it.
+    ///
+    /// `vs_canvas` computes `uv = t * uv_scale + uv_offset` for
+    /// `t ∈ [0, 1]` across the viewport, so the frame spans
+    /// `uv_scale * tex_size` document texels over `viewport_px` screen
+    /// pixels. Screen pixels per document pixel -- i.e. the zoom the
+    /// user actually sees -- is the reciprocal of that ratio.
+    fn rendered_zoom(
+        grid: (u32, u32),
+        sub_tile: (f32, f32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+    ) -> (f32, f32) {
+        let values =
+            TileResidency::uniform_values(grid, TileId { x: 0, y: 0 }, sub_tile, viewport_px, zoom);
+        let (Some(&scale_u), Some(&scale_v)) = (values.get(2), values.get(3)) else {
+            unreachable!("uniform_values always returns four floats");
+        };
+        let tex_w = (grid.0 * TILE) as f32;
+        let tex_h = (grid.1 * TILE) as f32;
+        (
+            viewport_px.0 as f32 / (scale_u * tex_w),
+            viewport_px.1 as f32 / (scale_v * tex_h),
+        )
+    }
+
+    /// Relative difference, so one tolerance reads the same at zoom 0.01
+    /// and at zoom 64.
+    fn relative_error(a: f32, b: f32) -> f32 {
+        ((a - b) / b).abs()
+    }
+
+    /// A realistic 1x 1920x1080 canvas: grid (9, 6), atlas 2304x1536,
+    /// and the two axes saturate at *different* zooms (0.9375 and
+    /// 0.84375) -- the asymmetry the anisotropy regression lived in.
+    const CANVAS_1080P: (u32, u32) = (1920, 1080);
+
+    #[test]
+    // The whole point is that these are bit-identical: the formula must
+    // not read `sub_tile` at all. A tolerance here would hide exactly
+    // the drift being tested.
+    #[allow(clippy::float_cmp)]
+    fn rendered_zoom_is_pan_independent_across_a_full_tile_of_pan() {
+        // RT12-02. `uv_scale` used to be clamped to `tex_size -
+        // sub_tile`, and `sub_tile` sweeps [0, TILE) continuously as the
+        // user pans -- so at a *constant* user zoom the rendered scale
+        // ramped smoothly and then snapped back once per tile of
+        // panning (measured: 0.500 -> 0.889 across one tile, a 1.78x
+        // change, at a constant zoom of 0.5). The floor is now taken at
+        // the worst case, so nothing here may move.
+        let grid = TileResidency::grid_for(CANVAS_1080P);
+        for zoom in [0.5_f32, 0.9, 0.9375, 1.0, 4.0] {
+            let baseline = rendered_zoom(grid, (0.0, 0.0), CANVAS_1080P, zoom);
+            for step in 0..=64 {
+                let offset = (step as f32) * (TILE as f32) / 64.0;
+                // The full open range [0, TILE) on each axis, and the
+                // two axes at unrelated pan positions -- a sub-tile pan
+                // is not diagonal.
+                let sub_tile = (offset, (TILE as f32) - offset - 0.001);
+                let seen = rendered_zoom(grid, sub_tile, CANVAS_1080P, zoom);
+                assert_eq!(
+                    seen, baseline,
+                    "at a constant zoom of {zoom}, panning to sub-tile \
+                     {sub_tile:?} changed the rendered scale from \
+                     {baseline:?} to {seen:?}. The scale must depend on \
+                     zoom alone; a scale that ramps with the pan position \
+                     makes the document visibly breathe as the user pans"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_zoom_is_isotropic_on_a_non_square_viewport() {
+        // RT12-03. Clamping each axis to its own coverage let one axis
+        // keep shrinking after the other had stopped: measured up to
+        // 33.6% divergence on 512x256, and ~18.5% permanent horizontal
+        // stretch on 1920x1080 below the y-axis threshold. Circles
+        // rendered as ellipses.
+        for viewport in [CANVAS_1080P, (512, 256), (1366, 768), (2560, 1080)] {
+            let grid = TileResidency::grid_for(viewport);
+            for zoom in [0.001_f32, 0.25, 0.5, 0.84, 0.9, 0.99, 1.0, 3.0, 64.0] {
+                for sub_tile in [(0.0, 0.0), (200.0, 40.0), (255.9, 255.9)] {
+                    let (x, y) = rendered_zoom(grid, sub_tile, viewport, zoom);
+                    assert!(
+                        relative_error(x, y) < 1e-6,
+                        "viewport {viewport:?} at zoom {zoom} rendered \
+                         x at {x} and y at {y} -- a {}% aspect-ratio \
+                         distortion. Both axes must scale by the same \
+                         factor at every zoom",
+                        relative_error(x, y) * 100.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_zoom_equals_the_requested_zoom_at_or_above_the_floor() {
+        // RT12-04's `aurora-gpu` half, and the property
+        // `aurora-app`/`CanvasView` depend on: at or above
+        // `min_zoom_for_viewport` the atlas renders *exactly* what it
+        // was asked for, so a caller that has clamped its own zoom to
+        // that floor converts pointer positions with the same number the
+        // frame was drawn at. `aurora-app`'s own
+        // `the_render_path_and_the_pointer_path_agree_on_scale_when_zoomed_out`
+        // closes the loop from the other side.
+        for viewport in [
+            CANVAS_1080P,
+            (512, 256),
+            (300, 300),
+            (3840, 2160),
+            (200, 900),
+        ] {
+            let grid = TileResidency::grid_for(viewport);
+            let floor = TileResidency::min_zoom_for_viewport(viewport);
+            for zoom in [floor, floor * 1.0001, 0.99, 1.0, 2.5, 64.0] {
+                if zoom < floor {
+                    continue;
+                }
+                for sub_tile in [(0.0, 0.0), (17.5, 250.0)] {
+                    let (x, y) = rendered_zoom(grid, sub_tile, viewport, zoom);
+                    assert!(
+                        relative_error(x, zoom) < 1e-5 && relative_error(y, zoom) < 1e-5,
+                        "viewport {viewport:?} asked for zoom {zoom} (floor \
+                         {floor}) and rendered {x} x {y}. Above the floor the \
+                         atlas must honour the zoom exactly, or every consumer \
+                         of the same view transform is drawing to a different \
+                         scale than the renderer"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    // Exact, because the floor is the *same* expression on both sides;
+    // see the test below.
+    #[allow(clippy::float_cmp)]
+    fn the_zoom_floor_survives_an_absurd_viewport_without_overflowing() {
+        // `grid_for` is `viewport.div_ceil(TILE) + 1` and every caller
+        // multiplies it back by `TILE`; both overflowed `u32` for a
+        // viewport near `u32::MAX` -- a hard panic in debug (this
+        // workspace denies `panic`) and a silent wrap to garbage in
+        // release. `min_zoom_for_viewport` is now called from
+        // `aurora-app`'s `redraw` above its GPU early-return, so this
+        // arithmetic runs with no GPU and no wgpu validation in front of
+        // it. The exact pre-fix threshold is the smallest viewport whose
+        // whole-tile grid exceeds `u32::MAX`.
+        let threshold = (u32::MAX / TILE - 1) * TILE + 1;
+        for viewport in [
+            (threshold, 1080),
+            (1920, threshold),
+            (u32::MAX, u32::MAX),
+            (u32::MAX - 1, u32::MAX - 1),
+        ] {
+            let grid = TileResidency::grid_for(viewport);
+            assert!(
+                grid.0 > 0 && grid.1 > 0,
+                "viewport {viewport:?}: grid {grid:?} wrapped to zero"
+            );
+            let floor = TileResidency::min_zoom_for_viewport(viewport);
+            assert!(
+                floor.is_finite() && floor > 0.0 && floor <= 2.0,
+                "viewport {viewport:?}: the floor must stay a sane, finite \
+                 number rather than wrap to garbage; got {floor}"
+            );
+            // And it is still a real bound, not a value that quietly
+            // disables the clamp.
+            assert_eq!(TileResidency::effective_zoom(viewport, floor / 2.0), floor);
+        }
+    }
+
+    #[test]
+    // `min_zoom_for_viewport` and the clamp inside `uniform_values` are
+    // the *same* expression applied to the same inputs; an exact
+    // comparison is what pins them together.
+    #[allow(clippy::float_cmp)]
+    fn min_zoom_for_viewport_is_exactly_the_floor_the_uniform_applies() {
+        // The public promise (`min_zoom_for_viewport`) and the private
+        // behaviour (`uniform_values`) must not be two formulas that
+        // merely agree today: `aurora-app` clamps `CanvasView` to the
+        // public one, so any drift between them reopens RT12-04.
+        for viewport in [CANVAS_1080P, (512, 256), (300, 300), (256, 256), (1, 1)] {
+            let grid = TileResidency::grid_for(viewport);
+            let floor = TileResidency::min_zoom_for_viewport(viewport);
+            assert!(
+                floor > 0.0 && floor <= 1.0,
+                "viewport {viewport:?}: the floor is \
+                 viewport / (viewport rounded up to whole tiles), which can \
+                 never exceed 1.0 or reach 0.0; got {floor}"
+            );
+            for below in [floor * 0.5, floor * 0.01, f32::MIN_POSITIVE / 2.0] {
+                let (x, y) = rendered_zoom(grid, (0.0, 0.0), viewport, below);
+                assert!(
+                    relative_error(x, floor) < 1e-5 && relative_error(y, floor) < 1e-5,
+                    "viewport {viewport:?}: zoom {below} is below the floor \
+                     {floor} and must render at exactly the floor, not at \
+                     {x} x {y}"
+                );
+            }
+            // `effective_zoom` is the same statement as a public API.
+            assert_eq!(TileResidency::effective_zoom(viewport, floor), floor);
+            assert_eq!(TileResidency::effective_zoom(viewport, floor / 2.0), floor);
+            assert_eq!(TileResidency::effective_zoom(viewport, 4.0), 4.0);
+            assert_eq!(
+                TileResidency::effective_zoom(viewport, f32::NAN),
+                1.0_f32.max(floor)
+            );
+        }
+    }
+
+    #[test]
+    fn uv_scale_never_reaches_past_the_atlas_coverage() {
+        // RT-09, the duplication bug, restated as the invariant that
+        // replaced its clamp. The atlas covers `tex_size` texels and the
+        // window starts `sub_tile` into them, so a frame spanning more
+        // than `tex_size - sub_tile` texels wraps through the toroidal
+        // `AddressMode::Repeat` sampler and shows the same document
+        // region twice. `zoom >= zoom_floor` is supposed to make that
+        // impossible without any clamp on `uv_scale` itself; this
+        // asserts the implication directly, at every sub-tile pan
+        // position, rather than trusting the algebra.
+        for viewport in [CANVAS_1080P, (512, 256), (300, 300), (256, 256), (17, 4000)] {
+            let grid = TileResidency::grid_for(viewport);
+            let tex_w = (grid.0 * TILE) as f32;
+            let tex_h = (grid.1 * TILE) as f32;
+            for zoom in [
+                f32::MIN_POSITIVE / 2.0,
+                0.01,
+                0.25,
+                0.5,
+                TileResidency::min_zoom_for_viewport(viewport),
+                1.0,
+                64.0,
+                f32::NAN,
+                0.0,
+                -3.0,
+            ] {
+                for step in 0..16 {
+                    let offset = (step as f32) * (TILE as f32) / 16.0;
+                    let sub_tile = (offset, (TILE as f32) - offset - 0.5);
+                    let values = TileResidency::uniform_values(
+                        grid,
+                        TileId { x: 3, y: 5 },
+                        sub_tile,
+                        viewport,
+                        zoom,
+                    );
+                    let (Some(&scale_u), Some(&scale_v)) = (values.get(2), values.get(3)) else {
+                        unreachable!("uniform_values always returns four floats");
+                    };
+                    assert!(
+                        scale_u * tex_w <= tex_w - sub_tile.0 + 1e-3
+                            && scale_v * tex_h <= tex_h - sub_tile.1 + 1e-3,
+                        "viewport {viewport:?} at zoom {zoom}, sub-tile \
+                         {sub_tile:?}: the frame spans {} x {} texels of an \
+                         atlas holding only {} x {} ahead of the window. \
+                         Past that the sampler wraps and the canvas shows a \
+                         seamless duplicate of document content that is not \
+                         there",
+                        scale_u * tex_w,
+                        scale_v * tex_h,
+                        tex_w - sub_tile.0,
+                        tex_h - sub_tile.1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uv_scale_stays_inside_an_atlas_smaller_than_the_viewport_asks_for() {
+        // A caller whose viewport grew without calling `resize` first
+        // hands `uniform_values` a grid that predates it. The floor is
+        // taken against whichever atlas is smaller for exactly this
+        // case: rendering at the wrong scale for one frame is a
+        // transient; wrapping the sampler and fabricating document
+        // content is not.
+        let stale_grid = TileResidency::grid_for((256, 256));
+        let tex = ((stale_grid.0 * TILE) as f32, (stale_grid.1 * TILE) as f32);
+        for zoom in [0.25_f32, 1.0, 4.0] {
+            let sub_tile = (200.0, 30.0);
+            let values = TileResidency::uniform_values(
+                stale_grid,
+                TileId { x: 0, y: 0 },
+                sub_tile,
+                CANVAS_1080P,
+                zoom,
+            );
+            let (Some(&scale_u), Some(&scale_v)) = (values.get(2), values.get(3)) else {
+                unreachable!("uniform_values always returns four floats");
+            };
+            assert!(
+                scale_u * tex.0 <= tex.0 - sub_tile.0 + 1e-3
+                    && scale_v * tex.1 <= tex.1 - sub_tile.1 + 1e-3,
+                "a 1920x1080 viewport drawn through an atlas still sized for \
+                 256x256 must still never sample past that atlas's own \
+                 coverage; got {} x {} texels of {} x {} available",
+                scale_u * tex.0,
+                scale_v * tex.1,
+                tex.0 - sub_tile.0,
+                tex.1 - sub_tile.1
+            );
+        }
+    }
+
+    #[test]
+    // Each assertion is an exact bound landing on a literal, not an
+    // accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn clamp_doc_origin_bounds_every_degenerate_document_position() {
+        // RT12-07's arithmetic half. `write_uniform` computes
+        // `origin.x * TILE` in `u32`; an unbounded `doc_origin`
+        // overflows it -- a panic in debug (this workspace denies
+        // `panic` because "a panic loses unsaved work"), a silently
+        // wrong tile in release.
+        assert_eq!(
+            TileResidency::clamp_doc_origin((12.5, 900.25)),
+            (12.5, 900.25)
+        );
+        assert_eq!(TileResidency::clamp_doc_origin((-5.0, -0.5)), (0.0, 0.0));
+        assert_eq!(
+            TileResidency::clamp_doc_origin((f32::INFINITY, f32::MAX)),
+            (
+                TileResidency::MAX_DOC_ORIGIN_PX,
+                TileResidency::MAX_DOC_ORIGIN_PX,
+            )
+        );
+        assert_eq!(
+            TileResidency::clamp_doc_origin((4.3e9, 1e12)),
+            (
+                TileResidency::MAX_DOC_ORIGIN_PX,
+                TileResidency::MAX_DOC_ORIGIN_PX,
+            )
+        );
+        assert_eq!(
+            TileResidency::clamp_doc_origin((f32::NEG_INFINITY, 5.0)),
+            (0.0, 5.0)
+        );
+        // NaN lands on the document's own origin rather than
+        // propagating -- `f32::max` returns the non-NaN operand, which
+        // is why this is not spelled `clamp`.
+        assert_eq!(
+            TileResidency::clamp_doc_origin((f32::NAN, f32::NAN)),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    // Every assertion is an exact identity -- the value goes in and the
+    // same value must come back out, never an accumulated computation.
+    #[allow(clippy::float_cmp)]
+    fn clamp_doc_origin_is_the_identity_across_its_whole_public_range() {
+        // What [`TileResidency::MAX_DOC_ORIGIN_PX`] promises a caller
+        // that keeps itself inside the bound, stated as the property
+        // that makes it useful across a crate boundary: every position
+        // in `[0, MAX_DOC_ORIGIN_PX]` passes through untouched. That is
+        // what lets `aurora-app` prove render/paint agreement by
+        // asserting range membership alone -- it never has to reach
+        // this private function, which stays private.
+        let ceiling = TileResidency::MAX_DOC_ORIGIN_PX;
+        for value in [
+            0.0_f32,
+            1.0,
+            TILE as f32,
+            ceiling / 2.0,
+            ceiling - 1.0,
+            ceiling,
+        ] {
+            assert_eq!(
+                TileResidency::clamp_doc_origin((value, value)),
+                (value, value),
+                "{value} is inside the bound and must pass through unchanged"
+            );
+        }
+        // And it really does saturate just past it -- the identity is a
+        // statement about the range, not about the clamp being absent.
+        assert_eq!(
+            TileResidency::clamp_doc_origin((ceiling + 1.0, ceiling * 2.0)),
+            (ceiling, ceiling)
+        );
+    }
+
+    #[test]
+    fn set_origin_survives_a_huge_or_non_finite_document_origin() {
+        // RT12-07 end to end: the value has to survive the real
+        // `u32` multiply inside `write_uniform`, which is where it
+        // overflowed.
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max_tile = (TileResidency::MAX_DOC_ORIGIN_PX / (TILE as f32)) as u32;
+        for doc_origin in [
+            (4.3e9_f32, 4.3e9),
+            (f32::MAX, f32::MAX),
+            (f32::INFINITY, 0.0),
+            (0.0, f32::INFINITY),
+            (f32::NAN, f32::NAN),
+            (-1.0e9, -1.0e9),
+        ] {
+            residency.set_origin(context.queue(), doc_origin, (256, 256), 1.0);
+            let origin = residency.origin();
+            assert!(
+                origin.x <= max_tile && origin.y <= max_tile,
+                "doc_origin {doc_origin:?} addressed tile {origin:?}, past the \
+                 {} px document ceiling -- `origin * TILE` overflows \
+                 `u32` from there",
+                TileResidency::MAX_DOC_ORIGIN_PX
+            );
+        }
+    }
+
+    #[test]
+    // The sub-tile offset is copied, not recomputed -- exact equality is
+    // the assertion.
+    #[allow(clippy::float_cmp)]
+    fn resize_preserves_the_sub_tile_pan_offset() {
+        // RT12-08. `resize` restores `origin` *and* `sub_tile`; before
+        // it restored `sub_tile` a window resize silently snapped the
+        // view back to the nearest tile boundary. Nothing else in the
+        // suite pans to a fractional position and then resizes, so
+        // deleting that one line left every test green.
+        let Some(context) = real_context() else {
+            return;
+        };
+        let mut residency = TileResidency::new(context.device(), context.queue(), (256, 256));
+        let doc_origin = (5.0 * (TILE as f32) + 91.5, 3.0 * (TILE as f32) + 200.25);
+        residency.set_origin(context.queue(), doc_origin, (256, 256), 1.0);
+        assert_eq!(residency.sub_tile, (91.5, 200.25));
+
+        residency.resize(context.device(), context.queue(), (512, 512));
+
+        assert_eq!(
+            residency.origin(),
+            TileId { x: 5, y: 3 },
+            "the whole-tile part of the pan must survive a resize"
+        );
+        assert_eq!(
+            residency.sub_tile,
+            (91.5, 200.25),
+            "the *fractional* part of the pan must survive a resize too -- \
+             dropping it snaps the view back to the nearest tile boundary, a \
+             visible jump of up to a tile in each axis on every window resize"
+        );
+        // And it must reach the uniform, not just the field: the sampled
+        // window's own offset is what the user actually sees.
+        let values = TileResidency::uniform_values(
+            residency.grid,
+            residency.origin(),
+            residency.sub_tile,
+            (512, 512),
+            1.0,
+        );
+        let tex_w = (residency.grid.0 * TILE) as f32;
+        let Some(&offset_u) = values.first() else {
+            unreachable!("uniform_values always returns four floats");
+        };
+        assert_eq!(
+            (offset_u * tex_w).rem_euclid(TILE as f32),
+            91.5,
+            "the restored sub-tile offset must show up in the sampled UV \
+             origin the shader reads"
         );
     }
 }

@@ -45,6 +45,19 @@ jobs:
       - name: No hardcoded style values
         run: python3 scripts/check_no_hardcoded_style.py
 
+      # Every other compile step in this file passes `--all-targets` and/or
+      # `--all-features`, so none of them build the configuration Aurora
+      # actually ships. That gap is not theoretical: `aurora-doc`'s
+      # `test-support` feature gates a test-only escape hatch, and a
+      # non-test `pub fn` in a shipping crate calling it passed
+      # `cargo build --workspace --all-targets` and
+      # `cargo check --workspace --all-features` while failing only a
+      # plain, flagless build. `check` rather than `build`: the leak is an
+      # unresolved path, caught at type-check time, and `check` is the
+      # cheap half. `--locked` additionally keeps `Cargo.lock` honest.
+      - name: Default-feature check (the configuration that ships)
+        run: cargo check --workspace --locked
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

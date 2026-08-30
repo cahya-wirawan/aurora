@@ -39,5 +39,25 @@ fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
     let sq = floor(in.pos.xy / 8.0);
     let check = select(0.18, 0.24, (sq.x + sq.y) % 2.0 == 0.0);
     let bg = vec3<f32>(check);
-    return vec4<f32>(c.rgb + bg * (1.0 - c.a), 1.0);
+    // **The atlas holds straight alpha**, the tile store's universal
+    // convention everywhere else in the workspace (a 50%-alpha white
+    // texel is (1, 1, 1, 0.5), not the premultiplied (0.5, 0.5, 0.5,
+    // 0.5)), so this is the straight-alpha "over" formula:
+    // `Cs * as + Cb * (1 - as)`. This is the one place in the codebase
+    // where straight alpha is converted for display.
+    //
+    // It used to be `c.rgb + bg * (1.0 - c.a)` -- the *premultiplied*
+    // "over" formula -- and that was accidentally correct, because until
+    // 0.52.0 `composite_roots_into_tile` and `begin_gpu_composite_tile`
+    // both skipped the un-premultiply step that `resolve_tile`'s own
+    // `Group` arm had always run, so the composite surface really did
+    // hold premultiplied texels. Two bugs cancelled on screen while the
+    // same wrong values went straight into every export and every
+    // eyedropper read. Fixing those two entry points without also
+    // fixing this line would have turned an accidentally-correct display
+    // into a visibly wrong one (translucent content rendering too bright,
+    // clipping to white), which is why all three landed together --
+    // `canvas_pipeline_blends_a_translucent_tile_against_the_checkerboard`
+    // in render_test.rs is the test that catches this line being missed.
+    return vec4<f32>(c.rgb * c.a + bg * (1.0 - c.a), 1.0);
 }
