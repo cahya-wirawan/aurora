@@ -34,7 +34,7 @@ use aurora_core::Rect;
 
 use crate::error::DocError;
 use crate::layer::{BlendMode, LayerEntry, LayerId, LayerKind, LayerLock, LayerMask};
-use crate::tree::{LayerTree, RemovedSubtree};
+use crate::tree::{LayerTree, RemovedSubtree, validate_origin};
 
 /// One recorded step. On the undo/redo stacks, stored as *how to undo the
 /// step that's currently on top* — never "what the user did," which
@@ -753,7 +753,23 @@ impl History {
     /// # Errors
     ///
     /// Returns [`DocError::UnknownLayer`] if `id` doesn't currently name
-    /// a real layer in `tree`.
+    /// a real layer in `tree`, or [`DocError::LayerOriginOutOfRange`] if
+    /// `old`'s own origin is one [`LayerTree::set_bounds`] would refuse.
+    /// Nothing is recorded when either happens — neither the journal nor
+    /// the undo stack is touched.
+    ///
+    /// **Why `old` is range-checked here even though this method never
+    /// writes to `tree`.** Until 0.57.14 it was not, on the argument
+    /// that the value reaches the journal rather than the tree, and that
+    /// the first thing to put it *in* the tree would be an ordinary
+    /// [`Self::undo`], which delegates to [`LayerTree::set_bounds`] and
+    /// is refused there. The premise held; the conclusion did not. That
+    /// refusal happens *after* the entry is on the undo stack and with
+    /// nothing popping it, so the same `undo()` fails the same way on
+    /// every attempt while [`Self::can_undo`] keeps reporting `true` —
+    /// undo permanently wedged, and every step beneath it unreachable.
+    /// Checking up front, with the same predicate `set_bounds` uses,
+    /// turns that into an ordinary rejected call.
     pub fn record_bounds_change(
         &mut self,
         tree: &LayerTree,
@@ -761,6 +777,9 @@ impl History {
         old: Rect,
     ) -> Result<(), DocError> {
         let current = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
+        // Before the first push, so a refusal records nothing at all --
+        // the same "all or nothing" discipline `set_bounds` follows.
+        validate_origin(old)?;
         self.journal.push(LayerOp::SetBounds { id, value: current });
         self.push(LayerOp::SetBounds { id, value: old });
         Ok(())
@@ -961,7 +980,7 @@ impl std::fmt::Debug for History {
 mod tests {
     use super::History;
     use crate::DocError;
-    use crate::layer::{BlendMode, LayerKind, LayerLock};
+    use crate::layer::{BlendMode, LayerKind, LayerLock, LayerMask};
     use crate::tree::LayerTree;
     use aurora_core::{Id, Rect};
 
@@ -1651,6 +1670,70 @@ mod tests {
         }
     }
 
+    // Before 0.57.14 this call succeeded, and the entry it pushed made
+    // undo permanently unusable: `undo` delegates to
+    // `LayerTree::set_bounds`, which refuses the out-of-range origin,
+    // but the refusal happens with the entry still on the stack and
+    // nothing popping it -- so every later `undo()` failed identically
+    // while `can_undo()` kept saying `true`. Checking `old` before the
+    // first push is what turns that into an ordinary rejected call.
+    #[test]
+    fn record_bounds_change_rejects_an_old_origin_outside_the_document_range() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        // Built on the tree directly, so the undo stack starts genuinely
+        // empty and `can_undo()` is a clean signal for the wedge.
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let journal_len_before = history.journal_len();
+        assert!(!history.can_undo(), "nothing to undo before the bad call");
+
+        match history.record_bounds_change(&tree, id, out_of_range_origin()) {
+            Err(DocError::LayerOriginOutOfRange { x, y: _, max }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+
+        assert_eq!(
+            history.journal_len(),
+            journal_len_before,
+            "a refused call must record nothing in the journal"
+        );
+        assert!(
+            !history.can_undo(),
+            "a refused call must leave the undo stack untouched -- the wedge this closes"
+        );
+        assert!(!history.can_redo());
+
+        // And the tree, which this method never writes to anyway, is
+        // still exactly where the caller left it.
+        assert_eq!(tree.bounds(id), Some(bounds()));
+
+        // The layer is still perfectly editable afterwards: a legitimate
+        // `record_bounds_change` on the same id still works, and its undo
+        // succeeds -- proving nothing was left half-recorded.
+        let moved = Rect {
+            x: 100,
+            y: 100,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = tree.set_bounds(id, moved) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.record_bounds_change(&tree, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.bounds(id), Some(bounds()));
+    }
+
     #[test]
     fn journal_describes_set_bounds_distinctly_from_reparent() {
         let mut tree = LayerTree::new();
@@ -2218,6 +2301,81 @@ mod tests {
         match replay_crafted_journal(&journal) {
             Err(DocError::MalformedRemovedSubtree(id)) => assert_eq!(id, clash),
             other => unreachable!("expected MalformedRemovedSubtree, got {other:?}"),
+        }
+    }
+
+    /// An origin one step past `aurora_core::MAX_DOCUMENT_ORIGIN`, with
+    /// a small extent so only the origin is at fault.
+    fn out_of_range_origin() -> Rect {
+        Rect {
+            x: aurora_core::MAX_DOCUMENT_ORIGIN + 1,
+            y: 0,
+            width: 10,
+            height: 10,
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_layer_sits_outside_the_document_range_errors() {
+        // `set_bounds` and `insert_unchecked` both run `validate_origin`
+        // on a caller-supplied `Rect`, but `restore` deliberately does
+        // not (it puts back a value the tree already accepted), so a
+        // crafted `Restore` op was a way to splice an origin past
+        // `MAX_DOCUMENT_ORIGIN` into a live tree. `replay`'s closing
+        // `tree.validate()` is what refuses it now.
+        let root: super::LayerId = Id::from_raw(0);
+        let entry = super::LayerEntry::new(
+            "far".to_owned(),
+            None,
+            LayerKind::Pixel {
+                bounds: out_of_range_origin(),
+            },
+        );
+        let journal = vec![super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries: vec![(root, entry)],
+        })];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+                assert_eq!(y, 0);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_journal_whose_restored_mask_sits_outside_the_document_range_errors() {
+        // The mask half of the same door: `add_mask` runs
+        // `validate_origin`, `restore_mask` does not. The layer this
+        // mask lands on is itself in range, so only the mask is at
+        // fault.
+        let root: super::LayerId = Id::from_raw(0);
+        let journal = vec![
+            super::LayerOp::Restore(super::RemovedSubtree {
+                root,
+                parent: None,
+                index: 0,
+                entries: vec![(root, pixel_entry("host", None))],
+            }),
+            super::LayerOp::RestoreMask(
+                root,
+                LayerMask {
+                    bounds: out_of_range_origin(),
+                    enabled: true,
+                    inverted: false,
+                },
+            ),
+        ];
+        match replay_crafted_journal(&journal) {
+            Err(DocError::LayerOriginOutOfRange { x, max, .. }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
         }
     }
 

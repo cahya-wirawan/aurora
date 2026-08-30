@@ -241,19 +241,30 @@ pub enum DocError {
     /// [`LayerId`], since the check runs before the generator is
     /// touched.
     ///
-    /// "In the tree" is the exact scope, stated rather than rounded up
-    /// to "every public path". One public method takes a
-    /// caller-supplied `Rect` and is *not* covered:
-    /// [`crate::History::record_bounds_change`], which by design never
-    /// touches the tree at all — it journals the caller's `old`
-    /// rectangle as an undo entry for a change the caller already
-    /// applied itself. An out-of-range `old` there reaches the journal,
-    /// not the tree, and the first thing that would try to put it *in*
-    /// the tree is an ordinary undo, which goes through
-    /// [`crate::LayerTree::set_bounds`] and so is refused by this same
-    /// variant. `aurora-app`'s only caller passes bounds it read back
-    /// out of the tree, so it cannot produce one; PLAN.md records the
-    /// residual rather than leaving it implied here.
+    /// Since 0.57.14 it is **also** returned by
+    /// [`crate::History::replay`], via the whole-tree walk
+    /// `LayerTree::validate` runs as `replay`'s closing step. That path
+    /// takes no `Rect` from its caller directly — it splices one out of
+    /// a journal's `Restore`/`RestoreMask` entry, where the per-call
+    /// guards above never see it — so it is listed separately rather
+    /// than folded into the sentence above.
+    ///
+    /// One public method takes a caller-supplied `Rect` without storing
+    /// it in the tree, and it is covered too, since 0.57.14:
+    /// [`crate::History::record_bounds_change`] journals the caller's
+    /// `old` rectangle as an undo entry for a change the caller already
+    /// applied itself. It used to accept any `old` at all, on the
+    /// argument that an out-of-range one reaches the journal and not the
+    /// tree, and that the first thing to put it *in* the tree would be
+    /// an ordinary undo, refused by [`crate::LayerTree::set_bounds`] and
+    /// this same variant. That argument was right about where the value
+    /// lands and wrong about the consequence: the refusal happens with
+    /// the entry already on the undo stack, so *every* subsequent
+    /// `undo()` fails identically and `can_undo()` stays `true` forever
+    /// — undo wedged permanently, with no way back. The check now runs
+    /// before anything is pushed, so a refusal leaves the journal and
+    /// both stacks untouched, exactly as `set_bounds`' own refusal
+    /// leaves the tree untouched.
     ///
     /// **Negative origins are still legal**, and deliberately so — a
     /// layer dragged partly or wholly off the canvas is an ordinary

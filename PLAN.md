@@ -6118,9 +6118,20 @@ structural design work.
   `write_autosave` writes the current document's journal to it on
   every startup (whichever document ends up current: the demo one, or
   a just-recovered one), and, only when a previous run's marker is
-  still there, `recover_document` reads it back, deserializes via
-  `History::load_journal`, and replays via `History::replay` into a
-  fresh `LayerTree`. `App::new` uses the recovered document instead of
+  still there, `recover_document` reads it back and deserializes the
+  journal via `History::load_journal`. (An earlier draft of this
+  paragraph said it "replays via `History::replay` into a fresh
+  `LayerTree`" — **that was never true of the shipped code, and is
+  corrected here in 0.57.14** because it contradicted the
+  `History::replay()` residual entry near the end of this file, whose
+  "not reachable in the live app" claim rests on `aurora-app` never
+  calling `replay()`. Re-verified: `grep -rn '\.replay(' crates/`
+  matches only `aurora-doc/src/history.rs` itself. What
+  `recover_document` actually does is take the `LayerTree` straight out
+  of the autosave container's manifest via `read_autosave_container`,
+  and pair it with a `History` whose journal was loaded by
+  `load_journal` and whose undo/redo stacks therefore start empty —
+  `load_journal_starts_with_empty_undo_redo_stacks`.) `App::new` uses the recovered document instead of
   `demo_document()` when this succeeds. The crash-recovery dialog keeps
   its single "Continue" action either way — recovery is unconditional
   and automatic, not a "Recover Document" vs. "Discard" user choice —
@@ -6933,22 +6944,24 @@ structural design work.
   - No interactive "Discard recovered document" choice.
 
   **Three small follow-ups from the judge that closed this round out
-  (2026-08-24), none blocking. The first two are still open; the third
-  was closed in 0.50.0 — see its own bullet below:**
+  (2026-08-24), none blocking. The first was closed in 0.57.14 and the
+  third in 0.50.0 — see each bullet below; the second is still open:**
 
-  - **`LayerTree::validate()` doesn't call `validate_opacities`** —
-    `tree.rs` runs shape + allocator only there, while its own doc
-    comment claims it holds a tree "to exactly the bar
+  - ~~**`LayerTree::validate()` doesn't call `validate_opacities`**~~ —
+    **closed in 0.57.14** by adding the call (the "add the call" branch
+    of the fix below), alongside the origin check that closed the
+    `History::replay()` residual near the end of this file. The
+    description below still holds for why it was worth closing and for
+    how much it closes: `tree.rs` ran shape + allocator only there,
+    while its own doc comment claimed it held a tree "to exactly the bar
     `#[serde(try_from = "LayerTreeRepr")]` holds a deserialized one to."
-    That's now overstated by one check. No live defect follows: its
-    only caller is `replay`, and every opacity-setting op reaching it
-    goes through `set_opacity`/`set_fill_opacity` (which already
-    enforce the range) or `restore` (which already validates) — but
-    it's exactly the "a guard's stated contract is broader than what it
-    does" drift that produced the dangling-reference gap above, left
-    here rather than fixed under the same discipline of naming it
-    instead of leaving it implicit. Fix: add the call, or narrow the
-    doc comment.
+    That was overstated by one check. **No live defect followed and none
+    was fixed**: its only caller is `replay`, and every opacity-setting
+    op reaching it goes through `set_opacity`/`set_fill_opacity` (which
+    already enforce the range) or `restore` (which already validates).
+    It was closed as the "a guard's stated contract is broader than what
+    it does" drift that produced the dangling-reference gap above, not
+    as a reachable hole.
   - **`validate_cross_references` mirrors group `children` only, not
     `roots`.** A live tree's `roots` naming an incoming id during
     `restore` is the same shape as the children-direction check it
@@ -8793,8 +8806,33 @@ structural design work.
     reaches the journal, not the tree, and the first thing that would
     put it *in* the tree is an ordinary undo, which goes through
     `set_bounds` and is refused. `aurora-app`'s only caller passes
-    bounds read back out of the tree. Recorded, not fixed — it is a
-    behaviour change to a public API outside this round's scope.
+    bounds read back out of the tree. Recorded, not fixed — a
+    behaviour change to a public API, outside 0.57.13's scope.
+    **Fixed in 0.57.14**, because the "recorded, not fixed" reasoning
+    above was right about where the value lands and **wrong about the
+    consequence**, and a reviewer reproduced the difference concretely:
+    the `set_bounds` refusal happens with the bad entry *already on the
+    undo stack* and with nothing popping it, so three consecutive
+    `undo()` attempts all failed identically while `can_undo()` kept
+    returning `true` — undo permanently wedged, every step beneath it
+    unreachable, on a public API taking a caller-supplied `Rect`. That
+    is a worse outcome than the rejected call it was traded for, which
+    is what moved it from "defer, non-exploitable today" to "close
+    now". `record_bounds_change` now runs the same `validate_origin`
+    predicate `set_bounds` uses, *before* the first push, so a refusal
+    leaves the journal and both stacks untouched — the same all-or-
+    nothing discipline every other guard in this crate follows.
+    `validate_origin` became `pub(crate)` for it (still not public API,
+    and no new `DocError` variant: the existing
+    `DocError::LayerOriginOutOfRange` is reused, same failure class).
+    New test `record_bounds_change_rejects_an_old_origin_outside_the_document_range`
+    pins it: the refusal is reported, `journal_len()` and `can_undo()`
+    are both unchanged, and a legitimate `record_bounds_change` plus
+    `undo` on the same layer still works afterwards. Run against the
+    unfixed code it failed. The two pre-existing tests
+    (`record_bounds_change_records_one_undo_step_covering_a_change_already_applied`,
+    `record_bounds_change_rejects_an_unknown_id`) pass unmodified —
+    both use legitimate bounds, so no caller in the tree is affected.
   - **The stated reason for keeping origin validation out of
     `aurora-doc`'s deserializer was internally inconsistent, and is
     rewritten.** It argued the check belongs in `aurora-io` because an
@@ -8887,39 +8925,146 @@ structural design work.
     that one piece of input is unreadable. **Not reachable today** — no
     producer can build such a tree any more, since both `LayerTree`'s
     live-edit API and `aur::read` refuse one — so this matters only if a
-    future path (`History::replay()`, or the `Deserialize` third door
-    noted above) reintroduces one. If it ever does, the autosave that
+    future path reintroduces one. If it ever does, the autosave that
     was supposed to be the safety net is the thing that stops running.
     Worth revisiting then, deliberately, rather than defaulting either
-    way now.
-- [ ] **`History::replay()` can still splice an out-of-range origin into
-    a tree, bypassing `set_bounds`.** Disclosed 2026-08-29 alongside the
-    0.57.12 origin fix above, and deliberately **not** fixed in that
-    round. `replay()` is `pub` and applies a journal's `Restore` entries
-    directly, so a crafted `.aur` file's `history` section could
-    theoretically reach a layer origin the `set_bounds`/`tile_grid`
-    checks would have refused. **Not reachable in the live app today**:
-    grep confirms `aurora-app` never calls `replay()` — only
-    `aurora-doc`'s own tests do — and a loaded journal starts with empty
-    undo/redo stacks (`load_journal_starts_with_empty_undo_redo_stacks`).
-    It is a real residual for any *future* caller of `replay()`, which
-    is why it is recorded rather than closed.
-    **Fix when one appears: extend `LayerTree::validate`'s existing
-    walk with an origin check**, covering a pixel layer's own `bounds`
-    and every mask's `bounds` together, which `replay`'s trailing
-    `tree.validate()` then picks up for free. An earlier draft of this
-    entry suggested validating in `apply`'s `Restore`/`RestoreMask`
-    arms instead. **Do not do that** (corrected 2026-08-29): `apply` is
-    the shared body for `replay()` *and* for ordinary
-    `History::undo`/`redo`, and those two arms call
-    `LayerTree::restore`/`restore_mask`, which are deliberately left
-    unvalidated precisely because they put back a value the tree itself
-    produced — `tree.rs`'s own doc comment on `validate_origin` states
-    that contract. A check there would make an ordinary undo able to
-    fail on the tree's own output, which is a worse defect than the one
-    being closed. `LayerTree::validate` is the right seam because it is
-    already the single bar both a deserialized manifest and a replayed
-    journal are held to.
+    way now. **Narrowed in 0.57.14**: one of the two future paths this
+    entry named, `History::replay()`, is now itself closed (see that
+    entry below), so it can no longer be the thing that reintroduces
+    such a tree. `LayerTree`'s own `Deserialize` still deliberately does
+    not check origins (that check lives in `aurora-io`, for the reasons
+    recorded above, and `try_from`'s call sequence was left untouched),
+    so that door is unchanged; so is the entry's own concern — that a
+    hard fail here defeats the autosave safety net — for any path that
+    ever does reintroduce such a tree.
+- [x] **`History::replay()` can still splice an out-of-range origin into
+    a tree, bypassing `set_bounds`** — disclosed 2026-08-29 alongside the
+    0.57.12 origin fix, **closed in 0.57.14**. `replay()` is `pub` and
+    applies a journal's `Restore`/`RestoreMask` entries directly, so a
+    crafted `.aur` file's `history` section could reach a layer or mask
+    origin the `set_bounds`/`add_mask`/`tile_grid` checks would have
+    refused. It was never reachable in the live app (`aurora-app` still
+    never calls `replay()`, and a loaded journal starts with empty
+    undo/redo stacks — `load_journal_starts_with_empty_undo_redo_stacks`),
+    so this closes a residual before a caller appears rather than an
+    active exploit.
+    **Fixed exactly where the entry said to fix it**: a new
+    `validate_origins` in `tree.rs` walks every entry and applies the
+    existing `validate_origin` predicate to a pixel layer's own `bounds`
+    *and* — outside the `kind` match, so a masked **group** is covered
+    too — every `LayerMask::bounds`; `LayerTree::validate` now calls it,
+    and `replay`'s trailing `tree.validate()` picks it up. The rejected
+    alternative stays rejected: nothing was added to `apply`'s
+    `Restore`/`RestoreMask` arms, and `LayerTree::restore`/`restore_mask`
+    are untouched, so an ordinary `undo`/`redo` still cannot fail on a
+    value the tree itself produced. Proven red-before-green: the two new
+    `history.rs` replay tests
+    (`replaying_a_journal_whose_restored_layer_sits_outside_the_document_range_errors`,
+    `…restored_mask_…`) and the three new `tree.rs` origin-rejection
+    `validate` tests (pixel bounds, a pixel layer's mask, a *group's*
+    mask) were run against the unfixed `validate` and all five failed.
+    A positive control
+    (`validate_accepts_origins_exactly_on_the_document_range_boundary`)
+    pins the inclusive `±MAX_DOCUMENT_ORIGIN` boundary so the check
+    cannot start refusing legitimate far-corner documents.
+    **Scoped honestly**: the same commit also has `validate` call
+    `validate_opacities` (the follow-up recorded further up this file),
+    but that is **contract completeness for `validate` itself, not a
+    second closed exploit** — both journal doors for an opacity were
+    already guarded before it: `apply`'s `SetOpacity`/`SetFillOpacity`
+    arms go through the already-range-checked
+    `set_opacity`/`set_fill_opacity`, and `apply`'s `Restore` arm goes
+    through `LayerTree::restore`, which already ran `validate_opacities`
+    on the incoming subtree. What it fixes is that `validate`'s own doc
+    comment claimed a bar `try_from` and `restore` held to and it did
+    not. `TryFrom<LayerTreeRepr>` is deliberately untouched — its own
+    call sequence and error ordering are unchanged.
+    **Origin only, and deliberately so.** A `Rect`'s *extent* stays
+    unchecked through `replay`/`restore`, exactly as it stays unchecked
+    through `set_bounds` — that is the live-edit API's own already
+    -documented policy (`DocError::LayerOriginOutOfRange` and
+    `aurora_core::MAX_DOCUMENT_ORIGIN` both state it), not a gap this
+    round opened or narrowed. Extent is bounded where it is owned:
+    `aurora_core::Size::new`, and `aurora-io`'s `tile_grid` on the
+    `.aur` read path. So `validate` does **not** reach parity with
+    `aur::read` on extent, and this entry does not claim it does.
+    **Two follow-ups from the review round on this commit, both landed
+    under the same 0.57.14 version:**
+    - **`validate_origins` and `validate_opacities` reported a
+      nondeterministic offender.** Both returned on whichever violating
+      `LayerEntry` the `HashMap` iteration happened to reach first, so a
+      tree with two offenders produced a different error message from
+      run to run — unreproducible bug reports, and a break with this
+      module's own established convention (`validate_shape` picks the
+      lowest-numbered orphan by `min_by_key`, `validate_id_allocator`
+      the highest colliding id by `max_by_key`, each saying so in its
+      doc comment). Both now select the lowest raw `LayerId` the same
+      way and document the guarantee, with the offending-value test
+      factored into `offending_opacity`/`offending_origin` so the "is
+      this an offender" and "what gets reported" halves cannot drift.
+      Within one entry the documented order is `opacity` before
+      `fill_opacity`, and a layer's own `bounds` before its mask's. No
+      new `DocError` field — which offender is named changed, not the
+      error's shape. Four new `tree.rs` tests; the two
+      lowest-id ones fail against the pre-fix code (the fixtures are
+      rebuilt per iteration, because a single `HashMap` instance walks
+      in one fixed order for the life of the process and re-walking it
+      would prove nothing), the two within-entry ones are regression
+      pins for an order that was already correct.
+    - **The "already validated on the way in" premise in
+      `restore`/`restore_mask`'s doc comments was factually wrong**, and
+      is corrected (documentation only — no validation was added to
+      either body, which would break the undo contract, and
+      `try_from`'s call sequence is still untouched). The comments said
+      the tree "only ever holds values it validated". It does not:
+      `LayerTree` is `#[serde(try_from = "LayerTreeRepr")]`, and
+      `try_from` runs `validate_shape`/`validate_id_allocator`/
+      `validate_opacities` but deliberately **not** `validate_origins`,
+      so a direct `postcard::from_bytes::<LayerTree>()` can build a live
+      tree carrying an out-of-range origin that `restore`/`undo`/`redo`
+      then launder through unchanged. `validate_origin`,
+      `validate_origins`, `restore`, `restore_mask` and
+      `DocError::LayerOriginOutOfRange` now say precisely what the
+      phrase covers — the live-edit API (`set_bounds`/`add_mask`/
+      `insert_unchecked`) and the `.aur` file-read path (`aurora-io`'s
+      `tile_grid`/`validate_mask_origins`) — and name the deserializer
+      as the route it does not cover. This is the same "third door"
+      recorded above, stated where a reader of `restore` will actually
+      meet it rather than only in PLAN.md; it is a real residual and it
+      is not reachable in production, since that round's audit found the
+      only such call sites are inside `aurora-app`'s own `#[cfg(test)]`
+      module.
+- [ ] **A journal layer name reaches a screen reader unbounded and
+    unsanitized.** Disclosed 2026-08-30 by a reviewer working the
+    0.57.14 round; **not fixed there**, because it is `aurora-io` /
+    `aurora-ui` scope and that round was constrained to `aurora-doc`.
+    `aurora_ui::populate_history_panel`
+    (`crates/aurora-ui/src/history_panel.rs`, ~line 41) turns each
+    string from `History::journal_descriptions()` straight into an
+    `accesskit` `ListItem` label — `node.set_label(description)` — with
+    no length cap and no control-character filtering. The descriptions
+    are built from layer names, which on the `.aur` path come from the
+    file. Reproduced by the reviewer: a 500KB layer name produced a
+    500,026-byte accessibility label, and embedded `U+202E` (bidi
+    override) and `U+0007` survived into it intact; `aur::read`'s own
+    `MAX_METADATA_ENTRY_BYTES` (64 MB, `aur.rs:138`) leaves room for
+    hundreds of thousands of such ops in one file.
+    **Low severity today and not reachable**: exactly like `replay()`
+    was before 0.57.14 closed it, `aur::read`'s untrusted journal is not
+    wired into `aurora-app` — the live history panel is fed by a
+    `History` built from the user's own in-session edits. It becomes
+    **medium** the moment a loaded file's journal does reach the panel,
+    since the payload then crosses a process boundary into an assistive
+    technology that did not ask for it, and a bidi override can make a
+    label read as something other than what it is.
+    **Suggested direction when it is picked up** (not implemented, and
+    not a decision made here): cap the count and per-entry length where
+    the journal is loaded (`History::load_journal`) or where the strings
+    are produced (`journal_descriptions`), and strip control and
+    bidi-formatting characters before labelling. The cap belongs
+    upstream of the widget so every consumer of the descriptions gets
+    it, not just this panel. Worth doing **before** wiring `aur::read`'s
+    journal in, not after.
 - [x] **Panning past the document's *far* edge has no bound matching the
     origin-side one** — found 2026-08-25, fixed in 0.57.10.
     `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together

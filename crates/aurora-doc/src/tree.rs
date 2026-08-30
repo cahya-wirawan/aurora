@@ -483,15 +483,100 @@ fn validate_cross_references(
 /// than what it says. The range test is [`LayerTree::set_opacity`]'s,
 /// character for character — which also rejects `NaN`, since a
 /// `RangeInclusive::contains` is false for it.
+///
+/// Deterministic despite `HashMap`'s arbitrary iteration order: when
+/// several layers are out of range, the one with the lowest raw
+/// [`LayerId`] is the one reported — the same discipline
+/// [`validate_shape`] states for its own orphan report, and for the same
+/// reason (a validator that names a different offender on each run makes
+/// a bug report unreproducible). Within one entry, `opacity` is reported
+/// ahead of `fill_opacity`.
 fn validate_opacities(layers: &HashMap<LayerId, LayerEntry>) -> Result<(), DocError> {
-    for entry in layers.values() {
-        for value in [entry.opacity, entry.fill_opacity] {
-            if !(0.0..=1.0).contains(&value) {
-                return Err(DocError::OpacityOutOfRange(value));
-            }
-        }
+    // `aurora_core::Id<T>` deliberately has no `Ord`, so the minimum is
+    // taken over the raw values rather than over the ids themselves --
+    // see `validate_shape`'s own note.
+    if let Some((_, value)) = layers
+        .iter()
+        .filter_map(|(id, entry)| offending_opacity(entry).map(|value| (id.to_raw(), value)))
+        .min_by_key(|(raw, _)| *raw)
+    {
+        return Err(DocError::OpacityOutOfRange(value));
     }
     Ok(())
+}
+
+/// The first of `entry`'s two opacities outside `0.0..=1.0`, if either
+/// is. Split out of [`validate_opacities`] so the "is this entry an
+/// offender" test and the "what value gets reported" answer cannot drift
+/// apart across the two passes the deterministic selection needs.
+fn offending_opacity(entry: &LayerEntry) -> Option<f32> {
+    [entry.opacity, entry.fill_opacity]
+        .into_iter()
+        .find(|value| !(0.0..=1.0).contains(value))
+}
+
+/// Whole-tree counterpart to [`validate_origin`]: holds every stored
+/// `Rect` origin in `layers` to that same shared predicate, so a tree
+/// assembled by some route other than the per-call guards can still be
+/// refused as a whole.
+///
+/// The mask check sits *outside* the `kind` match on purpose. A group
+/// carries a mask too, so testing only the `Pixel` arm would leave a
+/// masked group's own origin unchecked — the same reasoning
+/// `aurora-io`'s `validate_mask_origins` follows when it walks every
+/// layer id regardless of kind.
+///
+/// [`LayerTree::restore`] and [`LayerTree::restore_mask`] still do not
+/// call this (nor [`validate_origin`]) for the reason
+/// [`validate_origin`]'s own doc comment gives: re-checking there would
+/// let an ordinary undo fail on a value the tree itself produced. The
+/// bar is applied instead where an *untrusted* whole tree arrives —
+/// [`LayerTree::validate`], which `crate::History::replay` runs as its
+/// closing step — and, on the `.aur` file-read path, by `aurora-io`'s
+/// own `tile_grid`/`validate_mask_origins`. See [`validate_origin`] for
+/// exactly which routes into the tree that does and does not cover:
+/// [`LayerTree`]'s bare `Deserialize` is deliberately not one of them.
+///
+/// Deterministic despite `HashMap`'s arbitrary iteration order: when
+/// several layers are out of range, the one with the lowest raw
+/// [`LayerId`] is the one reported — the same discipline
+/// [`validate_shape`] states for its own orphan report. Within one
+/// entry, the layer's own `bounds` is reported ahead of its mask's.
+fn validate_origins(layers: &HashMap<LayerId, LayerEntry>) -> Result<(), DocError> {
+    // `aurora_core::Id<T>` deliberately has no `Ord`, so the minimum is
+    // taken over the raw values rather than over the ids themselves --
+    // see `validate_shape`'s own note.
+    match layers
+        .iter()
+        .filter_map(|(id, entry)| offending_origin(entry).map(|bounds| (id.to_raw(), bounds)))
+        .min_by_key(|(raw, _)| *raw)
+    {
+        // Routed back through the shared predicate rather than building
+        // the error here, so there stays exactly one place that maps an
+        // out-of-range `Rect` to a `DocError`.
+        Some((_, bounds)) => validate_origin(bounds),
+        None => Ok(()),
+    }
+}
+
+/// The first of `entry`'s stored rectangles whose origin is out of
+/// document range, if either is. Split out of [`validate_origins`] for
+/// the same reason [`offending_opacity`] is split out of
+/// [`validate_opacities`]: the "is this entry an offender" test and the
+/// "which rectangle gets reported" answer must not drift apart across
+/// the two passes the deterministic selection needs.
+fn offending_origin(entry: &LayerEntry) -> Option<Rect> {
+    let own = match &entry.kind {
+        LayerKind::Pixel { bounds } if !bounds.origin_in_document_range() => Some(*bounds),
+        _ => None,
+    };
+    own.or_else(|| {
+        entry
+            .mask
+            .as_ref()
+            .map(|mask| mask.bounds)
+            .filter(|bounds| !bounds.origin_in_document_range())
+    })
 }
 
 /// Refuses a `bounds` whose origin sits further from the document
@@ -502,17 +587,42 @@ fn validate_opacities(layers: &HashMap<LayerId, LayerEntry>) -> Result<(), DocEr
 /// Called from every public path that stores a caller-supplied `Rect`
 /// (`insert_unchecked` for a pixel layer, `set_bounds`, `add_mask`),
 /// always *before* the value is written, so a refusal changes nothing.
+/// [`crate::History::record_bounds_change`] calls it too — it stores no
+/// `Rect` in the tree, but journals one as an undo entry, and an
+/// out-of-range value there used to wedge undo permanently.
+///
 /// Deliberately not called from `restore`/`restore_mask`: those are
-/// crate-private undo paths putting back a value this function already
-/// passed on the way in, and re-checking there would let an undo fail
-/// on a value the tree itself produced.
+/// crate-private undo paths putting back a value that reached the tree
+/// through one of the checked routes above, and re-checking there would
+/// let an undo fail on a value the tree itself produced.
+///
+/// **What "already validated on the way in" does and does not mean.**
+/// It covers the *live-edit API* (`set_bounds`, `add_mask`,
+/// `insert_unchecked`) and the *`.aur` file-read path* (`aurora-io`'s
+/// own `tile_grid` and `validate_mask_origins`, which is where the
+/// read-time origin bar lives — see
+/// [`DocError::LayerOriginOutOfRange`] for why it is there and not in
+/// this crate's deserializer). It does **not** cover [`LayerTree`]'s
+/// own bare `Deserialize`: that is `#[serde(try_from =
+/// "LayerTreeRepr")]`, and [`LayerTreeRepr`]'s `try_from` deliberately
+/// runs [`validate_shape`], [`validate_id_allocator`] and
+/// [`validate_opacities`] but *not* [`validate_origins`]. So a direct
+/// `postcard::from_bytes::<LayerTree>()` that bypasses `aurora-io` can
+/// construct a live tree holding an out-of-range origin, which
+/// `restore`/`restore_mask` (and so `undo`/`redo`) will then put back
+/// unchanged. That is a real residual, narrower than `restore` alone
+/// suggests: the prior round's audit (PLAN.md, "third door") found the
+/// only such call sites today are inside `aurora-app`'s own
+/// `#[cfg(test)]` module, so it is not reachable in production, and
+/// [`LayerTree::validate`] — which [`validate_origins`] backs — is the
+/// whole-tree bar any untrusted tree is held to.
 ///
 /// Extent is deliberately *not* checked here — see
 /// [`DocError::LayerOriginOutOfRange`] and
 /// `aurora_core::MAX_DOCUMENT_ORIGIN` for why. It is bounded where it
 /// is owned instead (`aurora_core::Size::new`, and `aurora-io`'s own
 /// `tile_grid` for a manifest read off disk).
-fn validate_origin(bounds: Rect) -> Result<(), DocError> {
+pub(crate) fn validate_origin(bounds: Rect) -> Result<(), DocError> {
     if bounds.origin_in_document_range() {
         return Ok(());
     }
@@ -937,6 +1047,17 @@ impl LayerTree {
     /// [`Self::new`] with the counter at `0`) cannot make the next
     /// `add_pixel_layer` alias one of them.
     ///
+    /// **A layer origin is deliberately *not* re-checked here** — this
+    /// puts back a rectangle that reached the tree through a checked
+    /// route, and re-checking would let an ordinary undo fail on a value
+    /// the tree itself produced. "A checked route" means the live-edit
+    /// API or the `.aur` file-read path, *not* this type's own bare
+    /// `Deserialize`, which does not bound origin; [`validate_origin`]'s
+    /// doc comment states exactly what that leaves open (in short: a
+    /// direct `postcard::from_bytes::<LayerTree>()` bypassing
+    /// `aurora-io`, whose only call sites today are `aurora-app` tests).
+    /// The whole-tree bar for an untrusted tree is [`Self::validate`].
+    ///
     /// Nothing is changed when any of these happens — every check runs
     /// before the first mutation.
     pub(crate) fn restore(&mut self, removed: RemovedSubtree) -> Result<LayerId, DocError> {
@@ -1326,8 +1447,11 @@ impl LayerTree {
 
     /// Holds this whole tree to exactly the bar
     /// `#[serde(try_from = "LayerTreeRepr")]` holds a deserialized one
-    /// to — literally the same [`validate_shape`] call, rooted at
-    /// [`Self::roots`] with no parent above them.
+    /// to — literally the same [`validate_shape`], [`validate_opacities`]
+    /// and [`validate_id_allocator`] calls, rooted at [`Self::roots`]
+    /// with no parent above them, plus [`validate_origins`] for the
+    /// stored `Rect` origins the per-call guards cover on the live edit
+    /// paths.
     ///
     /// It exists because there is a second way an untrusted `.aur` file
     /// reaches a live `LayerTree` that never touches
@@ -1343,10 +1467,34 @@ impl LayerTree {
     /// Whatever [`validate_shape`] returns — see its own doc comment for
     /// the four rules — plus [`DocError::StaleLayerIdGenerator`] from
     /// [`validate_id_allocator`], the same pairing
-    /// `#[serde(try_from = "LayerTreeRepr")]` runs.
+    /// `#[serde(try_from = "LayerTreeRepr")]` runs; plus
+    /// [`DocError::OpacityOutOfRange`] from [`validate_opacities`] and
+    /// [`DocError::LayerOriginOutOfRange`] from [`validate_origins`].
+    ///
+    /// The last two close a gap between this function and the two other
+    /// whole-tree gates. `try_from` already ran `validate_opacities`
+    /// directly, and [`Self::restore`] already runs it on an incoming
+    /// subtree; `set_bounds`/`add_mask`/`insert_unchecked` already run
+    /// [`validate_origin`] on every caller-supplied `Rect`. Only
+    /// `validate` itself stopped at shape and ids — which mattered
+    /// because [`crate::History::replay`] has no other gate: a crafted
+    /// journal's `Restore`/`RestoreMask` op could splice in an origin
+    /// past `aurora_core::MAX_DOCUMENT_ORIGIN` and reach a live tree.
+    /// Property ranges are now checked here too, so `replay` clears the
+    /// same bar `try_from` and `restore` each already apply on their own
+    /// paths. (The opacity call is contract completeness rather than a
+    /// second closed exploit: both journal doors for an opacity —
+    /// `SetOpacity`/`SetFillOpacity`, which go through the
+    /// already-range-checked setters, and `Restore`, which goes through
+    /// [`Self::restore`]'s own `validate_opacities` — were guarded
+    /// before this.)
     pub(crate) fn validate(&self) -> Result<(), DocError> {
+        // Shape, allocator, opacity, origin -- `try_from`'s own
+        // ordering, one step further.
         validate_shape(&self.layers, &self.roots, None, 1)?;
-        validate_id_allocator(&self.ids, &self.layers)
+        validate_id_allocator(&self.ids, &self.layers)?;
+        validate_opacities(&self.layers)?;
+        validate_origins(&self.layers)
     }
 
     /// The sibling list `parent` names: [`Self::roots`] if `None`, or a
@@ -1631,6 +1779,16 @@ impl LayerTree {
     /// its exact `enabled`/`inverted` state — unlike [`Self::add_mask`],
     /// which always creates a fresh, enabled, uninverted one, this is for
     /// restoring one that may have been toggled before it was removed.
+    ///
+    /// **The mask's origin is deliberately *not* re-checked here**, for
+    /// the same reason [`Self::restore`] gives: it puts back a rectangle
+    /// that reached the tree through a checked route (the live-edit API,
+    /// via [`Self::add_mask`], or the `.aur` file-read path, via
+    /// `aurora-io`'s `validate_mask_origins`), and re-checking would let
+    /// an ordinary undo fail on a value the tree itself produced. This
+    /// type's own bare `Deserialize` is *not* one of those checked
+    /// routes — see [`validate_origin`] for what that leaves open, and
+    /// [`Self::validate`] for the whole-tree bar that covers it.
     ///
     /// # Errors
     ///
@@ -4615,6 +4773,264 @@ mod tests {
         }
         assert!(!tree.contains(ghost), "a refused restore must add nothing");
         assert_eq!(tree.len(), 0);
+    }
+
+    // --- property ranges reaching `validate` itself --------------------
+    //
+    // `validate` used to run only `validate_shape` and
+    // `validate_id_allocator`, while `try_from` additionally ran
+    // `validate_opacities` and every live edit path ran
+    // `validate_origin`. `History::replay` has no gate but `validate`,
+    // so a crafted journal could splice an out-of-range origin into a
+    // live tree (see history.rs's own two replay tests for that end of
+    // it). These check the validator directly.
+
+    /// A rectangle whose origin sits one step past the document range on
+    /// `x`, with an extent small enough that only the origin is at fault.
+    fn out_of_range_origin() -> Rect {
+        Rect {
+            x: aurora_core::MAX_DOCUMENT_ORIGIN + 1,
+            y: 0,
+            width: 10,
+            height: 10,
+        }
+    }
+
+    fn mask_at(bounds: Rect) -> LayerMask {
+        LayerMask {
+            bounds,
+            enabled: true,
+            inverted: false,
+        }
+    }
+
+    /// A one-layer tree holding `entry`, with its id allocator already
+    /// positioned past that id so `validate_id_allocator` cannot fire
+    /// before the check under test.
+    fn one_layer_tree(entry: super::LayerEntry) -> LayerTree {
+        let id = super::LayerId::from_raw(0);
+        let mut layers = HashMap::new();
+        layers.insert(id, entry);
+        LayerTree {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![id],
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_pixel_layer_whose_origin_is_out_of_document_range() {
+        let mut entry = pixel_entry("a", None);
+        entry.kind = LayerKind::Pixel {
+            bounds: out_of_range_origin(),
+        };
+        match one_layer_tree(entry).validate() {
+            Err(DocError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+                assert_eq!(y, 0);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_pixel_layers_mask_whose_origin_is_out_of_document_range() {
+        // The layer's own bounds are fine; only the mask is out of range.
+        let mut entry = pixel_entry("a", None);
+        entry.mask = Some(mask_at(out_of_range_origin()));
+        match one_layer_tree(entry).validate() {
+            Err(DocError::LayerOriginOutOfRange { x, .. }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_group_layers_mask_whose_origin_is_out_of_document_range() {
+        // A group has no `Pixel { bounds }` of its own, so this is only
+        // caught if the mask check sits outside the `kind` match.
+        let mut entry = group_entry("g", None, Vec::new());
+        entry.mask = Some(mask_at(Rect {
+            x: 0,
+            y: -aurora_core::MAX_DOCUMENT_ORIGIN - 1,
+            width: 10,
+            height: 10,
+        }));
+        match one_layer_tree(entry).validate() {
+            Err(DocError::LayerOriginOutOfRange { x, y, .. }) => {
+                assert_eq!(x, 0);
+                assert_eq!(y, -aurora_core::MAX_DOCUMENT_ORIGIN - 1);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    // The exact literal set two lines below, returned unchanged in the
+    // error with no arithmetic in between -- the same reasoning
+    // `set_opacity_updates_and_rejects_out_of_range` above documents.
+    #[allow(clippy::float_cmp)]
+    fn validate_rejects_an_opacity_outside_the_allowed_range() {
+        // Contract completeness rather than a newly closed exploit --
+        // both journal doors for an opacity were already guarded (the
+        // setters range-check, and `restore` runs `validate_opacities`
+        // on the incoming subtree). What was missing is that `validate`
+        // itself did not hold to the bar `try_from` and `restore` do.
+        let mut entry = pixel_entry("a", None);
+        entry.fill_opacity = 1.5;
+        match one_layer_tree(entry).validate() {
+            Err(DocError::OpacityOutOfRange(value)) => assert_eq!(value, 1.5),
+            other => unreachable!("expected OpacityOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_origins_exactly_on_the_document_range_boundary() {
+        // The direction that must keep working: `MAX_DOCUMENT_ORIGIN` is
+        // inclusive on both axes and both signs, so a legitimate
+        // far-corner document must still validate. Bounds and mask are
+        // pinned to opposite corners so one fixture covers all four
+        // comparisons.
+        let max = aurora_core::MAX_DOCUMENT_ORIGIN;
+        let mut entry = pixel_entry("a", None);
+        entry.kind = LayerKind::Pixel {
+            bounds: Rect {
+                x: max,
+                y: max,
+                width: 10,
+                height: 10,
+            },
+        };
+        entry.mask = Some(mask_at(Rect {
+            x: -max,
+            y: -max,
+            width: 10,
+            height: 10,
+        }));
+        if let Err(err) = one_layer_tree(entry).validate() {
+            unreachable!("the boundary origins are legitimate: {err:?}");
+        }
+    }
+
+    #[test]
+    fn the_out_of_range_origin_reported_is_the_lowest_numbered_layers() {
+        // Same discipline as
+        // `the_orphan_reported_is_the_lowest_numbered_one_not_whichever_hashmap_yields_first`:
+        // with two offenders, which one is named must not depend on
+        // `HashMap`'s per-process iteration order, or the same file
+        // yields a different error message on every run. The offenders
+        // carry *different* x values so the reported one is identifiable.
+        let low = super::LayerId::from_raw(1);
+        let high = super::LayerId::from_raw(2);
+        let out_of_range_at = |x: i64| Rect {
+            x,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        // A *fresh* map each iteration, not one map walked 32 times:
+        // `HashMap`'s `RandomState` is seeded per instance, so re-walking
+        // a single map yields the same order every time and would prove
+        // nothing. Rebuilding reseeds it, so 32 rounds make agreeing by
+        // luck vanishingly unlikely.
+        for _ in 0..32 {
+            let mut low_entry = pixel_entry("low", None);
+            low_entry.kind = LayerKind::Pixel {
+                bounds: out_of_range_at(aurora_core::MAX_DOCUMENT_ORIGIN + 1),
+            };
+            let mut high_entry = pixel_entry("high", None);
+            high_entry.kind = LayerKind::Pixel {
+                bounds: out_of_range_at(aurora_core::MAX_DOCUMENT_ORIGIN + 2),
+            };
+            let mut layers = HashMap::new();
+            layers.insert(high, high_entry);
+            layers.insert(low, low_entry);
+            match super::validate_origins(&layers) {
+                Err(DocError::LayerOriginOutOfRange { x, .. }) => {
+                    assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+                }
+                other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    // The exact literals set below, reported unchanged with no
+    // arithmetic in between.
+    #[allow(clippy::float_cmp)]
+    fn the_out_of_range_opacity_reported_is_the_lowest_numbered_layers() {
+        // The same nondeterminism `validate_origins` had, which this
+        // check has had since it landed: it reported whichever violating
+        // entry the `HashMap` happened to yield first.
+        let low = super::LayerId::from_raw(1);
+        let high = super::LayerId::from_raw(2);
+        // Rebuilt each round for the reseeding reason the origin test
+        // above spells out.
+        for _ in 0..32 {
+            let mut low_entry = pixel_entry("low", None);
+            low_entry.opacity = 1.5;
+            let mut high_entry = pixel_entry("high", None);
+            high_entry.opacity = 2.5;
+            let mut layers = HashMap::new();
+            layers.insert(high, high_entry);
+            layers.insert(low, low_entry);
+            match super::validate_opacities(&layers) {
+                Err(DocError::OpacityOutOfRange(value)) => assert_eq!(value, 1.5),
+                other => unreachable!("expected OpacityOutOfRange, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    // As above: the literal is reported unchanged.
+    #[allow(clippy::float_cmp)]
+    fn one_layers_own_opacity_is_reported_ahead_of_its_fill_opacity() {
+        // Pins the documented within-entry order, so the "which value"
+        // half of the determinism guarantee is covered too -- `opacity`
+        // and `fill_opacity` are both out of range on the same entry.
+        let id = super::LayerId::from_raw(0);
+        let mut entry = pixel_entry("a", None);
+        entry.opacity = 1.5;
+        entry.fill_opacity = 2.5;
+        let mut layers = HashMap::new();
+        layers.insert(id, entry);
+        match super::validate_opacities(&layers) {
+            Err(DocError::OpacityOutOfRange(value)) => assert_eq!(value, 1.5),
+            other => unreachable!("expected OpacityOutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_layers_own_bounds_are_reported_ahead_of_its_masks() {
+        // The origin counterpart to the test above: both rectangles on
+        // one entry are out of range, and the layer's own `bounds` is
+        // the documented answer.
+        let id = super::LayerId::from_raw(0);
+        let mut entry = pixel_entry("a", None);
+        entry.kind = LayerKind::Pixel {
+            bounds: Rect {
+                x: aurora_core::MAX_DOCUMENT_ORIGIN + 1,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        };
+        entry.mask = Some(mask_at(Rect {
+            x: aurora_core::MAX_DOCUMENT_ORIGIN + 2,
+            y: 0,
+            width: 10,
+            height: 10,
+        }));
+        let mut layers = HashMap::new();
+        layers.insert(id, entry);
+        match super::validate_origins(&layers) {
+            Err(DocError::LayerOriginOutOfRange { x, .. }) => {
+                assert_eq!(x, aurora_core::MAX_DOCUMENT_ORIGIN + 1);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
     }
 
     // --- reparent's own stale sibling list ----------------------------
