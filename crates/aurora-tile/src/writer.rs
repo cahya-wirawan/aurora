@@ -8,7 +8,8 @@
 //! `aurora-tile` grows genuinely concurrent I/O needs beyond one writer.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
@@ -41,6 +42,53 @@ pub(crate) struct WriteResult {
     pub(crate) outcome: std::io::Result<()>,
 }
 
+/// Writes one scratch tile file, owner-only where the platform lets
+/// this crate say so. `0o600` is set by `OpenOptions` at creation, not
+/// chmod-ed afterwards, so there is no window in which the file exists
+/// wider than intended. Defence in depth: the containing scratch
+/// directory is already `0o700` ([`crate::store`]'s `create_private_dir`),
+/// which on its own denies every other user the traversal needed to
+/// reach anything inside it.
+///
+/// The mode applies only when this call *creates* the file; a rewrite
+/// of an existing path keeps that file's mode, which is fine because
+/// every file here was created by this process, in a directory only it
+/// can traverse. Rewriting is not an edge case -- it is how a later
+/// generation supersedes an earlier one for the same key, so
+/// `create_new(true)` is deliberately *not* used: it would fail every
+/// such rewrite and break the FIFO invariant [`BackgroundWriter::spawn`]
+/// documents.
+///
+/// **This is defence in depth *on top of* the directory's `0o700`, not
+/// protection independent of it.** `open` follows symlinks, and `open`'s
+/// mode argument is consulted only when the call actually creates a new
+/// inode -- so if the containing directory's protection ever fails or is
+/// bypassed, a pre-existing file (or a planted symlink) at this path is
+/// truncated and overwritten at *its* mode, and the `0o600` requested
+/// here buys nothing. The `0o700` scratch directory, which denies every
+/// other user the traversal needed to reach or create anything inside
+/// it, is what actually holds that line today. Closing the gap properly
+/// needs `O_NOFOLLOW` on this open, tracked with the same requirement
+/// for `create_private_dir` in `PLAN.md` -- it needs a `libc` dependency
+/// and an `unsafe_code` override, so it is its own architecture
+/// decision rather than part of this helper.
+///
+/// Windows ACLs are *not* addressed here: `OpenOptions` has no portable
+/// equivalent -- the same gap `aurora_app::create_autosave_temp` and
+/// `create_private_dir` already disclose. A Windows scratch tile is
+/// created with the parent directory's inherited ACL.
+fn write_tile_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)
+}
+
 pub(crate) struct BackgroundWriter {
     tx: Option<Sender<WriteJob>>,
     handle: Option<JoinHandle<()>>,
@@ -67,7 +115,8 @@ impl BackgroundWriter {
     /// failure against) bytes that are not its own. It says nothing at
     /// all about which bytes end up in the *file*. That comes entirely
     /// from the loop below -- a single thread draining a single `mpsc`
-    /// queue, one `fs::write` at a time, in the order jobs were sent --
+    /// queue, one [`write_tile_file`] at a time, in the order jobs were
+    /// sent --
     /// combined with `TileStore::make_room` minting generations in that
     /// same submission order. Two evictions of one tile therefore write
     /// the older bytes first and the newer bytes second, so the file is
@@ -104,7 +153,7 @@ impl BackgroundWriter {
         let (results_tx, results_rx) = mpsc::channel::<WriteResult>();
         let handle = std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                let outcome = fs::write(&job.path, &job.bytes);
+                let outcome = write_tile_file(&job.path, &job.bytes);
                 // The store may already be gone (e.g. process shutdown
                 // mid-write) -- a dropped results receiver is not this
                 // thread's problem to report anywhere.
@@ -193,6 +242,116 @@ mod tests {
             }
         };
         assert_eq!(written, vec![1, 2, 3, 4]);
+    }
+
+    /// A scratch tile file must be created with no group or other
+    /// permission bits, and must stay rewritable by a later generation
+    /// for the same key.
+    ///
+    /// **The mode assertion is this test's own contribution.** The
+    /// rewrite half is *also* pinned here only because it is convenient
+    /// to check both properties from one run -- the primary,
+    /// pre-existing guarantee for the rewrite case is
+    /// `writes_for_one_path_land_in_submission_order` below, which
+    /// submits three jobs to one path, is not `unix`-gated, and would
+    /// already fail on every platform if `create_new(true)` were used by
+    /// mistake. What this test adds is that the mode hardening did not
+    /// cost that path *under the same `OpenOptions` call* the mode is
+    /// requested on.
+    ///
+    /// # Guards the guard
+    ///
+    /// The mode is asserted as `& 0o077 == 0` -- "never wider than
+    /// owner-only" -- rather than exactly `0o600`, for two reasons.
+    /// Owner-only is the actual security property; and a sufficiently
+    /// restrictive ambient umask (`0o377`, say) can strip owner bits
+    /// too, which would make an exact-equality assertion a false failure
+    /// on such a system even with the fix correctly present.
+    ///
+    /// That assertion alone would be vacuous under a common ambient
+    /// umask: `0o077` is the default on hardened Linux, many container
+    /// images, and several CI hardening profiles, and under it the *old*
+    /// `fs::write` code (which requests `0o666`) also lands `0o600`. So
+    /// this test first writes a sibling control file with plain
+    /// `std::fs::write`, bypassing `write_tile_file` entirely, and
+    /// requires that the ambient umask really does leave *it* wider than
+    /// owner-only. If it does not, the premise assertion fails loudly
+    /// rather than letting the real assertion pass while proving
+    /// nothing -- the same shape as `store.rs`'s
+    /// `new_leaves_the_scratch_directory_owner_only`, which pre-creates
+    /// at `0o777` for exactly this reason. (Verified by mutation:
+    /// reverting `write_tile_file` to `fs::write` makes this fail under
+    /// both `umask 0022` and `umask 0077`.)
+    #[cfg(unix)]
+    #[test]
+    fn a_scratch_tile_file_is_created_owner_only_and_stays_rewritable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("tempdir creation must succeed in a test environment: {err}"),
+        };
+
+        // Guards the guard: a control file created the way the writer
+        // used to create tiles. If the ambient umask already forces
+        // owner-only on *this*, the assertion below cannot distinguish
+        // the fix from its absence, and must say so rather than pass.
+        let control = dir.path().join("umask-control");
+        if let Err(err) = std::fs::write(&control, b"control") {
+            unreachable!("writing a file into a fresh tempdir must succeed: {err}");
+        }
+        let control_mode = match std::fs::metadata(&control) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the control file was just written: {err}"),
+        };
+        assert_ne!(
+            control_mode & 0o077,
+            0,
+            "this test's premise is an ambient umask that permits a wider-than-owner-only mode by \
+             default (the control file came back {control_mode:04o}); this environment's umask \
+             already restricts every new file to owner-only, so the assertion below would hold \
+             with or without `write_tile_file`'s own `.mode(0o600)` and cannot distinguish the \
+             fix from its absence -- rerun with a laxer umask (e.g. 0o022)"
+        );
+
+        let path = dir.path().join("0_0.tile");
+        let mut writer = BackgroundWriter::spawn();
+        for generation in 1..=2_u64 {
+            writer.submit(WriteJob {
+                surface: SurfaceId::from_raw(0),
+                id: TileId { x: 0, y: 0 },
+                generation,
+                path: path.clone(),
+                bytes: vec![generation as u8; 8],
+            });
+        }
+        writer.flush();
+
+        let written = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                unreachable!("flush() joined the writer thread, so the file must exist: {err}")
+            }
+        };
+        assert_eq!(
+            written,
+            vec![2_u8; 8],
+            "hardening the file's mode must not have cost the rewrite path: a later generation \
+             for the same key still has to land its own bytes"
+        );
+
+        let mode = match std::fs::metadata(&path) {
+            Ok(meta) => meta.permissions().mode() & 0o777,
+            Err(err) => unreachable!("the file the writer just wrote must exist: {err}"),
+        };
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a scratch tile holds the document's real unsaved pixel data; the background writer \
+             must create it owner-only rather than at whatever the process umask happens to \
+             allow, and this one came back {mode:04o} (the control file above confirms this \
+             environment's umask would have permitted a wider mode)"
+        );
     }
 
     /// Pins the FIFO invariant [`BackgroundWriter::spawn`]'s own doc

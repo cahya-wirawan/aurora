@@ -1263,7 +1263,7 @@ mod tests {
     /// `pending`/disk actually served the revisit. Measured on this
     /// machine, the background writer thread -- already alive and
     /// blocked in `recv()` before `submit` is ever called -- can
-    /// complete a small `fs::write` to a fresh tempdir and have its
+    /// complete a small `write_tile_file` to a fresh tempdir and have its
     /// result reconciled before this test's own next few statements
     /// run, even with no explicit sleep/yield; asserting "the file must
     /// not exist yet" here would be asserting a timing outcome this
@@ -1400,7 +1400,8 @@ mod tests {
     ///
     /// The write is made to fail deterministically, and portably, by
     /// occupying the exact path `make_room` will write to with a
-    /// *directory*: `fs::write` cannot succeed against one on any
+    /// *directory*: the background writer's file open cannot succeed
+    /// against one on any
     /// platform this ships to, and unlike a permissions change it needs
     /// no `unix`-only API and no privileged environment.
     #[test]
@@ -1818,7 +1819,8 @@ mod tests {
         let id = TileId { x: 2, y: 5 };
 
         // A directory at the target path: the portable idiom the other
-        // failed-write tests here use to force `fs::write` to fail.
+        // failed-write tests here use to force the background writer's
+        // file open to fail.
         let unwritable = dir.path().join("unwritable");
         if let Err(err) = std::fs::create_dir(&unwritable) {
             unreachable!("test-local scratch dir must accept a subdirectory: {err}");

@@ -10832,6 +10832,18 @@ structural design work.
     `[lints]` table. That is an architecture decision, not a bug fix,
     which is why it is its own item.
 
+    **When it happens, it should cover the scratch *tile file* open
+    too, not just directory creation.** `aurora_tile::writer`'s
+    `write_tile_file` (0.58.0) opens each tile with `.mode(0o600)`, but
+    `open` follows symlinks and its mode argument is consulted only when
+    the call creates a new inode — so a pre-existing file or a planted
+    symlink at that path is truncated and overwritten at *its* mode.
+    Nothing is exploitable today, for the same reason the directory case
+    is not: the `0o700` scratch directory denies every other user the
+    traversal needed to reach or create anything inside it. It is the
+    same class of gap, wants the same `O_NOFOLLOW`, and would ride along
+    on the same `libc`/`unsafe_code` decision.
+
     **Same gap on the `aurora-app` side, found by the round's final
     judge pass and not yet fixed.** `create_dir_owner_only`
     (`crates/aurora-app/src/lib.rs`, the self-heal helper
@@ -10852,15 +10864,62 @@ structural design work.
     the cheaper symlink-refusal half of `create_private_dir`'s check on
     its own first.
 
-- [ ] **Nice-to-have: create the scratch *tile files* `0o600` too.**
-    Opened 2026-08-25. Defence in depth only — 0.53.0's stated scope was
-    directory-level protection, and a `0o700` directory already denies
-    every other user the traversal needed to reach the files inside it.
-    Would matter if the directory's mode were ever weakened, or on a
-    filesystem that does not enforce directory permissions. The change
-    belongs in `aurora-tile`'s background writer (`fs::write` currently
-    creates at the umask default), and on Windows has the same missing-
-    ACL story `create_autosave_temp` already discloses.
+- [x] **Nice-to-have: create the scratch *tile files* `0o600` too** —
+    done 2026-08-30. Opened 2026-08-25. Defence in depth only — 0.53.0's
+    stated scope was directory-level protection, and a `0o700` directory
+    already denies every other user the traversal needed to reach the
+    files inside it. Would matter if the directory's mode were ever
+    weakened, or on a filesystem that does not enforce directory
+    permissions — with the honest caveat that under *exactly* that
+    hypothesis the new mode buys little on its own: `open` follows
+    symlinks and its mode argument is consulted only when the call
+    creates a new inode, so a pre-existing file or planted symlink at
+    the path is overwritten at its own mode. This is defence in depth
+    layered on the `0o700` directory, not protection independent of it,
+    and closing the gap properly is folded into the existing
+    `O_NOFOLLOW` item above.
+
+    `aurora-tile`'s background writer no longer calls `fs::write` (which
+    created at the umask default). A new private `write_tile_file` in
+    `writer.rs` opens each scratch tile through `fs::OpenOptions` with
+    `.write(true).create(true).truncate(true)` and, under `#[cfg(unix)]`,
+    `.mode(0o600)` — the same single-call-site idiom
+    `aurora_app::create_autosave_temp` established. The mode is applied
+    by the `open` itself, so unlike a follow-up `set_permissions` there
+    is no window in which the file exists wider than intended.
+
+    `create_new(true)` is deliberately *not* used: a later generation
+    legitimately rewrites the same key's path, and refusing that would
+    break the FIFO/generation invariant `BackgroundWriter::spawn`
+    documents. A rewrite therefore keeps the existing file's mode, which
+    is fine — every such file was created by this process, in a
+    directory only it can traverse. Durability semantics are unchanged
+    (no `sync_all`/`sync_data` added).
+
+    Windows still inherits the parent directory's ACL: `OpenOptions` has
+    no portable mode equivalent, the same gap `create_autosave_temp` and
+    `create_private_dir` already disclose, and it is disclosed again in
+    `write_tile_file`'s own doc comment. The `0o700` scratch *directory*
+    protection is untouched.
+
+    Pinned by `writer.rs`'s
+    `a_scratch_tile_file_is_created_owner_only_and_stays_rewritable`
+    (`#[cfg(unix)]`). Its own contribution is the mode assertion —
+    `mode & 0o077 == 0`, "never wider than owner-only", which is the
+    property that actually matters and which (unlike exact `0o600`)
+    cannot false-fail under a umask that strips owner bits too. It
+    guards its own premise the way `new_leaves_the_scratch_directory_
+    owner_only` does: a sibling control file written with plain
+    `std::fs::write` must come back *wider* than owner-only, or the test
+    fails loudly, because under an ambient umask of `0o077` (hardened
+    Linux, many container images, several CI profiles) the old
+    `fs::write` path also lands `0o600` and an unguarded assertion would
+    prove nothing. It additionally confirms the rewrite path still works
+    under the same `OpenOptions`; the primary, pre-existing and
+    all-platform guarantee for that is
+    `writes_for_one_path_land_in_submission_order`, which submits three
+    jobs to one path and would already fail if `create_new(true)` were
+    used by mistake.
 
 - [x] **Undo/Redo, wired to a real, live `History`** — done 2026-08-06.
   `aurora_doc::History` (M1.4) already mirrored every `LayerTree`
