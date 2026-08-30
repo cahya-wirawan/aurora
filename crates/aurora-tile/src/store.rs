@@ -12,6 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use aurora_core::Rect;
 use lru::LruCache;
@@ -127,6 +128,11 @@ pub struct Stats {
 /// result whose generation is not the one `pending` holds — before they
 /// look at whether it succeeded, so a superseded *failure* cannot enter
 /// the failed-write queue either. Counted in [`Stats::superseded_writes`].
+/// One entry of [`TileStore::pending`]: the `write_generation` the bytes
+/// were submitted under, and the bytes themselves, shared with the
+/// queued [`WriteJob`] rather than copied into it.
+type PendingWrite = (u64, Arc<Vec<u8>>);
+
 #[derive(Debug)]
 pub struct TileStore {
     resident: LruCache<(SurfaceId, TileId), Tile>,
@@ -143,7 +149,16 @@ pub struct TileStore {
     /// older job for the same key, superseded by a later eviction, must
     /// not clear (or record a failure against) bytes that are not its
     /// own — see this type's own "Stale-write race, closed" note.
-    pending: HashMap<(SurfaceId, TileId), (u64, Vec<u8>)>,
+    ///
+    /// The bytes are an `Arc<Vec<u8>>` shared with the queued
+    /// [`WriteJob`], not a copy of it: both holders are read-only, and
+    /// this map is only ever inserted into and removed from — never
+    /// mutated in place — so sharing is sound and an eviction no longer
+    /// pays an allocate-and-copy of up to 512 KiB on the caller's
+    /// thread. `Arc<Vec<u8>>` rather than `Arc<[u8]>` is what makes that
+    /// true rather than merely tidy — see [`WriteJob::bytes`] for why the
+    /// slice form would reintroduce the very copy this avoids.
+    pending: HashMap<(SurfaceId, TileId), PendingWrite>,
     /// The keys in [`Self::pending`] whose background write actually
     /// *failed*, oldest first — the retention queue
     /// [`Self::cap_failed_writes`] bounds. A successful write's `pending`
@@ -1011,7 +1026,22 @@ impl TileStore {
             let Some(((victim_surface, victim_id), victim_tile)) = self.resident.pop_lru() else {
                 break;
             };
-            let bytes = codec::encode(victim_tile.texels());
+            // Shared, not copied: the same bytes go into `pending` *and*
+            // into the `WriteJob` below, and both are read-only for the
+            // rest of their lives. Sharing one allocation turns what used
+            // to be a full copy of the encoded tile (up to 512 KiB, on the
+            // caller's — often the brush — thread) into a refcount bump,
+            // and halves how much memory an eviction burst pins while a
+            // slow scratch disk works through the writer's unbounded queue.
+            //
+            // `Arc::new(vec)` and *not* `vec.into()`: the former wraps the
+            // buffer `codec::encode` already allocated, touching none of
+            // its bytes, so the copy is genuinely gone. The latter would
+            // build an `Arc<[u8]>`, whose inline refcount header forces a
+            // fresh allocation and a memcpy of the whole encoded tile —
+            // relocating this copy rather than removing it. See
+            // [`WriteJob::bytes`].
+            let bytes: Arc<Vec<u8>> = Arc::new(codec::encode(victim_tile.texels()));
             let path = self.tile_path(victim_surface, victim_id);
             // `wrapping_add` rather than `+=`: overflow here is unreachable
             // (one eviction per nanosecond for 584 years), and a wrap is still
@@ -1029,8 +1059,10 @@ impl TileStore {
             // closes). Cleared by `reconcile_pending` once the write is
             // confirmed complete -- and only by *this* submission's own
             // result, which is what `generation` distinguishes.
-            self.pending
-                .insert((victim_surface, victim_id), (generation, bytes.clone()));
+            self.pending.insert(
+                (victim_surface, victim_id),
+                (generation, Arc::clone(&bytes)),
+            );
             self.writer.submit(WriteJob {
                 surface: victim_surface,
                 id: victim_id,
@@ -1061,6 +1093,8 @@ impl TileStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::TileStore;
     use crate::tile::{CHANNELS, SurfaceId, TILE, TileId};
     use std::num::NonZeroUsize;
@@ -1224,7 +1258,7 @@ mod tests {
         let texels = vec![half::f16::from_f32(0.75); crate::tile::SAMPLES];
         let bytes = crate::codec::encode(&texels);
         let nonexistent = dir.path().join("this_file_is_never_created.tile");
-        store.pending.insert((s, id), (0, bytes));
+        store.pending.insert((s, id), (0, Arc::new(bytes)));
         store.paged_out.insert((s, id), nonexistent);
 
         let tile = match store.get(s, id) {
@@ -1598,7 +1632,10 @@ mod tests {
             (s, stale),
             (
                 0,
-                crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]),
+                Arc::new(crate::codec::encode(&vec![
+                    half::f16::from_f32(0.75);
+                    crate::tile::SAMPLES
+                ])),
             ),
         );
         store
@@ -1608,7 +1645,10 @@ mod tests {
             (s, filler),
             (
                 0,
-                crate::codec::encode(&vec![half::f16::from_f32(0.5); crate::tile::SAMPLES]),
+                Arc::new(crate::codec::encode(&vec![
+                    half::f16::from_f32(0.5);
+                    crate::tile::SAMPLES
+                ])),
             ),
         );
 
@@ -1623,7 +1663,7 @@ mod tests {
                 // Matches the `pending` generations set above, on purpose.
                 generation: 0,
                 path: unwritable,
-                bytes: vec![1, 2, 3, 4],
+                bytes: vec![1, 2, 3, 4].into(),
             });
         }
         // Joined before draining, so both failures are queued and their
@@ -1681,14 +1721,14 @@ mod tests {
         }
 
         let texels = vec![half::f16::from_f32(0.25); crate::tile::SAMPLES];
-        let bytes = crate::codec::encode(&texels);
+        let bytes: Arc<Vec<u8>> = Arc::new(crate::codec::encode(&texels));
         // Exactly the state `make_room` leaves behind for an eviction:
         // both maps populated, the same bytes handed to the writer, and
         // the same generation on both. The two `0`s are matched
         // deliberately -- with a mismatch the result would be skipped as
         // superseded and the `Err` arm this test exists to exercise
         // would never run, leaving the test green for the wrong reason.
-        store.pending.insert((s, id), (0, bytes.clone()));
+        store.pending.insert((s, id), (0, Arc::clone(&bytes)));
         store.paged_out.insert((s, id), path.clone());
         store.writer.submit(crate::writer::WriteJob {
             surface: s,
@@ -1740,8 +1780,14 @@ mod tests {
         let id = TileId { x: 0, y: 0 };
         let path = store.tile_path(s, id);
 
-        let old = crate::codec::encode(&vec![half::f16::from_f32(0.25); crate::tile::SAMPLES]);
-        let new = crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]);
+        let old: Arc<Vec<u8>> = Arc::new(crate::codec::encode(&vec![
+            half::f16::from_f32(0.25);
+            crate::tile::SAMPLES
+        ]));
+        let new: Arc<Vec<u8>> = Arc::new(crate::codec::encode(&vec![
+            half::f16::from_f32(0.75);
+            crate::tile::SAMPLES
+        ]));
 
         // The second eviction's state: `pending` holds generation 2's
         // bytes, `paged_out` points at the one path both writes target.
@@ -1836,7 +1882,7 @@ mod tests {
             id,
             generation: 9,
             path: unwritable,
-            bytes: vec![1, 2, 3, 4],
+            bytes: vec![1, 2, 3, 4].into(),
         });
 
         match store.flush() {
@@ -1871,10 +1917,16 @@ mod tests {
         let id = TileId { x: 0, y: 0 };
         let path = store.tile_path(s, id);
 
-        let old = crate::codec::encode(&vec![half::f16::from_f32(0.25); crate::tile::SAMPLES]);
-        let new = crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]);
+        let old: Arc<Vec<u8>> = Arc::new(crate::codec::encode(&vec![
+            half::f16::from_f32(0.25);
+            crate::tile::SAMPLES
+        ]));
+        let new: Arc<Vec<u8>> = Arc::new(crate::codec::encode(&vec![
+            half::f16::from_f32(0.75);
+            crate::tile::SAMPLES
+        ]));
 
-        store.pending.insert((s, id), (2, new.clone()));
+        store.pending.insert((s, id), (2, Arc::clone(&new)));
         store.paged_out.insert((s, id), path.clone());
 
         // Generation 1: the superseded write, which really does land on
@@ -1903,7 +1955,7 @@ mod tests {
             id,
             generation: 2,
             path: path.clone(),
-            bytes: new.clone(),
+            bytes: Arc::clone(&new),
         });
         assert!(store.flush().is_ok());
         assert!(
@@ -1912,7 +1964,11 @@ mod tests {
         );
         assert_eq!(store.stats().superseded_writes, 1);
         match std::fs::read(&path) {
-            Ok(bytes) => assert_eq!(bytes, new, "the file must hold the newer eviction's bytes"),
+            Ok(bytes) => assert_eq!(
+                bytes.as_slice(),
+                &*new,
+                "the file must hold the newer eviction's bytes"
+            ),
             Err(err) => unreachable!("flush joined the writer, so the file must exist: {err}"),
         }
 
@@ -1966,7 +2022,10 @@ mod tests {
                 (s, id),
                 (
                     2,
-                    crate::codec::encode(&vec![half::f16::from_f32(0.75); crate::tile::SAMPLES]),
+                    Arc::new(crate::codec::encode(&vec![
+                        half::f16::from_f32(0.75);
+                        crate::tile::SAMPLES
+                    ])),
                 ),
             );
         }
@@ -1984,7 +2043,7 @@ mod tests {
                 id,
                 generation: 1,
                 path: unwritable,
-                bytes: vec![1, 2, 3, 4],
+                bytes: vec![1, 2, 3, 4].into(),
             });
         }
         store.writer.flush();
@@ -2377,7 +2436,7 @@ mod tests {
         let never_created = dir.path().join("this_file_is_never_created.tile");
         store
             .pending
-            .insert((s, id), (0, crate::codec::encode_any_length(&half)));
+            .insert((s, id), (0, crate::codec::encode_any_length(&half).into()));
         store.paged_out.insert((s, id), never_created);
 
         for read in 1..=2 {

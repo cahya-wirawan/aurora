@@ -10,6 +10,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
@@ -26,7 +27,29 @@ pub(crate) struct WriteJob {
     /// and a later read silently returns pre-edit pixels.
     pub(crate) generation: u64,
     pub(crate) path: PathBuf,
-    pub(crate) bytes: Vec<u8>,
+    /// Shared rather than owned: `TileStore::make_room` keeps the exact
+    /// same encoded bytes in its `pending` map until this write is
+    /// confirmed, so an owned `Vec<u8>` here forced a full allocate-and-
+    /// copy of up to 512 KiB per eviction. Both holders are read-only
+    /// (nothing ever mutates a queued job's bytes, and `pending` is only
+    /// ever inserted into and removed from — never mutated in place), so
+    /// one `Arc` serves both and the copy becomes a refcount bump. This
+    /// also halves the peak footprint of an eviction burst that a slow
+    /// scratch disk has backed up behind this queue.
+    ///
+    /// `Arc<Vec<u8>>`, deliberately, and **not** `Arc<[u8]>`: the bytes
+    /// arrive from `codec::encode` as an owned `Vec<u8>`, and
+    /// `Arc::new(vec)` wraps that existing buffer in place — it allocates
+    /// only the small refcount header holding the 24-byte `Vec` struct.
+    /// The `Vec<u8> -> Arc<[u8]>` conversion looks tidier but is *not*
+    /// free: `Arc<[T]>` stores its refcount header inline, contiguous with
+    /// the payload, a layout a bare `Vec` buffer does not have, so `.into()`
+    /// allocates a fresh block and memcpies every byte into it — exactly
+    /// the per-eviction copy this field exists to avoid, merely moved one
+    /// line earlier. The cost of `Arc<Vec<u8>>` is one extra pointer hop
+    /// to reach the bytes (`Arc` → `Vec` → buffer), which is negligible
+    /// beside a 512 KiB copy on the caller's thread.
+    pub(crate) bytes: Arc<Vec<u8>>,
 }
 
 /// Result of a background write, reported back so [`crate::store::TileStore`]
@@ -232,7 +255,7 @@ mod tests {
             id: TileId { x: 0, y: 0 },
             generation: 0,
             path: path.clone(),
-            bytes: vec![1, 2, 3, 4],
+            bytes: vec![1, 2, 3, 4].into(),
         });
         writer.flush();
         let written = match std::fs::read(&path) {
@@ -322,7 +345,7 @@ mod tests {
                 id: TileId { x: 0, y: 0 },
                 generation,
                 path: path.clone(),
-                bytes: vec![generation as u8; 8],
+                bytes: vec![generation as u8; 8].into(),
             });
         }
         writer.flush();
@@ -390,7 +413,7 @@ mod tests {
                 id: TileId { x: 0, y: 0 },
                 generation,
                 path: path.clone(),
-                bytes: vec![generation as u8; 16],
+                bytes: vec![generation as u8; 16].into(),
             });
         }
         writer.flush();
@@ -423,7 +446,7 @@ mod tests {
                 id: TileId { x: i, y: 0 },
                 generation: 0,
                 path: dir.path().join(format!("{i}_0.tile")),
-                bytes: vec![0; 1024],
+                bytes: vec![0; 1024].into(),
             });
         }
         assert!(

@@ -10551,7 +10551,7 @@ structural design work.
     interaction with an external process mutating the scratch files
     underneath it; and, as item 5 above records, the disk-side half of
     the guarantee rests on the writer staying single-threaded and FIFO.
-- [ ] **`make_room` clones every evicted tile's encoded bytes.** Noticed
+- [x] **`make_room` clones every evicted tile's encoded bytes.** Noticed
     by the 0.54.0 review (critic PERF-02, distinct from the same round's
     PERF-01 about the fuzz test's own runtime) and deliberately **not**
     fixed there: it predates that round's stale-write fix and is not a
@@ -10564,6 +10564,179 @@ structural design work.
     branch. Wants its own round, and a measurement first: eviction
     already pays a synchronous `codec::encode`, so the clone may well be
     noise beside it.
+
+    **Measured 2026-08-30, and fixed (0.59.0)** — after the first
+    measurement said "don't fix" and a review of that measurement's
+    *method* overturned it. Worth recording in that order, because the
+    reversal came from the benchmark being wrong, not from the threshold
+    moving.
+
+    The threshold was pre-committed before any number existed: fix iff
+    the clone costs ≥ 100 µs (1 % of the 10 ms brush budget, ~11 % of
+    the measured 0.9 ms p99 margin) **or** ≥ 15 % of `codec::encode`'s
+    own cost on the same input, judged on the `noise` case — the
+    incompressible worst case, so the largest clone the code can be
+    asked to make. Note the **or**: either limb alone triggers the fix.
+    The threshold was not revisited, and is not being re-litigated here.
+
+    The first bench read the clone at **6.1 % of `encode`** and closed
+    the item. That number was an artifact. It timed `encoded.clone()`
+    with the copy dropped at the end of every criterion iteration, so
+    `glibc` handed back the same already-page-faulted, cache-warm block
+    on every pass — a best case `make_room` never actually got. The real
+    pattern retains: the clone sits in `pending` until the write is
+    confirmed, *alongside* every other in-flight eviction's clone, so
+    the copy lands in cold, freshly-faulted pages. Measured in that
+    shape (core-pinned, min-of-9, < 2 % across runs) the cost rises with
+    the number of writes in flight — 1.7× the naive reading at depth 2,
+    **3.0× at depth 16: 46.9 µs against `encode`'s 261.5 µs, or 17.9 %**.
+    That crosses the relative limb. The absolute limb is never crossed,
+    at any depth measured (54.1 µs at depth 64, against a 100 µs bar).
+    One limb is enough, so: fix.
+
+    Depth 16 is not hypothetical. The background writer's `mpsc` queue
+    is unbounded (`submit` never blocks) and `failed_write_capacity()`
+    equals the store's whole tile budget, so an ordinary slow or
+    contended scratch disk can pin that many 512 KiB clones in `pending`
+    at once. This is the "eviction pressure grows" reopen trigger the
+    superseded closure note named as a future risk — it is reachable
+    now, under disk contention alone.
+
+    **The fix:** `WriteJob::bytes` and `pending`'s value type are both
+    `Arc<Vec<u8>>`, constructed once in `make_room` via
+    `Arc::new(codec::encode(...))` and shared, so the allocate-and-copy
+    becomes an `Arc::clone` refcount bump. Both
+    holders are read-only, and `pending` is only ever inserted into and
+    removed from (never `get_mut`/`entry`/`values_mut`), which is the
+    precondition the sharing rests on — re-verified against the code,
+    not assumed. `ensure_resident`'s decode branch and
+    `write_tile_file(&job.path, &job.bytes)` compile unchanged via deref
+    coercion. `BackgroundWriter`'s threading model, `WriteJob`'s other
+    fields, and the FIFO per-key write-ordering guarantee are untouched;
+    `writes_for_one_path_land_in_submission_order` passes unmodified.
+    No new dependency (`std::sync::Arc`). 46 `aurora-tile` tests before
+    and after — this is a representation change with no new behaviour to
+    assert.
+
+    **Corrected mid-round: `Arc<[u8]>` did not actually remove the
+    copy.** The first version of this fix used `Arc<[u8]>`, chosen on the
+    reasoning that it "avoids the double indirection of `Arc<Vec<u8>>`
+    for no benefit" since `codec::decode` and `write_tile_file` both take
+    `&[u8]`. That reasoning missed the allocation cost of the conversion
+    itself, and review caught it. `codec::encode` returns a `Vec<u8>`,
+    and `Vec<u8> -> Arc<[u8]>` via `.into()` is **not** free: `Arc<[T]>`
+    stores its refcount header inline, contiguous with the payload, a
+    layout a bare `Vec` buffer does not have — so the conversion
+    allocates a fresh block, memcpies every byte into it, and frees the
+    original. The fix as first written relocated the per-eviction copy
+    one line earlier rather than eliminating it, leaving the round
+    delivering nothing it set out to deliver.
+
+    Verified rather than reasoned about, twice independently: a
+    standalone `rustc -O` program over 2,000 iterations at 512 KiB found
+    the `Arc<[u8]>`'s data pointer **never** equal to the source `Vec`'s
+    (0/2000 — a real copy every time), while `Arc::new(vec)` produced an
+    `Arc` whose data pointer **always** matched (2000/2000 — a genuine
+    zero-copy wrap, allocating only the small refcount header holding the
+    24-byte `Vec` struct; the 512 KiB buffer `codec::encode` returned is
+    never touched).
+
+    Corrected to `Arc<Vec<u8>>` throughout. The trade-off is one extra
+    pointer hop to reach the bytes (`Arc` → `Vec` → buffer, rather than
+    `Arc` → buffer), negligible beside a 512 KiB copy on the brush
+    thread. Both consumer sites still compile unchanged: Rust's deref
+    coercion chains two levels, `&Arc<Vec<u8>>` → `&Vec<u8>` → `&[u8]`,
+    confirmed by compiling rather than assumed.
+
+    With that correction the fix genuinely removes the cost this item was
+    opened to investigate, which also makes the 17.9 %-vs-~10 %
+    disagreement above **moot for the current code**: that dispute was
+    about whether a byte-copying clone's cost crossed a threshold, and
+    the shipped code performs no such copy at any depth, so neither
+    number decides anything now. It is deliberately left in place rather
+    than deleted — it is an honest record of this round's own process,
+    including a measurement that was wrong and a fix that was wrong, and
+    that record is worth more than a tidy note.
+
+    **Re-measured against the corrected code** (same headless Linux
+    sandbox, no core pinning, so the environment caveat below applies
+    unchanged):
+
+    ```sh
+    cargo bench -p aurora-tile --bench tile_store -- "^(encode|pending_clone|eviction)"
+    ```
+
+    `eviction_cost` — `make_room`'s whole synchronous path, one forced
+    eviction per iteration — reads **423.5 µs [409.6, 439.5]**, against
+    `encode/uniform` at **364.4 µs [352.3, 379.7]** on the same run. That
+    bench evicts blank, highly compressible tiles (2,080 bytes encoded),
+    so `encode` is ~86 % of it and the remaining ~59 µs is the LRU pop,
+    path construction, the two map inserts and the `mpsc` submit. It was
+    never able to show the clone either way — a 2 KiB copy is ~74 ns —
+    which is exactly why the threshold was judged on `noise` instead.
+
+    The `pending_clone/*` arms now measure a copy the shipped code no
+    longer performs at all, so they are **moot as a decision input** and
+    retained only as the record of what the `Vec<u8>`-clone (and the
+    rejected `Arc<[u8]>` conversion) would have cost: noise naive
+    16.2 µs, retained-at-16 26.9 µs, against `encode/noise` 367.5 µs.
+    `make_room` itself now performs one `Arc::new` (header-only
+    allocation, no byte copy) plus one `Arc::clone` (refcount bump) per
+    eviction, neither of which scales with tile size.
+
+    **A second, unpriced benefit:** the threshold only ever weighed CPU
+    time, but the clone also *doubled* the memory an eviction burst
+    pins. Under sustained write backpressure `pending` and the writer
+    queue each held a full copy of every in-flight tile; they now share
+    one. That halves the peak footprint of exactly the scenario
+    invariant §7.3.1 cares about, and nothing in the original threshold
+    accounted for it.
+
+    **Bench numbers and how to reproduce.** The bench keeps all three
+    arms (`encode/*`, `pending_clone/*` naive, and
+    `pending_clone_retained/*` at depth 16), so the corrected shape
+    stays measurable instead of living only in this note:
+
+    ```sh
+    cargo bench -p aurora-tile --bench tile_store -- "^(encode|pending_clone)"
+    ```
+
+    That filter is verified to match all nine benchmark IDs. The
+    superseded note documented `-- clone_vs_encode`, which is the Rust
+    *function* name and matches **no** criterion ID: it exits 0 having
+    measured nothing.
+
+    On this machine (headless Linux sandbox, no core pinning, three
+    runs) the checked-in bench reads noise `encode` 284–291 µs, naive
+    `pending_clone` 16.2–17.1 µs (5.7 %), retained-at-16 27.6–29.0 µs
+    (**~10 %**). So the in-tree bench reproduces the *direction* firmly
+    — the naive arm understates by ~1.75× — but reads lower than the
+    17.9 % that the core-pinned harness measured; the limb crossing
+    rests on that pinned measurement, not on this looser one. Recorded
+    honestly rather than rounded toward the conclusion. Compressible
+    content stays lopsided either way (uniform 2,080 bytes and gradient
+    2,590 bytes clone in tens of nanoseconds), because the clone scaled
+    with the *compressed* size while `encode` scales with the raw
+    512 KiB — the worst case is the incompressible one, which is why the
+    threshold was judged there.
+
+    Absolute figures here are **environment-sensitive** — allocator
+    tuning above all (`glibc`'s dynamic `mmap` threshold decides whether
+    a 512 KiB copy reuses a warm block or faults fresh pages), which is
+    precisely how the first measurement went wrong. Read them as a ratio
+    on one machine, not a portable cost; the same discipline this file
+    applies to every other locally-measured number. The bench file says
+    so too, at the benchmark.
+
+    Same commit drops the bench file's local size-only re-encoder: it
+    was justified by a comment claiming `codec::encode` was
+    crate-private, which was never true of the shipped crate, and a
+    second copy of the encoding rules could silently drift from the one
+    being measured. `compression_ratio` now calls the real
+    `aurora_tile::codec::encode` and reports byte-for-byte identical
+    sizes (2,080 / 2,590 / 524,296). `black_box` is also now applied
+    symmetrically — input *and* result on both arms; it previously
+    wrapped the input on one and the output on the other.
 - [x] **HIGH PRIORITY — the tile scratch directory is a fixed, shared,
     world-readable path with filenames that collide across processes,
     documents and users.** Opened 2026-08-24 by the 0.52.2 review
