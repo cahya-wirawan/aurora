@@ -153,9 +153,13 @@
 //! **Crash recovery and autosave** (PLAN.md M1.9): `run` writes a small
 //! marker file (`std::env::temp_dir()`) at startup and clears it on
 //! every clean shutdown — both the `WindowEvent::CloseRequested` arm
-//! and `ApplicationHandler::exiting`, which is the one the paths that
-//! never produce a close request (macOS's own menu Quit, `App::fail`'s
-//! `el.exit()`) go through; if a *previous* run's
+//! and `ApplicationHandler::exiting`, which is the one macOS's own menu
+//! Quit (a path that never produces a close request) goes through. A run
+//! that aborts through `App::fail` reaches `exiting` too but is
+//! deliberately exempt: it never got a window up, so it may be holding a
+//! *previous* crash's recovered document whose only on-disk copy is that
+//! autosave, behind a recovery dialog that was never shown — see
+//! `aborted_startup_cleanup`. If a *previous* run's
 //! marker is still there, this run shows a real, modal
 //! `Role::AlertDialog` (`aurora_widgets::widgets::dialog`) saying so.
 //! Document recovery is now real, not just detected: `aurora-doc`'s
@@ -6794,14 +6798,23 @@ fn tile_store_scratch_dir() -> Option<&'static Path> {
 /// answering it.
 ///
 /// **Every *clean* exit reaches this now, not only a window close.**
-/// [`App::finish_shutdown`] wraps it, and both
-/// `WindowEvent::CloseRequested` and
-/// [`ApplicationHandler::exiting`](App::exiting) call that — so macOS's
-/// own menu Quit and [`App::fail`]'s `el.exit()`, which used to leave a
-/// marker, an autosave and a scratch directory behind, are covered. The
-/// `CloseRequested` path runs it twice (its own call, then `exiting`);
-/// every step here is idempotent, which
+/// [`run_shutdown_cleanup`] calls it, [`App::finish_shutdown`] wraps
+/// that, and both `WindowEvent::CloseRequested` and
+/// [`ApplicationHandler::exiting`](App::exiting) call *that* — so
+/// macOS's own menu Quit, which used to leave a marker, an autosave and
+/// a scratch directory behind, is covered. The `CloseRequested` path
+/// runs it twice (its own call, then `exiting`); every step here is
+/// idempotent, which
 /// `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths` pins.
+///
+/// **An *aborted* run is deliberately not one of those exits.** A run
+/// that ends through [`App::fail`] never got a window up, so it may be
+/// holding a *previous* run's recovered document with the autosave as
+/// its only on-disk copy and a recovery dialog that was never shown.
+/// Clearing the marker and the autosave there would destroy that
+/// previous crash's recovery data, so [`run_shutdown_cleanup`] routes
+/// that exit to [`aborted_startup_cleanup`] instead, which removes only
+/// this run's own scratch tiles.
 ///
 /// **Crash leftovers are still not covered** — see PLAN.md's own
 /// follow-up item, whose remaining half is a startup sweep. A hard
@@ -6813,36 +6826,106 @@ fn tile_store_scratch_dir() -> Option<&'static Path> {
 fn clean_shutdown_cleanup(state: &mut impl ShutdownState) {
     clear_session_marker(state.marker_path());
     remove_autosave(&state.autosave_path());
-    // Taken and dropped *before* the directory goes: dropping a
-    // `aurora_tile::TileStore` joins its background writer thread (its
-    // `BackgroundWriter`'s own `Drop` calls `flush`, which drops the
-    // sender and joins), so no eviction can still be in flight against
-    // a directory that is being deleted. Deterministic by construction
-    // rather than a race this has to win.
+    remove_session_scratch(state);
+}
+
+/// The cleanup an **aborted** run may safely do: this run's own scratch
+/// tiles, and nothing else.
+///
+/// [`App::fail`] is the only way here, and it is only ever reached from
+/// `resumed` — before a window, a device or a surface exists. Two facts
+/// about that moment make the marker and the autosave off limits:
+///
+/// - `App::new` may have just recovered a *previous* run's crashed
+///   document out of the autosave and into memory, and `startup_document`
+///   deliberately does not rewrite the file in that case — the autosave
+///   on disk is the only copy of those pixels there is.
+/// - The crash-recovery dialog `App::new` built for it has never been
+///   *shown*: showing it needs the window `resumed` was in the middle of
+///   creating when it failed.
+///
+/// So the user has neither seen nor dismissed anything, and the failure
+/// itself (no GPU adapter, a driver hiccup, a surface that would not
+/// create) is exactly the kind of machine-level trouble that can repeat
+/// or that explains why the previous run died too. Deleting the recovery
+/// data here would be silent, permanent, and would leave a retry with
+/// nothing to recover; leaving it means the next run shows the dialog
+/// and recovers, which is what happened before 0.63.0 and what 0.63.0
+/// broke by routing this path through the full cleanup.
+///
+/// The scratch directory *is* removed: it holds tiles this run paged
+/// out, including the ones `recover_document` just read out of the
+/// autosave, and the autosave itself still holds every one of those
+/// pixels. Nothing recoverable lives only there.
+fn aborted_startup_cleanup(state: &mut impl ShutdownState) {
+    remove_session_scratch(state);
+}
+
+/// The scratch-tile half both exit paths share: drop the live store,
+/// then delete this session's paged-out tiles.
+///
+/// The store is taken and dropped *before* the directory goes, because
+/// dropping a `aurora_tile::TileStore` joins its background writer
+/// thread (its `BackgroundWriter`'s own `Drop` calls `flush`, which
+/// drops the sender and joins), so no eviction can still be in flight
+/// against a directory that is being deleted. Deterministic by
+/// construction rather than a race this has to win.
+fn remove_session_scratch(state: &mut impl ShutdownState) {
     drop(state.take_tile_store());
     if let Some(dir) = state.scratch_dir() {
         remove_scratch_dir(dir);
     }
 }
 
-/// Everything [`clean_shutdown_cleanup`] needs from the running
-/// application, as one source of truth rather than four arguments.
+/// The whole of what a run owes the next one on the way out, and the one
+/// place that decides *which* exit this is — so the decision sits behind
+/// [`ShutdownState`] where a test can reach it, rather than inside
+/// [`App::finish_shutdown`], which needs a real `winit` event loop and a
+/// real window to construct an [`App`] for at all.
 ///
-/// **Why a trait and not four parameters.** A review round showed that
-/// changing the single production call site to pass `None` for the
-/// store and `None` for the scratch directory compiled, ran, and passed
-/// the entire gate — a plausible slip with no protection whatsoever,
-/// and one `dead_code` would not catch either, since the function still
-/// had callers. With the state behind a trait the call site is
-/// `clean_shutdown_cleanup(self)`: there is no argument left to get
-/// wrong, and what remains is a four-line `impl` for [`App`] whose
+/// A run that came all the way up and is ending normally gets
+/// [`clean_shutdown_cleanup`] plus the workspace-layout save. A run
+/// aborting out of [`App::fail`] gets [`aborted_startup_cleanup`]: its
+/// own scratch tiles only, never the marker or the autosave (see that
+/// function for why), and no layout save either — an aborted run never
+/// showed a window, so its in-memory layout is at best the one it just
+/// loaded and at worst the defaults it fell back to when *reading* the
+/// saved layout failed, which is a real possibility on the same
+/// misbehaving machine. Writing that back would overwrite a good saved
+/// layout with defaults for no gain.
+fn run_shutdown_cleanup(state: &mut impl ShutdownState) {
+    if state.aborted() {
+        aborted_startup_cleanup(state);
+        return;
+    }
+    clean_shutdown_cleanup(state);
+    if let Some((path, workspace)) = state.workspace_layout() {
+        save_workspace_layout(path, workspace);
+    }
+}
+
+/// Everything [`run_shutdown_cleanup`] and [`clean_shutdown_cleanup`]
+/// need from the running application, as one source of truth rather than
+/// a handful of arguments.
+///
+/// **Why a trait and not a handful of parameters.** A review round
+/// showed that changing the single production call site to pass `None`
+/// for the store and `None` for the scratch directory compiled, ran, and
+/// passed the entire gate — a plausible slip with no protection
+/// whatsoever, and one `dead_code` would not catch either, since the
+/// function still had callers. With the state behind a trait the call
+/// site is `run_shutdown_cleanup(self)`: there is no argument left to
+/// get wrong, and what remains is a short `impl` for [`App`] whose
 /// bodies are each a single field or function reference.
 ///
-/// It is also what keeps the function testable. The real
+/// It is also what keeps the functions testable. The real
 /// implementation resolves the live session directory and the live
 /// store; a test supplies throwaway paths instead, because removing the
 /// live session directory from a test would pull the scratch disk out
-/// from under every other test sharing this binary.
+/// from under every other test sharing this binary. [`Self::aborted`]
+/// and [`Self::workspace_layout`] are here for the same reason: they are
+/// what let a test drive the failed-vs-clean branch and the layout save
+/// without an event loop.
 trait ShutdownState {
     /// This run's own "I'm still running" marker.
     fn marker_path(&self) -> &Path;
@@ -6854,6 +6937,14 @@ trait ShutdownState {
     /// This session's scratch directory, or `None` if one was never
     /// created (painting disabled for the run).
     fn scratch_dir(&self) -> Option<&Path>;
+    /// Whether this run is ending through [`App::fail`] rather than
+    /// finishing normally — `true` means the marker and the autosave
+    /// must survive it (see [`aborted_startup_cleanup`]).
+    fn aborted(&self) -> bool;
+    /// Where to persist the dock layout, and the workspace to read it
+    /// out of — `None` when the OS couldn't report a config directory
+    /// ([`layout_path`]).
+    fn workspace_layout(&self) -> Option<(&Path, &aurora_ui::Workspace)>;
 }
 
 /// [`clean_shutdown_cleanup`]'s scratch-directory step, split out so it
@@ -7834,6 +7925,16 @@ impl ShutdownState for App {
 
     fn scratch_dir(&self) -> Option<&Path> {
         tile_store_scratch_dir()
+    }
+
+    fn aborted(&self) -> bool {
+        self.failed
+    }
+
+    fn workspace_layout(&self) -> Option<(&Path, &aurora_ui::Workspace)> {
+        self.layout_path
+            .as_deref()
+            .map(|path| (path, &self.workspace))
     }
 }
 
@@ -9047,24 +9148,43 @@ impl App {
     /// unrecoverable error, matching `aurora-gpu`'s own
     /// `examples/surface_smoke.rs::report_failure`.
     ///
-    /// **This path is not missing the shutdown cleanup, despite calling
-    /// nothing itself.** `el.exit()` is what makes `winit` dispatch
-    /// `Event::LoopExiting`, and this crate's
-    /// [`ApplicationHandler::exiting`](App::exiting) implementation runs
-    /// [`App::finish_shutdown`] there — so a failed run clears its own
-    /// marker, autosave and scratch tiles exactly like a clean window
-    /// close does, without this method having to remember to. Adding a
-    /// `finish_shutdown` call *here* as well would be harmless
-    /// (`clean_shutdown_cleanup` is idempotent — see
-    /// `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`) but
-    /// redundant, and would suggest the general path did not cover it.
+    /// **This path still reaches the shutdown cleanup, despite calling
+    /// nothing itself — but a deliberately narrower one.** `el.exit()`
+    /// is what makes `winit` dispatch `Event::LoopExiting`, and this
+    /// crate's [`ApplicationHandler::exiting`](App::exiting)
+    /// implementation runs [`App::finish_shutdown`] there. Setting
+    /// `self.failed` *before* `el.exit()` is load-bearing, not
+    /// bookkeeping for `run`'s exit code alone: it is what
+    /// [`run_shutdown_cleanup`] reads to take the
+    /// [`aborted_startup_cleanup`] branch, which removes this run's own
+    /// scratch tiles and leaves the session marker and the autosave
+    /// alone.
+    ///
+    /// **Why the marker and the autosave must survive this.** Every call
+    /// site is inside `resumed`, before a window exists, so a
+    /// crash-recovery dialog `App::new` may have just built has not been
+    /// shown yet — and `App::new` may equally have just recovered a
+    /// *previous* crash's document out of the autosave without rewriting
+    /// it (`startup_document`'s recovered branch deliberately doesn't:
+    /// the file already holds exactly that document). Deleting either
+    /// here would destroy that previous run's only on-disk copy, unseen
+    /// and unrecoverably, on a path whose own trigger — no adapter, a
+    /// driver hiccup, a surface that would not create — is exactly the
+    /// sort of thing that can also explain why the previous run died.
+    /// 0.63.0 routed this path through the full cleanup and did exactly
+    /// that; 0.64.1 is the correction. See [`aborted_startup_cleanup`].
     fn fail(&mut self, el: &ActiveEventLoop, message: &str) {
         tracing::error!("{message}");
         self.failed = true;
         el.exit();
     }
 
-    /// Everything this run owes the *next* one on the way out: the
+    /// Everything this run owes the *next* one on the way out, for
+    /// whichever way out this is — [`run_shutdown_cleanup`] holds the
+    /// branch and the reasoning, and this method exists to give it
+    /// `self`.
+    ///
+    /// A run that came all the way up and is now closing gets the
     /// [`clean_shutdown_cleanup`] trio — clear this run's own marker so
     /// the next run's `previous_session_left_a_marker` reads false, not
     /// true (see this crate's own "crash recovery" section); delete the
@@ -9078,6 +9198,12 @@ impl App {
     /// layout" section for why this is the one point this crate writes
     /// it).
     ///
+    /// A run aborting out of [`App::fail`] gets only its own scratch
+    /// tiles removed: the marker and the autosave may be a *previous*
+    /// crash's recovery data that nobody has been shown yet, and the
+    /// layout is one this run never had a window to change. See
+    /// [`aborted_startup_cleanup`].
+    ///
     /// **Why a method rather than statements in one event arm.** There
     /// is more than one way out of a running Aurora, and they do not all
     /// pass through `WindowEvent::CloseRequested`: macOS's own menu Quit
@@ -9087,15 +9213,12 @@ impl App {
     /// running it twice on the paths that reach both is a no-op rather
     /// than a hazard.
     ///
-    /// `clean_shutdown_cleanup` takes `self` as its only argument on
+    /// `run_shutdown_cleanup` takes `self` as its only argument on
     /// purpose — an earlier four-argument shape let the single call site
     /// silently pass `None` for the store and the scratch directory and
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
-        clean_shutdown_cleanup(self);
-        if let Some(layout_path) = self.layout_path.as_deref() {
-            save_workspace_layout(layout_path, &self.workspace);
-        }
+        run_shutdown_cleanup(self);
     }
 
     /// Recomputes the workspace layout for `physical_size`, then
@@ -9723,14 +9846,30 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
     /// had happened — along with the autosave and every unsaved pixel
     /// paged out to this session's scratch directory.
     ///
-    /// `winit` guarantees this is irreversible and terminal: it fires
-    /// once, after `about_to_wait`, and the loop exits right after
-    /// (macOS explicitly queues its own end-of-iteration observer at the
-    /// lowest priority so `LoopExiting` cannot precede `AboutToWait`).
+    /// **The two exits are not the same cleanup.** A run that came up
+    /// and is closing gets the full one; a run aborting out of
+    /// [`App::fail`] gets only its own scratch tiles, because the marker
+    /// and the autosave it would otherwise delete may be a *previous*
+    /// crash's recovery data that no dialog has managed to show yet.
+    /// [`run_shutdown_cleanup`] holds that branch, on `self.failed`.
+    ///
+    /// `winit` 0.30.13 (the pinned version, and the one this was read
+    /// against) makes this irreversible and terminal: it fires once,
+    /// after `about_to_wait`, and the loop exits right after — macOS
+    /// explicitly queues its own end-of-iteration observer at the lowest
+    /// priority so `LoopExiting` cannot precede `AboutToWait`. **That
+    /// paragraph comes from reading `winit`'s source, not from watching
+    /// it happen**: nothing here has been observed on real macOS or
+    /// Windows hardware, the same caveat
+    /// `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`
+    /// already carries, and it is a claim about one pinned version
+    /// rather than about `winit` in general.
+    ///
     /// The `CloseRequested` arm calls [`App::finish_shutdown`] too, so
     /// that path runs it twice; `clean_shutdown_cleanup` is idempotent,
     /// which `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`
-    /// pins.
+    /// pins, and so is the whole of `run_shutdown_cleanup`, which
+    /// `finish_shutdown_is_idempotent_across_two_exit_paths` pins.
     ///
     /// What still escapes it: a hard crash, `SIGKILL`, an OS shutdown,
     /// and a `panic = "abort"` build — none of which run any Rust
@@ -9843,10 +9982,11 @@ mod tests {
         palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
         pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
         recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
-        resized_rail_width, resolve_tile, run_command, sample_pixel, select_layer, shift_bounds,
-        splitmix64, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, unwarned_failures,
-        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
+        select_layer, shift_bounds, splitmix64, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -13374,59 +13514,13 @@ mod tests {
     /// handler is left to inspection.
     #[test]
     fn clean_shutdown_cleanup_removes_the_marker_the_autosave_and_the_scratch_tiles() {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let marker = dir.path().join("aurora-session.marker");
-        if let Err(err) = std::fs::write(&marker, b"") {
-            unreachable!("a fresh tempdir must be writable: {err}");
-        }
-        let autosave = dir.path().join("aurora-autosave.aur");
-        if let Err(err) = std::fs::write(&autosave, b"") {
-            unreachable!("a fresh tempdir must be writable: {err}");
-        }
-
-        // A real, live store with a real paged-out tile in a real
-        // scratch directory -- not an empty directory, which would pass
-        // even if the removal never ran against anything.
-        let Some(scratch) = create_tile_store_scratch_dir() else {
-            unreachable!("a scratch directory is always creatable in a real test environment");
-        };
-        let Some(budget) = std::num::NonZeroUsize::new(1) else {
-            unreachable!("1 is non-zero");
-        };
-        let mut store = match aurora_tile::TileStore::new(scratch.clone(), budget) {
-            Ok(store) => store,
-            Err(err) => unreachable!("a fresh scratch directory must be usable: {err}"),
-        };
-        let surface = aurora_tile::SurfaceId::from_raw(0);
-        for id in [
-            aurora_tile::TileId { x: 0, y: 0 },
-            aurora_tile::TileId { x: 1, y: 0 },
-        ] {
-            if let Err(err) = store.get_mut(surface, id) {
-                unreachable!("touching a blank tile cannot fail: {err}");
-            }
-        }
-        if let Err(err) = store.flush() {
-            unreachable!("a test-local scratch disk must accept the write: {err}");
-        }
-        let tiles = match std::fs::read_dir(&scratch) {
-            Ok(entries) => entries.flatten().count(),
-            Err(err) => unreachable!("the scratch directory is readable: {err}"),
-        };
-        assert!(
-            tiles > 0,
-            "this test's premise is a scratch directory with real paged-out tiles in it"
-        );
-
-        let mut state = FakeShutdownState {
-            marker: marker.clone(),
-            autosave: autosave.clone(),
-            store: Some(store),
-            scratch: Some(scratch.clone()),
-        };
+        let ShutdownFixture {
+            _dir,
+            marker,
+            autosave,
+            scratch,
+            mut state,
+        } = shutdown_fixture(Aborted::No, None);
         clean_shutdown_cleanup(&mut state);
         assert!(
             state.store.is_none(),
@@ -13464,58 +13558,13 @@ mod tests {
     /// real hardware.
     #[test]
     fn clean_shutdown_cleanup_is_idempotent_across_two_exit_paths() {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let marker = dir.path().join("aurora-session.marker");
-        if let Err(err) = std::fs::write(&marker, b"") {
-            unreachable!("a fresh tempdir must be writable: {err}");
-        }
-        let autosave = dir.path().join("aurora-autosave.aur");
-        if let Err(err) = std::fs::write(&autosave, b"") {
-            unreachable!("a fresh tempdir must be writable: {err}");
-        }
-
-        // As in the single-pass test: a real store with real paged-out
-        // tiles, so an empty directory cannot make this pass vacuously.
-        let Some(scratch) = create_tile_store_scratch_dir() else {
-            unreachable!("a scratch directory is always creatable in a real test environment");
-        };
-        let Some(budget) = std::num::NonZeroUsize::new(1) else {
-            unreachable!("1 is non-zero");
-        };
-        let mut store = match aurora_tile::TileStore::new(scratch.clone(), budget) {
-            Ok(store) => store,
-            Err(err) => unreachable!("a fresh scratch directory must be usable: {err}"),
-        };
-        let surface = aurora_tile::SurfaceId::from_raw(0);
-        for id in [
-            aurora_tile::TileId { x: 0, y: 0 },
-            aurora_tile::TileId { x: 1, y: 0 },
-        ] {
-            if let Err(err) = store.get_mut(surface, id) {
-                unreachable!("touching a blank tile cannot fail: {err}");
-            }
-        }
-        if let Err(err) = store.flush() {
-            unreachable!("a test-local scratch disk must accept the write: {err}");
-        }
-        let tiles = match std::fs::read_dir(&scratch) {
-            Ok(entries) => entries.flatten().count(),
-            Err(err) => unreachable!("the scratch directory is readable: {err}"),
-        };
-        assert!(
-            tiles > 0,
-            "this test's premise is a scratch directory with real paged-out tiles in it"
-        );
-
-        let mut state = FakeShutdownState {
-            marker: marker.clone(),
-            autosave: autosave.clone(),
-            store: Some(store),
-            scratch: Some(scratch.clone()),
-        };
+        let ShutdownFixture {
+            _dir,
+            marker,
+            autosave,
+            scratch,
+            mut state,
+        } = shutdown_fixture(Aborted::No, None);
 
         // The `CloseRequested` arm's own call.
         clean_shutdown_cleanup(&mut state);
@@ -13548,14 +13597,254 @@ mod tests {
         );
     }
 
-    /// [`ShutdownState`]'s test double — the four things a clean
-    /// shutdown reads out of the running application, backed by
-    /// throwaway paths instead of the live session's.
+    /// A run that never got a window up must not delete the *previous*
+    /// run's crash-recovery data on its way out.
+    ///
+    /// `App::fail` is only ever called from inside `resumed`, before a
+    /// window, a device or a surface exists — and by then `App::new` may
+    /// already have recovered a previous crash's document out of the
+    /// autosave without rewriting it (`startup_document`'s recovered
+    /// branch deliberately doesn't: the file *is* the document), with
+    /// the crash-recovery dialog built but never shown, because showing
+    /// it needs the window that just failed to create. 0.63.0 routed
+    /// this exit through the full clean-shutdown cleanup, so a failed
+    /// startup deleted that marker, that autosave and the partial
+    /// autosave — unseen, permanently, on a path whose own triggers (no
+    /// GPU adapter, a driver hiccup, a surface that would not create)
+    /// can be exactly why the previous run died too. Before 0.63.0 the
+    /// data survived and a retry recovered normally; this pins that
+    /// behaviour back.
+    ///
+    /// The scratch directory is a different matter and *is* removed:
+    /// those tiles are this run's own, the autosave still holds every
+    /// pixel `recover_document` read out of it, and nothing recoverable
+    /// lives only there.
+    #[test]
+    fn a_failed_startup_preserves_the_previous_runs_crash_recovery_data() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // A layout path this run really could have written to, so the
+        // "no layout was written" assertion below is a real one rather
+        // than a state that names nowhere to write in the first place.
+        let layout = dir.path().join("workspace-layout.postcard");
+        let ShutdownFixture {
+            _dir,
+            marker,
+            autosave,
+            scratch,
+            mut state,
+        } = shutdown_fixture(Aborted::Yes, Some(layout));
+
+        // What `ApplicationHandler::exiting` runs after `App::fail`.
+        run_shutdown_cleanup(&mut state);
+
+        assert!(
+            marker.exists(),
+            "a failed startup must leave the session marker alone -- it is what makes the \
+             next run offer recovery at all"
+        );
+        assert!(
+            autosave.exists(),
+            "a failed startup must leave the autosave alone -- it can be the only on-disk \
+             copy of a previous crash's document, and nobody has been shown the dialog"
+        );
+        assert!(
+            !scratch.exists(),
+            "this run's own scratch tiles are still its own to remove"
+        );
+        assert!(
+            state.store.is_none(),
+            "the store must still be taken and dropped before its directory goes"
+        );
+        assert!(
+            !state.layout_written(),
+            "a run that never had a window has no layout worth writing back, and its \
+             in-memory one may be the default it fell back to when the *read* failed"
+        );
+    }
+
+    /// The whole of `App::finish_shutdown`, twice — the real double
+    /// invocation closing a window produces, not two raw calls to the
+    /// inner trio.
+    ///
+    /// `WindowEvent::CloseRequested` calls `App::finish_shutdown`, and
+    /// `ApplicationHandler::exiting` — which `winit` dispatches on the
+    /// way out of *every* exit, that close request included — calls it
+    /// again. `finish_shutdown` is `run_shutdown_cleanup(self)`, which
+    /// is the cleanup trio *plus* a `save_workspace_layout` the
+    /// trio-only idempotency test never touches. If the second pass
+    /// could fail, error, or write a different layout than the first,
+    /// closing a window would be worse than quitting from the menu.
+    ///
+    /// **What it does not prove.** Only that the function is idempotent.
+    /// It does not prove either call site is actually wired to a real
+    /// event loop: constructing an `App` needs an `EventLoopProxy`,
+    /// which needs a live `winit` loop, so no test in this crate can
+    /// call `App::finish_shutdown` itself — `run_shutdown_cleanup` over
+    /// [`ShutdownState`] is the closest seam there is, and it is the
+    /// whole of that method's body. That wiring is left to inspection.
+    #[test]
+    fn finish_shutdown_is_idempotent_across_two_exit_paths() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let layout = dir.path().join("nested").join("workspace-layout.postcard");
+        let ShutdownFixture {
+            _dir,
+            marker,
+            autosave,
+            scratch,
+            mut state,
+        } = shutdown_fixture(Aborted::No, Some(layout.clone()));
+
+        // The `CloseRequested` arm's own call.
+        run_shutdown_cleanup(&mut state);
+        assert!(!marker.exists(), "the session marker must be cleared");
+        assert!(!autosave.exists(), "the autosave must be removed");
+        assert!(!scratch.exists(), "the scratch tiles must be removed");
+        let first = match std::fs::read(&layout) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("the layout must have been written: {err}"),
+        };
+        assert!(!first.is_empty(), "a written layout is not empty");
+
+        // ...and then `exiting`'s, on the very same state, which is
+        // exactly what closing a window produces.
+        run_shutdown_cleanup(&mut state);
+        assert!(
+            !marker.exists(),
+            "a second pass must leave the marker gone, not recreate it"
+        );
+        assert!(
+            !autosave.exists(),
+            "a second pass must leave the autosave gone"
+        );
+        assert!(
+            !scratch.exists(),
+            "a second pass must leave the scratch directory gone"
+        );
+        let second = match std::fs::read(&layout) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("the layout must still be there: {err}"),
+        };
+        assert_eq!(
+            first, second,
+            "a second pass must rewrite the identical layout, not a degraded one"
+        );
+    }
+
+    /// Whether the run [`shutdown_fixture`] builds is ending through
+    /// `App::fail` — a named pair rather than a bare `bool`, so a call
+    /// site says which exit it is testing.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Aborted {
+        Yes,
+        No,
+    }
+
+    /// What both exit-path tests are built on, held together so the
+    /// temp directory outlives them.
+    struct ShutdownFixture {
+        /// Held only to keep the temp directory alive for the test.
+        _dir: tempfile::TempDir,
+        marker: PathBuf,
+        autosave: PathBuf,
+        scratch: PathBuf,
+        state: FakeShutdownState,
+    }
+
+    /// A marker and an autosave that really exist, and a *real* tile
+    /// store with real paged-out tiles in a real scratch directory — not
+    /// an empty one, which would let a removal pass while removing
+    /// nothing.
+    ///
+    /// Throwaway paths throughout, never the live session's: removing
+    /// the live scratch directory from a test would pull the scratch
+    /// disk out from under every other test sharing this binary.
+    fn shutdown_fixture(aborted: Aborted, layout: Option<PathBuf>) -> ShutdownFixture {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let marker = dir.path().join("aurora-session.marker");
+        if let Err(err) = std::fs::write(&marker, b"") {
+            unreachable!("a fresh tempdir must be writable: {err}");
+        }
+        let autosave = dir.path().join("aurora-autosave.aur");
+        if let Err(err) = std::fs::write(&autosave, b"") {
+            unreachable!("a fresh tempdir must be writable: {err}");
+        }
+
+        let Some(scratch) = create_tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(scratch.clone(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("a fresh scratch directory must be usable: {err}"),
+        };
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for id in [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+        ] {
+            if let Err(err) = store.get_mut(surface, id) {
+                unreachable!("touching a blank tile cannot fail: {err}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("a test-local scratch disk must accept the write: {err}");
+        }
+        let tiles = match std::fs::read_dir(&scratch) {
+            Ok(entries) => entries.flatten().count(),
+            Err(err) => unreachable!("the scratch directory is readable: {err}"),
+        };
+        assert!(
+            tiles > 0,
+            "this fixture's premise is a scratch directory with real paged-out tiles in it"
+        );
+
+        let state = FakeShutdownState {
+            marker: marker.clone(),
+            autosave: autosave.clone(),
+            store: Some(store),
+            scratch: Some(scratch.clone()),
+            aborted: aborted == Aborted::Yes,
+            layout: layout.map(|path| (path, aurora_ui::build_workspace())),
+        };
+        ShutdownFixture {
+            _dir: dir,
+            marker,
+            autosave,
+            scratch,
+            state,
+        }
+    }
+
+    /// [`ShutdownState`]'s test double — the six things a shutdown reads
+    /// out of the running application, backed by throwaway paths instead
+    /// of the live session's.
     struct FakeShutdownState {
         marker: PathBuf,
         autosave: PathBuf,
         store: Option<aurora_tile::TileStore>,
         scratch: Option<PathBuf>,
+        aborted: bool,
+        layout: Option<(PathBuf, aurora_ui::Workspace)>,
+    }
+
+    impl FakeShutdownState {
+        /// Whether a layout file was actually written where this state
+        /// says one should go — `false` when it names no layout path at
+        /// all, which is also a run that wrote nothing.
+        fn layout_written(&self) -> bool {
+            self.layout.as_ref().is_some_and(|(path, _)| path.exists())
+        }
     }
 
     impl ShutdownState for FakeShutdownState {
@@ -13573,6 +13862,16 @@ mod tests {
 
         fn scratch_dir(&self) -> Option<&std::path::Path> {
             self.scratch.as_deref()
+        }
+
+        fn aborted(&self) -> bool {
+            self.aborted
+        }
+
+        fn workspace_layout(&self) -> Option<(&std::path::Path, &aurora_ui::Workspace)> {
+            self.layout
+                .as_ref()
+                .map(|(path, workspace)| (path.as_path(), workspace))
         }
     }
 
@@ -13669,6 +13968,8 @@ mod tests {
             autosave: autosave.clone(),
             store: None,
             scratch: None,
+            aborted: false,
+            layout: None,
         };
         clean_shutdown_cleanup(&mut state);
         assert!(!marker.exists());

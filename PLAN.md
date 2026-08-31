@@ -11174,11 +11174,35 @@ structural design work.
     marker, a real autosave and a real scratch directory holding real
     flushed tiles, and asserts the second pass is a no-op.
 
+    **0.63.0's own first cut of this went too far, and 0.64.1 corrected
+    it.** Routing *every* exit through the full cleanup meant
+    `App::fail`'s `el.exit()` deleted the session marker and the
+    autosave too — and `App::fail` runs only from inside `resumed`,
+    before a window exists, where `App::new` may already have recovered
+    a *previous* crash's document out of that autosave without
+    rewriting it and where the recovery dialog it built can never have
+    been shown. That is a data-loss regression against a state (before
+    0.63.0) in which a retry simply recovered. `App::finish_shutdown` is
+    now `run_shutdown_cleanup(self)`, which branches on `self.failed`:
+    an aborted run gets `aborted_startup_cleanup` — this run's own
+    scratch tiles only, no marker, no autosave, no layout write — while
+    `CloseRequested` and the menu Quit are unchanged. Pinned by
+    `a_failed_startup_preserves_the_previous_runs_crash_recovery_data`,
+    and the layout double-write the trio-only idempotency test never
+    reached is now covered by
+    `finish_shutdown_is_idempotent_across_two_exit_paths`. The lesson
+    worth keeping: "clean up on every exit path" is not one rule —
+    *whose* data a path is holding decides what it may delete.
+
     **Still open: the startup sweep only.** A hard crash, a `SIGKILL`,
     an OS shutdown, and a `panic = "abort"` build (the release profile
     sets it) all end the process without running any Rust cleanup, so
     they never reach `exiting` either and still strand a scratch
-    directory, a marker and an autosave.
+    directory, a marker and an autosave. A run aborting through
+    `App::fail` now deliberately leaves its marker and autosave behind
+    too — that is the correct behaviour (see above), and the leftover is
+    the *previous* run's recovery data, which the next successful run
+    consumes and clears.
 
     Concrete fix shape for that remaining half: a sweep at startup over
     `aurora-scratch-*`
@@ -13877,6 +13901,49 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-01 (0.64.1) — 0.63.0's own fix destroyed the previous
+run's crash-recovery data on a failed startup; corrected.** Found by
+review (code-tracing) immediately after 0.63.0 landed, and it is the
+worse failure of the two: hooking `ApplicationHandler::exiting` meant
+`App::fail`'s `el.exit()` now reached `clean_shutdown_cleanup`, which
+deletes the session marker **and** the autosave. But `App::fail` is only
+ever called from inside `resumed`, before a window exists — and by then
+`App::new` may already have recovered a *previous* crash's document out
+of that autosave without rewriting it (`startup_document`'s recovered
+branch deliberately doesn't; the file **is** the document), with the
+crash-recovery dialog built but never shown, because showing it needs
+the window that just failed to create. So an aborted startup silently
+and permanently destroyed a previous crash's only on-disk copy, on a
+path whose own triggers — no GPU adapter, a driver hiccup, a surface
+that would not create — are exactly the machine-level trouble that can
+explain why the previous run died too. Before 0.63.0 the data survived
+and a retry recovered normally. **Fixed** by splitting the exit in two:
+a new `run_shutdown_cleanup` (the whole of `App::finish_shutdown`'s
+body) branches on `self.failed` and routes an aborted run to a new
+`aborted_startup_cleanup`, which removes this run's own scratch tiles
+and nothing else — not the marker, not the autosave, and not the
+workspace layout either, since a run that never had a window may be
+holding the defaults it fell back to when *reading* the saved layout
+failed. `WindowEvent::CloseRequested` is unaffected and still does the
+full cleanup. `App::fail`'s doc comment claimed the opposite of all this
+("clears its own marker, autosave and scratch tiles exactly like a clean
+window close does") and is rewritten; so are `finish_shutdown`'s,
+`exiting`'s, `clean_shutdown_cleanup`'s and the module's own crash-
+recovery paragraph. Two new tests (295 in `aurora-app`, up from 293):
+`a_failed_startup_preserves_the_previous_runs_crash_recovery_data`,
+mutation-checked (forcing the clean branch fails it), and
+`finish_shutdown_is_idempotent_across_two_exit_paths`, which runs the
+*whole* of `finish_shutdown`'s body twice — including the
+`save_workspace_layout` the trio-only idempotency test never touched —
+and requires the second pass to write the identical bytes. `exiting`'s
+winit claims now name the version they were read against (0.30.13) and
+say plainly that they come from reading source, not from real hardware.
+**Still inspection-only**: constructing an `App` needs an
+`EventLoopProxy`, so no test in this crate calls `App::fail`,
+`App::finish_shutdown` or `exiting` themselves — `run_shutdown_cleanup`
+over `ShutdownState` is the closest reachable seam, and it is the
+entirety of `finish_shutdown`'s body.
 
 **Addendum 2026-09-01 (0.64.0) — `describe()`'s unbounded `Restore` scan
 is bounded, by the direction that does not reopen `load_journal`.** The
