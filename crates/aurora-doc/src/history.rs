@@ -283,6 +283,27 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
 /// expects, rather than growing with an untrusted file's journal length.
 const MAX_DESCRIPTIONS: usize = 1000;
 
+/// How far into a `RemovedSubtree`'s own `entries` list [`describe`]
+/// will look for the root's recorded name.
+///
+/// The root is at index 0 for every subtree this crate produces —
+/// `LayerTree::remove_capturing` captures it first (its
+/// `capture_subtree` walks "root first, then each child's own subtree in
+/// stored order"), and [`History::add_pixel_layer`]/[`History::add_group`]
+/// each build a one-element list holding only it. So a limit of any size
+/// ≥ 1 is behaviour-preserving for every journal Aurora itself wrote.
+///
+/// The limit exists for the other case: [`History::load_journal`]
+/// deliberately performs zero structural validation, so a crafted or
+/// foreign journal can carry an arbitrarily long `entries` list whose
+/// root is nowhere near the front — and an unbounded `find` there is an
+/// unbounded scan *per described entry*, on the UI thread that is
+/// drawing the History panel. 64 is generous next to the 1 every real
+/// subtree needs, and small enough that
+/// `MAX_DESCRIPTIONS × MAX_ROOT_SEARCH_ENTRIES` is a fixed, trivial
+/// ceiling on the whole panel's work.
+const MAX_ROOT_SEARCH_ENTRIES: usize = 64;
+
 /// A one-line, human-readable description of one journal entry — see
 /// [`History::journal_descriptions`]'s own doc comment for why this
 /// deliberately doesn't take a `&LayerTree` to resolve names beyond
@@ -293,6 +314,18 @@ const MAX_DESCRIPTIONS: usize = 1000;
 /// [`LayerOp`]'s fourteen variants format only numeric ids, verbs,
 /// percentages, coordinates, or a `Debug`-formatted [`BlendMode`], none
 /// of which carry unbounded text.
+///
+/// **The `Restore` arm's search for the root's name is bounded** to the
+/// first [`MAX_ROOT_SEARCH_ENTRIES`] entries — see that constant for why
+/// that is invisible to every subtree this crate builds, all of which
+/// put the root at index 0. Past the bound the arm falls back to the
+/// same `"layer"` placeholder it already uses when `entries` doesn't
+/// name the root at all, so the degradation is display-only text on a
+/// crafted or foreign journal. It changes nothing about what a journal
+/// is *accepted* as: [`History::load_journal`]'s deliberate
+/// zero-structural-validation doctrine is untouched, and
+/// [`History::replay`] still holds the full subtree to the real
+/// validator.
 fn describe(op: &LayerOp) -> String {
     match op {
         LayerOp::RemoveById(id) => format!("Removed layer #{}", id.to_raw()),
@@ -300,6 +333,7 @@ fn describe(op: &LayerOp) -> String {
             let name = removed
                 .entries
                 .iter()
+                .take(MAX_ROOT_SEARCH_ENTRIES)
                 .find(|(entry_id, _)| *entry_id == removed.root)
                 .map_or("layer", |(_, entry)| entry.name.as_str());
             format!("Added layer \"{}\"", sanitize_display_name(name))
@@ -478,11 +512,22 @@ impl History {
     ///   is a synthetic `"… {n} earlier steps omitted"` entry (singular
     ///   `step` when `n == 1`) sitting in the oldest-of-what's-shown
     ///   position this method's chronological order puts it in.
+    /// - **Per-entry *compute*, not just per-entry output**: the one arm
+    ///   that searches rather than formats — `Restore`, looking through a
+    ///   removed subtree's `entries` for the root's recorded name — stops
+    ///   after `MAX_ROOT_SEARCH_ENTRIES` (64) comparisons. Without
+    ///   that, a single crafted journal entry carrying a million-element
+    ///   `entries` list was a million comparisons *per described entry*,
+    ///   so total work grew with the file rather than with this method's
+    ///   own caps. It is now bounded by
+    ///   `MAX_DESCRIPTIONS × MAX_ROOT_SEARCH_ENTRIES` regardless of how
+    ///   large the journal on disk was.
     ///
-    /// Both bounds are **display-only**. The journal, the stored layer
-    /// name ([`LayerTree::name`]), and [`Self::replay`] all still carry the
-    /// full, unmodified name and the full op sequence; nothing here
-    /// edits what an undo or a replay will reproduce.
+    /// All three bounds are **display-only**. The journal, the stored
+    /// layer name ([`LayerTree::name`]), and [`Self::replay`] all still
+    /// carry the full, unmodified name and the full op sequence; nothing
+    /// here edits what an undo or a replay will reproduce, and nothing
+    /// here changes which journals [`Self::load_journal`] accepts.
     #[must_use]
     pub fn journal_descriptions(&self) -> Vec<String> {
         let omitted = self.journal.len().saturating_sub(MAX_DESCRIPTIONS);
@@ -2811,5 +2856,74 @@ mod tests {
         };
         assert_eq!(tree.roots(), &[group]);
         assert_eq!(tree.children(group), Some([child].as_slice()));
+    }
+
+    /// A `RemovedSubtree` whose `entries` list is `size` long, with the
+    /// root's own `"Retouch"` entry at `root_index` and short filler
+    /// everywhere else — the shared fixture for the two
+    /// [`super::MAX_ROOT_SEARCH_ENTRIES`] tests below.
+    ///
+    /// The filler entries carry empty names and ids that start well past
+    /// the root's, so nothing but the root can ever match and the memory
+    /// this holds stays close to the bare `LayerEntry` size.
+    fn restore_with_root_at(size: usize, root_index: usize) -> super::LayerOp {
+        let root: super::LayerId = Id::from_raw(0);
+        let mut entries = Vec::with_capacity(size);
+        // `+ 1` so no filler id can ever collide with the root's 0.
+        let mut next_filler = 1_u64;
+        for position in 0..size {
+            if position == root_index {
+                entries.push((root, pixel_entry("Retouch", None)));
+            } else {
+                let filler: super::LayerId = Id::from_raw(next_filler);
+                next_filler += 1;
+                entries.push((filler, pixel_entry("", None)));
+            }
+        }
+        super::LayerOp::Restore(super::RemovedSubtree {
+            root,
+            parent: None,
+            index: 0,
+            entries,
+        })
+    }
+
+    /// The real case the bound must not break: the root leads the list,
+    /// as it does for every subtree this crate produces, and the list is
+    /// far longer than the bound.
+    ///
+    /// `capture_subtree` visits root-first, and
+    /// `add_pixel_layer`/`add_group` build a one-element list, so a
+    /// journal Aurora itself wrote never has the root anywhere but index
+    /// 0 — and the description must still be the layer's real name no
+    /// matter how many entries follow it.
+    #[test]
+    fn describe_names_a_restore_root_that_leads_a_huge_entry_list() {
+        let op = restore_with_root_at(50_000, 0);
+        assert_eq!(super::describe(&op), "Added layer \"Retouch\"");
+    }
+
+    /// The structural proof of the bound: the same list, the same size,
+    /// the root moved to the very end.
+    ///
+    /// Against the unpatched, unbounded `find` this fails — it walks all
+    /// 50,000 entries and reports the real `"Retouch"`. Against the bound
+    /// it stops after `MAX_ROOT_SEARCH_ENTRIES` and falls back to the
+    /// `"layer"` placeholder the arm already used when `entries` names no
+    /// root at all. No timing is involved, so it is deterministic on any
+    /// machine.
+    ///
+    /// **This is the deliberate, disclosed degradation**, and it is
+    /// display-only: only a crafted or foreign journal can reach it (see
+    /// `MAX_ROOT_SEARCH_ENTRIES`), it costs a placeholder name in the
+    /// History panel, and it does not change which journals
+    /// `History::load_journal` accepts — that method's
+    /// zero-structural-validation doctrine is untouched, and `replay`
+    /// still holds the same subtree to the real validator.
+    #[test]
+    fn describe_stops_searching_a_restore_entry_list_after_a_bounded_prefix() {
+        let size = 50_000;
+        let op = restore_with_root_at(size, size - 1);
+        assert_eq!(super::describe(&op), "Added layer \"layer\"");
     }
 }

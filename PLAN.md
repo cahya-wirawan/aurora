@@ -9310,8 +9310,8 @@ structural design work.
     `journal_len()`, a relation that now holds only below 1000 entries;
     it compares against `journal_descriptions().len()` now, which is what
     the panel is actually built from.
-- [ ] **`describe()`'s `Restore` arm scans an unbounded entry list on the
-    UI thread** — disclosed 2026-08-30, **not fixed; informational**.
+- [x] **`describe()`'s `Restore` arm scans an unbounded entry list on the
+    UI thread** — disclosed 2026-08-30, **fixed 2026-09-01 (0.64.0)**.
     Found by a reviewer during the round above. `describe()`'s
     `LayerOp::Restore` arm resolves the subtree's root name with
     `removed.entries.iter().find(|(entry_id, _)| *entry_id == removed.root)`
@@ -9329,12 +9329,45 @@ structural design work.
     in one narrow way: the *output* is capped at 1000 entries and 128
     name characters, but the *compute per kept entry* is bounded only by
     the file's own size.
-    **Suggested direction, not implemented**: bound
-    `RemovedSubtree::entries`' length in `load_journal`, or resolve the
-    root by a map or a first-entry convention instead of a linear scan.
-    Either is a real change to a hot, load-bearing type and belongs with
-    whoever next opens `load_journal`'s validation posture deliberately,
-    not as a drive-by.
+    **Fixed by the first-entry-convention direction, deliberately not the
+    `load_journal` one.** The disclosure offered two shapes; only one of
+    them can be taken without reopening a doctrine. Bounding
+    `RemovedSubtree::entries`' length inside `load_journal` would make
+    that method reject journals it accepts today — exactly the structural
+    validation it documents itself as *not* doing, with `replay()` owning
+    that job — so it would have to come with whoever opens that posture
+    on purpose. Bounding the *search* does not: `describe()` is
+    display-only, so the worst it can do is print a placeholder.
+
+    A new `MAX_ROOT_SEARCH_ENTRIES` (64) in
+    `crates/aurora-doc/src/history.rs` caps the arm's scan with a
+    `.take(..)` ahead of the `.find(..)`. The root sits at index 0 for
+    every subtree this crate produces — `LayerTree::capture_subtree`
+    documents its visit order as "root first", and
+    `History::add_pixel_layer`/`add_group` each build a one-element list —
+    so any limit ≥ 1 is behaviour-preserving for every journal Aurora
+    itself wrote, and every pre-existing exact-string description
+    assertion stayed green unchanged. Past the bound the arm falls back
+    to the `"layer"` placeholder it already used when `entries` names no
+    root at all: **a disclosed, display-only degradation** reachable only
+    by a crafted or foreign journal. `journal_descriptions()`'s
+    "bounded on both axes" list gained a third bullet, so the narrow
+    contradiction this item recorded is gone: total work is now capped at
+    `MAX_DESCRIPTIONS × MAX_ROOT_SEARCH_ENTRIES` rather than by the
+    file's size.
+
+    Two new deterministic tests, no timing in either:
+    `describe_names_a_restore_root_that_leads_a_huge_entry_list` (root
+    first, 50,000 entries — the real case must still print the real
+    name) and
+    `describe_stops_searching_a_restore_entry_list_after_a_bounded_prefix`
+    (same size, root last — asserts the placeholder). The second is a
+    structural negative control: it fails against the unpatched,
+    unbounded `find`, which walks all 50,000 entries and finds the real
+    name. **The reviewer's 232 ms measurement was not re-measured** —
+    these tests prove the bound structurally rather than by timing, which
+    is deliberate (a wall-clock assertion is not stable in CI), so the
+    post-fix latency number is inferred from the bound, not observed.
 - [x] **Panning past the document's *far* edge has no bound matching the
     origin-side one** — found 2026-08-25, fixed in 0.57.10.
     `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together
@@ -13844,6 +13877,26 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-01 (0.64.0) — `describe()`'s unbounded `Restore` scan
+is bounded, by the direction that does not reopen `load_journal`.** The
+2026-08-30 disclosure (M1.9) offered two fixes; only one was takeable
+without a doctrine change. Bounding `RemovedSubtree::entries`' length in
+`load_journal` would have made that method reject journals it accepts
+today — precisely the structural validation it documents itself as not
+doing, with `replay()` owning that job. Bounding the *search* instead
+costs nothing real: a new `MAX_ROOT_SEARCH_ENTRIES` (64) caps the scan,
+the root is at index 0 for every subtree this crate produces
+(`capture_subtree` is root-first; `add_pixel_layer`/`add_group` build
+one-element lists), and every pre-existing exact-string description
+assertion stayed green unchanged. Past the bound the arm prints the
+`"layer"` placeholder it already used for a rootless `entries` list — a
+disclosed, display-only degradation reachable only by a crafted or
+foreign journal. Two new deterministic tests, one of them a structural
+negative control that fails against the unpatched code. **The
+reviewer's 232 ms number was not re-measured**: the tests prove the
+bound by structure, not by wall clock, so the post-fix latency is
+inferred from the cap rather than observed.
 
 **Addendum 2026-09-01 (0.63.0) — the clean-shutdown cleanup now runs on
 every exit path, so only the crash half of that item is left.** M1.9's
