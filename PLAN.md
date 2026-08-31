@@ -11097,8 +11097,10 @@ structural design work.
     gigabytes of the user's real painted pixels — behind for the
     platform's temp cleaner, which on many machines means indefinitely.
 
-    **That is not only crashes**, as this item first said. It is equally
-    every *clean* quit that bypasses that specific handler: macOS's
+    **That was not only crashes**, as this item first said — though the
+    clean-quit half is fixed as of 0.63.0 (see the addendum below), so
+    what follows describes the state this item opened in. It was equally
+    every *clean* quit that bypassed that specific handler: macOS's
     native menu Quit item terminates through AppKit rather than
     delivering a winit `CloseRequested` event, and `App::fail`'s own
     early-exit path never reaches it either. Nor is it unique to the
@@ -11116,7 +11118,37 @@ structural design work.
     quit through any route runs `clean_shutdown_cleanup`. The second is
     the cheaper one and covers the marker and autosave too.
 
-    Concrete fix shape: a sweep at startup over `aurora-scratch-*`
+    **First half closed 2026-09-01 (0.63.0)**:
+    `ApplicationHandler::exiting` now runs `clean_shutdown_cleanup` plus
+    the workspace-layout save, via a new `App::finish_shutdown` that the
+    `WindowEvent::CloseRequested` arm calls too; `App::fail`'s existing
+    `el.exit()` reaches it as well, so no separate call was needed there.
+    Verified against the vendored winit 0.30.13 source: `el.exit()`
+    dispatches `Event::LoopExiting`, `event_loop.rs:648` maps it to
+    `ApplicationHandler::exiting`, and each backend emits it —
+    `macos/app_state.rs:224` (`internal_exit`, which
+    `applicationWillTerminate:` at `:171` calls, i.e. the native menu
+    Quit), `windows/event_loop/runner.rs:302/311/322`,
+    `linux/x11/mod.rs:429`, `linux/wayland/event_loop/mod.rs:231`; macOS
+    additionally queues its end-of-iteration observer at lowest priority
+    so `LoopExiting` cannot precede `AboutToWait`
+    (`macos/observer.rs:71`). **Not verified on real hardware — no test
+    in this crate can drive a real event loop**, so the wiring itself is
+    still inspection-only, exactly as the `CloseRequested` arm always
+    was. What *is* tested is the property the two call sites rest on:
+    `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`
+    (`crates/aurora-app/src/lib.rs`) runs the cleanup twice over a real
+    marker, a real autosave and a real scratch directory holding real
+    flushed tiles, and asserts the second pass is a no-op.
+
+    **Still open: the startup sweep only.** A hard crash, a `SIGKILL`,
+    an OS shutdown, and a `panic = "abort"` build (the release profile
+    sets it) all end the process without running any Rust cleanup, so
+    they never reach `exiting` either and still strand a scratch
+    directory, a marker and an autosave.
+
+    Concrete fix shape for that remaining half: a sweep at startup over
+    `aurora-scratch-*`
     siblings, deleting only those whose owning process is provably gone.
     That liveness check is the whole reason this is its own round — it is
     a per-platform question (an advisory lock file inside each directory
@@ -13812,6 +13844,28 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-01 (0.63.0) — the clean-shutdown cleanup now runs on
+every exit path, so only the crash half of that item is left.** M1.9's
+"Scratch directories from sessions that never reach the shutdown
+cleanup" item was two halves; the cheaper one is done. A new
+`App::finish_shutdown` holds the `clean_shutdown_cleanup` trio plus the
+workspace-layout save, and `ApplicationHandler::exiting` calls it
+alongside the existing `WindowEvent::CloseRequested` arm — so macOS's
+native menu Quit and `App::fail`'s own `el.exit()`, both of which used to
+strand a session marker (making the *next* run claim a crash), an
+autosave and gigabytes of paged-out pixels, are covered. Verified
+against the vendored winit 0.30.13 source, backend by backend, in that
+item's own addendum. **Not verified on real hardware**: no test in this
+crate can drive a real event loop, so the wiring stays inspection-only,
+exactly as the `CloseRequested` arm always was; the one new test
+(`clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`) pins only
+the property the two call sites rest on. **Next** on that item is the
+half deliberately left alone — a startup sweep of *other* runs'
+`aurora-scratch-*` leftovers, which still needs the per-platform
+liveness check that made it its own round, since a hard crash,
+`SIGKILL`, an OS shutdown and the release profile's `panic = "abort"`
+never reach `exiting` either.
 
 **Addendum 2026-08-26 (0.57.8) — the rule 0.57.7 wrote down had a live
 exception in the same commit.** `App::active_layer`'s doc comment states

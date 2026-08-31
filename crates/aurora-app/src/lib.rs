@@ -151,8 +151,11 @@
 //! are plain data, constructible with no window either.
 //!
 //! **Crash recovery and autosave** (PLAN.md M1.9): `run` writes a small
-//! marker file (`std::env::temp_dir()`) at startup and clears it on a
-//! clean `WindowEvent::CloseRequested` shutdown; if a *previous* run's
+//! marker file (`std::env::temp_dir()`) at startup and clears it on
+//! every clean shutdown — both the `WindowEvent::CloseRequested` arm
+//! and `ApplicationHandler::exiting`, which is the one the paths that
+//! never produce a close request (macOS's own menu Quit, `App::fail`'s
+//! `el.exit()`) go through; if a *previous* run's
 //! marker is still there, this run shows a real, modal
 //! `Role::AlertDialog` (`aurora_widgets::widgets::dialog`) saying so.
 //! Document recovery is now real, not just detected: `aurora-doc`'s
@@ -6790,12 +6793,23 @@ fn tile_store_scratch_dir() -> Option<&'static Path> {
 /// ordering it this way removes the question at zero cost rather than
 /// answering it.
 ///
-/// **Crash leftovers are not covered** — see PLAN.md's own follow-up
-/// item. A run that never reaches this leaves its directory behind for
-/// the platform's temp cleaner, and that includes clean quits that
-/// bypass `WindowEvent::CloseRequested` (macOS's own menu Quit,
-/// [`App::fail`]), not only crashes. The marker and the autosave have
-/// exactly the same gap.
+/// **Every *clean* exit reaches this now, not only a window close.**
+/// [`App::finish_shutdown`] wraps it, and both
+/// `WindowEvent::CloseRequested` and
+/// [`ApplicationHandler::exiting`](App::exiting) call that — so macOS's
+/// own menu Quit and [`App::fail`]'s `el.exit()`, which used to leave a
+/// marker, an autosave and a scratch directory behind, are covered. The
+/// `CloseRequested` path runs it twice (its own call, then `exiting`);
+/// every step here is idempotent, which
+/// `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths` pins.
+///
+/// **Crash leftovers are still not covered** — see PLAN.md's own
+/// follow-up item, whose remaining half is a startup sweep. A hard
+/// crash, a `SIGKILL`, an OS shutdown, and a `panic = "abort"` build
+/// (the release profile) all end the process without running any Rust
+/// cleanup, so none of them reach `exiting` either; such a run leaves
+/// its scratch directory behind for the platform's temp cleaner, and
+/// the marker and the autosave have exactly the same gap.
 fn clean_shutdown_cleanup(state: &mut impl ShutdownState) {
     clear_session_marker(state.marker_path());
     remove_autosave(&state.autosave_path());
@@ -9032,10 +9046,56 @@ impl App {
     /// which are `&mut self` with no `Result` return) can surface an
     /// unrecoverable error, matching `aurora-gpu`'s own
     /// `examples/surface_smoke.rs::report_failure`.
+    ///
+    /// **This path is not missing the shutdown cleanup, despite calling
+    /// nothing itself.** `el.exit()` is what makes `winit` dispatch
+    /// `Event::LoopExiting`, and this crate's
+    /// [`ApplicationHandler::exiting`](App::exiting) implementation runs
+    /// [`App::finish_shutdown`] there — so a failed run clears its own
+    /// marker, autosave and scratch tiles exactly like a clean window
+    /// close does, without this method having to remember to. Adding a
+    /// `finish_shutdown` call *here* as well would be harmless
+    /// (`clean_shutdown_cleanup` is idempotent — see
+    /// `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`) but
+    /// redundant, and would suggest the general path did not cover it.
     fn fail(&mut self, el: &ActiveEventLoop, message: &str) {
         tracing::error!("{message}");
         self.failed = true;
         el.exit();
+    }
+
+    /// Everything this run owes the *next* one on the way out: the
+    /// [`clean_shutdown_cleanup`] trio — clear this run's own marker so
+    /// the next run's `previous_session_left_a_marker` reads false, not
+    /// true (see this crate's own "crash recovery" section); delete the
+    /// autosave, since nothing is left to recover once this run has
+    /// ended cleanly and the file holds real pixel content at a
+    /// predictable path in a shared temp directory (see
+    /// [`remove_autosave`]); and delete this session's paged-out tiles,
+    /// which are its unsaved pixels and which nothing recovers after a
+    /// clean exit — plus saving the current dock layout so the next
+    /// run's own `App::new` can restore it (see the "persisted workspace
+    /// layout" section for why this is the one point this crate writes
+    /// it).
+    ///
+    /// **Why a method rather than statements in one event arm.** There
+    /// is more than one way out of a running Aurora, and they do not all
+    /// pass through `WindowEvent::CloseRequested`: macOS's own menu Quit
+    /// and [`App::fail`] both end the loop without one. Both callers —
+    /// that arm and [`ApplicationHandler::exiting`](App::exiting) — need
+    /// the identical work, and the cleanup itself is idempotent, so
+    /// running it twice on the paths that reach both is a no-op rather
+    /// than a hazard.
+    ///
+    /// `clean_shutdown_cleanup` takes `self` as its only argument on
+    /// purpose — an earlier four-argument shape let the single call site
+    /// silently pass `None` for the store and the scratch directory and
+    /// still pass the whole gate. See [`ShutdownState`].
+    fn finish_shutdown(&mut self) {
+        clean_shutdown_cleanup(self);
+        if let Some(layout_path) = self.layout_path.as_deref() {
+            save_workspace_layout(layout_path, &self.workspace);
+        }
     }
 
     /// Recomputes the workspace layout for `physical_size`, then
@@ -9526,31 +9586,14 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                // A clean shutdown -- clear this run's own marker so the
-                // *next* run's `previous_session_left_a_marker` reads
-                // false, not true (see this crate's own "crash
-                // recovery" section), and save the current dock layout
-                // so the *next* run's own `App::new` can restore it
-                // (see the "persisted workspace layout" section's own
-                // doc comment for why this is the one point this crate
-                // writes it).
-                // All three cleanups -- the marker, the autosave
-                // (nothing is left to recover once this run has ended
-                // cleanly, and the file holds real pixel content at a
-                // predictable path in a shared temp directory; see
-                // [`remove_autosave`]'s own doc comment), and this
-                // session's paged-out tiles, which are its unsaved
-                // pixels and which nothing recovers after a clean exit
-                // -- go through one function so a test can execute them
-                // as a unit; this arm itself needs a real event loop
-                // to reach. `self` is the only argument on purpose --
-                // an earlier four-argument shape let this call site
-                // silently pass `None` for the store and the scratch
-                // directory and still pass the whole gate.
-                clean_shutdown_cleanup(self);
-                if let Some(layout_path) = self.layout_path.as_deref() {
-                    save_workspace_layout(layout_path, &self.workspace);
-                }
+                // A clean shutdown -- see `App::finish_shutdown` for
+                // what it undoes and why it is one method. `exiting`
+                // would run it anyway once `el.exit()` takes effect;
+                // it is called here too so the marker, the autosave,
+                // the scratch tiles and the dock layout are all settled
+                // before the loop starts unwinding, and running it
+                // twice is a no-op.
+                self.finish_shutdown();
                 el.exit();
             }
             WindowEvent::Resized(size) => self.apply_resize((size.width, size.height)),
@@ -9667,6 +9710,33 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             window.request_redraw();
             self.needs_redraw = false;
         }
+    }
+
+    /// The catch-all for every way out of the loop, including the ones
+    /// that never produce a `WindowEvent::CloseRequested`: macOS's own
+    /// menu Quit (`applicationWillTerminate:` reaches
+    /// `ApplicationDelegate::internal_exit`, which dispatches
+    /// `Event::LoopExiting`) and [`App::fail`]'s `el.exit()`, which is
+    /// how an unrecoverable error during window/device/surface creation
+    /// ends the run. Before this existed, either of those left the
+    /// session marker behind — so the *next* run opened claiming a crash
+    /// had happened — along with the autosave and every unsaved pixel
+    /// paged out to this session's scratch directory.
+    ///
+    /// `winit` guarantees this is irreversible and terminal: it fires
+    /// once, after `about_to_wait`, and the loop exits right after
+    /// (macOS explicitly queues its own end-of-iteration observer at the
+    /// lowest priority so `LoopExiting` cannot precede `AboutToWait`).
+    /// The `CloseRequested` arm calls [`App::finish_shutdown`] too, so
+    /// that path runs it twice; `clean_shutdown_cleanup` is idempotent,
+    /// which `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`
+    /// pins.
+    ///
+    /// What still escapes it: a hard crash, `SIGKILL`, an OS shutdown,
+    /// and a `panic = "abort"` build — none of which run any Rust
+    /// cleanup at all. See [`clean_shutdown_cleanup`].
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        self.finish_shutdown();
     }
 }
 
@@ -13369,6 +13439,112 @@ mod tests {
         assert!(
             !scratch.exists(),
             "the session's scratch directory and its unsaved pixels must be removed"
+        );
+    }
+
+    /// Running the clean-shutdown cleanup twice must be as safe as
+    /// running it once.
+    ///
+    /// This is the premise the two-call-site shape rests on:
+    /// `WindowEvent::CloseRequested` calls `App::finish_shutdown`, and
+    /// `ApplicationHandler::exiting` — which `winit` dispatches on the
+    /// way out of *every* exit, that close request included — calls it
+    /// again. If the second pass could fail, error, or undo something,
+    /// closing a window would be worse than quitting from the menu.
+    ///
+    /// **What it does not prove.** Only that the function is idempotent.
+    /// It does not prove either call site is actually wired to a real
+    /// event loop, because no test in this crate can drive one: both
+    /// `window_event` and `exiting` need a live `winit` loop and a real
+    /// window to reach, and that wiring is left to inspection (a review
+    /// round showed that deleting the scratch-directory cleanup from the
+    /// `CloseRequested` arm left every test in this binary green). Nor
+    /// does it say anything about `exiting` firing on any particular
+    /// platform — that is `winit`'s own guarantee, unverified here on
+    /// real hardware.
+    #[test]
+    fn clean_shutdown_cleanup_is_idempotent_across_two_exit_paths() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let marker = dir.path().join("aurora-session.marker");
+        if let Err(err) = std::fs::write(&marker, b"") {
+            unreachable!("a fresh tempdir must be writable: {err}");
+        }
+        let autosave = dir.path().join("aurora-autosave.aur");
+        if let Err(err) = std::fs::write(&autosave, b"") {
+            unreachable!("a fresh tempdir must be writable: {err}");
+        }
+
+        // As in the single-pass test: a real store with real paged-out
+        // tiles, so an empty directory cannot make this pass vacuously.
+        let Some(scratch) = create_tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(scratch.clone(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("a fresh scratch directory must be usable: {err}"),
+        };
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for id in [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+        ] {
+            if let Err(err) = store.get_mut(surface, id) {
+                unreachable!("touching a blank tile cannot fail: {err}");
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("a test-local scratch disk must accept the write: {err}");
+        }
+        let tiles = match std::fs::read_dir(&scratch) {
+            Ok(entries) => entries.flatten().count(),
+            Err(err) => unreachable!("the scratch directory is readable: {err}"),
+        };
+        assert!(
+            tiles > 0,
+            "this test's premise is a scratch directory with real paged-out tiles in it"
+        );
+
+        let mut state = FakeShutdownState {
+            marker: marker.clone(),
+            autosave: autosave.clone(),
+            store: Some(store),
+            scratch: Some(scratch.clone()),
+        };
+
+        // The `CloseRequested` arm's own call.
+        clean_shutdown_cleanup(&mut state);
+        assert!(state.store.is_none(), "the store must be taken and dropped");
+        assert!(!marker.exists(), "the session marker must be cleared");
+        assert!(!autosave.exists(), "the autosave must be removed");
+        assert!(
+            !scratch.exists(),
+            "the session's scratch directory and its unsaved pixels must be removed"
+        );
+
+        // ...and then `exiting`'s, on the very same state, which is
+        // exactly what closing a window produces.
+        clean_shutdown_cleanup(&mut state);
+        assert!(
+            state.store.is_none(),
+            "a second pass must not resurrect a store slot it already emptied"
+        );
+        assert!(
+            !marker.exists(),
+            "a second pass must leave the marker gone, not recreate it"
+        );
+        assert!(
+            !autosave.exists(),
+            "a second pass must leave the autosave gone"
+        );
+        assert!(
+            !scratch.exists(),
+            "a second pass must leave the scratch directory gone"
         );
     }
 
