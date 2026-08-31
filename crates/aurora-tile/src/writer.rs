@@ -82,19 +82,22 @@ pub(crate) struct WriteResult {
 /// such rewrite and break the FIFO invariant [`BackgroundWriter::spawn`]
 /// documents.
 ///
-/// **This is defence in depth *on top of* the directory's `0o700`, not
-/// protection independent of it.** `open` follows symlinks, and `open`'s
-/// mode argument is consulted only when the call actually creates a new
-/// inode -- so if the containing directory's protection ever fails or is
-/// bypassed, a pre-existing file (or a planted symlink) at this path is
-/// truncated and overwritten at *its* mode, and the `0o600` requested
-/// here buys nothing. The `0o700` scratch directory, which denies every
-/// other user the traversal needed to reach or create anything inside
-/// it, is what actually holds that line today. Closing the gap properly
-/// needs `O_NOFOLLOW` on this open, tracked with the same requirement
-/// for `create_private_dir` in `PLAN.md` -- it needs a `libc` dependency
-/// and an `unsafe_code` override, so it is its own architecture
-/// decision rather than part of this helper.
+/// **Defence in depth *on top of* the directory's `0o700`, not
+/// protection independent of it** -- the `0o700` scratch directory,
+/// which denies every other user the traversal needed to reach or
+/// create anything inside it, is what actually holds that line today.
+/// But the gap this closes is real on its own terms too: `open`'s mode
+/// argument is consulted only when the call actually creates a new
+/// inode, so a pre-existing file at this path would otherwise be
+/// truncated and overwritten at *its* mode, and `open` follows symlinks
+/// by default, so a planted symlink would be silently written through to
+/// whatever it points at. `custom_flags(libc::O_NOFOLLOW)` closes the
+/// second half: if the final path component is a symlink, the `open`
+/// call itself fails instead of following it. `O_NOFOLLOW` needs no
+/// `unsafe` code -- `custom_flags` is a safe `std` method, and `libc` is
+/// used here only for the flag's platform-specific numeric value, the
+/// same crate `create_private_dir` (`aurora-tile`'s one `unsafe_code`
+/// exception) already depends on.
 ///
 /// Windows ACLs are *not* addressed here: `OpenOptions` has no portable
 /// equivalent -- the same gap `aurora_app::create_autosave_temp` and
@@ -107,6 +110,7 @@ fn write_tile_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path)?;
     file.write_all(bytes)
@@ -374,6 +378,73 @@ mod tests {
              must create it owner-only rather than at whatever the process umask happens to \
              allow, and this one came back {mode:04o} (the control file above confirms this \
              environment's umask would have permitted a wider mode)"
+        );
+    }
+
+    /// A symlink at a tile's target path must be *refused*, not
+    /// followed.
+    ///
+    /// `open`'s mode argument only applies when the call creates a new
+    /// inode, so before `custom_flags(libc::O_NOFOLLOW)` a planted
+    /// symlink at the target path was silently opened, truncated, and
+    /// overwritten through to whatever it pointed at -- the same class
+    /// of attack `store.rs`'s `new_refuses_a_symlinked_scratch_directory`
+    /// guards against for the containing directory. Both halves are
+    /// asserted: the write reports an error (specifically `ELOOP`, not
+    /// just any failure -- the `0o600` mode-only test above already
+    /// covers "some error" territory), *and* the symlink's target is
+    /// left with its original content.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_tile_path_is_refused_not_followed() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("tempdir creation must succeed in a test environment: {err}"),
+        };
+
+        let victim = dir.path().join("someone-elses-file");
+        if let Err(err) = std::fs::write(&victim, b"do not overwrite me") {
+            unreachable!("writing a file into a fresh tempdir must succeed: {err}");
+        }
+        let link = dir.path().join("0_0.tile");
+        if let Err(err) = std::os::unix::fs::symlink(&victim, &link) {
+            unreachable!("creating a symlink inside a fresh tempdir must succeed: {err}");
+        }
+
+        let mut writer = BackgroundWriter::spawn();
+        writer.submit(WriteJob {
+            surface: SurfaceId::from_raw(0),
+            id: TileId { x: 0, y: 0 },
+            generation: 1,
+            path: link,
+            bytes: vec![0xFF_u8; 8].into(),
+        });
+        writer.flush();
+
+        let mut results = writer.drain_results();
+        assert_eq!(results.len(), 1, "exactly one job was submitted");
+        let Some(result) = results.pop() else {
+            unreachable!("just asserted results.len() == 1");
+        };
+        match &result.outcome {
+            Err(err) => assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ELOOP),
+                "a symlinked target must be refused specifically as ELOOP, not some other \
+                 failure: {err}"
+            ),
+            Ok(()) => unreachable!(
+                "a symlinked tile path must be refused, not opened and written through"
+            ),
+        }
+
+        let after = match std::fs::read(&victim) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("the victim file must still exist untouched: {err}"),
+        };
+        assert_eq!(
+            after, b"do not overwrite me",
+            "a refused write must not have touched the symlink's target"
         );
     }
 

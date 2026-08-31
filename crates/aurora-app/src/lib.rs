@@ -924,16 +924,46 @@ fn aur_verify_scratch_dir() -> Option<tempfile::TempDir> {
 
 /// Creates `dir` (and any missing parent) owner-only on Unix, and
 /// accepts one that already exists — `aurora_tile`'s own
-/// `create_private_dir` without the hardening checks, which is all this
-/// needs: the only caller ([`aur_verify_scratch_dir`]) is recreating a
-/// directory this process itself created under a random name, not
-/// adopting an arbitrary caller-supplied path.
+/// `create_private_dir` without its full `O_NOFOLLOW`/ownership
+/// treatment, which this deliberately does not need: the only caller
+/// ([`aur_verify_scratch_dir`]) is recreating a directory this process
+/// itself created under a random name, not adopting an arbitrary
+/// caller-supplied path, and the directory this recreates is nested
+/// under an already-`0o700` session directory — bounding the impact of a
+/// planted symlink here to a forced, attacker-triggerable verification
+/// failure, not a data leak (PLAN.md).
+///
+/// **Refuses a symlink rather than following it** — the cheap half of
+/// `create_private_dir`'s hardening, `symlink_metadata`-based and
+/// `std`-only, deliberately stopping short of that function's
+/// descriptor-based `fchmod`/ownership check. That fuller treatment
+/// needs a `libc` dependency and `aurora-tile`'s `unsafe_code`
+/// exception; pulling both into `aurora-app` for a gap this bounded is
+/// not worth it today. `std::fs::DirBuilder::create` on its own already
+/// refuses a symlink no differently than any other pre-existing
+/// non-directory — the *point* of this check is the specific, honest
+/// error message a bare `EEXIST` would not give.
 ///
 /// Windows gets the parent's inherited ACL, the same gap
 /// [`create_autosave_temp`] already discloses.
 #[cfg(unix)]
 fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
     use std::os::unix::fs::DirBuilderExt as _;
+
+    if let Ok(existing) = std::fs::symlink_metadata(dir)
+        && existing.file_type().is_symlink()
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to recreate {} as a scratch directory: it is a symlink, and following \
+                 it would create and chmod whatever it points at",
+                dir.display()
+            ),
+        ));
+    }
+
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -9732,7 +9762,7 @@ mod tests {
         canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
         clean_shutdown_cleanup, clear_session_marker, close_command_palette,
         close_crash_recovery_dialog, collect_widget_paints, commit_ending_drag, composite_document,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message, create_dir_owner_only,
         create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
         document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
         effective_residency_zoom, eraser_stroke_mut, eyedropper_sample, guarded_scale_factor,
@@ -13216,6 +13246,51 @@ mod tests {
         drop(first);
         assert!(!path.exists(), "dropping the guard removes the directory");
         drop(second);
+    }
+
+    /// A symlink at the path `create_dir_owner_only` is asked to
+    /// recreate must be *refused*, not followed.
+    ///
+    /// The only caller ([`aur_verify_scratch_dir`]) reaches this path
+    /// specifically when the directory it expects is *missing* -- the
+    /// same precondition under which a local attacker could plant a
+    /// symlink at that exact name first. `DirBuilder::create` alone
+    /// would already refuse a symlink no differently than any other
+    /// pre-existing non-directory (some `io::Error`); this test pins the
+    /// specific, honest `InvalidInput` this function's own check adds,
+    /// mirroring `aurora_tile::store`'s
+    /// `new_refuses_a_symlinked_scratch_directory` for the sibling
+    /// hardening this deliberately took the cheaper half of.
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_owner_only_refuses_a_symlink() {
+        let parent = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("tempdir creation must succeed in a test environment: {err}"),
+        };
+        let target = parent.path().join("someone-elses-directory");
+        if let Err(err) = std::fs::create_dir(&target) {
+            unreachable!("creating a directory inside a fresh tempdir must succeed: {err}");
+        }
+        let link = parent.path().join("scratch");
+        if let Err(err) = std::os::unix::fs::symlink(&target, &link) {
+            unreachable!("creating a symlink inside a fresh tempdir must succeed: {err}");
+        }
+
+        match create_dir_owner_only(&link) {
+            Err(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    err.to_string().contains("symlink"),
+                    "the symlink check is what must reject this, not an overlapping one: {err}"
+                );
+            }
+            Ok(()) => unreachable!("a symlink at the target path must be refused, not followed"),
+        }
+        assert!(
+            target.is_dir(),
+            "a refused call must not have touched the symlink's target"
+        );
     }
 
     /// The three things a clean shutdown must undo, exercised as a unit.

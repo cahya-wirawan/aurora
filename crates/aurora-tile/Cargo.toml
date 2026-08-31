@@ -9,8 +9,31 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[lints]
-workspace = true
+# Not `workspace = true`: this crate is the one exception to the
+# workspace's blanket `unsafe_code = "deny"` (see CLAUDE.md's "Lints
+# worth knowing"). `create_private_dir`'s scratch-directory adoption path
+# needs `fchmod` on an open descriptor and `geteuid` for an ownership
+# check, neither exposed by `std`, only by `libc` (`extern "C"`, hence
+# `unsafe`). Every other lint below is copied verbatim from
+# `[workspace.lints]` -- only `unsafe_code` differs -- so the override is
+# visible in review without silently opting this crate out of anything
+# else the workspace enforces.
+[lints.rust]
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+module_name_repetitions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+similar_names = "allow"
 
 [dependencies]
 aurora-core = { workspace = true }
@@ -20,6 +43,13 @@ half = { workspace = true }
 lru = { workspace = true }
 lz4_flex = { workspace = true }
 serde = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Only for `fchmod`/`geteuid` (scratch-directory hardening,
+# `store::create_private_dir`) and the `O_NOFOLLOW` flag constant
+# (`writer::write_tile_file`) -- both Unix-only, so this stays out of the
+# Windows dependency graph entirely.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

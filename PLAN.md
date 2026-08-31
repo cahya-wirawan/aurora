@@ -11100,53 +11100,59 @@ structural design work.
     getting it wrong deletes a *live* session's scratch tiles, which is
     worse than the leak it fixes.
 
-- [ ] **`aurora_tile::create_private_dir` wants `O_NOFOLLOW` and a real
+- [x] **`aurora_tile::create_private_dir` wants `O_NOFOLLOW` and a real
     ownership check before FR-026 lets a user choose the scratch
-    location.** Opened 2026-08-25. Today it refuses a symlink, refuses a
-    non-directory, and verifies the settled mode — enough while every
-    caller passes a freshly created `tempfile` directory, so nothing
-    pre-existing is ever adopted. A user-configurable scratch path
-    changes that: a pre-existing directory would then be tightened and
-    adopted without confirming the current user owns it, and with a real
-    (measured) window at its original mode before the chmod. The
-    race-free shape is `open(O_DIRECTORY|O_NOFOLLOW)` plus `fchmod`/
-    `fstat` on the descriptor; `std` exposes neither, nor a `geteuid`,
-    so this is the first thing in the workspace that would need a
-    `libc` dependency and an `unsafe_code` override in one crate's own
-    `[lints]` table. That is an architecture decision, not a bug fix,
-    which is why it is its own item.
+    location.** Opened 2026-08-25, **closed 2026-08-31 (0.61.0)**. Was:
+    refuses a symlink, refuses a non-directory, and verifies the settled
+    mode by re-reading the *path* — enough while every caller passes a
+    freshly created `tempfile` directory, so nothing pre-existing was
+    ever adopted. A user-configurable scratch path changes that: a
+    pre-existing directory would then be tightened and adopted without
+    confirming the current user owns it, and with a real (measured)
+    window at its original mode before the chmod.
 
-    **When it happens, it should cover the scratch *tile file* open
-    too, not just directory creation.** `aurora_tile::writer`'s
-    `write_tile_file` (0.58.0) opens each tile with `.mode(0o600)`, but
-    `open` follows symlinks and its mode argument is consulted only when
-    the call creates a new inode — so a pre-existing file or a planted
-    symlink at that path is truncated and overwritten at *its* mode.
-    Nothing is exploitable today, for the same reason the directory case
-    is not: the `0o700` scratch directory denies every other user the
-    traversal needed to reach or create anything inside it. It is the
-    same class of gap, wants the same `O_NOFOLLOW`, and would ride along
-    on the same `libc`/`unsafe_code` decision.
+    **Now the race-free shape this item originally described**:
+    `open(O_DIRECTORY | O_NOFOLLOW)`, then `fstat` for ownership and
+    mode and `fchmod` to correct it, all against the one held
+    descriptor rather than the path — a path can be raced out from under
+    a second syscall, an open descriptor cannot. `std` exposes neither
+    `fchmod`-on-a-descriptor nor `geteuid`, so this is, as predicted,
+    **the first thing in the workspace needing a `libc` dependency and
+    an `unsafe_code` override** — confined to `aurora-tile`'s own
+    `[lints]` table (`unsafe_code = "allow"`, every other workspace lint
+    copied verbatim so the exception is narrow and visible in review),
+    with exactly two `unsafe` blocks (`geteuid`, `fchmod`), each carrying
+    its own `// SAFETY:` comment. CLAUDE.md's "No crate has needed to
+    yet" line is updated alongside this.
 
-    **Same gap on the `aurora-app` side, found by the round's final
-    judge pass and not yet fixed.** `create_dir_owner_only`
-    (`crates/aurora-app/src/lib.rs`, the self-heal helper
-    `aur_verify_scratch_dir` calls when the session directory has
-    disappeared) does `DirBuilder::recursive(true).mode(0o700)` with no
-    symlink refusal, on the stated reasoning that the only caller is
-    "recreating a directory this process itself created." That
-    precondition is exactly what's false at the one moment this helper
-    exists to handle: the directory is missing because *something else*
-    removed it, which is also the precondition for a local attacker to
-    plant a symlink at that exact name first. Impact is bounded — the
-    live store never takes this path (it goes through the hardened
-    `create_private_dir` above and fails closed), and the nested verify
-    directory it recreates is itself `0o700` and owned by the victim, so
-    the worst realistic outcome is a forced, attacker-triggerable
-    verification failure, not a data leak. Fold into the same
-    `O_NOFOLLOW` round when it happens, or give `create_dir_owner_only`
-    the cheaper symlink-refusal half of `create_private_dir`'s check on
-    its own first.
+    **Ownership-mismatch is disclosed as untested, not silently assumed
+    correct**: exercising it needs a directory owned by a *different*
+    user, which a single-user sandbox or CI runner cannot construct. The
+    two existing tests that already covered this function's other two
+    paths (`new_leaves_the_scratch_directory_owner_only`,
+    `new_refuses_a_symlinked_scratch_directory`) both still pass
+    unchanged against the rewrite — confirming the descriptor-based
+    `fchmod` correction and the symlink refusal both still hold.
+
+    **The scratch *tile file* open is closed too, and needed no
+    `unsafe` at all.** `aurora_tile::writer::write_tile_file` now adds
+    `.custom_flags(libc::O_NOFOLLOW)` to its existing `OpenOptions` —
+    `custom_flags` is a safe `std` method, so this only needed `libc`
+    for the platform-specific flag *value*, not an FFI call. A new test
+    plants a symlink at a tile's target path pointing at a file with
+    known content, submits a write, and asserts both that it errors and
+    that the victim file's content is untouched.
+
+    **`aurora-app`'s `create_dir_owner_only` took the cheaper of the two
+    options this item offered**, rather than folding into the
+    descriptor-based round: a `symlink_metadata`-based refusal,
+    `std`-only, matching `create_private_dir`'s own pre-check. Its
+    impact was already assessed as bounded (a forced, attacker-
+    triggerable verification failure, not a data leak, since the
+    directory it recreates is nested under an already-`0o700` session
+    directory) — not worth pulling `libc`/`unsafe_code` into a second
+    crate for. A new test plants a symlink at the target path and
+    asserts the call is refused rather than followed.
 
 - [x] **Nice-to-have: create the scratch *tile files* `0o600` too** —
     done 2026-08-30. Opened 2026-08-25. Defence in depth only — 0.53.0's

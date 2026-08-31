@@ -191,68 +191,58 @@ pub struct TileStore {
 }
 
 /// Creates `dir` (and any missing parent) owner-only on Unix, and
-/// returns having re-read the directory's own metadata to confirm that
-/// no group or other permission bit is set.
+/// returns having re-read the directory's own metadata — off an open,
+/// `O_NOFOLLOW`-opened descriptor, not the path again — to confirm that
+/// it is owned by this process and that no group or other permission bit
+/// is set.
 ///
 /// # What this checks, exactly
 ///
-/// - **A symlink at `dir` is refused, not followed.**
-///   `std::fs::set_permissions` follows symlinks, so a symlink planted
-///   at this path would silently chmod its *target* — an unrelated
-///   directory elsewhere — to `0o700` while leaving the scratch files
-///   themselves in whatever directory the link points at. A path whose
-///   `symlink_metadata` says "symlink" is an error instead.
+/// - **A symlink at `dir` is refused, not followed**, at two independent
+///   points. First, a quick `symlink_metadata` check up front gives a
+///   friendly, specific error before anything else runs. Second — the
+///   part that actually holds the line — `dir` is opened with
+///   `O_NOFOLLOW | O_DIRECTORY`: if a symlink (or anything not a
+///   directory) has been swapped in between that first check and this
+///   open, the open itself fails instead of silently following it. Every
+///   check after that point runs against the resulting descriptor, never
+///   the path again, so nothing later in this function can be raced onto
+///   a different inode.
 /// - **A non-directory at `dir` is refused** as
 ///   [`std::io::ErrorKind::NotADirectory`], rather than surfacing
 ///   `mkdir`'s own less specific `EEXIST`.
-/// - **The final mode is verified**, by reading `symlink_metadata` back
-///   off the path. That is what lets this function's contract say
-///   "owner-only" as a fact rather than as an intention. It also
-///   *detects* a symlink swapped in after the first check — detects,
-///   not prevents: if a chmod had already run against it, the target's
-///   mode has already been changed by then.
-/// - **The chmod is skipped when it is not needed.** The permissions
-///   are read before they are written, so a directory this call just
-///   created at `0o700` — which is every caller in Aurora — never
-///   reaches `set_permissions` at all, and `set_permissions` is exactly
-///   the call that follows symlinks. Only adopting a pre-existing,
-///   wider directory reaches it.
+/// - **Ownership is verified.** The opened descriptor's `fstat` (`uid()`
+///   on its `Metadata`) is compared against `geteuid()`; a pre-existing
+///   directory owned by a different user is refused rather than adopted.
+/// - **The final mode is verified and corrected on the descriptor, not
+///   the path.** A directory this call just created at `0o700` — every
+///   caller in Aurora today — is already owner-only, so no `fchmod` call
+///   happens at all. Only adopting a pre-existing, wider directory reaches
+///   it, and because `fchmod` takes a file descriptor rather than a path,
+///   there is no window in which a second syscall could be pointed
+///   somewhere else — unlike `std::fs::set_permissions`, which resolves
+///   the path again and therefore follows a symlink swapped in right
+///   before it runs.
 ///
-/// The `mkdir` sets mode `0o700` directly so a freshly created
-/// directory is never group- or world-readable for even an instant. The
-/// following `set_permissions` is *not* about the umask: a umask can
-/// only clear permission bits, never add them, so `mkdir(0o700)` cannot
-/// produce anything wider than `0o700` on its own. It is there for the
-/// one case `mkdir` does not cover — `recursive(true)` silently accepts
-/// a directory that *already exists*, at whatever mode it already has,
-/// and that is the mode `set_permissions` tightens.
+/// The `mkdir` sets mode `0o700` directly so a freshly created directory
+/// is never group- or world-readable for even an instant. The `fchmod`
+/// that can follow it is *not* about the umask: a umask can only clear
+/// permission bits, never add them, so `mkdir(0o700)` cannot produce
+/// anything wider than `0o700` on its own. It is there for the one case
+/// `mkdir` does not cover — `recursive(true)` silently accepts a
+/// directory that *already exists*, at whatever mode it already has, and
+/// that is the mode this function tightens.
 ///
 /// # What this does *not* check
 ///
-/// - **Ownership.** A pre-existing directory is tightened and adopted
-///   without confirming the current user owns it; `std::` exposes no
-///   stable `geteuid`, and reaching for `libc` would mean this
-///   workspace's first `unsafe_code` override. So would the fully
-///   race-free shape of this function (`open(O_DIRECTORY|O_NOFOLLOW)`
-///   plus `fchmod` on the resulting descriptor), which is why the
-///   check-then-chmod sequence above is what is implemented.
-/// - **Intermediate parents.** Only the final component is checked for
-///   being a symlink; a symlinked parent is not.
-/// - **The window before the chmod.** For a directory that already
-///   existed at a wider mode, it stays at that wider mode until
-///   `set_permissions` runs. Nothing of the user's has been written
-///   into it yet at that point, but an attacker who could already write
-///   there could have planted files or symlinks the chmod does not
-///   remove.
-///
-/// None of the three is reachable from Aurora today: every caller in
-/// the app passes a freshly created, randomly named directory from
-/// `tempfile::Builder` (`aurora_app::create_tile_store_scratch_dir`) or
-/// a child of one, so there is never a pre-existing directory to adopt.
-/// They become reachable the moment a *caller-supplied* scratch path is
-/// possible — FR-026's still-open, user-facing scratch-disk-location
-/// preference — which is when this wants the `O_NOFOLLOW` treatment and
-/// a real ownership check. Recorded as a follow-up in PLAN.md.
+/// - **Intermediate parents.** Only the final component is opened
+///   `O_NOFOLLOW`; a symlinked parent is not checked.
+/// - **A mismatched-owner path is not covered by this crate's own test
+///   suite.** Exercising it needs a directory owned by a *different*
+///   user, which a single-user sandbox or CI runner cannot construct.
+///   The check is a direct, one-line comparison against `geteuid()`
+///   (nothing to get subtly wrong in the comparison itself), but the
+///   caveat is recorded here rather than implied.
 ///
 /// A failure to make the directory private is returned, not logged and
 /// ignored: refusing to page a document's pixels into a directory this
@@ -269,7 +259,8 @@ pub struct TileStore {
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::io::AsRawFd as _;
 
     if let Ok(existing) = std::fs::symlink_metadata(dir) {
         if existing.file_type().is_symlink() {
@@ -304,24 +295,19 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         .mode(0o700)
         .create(dir)?;
 
-    // Read before writing, so the ordinary case never chmods at all.
-    // Every caller in Aurora reaches here having just *created* the
-    // directory at mode `0o700`, which is already owner-only, so the
-    // check below returns without calling `set_permissions` — and
-    // `set_permissions` is precisely the call that follows symlinks.
-    // Only the adopt-an-existing-wider-directory case reaches the chmod.
-    //
-    // `symlink_metadata` (not `metadata`) deliberately: it reports the
-    // path itself rather than a link's target, so a symlink swapped in
-    // after the check above is caught here instead of being silently
-    // reported as its target's mode.
-    let mut settled = std::fs::symlink_metadata(dir)?;
-    if settled.permissions().mode() & 0o077 != 0 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        settled = std::fs::symlink_metadata(dir)?;
-    }
+    // From here on the security boundary is a held descriptor, not the
+    // path: `O_NOFOLLOW | O_DIRECTORY` refuses outright if a symlink or
+    // non-directory has been swapped in since the checks above, and
+    // every remaining check runs against this one `File` -- never `dir`
+    // again -- so nothing later in this function can be raced onto a
+    // different inode the way a second path-based syscall could be.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)?;
+    let metadata = file.metadata()?;
 
-    if settled.file_type().is_symlink() || !settled.is_dir() {
+    if !metadata.is_dir() {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
@@ -331,13 +317,45 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
             ),
         ));
     }
-    let mode = settled.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
+
+    // SAFETY: `geteuid` takes no arguments, has no preconditions, and
+    // cannot fail -- it is inherently safe to call, `std` just does not
+    // expose it.
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             format!(
-                "scratch directory {} is still group- or world-accessible (mode {mode:o}) after \
-                 being made owner-only",
+                "refusing to adopt {} as a scratch directory: it is owned by uid {} but this \
+                 process is uid {euid}",
+                dir.display(),
+                metadata.uid()
+            ),
+        ));
+    }
+
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        // SAFETY: `file`'s descriptor is open and held for this whole
+        // call, so `fchmod` cannot be raced onto a different inode the
+        // way `std::fs::set_permissions` (path-based, follows symlinks)
+        // could be by a symlink swapped in right before it runs.
+        let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o700) };
+        if result != 0 {
+            return Err(Error::last_os_error());
+        }
+    }
+
+    // Re-read rather than trust the `fchmod` call's success alone: this
+    // is what lets the function's contract say "owner-only" as a fact
+    // about the directory's settled state, not merely "we asked for it."
+    let settled_mode = file.metadata()?.mode() & 0o777;
+    if settled_mode & 0o077 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "scratch directory {} is still group- or world-accessible (mode {settled_mode:o}) \
+                 after being made owner-only",
                 dir.display()
             ),
         ));

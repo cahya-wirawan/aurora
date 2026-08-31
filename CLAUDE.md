@@ -122,7 +122,7 @@ Toolchain is pinned in `rust-toolchain.toml` (1.97, edition 2024 — `cosmic-tex
 
 ## Lints worth knowing
 
-The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `Cargo.toml`). This is deliberate: Aurora holds a professional's unsaved work, and a panic loses it. Return errors instead. A crate needing `unsafe` must override `unsafe_code` in its own `[lints]` table rather than the workspace's, so the exception is visible in review. **No crate has needed to yet** — `wgpu` and the FFI wrappers in use present safe Rust APIs, so the whole workspace is still `unsafe_code = "deny"`. Keep it that way if you can.
+The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `Cargo.toml`). This is deliberate: Aurora holds a professional's unsaved work, and a panic loses it. Return errors instead. A crate needing `unsafe` must override `unsafe_code` in its own `[lints]` table rather than the workspace's, so the exception is visible in review. **`aurora-tile` is the one exception** (0.61.0): `store::create_private_dir`'s scratch-directory hardening needs `fchmod` on an open descriptor and `geteuid` for an ownership check, neither exposed by `std`, only by `libc` FFI. Its `[lints]` table copies every other workspace lint verbatim and overrides only `unsafe_code` to `"allow"`; every other crate is still `unsafe_code = "deny"` — keep it that way if you can.
 
 ## Versioning
 
