@@ -26,6 +26,35 @@ use std::borrow::Cow;
 /// and the journal itself keep the full name.
 pub(crate) const MAX_NAME_CHARS: usize = 128;
 
+/// The most characters of the *input* [`sanitize_display_name`] will
+/// look at — eight times [`MAX_NAME_CHARS`], so a name has to be
+/// seven-eighths invisible padding before the bound can change anything
+/// it produces.
+///
+/// **Why an input bound is needed at all.** The output cap alone does
+/// not bound the work: the filter has to *find* `MAX_NAME_CHARS` visible
+/// characters, so a name made entirely of stripped characters is walked
+/// end to end whatever the cap says. That is reachable — a name on the
+/// `.aur` path comes from a file, `History::load_journal` performs no
+/// structural validation by design, and `History::journal_descriptions`
+/// runs this once per described entry on the UI thread that is drawing
+/// the History panel. A review round measured a crafted journal of 200
+/// names × 200,000 invisible characters at 158 ms against 170 µs for the
+/// same journal with ordinary names, roughly 930×. With this bound the
+/// same journal is ~1000 × 1024 character tests: a fixed ceiling that no
+/// longer grows with the file.
+///
+/// **What it can change, stated plainly.** Any name of at most
+/// `MAX_SCANNED_CHARS` characters — every real one, and every one that
+/// was not already being truncated in practice — comes back exactly as
+/// before. Past that, visible characters sitting behind more than 1024
+/// characters of padding are not found, and the result ends in `…`
+/// because something genuinely was dropped unread. A 255-byte PSD
+/// legacy Pascal string and a 255-character `luni` block are the
+/// largest legitimate names this project expects; 1024 is four times
+/// that even before the padding ratio is considered.
+const MAX_SCANNED_CHARS: usize = 8 * MAX_NAME_CHARS;
+
 /// Whether a character is dropped from a name before it reaches a
 /// display string (and, through a panel, an `accesskit` label).
 ///
@@ -94,6 +123,15 @@ fn is_stripped(c: char) -> bool {
 /// count, so the returned string can still be several times
 /// `MAX_NAME_CHARS` in bytes (up to 4 bytes per `char`).
 ///
+/// **The input is bounded too, not just the output.** At most
+/// `MAX_SCANNED_CHARS` — 1024, eight times the cap — characters of
+/// `name` are ever examined, because the output cap on its own does not
+/// bound the work: finding `MAX_NAME_CHARS` visible characters in a name
+/// made of nothing but stripped ones means walking all of it. See that
+/// constant (this module's own, private like `MAX_NAME_CHARS`) for the
+/// measurement, and for why a name of 1024 characters or fewer — which
+/// is every real one — is unaffected.
+///
 /// An ordinary short, clean name takes the borrowed fast path and comes
 /// back byte-identical.
 #[must_use]
@@ -101,16 +139,31 @@ pub fn sanitize_display_name(name: &str) -> Cow<'_, str> {
     // `name.len()` is bytes and so is a conservative stand-in for the
     // character count here: a string of at most `MAX_NAME_CHARS` bytes
     // has at most `MAX_NAME_CHARS` characters, so the fast path can
-    // never skip a truncation that was actually needed.
+    // never skip a truncation that was actually needed. `&&`
+    // short-circuits, so the scan that follows it never runs on a name
+    // longer than `MAX_NAME_CHARS` bytes -- this line is already
+    // bounded, and only the slow path below needed fixing.
     if name.len() <= MAX_NAME_CHARS && !name.chars().any(is_stripped) {
         return Cow::Borrowed(name);
     }
-    let mut kept = name.chars().filter(|c| !is_stripped(*c));
+    let mut chars = name.chars();
+    let mut kept = chars
+        .by_ref()
+        .take(MAX_SCANNED_CHARS)
+        .filter(|c| !is_stripped(*c));
     let mut out: String = kept.by_ref().take(MAX_NAME_CHARS).collect();
     // Only an actually-*visible* character past the cap earns the
     // ellipsis: a name whose tail is nothing but stripped characters
     // lost nothing a reader would have seen.
-    if kept.next().is_some() {
+    let dropped_visible = kept.next().is_some();
+    // Releases the borrow on `chars`, so what the scan bound left
+    // unread can be asked about below.
+    drop(kept);
+    // Anything left unread past the scan bound also earns the ellipsis:
+    // unlike the case above, what was dropped is genuinely unknown
+    // here, and claiming a complete name for a truncated scan would be
+    // the dishonest half of the trade.
+    if dropped_visible || chars.next().is_some() {
         out.push('\u{2026}');
     }
     Cow::Owned(out)
@@ -118,7 +171,7 @@ pub fn sanitize_display_name(name: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NAME_CHARS, sanitize_display_name};
+    use super::{MAX_NAME_CHARS, MAX_SCANNED_CHARS, sanitize_display_name};
 
     #[test]
     fn an_ordinary_name_comes_back_borrowed_and_identical() {
@@ -233,5 +286,90 @@ mod tests {
     fn invisible_padding_does_not_consume_the_budget() {
         let name = format!("{}real", "\u{200B}".repeat(500));
         assert_eq!(sanitize_display_name(&name), "real");
+    }
+
+    /// The input-scan boundary, both sides, in the shape that makes the
+    /// bound matter: nothing but stripped characters, so the output cap
+    /// alone would never stop the walk.
+    ///
+    /// A visible character at input position `MAX_SCANNED_CHARS` (the
+    /// last one scanned) is still found; one at `MAX_SCANNED_CHARS + 1`
+    /// is not, and the result is the `…` that says so. Setting the
+    /// constant anywhere else fails one half or the other, so this pins
+    /// its magnitude rather than merely that some bound exists.
+    #[test]
+    fn the_input_scan_boundary_is_exact() {
+        let pad = |n: usize| "\u{200B}".repeat(n);
+
+        let last_scanned = format!("{}x", pad(MAX_SCANNED_CHARS - 1));
+        assert_eq!(sanitize_display_name(&last_scanned), "x");
+
+        let just_past = format!("{}x", pad(MAX_SCANNED_CHARS));
+        let out = sanitize_display_name(&just_past);
+        assert_eq!(
+            out, "\u{2026}",
+            "a visible character behind more padding than the scan bound is not found, and \
+             the result must say something was dropped"
+        );
+    }
+
+    /// The *magnitude* of the scan bound, which the boundary test above
+    /// cannot pin: it is written in terms of the constant, so it stays
+    /// green at any value, including a useless one.
+    ///
+    /// Both ends carry a reason. Below 512 the bound would start
+    /// clipping legitimate names — PSD's own legacy layer-name record is
+    /// a 255-byte Pascal string and its `luni` block 255 characters, and
+    /// the scan has to cover a real name plus whatever stripped
+    /// characters are mixed into it. Above 4096 the panel's own ceiling
+    /// (`MAX_DESCRIPTIONS`, 1000, in `history.rs`) stops being trivial:
+    /// 1000 × 4096 is four million character tests on the UI thread.
+    /// The floor also keeps the bound clear of `MAX_NAME_CHARS` itself,
+    /// at or below which every name carrying a single stripped
+    /// character would start truncating.
+    #[test]
+    fn the_scan_bound_is_generous_for_real_names_and_trivial_in_total() {
+        assert!(
+            (512..=4096).contains(&MAX_SCANNED_CHARS),
+            "{MAX_SCANNED_CHARS} is outside the band this bound is justified in, and \
+             must in particular stay well clear of the {MAX_NAME_CHARS}-character output cap"
+        );
+    }
+
+    /// The bound is real work avoided, not just a documented intention:
+    /// a name of a million stripped characters must come back in about
+    /// the time a bounded one does.
+    ///
+    /// Timing is only ever asserted as an *order of magnitude* here --
+    /// the ratio between two calls on the same machine, with a
+    /// deliberately loose 50× threshold against a bound that is 8000×
+    /// tighter than the input. It exists so an unbounded regression
+    /// cannot land silently; it is not a benchmark, and its numbers are
+    /// not evidence about real hardware (CLAUDE.md's own caveat).
+    #[test]
+    fn a_pathologically_padded_name_costs_about_what_a_bounded_one_does() {
+        let bounded = format!("{}x", "\u{200B}".repeat(MAX_SCANNED_CHARS));
+        let huge = format!("{}x", "\u{200B}".repeat(1_000_000));
+
+        // One warm-up of each, so neither timing pays for a cold cache.
+        let _ = sanitize_display_name(&bounded);
+        let _ = sanitize_display_name(&huge);
+
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = sanitize_display_name(&bounded);
+        }
+        let small = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = sanitize_display_name(&huge);
+        }
+        let large = start.elapsed();
+
+        assert!(
+            large < small.saturating_mul(50) + std::time::Duration::from_millis(50),
+            "a 1,000,000-character name took {large:?} against {small:?} for a \
+             {MAX_SCANNED_CHARS}-character one -- the input scan is unbounded again"
+        );
     }
 }

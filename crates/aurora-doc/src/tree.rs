@@ -4628,6 +4628,77 @@ mod tests {
         assert_eq!(tree.roots(), &[sibling, outer]);
     }
 
+    /// The root leads `RemovedSubtree::entries`, and something outside
+    /// this file depends on it.
+    ///
+    /// `capture_subtree` documents its visit order as "root first, then
+    /// each child's own subtree in stored order", and
+    /// `History::describe`'s `Restore` arm now searches only the first
+    /// `MAX_ROOT_SEARCH_ENTRIES` entries for the root's recorded name —
+    /// so a capture that stopped leading with the root would silently
+    /// turn every deep subtree's History-panel description into the
+    /// `"layer"` placeholder. A review round proved the gap by mutation:
+    /// reversing `entries` after the capture left all 199 tests in this
+    /// crate green. This is the test that would have failed.
+    ///
+    /// Deliberately a *multi-entry* capture (a group, three children,
+    /// one of them a nested group with its own child), because a
+    /// one-element list satisfies "root first" no matter what the walk
+    /// does. The whole subtree must be captured, too — a bound that
+    /// holds only because entries went missing would be no bound at all.
+    #[test]
+    fn remove_capturing_puts_the_root_first_in_its_captured_entries() {
+        let mut tree = LayerTree::new();
+        let root = match tree.add_group("root", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let nested = match tree.add_group("nested", Some(root)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut expected = vec![root, nested];
+        for (name, parent) in [
+            ("deep", nested),
+            ("first", root),
+            ("second", root),
+            ("third", root),
+        ] {
+            match tree.add_pixel_layer(name, bounds(), Some(parent)) {
+                Ok(id) => expected.push(id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        let removed = match tree.remove_capturing(root) {
+            Ok(removed) => removed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some((first, _)) = removed.entries.first() else {
+            unreachable!(
+                "a captured subtree is never empty: {}",
+                removed.entries.len()
+            );
+        };
+        assert_eq!(
+            *first, removed.root,
+            "the root must lead the captured entries -- `History::describe` searches only \
+             the first MAX_ROOT_SEARCH_ENTRIES of them for it"
+        );
+
+        // `LayerId` is `Eq` but not `Ord`, so compare the raw values --
+        // this is about *which* layers were captured, not their order
+        // (the order assertion above is the one that matters).
+        let mut captured: Vec<_> = removed.entries.iter().map(|(id, _)| id.to_raw()).collect();
+        captured.sort_unstable();
+        let mut expected: Vec<_> = expected.iter().map(|id| id.to_raw()).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            captured, expected,
+            "the whole subtree must be captured, not merely a prefix of it"
+        );
+    }
+
     // --- restore: cross-references, in both directions -----------------
 
     #[test]

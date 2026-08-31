@@ -9261,6 +9261,12 @@ structural design work.
       separator, and corrupting a legitimate name is the worse failure.
       Filtering runs *before* counting toward the cap, so invisible
       padding cannot consume the budget and leave a near-empty label.
+      **That cap bounds the output, and 0.64.2 had to add a second one
+      for the input** — finding 128 visible characters in a name made of
+      nothing but stripped ones means walking all of it, which a
+      reviewer measured at 158 ms for a crafted journal (see the 0.64.2
+      addendum); `MAX_SCANNED_CHARS` (1024) now stops that scan without
+      touching any name a real file carries.
     - **In total.** `journal_descriptions()` returns at most
       `MAX_DESCRIPTIONS` = 1000 real entries (Photoshop's own
       History-states maximum, cited as the precedent), keeping the most
@@ -9368,6 +9374,27 @@ structural design work.
     these tests prove the bound structurally rather than by timing, which
     is deliberate (a wall-clock assertion is not stable in CI), so the
     post-fix latency number is inferred from the bound, not observed.
+
+    **What 232 ms was, and was not, reachable through** (added 0.64.2,
+    after a second review round): it is a measurement against a
+    synthetic in-memory journal, not against a file. Through any `.aur`
+    the app will actually open, `aurora-io`'s
+    `MAX_METADATA_ENTRY_BYTES` (64 MiB, `crates/aurora-io/src/aur.rs`)
+    caps the whole journal entry, and a `(LayerId, LayerEntry)` pair
+    costs roughly 20 bytes on the wire — so *every* `entries` list in
+    the file put together holds a few million elements, and the
+    pre-fix worst case for this scan through a real file is single-digit
+    milliseconds rather than 232. The fix is still right (the bound is
+    now the panel's own caps, not the file's size), but the headline
+    number over-represents what a file could reach.
+
+    **Two follow-ups from that same second review round**, both closed
+    in 0.64.2: the boundary of `MAX_ROOT_SEARCH_ENTRIES` was untested
+    (mutation showed 1 and 49,998 both left the two tests above green),
+    and the root-first convention the whole bound rests on was
+    completely unenforced (injecting `entries.reverse()` after
+    `capture_subtree` left all 199 `aurora-doc` tests green). See that
+    addendum.
 - [x] **Panning past the document's *far* edge has no bound matching the
     origin-side one** — found 2026-08-25, fixed in 0.57.10.
     `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together
@@ -13902,6 +13929,48 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.64.2) — 0.64.0's "bounded regardless of how
+large the journal on disk was" was only half true; the other half is
+bounded now, and both bounds are pinned.** A second review round, this
+one by live mutation rather than code-tracing, found three things about
+0.64.0. **(1) The wrong half was bounded.** `describe()`'s `Restore`
+scan was capped, but the `sanitize_display_name` every described entry
+then runs was not: its output cap can only stop the walk once it has
+*found* 128 visible characters, so a name made entirely of stripped
+characters is walked end to end however small the cap is. Measured by
+the reviewer: 158 ms for a crafted journal of 200 names × 200,000
+invisible characters, against 170 µs for the same journal with ordinary
+names — about 930×, through the same `History::load_journal` path with
+the same zero structural validation. Fixed the same way and in the same
+spirit as the first half: a new `MAX_SCANNED_CHARS` (1024, eight times
+the output cap) bounds the *input*, so a name of 1024 characters or
+fewer — every real one; PSD's own legacy record is 255 bytes and its
+`luni` block 255 characters — behaves exactly as before, and past that
+the result ends in `…` because something genuinely was dropped unread.
+The `journal_descriptions` doc comment that made the overclaim now says
+which two bounds there are and that only one of them held between
+0.64.0 and 0.64.2. **(2) The `MAX_ROOT_SEARCH_ENTRIES` tests did not
+pin the constant**: mutation showed 1 and 49,998 both left them green.
+`describe_searches_exactly_the_first_max_root_search_entries` now pins
+the boundary one entry apart, and
+`the_root_search_bound_is_generous_but_still_trivial` pins the
+magnitude to a justified band (both of the reviewer's mutations now
+fail; nearby values like 63/65 deliberately do not, since the boundary
+test is written in terms of the constant). **(3) The root-first
+convention the whole bound rests on was unenforced** — injecting
+`entries.reverse()` after `capture_subtree` left all 199 `aurora-doc`
+tests green. `remove_capturing_puts_the_root_first_in_its_captured_entries`
+(`crates/aurora-doc/src/tree.rs`, a group with three children and a
+nested group of its own) now fails against exactly that mutation.
+**Six new tests** (205 in `aurora-doc`, up from 199), five of them
+deterministic; the sixth is a deliberately loose 50× *ratio* between two
+`sanitize_display_name` calls on the same machine, there so an unbounded
+regression cannot land silently, and it is not a benchmark — CLAUDE.md's
+own caveat about wall-clock numbers applies. The 0.64.0 addendum's
+232 ms figure is annotated in place: it came from a synthetic in-memory
+journal, and `aurora-io`'s 64 MiB `MAX_METADATA_ENTRY_BYTES` puts the
+reachable worst case through a real `.aur` at single-digit milliseconds.
+
 **Addendum 2026-09-01 (0.64.1) — 0.63.0's own fix destroyed the previous
 run's crash-recovery data on a failed startup; corrected.** Found by
 review (code-tracing) immediately after 0.63.0 landed, and it is the
@@ -13963,7 +14032,12 @@ foreign journal. Two new deterministic tests, one of them a structural
 negative control that fails against the unpatched code. **The
 reviewer's 232 ms number was not re-measured**: the tests prove the
 bound by structure, not by wall clock, so the post-fix latency is
-inferred from the cap rather than observed.
+inferred from the cap rather than observed. **Superseded in three ways
+by 0.64.2 (addendum above)** — this round's own summary claim that the
+panel is bounded "regardless of how large the journal on disk was" was
+false while `sanitize_display_name`'s input stayed unbounded; the two
+tests here pin *a* bound but not its magnitude; and 232 ms is not
+reachable through a real `.aur` file.
 
 **Addendum 2026-09-01 (0.63.0) — the clean-shutdown cleanup now runs on
 every exit path, so only the crash half of that item is left.** M1.9's

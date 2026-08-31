@@ -496,7 +496,13 @@ impl History {
     /// - **Per entry**: an embedded layer name goes through
     ///   [`sanitize_display_name`] — control, bidi-formatting,
     ///   separator, and invisible-format characters removed, then capped
-    ///   at `MAX_NAME_CHARS` (128) characters plus an `…`. The longest
+    ///   at `MAX_NAME_CHARS` (128) characters plus an `…`. That function
+    ///   bounds its *input* as well as its output (at most 1024
+    ///   characters of a name are examined), which is what keeps a name
+    ///   made entirely of invisible characters from costing its own
+    ///   full length here — the output cap alone never stopped that
+    ///   walk, and 0.64.0's claim to be bounded "regardless of how large
+    ///   the journal on disk was" was wrong until 0.64.2. The longest
     ///   description any arm can produce is therefore
     ///   `Renamed layer #{u64} to "{name}"` — about 15 characters of
     ///   fixed text, up to 20 digits of id, and 129 characters of name
@@ -519,9 +525,15 @@ impl History {
     ///   that, a single crafted journal entry carrying a million-element
     ///   `entries` list was a million comparisons *per described entry*,
     ///   so total work grew with the file rather than with this method's
-    ///   own caps. It is now bounded by
-    ///   `MAX_DESCRIPTIONS × MAX_ROOT_SEARCH_ENTRIES` regardless of how
-    ///   large the journal on disk was.
+    ///   own caps. That search is now bounded by
+    ///   `MAX_DESCRIPTIONS × MAX_ROOT_SEARCH_ENTRIES`, and the name
+    ///   sanitizer each described entry runs is separately bounded to
+    ///   1024 input characters (`MAX_SCANNED_CHARS`) — the two together
+    ///   are what make this method's total work a function of its own
+    ///   caps rather than of the journal's size. Between 0.64.0 and
+    ///   0.64.2 only the first of the two held: a review round measured
+    ///   a journal of 200 names × 200,000 invisible characters at 158 ms
+    ///   through the sanitizer, against 170 µs for ordinary names.
     ///
     /// All three bounds are **display-only**. The journal, the stored
     /// layer name ([`LayerTree::name`]), and [`Self::replay`] all still
@@ -2925,5 +2937,57 @@ mod tests {
         let size = 50_000;
         let op = restore_with_root_at(size, size - 1);
         assert_eq!(super::describe(&op), "Added layer \"layer\"");
+    }
+
+    /// The bound's own boundary, both sides, one entry apart.
+    ///
+    /// The two tests above prove *a* bound exists somewhere between 1
+    /// and 50,000; a review round showed by mutation that setting
+    /// `MAX_ROOT_SEARCH_ENTRIES` to 1 or to 49,998 left both of them
+    /// green. This pins where it actually falls: the entry at index
+    /// `MAX_ROOT_SEARCH_ENTRIES - 1` is the last one searched, and the
+    /// one at `MAX_ROOT_SEARCH_ENTRIES` is the first one missed. An
+    /// off-by-one in the `take` fails one half or the other.
+    #[test]
+    fn describe_searches_exactly_the_first_max_root_search_entries() {
+        let size = super::MAX_ROOT_SEARCH_ENTRIES + 1;
+
+        let last_searched = restore_with_root_at(size, super::MAX_ROOT_SEARCH_ENTRIES - 1);
+        assert_eq!(
+            super::describe(&last_searched),
+            "Added layer \"Retouch\"",
+            "the entry at MAX_ROOT_SEARCH_ENTRIES - 1 is still inside the bound"
+        );
+
+        let first_missed = restore_with_root_at(size, super::MAX_ROOT_SEARCH_ENTRIES);
+        assert_eq!(
+            super::describe(&first_missed),
+            "Added layer \"layer\"",
+            "the entry at MAX_ROOT_SEARCH_ENTRIES is the first one past the bound"
+        );
+    }
+
+    /// The *magnitude*, which the boundary test above cannot pin: it is
+    /// written in terms of the constant, so it stays green at any value,
+    /// including a useless one.
+    ///
+    /// Both ends carry a reason. Every subtree this crate produces puts
+    /// the root at index 0, so anything ≥ 1 is behaviour-preserving for
+    /// Aurora's own journals — but a bound that tight would make a
+    /// foreign journal's *first sibling* enough to lose the name, so the
+    /// floor here is real headroom rather than the bare minimum. The
+    /// ceiling keeps the panel's total work trivial:
+    /// `MAX_DESCRIPTIONS` (1000) × this is the whole of it.
+    #[test]
+    fn the_root_search_bound_is_generous_but_still_trivial() {
+        assert!(
+            (16..=1024).contains(&super::MAX_ROOT_SEARCH_ENTRIES),
+            "{} is outside the band this bound is justified in",
+            super::MAX_ROOT_SEARCH_ENTRIES
+        );
+        assert!(
+            super::MAX_DESCRIPTIONS.saturating_mul(super::MAX_ROOT_SEARCH_ENTRIES) <= 1_000_000,
+            "the panel's whole worst case must stay a trivial number of comparisons"
+        );
     }
 }
