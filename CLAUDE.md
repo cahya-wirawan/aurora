@@ -109,8 +109,12 @@ GitHub Actions sets a variable to the empty string when a `${{ }}` expression is
 empty, and treating that as "on" would fail a whole matrix for a reason the
 workflow file never states. Any other present value is on.
 
-**No workflow in `.github/workflows/` sets it yet** — which runner, if any,
-should is an open decision. The single implementation is
+**No regular push/PR workflow sets it yet** — which runner, if any, should is
+still an open decision, but `.github/workflows/gpu-probe.yml` (0.62.0) is a
+manual, `workflow_dispatch`-only job that runs the workspace's GPU-gated
+tests on `macos-latest` with it set, specifically to find out whether that
+runner has a real adapter before committing either way — see PLAN.md for
+how to read its result. The single implementation is
 `aurora_gpu::test_support::real_context_or_skip` (behind `aurora-gpu`'s
 `test-support` feature); every crate's `real_context()`/`real_gpu_context()`
 helper delegates to it, and it prints the selected adapter's name, backend and

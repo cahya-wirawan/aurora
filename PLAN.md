@@ -7848,15 +7848,39 @@ structural design work.
       *after* the device-type check was added, not assumed unaffected
       by it.
 
-    **What is still open, and why this is `[~]` and not `[x]`.** No file
-    under `.github/workflows/` was touched and nothing sets
-    `AURORA_REQUIRE_GPU` today, so every existing job behaves
-    byte-identically to before. Which runner (if any) genuinely has a
-    real adapter and should therefore set it is a decision about CI
-    infrastructure that needs a human, not a code change — **open
-    follow-up**. Until it is made, the gap this item describes is
-    *closeable* rather than closed: the capability exists and is
-    demonstrated, but nothing is yet using it.
+    **What is still open, and why this is `[~]` and not `[x]`.**
+    Originally: no file under `.github/workflows/` touched at all, so
+    every existing job behaved byte-identically to before, and which
+    runner (if any) genuinely has a real adapter was an open question
+    needing a human, not a code change.
+
+    **2026-08-31: the question now has a way to answer itself, without
+    committing to an answer first.** `.github/workflows/gpu-probe.yml`
+    is a new, standalone `workflow_dispatch`-only workflow — deliberately
+    *not* folded into `verify.yml`'s regular push/PR matrix — that runs
+    `cargo test --workspace --all-features` on `macos-latest` with
+    `AURORA_REQUIRE_GPU=1` and `--nocapture`, so every GPU-gated test's
+    own "GPU adapter: `<name>` (`<backend>`, `<device_type>`)" line
+    (`aurora_gpu::test_support::real_context_or_skip`'s own log) reaches
+    the run log whether the test passes or fails. `ubuntu-latest` and
+    `windows-latest` are deliberately not probed: their hosted runners
+    are virtualized with no GPU passthrough, so `AURORA_REQUIRE_GPU`
+    there would only reconfirm the already-known llvmpipe/WARP gap, not
+    answer anything new. `macos-latest` is the one case genuinely
+    unverified from a sandbox — it runs on real Apple Silicon hardware,
+    but whether GitHub's sandbox exposes a *usable* Metal adapter to a
+    headless test process is not something this sandbox can determine by
+    reading code.
+
+    **Still open, and now concretely actionable rather than only
+    conceptually so**: Cahya needs to actually trigger the probe (Actions
+    tab → "Run workflow") and read the result. A pass with a non-`Cpu`
+    device type means `AURORA_REQUIRE_GPU` can move into `verify.yml`'s
+    real macOS `test` matrix leg and `gpu-probe.yml` can be deleted; a
+    fail, or a pass reporting `Cpu`, means macOS hosted runners are
+    software-rendered too and this stays open until real GPU-backed
+    infrastructure exists (self-hosted or a paid GPU tier), at which
+    point `gpu-probe.yml` is still deleted, just without the win.
 
     **A second, narrower limitation, disclosed rather than fixed.** What
     the mechanism asserts is that a real adapter *exists* — not that any

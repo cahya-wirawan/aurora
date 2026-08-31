@@ -1,0 +1,50 @@
+name: GPU probe (macOS)
+
+# One-off, manually triggered check for whether GitHub's macos-latest
+# runner exposes a real GPU adapter to a headless test process, or falls
+# back to a software rasterizer the same way the Linux/Windows hosted
+# runners always do (confirmed via `GpuContext::adapter_info()`, not
+# assumed — see CLAUDE.md's "The lesson from the last round"). Separate
+# from verify.yml/ci.yml on purpose: `AURORA_REQUIRE_GPU` should not
+# join the regular push/PR matrix until this has actually been run and
+# read — setting it on a runner that does *not* have a real adapter
+# fails the whole matrix for a reason the workflow file never states
+# (see `aurora_gpu::test_support`'s own doc comment).
+#
+# Read the "GPU adapter: <name> (<backend>, <device_type>)" line each
+# GPU-gated test prints (`--nocapture` below, so it shows even on a
+# pass) — that is `aurora_gpu::test_support::real_context_or_skip`'s own
+# log, and it names the actual backend/device type this runner gave it.
+# `DeviceType::Cpu` there means the same llvmpipe/WARP gap this project
+# already has on Linux/Windows, just under Metal's name instead.
+#
+# Not meant to be a permanent fixture: once the answer is known, either
+# delete this file (no real adapter — nothing to wire up) or fold
+# `AURORA_REQUIRE_GPU` into verify.yml's own macOS `test` matrix leg (a
+# real adapter is confirmed) and delete this file either way.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  AURORA_REQUIRE_GPU: "1"
+
+jobs:
+  probe:
+    name: Require a real GPU adapter on macos-latest
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `--all-features` so `aurora-gpu`'s `test-support` feature (and
+      # therefore its GPU-gated tests, plus `aurora-render`'s,
+      # `aurora-widgets`'s, and `aurora-app`'s own) actually builds — the
+      # same reasoning `verify.yml`'s `clippy`/`docs` jobs already give
+      # for using it. `--nocapture` so a *passing* test's own
+      # "GPU adapter: ..." line reaches this log too, not only a
+      # failing one's.
+      - name: Test (real GPU adapter required)
+        run: cargo test --workspace --all-features -- --nocapture
