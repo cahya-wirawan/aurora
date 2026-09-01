@@ -32,9 +32,12 @@ const TILE_BYTES: usize = SAMPLES * 2;
 /// uploads `mip_level: 0` only, and [`TileResidency::upload_mip`] (which
 /// can write the rest) has no call site in `aurora-app`. wgpu lazily
 /// zero-initializes what was never written, so a sample that landed on
-/// one of those levels read `(0, 0, 0, 0)`, `fs_canvas`'s straight-alpha
+/// one of those levels read `(0, 0, 0, 0)`, `fs_canvas`'s premultiplied
 /// "over" collapsed to pure background, and the canvas rendered as pure
-/// checkerboard.
+/// checkerboard. (That sentence said "straight-alpha" until 0.68.0 moved
+/// the alpha-convention boundary to upload time — see
+/// [`premultiply_rgba`]; the conclusion is unchanged either way, since
+/// both formulas collapse to the background at `a = 0`.)
 ///
 /// It *did* land on them. `write_uniform` makes the atlas cover `1/zoom`
 /// texels per screen pixel, so the hardware's computed LOD is
@@ -71,6 +74,51 @@ const TILE_BYTES: usize = SAMPLES * 2;
 /// in the same change that starts filling the chain — not as a side
 /// effect.
 const MIP_LEVELS: u32 = 4;
+
+/// Converts a tile's straight-alpha texels to **premultiplied** alpha in
+/// place: each texel's `r`/`g`/`b` multiplied by its own `a`.
+///
+/// This is the alpha-convention boundary for the atlas, and it is here
+/// — at upload — rather than in the shader, for one reason:
+/// **hardware texture filtering has to happen in the premultiplied
+/// domain to be correct.** A bilinear tap is a weighted average of four
+/// texels computed per channel, independently. Averaging *straight*
+/// colours weights a fully transparent texel's RGB exactly as heavily as
+/// an opaque neighbour's, so a hard opaque/transparent boundary drags
+/// the transparent side's (arbitrary, usually black or stale) colour
+/// into the visible result — the classic dark halo. Premultiplied RGB
+/// carries its own alpha weight, so the same average is the correct
+/// alpha-weighted one.
+///
+/// `aurora-tile`'s store stays **straight** — that is the workspace's
+/// universal convention, and nothing about it changes here. So do the
+/// CPU/GPU composite surfaces. Only the atlas texture, whose whole
+/// purpose is to be *sampled with filtering*, holds premultiplied
+/// texels, and `canvas.wgsl`'s `fs_canvas` is written against exactly
+/// that (see its own comment, which carries the history).
+///
+/// **Trailing partial chunk**: `chunks_exact_mut` yields only whole
+/// [`CHANNELS`]-sized groups, so a slice whose length is not a multiple
+/// of `CHANNELS` leaves its final, incomplete texel untouched rather
+/// than corrupting it. Both call sites validate their sample counts
+/// upstream ([`TileResidency::sync`] uploads whole tiles of exactly
+/// [`SAMPLES`]; [`TileResidency::upload_mip`] rejects a wrong-length
+/// slice before reaching here), so the case is unreachable in practice
+/// — it is defined rather than assumed away. The `[r, g, b, a]` slice
+/// pattern below is what ties this to `CHANNELS == 4`, which
+/// `premultiply_rgba_is_written_against_a_four_channel_texel` pins
+/// against the crate's own constant rather than leaving it implied.
+fn premultiply_rgba(texels: &mut [f16]) {
+    for texel in texels.chunks_exact_mut(CHANNELS) {
+        let [r, g, b, a] = texel else {
+            continue;
+        };
+        let alpha = f32::from(*a);
+        *r = f16::from_f32(f32::from(*r) * alpha);
+        *g = f16::from_f32(f32::from(*g) * alpha);
+        *b = f16::from_f32(f32::from(*b) * alpha);
+    }
+}
 
 /// The result of one [`TileResidency::sync`] call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -735,6 +783,13 @@ impl TileResidency {
     ) -> SyncStats {
         let mut stats = SyncStats::default();
         let mut bytes_left = byte_budget;
+        // Reused across every tile this call uploads: `premultiply_rgba`
+        // needs a mutable copy (the store's own tile must stay straight
+        // alpha), and allocating a fresh half-megabyte buffer per tile
+        // on the upload path -- the one `spike/FINDINGS.md` finding #3
+        // already names as bandwidth-bound -- would be a poor trade for
+        // three lines of tidiness.
+        let mut staging: Vec<f16> = Vec::new();
         for gy in 0..self.grid.1 {
             for gx in 0..self.grid.0 {
                 let id = TileId {
@@ -765,8 +820,14 @@ impl TileResidency {
                         continue;
                     }
                 };
-                let mut bytes = Vec::with_capacity(tile.texels().len() * 2);
-                for sample in tile.texels() {
+                // Premultiplied on the way in -- see `premultiply_rgba`
+                // for why the atlas, and only the atlas, holds that
+                // convention. The store's own tile is untouched.
+                staging.clear();
+                staging.extend_from_slice(tile.texels());
+                premultiply_rgba(&mut staging);
+                let mut bytes = Vec::with_capacity(staging.len() * 2);
+                for sample in &staging {
                     bytes.extend_from_slice(&sample.to_le_bytes());
                 }
                 queue.write_texture(
@@ -857,8 +918,16 @@ impl TileResidency {
         }
 
         let slot = (id.x % self.grid.0, id.y % self.grid.1);
-        let mut bytes = Vec::with_capacity(texels.len() * 2);
-        for sample in texels {
+        // The same premultiply `sync` applies, for the same reason: both
+        // write into the same atlas texture, so both must leave it in
+        // the same alpha convention or `fs_canvas` would be right about
+        // level 0 and wrong about every other level. `texels` itself is
+        // a borrowed slice the caller still owns, so this copies rather
+        // than mutating in place.
+        let mut staging = texels.to_vec();
+        premultiply_rgba(&mut staging);
+        let mut bytes = Vec::with_capacity(staging.len() * 2);
+        for sample in &staging {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         queue.write_texture(
@@ -911,7 +980,7 @@ impl std::fmt::Debug for TileResidency {
 
 #[cfg(test)]
 mod tests {
-    use super::{TILE_BYTES, TileResidency};
+    use super::{TILE_BYTES, TileResidency, premultiply_rgba};
     use crate::test_support::{real_context, real_tile_store};
     use aurora_tile::{SurfaceId, TILE, TileId};
     use half::f16;
@@ -1723,5 +1792,152 @@ mod tests {
             "the restored sub-tile offset must show up in the sampled UV \
              origin the shader reads"
         );
+    }
+
+    /// The `[r, g, b, a]` slice pattern in `premultiply_rgba` is written
+    /// against a four-channel texel. Pinned against the tile crate's own
+    /// constant rather than left implied: if `CHANNELS` ever changed,
+    /// `chunks_exact_mut(CHANNELS)` would yield chunks the pattern does
+    /// not match and the function would silently do **nothing** — an
+    /// upload path that quietly stopped premultiplying is exactly the
+    /// kind of failure a green test run would otherwise hide.
+    #[test]
+    fn premultiply_rgba_is_written_against_a_four_channel_texel() {
+        assert_eq!(
+            aurora_tile::CHANNELS,
+            4,
+            "premultiply_rgba's [r, g, b, a] pattern assumes four channels"
+        );
+    }
+
+    /// The whole arithmetic contract, on one texel at a time — no GPU
+    /// needed, which is the point of extracting the helper at all.
+    #[test]
+    fn premultiply_rgba_scales_rgb_by_alpha() {
+        let mut texels = [
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(0.5),
+        ];
+        premultiply_rgba(&mut texels);
+        let got: Vec<f32> = texels.iter().map(|&s| f32::from(s)).collect();
+        assert_eq!(got, vec![0.5, 0.5, 0.5, 0.5]);
+    }
+
+    /// A fully transparent texel becomes fully zero. This is the case
+    /// the whole item exists for: it is what stops a transparent texel's
+    /// arbitrary RGB from being dragged into a filtered tap next to an
+    /// opaque neighbour.
+    #[test]
+    fn premultiply_rgba_zeroes_a_fully_transparent_texel() {
+        // Deliberately *white* under zero alpha -- a straight-alpha
+        // store can legitimately hold that, and it is the worst case for
+        // bleeding.
+        let mut texels = [
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(0.0),
+        ];
+        premultiply_rgba(&mut texels);
+        let got: Vec<f32> = texels.iter().map(|&s| f32::from(s)).collect();
+        assert_eq!(got, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// A fully opaque texel is left exactly as it was — bit-for-bit, not
+    /// merely approximately, since multiplying by 1.0 must not perturb
+    /// the `f16` representation.
+    #[test]
+    fn premultiply_rgba_leaves_a_fully_opaque_texel_unchanged() {
+        let before = [
+            f16::from_f32(0.25),
+            f16::from_f32(0.75),
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+        ];
+        let mut texels = before;
+        premultiply_rgba(&mut texels);
+        assert_eq!(texels, before);
+    }
+
+    /// Every texel in a multi-texel buffer, not just the first — the
+    /// `chunks_exact_mut` walk has to advance.
+    #[test]
+    fn premultiply_rgba_walks_every_texel_in_the_buffer() {
+        let mut texels = [
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(0.0),
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+        ];
+        premultiply_rgba(&mut texels);
+        let got: Vec<f32> = texels.iter().map(|&s| f32::from(s)).collect();
+        assert_eq!(got, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    /// `chunks_exact_mut` yields only whole texels, so a trailing
+    /// partial one is left alone rather than corrupted. Unreachable
+    /// through either real call site (both validate their lengths
+    /// upstream), but defined rather than assumed away.
+    #[test]
+    fn premultiply_rgba_leaves_a_trailing_partial_texel_untouched() {
+        let mut texels = [
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+            f16::from_f32(0.0),
+            // Half a texel.
+            f16::from_f32(1.0),
+            f16::from_f32(1.0),
+        ];
+        premultiply_rgba(&mut texels);
+        let got: Vec<f32> = texels.iter().map(|&s| f32::from(s)).collect();
+        assert_eq!(got, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// `f16` rounding near alpha ~ 0, pinned rather than left implied.
+    ///
+    /// The worry worth pinning is a *flush to zero*: if a very small but
+    /// non-zero alpha collapsed the colour to exactly zero, a barely
+    /// visible layer would vanish from the canvas entirely rather than
+    /// being faint. It does not — `f16` subnormals reach down to
+    /// ~5.96e-8, so all three values below stay non-zero — and the exact
+    /// products are pinned so a future change to the arithmetic (a
+    /// different intermediate precision, say) is visible rather than
+    /// silent.
+    #[test]
+    fn premultiply_rgba_does_not_flush_a_faint_texel_to_zero() {
+        for (colour, alpha, expected) in [
+            (1.0_f32, 6.002_188e-5_f32, 6.002_188e-5_f32),
+            (0.5, 1.000_166e-4, 5.000_83e-5),
+            // The smallest positive `f16` there is, at full brightness.
+            (1.0, 5.960_464_5e-8, 5.960_464_5e-8),
+            (0.25, 1.000_404_4e-3, 2.501_011e-4),
+        ] {
+            let mut texels = [
+                f16::from_f32(colour),
+                f16::from_f32(colour),
+                f16::from_f32(colour),
+                f16::from_f32(alpha),
+            ];
+            premultiply_rgba(&mut texels);
+            let Some(&red) = texels.first() else {
+                unreachable!("a four-element array always has a first element");
+            };
+            assert!(
+                f32::from(red) > 0.0,
+                "a faint but non-zero texel must not vanish: {colour} * {alpha} became zero"
+            );
+            assert_eq!(
+                red,
+                f16::from_f32(expected),
+                "premultiplied {colour} * {alpha}"
+            );
+        }
     }
 }

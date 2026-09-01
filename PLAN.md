@@ -13948,6 +13948,89 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.68.0) — the atlas is premultiplied at upload,
+so hardware filtering happens in the domain it has to happen in.**
+`TileResidency::sync` and `TileResidency::upload_mip` now run a new
+`premultiply_rgba` over the texels on their way into the atlas texture,
+and `canvas.wgsl`'s `fs_canvas` is back to the premultiplied "over"
+formula `c.rgb + bg * (1.0 - c.a)`.
+
+**Why, in one sentence**: a `textureSample` with `min_filter: Linear`
+averages four texels per channel in fixed-function hardware *before* any
+shader code runs, and in the straight-alpha domain that average weights a
+fully transparent texel's RGB exactly as heavily as an opaque
+neighbour's — so at a hard alpha edge under minification, whatever
+colour sits behind `alpha = 0` bleeds into the visible result and no
+shader formula can undo it, because the information is already gone.
+
+**What did *not* change**: `aurora-tile`'s store is still straight alpha
+(unchanged, its tests unmodified and passing), and so are the CPU and GPU
+composite surfaces — 0.52.0's un-premultiply fix stands untouched. Only
+the atlas texture, whose entire purpose is to be sampled with filtering,
+holds premultiplied texels. The 20-line comment in `fs_canvas` was
+rewritten rather than deleted: it now explains where the boundary is,
+why it cannot be in the shader, **and** keeps the 0.52.0 history, so a
+future reader who is tempted to "fix" the line back is told to check
+whether `premultiply_rgba` still runs first.
+
+**Twelve new tests.** Seven pure-CPU ones on the helper (`aurora-gpu`
+59, up from 51): `(1,1,1,0.5) -> (0.5,0.5,0.5,0.5)`, alpha 0 zeroes a
+*white* texel, alpha 1 is bit-for-bit unchanged, the walk advances
+across a multi-texel buffer, a trailing partial chunk is defined rather
+than corrupted, `f16` rounding near alpha ~ 0 is pinned at four points
+(including the smallest positive `f16`) so a faint texel provably does
+not flush to zero, and the `[r, g, b, a]` pattern is pinned against
+`aurora_tile::CHANNELS` rather than assuming 4. Plus the GPU test below.
+`canvas_pipeline_blends_a_translucent_tile_against_the_checkerboard`
+passed **unchanged**, as expected: for a spatially uniform texel,
+premultiply-then-premultiplied-over is mathematically identical to
+straight-over, so it can only fail if exactly one of the two halves
+moved.
+
+**The negative control, and it is measured rather than asserted by
+inspection.** `canvas_pipeline_does_not_bleed_transparent_black_across_a_hard_alpha_edge`
+carries two controls, one per half of the fix. (a) A self-calibrating
+A/B pair: the same document rendered twice, differing only in the RGB
+stored *behind* the transparent side of a hard edge at minification —
+transparent black versus transparent white. Those are visually identical
+documents, so the frames must match; with `premultiply_rgba` made a
+no-op they diverge by **209/255** at the edge pixel (46 versus 255),
+which is the halo itself. (b) A uniform 50%-alpha white document at the
+same minified zoom, where alpha is 0.5 by construction rather than by
+wherever the sampler's ramp landed, pinned to the premultiplied-domain
+`0.5 + bg * 0.5` (150–158 of 255); with `fs_canvas` reverted to the
+straight-domain formula it reads **94**. In that same reverted run the
+hard edge's single blended pixel moves from **186 to 129**. Each control
+was run against its own mutation and observed failing, then restored.
+
+**Honest statement of what verified this — and a correction.** This
+round's brief assumed the machine had only Mesa llvmpipe. It does not:
+`real_context()` selected and printed `NVIDIA GeForce RTX 3090 (Vulkan,
+DiscreteGpu)`, and `AURORA_REQUIRE_GPU=1` — which hard-fails on a
+`DeviceType::Cpu` adapter — **passes** here. So these are real-GPU pixel
+readbacks, not software-rasterizer ones, and some older llvmpipe
+disclosures elsewhere in `aurora-gpu` describe a different machine or
+session rather than this one. What that establishes is bounded: one GPU,
+one vendor, one backend (NVIDIA, Vulkan) — Metal and DX12 are
+unverified, and one adapter's filtering is indicative, not settled. It
+establishes nothing interactive: there is no display server here, so
+nothing went through a window, a swapchain, or a human's eyes. And most
+importantly, **the original halo was never reproduced as a user-visible
+artifact** — not in software, not on this GPU, not by anyone. The fix
+rests on the arithmetic of texture filtering and is confirmed by pixel
+readback. "The halo is fixed" is a stronger claim than anything here
+supports and is not being made.
+
+**One cross-consumer check, disclosed.** The residency atlas is sampled
+by `fs_canvas` in production and nothing else — `aurora-app`'s GPU
+compositing builds its own per-layer source textures rather than reading
+the atlas. The one other reader is `aurora-render`'s `latency.rs`, which
+hands `residency.view()` to `TileCompositor::composite_over` (a
+straight-alpha `AlphaBlending` pass) purely to time submission; it
+asserts no pixel values, so the convention change does not affect what
+it measures. If a future caller composites *from* the atlas and cares
+about the result, it will need the same treatment.
+
 **Addendum 2026-09-01 (0.67.0) — orphaned `aurora-scratch-*`
 directories are collected at startup, on Unix, by a liveness lock rather
 than a guess.** 0.63.0 closed the clean-exit half of M1.9's scratch-leak

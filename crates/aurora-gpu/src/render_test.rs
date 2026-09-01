@@ -1151,6 +1151,235 @@ fn canvas_pipeline_min_filter_linear_still_applies_when_minified() {
     );
 }
 
+/// **The negative control for the alpha convention the atlas is in.**
+///
+/// A `textureSample` with `min_filter: Linear` averages four texels per
+/// channel, in fixed-function hardware, *before* `fs_canvas` runs. In
+/// the **straight**-alpha domain that average weights a fully
+/// transparent texel's RGB exactly as heavily as an opaque neighbour's,
+/// so whatever colour happens to be sitting behind `alpha = 0` bleeds
+/// into the visible result at a hard alpha edge — a dark halo if it is
+/// transparent black, a bright one if it is transparent white. No
+/// formula in the shader can undo that; the information is gone by the
+/// time the shader sees the tap. Premultiplying at *upload*
+/// (`TileResidency::sync`/`upload_mip`) is what makes the same hardware
+/// average the correct alpha-weighted one.
+///
+/// **The fixture is self-calibrating**, which is why it is written as a
+/// pair rather than as one absolute expected value. Two documents,
+/// identical except for the RGB stored *behind* the transparent side:
+///
+/// - A: opaque white `(1, 1, 1, 1)` next to transparent **black**
+///   `(0, 0, 0, 0)`.
+/// - B: opaque white `(1, 1, 1, 1)` next to transparent **white**
+///   `(1, 1, 1, 0)`.
+///
+/// Both are legal straight-alpha content and both are *visually
+/// identical documents* — alpha 0 means "not there", so what colour is
+/// stored underneath must not be observable. Premultiplying maps both
+/// transparent texels to `(0, 0, 0, 0)`, so the two frames come out the
+/// same. In the straight domain they do not: at the midpoint of the edge
+/// (`a = 0.5`) A renders `0.5 * 0.5 + bg * 0.5` and B renders
+/// `1.0 * 0.5 + bg * 0.5` — a gap of 0.25, about **64 of 255 units**,
+/// far above any rounding noise.
+///
+/// Asserting frame-equality rather than one expected number means the
+/// test needs to know neither the exact per-pixel alpha along the ramp
+/// nor which checkerboard square each sample lands on. The second
+/// assertion (at least one genuinely blended pixel) is what stops a
+/// degenerate frame — two identical *blank* renders — from satisfying
+/// the first one vacuously.
+///
+/// **The second half of the test covers the second half of the fix.**
+/// The A/B check above is a control for the *upload* step: it fails if
+/// `premultiply_rgba` stops running, and it passes either way for the
+/// shader line, since a premultiplied atlas makes both fixtures
+/// identical before `fs_canvas` ever sees them. So the test also renders
+/// a **uniform 50%-alpha white** document at the same minified zoom,
+/// where alpha is `0.5` by construction rather than by wherever the
+/// sampler's ramp happened to land, and pins the premultiplied-domain
+/// value: `0.5 + bg * 0.5` (150 or 158 of 255, for the checkerboard's
+/// two squares) against the straight-domain `0.25 + bg * 0.5` (87 or
+/// 94). Between those bands there is nothing but ~56 units of daylight.
+///
+/// **Both controls were measured, not argued** — by offscreen pixel
+/// readback on a real discrete GPU: `NVIDIA GeForce RTX 3090 (Vulkan,
+/// DiscreteGpu)`, the adapter `real_context()` selected and printed.
+/// `AURORA_REQUIRE_GPU=1`, which hard-fails on a `DeviceType::Cpu`
+/// adapter, passes on this machine — so these numbers are **not** from a
+/// software rasterizer, unlike some older measurements recorded
+/// elsewhere in this crate:
+///
+/// - With `fs_canvas` temporarily reverted to the straight-domain
+///   `c.rgb * c.a + bg * (1.0 - c.a)` and `premultiply_rgba` left in
+///   place, the uniform-alpha assertion fails, reading **94** where it
+///   requires ~150–158. The single blended pixel on the hard edge above
+///   moves from **186** to **129** in the same run — the 57-unit gap
+///   this test's own scan records.
+/// - With `fs_canvas` correct and `premultiply_rgba` made a no-op, the
+///   A/B assertion fails at sample 24: the transparent-**black** frame
+///   reads **46** (pure checkerboard) where the transparent-**white**
+///   frame reads **255** (fully blown out) — a **209/255** gap, which is
+///   the halo itself, in both directions at once.
+///
+/// **What that does and does not establish.** It is real-hardware
+/// *pixel* verification — one GPU, one vendor, one backend (NVIDIA,
+/// Vulkan); Metal and DX12 are unverified, and one adapter's filtering
+/// is indicative rather than settled. It is **not** interactive
+/// verification: this machine has no display server, so nothing here
+/// went through a window, a swapchain, or a human's eyes, which is
+/// exactly the gap CLAUDE.md's "lesson from the last round" is about.
+/// And note what was never observed at all: **the original halo was
+/// never reproduced as a user-visible artifact** — not in software, not
+/// on this GPU, not by anyone. The fix is justified by the arithmetic of
+/// texture filtering and confirmed by readback. "The halo is fixed" is a
+/// stronger claim than anything here supports, and should not be made.
+#[test]
+// One test, two controls, deliberately: the A/B pair and the
+// known-alpha check cover the two halves of one fix (upload, then
+// shader) and are only meaningful read together -- splitting them would
+// relocate lines without reducing what a reader has to hold in mind.
+#[allow(clippy::too_many_lines)]
+fn canvas_pipeline_does_not_bleed_transparent_black_across_a_hard_alpha_edge() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+
+    // The same scan the `min_filter` test uses, for the same reason: the
+    // atlas's own edge (document texel x = 256) lands at screen
+    // x = 256 * 0.6 ~= 153.6, and betting on one exact pixel would make
+    // this test about arithmetic nobody cares about.
+    let samples: Vec<(u32, u32)> = (130..180).map(|x| (x, 64)).collect();
+
+    // `behind` is the RGB stored *underneath* the transparent side. It
+    // must not be observable.
+    let render = |behind: f32| -> Vec<[u8; 4]> {
+        let (_dir, mut store) = tile_store();
+        let surface = SurfaceId::from_raw(0);
+        for y in 0..3 {
+            paint(
+                &mut store,
+                surface,
+                TileId { x: 0, y },
+                [1.0, 1.0, 1.0, 1.0],
+            );
+            for x in 1..3 {
+                paint(
+                    &mut store,
+                    surface,
+                    TileId { x, y },
+                    [behind, behind, behind, 0.0],
+                );
+            }
+        }
+
+        let mut residency = TileResidency::new(device, queue, MINIFYING_VIEWPORT);
+        let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+        assert_eq!(stats.uploaded, 9);
+        assert_eq!(stats.errors, 0);
+        residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, 0.6);
+
+        let mut canvas = CanvasPipeline::new(device);
+        render_and_sample_pixels(
+            device,
+            queue,
+            &mut canvas,
+            &residency,
+            MINIFYING_VIEWPORT,
+            &samples,
+        )
+    };
+
+    let behind_black = render(0.0);
+    let behind_white = render(1.0);
+
+    let reds = |pixels: &[[u8; 4]]| -> Vec<u8> {
+        pixels
+            .iter()
+            .map(|p| match p.first() {
+                Some(&red) => red,
+                None => unreachable!("a sampled pixel always has four channels"),
+            })
+            .collect()
+    };
+    let black_reds = reds(&behind_black);
+    let white_reds = reds(&behind_white);
+
+    // The edge really is being filtered, or the equality below would be
+    // satisfied by two identical unblended frames and prove nothing.
+    assert!(
+        black_reds.iter().any(|&r| (10..=245).contains(&r)),
+        "the scan must actually cross a filtered alpha edge; got only \
+         plateau values {black_reds:?}"
+    );
+
+    let mut worst = 0_i32;
+    let mut worst_at = 0_usize;
+    for (i, (&b, &w)) in black_reds.iter().zip(white_reds.iter()).enumerate() {
+        let delta = (i32::from(b) - i32::from(w)).abs();
+        if delta > worst {
+            worst = delta;
+            worst_at = i;
+        }
+    }
+    assert!(
+        worst <= 2,
+        "the RGB stored behind a fully transparent texel leaked into the \
+         visible result: at sample {worst_at} the frame with transparent \
+         *black* behind the edge read {:?} while the frame with \
+         transparent *white* behind it read {:?} -- a gap of {worst}/255. \
+         Those two documents are visually identical (alpha 0 means \
+         \"not there\"), so any gap at all means the atlas is being \
+         filtered in the straight-alpha domain. Measured at 209/255 with \
+         `premultiply_rgba` made a no-op (the halo itself), and 0 with \
+         the premultiply-at-upload step this test guards.\n\
+         behind-black: {black_reds:?}\nbehind-white: {white_reds:?}",
+        black_reds.get(worst_at),
+        white_reds.get(worst_at),
+    );
+
+    // -- The shader half: alpha known by construction, not by ramp --
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+    for y in 0..3 {
+        for x in 0..3 {
+            paint(&mut store, surface, TileId { x, y }, [1.0, 1.0, 1.0, 0.5]);
+        }
+    }
+    let mut residency = TileResidency::new(device, queue, MINIFYING_VIEWPORT);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.errors, 0);
+    residency.set_origin(queue, (0.0, 0.0), MINIFYING_VIEWPORT, 0.6);
+    let mut canvas = CanvasPipeline::new(device);
+    let pixel = render_and_sample_pixel(
+        device,
+        queue,
+        &mut canvas,
+        &residency,
+        MINIFYING_VIEWPORT,
+        (MINIFYING_VIEWPORT.0 / 2, MINIFYING_VIEWPORT.1 / 2),
+    );
+    let Some(&red) = pixel.first() else {
+        unreachable!("a sampled pixel always has four channels");
+    };
+    // Uniform content, so filtering cannot change the sampled value and
+    // alpha really is 0.5 wherever this lands. The band spans both
+    // checkerboard squares (`0.5 + 0.18 * 0.5 = 0.59` -> 150 and
+    // `0.5 + 0.24 * 0.5 = 0.62` -> 158) with a few units of slack, and
+    // excludes the straight-domain pair (87 and 94) by ~56 units.
+    assert!(
+        (145..=165).contains(&red),
+        "a uniform 50%-alpha white document rendered {red}, not the \
+         premultiplied-domain 150..158 (`0.5 + bg * 0.5`). Measured at \
+         94 with `fs_canvas` reverted to the straight-domain \
+         `c.rgb * c.a + bg * (1.0 - c.a)` while the atlas is \
+         premultiplied -- i.e. alpha counted twice, translucent content \
+         rendering far too dark."
+    );
+}
+
 /// A degenerate `zoom` must not corrupt the canvas.
 ///
 /// `write_uniform` divides by `zoom`. `set_origin`'s doc comment used to
