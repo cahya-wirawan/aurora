@@ -1964,6 +1964,32 @@ fn incomplete_composite_message(skipped: usize, first: &str) -> String {
     )
 }
 
+const MOVE_REFUSED_DISMISS: &str = "move.refused.dismiss";
+
+/// The move-refused dialog's own action — a single "OK", for the same
+/// reason [`export_refused_dialog_actions`] has one: nothing is being
+/// chosen. The drag is still live and still the user's to finish or
+/// abandon; this only tells them why it stopped moving.
+fn move_refused_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(MOVE_REFUSED_DISMISS, "OK")]
+}
+
+/// The message for a `Drag::Move` that `aurora_doc::LayerTree::set_bounds`
+/// refused with `DocError::LayerOriginOutOfRange`.
+///
+/// **It must not claim anything was undone**, because nothing was: the
+/// rejected origin was never written to the document, so there is no
+/// state to restore. What actually happens is that the layer stops
+/// following the pointer while the drag itself keeps running normally,
+/// and that is what this says — the user is looking at a layer that has
+/// visibly stopped tracking their cursor and needs to know that is the
+/// document's limit, not a hang.
+fn move_refused_message() -> &'static str {
+    "This layer can't move any further in that direction: its origin would leave the document's \
+     own coordinate range. The layer has been left where it was, and the drag itself is \
+     unaffected — keep dragging back the other way, or release to finish."
+}
+
 /// Closes the open dialog (a no-op if none is open): removes it from
 /// `workspace.tree` and clears any focus left dangling on it — the same
 /// [`FocusManager::validate`] pattern [`close_command_palette`] already
@@ -3421,6 +3447,17 @@ enum Drag {
         start_doc: (f32, f32),
         start_bounds: aurora_core::Rect,
         current_bounds: aurora_core::Rect,
+        /// Whether this drag has already told the user it hit the
+        /// document's own coordinate range.
+        ///
+        /// Same reasoning as `Drag::Brush`'s own `warned` set above, and
+        /// the same reason it lives here rather than on `App`: a drag
+        /// held past the range refuses on *every* pointer-move event for
+        /// the rest of the gesture, so without this the user would be
+        /// re-told once per event. Its lifetime is exactly the drag's by
+        /// construction — a new `Drag::Move` cannot inherit a stale
+        /// `true`, and no caller has to remember to clear it.
+        refused: bool,
     },
     Eyedropper,
 }
@@ -3492,6 +3529,28 @@ fn unwarned_failures<'a>(
         .filter(|(tile, _)| warned.insert(*tile))
         .map(|(tile, err)| (*tile, err))
         .collect()
+}
+
+/// Whether this drag's boundary refusal still needs reporting to the
+/// user, marking it reported as it goes — so a `Drag::Move` held past
+/// the document's own coordinate range opens one dialog for the whole
+/// gesture rather than one per pointer-move event.
+///
+/// [`unwarned_failures`]'s exact shape, for exactly the same reason and
+/// with the same stance on being wrong: a drag that is somehow *not* a
+/// `Drag::Move` returns `true` (report it), because under-reporting a
+/// refusal the user cannot otherwise see is the wrong way to be wrong
+/// about it. Unreachable in practice — only [`App::apply_move`] calls
+/// this, and it only runs while a `Drag::Move` is live.
+fn move_refusal_unreported(drag: &mut Option<Drag>) -> bool {
+    let Some(Drag::Move { refused, .. }) = drag else {
+        return true;
+    };
+    if *refused {
+        return false;
+    }
+    *refused = true;
+    true
 }
 
 /// Records a completed `Drag::Move` as a single undo step, from
@@ -3708,6 +3767,7 @@ fn begin_drag(
                 start_doc: view.to_document(canvas_point),
                 start_bounds: bounds,
                 current_bounds: bounds,
+                refused: false,
             })
         }
         (aurora_ui::Tool::Eyedropper, PointerButton::Primary) => Some(Drag::Eyedropper),
@@ -9123,11 +9183,67 @@ impl App {
     /// `self.composite_cache` unconditionally — a moved layer's own
     /// content lands at different composite tiles now, whether or not
     /// `set_bounds` itself succeeded.
+    ///
+    /// **One failure is also shown, not only logged**:
+    /// `aurora_doc::DocError::LayerOriginOutOfRange`, the one a user can
+    /// actually cause by dragging a layer far enough that its origin
+    /// would leave the document's own coordinate range. Without this the
+    /// drag simply stops advancing with no explanation — correct
+    /// behaviour, indistinguishable from a hang. The dialog opens **once
+    /// per drag** ([`move_refusal_unreported`], whose flag lives on the
+    /// `Drag::Move` itself so its lifetime is exactly the gesture's), not
+    /// once per pointer-move event, and the drag's own behaviour is
+    /// completely unchanged: position stops advancing, exactly as before.
+    ///
+    /// Every other `DocError` from `set_bounds` stays log-only,
+    /// deliberately — an unknown or non-pixel `layer_id` is a bug in this
+    /// crate rather than something the user did, and a modal alert is the
+    /// wrong response to it.
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
         if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
             tracing::warn!(?err, "failed to reposition the active layer");
+            // Taken *before* `self.workspace`/`self.focus`/`self.dialog`
+            // are borrowed: `move_refusal_unreported` needs `&mut
+            // self.drag`, and folding it into the `if` condition below
+            // would hold that borrow across the call that takes the
+            // others.
+            if matches!(err, aurora_doc::DocError::LayerOriginOutOfRange { .. }) {
+                let report = move_refusal_unreported(&mut self.drag);
+                if report {
+                    self.open_move_refused_dialog();
+                }
+            }
         }
         self.composite_cache.bump();
+    }
+
+    /// Opens the move-refused dialog, on exactly the terms
+    /// [`Self::open_export_refused_dialog`] documents — same shared
+    /// [`open_dialog`], same `apply_resize` + `push_accessibility`
+    /// pairing owned here rather than at the call site, same silent
+    /// logged no-op if the design scales can't be loaded.
+    fn open_move_refused_dialog(&mut self) {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a dialog");
+                return;
+            }
+        };
+        open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            "Can't Move This Layer Further",
+            move_refused_message(),
+            move_refused_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
     }
 
     /// Commits `drag`, whatever it turns out to be, into this
@@ -10105,31 +10221,32 @@ mod tests {
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS,
-        EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PanBounds,
-        PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, ShutdownState, UndoKind, UndoOrder,
-        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
-        apply_mask_clip, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
-        background_color_from_theme, begin_drag, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
-        create_dir_owner_only, create_tile_store_scratch_dir, default_shortcuts, demo_document,
-        dissolve_gate, document_canvas_size, document_from_image,
+        EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord, MOVE_REFUSED_DISMISS, Modifiers,
+        NamedKey, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, ShutdownState,
+        UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask_clip, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, brush_stroke_mut,
+        canvas_area_logical_size, canvas_area_physical_rect, canvas_area_physical_size,
+        canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer, clean_shutdown_cleanup,
+        clear_session_marker, close_command_palette, close_dialog, collect_widget_paints,
+        commit_ending_drag, composite_document, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, create_dir_owner_only, create_tile_store_scratch_dir,
+        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
         document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
         export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
         hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
         layer_local_point, load_document_view, load_scales, load_theme, logical_point,
-        logical_size, open_command_palette, open_crash_recovery_dialog, open_dialog, open_image,
-        open_tile_store, palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo,
-        pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
-        run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds, splitmix64,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        logical_size, move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
+        open_command_palette, open_crash_recovery_dialog, open_dialog, open_image, open_tile_store,
+        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
+        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
+        select_layer, shift_bounds, splitmix64, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -10854,6 +10971,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: layer_bounds(),
                 current_bounds: moved_layer_bounds(),
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -10925,6 +11043,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: moved_layer_bounds(),
                 current_bounds: layer_bounds(),
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -11044,6 +11163,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: moved_layer_bounds(),
                 current_bounds: layer_bounds(),
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -11216,6 +11336,7 @@ mod tests {
             start_doc: (0.0, 0.0),
             start_bounds: layer_bounds(),
             current_bounds: dragged_to,
+            refused: false,
         });
 
         press_layer_row(
@@ -21024,6 +21145,127 @@ mod tests {
         assert_eq!(dialog, None);
     }
 
+    /// A `Drag::Move` positioned wherever — the fields
+    /// [`move_refusal_unreported`] does not look at are irrelevant to it
+    /// by construction, so they get placeholder values here.
+    fn move_drag() -> Drag {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: (0.0, 0.0),
+            start_bounds: bounds,
+            current_bounds: bounds,
+            refused: false,
+        }
+    }
+
+    #[test]
+    fn move_refusal_is_reported_once_per_drag_and_again_for_a_fresh_one() {
+        // The shape of a drag held past the document's own coordinate
+        // range: `set_bounds` refuses on every pointer-move event for the
+        // rest of the gesture, and the user must be told exactly once.
+        let mut drag = Some(move_drag());
+        assert!(
+            move_refusal_unreported(&mut drag),
+            "the first refusal in a drag must be reported"
+        );
+        for _ in 0..10 {
+            assert!(
+                !move_refusal_unreported(&mut drag),
+                "a drag still out of range must not re-report on every event"
+            );
+        }
+
+        // A *new* drag starts from a clean slate -- the flag lives on the
+        // drag, so it cannot outlive the gesture it belongs to.
+        let mut next = Some(move_drag());
+        assert!(
+            move_refusal_unreported(&mut next),
+            "a new drag must report again rather than inheriting a stale flag"
+        );
+    }
+
+    #[test]
+    fn move_refusal_is_reported_when_the_live_drag_is_not_a_move() {
+        // Unreachable in practice (only `App::apply_move` calls this, and
+        // only while a `Drag::Move` is live), but under-reporting a
+        // refusal the user cannot otherwise see is the wrong way to be
+        // wrong about it -- the same stance `unwarned_failures` takes.
+        let mut none = None;
+        assert!(move_refusal_unreported(&mut none));
+        let mut pan = Some(Drag::Pan {
+            last_screen: (0.0, 0.0),
+        });
+        assert!(move_refusal_unreported(&mut pan));
+        let mut eyedropper = Some(Drag::Eyedropper);
+        assert!(move_refusal_unreported(&mut eyedropper));
+    }
+
+    #[test]
+    fn move_refused_message_names_the_layer_and_its_coordinate_range() {
+        let message = move_refused_message();
+        assert!(!message.is_empty());
+        assert!(message.contains("layer"), "{message}");
+        assert!(message.contains("coordinate range"), "{message}");
+        // The move was never applied, so nothing was undone -- claiming
+        // otherwise would describe a state change that did not happen.
+        assert!(
+            !message.contains("undone") && !message.contains("undo"),
+            "the refusal must not claim the move was reverted: {message}"
+        );
+    }
+
+    #[test]
+    fn the_move_refused_dialog_opens_and_closes_through_the_same_shared_routing() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Can't Move This Layer Further",
+            move_refused_message(),
+            move_refused_dialog_actions(),
+        );
+
+        let Some(handle) = dialog.clone() else {
+            unreachable!("must open");
+        };
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .map(accesskit::Node::role),
+            Some(accesskit::Role::AlertDialog)
+        );
+        assert_eq!(focus.focused(), handle.first_action());
+        let Some((id, _)) = handle.actions.first() else {
+            unreachable!("the move-refused dialog always has one action");
+        };
+        assert_eq!(id, MOVE_REFUSED_DISMISS);
+
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
+        );
+        assert_eq!(dialog, None);
+        assert!(!workspace.tree.contains(handle.root));
+        assert_eq!(focus.focused(), None);
+    }
+
     #[test]
     fn close_dialog_on_an_already_closed_dialog_is_a_no_op() {
         let mut workspace = aurora_ui::build_workspace();
@@ -22516,6 +22758,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: bounds,
                 current_bounds: moved,
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -22538,6 +22781,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: moved,
                 current_bounds: moved,
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -22601,10 +22845,12 @@ mod tests {
                 start_doc,
                 start_bounds,
                 current_bounds,
+                refused,
             }) => {
                 assert_eq!(layer_id, id);
                 assert_eq!(start_doc, (5.0, 5.0));
                 assert_eq!(start_bounds, bounds);
+                assert!(!refused, "a fresh drag has told the user nothing yet");
                 assert_eq!(current_bounds, bounds);
             }
             other => unreachable!("{other:?}"),
@@ -22811,6 +23057,7 @@ mod tests {
             start_doc: (0.0, 0.0),
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
         let dabs = continue_drag(
             &mut drag,
@@ -23572,6 +23819,7 @@ mod tests {
             start_doc: view.to_document(pointer),
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
 
         let moved = bounds_at((300.0, 150.0), None);
@@ -23702,6 +23950,7 @@ mod tests {
             start_doc: view.to_document(pointer),
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
 
         // (a) A zoom that hits the bound.
@@ -23867,6 +24116,7 @@ mod tests {
             start_doc: view.to_document(pointer),
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
         let mut selection = SelectionSet::new();
 
@@ -24038,6 +24288,7 @@ mod tests {
             start_doc,
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
         for point in path {
             let _ = continue_drag(

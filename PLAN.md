@@ -9036,19 +9036,19 @@ structural design work.
     exercised a large `width` with an in-range origin, which is the one
     shape where saturating and plain `+` could have parted company on a
     rectangle the validated API can still produce.
-- [ ] **The Move tool can now silently stop moving a layer once a drag
+- [x] **The Move tool can now silently stop moving a layer once a drag
     would push its origin past ±300,000 px.** Disclosed 2026-08-29
     alongside the 0.57.13 revision of the origin fix above;
-    informational, low, and deliberately **not** fixed — closing it
+    informational, low, and deliberately **not** fixed then — closing it
     means touching `aurora-app` UI code, which that round was scoped out
-    of. `set_bounds` now returns `DocError::LayerOriginOutOfRange`, and
-    the Move drag handler logs a `tracing::warn!` and drops the move
-    with no user-visible feedback: the layer simply stops following the
-    pointer. Correct refusal, poor affordance. Reaching it needs a drag
-    a whole document extent off the canvas, so it is a rough edge rather
-    than an obstacle. Fix when someone is next in the Move tool: surface
-    the refusal the way other rejected edits are surfaced, rather than
-    only in the log.
+    of. `set_bounds` returns `DocError::LayerOriginOutOfRange`, and the
+    Move drag handler logged a `tracing::warn!` and dropped the move
+    with no user-visible feedback: the layer simply stopped following the
+    pointer. Correct refusal, poor affordance. **Fixed 2026-09-01
+    (0.66.0)**, on the shared dialog 0.65.0 generalized out of the
+    crash-recovery path — see the 0.66.0 addendum under "Next action"
+    for what landed, including which part of it is covered only by
+    inspection.
 - [ ] **`aur::write_best_effort` hard-fails on a tree carrying an
     out-of-range origin instead of skipping just that layer.**
     Disclosed 2026-08-29 alongside the 0.57.13 revision above;
@@ -13933,6 +13933,55 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-01 (0.66.0) — a Move drag that hits the document's
+own coordinate range now says so, once per drag.** M1.9's own open item
+(above) had been waiting on a surface to report into; 0.65.0 built one,
+so this is the second caller of the same `open_dialog`. `App::apply_move`
+keeps its `tracing::warn!` **unchanged** and additionally matches
+`aurora_doc::DocError::LayerOriginOutOfRange` **specifically** — not a
+catch-all `Err(_)`; an unknown or non-pixel `layer_id` is a bug in this
+crate rather than something the user did, and a modal alert is the wrong
+response to it — to open a dialog with a new `move_refused_message()`.
+
+**The drag's own behaviour is completely unchanged**: the position
+simply stops advancing, exactly as before. The message says so, and
+deliberately does **not** claim the move was undone — nothing was
+undone, because the rejected origin was never written to the document in
+the first place. A test asserts that absence, since "we reverted your
+edit" is the specific wrong thing an alert like this tends to say.
+
+**Reported once per drag, not once per pointer-move event.** A drag held
+past the range refuses on *every* subsequent event, so a new
+`refused: bool` on `Drag::Move` and a free
+`move_refusal_unreported(&mut Option<Drag>) -> bool` (modeled directly
+on `unwarned_failures`, including its "a drag that is somehow not a
+`Move` returns `true`" stance — under-reporting a refusal the user
+cannot otherwise see is the wrong way to be wrong) gate the open. The
+flag lives on the drag, not on `App`, for the reason `unwarned_failures`
+already documents: its lifetime is then exactly the gesture's by
+construction, so a new drag cannot inherit a stale `true` and no caller
+has to remember to clear it. `open_dialog`'s own already-open guard is a
+second, independent line of defence, but on its own it would let a user
+who dismissed the dialog with Escape mid-drag see it reopen on the next
+event — which is why the field was worth the twelve-call-site churn
+rather than relying on the guard alone.
+
+**Four new tests** (305 in `aurora-app`, up from 301), all headless:
+`move_refusal_is_reported_once_per_drag_and_again_for_a_fresh_one` (ten
+subsequent events must all stay silent, and a *fresh* drag must report
+again — the stale-flag case),
+`move_refusal_is_reported_when_the_live_drag_is_not_a_move`,
+`move_refused_message_names_the_layer_and_its_coordinate_range`, and
+`the_move_refused_dialog_opens_and_closes_through_the_same_shared_routing`.
+`begin_drag`'s own existing `Drag::Move` assertion was extended to pin
+that a fresh drag starts with `refused: false`.
+
+**Still inspection-only, on the same terms as 0.65.0**: the two lines
+inside `App::apply_move` that call `move_refusal_unreported` and then
+`open_move_refused_dialog` are not covered by a test, because reaching
+them needs a real `App` (window, GPU adapter, live tile store) this
+crate cannot construct. Both halves they are built from are tested.
 
 **Addendum 2026-09-01 (0.65.0) — an export refused for unreadable tiles
 now says so on screen, not only in the log.** M1.9's own open item (see
