@@ -13948,6 +13948,34 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.68.8) — the Judge's independent pass found two
+things the Reviser's own ledger had missed, both fixed here.** (1) The
+0.68.6 liveness-lock re-take (`ensure_session_scratch_lock`) only ran on
+`aur_verify_scratch_dir`'s recreate path; `open_tile_store`'s call to
+`aurora_tile::TileStore::new` self-heals the same scratch directory the
+same way (`create_private_dir`'s own recreate-if-missing behaviour) and
+is called on every fresh open, not only at startup — so a store reopened
+after its directory was swept away ran the rest of that session
+permanently invisible to future startup sweeps, the identical leak
+0.68.6 closed one call site short of completely. Fixed by calling
+`ensure_session_scratch_lock` there too; new test
+`open_tile_store_survives_the_session_scratch_directory_being_swept_away`
+mirrors 0.68.6's own regression test. (2) 0.68.3's addendum (below)
+stated `TileResidency::sync` "has no production caller at all" to argue
+against re-measuring its cost — checked against the code by the Judge and
+found false: `App::redraw` calls it every frame
+(`residency.sync(gpu.queue(), store, composite_surface_id(), false,
+usize::MAX)`), which *is* the hot loop the 5.9× figure describes. The
+claim was inherited from a doc comment about a narrower, unrelated
+question (who picks which `SurfaceId`) without checking an actual call
+site — corrected in place below, in the same spirit as 0.68.5's own
+self-correction of an earlier overclaim. The fold itself is still a
+strict improvement either way (fewer allocations, no behaviour change),
+so nothing here was a regression risk, but the reasoning given for
+skipping measurement was wrong and CLAUDE.md's "measured, not assumed"
+rule means that belongs on the record. No new performance number is
+claimed by either fix.
+
 **Addendum 2026-09-01 (0.68.7) — a budget-skipped tile no longer has its
 dirty flag eaten by the call that skipped it.** `TileResidency::sync`
 called `store.take_dirty(...)` three lines above the per-frame byte-budget
@@ -14087,18 +14115,24 @@ it writes the little-endian bytes, so `sync` now keeps **one** reusable
 `Vec<u8>` for the whole call and the store's tile still never has to be
 copied to stay straight alpha.
 
-**Not re-measured, and the reason is worth stating rather than
-apologizing for.** The review that raised this described the cost as
-landing on "the exact upload path PLAN.md documents as 5.9× over the
-60 FPS budget". It does not: `TileResidency::sync` **has no production
-caller at all** — every call site in the workspace is one of
-`aurora-gpu`'s own tests, as its doc comment already says, and the
-documented p50/p99 pan-while-painting numbers come from `aurora-app`'s
-own composite/upload path instead. So this is a code-level correction to
-a path nothing on the hot loop reaches yet, not a measured speedup, and
-no new number is claimed for it. It matters for when that path *is*
-wired up, and because the comment was arguing against the code beneath
-it.
+**Corrected 2026-09-01 (Judge, this round's review) — the claim below
+that `sync` has no production caller was checked against the code and
+is false; restated honestly.** `App::redraw` (`aurora-app/src/lib.rs`,
+`residency.sync(gpu.queue(), store, composite_surface_id(), false,
+usize::MAX)`) calls it every frame — the very hot loop the review's
+"5.9× over the 60 FPS budget" figure describes. The doc comment this
+entry leaned on (`residency.rs`'s `sync`, "today's only callers (this
+crate's own tests)") is stale and about a different, narrower claim (who
+picks *which* `SurfaceId` to pass, not who calls `sync` at all) —
+inherited without being checked against an actual call site. **Not
+re-measured here either**, but for the honest reason: this round did not
+re-run the pan-while-painting benchmark, so no before/after number
+exists for this specific change. The fold (one fewer half-megabyte copy
+and allocation per tile) is a strict improvement over 0.68.0's shape
+either way, so nothing here is a regression risk — but the prior
+paragraph's justification for skipping measurement was wrong, and
+CLAUDE.md's own "measured, not assumed" rule means that should say so
+rather than stand corrected only in a later addendum.
 
 `upload_mip` deliberately keeps calling `premultiply_rgba` on its own
 copy: it is the cold preview path, one tile at a time, and leaving it

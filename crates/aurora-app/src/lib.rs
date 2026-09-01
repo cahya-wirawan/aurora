@@ -7277,7 +7277,18 @@ fn open_tile_store() -> Option<aurora_tile::TileStore> {
         return None;
     };
     match aurora_tile::TileStore::new(scratch_dir.to_path_buf(), budget) {
-        Ok(store) => Some(store),
+        Ok(store) => {
+            // `TileStore::new` recreates `scratch_dir` itself if a temp
+            // cleaner removed it (`create_private_dir`'s own self-heal) --
+            // the same gap `aur_verify_scratch_dir` closes on its own
+            // recreate path, and `TileStore::new` is called here on every
+            // fresh open, not only at startup (`open_tile_store`'s own
+            // callers include mid-run recovery). Without this, a store
+            // reopened after its directory was swept away runs the rest
+            // of the session invisible to every future startup sweep.
+            ensure_session_scratch_lock(scratch_dir);
+            Some(store)
+        }
         Err(err) => {
             tracing::warn!(
                 ?err,
@@ -14497,6 +14508,54 @@ mod tests {
                 "a recreated session directory holds the same unsaved pixels the original did \
                  (mode {mode:o})"
             );
+        }
+    }
+
+    /// `open_tile_store` is the *other* path (besides `verify_aur`, just
+    /// above) that recreates this session's scratch directory when a temp
+    /// cleaner has removed it mid-run — `aurora_tile::TileStore::new`
+    /// self-heals via `create_private_dir` on every open, not only at
+    /// startup. 0.68.6 re-took the liveness lock after `verify_aur`'s own
+    /// recreate but missed this second call site; fixed alongside PLAN.md's
+    /// correction of the `TileResidency::sync` caller claim (0.68.8).
+    #[test]
+    fn open_tile_store_survives_the_session_scratch_directory_being_swept_away() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let Some(session) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        super::remove_scratch_dir(session);
+        assert!(
+            !session.exists(),
+            "this test's premise is a session directory that has been swept away"
+        );
+
+        assert!(
+            open_tile_store().is_some(),
+            "reopening the tile store must still succeed after the session scratch \
+             directory has been swept away"
+        );
+        assert!(
+            session.is_dir(),
+            "the session directory must be recreated, not merely worked around once"
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                session.join(aurora_tile::LOCK_FILE_NAME).is_file(),
+                "the recreated session directory must carry a lock file again, or it is \
+                 permanently invisible to future sweeps"
+            );
+            match aurora_tile::lock_scratch_dir(session) {
+                Ok(_) => unreachable!(
+                    "the re-taken lock must actually be held -- an unheld lock file would let \
+                     the next run's sweep delete this live session's directory"
+                ),
+                Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock),
+            }
         }
     }
 
