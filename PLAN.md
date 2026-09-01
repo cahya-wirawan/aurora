@@ -13948,6 +13948,41 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.68.3) — the atlas premultiply is folded into
+the byte serialization it always ran next to, removing a per-tile copy
+and a per-tile allocation.** 0.68.0's `TileResidency::sync` copied each
+tile into a staging `Vec<f16>`, premultiplied that in place, then
+allocated a fresh `Vec<u8>` and serialized into it — while the staging
+buffer's own comment justified itself by saying it "avoids allocating a
+fresh half-megabyte buffer per tile", which the very next line then did
+anyway. A new `extend_premultiplied_le_bytes` premultiplies per texel as
+it writes the little-endian bytes, so `sync` now keeps **one** reusable
+`Vec<u8>` for the whole call and the store's tile still never has to be
+copied to stay straight alpha.
+
+**Not re-measured, and the reason is worth stating rather than
+apologizing for.** The review that raised this described the cost as
+landing on "the exact upload path PLAN.md documents as 5.9× over the
+60 FPS budget". It does not: `TileResidency::sync` **has no production
+caller at all** — every call site in the workspace is one of
+`aurora-gpu`'s own tests, as its doc comment already says, and the
+documented p50/p99 pan-while-painting numbers come from `aurora-app`'s
+own composite/upload path instead. So this is a code-level correction to
+a path nothing on the hot loop reaches yet, not a measured speedup, and
+no new number is claimed for it. It matters for when that path *is*
+wired up, and because the comment was arguing against the code beneath
+it.
+
+`upload_mip` deliberately keeps calling `premultiply_rgba` on its own
+copy: it is the cold preview path, one tile at a time, and leaving it
+alone keeps that helper (and its seven arithmetic tests) live rather than
+turning them into tests of nothing. **Two new tests** (`aurora-gpu` 61,
+up from 59) stop the two spellings drifting:
+`the_fused_serializer_matches_premultiply_then_serialize_exactly`
+compares them bit-for-bit across opaque, half, zero and near-zero alpha,
+and `the_fused_serializer_appends_and_ignores_a_trailing_partial_texel`
+pins the append semantics and the same partial-chunk contract.
+
 **Addendum 2026-09-01 (0.68.2) — a refusal that loses the race for the
 one modal slot is no longer marked as if the user had seen it, and the
 macOS menu bar can no longer fire commands underneath a modal.** Two

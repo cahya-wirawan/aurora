@@ -120,6 +120,37 @@ fn premultiply_rgba(texels: &mut [f16]) {
     }
 }
 
+/// Appends `texels` to `out` as the little-endian `f16` bytes
+/// `wgpu::Queue::write_texture` wants, **premultiplied on the way**
+/// ([`premultiply_rgba`]'s arithmetic, applied per texel as the bytes are
+/// written rather than in a separate pass over a separate buffer).
+///
+/// This exists so [`TileResidency::sync`] needs one reusable buffer for
+/// the whole call instead of two per tile. 0.68.0 spelled the same work
+/// as *copy the tile into a staging `Vec<f16>`, premultiply that in
+/// place, then allocate a fresh `Vec<u8>` and serialize into it* — a
+/// half-megabyte copy plus an allocation per tile, on an upload path
+/// `spike/FINDINGS.md` finding #3 already names as bandwidth-bound. The
+/// comment justifying the staging buffer said it "avoids allocating a
+/// fresh half-megabyte buffer per tile", which the very next line then
+/// did anyway.
+///
+/// Same trailing-partial-chunk contract as [`premultiply_rgba`]: a slice
+/// whose length is not a multiple of [`CHANNELS`] contributes nothing for
+/// its final incomplete texel rather than emitting corrupt bytes.
+fn extend_premultiplied_le_bytes(texels: &[f16], out: &mut Vec<u8>) {
+    for texel in texels.chunks_exact(CHANNELS) {
+        let [r, g, b, a] = texel else {
+            continue;
+        };
+        let alpha = f32::from(*a);
+        out.extend_from_slice(&f16::from_f32(f32::from(*r) * alpha).to_le_bytes());
+        out.extend_from_slice(&f16::from_f32(f32::from(*g) * alpha).to_le_bytes());
+        out.extend_from_slice(&f16::from_f32(f32::from(*b) * alpha).to_le_bytes());
+        out.extend_from_slice(&a.to_le_bytes());
+    }
+}
+
 /// The result of one [`TileResidency::sync`] call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncStats {
@@ -783,13 +814,14 @@ impl TileResidency {
     ) -> SyncStats {
         let mut stats = SyncStats::default();
         let mut bytes_left = byte_budget;
-        // Reused across every tile this call uploads: `premultiply_rgba`
-        // needs a mutable copy (the store's own tile must stay straight
-        // alpha), and allocating a fresh half-megabyte buffer per tile
-        // on the upload path -- the one `spike/FINDINGS.md` finding #3
-        // already names as bandwidth-bound -- would be a poor trade for
-        // three lines of tidiness.
-        let mut staging: Vec<f16> = Vec::new();
+        // *One* buffer, reused across every tile this call uploads, and
+        // the only one: `extend_premultiplied_le_bytes` premultiplies as
+        // it serializes, so the store's own tile stays straight alpha
+        // without a separate mutable copy of it. 0.68.0 had a staging
+        // `Vec<f16>` here *and* a fresh `Vec<u8>` per tile, which is the
+        // half-megabyte copy and the per-tile allocation the staging
+        // buffer's own comment claimed to be avoiding.
+        let mut bytes: Vec<u8> = Vec::with_capacity(TILE_BYTES);
         for gy in 0..self.grid.1 {
             for gx in 0..self.grid.0 {
                 let id = TileId {
@@ -823,13 +855,8 @@ impl TileResidency {
                 // Premultiplied on the way in -- see `premultiply_rgba`
                 // for why the atlas, and only the atlas, holds that
                 // convention. The store's own tile is untouched.
-                staging.clear();
-                staging.extend_from_slice(tile.texels());
-                premultiply_rgba(&mut staging);
-                let mut bytes = Vec::with_capacity(staging.len() * 2);
-                for sample in &staging {
-                    bytes.extend_from_slice(&sample.to_le_bytes());
-                }
+                bytes.clear();
+                extend_premultiplied_le_bytes(tile.texels(), &mut bytes);
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &self.texture,
@@ -980,9 +1007,9 @@ impl std::fmt::Debug for TileResidency {
 
 #[cfg(test)]
 mod tests {
-    use super::{TILE_BYTES, TileResidency, premultiply_rgba};
+    use super::{TILE_BYTES, TileResidency, extend_premultiplied_le_bytes, premultiply_rgba};
     use crate::test_support::{real_context, real_tile_store};
-    use aurora_tile::{SurfaceId, TILE, TileId};
+    use aurora_tile::{CHANNELS, SurfaceId, TILE, TileId};
     use half::f16;
 
     /// The one surface every test in this module addresses — nothing
@@ -1808,6 +1835,59 @@ mod tests {
             4,
             "premultiply_rgba's [r, g, b, a] pattern assumes four channels"
         );
+    }
+
+    /// The fused serializer and the in-place one must agree exactly, or
+    /// `sync` (which uses the fused one) and `upload_mip` (which uses the
+    /// in-place one) would leave the same atlas texture in two different
+    /// alpha conventions. Bit-for-bit, over a buffer carrying every
+    /// interesting alpha: opaque, half, zero, and a faint one near the
+    /// bottom of `f16`'s range.
+    #[test]
+    fn the_fused_serializer_matches_premultiply_then_serialize_exactly() {
+        let source: Vec<f16> = [
+            [1.0f32, 0.75, 0.5, 1.0],
+            [1.0, 0.75, 0.5, 0.5],
+            [1.0, 0.75, 0.5, 0.0],
+            [1.0, 0.75, 0.5, 0.001],
+        ]
+        .iter()
+        .flatten()
+        .map(|&channel| f16::from_f32(channel))
+        .collect();
+
+        let mut in_place = source.clone();
+        premultiply_rgba(&mut in_place);
+        let mut expected = Vec::new();
+        for sample in &in_place {
+            expected.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let mut fused = Vec::new();
+        extend_premultiplied_le_bytes(&source, &mut fused);
+
+        assert_eq!(fused, expected);
+    }
+
+    /// The fused serializer appends rather than replaces (`sync` clears
+    /// once per tile and fills one buffer), and honours the same
+    /// trailing-partial-chunk contract: an incomplete final texel
+    /// contributes nothing rather than corrupt bytes.
+    #[test]
+    fn the_fused_serializer_appends_and_ignores_a_trailing_partial_texel() {
+        let texels: Vec<f16> = [1.0f32, 1.0, 1.0, 0.5, 1.0, 1.0]
+            .iter()
+            .map(|&channel| f16::from_f32(channel))
+            .collect();
+        let mut out = vec![0xAA, 0xBB];
+        extend_premultiplied_le_bytes(&texels, &mut out);
+        assert_eq!(
+            out.len(),
+            2 + CHANNELS * 2,
+            "two pre-existing bytes plus exactly one whole texel"
+        );
+        assert_eq!(out.first(), Some(&0xAA));
+        assert_eq!(out.get(1), Some(&0xBB));
     }
 
     /// The whole arithmetic contract, on one texel at a time — no GPU
