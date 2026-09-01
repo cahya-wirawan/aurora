@@ -1,0 +1,500 @@
+//! Scratch-directory liveness: an advisory lock a running process holds
+//! for its own scratch directory, and a startup sweep that removes the
+//! directories of processes that are gone.
+//!
+//! **Why this exists.** A [`crate::TileStore`]'s scratch directory holds
+//! this session's paged-out tiles — potentially gigabytes of a
+//! professional's unsaved pixels. `aurora-app` removes its own on a
+//! clean exit (0.63.0 extended that to every `winit` exit path), but a
+//! hard crash, `SIGKILL`, an OS shutdown, and the release profile's
+//! `panic = "abort"` all skip it, so leftovers accumulate in the system
+//! temp directory forever. That was the half deliberately left open in
+//! 0.63.0, because deleting another process's directory needs a
+//! *liveness check* and getting one wrong is far worse than the leak.
+//!
+//! **The whole design is fail-closed.** A false "dead" verdict deletes a
+//! live session's real unsaved pixels; a false "alive" verdict leaks a
+//! directory someone can remove by hand. Those are not comparable, so
+//! every branch that is not a positive proof of death — no lock file, a
+//! lock already held, a permission error, an unreadable entry, a
+//! metadata failure, anything at all — counts as `skipped` and deletes
+//! nothing. There is no `unwrap_or(true)`-shaped path anywhere in here;
+//! [`Verdict`] exists specifically so the control flow cannot grow one.
+//!
+//! **`flock`, not `fcntl`.** The lock attaches to the open file
+//! *description*, which buys two things: the kernel releases it when the
+//! process dies however it dies (this is the entire liveness signal),
+//! and a second accidental lock attempt from *within this same process*
+//! conflicts rather than silently succeeding. `fcntl`/`F_SETLK` locks
+//! are per-process and are dropped by a `close(2)` on *any* descriptor
+//! for the same file, anywhere in the process — a footgun this crate
+//! does not need.
+//!
+//! ## Residual races and limits, stated plainly
+//!
+//! - **A directory created but not yet locked is skipped, not deleted.**
+//!   There are a few microseconds between `mkdir` and the `flock` that
+//!   follows it, and in that window the directory has no lock file at
+//!   all — which this sweep reads as "unknown", never as "dead". This is
+//!   why the order must stay *create the directory, then lock it*:
+//!   reversing it would open a window where a live directory looks dead.
+//! - **Pre-0.67.0 leftovers are never swept.** They have no lock file,
+//!   so they fall into the same "unknown" branch by design. Removing
+//!   them is a manual job, once. This is deliberate: "no lock file"
+//!   cannot mean "dead" without also meaning it for the race above.
+//! - **`flock` is not reliable over NFS or other network filesystems.**
+//!   Linux emulates it via `fcntl` byte-range locks over NFS, and other
+//!   platforms vary. A scratch directory on a network mount is outside
+//!   what this can promise — and is a bad idea for a tile store's paging
+//!   path regardless.
+//! - **Windows is not covered at all this round** — see the
+//!   `#[cfg(not(unix))]` arms below, which are honest no-ops rather than
+//!   a guess at an equivalent.
+
+use std::path::Path;
+
+/// What [`sweep_orphaned_scratch_dirs`] did.
+///
+/// `removed + skipped` is every entry whose name matched the prefix;
+/// entries that did not match are not counted at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Directories proven dead — their lock was acquired, so no process
+    /// held it — and therefore deleted.
+    pub removed: usize,
+    /// Matching entries left alone for **any** reason: a live lock, a
+    /// missing lock file, a symlink, a plain file, a foreign owner, or
+    /// any error at all along the way. Never a deletion.
+    pub skipped: usize,
+}
+
+/// The name of the lock file inside each scratch directory.
+///
+/// It lives *inside* the directory rather than beside it as
+/// `<dir>.lock`, deliberately: the scratch directory is created 0700 and
+/// its ownership is verified before anything is opened inside it
+/// ([`crate::TileStore`]'s own `create_private_dir`), so nothing another
+/// user can create is reachable there. A sibling in a world-writable,
+/// sticky `/tmp` has no such protection — an attacker can pre-create it
+/// and the sweep would then be reasoning about a file it does not own.
+///
+/// It is not a `.tile` file and never will be, which is what keeps every
+/// tile enumerator in this workspace correct in its presence.
+pub const LOCK_FILE_NAME: &str = "aurora.lock";
+
+/// A held advisory lock on one scratch directory, released when dropped
+/// (or when the process dies, however it dies — that is the point).
+///
+/// **Hold this for as long as the scratch directory is in use.**
+/// Dropping it early releases the lock immediately, and the *next*
+/// Aurora process to start will then correctly conclude the directory is
+/// dead and delete it — while it is still being written to.
+#[derive(Debug)]
+pub struct ScratchLock {
+    /// Kept solely to own the descriptor the lock is attached to. The
+    /// lock's lifetime *is* this `File`'s lifetime.
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
+
+/// Takes the exclusive, non-blocking lock for the scratch directory
+/// `dir`, creating its lock file if needed.
+///
+/// Call this immediately after creating `dir`, and keep the returned
+/// guard alive for as long as the directory is in use — see
+/// [`ScratchLock`].
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] if the lock file cannot be
+/// opened (`dir` missing, a symlink in the way — `O_NOFOLLOW` refuses
+/// one outright — permissions) or if another open file description
+/// already holds the lock (`EWOULDBLOCK`). It never blocks.
+#[cfg(unix)]
+pub fn lock_scratch_dir(dir: &Path) -> std::io::Result<ScratchLock> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(LOCK_FILE_NAME))?;
+
+    // SAFETY: `file`'s descriptor is open and owned by this `File` for
+    // the whole call, and stays owned by the `ScratchLock` returned
+    // below for as long as the lock is held -- so the lock cannot
+    // outlive the descriptor it was taken on, and no other code in this
+    // crate can close it out from under the lock.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ScratchLock { file })
+}
+
+/// Non-Unix counterpart: a no-op guard.
+///
+/// Windows has real equivalents (`LockFileEx`, or simply opening the
+/// file without `FILE_SHARE_DELETE`), but wiring one up is its own piece
+/// of work with its own testing, and a guessed-at implementation here
+/// would be worse than an honest gap — see [`sweep_orphaned_scratch_dirs`],
+/// which sweeps nothing on this platform, so nothing depends on this
+/// guard meaning anything yet.
+///
+/// # Errors
+///
+/// Never returns `Err` on this platform. The signature matches the Unix
+/// one so callers need no `cfg` of their own.
+#[cfg(not(unix))]
+pub fn lock_scratch_dir(_dir: &Path) -> std::io::Result<ScratchLock> {
+    Ok(ScratchLock {
+        file: std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(_dir.join(LOCK_FILE_NAME))?,
+    })
+}
+
+/// One matching entry's liveness, as an explicit three-way answer.
+///
+/// The point of naming `Unknown` separately from `Alive` is that they
+/// are treated identically (neither is deleted) while meaning very
+/// different things — and that no `bool` can be mistakenly coerced into
+/// "not alive, therefore dead."
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The lock was acquired: no process holds this directory.
+    Dead,
+    /// The lock is held by someone: a live session owns this directory.
+    Alive,
+    /// Anything else at all. Treated exactly like `Alive`.
+    Unknown,
+}
+
+/// Decides one candidate directory's fate, holding the lock on return
+/// for [`Verdict::Dead`] so the caller can delete under it.
+#[cfg(unix)]
+fn liveness(dir: &Path) -> (Verdict, Option<ScratchLock>) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+        return (Verdict::Unknown, None);
+    };
+    // `symlink_metadata`, so a symlink reports as a symlink rather than
+    // as whatever it points at -- deleting *through* one is exactly the
+    // attack this must not fall for.
+    if !metadata.file_type().is_dir() {
+        return (Verdict::Unknown, None);
+    }
+    // SAFETY: `geteuid` takes no arguments, has no preconditions, and
+    // cannot fail -- it is inherently safe to call, `std` just does not
+    // expose it.
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        return (Verdict::Unknown, None);
+    }
+
+    // A missing lock file is `Unknown`, never `Dead`: it is also what a
+    // directory created microseconds ago looks like, and what every
+    // pre-0.67.0 leftover looks like forever. See this module's own
+    // "residual races" list.
+    if !dir.join(LOCK_FILE_NAME).is_file() {
+        return (Verdict::Unknown, None);
+    }
+
+    match lock_scratch_dir(dir) {
+        Ok(lock) => (Verdict::Dead, Some(lock)),
+        Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => (Verdict::Alive, None),
+        Err(_) => (Verdict::Unknown, None),
+    }
+}
+
+/// Removes scratch directories under `parent` whose names start with
+/// `prefix` and whose owning process is provably gone.
+///
+/// Call this **once, at startup, before this session creates its own
+/// scratch directory** — which is what makes "never delete the current
+/// session's own directory" true by construction rather than by a check
+/// that could be got wrong.
+///
+/// `parent` is a parameter with no default on purpose: nothing in here
+/// reaches for [`std::env::temp_dir`] itself, so a test can point it at
+/// a `tempfile::tempdir()` with no possibility of touching a real
+/// running Aurora's scratch directory or another test's.
+///
+/// Nothing is deleted unless its lock is acquired, proving no live
+/// process holds it; the lock is held across the removal and dropped
+/// after. Every other outcome increments `skipped`. This function never
+/// returns an error — a sweep that cannot read `parent` at all reports
+/// zero of both and logs, because failing startup over housekeeping
+/// would be the wrong trade.
+#[cfg(unix)]
+#[must_use]
+pub fn sweep_orphaned_scratch_dirs(parent: &Path, prefix: &str) -> SweepReport {
+    let mut report = SweepReport::default();
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::debug!(
+                parent = %parent.display(),
+                %err,
+                "could not read the scratch parent directory; sweeping nothing"
+            );
+            return report;
+        }
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // An unreadable entry is not even a candidate -- there is no
+            // name to match against, so it is not counted either.
+            continue;
+        };
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let (verdict, lock) = liveness(&path);
+        if verdict != Verdict::Dead {
+            tracing::debug!(
+                path = %path.display(),
+                ?verdict,
+                "leaving a scratch directory alone"
+            );
+            report.skipped += 1;
+            continue;
+        }
+        // The lock is still held here, deliberately: it is dropped only
+        // after the directory is gone, so a process starting mid-removal
+        // cannot also conclude "dead" and race us into the same tree.
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                report.removed += 1;
+                tracing::info!(
+                    path = %path.display(),
+                    "removed an orphaned scratch directory from a session that is no longer running"
+                );
+            }
+            Err(err) => {
+                report.skipped += 1;
+                tracing::warn!(
+                    path = %path.display(),
+                    %err,
+                    "could not remove an orphaned scratch directory"
+                );
+            }
+        }
+        drop(lock);
+    }
+    report
+}
+
+/// Non-Unix counterpart: sweeps nothing and says so, once.
+///
+/// The liveness check this rests on is `flock`, which is Unix-only; the
+/// Windows equivalent is real, separate work (see [`lock_scratch_dir`]'s
+/// own non-Unix arm). Reporting `SweepReport::default()` rather than
+/// guessing keeps the caller's logged counts truthful on every platform.
+#[cfg(not(unix))]
+#[must_use]
+pub fn sweep_orphaned_scratch_dirs(parent: &Path, prefix: &str) -> SweepReport {
+    tracing::info!(
+        parent = %parent.display(),
+        prefix,
+        "scratch-directory liveness is not implemented on this platform; sweeping nothing"
+    );
+    SweepReport::default()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{LOCK_FILE_NAME, ScratchLock, lock_scratch_dir, sweep_orphaned_scratch_dirs};
+    use std::path::{Path, PathBuf};
+
+    const PREFIX: &str = "aurora-scratch-";
+
+    /// A scratch-shaped directory under `parent`, with one file in it so
+    /// a wrong "removed" verdict is visibly destructive rather than a
+    /// no-op on an empty directory.
+    fn scratch_dir(parent: &Path, name: &str) -> PathBuf {
+        let dir = parent.join(name);
+        if let Err(err) = std::fs::create_dir(&dir) {
+            unreachable!("a test-local temp directory must accept a mkdir: {err}");
+        }
+        if let Err(err) = std::fs::write(dir.join("0_0_0.tile"), b"pretend pixels") {
+            unreachable!("a test-local temp directory must accept a write: {err}");
+        }
+        dir
+    }
+
+    fn take_lock(dir: &Path) -> ScratchLock {
+        match lock_scratch_dir(dir) {
+            Ok(lock) => lock,
+            Err(err) => unreachable!("a freshly created directory must be lockable: {err}"),
+        }
+    }
+
+    fn temp_parent() -> tempfile::TempDir {
+        match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("a temp directory must be creatable: {err}"),
+        }
+    }
+
+    /// The whole point of the feature: a directory whose owning process
+    /// is gone. "Gone" is modelled by taking the lock and dropping it,
+    /// which is exactly what the kernel does when a process dies.
+    #[test]
+    fn a_directory_whose_owner_has_exited_is_removed() {
+        let parent = temp_parent();
+        let dir = scratch_dir(parent.path(), "aurora-scratch-dead");
+        drop(take_lock(&dir));
+
+        let report = sweep_orphaned_scratch_dirs(parent.path(), PREFIX);
+
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.skipped, 0);
+        assert!(!dir.exists(), "the orphan must actually be gone");
+    }
+
+    /// The case that must never regress: a *live* session's directory.
+    ///
+    /// No child process is needed — `flock` attaches to the open file
+    /// description, so a lock this test still holds conflicts with the
+    /// sweep's own attempt exactly as another process's would.
+    #[test]
+    fn a_directory_whose_lock_is_still_held_is_left_completely_alone() {
+        let parent = temp_parent();
+        let dir = scratch_dir(parent.path(), "aurora-scratch-live");
+        let live = take_lock(&dir);
+
+        let report = sweep_orphaned_scratch_dirs(parent.path(), PREFIX);
+
+        assert_eq!(report.removed, 0, "a live session's pixels are not garbage");
+        assert_eq!(report.skipped, 1);
+        assert!(dir.exists());
+        assert!(dir.join("0_0_0.tile").is_file(), "and its tiles survive");
+        drop(live);
+    }
+
+    /// A pre-0.67.0 leftover, and also what a directory looks like in
+    /// the microseconds between `mkdir` and `flock`. Both are `Unknown`,
+    /// and `Unknown` never deletes.
+    #[test]
+    fn a_directory_with_no_lock_file_is_skipped_not_swept() {
+        let parent = temp_parent();
+        let dir = scratch_dir(parent.path(), "aurora-scratch-legacy");
+
+        let report = sweep_orphaned_scratch_dirs(parent.path(), PREFIX);
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(dir.exists());
+    }
+
+    /// A lock *path* that cannot be opened as a file at all.
+    ///
+    /// A directory in its place fails deterministically with `EISDIR`
+    /// for every user including root, unlike a permission-based fixture,
+    /// which behaves differently when the suite happens to run as root.
+    #[test]
+    fn a_directory_whose_lock_path_cannot_be_opened_is_skipped_not_swept() {
+        let parent = temp_parent();
+        let dir = scratch_dir(parent.path(), "aurora-scratch-eisdir");
+        if let Err(err) = std::fs::create_dir(dir.join(LOCK_FILE_NAME)) {
+            unreachable!("a test-local temp directory must accept a mkdir: {err}");
+        }
+
+        let report = sweep_orphaned_scratch_dirs(parent.path(), PREFIX);
+
+        assert_eq!(report.removed, 0, "an error must never become a deletion");
+        assert_eq!(report.skipped, 1);
+        assert!(dir.exists());
+    }
+
+    /// The sweep is scoped by prefix, so a temp directory belonging to
+    /// anything else is not even a candidate — not counted, not touched.
+    #[test]
+    fn a_directory_whose_name_does_not_match_the_prefix_is_untouched() {
+        let parent = temp_parent();
+        let other = scratch_dir(parent.path(), "someone-elses-tmpdir");
+        drop(take_lock(&other));
+
+        let report = sweep_orphaned_scratch_dirs(parent.path(), PREFIX);
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.skipped, 0, "a non-match is not even counted");
+        assert!(other.exists());
+    }
+
+    /// A plain *file* carrying the prefix is not a scratch directory, so
+    /// it is skipped rather than unlinked — `remove_dir_all` on it would
+    /// be a deletion this function has no business performing.
+    #[test]
+    fn a_plain_file_with_the_matching_prefix_is_untouched() {
+        let parent = temp_parent();
+        let path = parent.path().join("aurora-scratch-notadir");
+        if let Err(err) = std::fs::write(&path, b"not a directory") {
+            unreachable!("a test-local temp directory must accept a write: {err}");
+        }
+
+        let report = sweep_orphaned_scratch_dirs(parent.path(), PREFIX);
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(path.is_file());
+    }
+
+    /// The lock really is exclusive within one process, which is what
+    /// makes the "live" test above a valid stand-in for a second
+    /// process, and what makes `flock` (per open file description) the
+    /// right primitive rather than `fcntl` (per process).
+    #[test]
+    fn a_second_lock_attempt_on_the_same_directory_is_refused() {
+        let parent = temp_parent();
+        let dir = scratch_dir(parent.path(), "aurora-scratch-twice");
+        let first = take_lock(&dir);
+
+        match lock_scratch_dir(&dir) {
+            Ok(_) => unreachable!("a held lock must not be handed out twice"),
+            Err(err) => assert_eq!(err.raw_os_error(), Some(libc::EWOULDBLOCK)),
+        }
+
+        drop(first);
+        // And it becomes available again once released, so a crashed
+        // session's directory really does become sweepable.
+        drop(take_lock(&dir));
+    }
+
+    /// The mixed case, in one sweep: the report's two counters must
+    /// track the right entries, not merely add up.
+    #[test]
+    fn a_sweep_removes_only_the_dead_among_several_candidates() {
+        let parent = temp_parent();
+        let dead_one = scratch_dir(parent.path(), "aurora-scratch-a");
+        let dead_two = scratch_dir(parent.path(), "aurora-scratch-b");
+        let alive = scratch_dir(parent.path(), "aurora-scratch-c");
+        let legacy = scratch_dir(parent.path(), "aurora-scratch-d");
+        drop(take_lock(&dead_one));
+        drop(take_lock(&dead_two));
+        let held = take_lock(&alive);
+
+        let report = sweep_orphaned_scratch_dirs(parent.path(), PREFIX);
+
+        assert_eq!(report.removed, 2);
+        assert_eq!(report.skipped, 2);
+        assert!(!dead_one.exists());
+        assert!(!dead_two.exists());
+        assert!(alive.exists());
+        assert!(legacy.exists());
+        drop(held);
+    }
+}

@@ -2917,8 +2917,14 @@ mod tests {
         // Two *real* files, not one that the second store overwrote.
         assert!(first.tile_path(surface(), a).is_file());
         assert!(second.tile_path(surface(), a).is_file());
+        // `.tile` only: a scratch directory may also hold
+        // `crate::LOCK_FILE_NAME` (0.67.0), which is not a paged-out
+        // tile and must not be counted as one.
         let entries = match std::fs::read_dir(dir.path()) {
-            Ok(entries) => entries.filter_map(Result::ok).count(),
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tile"))
+                .count(),
             Err(err) => unreachable!("the scratch directory is readable: {err}"),
         };
         assert_eq!(

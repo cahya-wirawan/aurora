@@ -11226,24 +11226,38 @@ structural design work.
     worth keeping: "clean up on every exit path" is not one rule —
     *whose* data a path is holding decides what it may delete.
 
-    **Still open: the startup sweep only.** A hard crash, a `SIGKILL`,
-    an OS shutdown, and a `panic = "abort"` build (the release profile
-    sets it) all end the process without running any Rust cleanup, so
-    they never reach `exiting` either and still strand a scratch
-    directory, a marker and an autosave. A run aborting through
-    `App::fail` now deliberately leaves its marker and autosave behind
-    too — that is the correct behaviour (see above), and the leftover is
-    the *previous* run's recovery data, which the next successful run
-    consumes and clears.
+    **The startup sweep landed 2026-09-01 (0.67.0), on Unix only.** A
+    hard crash, a `SIGKILL`, an OS shutdown, and a `panic = "abort"`
+    build (the release profile sets it) all end the process without
+    running any Rust cleanup, so they never reach `exiting` either and
+    used to strand a scratch directory forever. A new
+    `aurora_tile::scratch` module now gives each session's directory an
+    advisory `flock` on an `aurora.lock` file inside it, taken
+    immediately after the directory is created and held for the
+    process's whole life; `aurora_app::run` sweeps
+    `std::env::temp_dir()` for `aurora-scratch-*` siblings once at
+    startup, **before** this session's own directory exists, and deletes
+    one only when it can take that directory's lock — proof no live
+    process holds it. The marker and the autosave still have the
+    original gap in full, and deliberately so: a crashed run's marker is
+    what makes the *next* run offer recovery.
 
-    Concrete fix shape for that remaining half: a sweep at startup over
-    `aurora-scratch-*`
-    siblings, deleting only those whose owning process is provably gone.
-    That liveness check is the whole reason this is its own round — it is
-    a per-platform question (an advisory lock file inside each directory
-    is the most portable answer; a bare pid check races pid reuse), and
-    getting it wrong deletes a *live* session's scratch tiles, which is
-    worse than the leak it fixes.
+    **Windows is not covered this round.** `flock` is Unix-only; the
+    `#[cfg(not(unix))]` arms are honest no-ops (`lock_scratch_dir`
+    returns a guard that locks nothing, `sweep_orphaned_scratch_dirs`
+    returns a zeroed report and logs once that liveness is not
+    implemented), so a Windows run leaks exactly as it did before rather
+    than guessing at an equivalent. `LockFileEx` is the shape a later
+    round would use.
+
+    **Two other things it deliberately does not do**, both because the
+    same reasoning forbids them: a directory created but not yet locked
+    has no lock file for the few microseconds between `mkdir` and
+    `flock`, and every **pre-0.67.0 leftover** has none forever — so "no
+    lock file" is `Verdict::Unknown`, never `Dead`, and neither is ever
+    swept. Making the second case sweepable would necessarily make the
+    first case deletable, which would destroy a live session's unsaved
+    pixels. Old leftovers are a one-time manual `rm`.
 
 - [x] **`aurora_tile::create_private_dir` wants `O_NOFOLLOW` and a real
     ownership check before FR-026 lets a user choose the scratch
@@ -13933,6 +13947,90 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-01 (0.67.0) — orphaned `aurora-scratch-*`
+directories are collected at startup, on Unix, by a liveness lock rather
+than a guess.** 0.63.0 closed the clean-exit half of M1.9's scratch-leak
+item and named this as the half left alone, because deleting another
+process's directory needs a liveness check and getting one wrong is far
+worse than the leak. New `crates/aurora-tile/src/scratch.rs`:
+`lock_scratch_dir` takes an exclusive, non-blocking `flock` on an
+`aurora.lock` file inside the directory (opened `O_NOFOLLOW`, mode
+`0o600`), and `sweep_orphaned_scratch_dirs(parent, prefix)` deletes a
+matching directory **only** when it can acquire that lock, holding it
+across the `remove_dir_all` and dropping it after.
+
+**`flock`, not `fcntl`, deliberately**: it attaches to the open file
+*description*, so the kernel releases it when the process dies however
+it dies (that is the entire liveness signal), and a second accidental
+attempt from within the same process conflicts rather than silently
+succeeding — which is also what lets the "live session" test hold a real
+conflicting lock with no child process. `fcntl`/`F_SETLK` is per-process
+and a stray `close(2)` anywhere would drop it.
+
+**Fail-closed at every branch.** An explicit `enum Verdict { Dead,
+Alive, Unknown }` exists so the control flow cannot grow an
+`unwrap_or(true)`-shaped mistake: a missing lock file, `EWOULDBLOCK`,
+`EACCES`, `EISDIR`, a symlink, a plain file, a foreign `euid`, an
+unreadable entry, any `read_dir`/metadata error — all increment
+`skipped`, none delete. `parent` is a required parameter and nothing in
+the module reaches for `std::env::temp_dir()` itself, so every test
+points at a `tempfile::tempdir()` and cannot touch a real running
+Aurora's directory. The new `unsafe` (`flock`, `geteuid`) is confined to
+`aurora-tile`, the one crate already holding the `unsafe_code = "allow"`
+override, and each block carries a `// SAFETY:` comment in the voice of
+`store::create_private_dir`'s existing ones.
+
+**Wiring.** `aurora_app::create_tile_store_scratch_dir` now returns the
+path *and* the guard, and `tile_store_scratch_dir`'s `OnceLock` holds
+both for the process's life — dropping the guard early would release the
+lock and let the *next* Aurora delete this session's live directory. If
+the lock cannot be taken the directory is removed again and the session
+falls back to `open_tile_store`'s existing "painting is disabled"
+degradation, rather than running unlocked and looking dead to the next
+sweep. `run()` sweeps once right after `write_session_marker` and
+strictly before anything touches `tile_store_scratch_dir`, so "never
+delete the current session's own directory" is true *by construction* —
+it does not exist yet.
+
+**A required pre-check found real hazards and they are fixed here.**
+Seven scratch-directory enumerators counted directory *entries* rather
+than filtering by the `.tile` extension (`aurora-io`'s
+`break_the_only_scratch_file`, `aurora-tile`'s two-store collision test,
+and five in `aurora-app`), and a lock file inside each directory would
+have silently broken their exact-count assertions. All seven now filter
+by extension. The alternative design — a sibling `<dir>.lock` — was
+rejected: `/tmp` is world-writable and sticky, so a sibling can be
+pre-created by another user, whereas the directory itself is `0700` with
+its ownership verified before anything inside it is opened.
+
+**Eight new tests** in `aurora-tile` (55 up from 47), all `#[cfg(unix)]`
+and all against a `tempfile::tempdir()`: dead-owner removed;
+lock-still-held left completely alone (tiles intact); no lock file
+skipped; lock path is a directory (`EISDIR`, deterministic for root too,
+unlike a permission fixture) skipped; non-matching sibling untouched and
+not even counted; plain file with the prefix untouched; a second lock
+attempt refused with `EWOULDBLOCK` and available again after release;
+and a mixed sweep where two dead, one live and one legacy directory must
+sort into the right counters.
+
+**Manual, multi-process evidence — and what it is not.** This sandbox
+has no display server (`DISPLAY` and `WAYLAND_DISPLAY` are both unset,
+no Xvfb), so the windowed app cannot be run interactively here and the
+two-live-instances check could not be done with `aurora-app` itself. Two
+real things were done instead. (1) The real `aurora-app` binary was run:
+its sweep executed against the live `/tmp`, found the 24 pre-0.67.0
+leftovers already on this machine, and logged `removed=0 skipped=24` —
+deleting none of them, which is exactly the documented "no lock file
+means unknown" behaviour, observed rather than argued. (2) A throwaway
+harness linking the **shipping** `aurora_tile::lock_scratch_dir` /
+`sweep_orphaned_scratch_dirs` was driven from three separate OS
+processes: process A created and locked a directory holding a `.tile`
+file; process B's sweep reported `removed=0 skipped=1` and A's tile
+survived; A was then `kill -9`ed (no Rust cleanup runs at all); process
+C's sweep reported `removed=1 skipped=0` and the orphan was gone. That
+is a real `SIGKILL` across real process boundaries, which is the part
+unit tests genuinely cannot show.
 
 **Addendum 2026-09-01 (0.66.0) — a Move drag that hits the document's
 own coordinate range now says so, once per drag.** M1.9's own open item

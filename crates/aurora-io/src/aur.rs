@@ -882,7 +882,14 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(dir.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        // `.tile` only, never a bare entry list: a scratch directory
+        // also holds `aurora_tile::LOCK_FILE_NAME` (0.67.0), which is
+        // not an evicted tile and must not be counted as one.
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "tile"))
+            .collect();
         let [victim] = files.as_slice() else {
             unreachable!("exactly one tile should have been evicted: {files:?}");
         };

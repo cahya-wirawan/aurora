@@ -6818,9 +6818,18 @@ fn select_layer(
     clamp_pan_to_active_layer(view, layers, Some(layer_id), canvas_size);
 }
 
+/// The name prefix every session's scratch directory carries — what
+/// [`create_tile_store_scratch_dir`] builds one with, and what the
+/// startup sweep in [`run`] matches candidates against. One constant so
+/// the two cannot drift apart; a sweep looking for the wrong prefix
+/// would silently do nothing, which is the failure mode a startup
+/// housekeeping job is least likely to be noticed having.
+const SCRATCH_DIR_PREFIX: &str = "aurora-scratch-";
+
 /// Creates a fresh scratch directory for one session's tile store,
-/// under the platform temp directory, and returns its path. `None`
-/// (logged) if it cannot be created.
+/// under the platform temp directory, takes its liveness lock
+/// (`aurora_tile::lock_scratch_dir`), and returns both. `None` (logged)
+/// if either step fails.
 ///
 /// **Why not a fixed path.** Until 0.53.0 this was
 /// `std::env::temp_dir().join("aurora-tiles")`: one directory, shared by
@@ -6841,9 +6850,9 @@ fn select_layer(
 /// user-facing scratch-disk preference (FR-026), not something to decide
 /// here by silently redirecting a document's paging traffic into
 /// `directories::ProjectDirs`' data directory.
-fn create_tile_store_scratch_dir() -> Option<PathBuf> {
+fn create_tile_store_scratch_dir() -> Option<(PathBuf, aurora_tile::ScratchLock)> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix("aurora-scratch-");
+    builder.prefix(SCRATCH_DIR_PREFIX);
     // `tempfile` creates a *directory* with the process's default
     // permissions (a plain `DirBuilder::create`, so umask-derived and
     // typically `0o755`/`0o775`) -- unlike its temp *files*, which are
@@ -6859,13 +6868,37 @@ fn create_tile_store_scratch_dir() -> Option<PathBuf> {
         use std::os::unix::fs::PermissionsExt as _;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    match builder.tempdir() {
-        Ok(dir) => Some(dir.keep()),
+    let dir = match builder.tempdir() {
+        Ok(dir) => dir.keep(),
         Err(err) => {
             tracing::warn!(
                 ?err,
                 "failed to create this session's tile scratch directory"
             );
+            return None;
+        }
+    };
+    // Immediately after the directory exists, and never the other way
+    // round: the window between `mkdir` and this call is exactly the
+    // race `aurora_tile::sweep_orphaned_scratch_dirs` documents, and it
+    // is safe only in this order (a directory with no lock file yet
+    // reads as "unknown", which never deletes).
+    match aurora_tile::lock_scratch_dir(&dir) {
+        Ok(lock) => Some((dir, lock)),
+        Err(err) => {
+            // Fail closed in the other direction too: without a lock
+            // this session's directory would look dead to the *next*
+            // run's sweep, so rather than run unlocked, give up the
+            // directory entirely and take `open_tile_store`'s existing
+            // "painting is disabled this session" degradation.
+            tracing::warn!(
+                ?err,
+                path = %dir.display(),
+                "failed to lock this session's tile scratch directory; not using it"
+            );
+            if let Err(err) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!(?err, path = %dir.display(), "failed to remove it again");
+            }
             None
         }
     }
@@ -6890,10 +6923,19 @@ fn create_tile_store_scratch_dir() -> Option<PathBuf> {
 /// shutdown), so the cost of the memoization is one empty directory in
 /// the case where nothing needed one.
 fn tile_store_scratch_dir() -> Option<&'static Path> {
-    static SCRATCH_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    // The `ScratchLock` is held here, in a `'static`, for the rest of
+    // the process's life **on purpose**. It is not an unused value: it
+    // is what tells the next Aurora process that this directory is
+    // live. Dropping it early releases the lock immediately, and the
+    // next run's startup sweep would then correctly conclude the
+    // directory is dead and delete it -- while this session is still
+    // paging unsaved pixels into it.
+    static SCRATCH_DIR: std::sync::OnceLock<Option<(PathBuf, aurora_tile::ScratchLock)>> =
+        std::sync::OnceLock::new();
     SCRATCH_DIR
         .get_or_init(create_tile_store_scratch_dir)
-        .as_deref()
+        .as_ref()
+        .map(|(path, _lock)| path.as_path())
 }
 
 /// Everything a clean shutdown has to undo, in one directly callable
@@ -6945,13 +6987,22 @@ fn tile_store_scratch_dir() -> Option<&'static Path> {
 /// that exit to [`aborted_startup_cleanup`] instead, which removes only
 /// this run's own scratch tiles.
 ///
-/// **Crash leftovers are still not covered** — see PLAN.md's own
-/// follow-up item, whose remaining half is a startup sweep. A hard
-/// crash, a `SIGKILL`, an OS shutdown, and a `panic = "abort"` build
-/// (the release profile) all end the process without running any Rust
-/// cleanup, so none of them reach `exiting` either; such a run leaves
-/// its scratch directory behind for the platform's temp cleaner, and
-/// the marker and the autosave have exactly the same gap.
+/// **Crash leftovers reach this function's counterpart, not this
+/// function.** A hard crash, a `SIGKILL`, an OS shutdown, and a
+/// `panic = "abort"` build (the release profile) all end the process
+/// without running any Rust cleanup, so none of them reach `exiting`
+/// either. Since 0.67.0 the *scratch directory* such a run leaves behind
+/// is collected by the startup sweep in [`run`]
+/// (`aurora_tile::sweep_orphaned_scratch_dirs`), which deletes a
+/// directory only once it can take its liveness lock. Two named gaps
+/// remain there, both deliberate: **Windows**, where the `flock`-based
+/// liveness check has no implementation yet and the sweep is an honest
+/// no-op, and **pre-0.67.0 leftovers**, which carry no lock file and are
+/// therefore never swept — "no lock file" cannot mean "dead" without
+/// also meaning it for a directory created microseconds ago. The marker
+/// and the autosave still have the original gap in full: nothing sweeps
+/// those, and a crashed run's marker is load-bearing anyway (it is what
+/// makes the *next* run offer recovery).
 fn clean_shutdown_cleanup(state: &mut impl ShutdownState) {
     clear_session_marker(state.marker_path());
     remove_autosave(&state.autosave_path());
@@ -10183,6 +10234,18 @@ pub fn run() -> anyhow::Result<()> {
     // *previous* run crashed.
     let had_previous_marker = previous_session_left_a_marker(&marker_path);
     write_session_marker(&marker_path);
+    // Strictly before this session's own scratch directory is first
+    // created (`tile_store_scratch_dir` is lazy, and `App::new` below is
+    // the earliest thing that reaches it): "never delete the current
+    // session's own directory" is then true by construction, because it
+    // does not exist yet. See `aurora_tile::sweep_orphaned_scratch_dirs`
+    // for what it will and -- far more importantly -- will not delete.
+    let sweep = aurora_tile::sweep_orphaned_scratch_dirs(&std::env::temp_dir(), SCRATCH_DIR_PREFIX);
+    tracing::info!(
+        removed = sweep.removed,
+        skipped = sweep.skipped,
+        "swept scratch directories left by sessions that are no longer running"
+    );
     let autosave_path = autosave_path();
     let layout_path = layout_path();
 
@@ -10253,6 +10316,15 @@ mod tests {
     use aurora_widgets::widgets::{insert_button, new_tree};
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
+
+    /// Only `*.tile` files, never a bare directory-entry count: since
+    /// 0.67.0 a scratch directory also holds
+    /// `aurora_tile::LOCK_FILE_NAME`, and an enumerator that counted
+    /// entries would silently include it and start asserting the wrong
+    /// number.
+    fn is_tile_file(path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|ext| ext == "tile")
+    }
 
     /// [`ClipboardAccess`]'s test double — a plain in-memory slot, no
     /// real OS clipboard involved (this sandbox has no display server
@@ -13394,7 +13466,7 @@ mod tests {
     /// path every process and every user shared.
     #[test]
     fn each_scratch_directory_is_a_new_one() {
-        let (Some(first), Some(second)) = (
+        let (Some((first, first_lock)), Some((second, second_lock))) = (
             create_tile_store_scratch_dir(),
             create_tile_store_scratch_dir(),
         ) else {
@@ -13406,6 +13478,10 @@ mod tests {
         let fixed = std::env::temp_dir().join("aurora-tiles");
         assert_ne!(first, fixed);
         assert_ne!(second, fixed);
+        // Released before the directories go away, so the removal below
+        // is not racing the guard's own file.
+        drop(first_lock);
+        drop(second_lock);
         // These two are deliberately *not* the memoized session
         // directory, so nothing else is using them -- clean up rather
         // than leaving two directories behind per test run.
@@ -13431,9 +13507,10 @@ mod tests {
     fn a_fresh_scratch_directory_is_owner_only_before_any_store_opens() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let Some(dir) = create_tile_store_scratch_dir() else {
+        let Some((dir, lock)) = create_tile_store_scratch_dir() else {
             unreachable!("a scratch directory is always creatable in a real test environment");
         };
+        drop(lock);
         let mode = match std::fs::metadata(&dir) {
             Ok(meta) => meta.permissions().mode() & 0o777,
             Err(err) => unreachable!("the directory was just created: {err}"),
@@ -13504,9 +13581,12 @@ mod tests {
         // Deliberately a throwaway directory, not the live memoized
         // session one: removing the real one would pull the scratch
         // disk out from under every other test sharing this binary.
-        let Some(dir) = create_tile_store_scratch_dir() else {
+        let Some((dir, lock)) = create_tile_store_scratch_dir() else {
             unreachable!("a scratch directory is always creatable in a real test environment");
         };
+        // Released before the removal below: the guard's own lock file
+        // lives inside the directory this test is about to delete.
+        drop(lock);
         let tile = dir.join("0-0-0_0_0_0.tile");
         if let Err(err) = std::fs::write(&tile, [0_u8; 4]) {
             unreachable!("a fresh scratch directory must be writable: {err}");
@@ -13552,7 +13632,7 @@ mod tests {
                     if entry.path().is_dir() {
                         count_files(&entry.path())
                     } else {
-                        1
+                        usize::from(is_tile_file(&entry.path()))
                     }
                 })
                 .sum()
@@ -14042,9 +14122,13 @@ mod tests {
             unreachable!("a fresh tempdir must be writable: {err}");
         }
 
-        let Some(scratch) = create_tile_store_scratch_dir() else {
+        let Some((scratch, scratch_lock)) = create_tile_store_scratch_dir() else {
             unreachable!("a scratch directory is always creatable in a real test environment");
         };
+        // This fixture hands the directory to a `ShutdownState` that
+        // will delete it, so the liveness guard must not still be
+        // holding a file inside it.
+        drop(scratch_lock);
         let Some(budget) = std::num::NonZeroUsize::new(1) else {
             unreachable!("1 is non-zero");
         };
@@ -14065,7 +14149,10 @@ mod tests {
             unreachable!("a test-local scratch disk must accept the write: {err}");
         }
         let tiles = match std::fs::read_dir(&scratch) {
-            Ok(entries) => entries.flatten().count(),
+            Ok(entries) => entries
+                .flatten()
+                .filter(|entry| is_tile_file(&entry.path()))
+                .count(),
             Err(err) => unreachable!("the scratch directory is readable: {err}"),
         };
         assert!(
@@ -15209,7 +15296,9 @@ mod tests {
             unreachable!("the scratch directory must be readable");
         };
         for entry in entries.flatten() {
-            scratch_files.push(entry.path());
+            if is_tile_file(&entry.path()) {
+                scratch_files.push(entry.path());
+            }
         }
         assert_eq!(
             scratch_files.len(),
@@ -20155,7 +20244,11 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(scratch.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
         assert!(
             !files.is_empty(),
             "at least one tile should have been evicted"
@@ -20256,7 +20349,11 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(scratch.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
         let [victim] = files.as_slice() else {
             unreachable!("exactly one tile should have been evicted: {files:?}");
         };
@@ -22163,7 +22260,11 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(dir.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
         let [victim] = files.as_slice() else {
             unreachable!("exactly one tile should have been evicted: {files:?}");
         };
@@ -22267,7 +22368,11 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(dir.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
         assert_eq!(
             files.len(),
             broken.len(),
