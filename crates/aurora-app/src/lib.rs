@@ -1860,15 +1860,32 @@ fn crash_recovery_dialog_message(recovered: bool) -> &'static str {
     }
 }
 
-/// Opens the crash-recovery dialog (a no-op if one is already open):
-/// inserts it into `workspace.tree` under `workspace.root` and moves
-/// keyboard focus to its first (only, today) action.
-fn open_crash_recovery_dialog(
+/// Opens a modal dialog (a no-op if one is already open): inserts it
+/// into `workspace.tree` under `workspace.root` and moves keyboard focus
+/// to its first action.
+///
+/// The generic mechanism every dialog this crate opens goes through —
+/// [`open_crash_recovery_dialog`] is one thin wrapper, and
+/// [`App::save_file`]'s own incomplete-composite refusal is the other.
+/// **The "already open is a no-op" guard lives here, not in the
+/// wrappers**, so every caller inherits it: `App` holds exactly one
+/// dialog slot, a modal alert already blocks everything else, and a
+/// caller that fires repeatedly (a pointer-move during a refused drag,
+/// say) must not stack or replace what the user is currently reading.
+///
+/// Pushing the updated accessibility tree to the platform, and re-running
+/// layout so the new subtree actually has bounds, stay the caller's job
+/// (`App::push_accessibility`/`App::apply_resize`) — the same "pure
+/// dispatch, caller owns the one real platform side-effect" split
+/// [`select_layer`] already uses.
+fn open_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     dialog: &mut Option<DialogHandle>,
     scales: &Scales,
-    recovered: bool,
+    title: &str,
+    message: &str,
+    actions: Vec<DialogAction>,
 ) {
     if dialog.is_some() {
         return;
@@ -1877,29 +1894,81 @@ fn open_crash_recovery_dialog(
         &mut workspace.tree,
         workspace.root,
         scales,
-        "Aurora Didn't Close Properly",
-        crash_recovery_dialog_message(recovered),
-        crash_recovery_dialog_actions(),
+        title,
+        message,
+        actions,
     ) {
         Ok(handle) => handle,
         Err(err) => {
-            tracing::warn!(?err, "failed to open the crash recovery dialog");
+            tracing::warn!(?err, title, "failed to open a dialog");
             return;
         }
     };
     if let Some(button) = handle.first_action()
         && let Err(err) = focus.focus(&mut workspace.tree, button)
     {
-        tracing::warn!(?err, "failed to focus the crash recovery dialog");
+        tracing::warn!(?err, title, "failed to focus a dialog");
     }
     *dialog = Some(handle);
 }
 
-/// Closes the crash-recovery dialog (a no-op if none is open): removes
-/// it from `workspace.tree` and clears any focus left dangling on it —
-/// the same [`FocusManager::validate`] pattern
-/// [`close_command_palette`] already uses.
-fn close_crash_recovery_dialog(
+/// Opens the crash-recovery dialog — [`open_dialog`] with this dialog's
+/// own title, message ([`crash_recovery_dialog_message`]) and actions
+/// ([`crash_recovery_dialog_actions`]), and therefore a no-op if a
+/// dialog is already open.
+fn open_crash_recovery_dialog(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+    scales: &Scales,
+    recovered: bool,
+) {
+    open_dialog(
+        workspace,
+        focus,
+        dialog,
+        scales,
+        "Aurora Didn't Close Properly",
+        crash_recovery_dialog_message(recovered),
+        crash_recovery_dialog_actions(),
+    );
+}
+
+const EXPORT_REFUSED_DISMISS: &str = "export.refused.dismiss";
+
+/// The export-refused dialog's own action — a single "OK", because there
+/// is nothing to choose: the export already refused, and no file was
+/// touched. Acknowledging is the whole interaction, the same shape
+/// [`crash_recovery_dialog_actions`] settled on for the same reason.
+fn export_refused_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(EXPORT_REFUSED_DISMISS, "OK")]
+}
+
+/// The itemized message for an export refused because
+/// [`composite_document`] could not read every tile it needed
+/// ([`aurora_io::IoError::IncompleteComposite`]).
+///
+/// Itemized, not generic, because that is what makes it actionable and
+/// what CLAUDE.md's own "warn with an itemized list" rule asks for: the
+/// count of failed tile reads and the first failure's own message, both
+/// of which the error already carries. It also states plainly that
+/// nothing was written and that whatever was already at the path is
+/// untouched — the single most important fact for someone who just hit
+/// Save on unsaved work.
+fn incomplete_composite_message(skipped: usize, first: &str) -> String {
+    let plural = if skipped == 1 { "" } else { "s" };
+    format!(
+        "Nothing was written. {skipped} layer tile read{plural} failed while compositing this \
+         document, so the exported image would have been missing content. The first failure was: \
+         {first}. Any existing file at that path is unchanged."
+    )
+}
+
+/// Closes the open dialog (a no-op if none is open): removes it from
+/// `workspace.tree` and clears any focus left dangling on it — the same
+/// [`FocusManager::validate`] pattern [`close_command_palette`] already
+/// uses.
+fn close_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     dialog: &mut Option<DialogHandle>,
@@ -1908,12 +1977,12 @@ fn close_crash_recovery_dialog(
         return;
     };
     if let Err(err) = workspace.tree.remove(handle.root) {
-        tracing::warn!(?err, "failed to close the crash recovery dialog");
+        tracing::warn!(?err, "failed to close the open dialog");
     }
     focus.validate(&workspace.tree);
 }
 
-/// Routes one key press while the crash-recovery dialog is open —
+/// Routes one key press while a modal dialog is open —
 /// captures the keyboard directly, the same modal precedence
 /// [`handle_palette_key`] uses for the command palette (and, per
 /// [`handle_key`]'s own routing order, this dialog takes priority over
@@ -1928,7 +1997,7 @@ fn handle_dialog_key(
         return;
     };
     match chord.key {
-        Key::Named(NamedKey::Escape) => close_crash_recovery_dialog(workspace, focus, dialog),
+        Key::Named(NamedKey::Escape) => close_dialog(workspace, focus, dialog),
         Key::Named(NamedKey::Enter) => {
             let action = focus
                 .focused()
@@ -1940,7 +2009,7 @@ fn handle_dialog_key(
     }
 }
 
-/// Closes the crash-recovery dialog and, if `action` names one of its
+/// Closes the open dialog and, if `action` names one of its
 /// own action ids, logs it as chosen — the shared "resolve, then close"
 /// step [`handle_dialog_key`]'s own `Enter` case and
 /// [`handle_dialog_pointer`]'s own button-click case both need, factored
@@ -1951,13 +2020,13 @@ fn run_dialog_action(
     dialog: &mut Option<DialogHandle>,
     action: Option<String>,
 ) {
-    close_crash_recovery_dialog(workspace, focus, dialog);
+    close_dialog(workspace, focus, dialog);
     if let Some(action) = action {
-        tracing::info!(action, "crash recovery dialog action chosen");
+        tracing::info!(action, "dialog action chosen");
     }
 }
 
-/// Routes a real pointer press while the crash-recovery dialog is open
+/// Routes a real pointer press while a modal dialog is open
 /// — the same modal precedence [`handle_dialog_key`] already gives the
 /// keyboard, extended to the pointer now that this crate has real
 /// pointer input (PLAN.md M1.9) — previously this dialog's own named,
@@ -2952,8 +3021,8 @@ fn handle_palette_key(
     None
 }
 
-/// One key press's full routing, most-modal-first: the crash-recovery
-/// dialog owns the keyboard while open ([`handle_dialog_key`]) — a modal
+/// One key press's full routing, most-modal-first: an open modal
+/// dialog owns the keyboard ([`handle_dialog_key`]) — a modal
 /// alert blocks everything else, including the palette; otherwise the
 /// command palette owns it while open ([`handle_palette_key`]);
 /// otherwise a chord that resolves in `shortcuts` runs its command
@@ -7621,12 +7690,20 @@ struct App {
     /// in sync (see `aurora_widgets::widgets::command_palette`'s own doc
     /// comment).
     command_palette: Option<WidgetId>,
-    /// The open crash-recovery dialog, if one is open — `None` is
-    /// "closed" or "never needed one," the same "no separate visibility
-    /// flag" shape `command_palette` field above already uses. Opened
-    /// once, at construction, if [`previous_session_left_a_marker`] said
-    /// so — see this crate's own "crash recovery" section.
-    crash_recovery_dialog: Option<DialogHandle>,
+    /// The one open modal dialog, if any — `None` is "closed" or "never
+    /// needed one," the same "no separate visibility flag" shape the
+    /// `command_palette` field above already uses.
+    ///
+    /// **One slot, deliberately.** A modal alert blocks everything else
+    /// ([`handle_key`]'s own routing order), so a second one could never
+    /// be interacted with anyway; [`open_dialog`]'s own "already open is
+    /// a no-op" guard is what makes that concrete. Two callers open one
+    /// today: crash recovery at construction, if
+    /// [`previous_session_left_a_marker`] said so (see this crate's own
+    /// "crash recovery" section), and [`App::save_file`] refusing an
+    /// export whose composite came out incomplete
+    /// ([`incomplete_composite_message`]).
+    dialog: Option<DialogHandle>,
     /// This run's own "still running" marker file — written in [`run`]
     /// before this `App` is built, cleared on a clean shutdown
     /// (`WindowEvent::CloseRequested`).
@@ -7856,7 +7933,7 @@ struct App {
     pointer_position: Option<(f32, f32)>,
     /// An in-progress pointer drag (Pan, Marquee Select, Brush, or
     /// Eraser), if any — `None` is "not dragging," the same "no separate
-    /// flag" shape `command_palette`/`crash_recovery_dialog` above
+    /// flag" shape `command_palette`/`dialog` above
     /// already use.
     drag: Option<Drag>,
     /// An in-progress dock-rail resize, if any — deliberately separate
@@ -8030,12 +8107,12 @@ impl App {
         );
 
         let mut focus = FocusManager::default();
-        let mut crash_recovery_dialog = None;
+        let mut dialog = None;
         if had_previous_marker {
             open_crash_recovery_dialog(
                 &mut workspace,
                 &mut focus,
-                &mut crash_recovery_dialog,
+                &mut dialog,
                 &scales,
                 was_recovered,
             );
@@ -8052,7 +8129,7 @@ impl App {
             shortcuts: default_shortcuts(),
             modifiers: Modifiers::none(),
             command_palette: None,
-            crash_recovery_dialog,
+            dialog,
             marker_path,
             layout_path,
             scale_factor: 1.0,
@@ -8132,7 +8209,7 @@ impl App {
         let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
-            &mut self.crash_recovery_dialog,
+            &mut self.dialog,
             &mut self.command_palette,
             &mut self.tool,
             &mut self.layers,
@@ -8417,6 +8494,49 @@ impl App {
         self.push_accessibility();
     }
 
+    /// Opens the export-refused dialog with `message` and makes it real
+    /// on screen and to a screen reader: re-runs layout so the freshly
+    /// inserted subtree actually has bounds (otherwise every node in it
+    /// keeps zero-size defaults and nothing is hit-testable), then pushes
+    /// the updated accessibility tree.
+    ///
+    /// **Both steps live here rather than at the call site** so this
+    /// dialog is announced whichever route reached [`Self::save_file`] —
+    /// the keyboard path (`App::handle_key_event`) already pairs
+    /// `apply_resize`/`push_accessibility` around its own dispatch, but
+    /// the macOS native-menu path (`App::handle_menu_event`) only pushes
+    /// accessibility. Doing it unconditionally here costs one redundant
+    /// layout pass on the keyboard path — pure CPU geometry on a small
+    /// tree ([`Self::apply_resize`]'s own doc comment) — and removes a
+    /// whole class of "which call site remembered?" bug.
+    ///
+    /// A silent no-op, logged, if the design scales can't be loaded:
+    /// there is no dialog to build without them, and the export has
+    /// already refused safely either way.
+    fn open_export_refused_dialog(&mut self, message: &str) {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a dialog");
+                return;
+            }
+        };
+        open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            "Couldn't Export This Document",
+            message,
+            export_refused_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+    }
+
     /// Saves to `path` — the whole document, real and multi-layer
     /// ([`Self::save_aur_file`]), if the extension names `.aur`;
     /// otherwise a flat, composited export of the real document, built
@@ -8481,9 +8601,27 @@ impl App {
     /// could not be read out of the store (a corrupted scratch-disk
     /// tile, say), and this function then returns without touching
     /// `path` at all — no partial file, no overwrite of whatever was
-    /// there. That refusal is currently log-only: surfacing it as the
-    /// itemized, user-visible warning FR-001 wants is separate, still-
-    /// open work tracked in PLAN.md.
+    /// there. **That refusal is now user-visible**, not only logged: it
+    /// opens the same modal dialog crash recovery uses ([`open_dialog`]),
+    /// carrying the itemized detail the error already knows — how many
+    /// tile reads failed and what the first one said
+    /// ([`incomplete_composite_message`]) — which is what CLAUDE.md's own
+    /// "warn with an itemized list before any lossy save" rule asks for.
+    /// Every other error from this path stays log-only, deliberately: a
+    /// bad extension or a failed write is a different, narrower failure
+    /// than "the document itself could not be read," and widening the
+    /// match would put a modal alert in front of failures that don't
+    /// warrant one.
+    ///
+    /// **The wiring line itself is covered by inspection, not by a
+    /// test.** Reaching it needs a real `App` — a window, a GPU adapter,
+    /// a live tile store — which this sandbox has none of. What *is*
+    /// unit-tested is both halves it is built from: the message's own
+    /// content ([`incomplete_composite_message`]) and the dialog
+    /// mechanics ([`open_dialog`]/[`handle_dialog_key`]/
+    /// [`run_dialog_action`]), the same split this crate already draws
+    /// everywhere else between pure logic and the one platform-bound
+    /// call site that feeds it.
     fn save_file(&mut self, path: &Path) {
         if is_aur_path(path) {
             self.save_aur_file(path);
@@ -8496,14 +8634,18 @@ impl App {
         let image = match composite_document(&self.layers, store, width, height) {
             Ok(image) => image,
             Err(err) => {
-                // Includes `IoError::IncompleteComposite` -- the export
-                // refused because one or more layer tiles could not be
-                // read (see `composite_document`'s own `# Errors`). The
-                // *file* is safe either way: nothing is written, and
-                // whatever was already at `path` is untouched. What is
-                // still missing is telling the user, rather than only the
-                // log -- tracked in PLAN.md, not solved here.
+                // The *file* is safe either way: nothing is written, and
+                // whatever was already at `path` is untouched. The log
+                // line stays exactly as it was -- a dialog the user
+                // dismisses is not a substitute for a record of what
+                // happened.
                 tracing::error!(?err, "refusing to export: could not composite the document");
+                if let aurora_io::IoError::IncompleteComposite { skipped, first } = &err {
+                    // Only this variant, deliberately -- see this
+                    // method's own doc comment for why the match is not
+                    // widened to a catch-all.
+                    self.open_export_refused_dialog(&incomplete_composite_message(*skipped, first));
+                }
                 return;
             }
         };
@@ -8701,14 +8843,14 @@ impl App {
             return;
         };
 
-        // The crash-recovery dialog, if open, owns every pointer press
+        // A modal dialog, if open, owns every pointer press
         // the same way it already owns the keyboard (`handle_key`'s own
         // routing order) — a modal alert blocks everything else,
         // including layer selection and canvas tools.
         if handle_dialog_pointer(
             &mut self.workspace,
             &mut self.focus,
-            &mut self.crash_recovery_dialog,
+            &mut self.dialog,
             button,
             position,
         ) {
@@ -9962,31 +10104,32 @@ mod tests {
         COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
-        ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess,
-        Key, KeyChord, Modifiers, NamedKey, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE,
-        RailResize, ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin,
-        after_undo_redo, apply_canvas_min_zoom, apply_mask_clip, apply_scroll_zoom,
-        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
-        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, collect_widget_paints, commit_ending_drag, composite_document,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message, create_dir_owner_only,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eraser_stroke_mut, eyedropper_sample, guarded_scale_factor,
-        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
-        handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path, layer_local_point,
-        load_document_view, load_scales, load_theme, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
-        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
-        select_layer, shift_bounds, splitmix64, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS,
+        EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord, Modifiers, NamedKey, PanBounds,
+        PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, ShutdownState, UndoKind, UndoOrder,
+        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
+        apply_mask_clip, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
+        background_color_from_theme, begin_drag, brush_stroke_mut, canvas_area_logical_size,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
+        composite_document, composite_surface_id, continue_drag, crash_recovery_dialog_message,
+        create_dir_owner_only, create_tile_store_scratch_dir, default_shortcuts, demo_document,
+        dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
+        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
+        layer_local_point, load_document_view, load_scales, load_theme, logical_point,
+        logical_size, open_command_palette, open_crash_recovery_dialog, open_dialog, open_image,
+        open_tile_store, palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo,
+        pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
+        run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds, splitmix64,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
+        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -20721,11 +20864,172 @@ mod tests {
     }
 
     #[test]
-    fn close_crash_recovery_dialog_on_an_already_closed_dialog_is_a_no_op() {
+    fn incomplete_composite_message_names_the_count_and_the_first_failure() {
+        let message = incomplete_composite_message(3, "tile (2, 7): checksum mismatch");
+        assert!(message.contains('3'), "{message}");
+        assert!(
+            message.contains("tile (2, 7): checksum mismatch"),
+            "the first failure's own detail must survive verbatim: {message}"
+        );
+        assert!(
+            message.contains("Nothing was written"),
+            "the user's first question is whether their file was touched: {message}"
+        );
+    }
+
+    #[test]
+    fn incomplete_composite_message_agrees_with_itself_about_plurality() {
+        let one = incomplete_composite_message(1, "boom");
+        assert!(one.contains("1 layer tile read failed"), "{one}");
+        let many = incomplete_composite_message(2, "boom");
+        assert!(many.contains("2 layer tile reads failed"), "{many}");
+    }
+
+    /// The export-refusal dialog goes through exactly the same
+    /// [`open_dialog`] mechanism crash recovery does — this asserts the
+    /// generic helper, since `App::save_file`'s own wiring line needs a
+    /// real window/GPU/tile store to reach and is covered by inspection
+    /// (see that method's own doc comment).
+    #[test]
+    fn open_dialog_focuses_its_first_action() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
-        close_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog);
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+
+        let Some(handle) = dialog else {
+            unreachable!("must open");
+        };
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .map(accesskit::Node::role),
+            Some(accesskit::Role::AlertDialog)
+        );
+        assert_eq!(focus.focused(), handle.first_action());
+        let Some((id, _)) = handle.actions.first() else {
+            unreachable!("the export-refused dialog always has one action");
+        };
+        assert_eq!(id, EXPORT_REFUSED_DISMISS);
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.message)
+                .and_then(accesskit::Node::label),
+            Some(incomplete_composite_message(1, "boom").as_str())
+        );
+    }
+
+    #[test]
+    fn open_dialog_a_second_time_is_a_no_op_even_for_a_different_dialog() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+        let first = dialog.clone();
+        // A *different* dialog, to pin that the guard is about the slot
+        // being occupied at all -- not about opening the same one twice.
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        assert_eq!(
+            dialog, first,
+            "a dialog already on screen must not be replaced under the user"
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_export_refused_dialog_through_the_same_routing() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
+        );
+
+        assert_eq!(dialog, None);
+        assert!(!workspace.tree.contains(handle.root));
+        assert_eq!(focus.focused(), None);
+    }
+
+    #[test]
+    fn enter_on_the_export_refused_dialogs_action_closes_it() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Enter)),
+        );
+
+        assert_eq!(dialog, None);
+    }
+
+    #[test]
+    fn close_dialog_on_an_already_closed_dialog_is_a_no_op() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        close_dialog(&mut workspace, &mut focus, &mut dialog);
         assert_eq!(dialog, None);
     }
 

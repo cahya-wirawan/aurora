@@ -9778,18 +9778,23 @@ structural design work.
     itemized, user-visible warning FR-001's lossy-save rule calls for
     needs a dialog this shell does not have yet — see the new open item
     below.
-- [ ] **An export refused for unreadable tiles is only logged, never
+- [x] **An export refused for unreadable tiles is only logged, never
     shown to the user.** Opened 2026-08-24 by the 0.52.1 review, as the
     named remainder of the item above. `composite_document` now returns
     `IoError::IncompleteComposite` rather than silently writing a file
     with missing content, and `App::save_file` correctly writes nothing —
-    but from the user's side a Save that refuses looks identical to a
-    Save that worked, unless they are reading the log. PRD FR-001's rule
+    but from the user's side a Save that refuses looked identical to a
+    Save that worked, unless they were reading the log. PRD FR-001's rule
     is an *itemized warning before any lossy save*; this is the same
-    obligation on the same path. Needs a modal/notification surface in
-    `aurora-ui` that `save_file` can drive, which is real UI work rather
-    than a one-line change, and is why it was scoped out of 0.52.1 rather
-    than half-built.
+    obligation on the same path. **Fixed 2026-09-01 (0.65.0)** — the
+    modal surface this item said it needed turned out to already exist:
+    the crash-recovery dialog is built on `aurora_widgets`'
+    general-purpose `insert_dialog`, so the work was generalizing this
+    crate's own crash-recovery-specific plumbing into a shared
+    `open_dialog`/`close_dialog` and giving `save_file` an itemized
+    message, not building a new widget. See the 0.65.0 addendum under
+    "Next action" for exactly what landed and what is still only covered
+    by inspection.
 - [x] **A tile whose page-in fails is forgotten, so the *next* read of it
     silently returns a blank tile** — found 2026-08-24 while writing the
     export test above (**pre-existing**, not introduced by 0.52.1, and
@@ -13928,6 +13933,73 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-01 (0.65.0) — an export refused for unreadable tiles
+now says so on screen, not only in the log.** M1.9's own open item (see
+above) assumed this needed "a modal/notification surface in `aurora-ui`
+that `save_file` can drive, which is real UI work". That assumption was
+wrong in a useful way: `aurora_widgets::widgets::dialog::insert_dialog`
+is already general — a title, a message, an ordered row of real,
+focusable action buttons, with `Role::AlertDialog` and `set_modal()` —
+and the only thing making it crash-recovery-specific was `aurora-app`'s
+own wrapper. So this round **generalized the plumbing rather than
+building a widget**: `App::crash_recovery_dialog` is now just
+`App::dialog` (one modal slot, since a modal alert blocks everything
+else anyway), `close_crash_recovery_dialog` is `close_dialog`, and
+`open_crash_recovery_dialog`'s body is now a generic `open_dialog(...,
+title, message, actions)` that the crash-recovery wrapper calls with its
+own strings. **The "already open is a no-op" guard moved down into
+`open_dialog`**, deliberately, so every present and future caller
+inherits it. No new widget code, no new design tokens: `insert_dialog`
+and `insert_button` already resolve their own token-based styling
+(FR-027), which is precisely why reusing them was the right shape.
+
+The refusal itself: `save_file` keeps its `tracing::error!` exactly as
+it was — a dialog the user dismisses is not a record of what happened —
+and additionally matches `IoError::IncompleteComposite` **specifically**
+(not a catch-all `Err(_)`; a bad extension or a failed write is a
+narrower failure that does not warrant a modal alert) to open the dialog
+with a new pure `incomplete_composite_message(skipped, first)`. That
+message is itemized in FR-001's sense because the error already carries
+the itemized detail: how many layer tile reads failed, and verbatim what
+the first one said. It leads with "Nothing was written" and ends with
+"Any existing file at that path is unchanged", because that is the first
+thing someone who just hit Save on unsaved work needs to know. A new
+`App::open_export_refused_dialog` owns the `apply_resize` +
+`push_accessibility` pairing itself rather than leaving it to the call
+site, so the dialog is laid out and screen-reader-announced whichever
+route reached `save_file` — the keyboard path already paired both, but
+the macOS native-menu path only pushed accessibility.
+
+**Six new tests** (301 in `aurora-app`, up from 295), all headless:
+`incomplete_composite_message_names_the_count_and_the_first_failure`,
+`incomplete_composite_message_agrees_with_itself_about_plurality`,
+`open_dialog_focuses_its_first_action`,
+`open_dialog_a_second_time_is_a_no_op_even_for_a_different_dialog`
+(deliberately opens a *different* dialog second, to pin that the guard
+is about the slot being occupied at all),
+`escape_closes_the_export_refused_dialog_through_the_same_routing`, and
+`enter_on_the_export_refused_dialogs_action_closes_it`. Every existing
+crash-recovery dialog test was kept and still passes **by name**, not
+merely by count — `open_crash_recovery_dialog_focuses_its_only_action`,
+`opening_the_crash_recovery_dialog_a_second_time_is_a_no_op`,
+`enter_on_the_focused_action_closes_the_dialog`,
+`escape_also_closes_the_dialog`,
+`clicking_the_dialogs_action_button_closes_it`,
+`clicking_elsewhere_while_the_dialog_is_open_swallows_the_click_without_closing_it`,
+`handle_key_routes_to_the_dialog_before_the_palette_when_both_could_be_open`
+— which is what proves the rename did not silently delete coverage.
+
+**Still inspection-only, stated plainly**: the one line inside
+`save_file` that actually calls `open_export_refused_dialog` is not
+covered by a test. Reaching it needs a real `App` — a window, a GPU
+adapter, a live tile store — and this crate has no test that can
+construct one (`App::new` needs an `EventLoopProxy`). Both halves the
+line is built from *are* tested: the message's content, and the dialog
+mechanics through the same `open_dialog`/`handle_dialog_key`/
+`run_dialog_action` routing the crash-recovery dialog uses. That split
+is written into `save_file`'s own doc comment so the next reader is not
+misled about what "tested" covers here.
 
 **Addendum 2026-09-01 (0.64.2) — 0.64.0's "bounded regardless of how
 large the journal on disk was" was only half true; the other half is
