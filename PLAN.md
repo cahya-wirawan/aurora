@@ -14286,16 +14286,27 @@ strictly before anything touches `tile_store_scratch_dir`, so "never
 delete the current session's own directory" is true *by construction* —
 it does not exist yet.
 
-**A required pre-check found real hazards and they are fixed here.**
-Seven scratch-directory enumerators counted directory *entries* rather
-than filtering by the `.tile` extension (`aurora-io`'s
-`break_the_only_scratch_file`, `aurora-tile`'s two-store collision test,
-and five in `aurora-app`), and a lock file inside each directory would
-have silently broken their exact-count assertions. All seven now filter
-by extension. The alternative design — a sibling `<dir>.lock` — was
-rejected: `/tmp` is world-writable and sticky, so a sibling can be
-pre-created by another user, whereas the directory itself is `0700` with
-its ownership verified before anything inside it is opened.
+**A required pre-check found scratch-directory enumerators that counted
+directory *entries* rather than filtering by the `.tile` extension**, and
+a lock file inside each directory would have broken their exact-count
+assertions. Seven were fixed here; an **eighth** — `aurora-brush`'s
+`break_the_only_scratch_file` — was missed and is fixed in 0.68.5.
+
+**Corrected 2026-09-01 (0.68.5): this paragraph originally said all eight
+"would have silently broken", and that overstates the real exposure.**
+Most of those sites enumerate a bare `tempfile::tempdir()` that never
+receives a lock file in the first place, because nothing in them calls
+`lock_scratch_dir` — they were hardened pre-emptively, against a lock
+file appearing there later, not repaired. Exactly **one** was genuinely
+exposed: the production path where `aurora-app` locks the session
+directory a `TileStore` then pages into. Restated honestly, that is one
+real fix and seven pieces of cheap insurance, which is still worth having
+and is not the same claim.
+
+The alternative design — a sibling `<dir>.lock` — was rejected: `/tmp` is
+world-writable and sticky, so a sibling can be pre-created by another
+user, whereas the directory itself is `0700` with its ownership verified
+before anything inside it is opened.
 
 **Eight new tests** in `aurora-tile` (55 up from 47), all `#[cfg(unix)]`
 and all against a `tempfile::tempdir()`: dead-owner removed;

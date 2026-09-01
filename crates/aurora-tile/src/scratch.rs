@@ -67,16 +67,24 @@ use std::path::Path;
 
 /// What [`sweep_orphaned_scratch_dirs`] did.
 ///
-/// `removed + skipped` is every entry whose name matched the prefix;
-/// entries that did not match are not counted at all.
+/// `removed + skipped` is every entry whose name matched the prefix,
+/// plus any entry that could not be read well enough to have a name at
+/// all; entries whose name is readable and does not match are not
+/// counted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
     /// Directories proven dead — their lock was acquired, so no process
     /// held it — and therefore deleted.
     pub removed: usize,
     /// Matching entries left alone for **any** reason: a live lock, a
-    /// missing lock file, a symlink, a plain file, a foreign owner, or
-    /// any error at all along the way. Never a deletion.
+    /// missing lock file, a symlink, a plain file, a foreign owner, an
+    /// entry that could not be read at all, or any other error along the
+    /// way. Never a deletion.
+    ///
+    /// This is the sweep's only operator-visible signal, which is why an
+    /// unreadable entry counts here (0.68.5) rather than vanishing: a
+    /// failure the count never reflects is the one a startup housekeeping
+    /// job is least likely to be noticed having.
     pub skipped: usize,
 }
 
@@ -105,8 +113,14 @@ pub const LOCK_FILE_NAME: &str = "aurora.lock";
 pub struct ScratchLock {
     /// Kept solely to own the descriptor the lock is attached to. The
     /// lock's lifetime *is* this `File`'s lifetime.
+    ///
+    /// `Option` for one reason: on non-Unix there is no lock to attach
+    /// to anything yet, and the guard must still be constructible so
+    /// that arm can be genuinely infallible — see [`lock_scratch_dir`]'s
+    /// own non-Unix version. On Unix it is always `Some`, and a `None`
+    /// guard is never produced.
     #[allow(dead_code)]
-    file: std::fs::File,
+    file: Option<std::fs::File>,
 }
 
 /// Takes the exclusive, non-blocking `flock` on an already-existing
@@ -259,7 +273,7 @@ pub fn lock_scratch_dir(dir: &Path) -> std::io::Result<ScratchLock> {
                     "could not unlink the temporary lock name after publishing it"
                 );
             }
-            Ok(ScratchLock { file })
+            Ok(ScratchLock { file: Some(file) })
         }
         Err(err) => {
             drop(file);
@@ -268,7 +282,7 @@ pub fn lock_scratch_dir(dir: &Path) -> std::io::Result<ScratchLock> {
                 return Err(err);
             }
             Ok(ScratchLock {
-                file: try_lock_existing(&canonical)?,
+                file: Some(try_lock_existing(&canonical)?),
             })
         }
     }
@@ -283,20 +297,44 @@ pub fn lock_scratch_dir(dir: &Path) -> std::io::Result<ScratchLock> {
 /// which sweeps nothing on this platform, so nothing depends on this
 /// guard meaning anything yet.
 ///
+/// **Genuinely infallible, and that is load-bearing rather than
+/// cosmetic.** Until 0.68.5 this doc said "never returns `Err`" while
+/// the body propagated the open failure with `?` — and `aurora-app`
+/// treats a lock failure as fatal for the whole session: it deletes the
+/// scratch directory it has just created and falls back to "painting is
+/// disabled this session". On Unix that trade is right, because an
+/// unlocked directory really would look dead to the next run's sweep.
+/// On a platform that sweeps nothing and where the guard means nothing
+/// yet, it would be a brand-new way to lose a session for no benefit at
+/// all. So the lock file is created best-effort, a failure is logged and
+/// ignored, and a guard is always returned.
+///
 /// # Errors
 ///
-/// Never returns `Err` on this platform. The signature matches the Unix
-/// one so callers need no `cfg` of their own.
+/// Never returns `Err` on this platform — see above. The signature
+/// matches the Unix one so callers need no `cfg` of their own.
 #[cfg(not(unix))]
-pub fn lock_scratch_dir(_dir: &Path) -> std::io::Result<ScratchLock> {
-    Ok(ScratchLock {
-        file: std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(_dir.join(LOCK_FILE_NAME))?,
-    })
+pub fn lock_scratch_dir(dir: &Path) -> std::io::Result<ScratchLock> {
+    let path = dir.join(LOCK_FILE_NAME);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => Some(file),
+        Err(err) => {
+            tracing::debug!(
+                path = %path.display(),
+                %err,
+                "could not create the scratch lock file; this platform sweeps nothing, so the \
+                 guard means nothing yet and the session continues"
+            );
+            None
+        }
+    };
+    Ok(ScratchLock { file })
 }
 
 /// One matching entry's liveness, as an explicit three-way answer.
@@ -354,7 +392,7 @@ fn liveness(dir: &Path) -> (Verdict, Option<ScratchLock>) {
     // fresh lock file, lock it trivially, and call a directory nothing
     // ever proved dead `Dead`.
     match try_lock_existing(&dir.join(LOCK_FILE_NAME)) {
-        Ok(file) => (Verdict::Dead, Some(ScratchLock { file })),
+        Ok(file) => (Verdict::Dead, Some(ScratchLock { file: Some(file) })),
         Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => (Verdict::Alive, None),
         Err(_) => (Verdict::Unknown, None),
     }
@@ -396,10 +434,23 @@ pub fn sweep_orphaned_scratch_dirs(parent: &Path, prefix: &str) -> SweepReport {
     };
 
     for entry in entries {
-        let Ok(entry) = entry else {
-            // An unreadable entry is not even a candidate -- there is no
-            // name to match against, so it is not counted either.
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                // There is no name to match against, so this *might* not
+                // have been a candidate at all -- but `skipped` is this
+                // sweep's only operator-visible signal, and silently
+                // dropping an entry it could not even read would make it
+                // the one failure the count never reflects. Counted, and
+                // logged, rather than invisible.
+                report.skipped += 1;
+                tracing::debug!(
+                    parent = %parent.display(),
+                    %err,
+                    "could not read a directory entry while sweeping; counting it as skipped"
+                );
+                continue;
+            }
         };
         let name = entry.file_name();
         if !name.to_string_lossy().starts_with(prefix) {
