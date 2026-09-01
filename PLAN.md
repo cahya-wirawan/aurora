@@ -7700,7 +7700,7 @@ structural design work.
     That check is still owed, and it is the one part of this round where
     a wrong result would be immediately obvious to a person and is not
     obvious from any test.
-- [ ] **Atlas filtering may produce dark halos at translucent edges when
+- [x] **Atlas filtering may produce dark halos at translucent edges when
     zoomed out — needs real-hardware verification.** Raised 2026-08-24 by
     the 0.52.0 review, independently derived by two reviewers by hand
     computation, and **unconfirmed** — recorded as a plausible risk, not
@@ -7753,6 +7753,32 @@ structural design work.
     of its own size, and doing it blind on unconfirmed evidence, with no
     real GPU to check it against, is exactly the mistake CLAUDE.md's own
     "lesson from the last round" warns about.
+
+    **Closed 2026-09-01 (0.68.0, refined through 0.68.4)**, once the
+    real GPU this item's own text says it needs actually became
+    available — this sandbox has a real NVIDIA RTX 3090, not the Mesa
+    llvmpipe software rendering CLAUDE.md's text still assumes for "a
+    typical Linux dev box here." Took candidate fix (ii): the tile store
+    stays straight alpha, unchanged; `TileResidency::sync`/`upload_mip`
+    now premultiply at atlas-upload time, and `canvas.wgsl`'s `fs_canvas`
+    is back to the pre-0.52.0 premultiplied "over" formula, so
+    `min_filter: Linear` interpolates in the colour space where linear
+    filtering is actually defined. 0.68.4 closed an adjacent gap the
+    initial fix missed: `aurora-render`'s mip/preview box filter
+    (`mip::downsample`) was still averaging in the straight domain
+    *before* handing texels to the now-premultiplying upload path,
+    which would have baked the same halo into every preview mip one
+    step upstream of the fix — it now premultiplies before averaging,
+    the same domain the atlas fix picked. Verified by real-hardware
+    pixel readback (`AURORA_REQUIRE_GPU=1`, adapter logged as `NVIDIA
+    GeForce RTX 3090 (Vulkan, DiscreteGpu)`), with a genuine negative
+    control: the shader-only revert and the upload-only revert were each
+    applied, run, and confirmed failing before being restored. **Stated
+    honestly, not overclaimed**: the original halo was never reproduced
+    as a user-visible artifact by either reviewer, on any hardware — this
+    closes a real, mathematically-justified correctness gap in the
+    sampling math, not a confirmed visual bug. Full detail in the
+    0.68.0/0.68.4 addenda under "Next action" below.
 - [~] **GPU-backed tests self-skip silently instead of failing when no
     adapter is present — a systemic CI gap.** Not introduced by 0.52.0,
     but newly and sharply highlighted by it. Review demonstrated that
@@ -11173,7 +11199,7 @@ structural design work.
     to the Windows branch — that gap is still correctly disclosed above
     as Unix-only-covered, and its own test stays `#[cfg(unix)]`-gated.
 
-- [ ] **Scratch directories from sessions that never reach the shutdown
+- [~] **Scratch directories from sessions that never reach the shutdown
     cleanup are never cleaned up.** Opened 2026-08-24, split out of the
     item above as the one part of it deliberately left to its own round.
     Any run that does not reach the `WindowEvent::CloseRequested`
