@@ -13948,6 +13948,41 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.68.6) — a session that has to recreate its own
+scratch directory mid-run now re-takes its liveness lock, instead of
+becoming permanently unsweepable.** `aur_verify_scratch_dir` self-heals a
+session directory a temp cleaner removed out from under a running
+process (0.53.x), because failing there reaches `App::save_aur_file` as
+"the export did not verify", which deletes the export. But
+`create_dir_owner_only` brings the *directory* back and not the
+`aurora.lock` file inside it, and the `ScratchLock` the process still
+held was attached to the deleted inode — invisible to everything,
+including its own directory. From that point the session looked exactly
+like a pre-0.67.0 leftover to every future startup sweep: no lock file,
+therefore `Unknown`, therefore never collected. Fail-closed (nothing is
+deleted while it is live, and nothing afterwards either), but a permanent
+leak of a directory that can hold gigabytes.
+
+A new `ensure_session_scratch_lock` re-takes the lock when — and only
+when — the lock file is missing; re-locking while it is still there would
+conflict with the guard this process already holds, since `flock` is per
+open file description. Storing a *replaceable* guard needed
+`tile_store_scratch_dir`'s `OnceLock` to hold a
+`Mutex<Option<ScratchLock>>`, which is what the new
+`session_scratch_entry` exposes; `tile_store_scratch_dir` itself is now a
+one-line wrapper over it and its own contract is unchanged. A failure to
+re-take is logged at `warn` naming the consequence in plain terms — the
+directory will have to be removed by hand — rather than passing silently.
+
+**Covered by extending the existing self-heal test**, which already
+deletes the one live memoized session directory under
+`AUR_VERIFY_SCRATCH_LOCK` and asserts the save still verifies. It now
+also asserts the lock file is back **and is actually held** (a second
+`lock_scratch_dir` must return `WouldBlock`) — an unheld lock file would
+be worse than none, since it invites the next run's sweep to delete a
+live session. Measured: with the `ensure_session_scratch_lock` call
+removed, the test fails on the lock-file assertion; restored, it passes.
+
 **Addendum 2026-09-01 (0.68.4) — the mip/preview box filter now runs in
 the premultiplied domain too, which is where 0.68.0's fix stopped
 short.** 0.68.0 moved premultiplication ahead of GPU *minification* so

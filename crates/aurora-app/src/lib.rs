@@ -898,6 +898,13 @@ fn aur_verify_scratch_dir() -> Option<tempfile::TempDir> {
                 "could not recreate this session's scratch directory for .aur verification"
             );
         }
+        // Recreating the directory does not bring its lock file back,
+        // and the guard this process holds is attached to the deleted
+        // inode -- so without this the session becomes permanently
+        // invisible to every future startup sweep. See
+        // `ensure_session_scratch_lock`, which is a no-op in the
+        // overwhelmingly common case where nothing was removed.
+        ensure_session_scratch_lock(session);
         match builder.tempdir_in(session) {
             Ok(dir) => return Some(dir),
             Err(err) => {
@@ -6956,19 +6963,91 @@ fn create_tile_store_scratch_dir() -> Option<(PathBuf, aurora_tile::ScratchLock)
 /// shutdown), so the cost of the memoization is one empty directory in
 /// the case where nothing needed one.
 fn tile_store_scratch_dir() -> Option<&'static Path> {
-    // The `ScratchLock` is held here, in a `'static`, for the rest of
-    // the process's life **on purpose**. It is not an unused value: it
-    // is what tells the next Aurora process that this directory is
-    // live. Dropping it early releases the lock immediately, and the
-    // next run's startup sweep would then correctly conclude the
-    // directory is dead and delete it -- while this session is still
-    // paging unsaved pixels into it.
-    static SCRATCH_DIR: std::sync::OnceLock<Option<(PathBuf, aurora_tile::ScratchLock)>> =
-        std::sync::OnceLock::new();
+    session_scratch_entry().map(|(path, _lock)| path.as_path())
+}
+
+/// This session's scratch directory *and* the slot holding its liveness
+/// lock — [`tile_store_scratch_dir`]'s own storage, exposed separately
+/// so [`ensure_session_scratch_lock`] can replace the guard rather than
+/// only read the path.
+///
+/// The `ScratchLock` is held here, in a `'static`, for the rest of the
+/// process's life **on purpose**. It is not an unused value: it is what
+/// tells the next Aurora process that this directory is live. Dropping
+/// it early releases the lock immediately, and the next run's startup
+/// sweep would then correctly conclude the directory is dead and delete
+/// it — while this session is still paging unsaved pixels into it.
+///
+/// The `Mutex` exists only so the guard can be *replaced* when the
+/// directory has to be recreated mid-run (see
+/// [`ensure_session_scratch_lock`]); it is never held across anything
+/// that can block.
+#[allow(clippy::type_complexity)]
+fn session_scratch_entry()
+-> Option<&'static (PathBuf, std::sync::Mutex<Option<aurora_tile::ScratchLock>>)> {
+    static SCRATCH_DIR: std::sync::OnceLock<
+        Option<(PathBuf, std::sync::Mutex<Option<aurora_tile::ScratchLock>>)>,
+    > = std::sync::OnceLock::new();
     SCRATCH_DIR
-        .get_or_init(create_tile_store_scratch_dir)
+        .get_or_init(|| {
+            create_tile_store_scratch_dir()
+                .map(|(path, lock)| (path, std::sync::Mutex::new(Some(lock))))
+        })
         .as_ref()
-        .map(|(path, _lock)| path.as_path())
+}
+
+/// Re-takes this session's scratch-directory liveness lock if the lock
+/// file is gone — which it is exactly when [`aur_verify_scratch_dir`]
+/// has just had to recreate the directory a temp cleaner removed out
+/// from under a running session.
+///
+/// **Why this is not optional bookkeeping.** `create_dir_owner_only`
+/// brings the *directory* back but not the lock file inside it, and the
+/// `ScratchLock` this session still holds is attached to the deleted
+/// inode — invisible to everything, including its own directory. From
+/// that point the session's directory looks exactly like a pre-0.67.0
+/// leftover to every future run's startup sweep: no lock file, therefore
+/// `Unknown`, therefore never collected. That is fail-closed (nothing is
+/// deleted while it is live, and nothing is deleted afterwards either),
+/// but it is a permanent leak of a directory that can hold gigabytes.
+///
+/// A no-op in the overwhelmingly common case where the lock file is
+/// still there — re-locking then would conflict with the guard this
+/// process already holds, since `flock` is per open file description.
+/// A failure is logged at `warn` and nothing else changes: the session
+/// keeps running, unswept rather than unsafe.
+fn ensure_session_scratch_lock(session: &Path) {
+    if session.join(aurora_tile::LOCK_FILE_NAME).exists() {
+        return;
+    }
+    let Some((_, slot)) = session_scratch_entry() else {
+        return;
+    };
+    let Ok(mut guard) = slot.lock() else {
+        tracing::warn!("the scratch lock slot is poisoned; not re-taking the liveness lock");
+        return;
+    };
+    // The old guard is on an inode nothing can reach any more, so
+    // dropping it releases nothing anyone could observe -- and it must
+    // go before the new one is stored either way.
+    *guard = None;
+    match aurora_tile::lock_scratch_dir(session) {
+        Ok(lock) => {
+            *guard = Some(lock);
+            tracing::info!(
+                path = %session.display(),
+                "re-took the scratch-directory liveness lock after recreating the directory"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                path = %session.display(),
+                "could not re-take this session's scratch-directory liveness lock; the directory \
+                 is now invisible to future startup sweeps and will have to be removed by hand"
+            );
+        }
+    }
 }
 
 /// Everything a clean shutdown has to undo, in one directly callable
@@ -14383,6 +14462,27 @@ mod tests {
             session.is_dir(),
             "the session directory must be recreated, not merely worked around once"
         );
+        // And the liveness lock came back with it (0.68.6). Recreating
+        // the directory does not recreate its lock file, and the guard
+        // this process still held was attached to the deleted inode --
+        // so without the re-take the session would look exactly like a
+        // pre-0.67.0 leftover to every future startup sweep: no lock
+        // file, therefore `Unknown`, therefore leaked forever.
+        #[cfg(unix)]
+        {
+            assert!(
+                session.join(aurora_tile::LOCK_FILE_NAME).is_file(),
+                "the recreated session directory must carry a lock file again, or it is \
+                 permanently invisible to future sweeps"
+            );
+            match aurora_tile::lock_scratch_dir(session) {
+                Ok(_) => unreachable!(
+                    "the re-taken lock must actually be held -- an unheld lock file would let \
+                     the next run's sweep delete this live session's directory"
+                ),
+                Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock),
+            }
+        }
         // And it is owner-only again, not whatever the umask says.
         #[cfg(unix)]
         {
