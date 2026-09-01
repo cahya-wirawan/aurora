@@ -38,6 +38,18 @@
 //!   all — which this sweep reads as "unknown", never as "dead". This is
 //!   why the order must stay *create the directory, then lock it*:
 //!   reversing it would open a window where a live directory looks dead.
+//!   **The lock file itself must therefore never exist unlocked**, which
+//!   is a stronger claim than "the directory is created first" and is
+//!   what [`lock_scratch_dir`] now actually guarantees: it creates a
+//!   uniquely named temporary file, `flock`s *that*, and only then
+//!   publishes it under [`LOCK_FILE_NAME`] with `link(2)`, which is
+//!   atomic. Until 0.68.1 the sequence was `open(O_CREAT)` then `flock`,
+//!   so `aurora.lock` really did exist unlocked for the duration of one
+//!   syscall — long enough for a concurrent sweep to read it as `Dead`
+//!   and `remove_dir_all` a directory whose owner was, at that instant,
+//!   still taking its lock. That was a live-data-loss race, not a
+//!   theoretical one; see this module's own
+//!   `the_canonical_lock_file_is_never_visible_before_it_is_locked`.
 //! - **Pre-0.67.0 leftovers are never swept.** They have no lock file,
 //!   so they fall into the same "unknown" branch by design. Removing
 //!   them is a manual job, once. This is deliberate: "no lock file"
@@ -97,6 +109,106 @@ pub struct ScratchLock {
     file: std::fs::File,
 }
 
+/// Takes the exclusive, non-blocking `flock` on an already-existing
+/// `path`, never creating it — the read-only probe
+/// [`sweep_orphaned_scratch_dirs`] reasons about liveness with, and the
+/// second half of [`lock_scratch_dir`].
+///
+/// **No `O_CREAT`, deliberately.** A probe that could create the file it
+/// is asking about would turn "this directory has no lock file" into
+/// "this directory has a lock file I just made and can obviously lock",
+/// i.e. a `Dead` verdict for a directory nothing ever proved dead.
+#[cfg(unix)]
+fn try_lock_existing(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    flock_exclusive(&file)?;
+    Ok(file)
+}
+
+/// `flock(LOCK_EX | LOCK_NB)` on `file`, as a `Result`.
+#[cfg(unix)]
+fn flock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+
+    // SAFETY: `file`'s descriptor is open and owned by the caller's
+    // `File` for the whole call, and every caller keeps that `File`
+    // alive for exactly as long as the lock is meant to be held -- so
+    // the lock cannot outlive the descriptor it was taken on, and no
+    // other code in this crate can close it out from under the lock.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Creates a uniquely named, exclusively created, already-`flock`ed file
+/// inside `dir`, and returns it with its path — the unpublished half of
+/// [`lock_scratch_dir`]'s create-lock-publish sequence.
+///
+/// The name is not [`LOCK_FILE_NAME`] and is not a `.tile` file, so it is
+/// invisible both to the sweep (which only looks for the canonical name)
+/// and to every tile enumerator in this workspace. It exists for at most
+/// the few microseconds between the `flock` and the `link` that publishes
+/// it; a hard crash inside that window leaves one behind, which the
+/// scratch directory's own wholesale removal collects like anything else
+/// in there.
+#[cfg(unix)]
+fn create_locked_temp(dir: &Path) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Distinguishes two concurrent attempts from *this* process, which
+    /// a pid and a clock reading on their own would not always.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let mut last = std::io::Error::other("no attempt was made");
+    for _ in 0..8u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        let path = dir.join(format!(
+            ".{LOCK_FILE_NAME}.tmp.{}.{}.{nanos}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => {
+                // A file this call has just exclusively created cannot
+                // already be locked by anyone, so this does not block
+                // and does not realistically fail -- but a failure is
+                // still reported rather than assumed away.
+                if let Err(err) = flock_exclusive(&file) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(err);
+                }
+                return Ok((file, path));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = err;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last)
+}
+
 /// Takes the exclusive, non-blocking lock for the scratch directory
 /// `dir`, creating its lock file if needed.
 ///
@@ -104,36 +216,62 @@ pub struct ScratchLock {
 /// guard alive for as long as the directory is in use — see
 /// [`ScratchLock`].
 ///
+/// **The lock file is published already locked.** The sequence is
+/// *create a uniquely named temporary file → `flock` it → `link(2)` it
+/// onto [`LOCK_FILE_NAME`] → unlink the temporary name*. `link` is
+/// atomic and fails with `EEXIST` rather than replacing anything, so
+/// `aurora.lock` — the one name [`sweep_orphaned_scratch_dirs`] looks
+/// for — comes into existence already carrying this call's lock and can
+/// never be observed unlocked by a concurrent sweep. The obvious
+/// spelling, `open(O_CREAT)` followed by `flock`, is **not** equivalent
+/// and was the 0.67.0 bug this replaces: it published the canonical name
+/// one syscall before locking it, and a sweep landing in that window
+/// acquired the lock itself, concluded `Dead`, and deleted a live
+/// session's unsaved pixels.
+///
+/// `EEXIST` from the `link` means the canonical name is already there —
+/// a live session's held lock, or a dead one's leftover — so this falls
+/// through to locking (never creating) the file that is actually there,
+/// which is what keeps `flock`'s mutual exclusion (and therefore the
+/// sweep's `Alive` verdict) meaning what it always did.
+///
 /// # Errors
 ///
 /// Returns the underlying [`std::io::Error`] if the lock file cannot be
-/// opened (`dir` missing, a symlink in the way — `O_NOFOLLOW` refuses
-/// one outright — permissions) or if another open file description
-/// already holds the lock (`EWOULDBLOCK`). It never blocks.
+/// created or opened (`dir` missing, a symlink in the way — `O_NOFOLLOW`
+/// refuses one outright — permissions) or if another open file
+/// description already holds the lock (`EWOULDBLOCK`). It never blocks.
 #[cfg(unix)]
 pub fn lock_scratch_dir(dir: &Path) -> std::io::Result<ScratchLock> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    use std::os::unix::io::AsRawFd as _;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join(LOCK_FILE_NAME))?;
-
-    // SAFETY: `file`'s descriptor is open and owned by this `File` for
-    // the whole call, and stays owned by the `ScratchLock` returned
-    // below for as long as the lock is held -- so the lock cannot
-    // outlive the descriptor it was taken on, and no other code in this
-    // crate can close it out from under the lock.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error());
+    let canonical = dir.join(LOCK_FILE_NAME);
+    let (file, temp) = create_locked_temp(dir)?;
+    match std::fs::hard_link(&temp, &canonical) {
+        Ok(()) => {
+            // The lock lives on the inode, which now has two names; the
+            // canonical one is the only one anything else looks at, so
+            // the temporary one is dropped immediately. A failure here
+            // leaks one small file inside a directory that is deleted
+            // wholesale, so it is logged rather than propagated.
+            if let Err(err) = std::fs::remove_file(&temp) {
+                tracing::debug!(
+                    path = %temp.display(),
+                    %err,
+                    "could not unlink the temporary lock name after publishing it"
+                );
+            }
+            Ok(ScratchLock { file })
+        }
+        Err(err) => {
+            drop(file);
+            let _ = std::fs::remove_file(&temp);
+            if err.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(err);
+            }
+            Ok(ScratchLock {
+                file: try_lock_existing(&canonical)?,
+            })
+        }
     }
-    Ok(ScratchLock { file })
 }
 
 /// Non-Unix counterpart: a no-op guard.
@@ -209,8 +347,14 @@ fn liveness(dir: &Path) -> (Verdict, Option<ScratchLock>) {
         return (Verdict::Unknown, None);
     }
 
-    match lock_scratch_dir(dir) {
-        Ok(lock) => (Verdict::Dead, Some(lock)),
+    // `try_lock_existing`, not `lock_scratch_dir`: this must never
+    // *create* the file it is reasoning about. If the lock file were to
+    // vanish between the check just above and this call (another sweep
+    // removing the same directory), a creating variant would make a
+    // fresh lock file, lock it trivially, and call a directory nothing
+    // ever proved dead `Dead`.
+    match try_lock_existing(&dir.join(LOCK_FILE_NAME)) {
+        Ok(file) => (Verdict::Dead, Some(ScratchLock { file })),
         Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => (Verdict::Alive, None),
         Err(_) => (Verdict::Unknown, None),
     }
@@ -316,8 +460,13 @@ pub fn sweep_orphaned_scratch_dirs(parent: &Path, prefix: &str) -> SweepReport {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{LOCK_FILE_NAME, ScratchLock, lock_scratch_dir, sweep_orphaned_scratch_dirs};
+    use super::{
+        LOCK_FILE_NAME, ScratchLock, lock_scratch_dir, sweep_orphaned_scratch_dirs,
+        try_lock_existing,
+    };
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const PREFIX: &str = "aurora-scratch-";
 
@@ -472,6 +621,124 @@ mod tests {
         // And it becomes available again once released, so a crashed
         // session's directory really does become sweepable.
         drop(take_lock(&dir));
+    }
+
+    /// **The 0.67.0 data-loss race, as a test.**
+    ///
+    /// `lock_scratch_dir` used to `open(O_CREAT)` the canonical lock file
+    /// and *then* `flock` it, so between those two syscalls `aurora.lock`
+    /// existed unlocked — and a sweep landing in that window acquired the
+    /// lock itself, concluded [`super::Verdict::Dead`], and deleted the
+    /// directory of a session that was at that instant still taking its
+    /// own lock.
+    ///
+    /// This asserts the invariant that makes that unreachable rather than
+    /// merely unlikely: **while a `ScratchLock` is held, no observer can
+    /// ever acquire the lock on the canonical file** — including during
+    /// the acquisition itself. Two poller threads spin on
+    /// `try_lock_existing` (which never creates, exactly as the sweep's
+    /// own probe does not) across the whole acquisition, and the guard is
+    /// released only after they have stopped, so *any* successful probe
+    /// is a genuine violation and there are no false positives.
+    ///
+    /// It is a race detector, so a green run is evidence and not proof —
+    /// which is why it also asserts the pollers actually saw the file at
+    /// all, so a run that raced nothing cannot pass silently. Measured
+    /// against the pre-fix code (the `open`-then-`flock` spelling
+    /// restored temporarily): it failed, reporting violations.
+    #[test]
+    fn the_canonical_lock_file_is_never_visible_before_it_is_locked() {
+        const ITERATIONS: usize = 200;
+        const POLLERS: usize = 2;
+
+        let parent = temp_parent();
+        let violations = Arc::new(AtomicUsize::new(0));
+        let sightings = Arc::new(AtomicUsize::new(0));
+
+        for i in 0..ITERATIONS {
+            let dir = scratch_dir(parent.path(), &format!("aurora-scratch-race-{i}"));
+            let stop = Arc::new(AtomicBool::new(false));
+            let pollers: Vec<_> = (0..POLLERS)
+                .map(|_| {
+                    let lock_path = dir.join(LOCK_FILE_NAME);
+                    let stop = Arc::clone(&stop);
+                    let violations = Arc::clone(&violations);
+                    let sightings = Arc::clone(&sightings);
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            match try_lock_existing(&lock_path) {
+                                Ok(file) => {
+                                    // The acquirer below has not released
+                                    // anything yet, so this can only mean
+                                    // the canonical name became visible
+                                    // before it was locked.
+                                    violations.fetch_add(1, Ordering::Relaxed);
+                                    sightings.fetch_add(1, Ordering::Relaxed);
+                                    drop(file);
+                                }
+                                Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                                    sightings.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let held = take_lock(&dir);
+            stop.store(true, Ordering::Relaxed);
+            for poller in pollers {
+                if poller.join().is_err() {
+                    unreachable!("a poller thread must not panic");
+                }
+            }
+            // Only now, with every observer stopped.
+            drop(held);
+        }
+
+        assert_eq!(
+            violations.load(Ordering::Relaxed),
+            0,
+            "the canonical lock file was observed unlocked while a ScratchLock was held"
+        );
+        assert!(
+            sightings.load(Ordering::Relaxed) > 0,
+            "the pollers never saw the lock file at all, so this run raced nothing"
+        );
+    }
+
+    /// The publish step's own guarantee, stated directly: once
+    /// `lock_scratch_dir` returns, the canonical name exists and is the
+    /// very inode the returned guard holds — not a second, unlocked file
+    /// left beside it — and the temporary name it was published from is
+    /// gone.
+    #[test]
+    fn the_lock_file_that_ends_up_published_is_the_one_that_is_locked() {
+        let parent = temp_parent();
+        let dir = scratch_dir(parent.path(), "aurora-scratch-published");
+        let held = take_lock(&dir);
+
+        let canonical = dir.join(LOCK_FILE_NAME);
+        assert!(canonical.is_file(), "the canonical name must exist");
+        match try_lock_existing(&canonical) {
+            Ok(_) => unreachable!("the published lock file must already be locked"),
+            Err(err) => assert_eq!(err.raw_os_error(), Some(libc::EWOULDBLOCK)),
+        }
+
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            unreachable!("a test-local temp directory must be readable");
+        };
+        let leftovers: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&format!(".{LOCK_FILE_NAME}.tmp.")))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the temporary lock name must not survive publication: {leftovers:?}"
+        );
+        drop(held);
     }
 
     /// The mixed case, in one sweep: the report's two counters must

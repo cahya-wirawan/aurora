@@ -13948,6 +13948,62 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.68.1) — the scratch-directory lock file is now
+published already locked, closing a real TOCTOU race that could delete a
+*live* session's directory.** 0.67.0's `lock_scratch_dir` did
+`open(O_CREAT)` on `aurora.lock` and *then* `flock`ed it. Between those
+two syscalls the canonical file — the one and only name
+`sweep_orphaned_scratch_dirs` looks for — existed **unlocked**. A second
+Aurora starting in that window swept the parent, found the lock file,
+acquired the lock itself, concluded `Verdict::Dead`, and
+`remove_dir_all`ed the directory of a session that was at that instant
+still taking its own lock. The victim's `lock_scratch_dir` then returned
+`Ok(ScratchLock)` on an unlinked inode: it believed it was protected
+while holding a lock nothing on disk could ever see, and ran its whole
+life with no `aurora.lock` present — unprotected, and unsweepable by
+every future run. The module's own "residual races" list named the window
+as `mkdir` → `flock` (never read as dead, which is true) and missed that
+the real one was `open` → `flock` (readable as dead). That doc bullet is
+corrected here too, in the same commit as the code.
+
+**The fix is `link(2)`, not a bigger lock.** `lock_scratch_dir` now
+creates a uniquely named temporary file inside the directory
+(`O_EXCL`/`O_NOFOLLOW`/`0o600`), `flock`s *that*, and only then publishes
+it under `LOCK_FILE_NAME` with `std::fs::hard_link`, unlinking the
+temporary name afterwards. `link` is atomic and fails with `EEXIST`
+rather than replacing anything, so the canonical name comes into
+existence already carrying the lock — there is no window in which it
+exists unlocked, by construction rather than by being fast. `EEXIST`
+(the canonical name is already there: a live session's held lock or a
+dead one's leftover) falls through to locking the file that is actually
+there, which is what keeps `flock`'s mutual exclusion, the sweep's
+`Alive` verdict, and the "released and therefore sweepable again"
+property all meaning exactly what they did before. `rename(2)` was the
+obvious alternative and is **wrong** here: it would replace a live
+holder's lock file with a fresh one, leaving the holder's lock on an
+orphaned inode — the same class of bug as the one being fixed.
+
+**The sweep now probes rather than locks.** `liveness` used to call
+`lock_scratch_dir`, which creates. A new private `try_lock_existing`
+opens without `O_CREAT` and `flock`s, so a lock file that vanishes
+between the existence check and the probe reads as `Unknown`, never as a
+directory this sweep just made a lock file for and then called dead.
+
+**Two new tests** (`aurora-tile` 57, up from 55).
+`the_canonical_lock_file_is_never_visible_before_it_is_locked` is a real
+concurrency test, not an inspection: two poller threads spin on
+`try_lock_existing` across a live acquisition, and the guard is released
+only after they have stopped, so any successful probe is a genuine
+violation with no false positives — it also asserts the pollers actually
+saw the file, so a run that raced nothing cannot pass silently.
+**Measured against the pre-fix code**: the `open`-then-`flock` spelling
+was temporarily restored and the test failed, with a poller acquiring the
+lock out from under the acquirer — which is precisely the step the sweep
+takes immediately before `remove_dir_all`. Restored, it passes.
+`the_lock_file_that_ends_up_published_is_the_one_that_is_locked` pins the
+publish step directly: the canonical name exists, is already locked, and
+no temporary name survives beside it.
+
 **Addendum 2026-09-01 (0.68.0) — the atlas is premultiplied at upload,
 so hardware filtering happens in the domain it has to happen in.**
 `TileResidency::sync` and `TileResidency::upload_mip` now run a new
