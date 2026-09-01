@@ -13948,6 +13948,37 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.68.7) — a budget-skipped tile no longer has its
+dirty flag eaten by the call that skipped it.** `TileResidency::sync`
+called `store.take_dirty(...)` three lines above the per-frame byte-budget
+check that can `continue`. A tile the budget skipped had therefore
+already had its dirtiness *consumed* for an upload that never happened —
+and since it was still resident, the next call's own resident check saw
+nothing to do either. The edit was silently invisible until some
+unrelated change marked that tile dirty afresh. This predates the 0.65.0–
+0.68.0 round entirely and was noticed while reading three lines above
+code it touched; it is fixed rather than only disclosed, because the fix
+is small and the failure is a stale canvas, not a stat.
+
+`sync` now *peeks* (`TileStore::is_dirty`, new, non-consuming, and
+`peek`-based so asking does not bump LRU recency — a query is not an
+access) and consumes the flag only once it has committed to uploading.
+Consuming immediately before `get` rather than after is deliberate: `get`
+borrows the store for the rest of the iteration, and a `get` that *fails*
+leaves the tile non-resident, so the next call retries it on the resident
+check regardless.
+
+**The existing budget test could not have caught this**, and that is
+worth saying: `budget_limited_sync_converges_over_multiple_calls`'s
+skipped tiles are also non-resident, so the resident check alone forces
+their retry whatever became of their dirty flags. The new
+`a_resident_tile_skipped_for_budget_is_still_uploaded_on_a_later_call`
+warms the atlas first, *then* edits every tile, then squeezes the budget
+— the only shape in which the dirty flag is the sole thing distinguishing
+a stale tile from a finished one. Measured against the old ordering: the
+follow-up call reports `uploaded == 0` and the edit is dropped.
+`aurora-gpu` is at 62 tests, up from 61.
+
 **Addendum 2026-09-01 (0.68.6) — a session that has to recreate its own
 scratch directory mid-run now re-takes its liveness lock, instead of
 becoming permanently unsweepable.** `aur_verify_scratch_dir` self-heals a

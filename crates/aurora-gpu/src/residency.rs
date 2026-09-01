@@ -830,7 +830,14 @@ impl TileResidency {
                 };
                 let slot = (id.x % self.grid.0, id.y % self.grid.1);
                 let resident = self.slots.get(&slot) == Some(&id);
-                let dirty = store.take_dirty(surface, id).is_some();
+                // Peeked, not taken (0.68.7). Until then this was
+                // `take_dirty`, three lines above a budget check that can
+                // `continue` -- so a tile the budget skipped had already
+                // had its dirty flag consumed and was silently never
+                // uploaded on a later frame either, until some unrelated
+                // edit marked it dirty afresh. The flag is now consumed
+                // only once this loop has committed to uploading.
+                let dirty = store.is_dirty(surface, id);
                 if !force && resident && !dirty {
                     continue;
                 }
@@ -838,6 +845,14 @@ impl TileResidency {
                     stats.remaining += 1;
                     continue;
                 }
+                // Committed: the budget is there and the tile is about to
+                // be read and written. Consuming it before `get` rather
+                // than after is deliberate -- `get` borrows `store`
+                // immutably for the rest of the iteration, and a `get`
+                // that *fails* leaves the tile non-resident, so the next
+                // call's own resident check retries it regardless of any
+                // dirty flag.
+                let _ = store.take_dirty(surface, id);
                 let tile = match store.get(surface, id) {
                     Ok(tile) => tile,
                     Err(err) => {
@@ -1184,6 +1199,65 @@ mod tests {
         let third = residency.sync(context.queue(), &mut store, surface(), false, budget);
         assert_eq!(third.uploaded, 0);
         assert_eq!(third.remaining, 0);
+    }
+
+    /// **A budget-skipped *resident* tile must still be uploaded later.**
+    ///
+    /// `budget_limited_sync_converges_over_multiple_calls` above cannot
+    /// see this: its skipped tiles are also non-resident, so the resident
+    /// check alone forces a retry whatever happened to their dirty flags.
+    /// The gap is a tile that is already resident and has been *edited* —
+    /// until 0.68.7 `sync` called `take_dirty` three lines above the
+    /// budget check that skips it, so the flag was consumed for an upload
+    /// that never happened and the edit was then invisible until some
+    /// unrelated change marked the tile dirty again. That is a
+    /// user-visible stale canvas, not just a stat.
+    ///
+    /// Measured against the pre-fix ordering: the second call reports
+    /// `uploaded == 0` and the edit is silently dropped.
+    #[test]
+    fn a_resident_tile_skipped_for_budget_is_still_uploaded_on_a_later_call() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store(64);
+
+        let viewport = (256, 256);
+        let mut residency = TileResidency::new(context.device(), context.queue(), viewport);
+        for gy in 0..2 {
+            for gx in 0..2 {
+                paint(&mut store, TileId { x: gx, y: gy }, [0.0, 0.0, 1.0, 1.0]);
+            }
+        }
+        // Everything resident and clean.
+        let warmup = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
+        assert_eq!(warmup.uploaded, 4);
+        assert_eq!(warmup.remaining, 0);
+
+        // Now edit all four. They stay resident, so *only* the dirty flag
+        // distinguishes them from a tile with nothing to do.
+        for gy in 0..2 {
+            for gx in 0..2 {
+                paint(&mut store, TileId { x: gx, y: gy }, [1.0, 0.0, 0.0, 1.0]);
+            }
+        }
+
+        let tight = residency.sync(
+            context.queue(),
+            &mut store,
+            surface(),
+            false,
+            TILE_BYTES * 2,
+        );
+        assert_eq!(tight.uploaded, 2, "the budget caps this call at two");
+        assert_eq!(tight.remaining, 2, "and reports the other two as pending");
+
+        let rest = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
+        assert_eq!(
+            rest.uploaded, 2,
+            "a resident tile skipped for budget must keep its dirtiness and upload later"
+        );
+        assert_eq!(rest.remaining, 0);
     }
 
     #[test]

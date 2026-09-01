@@ -523,6 +523,21 @@ impl TileStore {
             .and_then(Tile::take_dirty)
     }
 
+    /// Whether `(surface, id)` is resident and currently dirty, **without
+    /// clearing it** — [`Self::take_dirty`]'s non-consuming counterpart,
+    /// for a caller that must decide whether it can act on the dirtiness
+    /// before consuming it (see [`Tile::is_dirty`]).
+    ///
+    /// Peeks rather than gets, so asking does not bump LRU recency: a
+    /// query is not an access, and a tile the caller then declines to
+    /// upload should not have been promoted for having been asked about.
+    #[must_use]
+    pub fn is_dirty(&self, surface: SurfaceId, id: TileId) -> bool {
+        self.resident
+            .peek(&(surface, id))
+            .is_some_and(Tile::is_dirty)
+    }
+
     /// Blocks until every write submitted so far has actually reached
     /// disk (e.g. before a document save) and surfaces the first
     /// failure encountered, if any. Every failure is logged via
