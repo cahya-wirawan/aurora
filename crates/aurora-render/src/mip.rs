@@ -73,11 +73,38 @@ impl MipLevel {
 /// special case — callers that always route through this function don't
 /// need their own full-resolution branch.
 ///
-/// Each output texel is the exact mean of the `factor` × `factor` block
-/// of source texels it covers, summed in `f32` (matching the render
-/// graph's own compute precision, ADR 0003 — not accumulated in `f16`,
-/// which would lose precision across the sum) and rounded back to `f16`
-/// once per output channel.
+/// Each output texel is the mean of the `factor` × `factor` block of
+/// source texels it covers, summed in `f32` (matching the render graph's
+/// own compute precision, ADR 0003 — not accumulated in `f16`, which
+/// would lose precision across the sum) and rounded back to `f16` once
+/// per output channel.
+///
+/// **The mean is taken in the premultiplied domain, and that is not a
+/// detail (0.68.4).** Averaging *straight* colours weights a fully
+/// transparent texel's RGB exactly as heavily as an opaque neighbour's,
+/// so a hard opaque/transparent edge drags the transparent side's
+/// arbitrary colour into the result — the same dark halo
+/// `aurora_gpu::TileResidency`'s own premultiply-at-upload exists to
+/// prevent, one step earlier in the pipeline and equally unrecoverable
+/// once baked in. This filter therefore multiplies each texel's RGB by
+/// its own alpha before summing, averages that, and divides the result
+/// back out by the averaged alpha, so:
+///
+/// - alpha is a plain mean, exactly as before;
+/// - RGB is the **alpha-weighted** mean of the block's colours, i.e. a
+///   texel contributes colour in proportion to how present it actually
+///   is;
+/// - a block whose alpha sums to zero has no colour to speak of and
+///   yields RGB 0 rather than a `0/0`.
+///
+/// **The output is still straight alpha**, deliberately: that is the
+/// workspace's universal convention (`aurora-tile`'s store, every CPU and
+/// GPU composite surface), and it is what
+/// `aurora_gpu::TileResidency::upload_mip` — the only consumer, via
+/// [`crate::preview::upload_preview`] — expects, since it applies its own
+/// premultiply on the way into the atlas. Filtering in the premultiplied
+/// domain and converting back is what makes the box filter *correct*;
+/// changing what this returns would just move the same bug.
 #[must_use]
 pub fn downsample(texels: &[f16], level: MipLevel) -> Vec<f16> {
     let factor = level.factor() as usize;
@@ -92,7 +119,11 @@ pub fn downsample(texels: &[f16], level: MipLevel) -> Vec<f16> {
     let mut out = Vec::with_capacity(out_dim * out_dim * CHANNELS);
     for oy in 0..out_dim {
         for ox in 0..out_dim {
-            let mut sums = [0f32; CHANNELS];
+            // Named accumulators rather than an array: the three colour
+            // sums are *premultiplied* and the alpha sum is not, so they
+            // are no longer the four interchangeable channels a single
+            // `[f32; CHANNELS]` loop implied they were.
+            let (mut sum_r, mut sum_g, mut sum_b, mut sum_a) = (0f32, 0f32, 0f32, 0f32);
             for dy in 0..factor {
                 let Some(row) = rows.get(oy * factor + dy) else {
                     unreachable!("oy*factor+dy < TILE: oy < out_dim = TILE/factor by construction");
@@ -104,15 +135,33 @@ pub fn downsample(texels: &[f16], level: MipLevel) -> Vec<f16> {
                     );
                 };
                 for texel in block.chunks_exact(CHANNELS) {
-                    for (sum, sample) in sums.iter_mut().zip(texel) {
-                        *sum += sample.to_f32();
-                    }
+                    // The `[r, g, b, a]` pattern is what ties this to
+                    // `CHANNELS == 4`, pinned by
+                    // `downsample_is_written_against_a_four_channel_texel`
+                    // against the constant rather than left implied. A
+                    // shorter chunk is impossible from `chunks_exact`.
+                    let [r, g, b, a] = texel else {
+                        continue;
+                    };
+                    let alpha = a.to_f32();
+                    sum_r += r.to_f32() * alpha;
+                    sum_g += g.to_f32() * alpha;
+                    sum_b += b.to_f32() * alpha;
+                    sum_a += alpha;
                 }
             }
             let count = (factor * factor) as f32;
-            for sum in sums {
-                out.push(f16::from_f32(sum / count));
-            }
+            // Back to straight alpha: dividing the premultiplied mean by
+            // the mean alpha is the same as dividing the premultiplied
+            // *sum* by the alpha sum, with one division fewer. A block
+            // that is entirely transparent has no colour to recover and
+            // yields 0 rather than a `0/0`.
+            let unpremultiply =
+                |sum: f32| f16::from_f32(if sum_a > 0.0 { sum / sum_a } else { 0.0 });
+            out.push(unpremultiply(sum_r));
+            out.push(unpremultiply(sum_g));
+            out.push(unpremultiply(sum_b));
+            out.push(f16::from_f32(sum_a / count));
         }
     }
     out
@@ -200,28 +249,123 @@ mod tests {
         }
     }
 
+    /// Rows coloured `value` in RGB and **opaque** in alpha, so the box
+    /// filter's colour mean is the plain one and the premultiplied
+    /// domain is the straight domain — which is what makes an exact
+    /// midpoint the right expectation.
+    fn striped_opaque_rows(value_for_row: impl Fn(u32) -> f32) -> Vec<f16> {
+        let mut texels = Vec::with_capacity(SAMPLES);
+        for row in 0..TILE {
+            let value = f16::from_f32(value_for_row(row));
+            for _ in 0..TILE {
+                texels.push(value);
+                texels.push(value);
+                texels.push(value);
+                texels.push(f16::from_f32(1.0));
+            }
+        }
+        texels
+    }
+
     #[test]
     fn downsample_averages_a_checkerboard_to_the_exact_midpoint() {
         // Alternate opaque black/white by texel row: at MipLevel::Half
         // (factor 2), every 2x2 source block covers one black row and one
         // white row -- exactly two of each colour, so the mean is exactly
-        // 0.5 in every channel, not merely close to it.
-        let mut texels = Vec::with_capacity(SAMPLES);
-        for row in 0..TILE {
-            let value = if row % 2 == 0 { 0.0 } else { 1.0 };
-            for _ in 0..TILE {
-                for _ in 0..CHANNELS {
-                    texels.push(f16::from_f32(value));
-                }
-            }
-        }
+        // 0.5 in every colour channel, not merely close to it. Alpha is
+        // 1.0 throughout, deliberately: with alpha varying in lockstep
+        // with RGB this fixture would be asserting the *straight*-domain
+        // answer, which is precisely the bug 0.68.4 fixed -- see
+        // `downsample_does_not_drag_a_transparent_neighbours_colour_into_the_mean`.
+        let texels = striped_opaque_rows(|row| if row % 2 == 0 { 0.0 } else { 1.0 });
         let out = downsample(&texels, MipLevel::Half);
-        for sample in &out {
+        for texel in out.chunks_exact(CHANNELS) {
+            let [r, g, b, a] = texel else {
+                unreachable!("chunks_exact(CHANNELS) yields CHANNELS samples");
+            };
             #[allow(clippy::float_cmp)]
             {
-                assert_eq!(sample.to_f32(), 0.5);
+                assert_eq!((r.to_f32(), g.to_f32(), b.to_f32()), (0.5, 0.5, 0.5));
+                assert_eq!(a.to_f32(), 1.0, "an all-opaque block stays opaque");
             }
         }
+    }
+
+    /// **The reason the filter runs in the premultiplied domain.**
+    ///
+    /// Half the block is opaque white, half is *transparent* black. The
+    /// transparent half has no colour anyone can see, so the visible
+    /// result must be white at 50% alpha. A straight-domain box filter
+    /// averages the invisible black in at full weight and returns 50%
+    /// grey at 50% alpha instead — a dark halo baked into the preview,
+    /// unrecoverable afterwards because the information is gone.
+    ///
+    /// Measured against the pre-0.68.4 filter: it returned `0.5` for
+    /// every colour channel here, so this test fails on the old code and
+    /// passes on the new one.
+    #[test]
+    fn downsample_does_not_drag_a_transparent_neighbours_colour_into_the_mean() {
+        // Even rows: transparent black. Odd rows: opaque white. At
+        // MipLevel::Half every 2x2 block covers one of each.
+        let mut texels = Vec::with_capacity(SAMPLES);
+        for row in 0..TILE {
+            let opaque = row % 2 == 1;
+            let value = f16::from_f32(if opaque { 1.0 } else { 0.0 });
+            let alpha = f16::from_f32(if opaque { 1.0 } else { 0.0 });
+            for _ in 0..TILE {
+                texels.push(value);
+                texels.push(value);
+                texels.push(value);
+                texels.push(alpha);
+            }
+        }
+
+        let out = downsample(&texels, MipLevel::Half);
+        for texel in out.chunks_exact(CHANNELS) {
+            let [r, g, b, a] = texel else {
+                unreachable!("chunks_exact(CHANNELS) yields CHANNELS samples");
+            };
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(
+                    (r.to_f32(), g.to_f32(), b.to_f32()),
+                    (1.0, 1.0, 1.0),
+                    "the visible half is white, so the colour must stay white"
+                );
+                assert_eq!(a.to_f32(), 0.5, "half the block was transparent");
+            }
+        }
+    }
+
+    /// A block with nothing visible in it at all: alpha sums to zero, so
+    /// the un-premultiply has nothing to divide by. Defined as fully
+    /// transparent black rather than left to produce `NaN`.
+    #[test]
+    fn downsample_of_a_fully_transparent_block_is_transparent_black_not_nan() {
+        let mut texels = Vec::with_capacity(SAMPLES);
+        for _ in 0..(TILE * TILE) {
+            // Arbitrary, invisible RGB behind alpha 0 -- exactly the
+            // stale colour that must not survive into the output.
+            for channel in [0.9f32, 0.2, 0.7, 0.0] {
+                texels.push(f16::from_f32(channel));
+            }
+        }
+        let out = downsample(&texels, MipLevel::Quarter);
+        for sample in &out {
+            assert!(sample.to_f32().is_finite(), "no NaN from a 0/0");
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(sample.to_f32(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn downsample_is_written_against_a_four_channel_texel() {
+        assert_eq!(
+            CHANNELS, 4,
+            "downsample's [r, g, b, a] pattern assumes four channels"
+        );
     }
 
     #[test]
@@ -229,16 +373,11 @@ mod tests {
         // Colour every texel by its own row index (as a fraction of
         // TILE), so a wrong row range (off-by-one, or averaging the wrong
         // rows entirely) produces a value distinguishable from the
-        // correct one, not coincidentally right.
-        let mut texels = Vec::with_capacity(SAMPLES);
-        for row in 0..TILE {
-            let value = row as f32 / TILE as f32;
-            for _ in 0..TILE {
-                for _ in 0..CHANNELS {
-                    texels.push(f16::from_f32(value));
-                }
-            }
-        }
+        // correct one, not coincidentally right. Opaque throughout, so
+        // this stays a test of *which rows* were read rather than of the
+        // alpha weighting `downsample_does_not_drag_a_transparent_
+        // neighbours_colour_into_the_mean` covers.
+        let texels = striped_opaque_rows(|row| row as f32 / TILE as f32);
         let out = downsample(&texels, MipLevel::Quarter);
         // Output row 1 (factor 4) must average source rows 4..8:
         // mean = (4+5+6+7)/4 / TILE = 5.5 / TILE.
@@ -249,9 +388,16 @@ mod tests {
             unreachable!("out has out_dim rows of out_dim texels each");
         };
         let expected = 5.5 / TILE as f32;
-        for sample in row {
+        let [r, g, b, a] = row else {
+            unreachable!("sliced exactly CHANNELS samples");
+        };
+        for sample in [r, g, b] {
             let diff = (sample.to_f32() - expected).abs();
             assert!(diff < 1e-3, "expected ~{expected}, got {}", sample.to_f32());
+        }
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(a.to_f32(), 1.0, "the fixture is opaque throughout");
         }
     }
 }

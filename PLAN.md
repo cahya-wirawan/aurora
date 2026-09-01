@@ -13948,6 +13948,67 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.68.4) — the mip/preview box filter now runs in
+the premultiplied domain too, which is where 0.68.0's fix stopped
+short.** 0.68.0 moved premultiplication ahead of GPU *minification* so
+hardware filtering would be mathematically valid. But the progressive-
+rendering path box-filters on the CPU **before** any of that:
+`mip::downsample` averaged straight-alpha texels, and only then did
+`TileResidency::upload_mip` premultiply the already-averaged result. A
+fully transparent texel's RGB was therefore averaged in at full weight
+against an opaque neighbour's — exactly the halo 0.68.0 exists to
+prevent, one step earlier in the pipeline and equally unrecoverable
+afterwards, because the information is gone before the premultiply ever
+runs.
+
+`downsample` now multiplies each texel's RGB by its own alpha before
+summing, averages that, and divides back out by the summed alpha. Alpha
+is still a plain mean; RGB is now the **alpha-weighted** mean, so a texel
+contributes colour in proportion to how present it actually is. A block
+whose alpha sums to zero yields RGB 0 rather than a `0/0`. **The output
+is still straight alpha**, deliberately — that is the workspace's
+universal convention and what `upload_mip` expects, since it applies its
+own premultiply into the atlas. Filtering in the premultiplied domain and
+converting back is what makes the box filter correct; changing what
+`downsample` returns would only move the bug.
+
+**Measured against the old filter, not argued.** The new
+`downsample_does_not_drag_a_transparent_neighbours_colour_into_the_mean`
+builds a block that is half opaque white and half *transparent* black:
+the visible half is white, so the answer must be white at 50% alpha. With
+the straight-domain arithmetic temporarily restored it returned
+**(0.5, 0.5, 0.5)** — the halo itself, as a number — and
+`downsample_of_a_fully_transparent_block_is_transparent_black_not_nan`
+returned **0.8999** for an invisible texel's stale colour instead of 0.
+Both failed on the old code and pass on the new; the mutation was then
+reverted.
+
+**Two existing fixtures were varying alpha in lockstep with RGB**, which
+meant they were asserting the *straight*-domain answer. `downsample_
+averages_a_checkerboard_to_the_exact_midpoint` and `downsample_reads_the_
+correct_source_block_not_a_shifted_one` are now opaque throughout, so
+each still tests exactly what it was written to test (the midpoint, and
+*which rows* were read) without doubling as a claim about alpha weighting.
+`aurora-render` is at 108 tests, up from 105.
+
+**And the latent test gap that hid all of this is closed.**
+`upload_mip`'s only readback test used an **opaque** fixture, where
+premultiplying is the identity — so the suite stayed green even with
+`upload_mip`'s `premultiply_rgba` call deleted outright. Both that test
+(`aurora-gpu`'s `upload_mip_lands_in_the_correct_slot_and_level`) and the
+end-to-end store → downsample → atlas one (`aurora-render`'s
+`upload_preview_lands_a_downsampled_tile_in_the_atlas`) now use
+half-transparent fixtures and assert the premultiplied readback. Verified
+by mutation on real hardware: with the premultiply removed, the readback
+reads `(1.0, 0.0, 1.0, 0.5)` against an expected `(0.5, 0.0, 0.5, 0.5)`
+and the test fails. These ran with `AURORA_REQUIRE_GPU=1` set, on the
+`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` adapter — real GPU
+readback, not a software rasterizer. As with 0.68.0, that establishes
+one GPU, one vendor, one backend, and nothing interactive: there is no
+display server here, and **the halo has still never been reproduced as a
+user-visible artifact by anyone**. What is claimed is the arithmetic and
+the pixel readback, no more.
+
 **Addendum 2026-09-01 (0.68.3) — the atlas premultiply is folded into
 the byte serialization it always ran next to, removing a per-tile copy
 and a per-tile allocation.** 0.68.0's `TileResidency::sync` copied each

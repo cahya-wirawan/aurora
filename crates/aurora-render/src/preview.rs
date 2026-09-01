@@ -107,9 +107,15 @@ mod tests {
                 Err(err) => unreachable!("test-local scratch store must accept this: {err}"),
             };
             for (i, sample) in tile.texels_mut().iter_mut().enumerate() {
-                // Opaque green -- distinct from a blank tile.
+                // Half-transparent green -- distinct from a blank tile,
+                // and *translucent* deliberately (0.68.4): with an opaque
+                // fixture, both `downsample`'s premultiplied-domain box
+                // filter and `upload_mip`'s own premultiply are the
+                // identity, so this whole store -> downsample -> atlas
+                // chain asserted nothing about either.
                 let channel = match i % 4 {
-                    1 | 3 => 1.0,
+                    1 => 1.0,
+                    3 => 0.5,
                     _ => 0.0,
                 };
                 *sample = f16::from_f32(channel);
@@ -195,8 +201,10 @@ mod tests {
                 let a = f16::from_le_bytes([*a0, *a1]).to_f32();
                 assert_eq!(
                     (r, g, b, a),
-                    (0.0, 1.0, 0.0, 1.0),
-                    "downsampling a uniform tile must preserve its colour exactly"
+                    (0.0, 0.5, 0.0, 0.5),
+                    "downsampling a uniform tile must preserve its colour exactly, and the \
+                     atlas holds it premultiplied: straight (0, 1, 0, 0.5) lands as \
+                     (0, 0.5, 0, 0.5)"
                 );
             }
             _ => unreachable!("sliced exactly 8 bytes"),

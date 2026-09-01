@@ -288,10 +288,18 @@ fn upload_mip_lands_in_the_correct_slot_and_level() {
     let size = TILE / 2;
     let mut texels = Vec::with_capacity((size * size * 4) as usize);
     for _ in 0..(size * size) {
-        // Opaque magenta -- distinct from this file's other test colour
-        // (green) and from a blank tile, so a wrong slot/level reads as
-        // visibly wrong, not coincidentally right.
-        for channel in [1.0, 0.0, 1.0, 1.0] {
+        // Half-transparent magenta -- distinct from this file's other
+        // test colour (green) and from a blank tile, so a wrong
+        // slot/level reads as visibly wrong, not coincidentally right.
+        //
+        // **Translucent, deliberately (0.68.4).** This fixture was opaque
+        // until then, and premultiplying an opaque texel is the identity
+        // -- so the assertion below held whether or not `upload_mip`
+        // premultiplied at all, and deleting that call left the suite
+        // green. Alpha 0.5 makes the expected readback differ from the
+        // uploaded straight-alpha texel, so the premultiply is now
+        // actually load-bearing for this test.
+        for channel in [1.0, 0.0, 1.0, 0.5] {
             texels.push(f16::from_f32(channel));
         }
     }
@@ -367,8 +375,9 @@ fn upload_mip_lands_in_the_correct_slot_and_level() {
             let a = f16::from_le_bytes([*a0, *a1]).to_f32();
             assert_eq!(
                 (r, g, b, a),
-                (1.0, 0.0, 1.0, 1.0),
-                "slot (1,0) at mip level 1 must hold the uploaded preview's own colour"
+                (0.5, 0.0, 0.5, 0.5),
+                "slot (1,0) at mip level 1 must hold the uploaded preview's own colour, \
+                 premultiplied: straight (1, 0, 1, 0.5) lands as (0.5, 0, 0.5, 0.5)"
             );
         }
         _ => unreachable!("sliced exactly 8 bytes"),
