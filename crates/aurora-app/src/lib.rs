@@ -5891,7 +5891,7 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// own fixed-function "source-over" *is* that formula exactly, so unlike
 /// `composite_tile_cpu` this needs no blend-mode dispatch of its own.
 ///
-/// For each collected layer (bottom to top): uploads its own tile-sized
+/// For each resolved layer (bottom to top), immediately: uploads its own tile-sized
 /// texel window into a fresh scratch `Rgba16Float` source texture
 /// (`TEXTURE_BINDING | COPY_DST`), then
 /// `aurora_render::TileCompositor::composite_over_with_opacity` blends it
@@ -5964,14 +5964,33 @@ fn begin_gpu_composite_tile(
     reference_origin: (i64, i64),
     budget: &mut CompositeBudget,
 ) -> Option<PendingGpuReadback> {
-    let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::new();
+    let device = gpu.device();
+    let queue = gpu.queue();
+    let tile_extent = wgpu::Extent3d {
+        width: aurora_tile::TILE,
+        height: aurora_tile::TILE,
+        depth_or_array_layers: 1,
+    };
+
+    // Built lazily, on the first root layer that actually resolves to
+    // real content for this tile -- a tile with no touched layer
+    // anywhere must do zero GPU work and return `None`, exactly as the
+    // collect-then-check-empty shape this replaces did. Resolving and
+    // compositing one layer at a time this way (rather than collecting
+    // every root's own `Vec<half::f16>` before uploading any of them)
+    // means this tile's peak memory is one resolved layer's texels plus
+    // one GPU-side src/dst texture pair, not one texel buffer per
+    // visible root -- the same shape `composite_roots_into_tile`'s own
+    // CPU path already has (0.51.0).
+    let mut dst: Option<(wgpu::Texture, wgpu::TextureView)> = None;
+
     for &id in layers.roots().iter().rev() {
         // `1`: a root-level layer, the same depth `aurora-doc`'s own
         // validator starts its budget at. One `budget` for all of this
         // tile's roots, not one each: in a well-formed tree their
         // subtrees are disjoint, so the sum of their node counts is
         // still bounded by the tree's own length.
-        if let Some((texels, opacity, _blend_mode)) = resolve_tile(
+        let Some((texels, opacity, _blend_mode)) = resolve_tile(
             id,
             layers,
             store,
@@ -5980,66 +5999,58 @@ fn begin_gpu_composite_tile(
             reference_origin,
             1,
             budget,
-        ) {
-            layer_texels.push((texels, opacity));
-        }
-    }
-    if layer_texels.is_empty() {
-        return None;
-    }
+        ) else {
+            continue;
+        };
 
-    let device = gpu.device();
-    let queue = gpu.queue();
-    let tile_extent = wgpu::Extent3d {
-        width: aurora_tile::TILE,
-        height: aurora_tile::TILE,
-        depth_or_array_layers: 1,
-    };
-    let dst_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("gpu-composite-dst"),
-        size: tile_extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        // `RENDER_ATTACHMENT` for the per-layer blend passes, `COPY_SRC`
-        // for the readback below -- nothing samples this texture, so it
-        // needs no `TEXTURE_BINDING`.
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let dst_view = dst_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    // Clear to fully transparent black -- `composite_over_with_opacity`
-    // always preserves existing content (`LoadOp::Load`), so the
-    // destination needs real, known-transparent content before the first
-    // real layer blends onto it.
-    {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpu-composite-clear"),
-        });
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gpu-composite-clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
+        let (_dst_texture, dst_view) = &*dst.get_or_insert_with(|| {
+            let dst_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gpu-composite-dst"),
+                size: tile_extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                // `RENDER_ATTACHMENT` for the per-layer blend passes, `COPY_SRC`
+                // for the readback below -- nothing samples this texture, so it
+                // needs no `TEXTURE_BINDING`.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
             });
-        }
-        queue.submit(std::iter::once(encoder.finish()));
-    }
+            let dst_view = dst_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    for (texels, opacity) in &layer_texels {
+            // Clear to fully transparent black -- `composite_over_with_opacity`
+            // always preserves existing content (`LoadOp::Load`), so the
+            // destination needs real, known-transparent content before the first
+            // real layer blends onto it.
+            {
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("gpu-composite-clear"),
+                });
+                {
+                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("gpu-composite-clear"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &dst_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
+                queue.submit(std::iter::once(encoder.finish()));
+            }
+
+            (dst_texture, dst_view)
+        });
+
         let src_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gpu-composite-src"),
             size: tile_extent,
@@ -6051,7 +6062,7 @@ fn begin_gpu_composite_tile(
             view_formats: &[],
         });
         let mut bytes = Vec::with_capacity(texels.len() * 2);
-        for sample in texels {
+        for sample in &texels {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         queue.write_texture(
@@ -6070,8 +6081,10 @@ fn begin_gpu_composite_tile(
             tile_extent,
         );
         let src_view = src_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        compositor.composite_over_with_opacity(gpu, &dst_view, &src_view, *opacity);
+        compositor.composite_over_with_opacity(gpu, dst_view, &src_view, opacity);
     }
+
+    let (dst_texture, _dst_view) = dst?;
 
     // `dst_texture` now holds this tile's finished composite in
     // *premultiplied* alpha -- the fixed-function `AlphaBlending` fold
@@ -19376,6 +19389,112 @@ mod tests {
         //     b = 0.75*0.0 + 0.25*1.0 = 0.25,
         //     a = 0.25 + 1.0*0.75 = 1.0 -> (0.375, 0.375, 0.25, 1.0).
         assert_eq!(gpu_result, (0.375, 0.375, 0.25, 1.0));
+    }
+
+    /// `begin_gpu_composite_tile` builds its shared destination texture
+    /// lazily now, on the first root layer that actually resolves at
+    /// this tile (0.69.0) — before, it collected every root's own
+    /// `Vec<half::f16>` into memory first, so which root happened to
+    /// resolve first never mattered structurally. This is the specific
+    /// case the streaming rewrite must get right: the *bottom* root has
+    /// no content at this tile at all (never filled, so `resolve_tile`
+    /// returns `None` and the loop `continue`s past it), so the
+    /// destination texture is only created on the *middle* root, the
+    /// first one that actually has something to composite — not on the
+    /// first root in iteration order. A bug that created the
+    /// destination unconditionally on the first iteration (or that
+    /// mishandled the lazily-created reference across further
+    /// iterations) would either panic, composite the wrong first layer,
+    /// or disagree with the CPU path, which this test would catch via
+    /// the exact-equality assertion below.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_skips_an_early_root_with_no_content_at_this_tile() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        // `bottom` is added and left completely unfilled -- it has no
+        // tile at all for this position, so `resolve_tile` returns
+        // `None` for it and the streaming loop must skip it without
+        // creating the destination texture yet.
+        let _bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let middle = match layers.add_pixel_layer("middle", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(middle, [0.0, 1.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "three Normal-blend, non-grouped pixel layers must qualify for the GPU path"
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        assert_eq!(
+            gpu_result, cpu_result,
+            "the GPU path and the CPU path must agree even when an early root layer has no \
+             content at this tile"
+        );
+
+        // Hand-computed, bottom to top: the unfilled bottom root
+        // contributes nothing (as if it weren't there); middle (opaque
+        // green, opacity 1.0) over transparent black reproduces the
+        // source exactly, then top (opaque blue, opacity 0.5) blends
+        // over it: as = 1.0*0.5 = 0.5,
+        //   r = 0.5*0.0 + 0.5*0.0 = 0.0, g = 0.5*1.0 + 0.5*0.0 = 0.5,
+        //   b = 0.5*0.0 + 0.5*1.0 = 0.5, a = 0.5 + 1.0*0.5 = 1.0.
+        assert_eq!(gpu_result, (0.0, 0.5, 0.5, 1.0));
     }
 
     /// AC-2's own regression test: the same fixture as

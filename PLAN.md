@@ -7381,27 +7381,46 @@ structural design work.
     has been run in a live session on real hardware, and none of it
     changes the still-open 60 FPS finding — this reduces peak *memory*,
     not per-tile cost.
-- [ ] **`begin_gpu_composite_tile` has the same collect-all-siblings
+- [x] **`begin_gpu_composite_tile` has the same collect-all-siblings
     shape the CPU path just lost** — named 2026-08-24, when
     `resolve_tile`'s own version was fixed (0.51.0), and deliberately
-    left open. It collects one buffer per visible root-level layer
+    left open. It collected one buffer per visible root-level layer
     before its upload/composite loop, reachable specifically when the
     document qualifies for GPU compositing (flat, groupless, all-
     `Normal`) — plausibly the *more* common shape for a many-layer
-    document, so this is not a smaller problem than the one just fixed.
-    Not fixed here. **Correction, from an independent judgment pass**: an
-    earlier draft of this bullet overstated the code obstacle — the
-    `dst_texture` accumulator already exists and is already cleared
-    before the loop, and each iteration already builds its own
-    `src_texture` and calls `composite_over_with_opacity` immediately, so
-    merging the resolve loop into the upload loop is close to the same
-    code motion the CPU side got, not a real batch/readback
-    restructuring; only the `layer_texels.is_empty()` early-return needs
-    rework. The real, honest blocker is that **there is no real GPU in
-    this sandbox to verify such a change against** (CLAUDE.md: a green
-    headless run is not evidence about GPU behaviour) — that alone is
-    reason enough to defer it, without overstating the code-side
-    difficulty too. Sized, not scheduled.
+    document, so this was not a smaller problem than the one just fixed.
+
+    **Closed 2026-09-01 (0.69.0)**, once the real blocker this item
+    itself named was actually gone: an earlier round of this same
+    session found this sandbox has a real NVIDIA RTX 3090 (`vulkaninfo`/
+    `nvidia-smi`, `DeviceType::DiscreteGpu`), not the Mesa llvmpipe
+    software rendering CLAUDE.md's text still assumes for "a typical
+    Linux dev box here" — so the change below is verified against real
+    hardware, not just a headless software-Vulkan run. The prior
+    independent-judgment correction on this item was right about the
+    code shape: the `dst_texture` accumulator now builds lazily, on the
+    first root layer that actually resolves at a given tile (via
+    `Option<(Texture, TextureView)>::get_or_insert_with`), rather than
+    resolving every root into a `Vec<(Vec<half::f16>, f32)>` before
+    uploading any of them — one root's own texels plus one GPU texture
+    pair is now this function's peak per-tile memory, the same shape
+    `composite_roots_into_tile`'s CPU path already had after 0.51.0. A
+    tile with no content on any root layer still returns `None` doing
+    zero GPU work (`dst?` after the loop), exactly as the old
+    collect-then-check-empty shape did — no behaviour change, only the
+    memory shape. New test
+    `recomposite_visible_tiles_gpu_path_skips_an_early_root_with_no_content_at_this_tile`
+    specifically exercises the case this rewrite had to get right: the
+    *bottom* root has no tile at all at the position under test, so the
+    loop must `continue` past it without creating the destination
+    texture, and only build it once the *middle* root resolves —
+    checked against both an independently hand-computed expected pixel
+    and the CPU path's own result, on real hardware
+    (`AURORA_REQUIRE_GPU=1`, adapter logged as `NVIDIA GeForce RTX 3090
+    (Vulkan, DiscreteGpu)`). All pre-existing GPU-path tests
+    (`..._batches_multiple_real_tiles_in_one_call_without_mixing_them_up`
+    included, the one that most exercises this function's control flow)
+    still pass unchanged. 311 `aurora-app` tests, up from 310.
 - [x] **Every saved file with translucent pixels has premultiplied
     alpha where straight alpha belongs — the un-premultiply step runs
     only inside a group** — found 2026-08-24 by the review of the
