@@ -13948,6 +13948,64 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-01 (0.68.2) — a refusal that loses the race for the
+one modal slot is no longer marked as if the user had seen it, and the
+macOS menu bar can no longer fire commands underneath a modal.** Two
+faults of the same class, found independently by two reviewers.
+
+**The swallowed refusal.** `App` holds exactly one dialog slot and
+`open_dialog` is correctly a no-op when it is occupied — but the callers
+marked the refusal reported *unconditionally*. `App::apply_move` called
+`move_refusal_unreported(&mut self.drag)`, which both answered "yes,
+report it" **and** latched `refused = true` in the same call, and then
+called `open_move_refused_dialog`, which does nothing at all while
+another dialog (crash recovery from `App::new`, or an earlier export
+refusal) is up. Because the flag lives on the drag, the refusal was then
+never offered again for the rest of that gesture — not even after the
+blocking dialog was dismissed. The user saw nothing, and nothing in the
+log said so either.
+
+`open_dialog` now **returns whether it actually opened**, and logs a
+`tracing::warn!` naming the dialog it suppressed when it did not, so the
+event survives in the record even when it never reaches a screen.
+`move_refusal_unreported` is now a pure query (`Option<&Drag> -> bool`)
+and a separate `mark_move_refusal_reported` does the latching, which
+`apply_move` runs **only** once a dialog genuinely opened. `save_file`'s
+export refusal has no latch to get wrong, but gains its own
+`tracing::warn!` carrying the full itemized message when the dialog could
+not be shown — the detail it would otherwise have taken to the screen and
+nowhere else.
+
+**The unguarded door.** `handle_key` opens with an early return while a
+dialog is open, so no keyboard-routed Save can fire underneath a modal.
+`handle_menu_event` (macOS, `muda`) had no equivalent: it called
+`activate_command` and then `save_file` regardless. A user with the
+crash-recovery dialog up could pick File > Save As from the native menu,
+hit `IoError::IncompleteComposite`, and be shown nothing — the same
+failure class through a different door, and one that specifically
+undermines the dialog's own `Role::AlertDialog` + `set_modal()` claim,
+since a native menu bar is not dialog-aware and nothing else enforces it
+on that path. It now takes the same early return.
+
+**Stated honestly: the menu gate is inspection-only.** `muda` is
+macOS-only and this sandbox is Linux with no display server, so no
+`muda::MenuEvent` can be constructed here and the two new lines were
+never executed. This is a code-path finding from reading, not a live
+reproduction, and it is disclosed on the method's own doc comment as
+well.
+
+**Three new tests** (`aurora-app` 308, up from 305), all headless.
+`a_move_refusal_suppressed_by_another_dialog_is_not_latched_as_reported`
+replays `apply_move`'s exact sequence against the real `open_dialog` with
+crash recovery already occupying the slot, asserts the refusal is still
+pending, then dismisses the blocker and asserts it now shows *and only
+then* latches.
+`asking_whether_a_move_refusal_needs_reporting_does_not_mark_it_reported`
+pins the query's purity directly. `a_menu_routed_save_is_gated_by_the_
+same_dialog_check_the_keyboard_uses` pins the invariant the macOS gate
+exists to give, against the same shared state, since the `cfg`-gated
+method itself cannot be reached here.
+
 **Addendum 2026-09-01 (0.68.1) — the scratch-directory lock file is now
 published already locked, closing a real TOCTOU race that could delete a
 *live* session's directory.** 0.67.0's `lock_scratch_dir` did

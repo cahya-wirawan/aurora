@@ -1866,12 +1866,21 @@ fn crash_recovery_dialog_message(recovered: bool) -> &'static str {
 ///
 /// The generic mechanism every dialog this crate opens goes through —
 /// [`open_crash_recovery_dialog`] is one thin wrapper, and
-/// [`App::save_file`]'s own incomplete-composite refusal is the other.
-/// **The "already open is a no-op" guard lives here, not in the
-/// wrappers**, so every caller inherits it: `App` holds exactly one
+/// [`App::save_file`]'s and [`App::apply_move`]'s own refusals are the
+/// other two. **The "already open is a no-op" guard lives here, not in
+/// the wrappers**, so every caller inherits it: `App` holds exactly one
 /// dialog slot, a modal alert already blocks everything else, and a
 /// caller that fires repeatedly (a pointer-move during a refused drag,
 /// say) must not stack or replace what the user is currently reading.
+///
+/// **Returns whether it actually opened**, which is not decoration
+/// (0.68.2): a caller that latches "the user has now been told" — as
+/// [`App::apply_move`] does, on the drag itself — must latch only when
+/// the dialog genuinely appeared. Latching unconditionally means a
+/// refusal suppressed by an unrelated dialog is never offered again for
+/// the rest of that gesture, and the user is shown nothing at all. The
+/// suppressed case is also logged here, naming the dialog that lost, so
+/// the event survives in the record even when it never reached a screen.
 ///
 /// Pushing the updated accessibility tree to the platform, and re-running
 /// layout so the new subtree actually has bounds, stay the caller's job
@@ -1886,9 +1895,14 @@ fn open_dialog(
     title: &str,
     message: &str,
     actions: Vec<DialogAction>,
-) {
+) -> bool {
     if dialog.is_some() {
-        return;
+        tracing::warn!(
+            suppressed = title,
+            "a modal dialog is already open, so this one was not shown; \
+             the condition it reports is still recorded in the log above"
+        );
+        return false;
     }
     let handle = match insert_dialog(
         &mut workspace.tree,
@@ -1901,7 +1915,7 @@ fn open_dialog(
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(?err, title, "failed to open a dialog");
-            return;
+            return false;
         }
     };
     if let Some(button) = handle.first_action()
@@ -1910,6 +1924,7 @@ fn open_dialog(
         tracing::warn!(?err, title, "failed to focus a dialog");
     }
     *dialog = Some(handle);
+    true
 }
 
 /// Opens the crash-recovery dialog — [`open_dialog`] with this dialog's
@@ -1922,7 +1937,7 @@ fn open_crash_recovery_dialog(
     dialog: &mut Option<DialogHandle>,
     scales: &Scales,
     recovered: bool,
-) {
+) -> bool {
     open_dialog(
         workspace,
         focus,
@@ -1931,7 +1946,7 @@ fn open_crash_recovery_dialog(
         "Aurora Didn't Close Properly",
         crash_recovery_dialog_message(recovered),
         crash_recovery_dialog_actions(),
-    );
+    )
 }
 
 const EXPORT_REFUSED_DISMISS: &str = "export.refused.dismiss";
@@ -3532,9 +3547,20 @@ fn unwarned_failures<'a>(
 }
 
 /// Whether this drag's boundary refusal still needs reporting to the
-/// user, marking it reported as it goes — so a `Drag::Move` held past
-/// the document's own coordinate range opens one dialog for the whole
-/// gesture rather than one per pointer-move event.
+/// user — so a `Drag::Move` held past the document's own coordinate
+/// range opens one dialog for the whole gesture rather than one per
+/// pointer-move event.
+///
+/// **A pure query, deliberately (0.68.2).** Until then this marked the
+/// refusal reported as it answered, and [`App::apply_move`] then called
+/// `open_move_refused_dialog` — which is a *no-op* whenever another
+/// dialog already occupies the one modal slot ([`open_dialog`]'s own
+/// guard). The flag was therefore latched for a dialog nobody ever saw,
+/// and because the flag lives on the drag, the refusal was never offered
+/// again for the rest of that gesture: the user saw nothing at all, even
+/// after dismissing whatever had been in the way. Marking is now
+/// [`mark_move_refusal_reported`]'s job and happens only once a dialog
+/// has genuinely opened.
 ///
 /// [`unwarned_failures`]'s exact shape, for exactly the same reason and
 /// with the same stance on being wrong: a drag that is somehow *not* a
@@ -3542,15 +3568,22 @@ fn unwarned_failures<'a>(
 /// refusal the user cannot otherwise see is the wrong way to be wrong
 /// about it. Unreachable in practice — only [`App::apply_move`] calls
 /// this, and it only runs while a `Drag::Move` is live.
-fn move_refusal_unreported(drag: &mut Option<Drag>) -> bool {
+fn move_refusal_unreported(drag: Option<&Drag>) -> bool {
     let Some(Drag::Move { refused, .. }) = drag else {
         return true;
     };
-    if *refused {
-        return false;
+    !*refused
+}
+
+/// Marks this drag's boundary refusal as reported, so the rest of the
+/// gesture stays silent — see [`move_refusal_unreported`] for why this
+/// is separate from asking, and why it must run only after a dialog
+/// actually opened. A no-op for any other drag, matching the query's own
+/// "not a `Move` is always still unreported" answer.
+fn mark_move_refusal_reported(drag: &mut Option<Drag>) {
+    if let Some(Drag::Move { refused, .. }) = drag {
+        *refused = true;
     }
-    *refused = true;
-    true
 }
 
 /// Records a completed `Drag::Move` as a single undo step, from
@@ -7806,14 +7839,25 @@ struct App {
     /// `command_palette` field above already uses.
     ///
     /// **One slot, deliberately.** A modal alert blocks everything else
-    /// ([`handle_key`]'s own routing order), so a second one could never
-    /// be interacted with anyway; [`open_dialog`]'s own "already open is
-    /// a no-op" guard is what makes that concrete. Two callers open one
-    /// today: crash recovery at construction, if
+    /// ([`handle_key`]'s own routing order, and — since 0.68.2 —
+    /// [`App::handle_menu_event`]'s), so a second one could never be
+    /// interacted with anyway; [`open_dialog`]'s own "already open is a
+    /// no-op" guard is what makes that concrete. **Three callers open
+    /// one today**: crash recovery at construction, if
     /// [`previous_session_left_a_marker`] said so (see this crate's own
-    /// "crash recovery" section), and [`App::save_file`] refusing an
-    /// export whose composite came out incomplete
-    /// ([`incomplete_composite_message`]).
+    /// "crash recovery" section); [`App::save_file`] refusing an export
+    /// whose composite came out incomplete
+    /// ([`incomplete_composite_message`]); and [`App::apply_move`]
+    /// refusing a Move drag that left the document's own coordinate
+    /// range ([`move_refused_message`], 0.66.0).
+    ///
+    /// **The consequence of one slot is mutual exclusion, and it is not
+    /// free.** Any one of those three can silently suppress the other
+    /// two, so a caller that remembers "the user has been told" must ask
+    /// [`open_dialog`] whether it actually opened rather than assuming —
+    /// see [`move_refusal_unreported`] for the bug that assumption
+    /// caused, and `open_dialog`'s own suppression log line for what is
+    /// left behind when a refusal loses the race for the slot.
     dialog: Option<DialogHandle>,
     /// This run's own "still running" marker file — written in [`run`]
     /// before this `App` is built, cleared on a clean shutdown
@@ -8624,15 +8668,21 @@ impl App {
     /// A silent no-op, logged, if the design scales can't be loaded:
     /// there is no dialog to build without them, and the export has
     /// already refused safely either way.
-    fn open_export_refused_dialog(&mut self, message: &str) {
+    ///
+    /// **Returns whether a dialog actually opened** — the same signal
+    /// [`Self::open_move_refused_dialog`] returns and for the same
+    /// reason: the one modal slot may already be occupied, in which case
+    /// the refusal reached the log but not the user, and the caller is
+    /// what knows how to say so.
+    fn open_export_refused_dialog(&mut self, message: &str) -> bool {
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
                 tracing::error!(%err, "failed to load design scales; cannot open a dialog");
-                return;
+                return false;
             }
         };
-        open_dialog(
+        let opened = open_dialog(
             &mut self.workspace,
             &mut self.focus,
             &mut self.dialog,
@@ -8646,6 +8696,7 @@ impl App {
             self.apply_resize((size.width, size.height));
         }
         self.push_accessibility();
+        opened
     }
 
     /// Saves to `path` — the whole document, real and multi-layer
@@ -8755,7 +8806,18 @@ impl App {
                     // Only this variant, deliberately -- see this
                     // method's own doc comment for why the match is not
                     // widened to a catch-all.
-                    self.open_export_refused_dialog(&incomplete_composite_message(*skipped, first));
+                    let message = incomplete_composite_message(*skipped, first);
+                    if !self.open_export_refused_dialog(&message) {
+                        // The one modal slot was already occupied, so the
+                        // itemized refusal never reached the screen. It
+                        // is not allowed to vanish with it.
+                        tracing::warn!(
+                            path = %path.display(),
+                            %message,
+                            "the export refusal could not be shown (a dialog is already open); \
+                             the file is still untouched"
+                        );
+                    }
                 }
                 return;
             }
@@ -9253,16 +9315,16 @@ impl App {
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
         if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
             tracing::warn!(?err, "failed to reposition the active layer");
-            // Taken *before* `self.workspace`/`self.focus`/`self.dialog`
-            // are borrowed: `move_refusal_unreported` needs `&mut
-            // self.drag`, and folding it into the `if` condition below
-            // would hold that borrow across the call that takes the
-            // others.
-            if matches!(err, aurora_doc::DocError::LayerOriginOutOfRange { .. }) {
-                let report = move_refusal_unreported(&mut self.drag);
-                if report {
-                    self.open_move_refused_dialog();
-                }
+            // Ask, open, and only then latch. The latch must not happen
+            // when `open_move_refused_dialog` was a no-op because another
+            // dialog holds the one modal slot -- see
+            // `move_refusal_unreported`'s own doc comment for the bug
+            // that ordering had until 0.68.2.
+            if matches!(err, aurora_doc::DocError::LayerOriginOutOfRange { .. })
+                && move_refusal_unreported(self.drag.as_ref())
+                && self.open_move_refused_dialog()
+            {
+                mark_move_refusal_reported(&mut self.drag);
             }
         }
         self.composite_cache.bump();
@@ -9273,15 +9335,20 @@ impl App {
     /// [`open_dialog`], same `apply_resize` + `push_accessibility`
     /// pairing owned here rather than at the call site, same silent
     /// logged no-op if the design scales can't be loaded.
-    fn open_move_refused_dialog(&mut self) {
+    ///
+    /// **Returns whether a dialog actually opened**, which the caller
+    /// ([`Self::apply_move`]) needs in order to latch "reported" only
+    /// when the user was genuinely shown something — see
+    /// [`move_refusal_unreported`].
+    fn open_move_refused_dialog(&mut self) -> bool {
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
                 tracing::error!(%err, "failed to load design scales; cannot open a dialog");
-                return;
+                return false;
             }
         };
-        open_dialog(
+        let opened = open_dialog(
             &mut self.workspace,
             &mut self.focus,
             &mut self.dialog,
@@ -9295,6 +9362,7 @@ impl App {
             self.apply_resize((size.width, size.height));
         }
         self.push_accessibility();
+        opened
     }
 
     /// Commits `drag`, whatever it turns out to be, into this
@@ -9433,8 +9501,38 @@ impl App {
     /// Routes one native menu activation to [`activate_command`] — the
     /// same dispatch the command palette's `Enter` key already uses,
     /// just reached from the menu bar instead.
+    ///
+    /// **An open modal dialog swallows the whole event (0.68.2)**, the
+    /// same early return [`handle_key`] opens with, and for the same
+    /// reason: the dialog is a `Role::AlertDialog` with `set_modal()`
+    /// set, so it claims to block everything else — and a native menu
+    /// bar is not dialog-aware, so nothing else enforces that claim on
+    /// this path. Without the gate a user could pick File > Save As
+    /// underneath the crash-recovery dialog, reach
+    /// `IoError::IncompleteComposite`, and be shown nothing at all,
+    /// because the refusal's own dialog is a no-op while the slot is
+    /// occupied ([`open_dialog`]). The keyboard route was already
+    /// immune; this closes the other door.
+    ///
+    /// **Covered by inspection, not by a test.** `muda` is macOS-only,
+    /// and this sandbox is Linux with no display server, so no
+    /// `muda::MenuEvent` can be constructed here at all — the same
+    /// disclosed-inspection-only footing the rest of this crate's
+    /// platform-gated code sits on. What *is* tested headlessly is the
+    /// invariant the gate exists to preserve: see
+    /// `a_menu_routed_save_is_gated_by_the_same_dialog_check_the_keyboard_uses`.
     #[cfg(target_os = "macos")]
     fn handle_menu_event(&mut self, event: &muda::MenuEvent) {
+        if self.dialog.is_some() {
+            // Annotated rather than inferred: `MenuId`'s `AsRef` has no
+            // `&str`-typed context to resolve against inside the macro.
+            let id: &str = event.id().as_ref();
+            tracing::debug!(
+                id,
+                "ignoring a native menu activation while a modal dialog is open"
+            );
+            return;
+        }
         let picked = activate_command(
             &mut self.workspace,
             &mut self.focus,
@@ -10300,9 +10398,10 @@ mod tests {
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
         hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
         layer_local_point, load_document_view, load_scales, load_theme, logical_point,
-        logical_size, move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
-        open_command_palette, open_crash_recovery_dialog, open_dialog, open_image, open_tile_store,
-        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        logical_size, mark_move_refusal_reported, move_refusal_unreported,
+        move_refused_dialog_actions, move_refused_message, open_command_palette,
+        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
+        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
         pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
         recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
         resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
@@ -21266,25 +21365,43 @@ mod tests {
         // The shape of a drag held past the document's own coordinate
         // range: `set_bounds` refuses on every pointer-move event for the
         // rest of the gesture, and the user must be told exactly once.
+        // Asking and marking are two calls since 0.68.2 -- `apply_move`
+        // marks only once a dialog has genuinely opened -- so this test
+        // performs the pair the way the real call site does.
         let mut drag = Some(move_drag());
         assert!(
-            move_refusal_unreported(&mut drag),
+            move_refusal_unreported(drag.as_ref()),
             "the first refusal in a drag must be reported"
         );
+        mark_move_refusal_reported(&mut drag);
         for _ in 0..10 {
             assert!(
-                !move_refusal_unreported(&mut drag),
+                !move_refusal_unreported(drag.as_ref()),
                 "a drag still out of range must not re-report on every event"
             );
         }
 
         // A *new* drag starts from a clean slate -- the flag lives on the
         // drag, so it cannot outlive the gesture it belongs to.
-        let mut next = Some(move_drag());
+        let next = Some(move_drag());
         assert!(
-            move_refusal_unreported(&mut next),
+            move_refusal_unreported(next.as_ref()),
             "a new drag must report again rather than inheriting a stale flag"
         );
+    }
+
+    /// The 0.68.2 regression: asking must not itself latch, or a refusal
+    /// whose dialog never opened is marked reported anyway and the user
+    /// is shown nothing for the rest of the gesture.
+    #[test]
+    fn asking_whether_a_move_refusal_needs_reporting_does_not_mark_it_reported() {
+        let drag = Some(move_drag());
+        for _ in 0..10 {
+            assert!(
+                move_refusal_unreported(drag.as_ref()),
+                "an unanswered refusal must stay unreported however often it is asked about"
+            );
+        }
     }
 
     #[test]
@@ -21293,14 +21410,147 @@ mod tests {
         // only while a `Drag::Move` is live), but under-reporting a
         // refusal the user cannot otherwise see is the wrong way to be
         // wrong about it -- the same stance `unwarned_failures` takes.
+        // Marking one is correspondingly a no-op rather than a panic.
         let mut none = None;
-        assert!(move_refusal_unreported(&mut none));
+        assert!(move_refusal_unreported(none.as_ref()));
+        mark_move_refusal_reported(&mut none);
+        assert!(move_refusal_unreported(none.as_ref()));
         let mut pan = Some(Drag::Pan {
             last_screen: (0.0, 0.0),
         });
-        assert!(move_refusal_unreported(&mut pan));
-        let mut eyedropper = Some(Drag::Eyedropper);
-        assert!(move_refusal_unreported(&mut eyedropper));
+        assert!(move_refusal_unreported(pan.as_ref()));
+        mark_move_refusal_reported(&mut pan);
+        assert!(move_refusal_unreported(pan.as_ref()));
+        let eyedropper = Some(Drag::Eyedropper);
+        assert!(move_refusal_unreported(eyedropper.as_ref()));
+    }
+
+    /// **RT-02, as a test.** `App::apply_move`'s exact sequence, replayed
+    /// against the real `open_dialog` with another dialog (crash
+    /// recovery) already occupying the one modal slot.
+    ///
+    /// Before 0.68.2 the refusal was latched on the drag regardless of
+    /// whether anything opened, so the user was shown nothing *and* the
+    /// refusal was never offered again for the rest of the gesture — even
+    /// after the blocking dialog was dismissed. Now the latch follows the
+    /// open, so the refusal survives to be shown once the slot frees.
+    ///
+    /// An `App` cannot be constructed here (window, GPU adapter, live
+    /// tile store), so this drives the same free functions `apply_move`
+    /// drives, in the same order, rather than the method itself.
+    #[test]
+    fn a_move_refusal_suppressed_by_another_dialog_is_not_latched_as_reported() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        // Something else got there first -- crash recovery at startup is
+        // the realistic one.
+        assert!(open_crash_recovery_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            false
+        ));
+
+        let mut drag = Some(move_drag());
+        assert!(move_refusal_unreported(drag.as_ref()));
+        let opened = open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Can't Move This Layer Further",
+            move_refused_message(),
+            move_refused_dialog_actions(),
+        );
+        assert!(!opened, "the occupied slot must refuse the second dialog");
+        if opened {
+            mark_move_refusal_reported(&mut drag);
+        }
+        assert!(
+            move_refusal_unreported(drag.as_ref()),
+            "a refusal the user never saw must still be pending"
+        );
+
+        // And once the slot frees, the same sequence does show it, and
+        // only then latches.
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
+        );
+        assert_eq!(dialog, None);
+        let opened = open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Can't Move This Layer Further",
+            move_refused_message(),
+            move_refused_dialog_actions(),
+        );
+        assert!(opened, "an empty slot must accept the refusal");
+        if opened {
+            mark_move_refusal_reported(&mut drag);
+        }
+        assert!(
+            !move_refusal_unreported(drag.as_ref()),
+            "a refusal the user has now seen must not repeat for the rest of the drag"
+        );
+    }
+
+    /// **RT-03's invariant, headlessly.** `handle_menu_event` is
+    /// macOS-only (`muda`) and cannot be constructed on this platform, so
+    /// what is asserted here is the property its new early return exists
+    /// to give it — the same property `handle_key` already has, pinned
+    /// against the same shared state — rather than the `cfg`-gated method
+    /// itself. The method's own two lines stay inspection-only, disclosed
+    /// on its doc comment.
+    #[test]
+    fn a_menu_routed_save_is_gated_by_the_same_dialog_check_the_keyboard_uses() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert!(open_crash_recovery_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            false
+        ));
+
+        // The gate itself, spelled exactly as both routes spell it.
+        assert!(
+            dialog.is_some(),
+            "a dialog is open, so neither route may dispatch a command"
+        );
+
+        // And the failure it prevents: a save that got through anyway
+        // would try to report its own refusal into an occupied slot and
+        // be silently swallowed.
+        let swallowed = open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+        assert!(
+            !swallowed,
+            "this is what a menu-routed Save would have hit without the gate"
+        );
     }
 
     #[test]
