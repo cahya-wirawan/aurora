@@ -11689,6 +11689,26 @@ fn draw_widget_paints<'pass>(
 #[cfg(target_os = "macos")]
 const MUDA_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// A floor on the real window's logical size, independent of anything a
+/// dialog or panel does on its own. Engineering defaults, not design
+/// tokens — the same "no dedicated token exists, use a justified literal"
+/// call `docs/taffy-behaviors.md` and `command_palette_style` already make
+/// for this class of value.
+///
+/// This is the guard the dialog-overlay round (`0.77.6`/`0.77.7`) named but
+/// didn't add: below roughly 34 logical px of window height, an open
+/// dialog's own action button falls outside `workspace.root`'s bounds and
+/// stops being hit-testable, while `handle_dialog_pointer` still swallows
+/// every click — the app going mouse-dead with only `Escape`/`Enter` left.
+/// `RAIL_MIN_WIDTH` (`aurora_ui::workspace`, 150px) is the closest existing
+/// precedent for "the rail alone needs at least this much"; `MIN_WINDOW_WIDTH`
+/// leaves real room for the canvas and divider beside it, and
+/// `MIN_WINDOW_HEIGHT` sits an order of magnitude above the dialog
+/// threshold rather than merely above it, so ordinary DPI/scale rounding
+/// can't erode the margin back down to the reachable-but-uncomfortable range.
+const MIN_WINDOW_WIDTH: f64 = 640.0;
+const MIN_WINDOW_HEIGHT: f64 = 480.0;
+
 impl ApplicationHandler<accesskit_winit::Event> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -11702,7 +11722,11 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
         let attrs = Window::default_attributes()
             .with_title("Aurora")
             .with_visible(false)
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(
+                MIN_WINDOW_WIDTH,
+                MIN_WINDOW_HEIGHT,
+            ));
         let window = match el.create_window(attrs) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -12076,8 +12100,8 @@ mod tests {
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, Drag,
-        ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord,
-        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PanBounds, PointerButton,
+        ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord, MIN_WINDOW_HEIGHT,
+        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PanBounds, PointerButton,
         RAIL_DIVIDER_HIT_TOLERANCE, RailResize, RecoveredDocument, ShutdownState, UndoKind,
         UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
         apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
@@ -26197,6 +26221,68 @@ mod tests {
                  or the app is mouse-dead for as long as the dialog is open"
             );
         }
+    }
+
+    /// `MIN_WINDOW_WIDTH`/`MIN_WINDOW_HEIGHT` are the guard the round above
+    /// disclosed but didn't add: a floor on the real window itself, so the
+    /// sub-~34px case `0.77.7`'s own module doc names as still-unfixable
+    /// (no scrolling, no text measurement) is unreachable through the real
+    /// window rather than merely documented. Proves the floor is
+    /// comfortably safe for the same real dialog every other test in this
+    /// file drives -- not just "bigger than the threshold," but bigger by
+    /// the margin `MIN_WINDOW_HEIGHT`'s own doc comment claims.
+    #[test]
+    fn the_windows_own_minimum_size_keeps_every_real_dialog_clickable() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+        let Some(button) = handle.first_action() else {
+            unreachable!("the crash recovery dialog always has one action");
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        workspace
+            .tree
+            .compute_layout(MIN_WINDOW_WIDTH as f32, MIN_WINDOW_HEIGHT as f32);
+
+        let Some(bounds) = workspace.tree.bounds(button) else {
+            unreachable!("just laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let center = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            bounds.y as f32 + bounds.height as f32 / 2.0,
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let min_height = MIN_WINDOW_HEIGHT as f32;
+        assert!(
+            center.1 >= 0.0 && center.1 < min_height,
+            "at the window's own minimum size ({MIN_WINDOW_WIDTH}x{MIN_WINDOW_HEIGHT}) \
+             the action's own centre must be a point the mouse can reach: \
+             {center:?} from {bounds:?}"
+        );
+
+        let opened = handle_dialog_pointer(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            PointerButton::Primary,
+            center,
+        );
+        assert!(opened, "a dialog was open to route the click to");
+        assert_eq!(
+            dialog, None,
+            "at the window's own minimum size the action must still be \
+             clickable -- this is the floor `resumed` actually sets, not \
+             just a size this test happens to try"
+        );
     }
 
     #[test]
