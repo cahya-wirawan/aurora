@@ -138,7 +138,7 @@ pub enum IoError {
     /// **Two rectangles per layer are covered, by two different
     /// guards.** A pixel layer's own `bounds` is checked in
     /// `tile_grid`, alongside the extent. A `LayerMask`'s own `bounds`
-    /// is checked in `validate_mask_origins`, which has to be a
+    /// is checked in `validate_persisted_rects`, which has to be a
     /// separate walk: `tile_grid` is only ever handed a
     /// `LayerKind::Pixel` arm's `bounds`, so it never sees a mask, and a
     /// *group* — which carries a mask but no bounds — never reaches it
