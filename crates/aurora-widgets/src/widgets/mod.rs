@@ -13,9 +13,13 @@
 //! ([`ScrollbarState`]) followed — **4 of the 12 named widgets**.
 //! `Scrollbar` is a deliberately narrow landing: a bounded position
 //! *model* with an accessibility node, a layout style, and a paint, but
-//! nothing in this crate scrolls any content yet, and no gallery golden
-//! covers it (see `scrollbar.rs`'s own module doc comment for the full
-//! account). The rest still need infrastructure that doesn't exist yet
+//! nothing in this crate scrolls any content yet. It has a real
+//! component-gallery entry with a contrast check passing in every
+//! built-in theme; only its golden-image diff tests are unblessed
+//! (`#[ignore]`d pending a human bless on real GPU hardware, the same
+//! discipline every other widget's goldens already follow — see
+//! `scrollbar.rs`'s own module doc comment for the full account). The
+//! rest still need infrastructure that doesn't exist yet
 //! (real text shaping for dropdowns, a real scrolling container for
 //! `Tree` — which additionally needs hierarchical expand/collapse this
 //! crate models nowhere — popover layering for menus/tooltips,

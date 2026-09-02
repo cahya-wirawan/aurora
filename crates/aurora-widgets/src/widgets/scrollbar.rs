@@ -184,6 +184,18 @@ fn node(state: &ScrollbarState) -> Node {
 /// scrollbar's length comes from the region it scrolls, and a region
 /// with no size of its own has none to give. Callers put scrollbars in
 /// sized containers.
+///
+/// **The other edge `flex_shrink: 0.0` doesn't cover**: a sized parent
+/// that also flexes *along the scrolling axis* — a vertical bar sharing
+/// a `Column` with other growing siblings, or a horizontal bar sharing
+/// a `Row` — is not this function's scenario (its own scrolling axis is
+/// always the parent's *cross* axis, by design), so `percent(1.0)`
+/// there resolves against the cross size as intended and nothing
+/// overflows. Only a caller who orients the scrollbar to run *along*
+/// its parent's main axis hits it: `flex_shrink: 0.0` refuses to give
+/// that percentage back up, and the bar can overflow a crowded parent
+/// rather than yield space to its siblings. Not exercised by anything
+/// in this crate today.
 fn style(scales: &Scales, orientation: Orientation) -> Style {
     let thickness = length(type_size(scales.typography.size.md));
     // `1.0_f32`, not a bare `1.0`: `percent` is generic and the literal

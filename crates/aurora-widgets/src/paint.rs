@@ -1387,6 +1387,41 @@ mod tests {
         height: 300,
     };
 
+    /// `TALL_BAR` transposed — every geometry test above exercises only
+    /// `Orientation::Vertical`; this is the one case pinning that the
+    /// horizontal branch (thumb offset along `x`, thickness on `y`)
+    /// resolves correctly too, independent of the GPU-gated gallery
+    /// (which self-skips on a CPU-only runner).
+    const WIDE_BAR: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 300,
+        height: 13,
+    };
+
+    /// The horizontal counterpart of the geometry this module's doc
+    /// comment traces by hand for the vertical case: a 20-of-120 page
+    /// (`(max - min) + page_size`) over a 300px track is a 50px thumb,
+    /// and a value of 50 out of a 0..100 range centers it at the
+    /// `x = [125, 175]` offset the same arithmetic gives vertically.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_horizontal_scrollbars_thumb_sits_on_the_x_axis_not_the_y_axis() {
+        let (track, thumb) = scrollbar_geometry(WIDE_BAR, Orientation::Horizontal, |state| {
+            state.min = 0.0;
+            state.max = 100.0;
+            state.value = 50.0;
+            state.page_size = 20.0;
+        });
+        assert_eq!(track, (0.0, 0.0, 300.0, 13.0));
+        assert_eq!(
+            thumb,
+            (125.0, 0.0, 175.0, 13.0),
+            "the thumb travels along x and keeps the bar's own y extent, \
+             not the vertical branch's x/y swapped"
+        );
+    }
+
     /// `min == max` with no page at all: nothing is scrollable, so
     /// there is no proportional information to draw a short thumb from
     /// and the thumb covers the whole track. Kills the `span > 0.0`
