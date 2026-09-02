@@ -11998,8 +11998,8 @@ mod tests {
         clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
         close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
         composite_document, composite_reference_origin, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, create_dir_owner_only, create_tile_store_scratch_dir,
-        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
+        demo_document, dissolve_gate, document_canvas_size, document_from_image,
         document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
         export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
         handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
@@ -12018,6 +12018,13 @@ mod tests {
         translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
         write_session_marker, write_verified, zoom_steps_for_scroll,
     };
+    // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
+    // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
+    // doesn't exist on Windows. An unconditional import here is unused
+    // (and `-D warnings` denies that) on every platform that test doesn't
+    // run on.
+    #[cfg(unix)]
+    use super::create_dir_owner_only;
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
     use aurora_widgets::widgets::{insert_button, new_tree};
