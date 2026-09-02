@@ -5249,6 +5249,12 @@ structural design work.
     on the rail's width. Unreachable behind `set_rail_width`'s
     `[150, 600]` clamp, and closed anyway, since that is the shape the
     height bug had before a 43-layer document made it reachable.
+    **Retracted below, 0.77.5**: this pin does nothing — `min_size` is
+    read on a flex item's own main axis only, and width is never that
+    for a `Column` item. Read this bullet as describing an intention,
+    not an effect; the real fix landed two rounds later, at the rail
+    itself, once mutation-testing the row style two panels now share
+    happened to expose it. See the `0.77.5` entry.
   - **Properties' zero-height rows are now pinned by a test**
     (`properties_rows_are_still_degenerate_zero_height_boxes`) that
     asserts the *broken* geometry on purpose, converting a prose-only
@@ -5367,7 +5373,8 @@ structural design work.
 
   - **Why the pins were inert, from `taffy`'s own source rather than
     reasoning.** `compute/flexbox.rs`'s `determine_flex_base_size`
-    (~line 794, `taffy 0.9.2`) does
+    (lines 817–820, `taffy 0.12.2` — the version this workspace actually
+    pins, per `Cargo.lock`) does
     `child.min_size...main(dir).unwrap_or(<measure min-content>)`. It
     reads a flex item's `min_size` **on its main axis only**, and a panel
     root and a panel body are both items of `Column` containers — width
