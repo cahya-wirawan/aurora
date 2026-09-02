@@ -315,6 +315,29 @@ pub enum DocError {
         "layer origin ({x}, {y}) is further than {max}px from the document origin on at least one axis"
     )]
     LayerOriginOutOfRange { x: i64, y: i64, max: i64 },
+    /// A rectangle's own *extent* is past the document ceiling
+    /// ([`aurora_core::MAX_DOCUMENT_EXTENT`], 300,000 px — PRD §7.3.1 /
+    /// ADR 0002). [`Self::LayerOriginOutOfRange`]'s companion: that one
+    /// is about where a rectangle sits, this one about how big it is.
+    ///
+    /// **Only [`crate::LayerTree::add_mask`] raises it today, and that
+    /// asymmetry is deliberate rather than an oversight** (0.71.3). A
+    /// mask's rectangle drives a real tile grid in `aurora-io`'s `.aur`
+    /// writer, and an oversized one there is not a big loop but an
+    /// unfinishable one — so it is refused at the point the mask is
+    /// created, not only at the file boundary, because a tree that
+    /// already holds one makes *every* save and *every* autosave for
+    /// the rest of the session fail. `add_pixel_layer`/`set_bounds` do
+    /// **not** carry this check: a layer's extent has meaning beyond
+    /// the tile grid (it is the document's own content extent, and
+    /// `aurora_core::Size::new` is where that ceiling is owned), and
+    /// tightening it here would be a live-editing policy change rather
+    /// than a hardening fix. `aurora-io`'s own hoisted
+    /// `validate_persisted_rects` refuses an oversized layer before it
+    /// writes a byte, which is what keeps that gap from producing a
+    /// partial file.
+    #[error("rectangle extent {width}x{height} is past the {max}px document ceiling")]
+    LayerBoundsTooLarge { width: u32, height: u32, max: u32 },
     /// A [`LayerId`] read back from an untrusted manifest (or journal)
     /// has [`crate::MASK_SURFACE_BIT`] set, which would put its own
     /// *pixel* surface into the half of the `aurora_tile::SurfaceId`

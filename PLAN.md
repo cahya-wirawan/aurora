@@ -14274,6 +14274,30 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-02 (0.71.3) — an oversized mask is refused where it
+is created, not only where it is saved.** `LayerTree::add_mask` ran
+`validate_origin` and no extent check, so an ordinary in-process caller
+— not just a crafted `.aur` file — could attach a mask larger than the
+document ceiling, after which `aurora-io` refused **both** `write` and
+`write_best_effort` for that document: one oversized mask silently
+disabled every save *and* every crash-recovery autosave for the rest of
+the session, for a state reachable through completely ordinary API
+calls. The file-boundary guard is the right place for a hostile
+manifest; it is the wrong and only place for an invariant the live-edit
+API can break. `add_mask` now also runs an extent check, raising a new
+`DocError::LayerBoundsTooLarge` that mirrors `IoError`'s variant of the
+same name. `add_pixel_layer`/`set_bounds` deliberately do *not* get the
+same bar (a layer's extent has meaning beyond the tile grid, and
+`aurora_core::Size::new` is where that ceiling is owned) — the new
+variant's doc comment records that asymmetry and why, and 0.71.1's
+hoisted writer pre-flight is what keeps the layer case from producing a
+partial file. Same commit: `persisted_surfaces` silently dropped a mask
+whose `mask()` is `Some` but whose `mask_surface_id()` is `None` —
+unreachable today, but the failure mode is painted coverage vanishing
+from every save with no error anywhere, so it now logs rather than
+resting on an argument about another crate's validators holding
+forever.
+
 **Addendum 2026-09-02 (0.71.2) — a failed `.aur` read no longer leaves
 its decoded tiles in the caller's live store.** `aurora_io::read_aur`
 decodes tiles straight into the caller's `TileStore` as it goes

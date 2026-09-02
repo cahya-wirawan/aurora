@@ -685,6 +685,30 @@ fn offending_origin(entry: &LayerEntry) -> Option<Rect> {
 /// `aurora_core::MAX_DOCUMENT_ORIGIN` for why. It is bounded where it
 /// is owned instead (`aurora_core::Size::new`, and `aurora-io`'s own
 /// `tile_grid` for a manifest read off disk).
+/// Refuses a *mask* rectangle whose extent is past the document ceiling
+/// ([`aurora_core::MAX_DOCUMENT_EXTENT`]).
+///
+/// Deliberately narrower than [`validate_origin`], which every
+/// rectangle-taking entry point runs: this is only called from
+/// [`LayerTree::add_mask`], and [`DocError::LayerBoundsTooLarge`]'s own
+/// doc comment records why a layer's own bounds are *not* held to the
+/// same bar here. It is not called from `restore_mask` either, for the
+/// reason that one already documents: it puts back a rectangle that
+/// reached the tree through a checked route, and re-checking would let
+/// an undo fail on a value the tree itself produced.
+fn validate_mask_extent(bounds: Rect) -> Result<(), DocError> {
+    if bounds.width <= aurora_core::MAX_DOCUMENT_EXTENT
+        && bounds.height <= aurora_core::MAX_DOCUMENT_EXTENT
+    {
+        return Ok(());
+    }
+    Err(DocError::LayerBoundsTooLarge {
+        width: bounds.width,
+        height: bounds.height,
+        max: aurora_core::MAX_DOCUMENT_EXTENT,
+    })
+}
+
 pub(crate) fn validate_origin(bounds: Rect) -> Result<(), DocError> {
     if bounds.origin_in_document_range() {
         return Ok(());
@@ -1873,20 +1897,33 @@ impl LayerTree {
     /// # Errors
     ///
     /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist,
-    /// [`DocError::MaskAlreadyExists`] if it already has a mask, or
+    /// [`DocError::MaskAlreadyExists`] if it already has a mask,
     /// [`DocError::LayerOriginOutOfRange`] if `bounds`' own origin sits
     /// further than [`aurora_core::MAX_DOCUMENT_ORIGIN`] from the
     /// document origin — the same bound (and the same "negative is
     /// still legal") [`Self::set_bounds`] documents, applied to a
-    /// mask's own rectangle. Nothing is changed when any of these
-    /// happens; in particular a refused origin leaves the layer
-    /// maskless rather than half-masked.
+    /// mask's own rectangle — or [`DocError::LayerBoundsTooLarge`] if
+    /// its *extent* is past [`aurora_core::MAX_DOCUMENT_EXTENT`].
+    /// Nothing is changed when any of these happens; in particular a
+    /// refused rectangle leaves the layer maskless rather than
+    /// half-masked.
+    ///
+    /// **The extent check is here, and not only at the `.aur` file
+    /// boundary** (0.71.3). Since 0.71.0 a mask's rectangle drives a
+    /// real tile grid in `aurora-io`, and an oversized one is not a
+    /// large loop there but an unfinishable one. `aurora-io` refuses it
+    /// — but by then the tree already holds it, and that writer refuses
+    /// the *whole document*, so one oversized mask silently disables
+    /// every save and every crash-recovery autosave for the rest of the
+    /// session. A rectangle no writer will accept has no business
+    /// entering the tree, so it is refused where it is created.
     pub fn add_mask(&mut self, id: LayerId, bounds: Rect) -> Result<(), DocError> {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
         if entry.mask.is_some() {
             return Err(DocError::MaskAlreadyExists(id));
         }
         validate_origin(bounds)?;
+        validate_mask_extent(bounds)?;
         entry.mask = Some(LayerMask {
             bounds,
             enabled: true,
@@ -3907,6 +3944,53 @@ mod tests {
             tree.mask(id).is_none(),
             "a refused mask must leave the layer maskless, not half-masked"
         );
+    }
+
+    #[test]
+    fn add_mask_rejects_an_extent_past_the_document_ceiling_and_leaves_the_layer_maskless() {
+        // The origin bar's companion (0.71.3). Since 0.71.0 a mask's
+        // rectangle drives a real tile grid in `aurora-io`'s `.aur`
+        // writer, so an oversized one there is an unfinishable loop --
+        // and `aurora-io` refusing it means refusing the *whole
+        // document*, so a single oversized mask would silently disable
+        // every save and every crash-recovery autosave for the rest of
+        // the session. Refused where it is created instead.
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let huge = Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT + 1,
+            height: 1,
+        };
+        match tree.add_mask(id, huge) {
+            Err(DocError::LayerBoundsTooLarge { width, height, max }) => {
+                assert_eq!(width, aurora_core::MAX_DOCUMENT_EXTENT + 1);
+                assert_eq!(height, 1);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+            }
+            other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+        }
+        assert!(
+            tree.mask(id).is_none(),
+            "a refused mask must leave the layer maskless, not half-masked"
+        );
+
+        // And the documented ceiling itself is still legal scope (PRD
+        // §7.3.1) -- the bar must not be what rejects the largest mask a
+        // real document can carry.
+        let at_ceiling = Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        if let Err(err) = tree.add_mask(id, at_ceiling) {
+            unreachable!("a mask exactly at the document ceiling must be accepted: {err:?}");
+        }
     }
 
     #[test]

@@ -532,11 +532,13 @@ pub struct SkippedTile {
 /// assumed, since it means this writer can refuse a whole autosave over
 /// a rectangle, and **that is reachable through ordinary
 /// `aurora-doc` API calls, not only from a crafted file** — an earlier
-/// version of this paragraph claimed otherwise. `add_pixel_layer` and
-/// `add_mask` bound a rectangle's *origin* but not its *extent*, and
-/// nothing bounds the whole-document total at all, so an oversized
-/// layer or two full-canvas-masked ceiling layers reach this refusal
-/// from a live session. Refusing is still the right answer (the
+/// version of this paragraph claimed otherwise. `add_mask` bounds a
+/// mask's extent as of 0.71.3, precisely so one oversized mask can no
+/// longer disable a session's autosave; `add_pixel_layer` still bounds
+/// a layer's origin but not its extent, and nothing bounds the
+/// whole-document total at all, so an oversized *layer* or two
+/// full-canvas-masked ceiling layers still reach this refusal from a
+/// live session. Refusing is still the right answer (the
 /// alternative is an unfinishable loop, or a file that cannot be
 /// reopened) but it means one such layer disables autosave for the rest
 /// of the session, which is a real cost. PLAN.md records it.
@@ -1001,10 +1003,25 @@ fn persisted_surfaces(layers: &LayerTree) -> Vec<(SurfaceId, aurora_core::Rect)>
         {
             surfaces.push((surface, *bounds));
         }
-        if let Some(mask) = layers.mask(id)
-            && let Some(surface) = layers.mask_surface_id(id)
-        {
-            surfaces.push((surface, mask.bounds));
+        if let Some(mask) = layers.mask(id) {
+            if let Some(surface) = layers.mask_surface_id(id) {
+                surfaces.push((surface, mask.bounds));
+            } else {
+                // Unreachable today and not silently relied on to stay
+                // that way: `mask_surface_id` returns `None` only for a
+                // layer that is not in the tree, and `mask` above just
+                // proved it is. If that ever stops holding, this is a
+                // mask whose painted coverage would be dropped from
+                // every save with no error anywhere -- the exact
+                // silent-degradation failure this format refuses
+                // elsewhere -- so it is logged rather than left to be
+                // rediscovered from a user's lost work.
+                tracing::warn!(
+                    ?id,
+                    "a layer carries a mask but has no mask surface id; its coverage cannot be \
+                     persisted"
+                );
+            }
         }
     }
     surfaces
