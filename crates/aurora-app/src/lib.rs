@@ -12086,25 +12086,26 @@ mod tests {
         clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
         close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
         composite_document, composite_reference_origin, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
-        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
-        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
-        select_layer, shift_bounds, skipped_tiles_dialog_actions, skipped_tiles_message,
-        skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
+        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
+        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
+        run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
+        tile_overlaps_doc_rect, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -25799,8 +25800,18 @@ mod tests {
         assert_eq!(dialog, None);
     }
 
+    /// Click routing against the dialog's **real** geometry, not
+    /// fabricated bounds. Through `0.77.5` both this test and its
+    /// outside-click sibling below set `Rect`s by hand with
+    /// `WidgetTree::set_bounds` because no real `compute_layout` was
+    /// involved -- which meant they proved `handle_dialog_pointer`'s
+    /// own dispatch logic and nothing about whether a user's click
+    /// would ever actually land on a button. It did not: the dialog
+    /// laid out as a 32 px-wide, full-height sliver at `x: 968` on a
+    /// 1000x800 window. `0.77.6` fixed the layout; these two now run
+    /// against what `compute_layout` really produces.
     #[test]
-    fn clicking_the_dialogs_action_button_closes_it() {
+    fn clicking_the_dialogs_action_button_closes_it_under_real_layout() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -25815,30 +25826,23 @@ mod tests {
         let Some(button) = handle.first_action() else {
             unreachable!("the crash recovery dialog always has one action");
         };
-        // `hit_test` requires every ancestor along the path, not just
-        // the button itself, to actually contain the point -- no real
-        // `compute_layout` has run in this test, so every node defaults
-        // to zero-size bounds; set all three explicitly, the same
-        // isolated-geometry shape `hit_test`'s own unit tests in
-        // `aurora-widgets` already use.
-        let big = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: 1000,
-            height: 1000,
+        workspace.tree.compute_layout(1000.0, 800.0);
+
+        let Some(bounds) = workspace.tree.bounds(button) else {
+            unreachable!("just laid out");
         };
-        for id in [workspace.root, handle.root, button] {
-            if let Err(err) = workspace.tree.set_bounds(id, big) {
-                unreachable!("{err:?}");
-            }
-        }
+        #[allow(clippy::cast_precision_loss)]
+        let center = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            bounds.y as f32 + bounds.height as f32 / 2.0,
+        );
 
         let opened = handle_dialog_pointer(
             &mut workspace,
             &mut focus,
             &mut dialog,
             PointerButton::Primary,
-            (10.0, 10.0),
+            center,
         );
 
         assert!(opened, "a dialog was open to route the click to");
@@ -25847,7 +25851,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_elsewhere_while_the_dialog_is_open_swallows_the_click_without_closing_it() {
+    fn clicking_outside_the_dialog_under_real_layout_is_swallowed_without_closing_it() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -25859,56 +25863,26 @@ mod tests {
         let Some(handle) = dialog.clone() else {
             unreachable!("just opened");
         };
-        let Some(button) = handle.first_action() else {
-            unreachable!("the crash recovery dialog always has one action");
-        };
-        // Root and the dialog's own root are real and hit-testable
-        // (same reasoning as `clicking_the_dialogs_action_button_closes_it`),
-        // but the button itself sits in just one corner -- so a click
-        // inside the dialog, but outside the button, hits the dialog's
-        // own root instead, which has no `action_id` of its own.
-        if let Err(err) = workspace.tree.set_bounds(
-            workspace.root,
-            aurora_core::Rect {
-                x: 0,
-                y: 0,
-                width: 1000,
-                height: 1000,
-            },
-        ) {
-            unreachable!("{err:?}");
-        }
-        if let Err(err) = workspace.tree.set_bounds(
-            handle.root,
-            aurora_core::Rect {
-                x: 0,
-                y: 0,
-                width: 1000,
-                height: 1000,
-            },
-        ) {
-            unreachable!("{err:?}");
-        }
-        if let Err(err) = workspace.tree.set_bounds(
-            button,
-            aurora_core::Rect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 20,
-            },
-        ) {
-            unreachable!("{err:?}");
-        }
+        workspace.tree.compute_layout(1000.0, 800.0);
 
-        // Inside the dialog's own root, but past the button's own
-        // bottom-right corner.
+        // Derived from the dialog's own real bounds rather than
+        // guessed: one pixel past its bottom edge, on its own vertical
+        // centre line, is outside it whatever the layout resolves to.
+        let Some(bounds) = workspace.tree.bounds(handle.root) else {
+            unreachable!("just laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let outside = (
+            bounds.x as f32 + bounds.width as f32 / 2.0,
+            (bounds.y + i64::from(bounds.height)) as f32 + 1.0,
+        );
+
         let opened = handle_dialog_pointer(
             &mut workspace,
             &mut focus,
             &mut dialog,
             PointerButton::Primary,
-            (500.0, 500.0),
+            outside,
         );
 
         assert!(opened, "a dialog was open, so the click must be swallowed");
@@ -25917,6 +25891,104 @@ mod tests {
             Some(handle),
             "clicking outside the dialog's own buttons must not close it"
         );
+    }
+
+    /// All three dialogs this crate can actually open, under real
+    /// layout -- driven through the shared free `open_dialog` with each
+    /// one's own real title/message/actions, the same split
+    /// `the_export_refused_dialog_opens_through_the_shared_helper` and
+    /// `the_move_refused_dialog_opens_and_closes_through_the_same_shared_routing`
+    /// already use, because the `&mut self` `App` methods that wrap
+    /// them need a live window, a GPU device and an event-loop proxy,
+    /// none of which exist headlessly.
+    #[test]
+    fn each_real_dialogs_own_message_and_actions_lay_out_as_a_centered_overlay() {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let export_message = incomplete_composite_message(1, "boom");
+        let cases: [(&str, &str, Vec<super::DialogAction>); 3] = [
+            (
+                "Aurora Didn't Close Properly",
+                crash_recovery_dialog_message(true),
+                crash_recovery_dialog_actions(),
+            ),
+            (
+                "Couldn't Export This Document",
+                &export_message,
+                export_refused_dialog_actions(),
+            ),
+            (
+                "Can't Move This Layer Further",
+                move_refused_message(),
+                move_refused_dialog_actions(),
+            ),
+        ];
+
+        for (title, message, actions) in cases {
+            let mut workspace = aurora_ui::build_workspace();
+            let mut focus = FocusManager::default();
+            let mut dialog = None;
+            assert!(
+                open_dialog(
+                    &mut workspace,
+                    &mut focus,
+                    &mut dialog,
+                    &scales,
+                    title,
+                    message,
+                    actions,
+                ),
+                "{title} must open"
+            );
+            let Some(handle) = dialog.clone() else {
+                unreachable!("just opened");
+            };
+            workspace.tree.compute_layout(1000.0, 800.0);
+
+            let Some(bounds) = workspace.tree.bounds(handle.root) else {
+                unreachable!("just laid out");
+            };
+            let right_gap = 1000 - (bounds.x + i64::from(bounds.width));
+            assert_eq!(
+                bounds.x, right_gap,
+                "{title} must be horizontally centred: {bounds:?}"
+            );
+            assert!(
+                bounds.y > 0 && bounds.y + i64::from(bounds.height) < 800,
+                "{title} must be a content-height overlay, not full height: {bounds:?}"
+            );
+
+            let Some(message_bounds) = workspace.tree.bounds(handle.message) else {
+                unreachable!("just laid out");
+            };
+            assert!(
+                message_bounds.width > 0 && message_bounds.height > 0,
+                "{title}'s message must be a real box: {message_bounds:?}"
+            );
+
+            for (action, button) in &handle.actions {
+                let Some(button_bounds) = workspace.tree.bounds(*button) else {
+                    unreachable!("just laid out");
+                };
+                assert!(
+                    button_bounds.width > 0 && button_bounds.height > 0,
+                    "{title}'s {action} button must be hit-testable: {button_bounds:?}"
+                );
+                #[allow(clippy::cast_precision_loss)]
+                let center = (
+                    button_bounds.x as f32 + button_bounds.width as f32 / 2.0,
+                    button_bounds.y as f32 + button_bounds.height as f32 / 2.0,
+                );
+                assert_eq!(
+                    workspace.tree.hit_test(center),
+                    Some(*button),
+                    "a click at the centre of {title}'s {action} button must \
+                     actually reach it"
+                );
+            }
+        }
     }
 
     #[test]
@@ -25931,6 +26003,75 @@ mod tests {
             PointerButton::Primary,
             (0.0, 0.0),
         ));
+    }
+
+    /// A modal dialog is an *overlay*: it must not participate in
+    /// `workspace.root`'s own `Row` flow beside the canvas, the divider
+    /// and the rail, because every pixel it takes there is a pixel the
+    /// canvas loses while the dialog is open.
+    #[test]
+    fn an_open_dialog_does_not_take_any_width_from_the_canvas() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+
+        workspace.tree.compute_layout(1000.0, 800.0);
+        let Some(baseline) = workspace.tree.bounds(workspace.canvas_area) else {
+            unreachable!("just laid out");
+        };
+
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        workspace.tree.compute_layout(1000.0, 800.0);
+
+        let Some(with_dialog) = workspace.tree.bounds(workspace.canvas_area) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            with_dialog, baseline,
+            "an open dialog must be an overlay, not a fourth in-flow sibling \
+             stealing width from the canvas"
+        );
+    }
+
+    #[test]
+    fn the_open_dialog_is_centered_over_the_workspace_under_real_layout() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+        workspace.tree.compute_layout(1000.0, 800.0);
+
+        let Some(bounds) = workspace.tree.bounds(handle.root) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            bounds.width > 0 && bounds.height > 0,
+            "the dialog must have a real box: {bounds:?}"
+        );
+        let right_gap = 1000 - (bounds.x + i64::from(bounds.width));
+        assert_eq!(
+            bounds.x, right_gap,
+            "the dialog must be horizontally centred over the window: {bounds:?}"
+        );
+        assert!(
+            bounds.y > 0,
+            "the dialog must sit below the window's own top edge: {bounds:?}"
+        );
+        assert!(
+            bounds.y + i64::from(bounds.height) < 800,
+            "the dialog must not stretch to the window's full height: {bounds:?}"
+        );
     }
 
     /// The whole point of 0.74.0, exercised end to end on a real file

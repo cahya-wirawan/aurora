@@ -30,15 +30,150 @@
 //! draws for the keyboard. `aurora-app`'s `handle_dialog_pointer`
 //! (added once that crate had real pointer input at all, PLAN.md M1.9)
 //! is the first caller to actually do this.
+//!
+//! **Layout is this module's job, unlike the command palette's.** A
+//! modal alert has no caller-specific placement to make: it is centred
+//! over whatever it interrupts, and this module already declares its own
+//! modality ([`Role::AlertDialog`] plus `Node::set_modal`) rather than
+//! taking it as a parameter. [`super::command_palette`] is the contrast
+//! — its popover shape genuinely is the caller's call, which is why its
+//! own doc comment leaves placement outside. Pushing this style down
+//! here also keeps it under `scripts/check_no_hardcoded_style.py`, which
+//! scans `aurora-widgets`/`aurora-ui` and nothing above them. See
+//! [`root_style`] for what the styles actually do and why.
+//!
+//! **What this does not do, stated plainly**: a dialog's root and
+//! message are still [`WidgetKind::Container`], and this crate draws no
+//! glyphs anywhere, so a dialog on screen today is *only* its action
+//! buttons' rounded rects floating over the canvas — no surface behind
+//! them, no visible title, no visible message text. The layout work here
+//! fixes where the boxes are and therefore which widget a click actually
+//! lands on; it is provable headlessly and it is proven that way. It
+//! makes no claim about how a dialog looks.
 
 use accesskit::{Node, Role};
 use aurora_theme::Scales;
-use taffy::Style;
+use taffy::style_helpers::{TaffyZero as _, auto, length, percent};
+use taffy::{FlexDirection, LengthPercentageAuto, Position, Rect as LayoutRect, Size, Style};
 
-use super::WidgetKind;
 use super::button::insert_button;
+use super::{WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
+
+/// The share of the window's own width a dialog spans. A proportion,
+/// deliberately, not a pixel count — see [`root_style`].
+const WIDTH_FRACTION: f32 = 0.5;
+
+/// How far down the window a dialog's own top edge sits — high enough
+/// to read as "over the document" rather than pinned to the top edge,
+/// low enough to leave the buttons well clear of the bottom.
+const TOP_INSET_FRACTION: f32 = 0.15;
+
+/// A dialog root's own layout: a centred overlay, **out of its parent's
+/// flow entirely**.
+///
+/// `Position::Absolute` is the load-bearing field. Without it (through
+/// `0.77.5`, when this root was given a bare `Style::default()` and
+/// nothing styled it afterwards) a dialog is an ordinary in-flow
+/// sibling of whatever it was inserted beside — in `aurora-app`'s own
+/// workspace, a fourth `Row` child after the canvas, the divider and
+/// the rail. Measured on a real `aurora_ui::build_workspace` at
+/// 1000x800: opening one shrank the canvas from 750 px wide to 718 px
+/// and put the dialog itself at `x: 968, width: 32, height: 800` — a
+/// full-height 32 px sliver past the rail, its width coming entirely
+/// out of the document. Absolute takes it out of that flow, the same
+/// mechanism `aurora-app`'s own command-palette style already uses.
+///
+/// **`inset.bottom` must stay `auto()`.** With both vertical insets
+/// definite and `size.height: auto()`, CSS's (and taffy's)
+/// over-constrained resolution stretches the box to the full
+/// containing-block height and collapses the horizontal auto margins —
+/// silently reproducing the full-height dialog this style exists to
+/// fix. `dialog_lays_out_as_a_centered_overlay_with_real_bounds` asserts
+/// against exactly that.
+///
+/// The width/inset choices are **proportions**, not pixels: there is no
+/// "dialog dimensions" token in `design/tokens/scales.toml`, and
+/// inventing one is a design decision for the design owner (CLAUDE.md:
+/// "don't invent tokens ad hoc when implementing a widget"), not a gap
+/// to fill here. A proportion needs no token at all — it is a
+/// structural layout choice, which is why `check_no_hardcoded_style.py`
+/// deliberately scopes `percent(...)` out. Everything that *is* an
+/// absolute size here (the padding, the gap, both `min_size` floors)
+/// goes through the token scales, per invariant §7.3.10.
+///
+/// `FlexDirection::Column` because the message belongs *above* the
+/// actions, not beside them — `Style::default()` is `Row`, which would
+/// lay the message out as a first column next to the buttons.
+fn root_style(scales: &Scales) -> Style {
+    Style {
+        position: Position::Absolute,
+        flex_direction: FlexDirection::Column,
+        inset: LayoutRect {
+            left: LengthPercentageAuto::ZERO,
+            right: LengthPercentageAuto::ZERO,
+            top: percent(TOP_INSET_FRACTION),
+            bottom: auto(),
+        },
+        // Horizontal centring: equal auto margins against a definite
+        // width and two definite horizontal insets, the standard
+        // absolute-centring idiom.
+        margin: LayoutRect {
+            left: auto(),
+            right: auto(),
+            top: LengthPercentageAuto::ZERO,
+            bottom: LengthPercentageAuto::ZERO,
+        },
+        size: Size {
+            width: percent(WIDTH_FRACTION),
+            height: auto(),
+        },
+        min_size: Size {
+            width: length(spacing(scales.spacing.xxxl)),
+            height: length(row_height(scales)),
+        },
+        padding: LayoutRect {
+            left: length(spacing(scales.spacing.md)),
+            right: length(spacing(scales.spacing.md)),
+            top: length(spacing(scales.spacing.md)),
+            bottom: length(spacing(scales.spacing.md)),
+        },
+        gap: Size {
+            width: length(spacing(scales.spacing.sm)),
+            height: length(spacing(scales.spacing.sm)),
+        },
+        ..Default::default()
+    }
+}
+
+/// A dialog message's own layout — the full dialog width, and **at
+/// least one row height tall**, mirroring `aurora_ui::panel`'s own
+/// shared `row_style`.
+///
+/// The floor is the whole point. Nothing in this codebase measures
+/// text: [`crate::WidgetTree::compute_layout`] builds a bare `taffy`
+/// tree with no measure function anywhere, so a `Role::Label` node
+/// resolves to zero height however much text it actually holds. Fixing
+/// the root's own position does not fix that — a zero-height message
+/// would still leave the buttons sitting directly under the dialog's
+/// top padding, and a zero-*size* box is not hit-testable at all. One
+/// [`row_height`] is the honest "at least one line of UI text" floor
+/// until real text shaping exists to measure the real thing.
+fn message_style(scales: &Scales) -> Style {
+    let row = row_height(scales);
+    Style {
+        size: Size {
+            width: percent(1.0_f32),
+            height: auto(),
+        },
+        min_size: Size {
+            width: length(row),
+            height: length(row),
+        },
+        ..Default::default()
+    }
+}
 
 /// One dialog action button — e.g. `("recover", "Recover Document")`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,11 +247,16 @@ pub fn insert_dialog(
     let mut root_node = Node::new(Role::AlertDialog);
     root_node.set_label(title.into());
     root_node.set_modal();
-    let root = tree.insert(parent, Style::default(), root_node, WidgetKind::Container)?;
+    let root = tree.insert(parent, root_style(scales), root_node, WidgetKind::Container)?;
 
     let mut message_node = Node::new(Role::Label);
     message_node.set_label(message.into());
-    let message_id = tree.insert(root, Style::default(), message_node, WidgetKind::Container)?;
+    let message_id = tree.insert(
+        root,
+        message_style(scales),
+        message_node,
+        WidgetKind::Container,
+    )?;
 
     let mut action_ids = Vec::with_capacity(actions.len());
     for action in actions {
@@ -135,7 +275,8 @@ pub fn insert_dialog(
 mod tests {
     use super::{DialogAction, insert_dialog};
     use crate::WidgetError;
-    use crate::widgets::{new_tree, test_scales};
+    use crate::tree::WidgetId;
+    use crate::widgets::{new_tree, row_height, test_scales};
     use accesskit::Action;
     use taffy::Style;
 
@@ -217,6 +358,125 @@ mod tests {
         };
         assert_eq!(handle.action_id(handle.message), None);
         assert_eq!(handle.action_id(root), None);
+    }
+
+    /// A definite-size test root — a `percent`-sized absolutely
+    /// positioned child has nothing to resolve against otherwise
+    /// (`new_tree(Style::default())`'s own root is auto-sized, and the
+    /// dialog would collapse to its `min_size` floor), the same
+    /// give-the-root-a-real-size setup `command_palette`'s own layout
+    /// test already uses.
+    fn sized_tree() -> (crate::WidgetTree<crate::widgets::WidgetKind>, WidgetId) {
+        new_tree(Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(WINDOW.0),
+                height: taffy::style_helpers::length(WINDOW.1),
+            },
+            ..Default::default()
+        })
+    }
+
+    const WINDOW: (f32, f32) = (800.0, 600.0);
+
+    /// Headless (no GPU, no display) proof of the layout half of
+    /// `0.77.6`: a dialog is a real, centred overlay box, not the
+    /// full-height sliver a bare `Style::default()` root resolved to.
+    #[test]
+    fn dialog_lays_out_as_a_centered_overlay_with_real_bounds() {
+        let (mut tree, root) = sized_tree();
+        let scales = test_scales();
+        let handle = match insert_dialog(
+            &mut tree,
+            root,
+            &scales,
+            "Title",
+            "Message",
+            vec![DialogAction::new("ok", "OK")],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(WINDOW.0, WINDOW.1);
+
+        let Some(bounds) = tree.bounds(handle.root) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            bounds.width > 0 && bounds.height > 0,
+            "the dialog must have a real box: {bounds:?}"
+        );
+        let right_gap = 800 - (bounds.x + i64::from(bounds.width));
+        assert_eq!(
+            bounds.x, right_gap,
+            "the dialog must be horizontally centred: {bounds:?}"
+        );
+        assert!(
+            bounds.y > 0,
+            "the dialog must sit below the top edge: {bounds:?}"
+        );
+        assert!(
+            bounds.y + i64::from(bounds.height) < 600,
+            "the dialog must be content-height, not stretched to the full window \
+             height -- `inset.bottom` staying `auto()` is what prevents that: \
+             {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn the_message_and_every_action_get_a_real_hittable_box() {
+        let (mut tree, root) = sized_tree();
+        let scales = test_scales();
+        let handle = match insert_dialog(
+            &mut tree,
+            root,
+            &scales,
+            "Title",
+            "Message",
+            vec![
+                DialogAction::new("recover", "Recover Document"),
+                DialogAction::new("discard", "Discard"),
+            ],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(WINDOW.0, WINDOW.1);
+
+        let Some(message) = tree.bounds(handle.message) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            message.width > 0,
+            "the message must span real width: {message:?}"
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = row_height(&scales) as u32;
+        assert!(
+            message.height >= row,
+            "the message must be at least one row of text tall ({row}), since \
+             nothing measures its actual text: {message:?}"
+        );
+
+        let mut previous_bottom = None;
+        for (_, button) in &handle.actions {
+            let Some(bounds) = tree.bounds(*button) else {
+                unreachable!("just laid out");
+            };
+            assert!(
+                bounds.width > 0 && bounds.height > 0,
+                "every action must be a real, hit-testable box: {bounds:?}"
+            );
+            if let Some(previous_bottom) = previous_bottom {
+                assert!(
+                    bounds.y >= previous_bottom,
+                    "stacked actions must not overlap vertically, or a click \
+                     lands on whichever one hit_test happens to reach first: \
+                     {bounds:?} after {previous_bottom}"
+                );
+            }
+            previous_bottom = Some(bounds.y + i64::from(bounds.height));
+        }
+        assert!(previous_bottom.is_some(), "two actions were inserted");
     }
 
     #[test]

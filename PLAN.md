@@ -6245,6 +6245,45 @@ structural design work.
   on-disk journal encoding — see the "Autosave and recovery" bullet in
   M1.9, below.
 
+  **Bug fix 2026-09-03 (0.77.6): a dialog was never laid out as an
+  overlay at all.** `insert_dialog` gave its root *and* its message node
+  a bare `Style::default()` and nothing styled either afterwards, so a
+  dialog was an ordinary in-flow fourth `Row` sibling of
+  `aurora_ui::build_workspace`'s canvas, divider and rail. Measured, not
+  assumed, on a real `build_workspace` at 1000×800: opening the
+  crash-recovery dialog shrank the canvas from **750 px to 718 px** wide
+  and put the dialog itself at **`x: 968, y: 0, width: 32, height:
+  800`** — a full-height 32 px sliver pinned past the rail at the right
+  edge, its width taken straight out of the document. (32 px is
+  `insert_button`'s own horizontal padding; the sliver was never
+  zero-size, and the message node — a `Role::Label` in a tree with no
+  text-measurement function anywhere — was.) The practical consequence
+  was worse than the appearance: `handle_dialog_pointer` correctly
+  swallows every click while a dialog is open, so with the buttons in
+  that sliver, essentially every click a user could make went nowhere.
+  Fixed in `aurora-widgets` (not caller-side): a dialog's own modality
+  is declared by the widget, so its overlay placement belongs with it,
+  and `crates/aurora-widgets/src/widgets/dialog.rs` is scanned by
+  `scripts/check_no_hardcoded_style.py` where `aurora-app` is not. New
+  private `root_style` (`Position::Absolute`, `Column`, 50 %-width with
+  auto horizontal margins, a 15 % top inset and `inset.bottom: auto()`
+  so it stays content-height) and `message_style` (one
+  `row_height` floor, the same shape `aurora_ui::panel::row_style`
+  already uses, because nothing measures text). Same measurement after:
+  the canvas keeps its full 750 px and the dialog lands at `x: 250, y:
+  120, width: 500, height: 89`. 2 new `aurora-widgets` tests; in
+  `aurora-app` the two pointer tests that used hand-set
+  `WidgetTree::set_bounds` (which proved dispatch logic and nothing about
+  real geometry) were rewritten against real `compute_layout`, and 3 more
+  added, including one covering all three real dialogs (crash recovery,
+  export refused, Move refused). **Deliberately not ticked to `[x]`**:
+  this is layout and click-routing correctness, proven headlessly. A
+  dialog's root and message are still `WidgetKind::Container` and this
+  crate paints no glyphs, so on screen a dialog is still only its action
+  buttons' rounded rects over the canvas — no surface, no visible title
+  or message text, and no real-hardware pass. Painting a dialog remains
+  open.
+
 ### M1.9 — Basic tools and I/O
 
 - [x] **Move, marquee select, zoom, pan, eyedropper** — three of five
