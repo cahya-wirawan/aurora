@@ -1598,8 +1598,26 @@ fn read_autosave_container(
     // tracks a "current document profile" to restore it into, because no
     // colour-management UI exists to have set one -- and an autosave this
     // crate wrote always carries `None` anyway ([`write_autosave`]).
+    //
+    // `skipped_tiles` is discarded here too, and that one is *not* a
+    // "nothing to restore it into" case -- it is real, named, deliberately
+    // deferred follow-on work. A recovered autosave written by
+    // `write_aur_best_effort` can genuinely be missing tiles, and this
+    // path -- crash recovery, on the pre-window startup route -- is
+    // exactly where a user would most want to be told. It is out of
+    // scope for 0.74.0 for two concrete reasons: this path has its own
+    // separate partial-autosave fallback logic (`recover_document` tries
+    // the `.partial` container after the primary one) and its own test
+    // suite, so warning correctly here means getting the interaction
+    // between two fallbacks and a modal dialog right on a path that runs
+    // before there is a window; and the dialog slot at startup is
+    // already claimed by the crash-recovery dialog itself
+    // (`open_crash_recovery_dialog`), so this needs a message design
+    // decision, not just a call. 0.74.0 warns on the explicit
+    // "File > Open" path only (`App::open_aur_file`). PLAN.md records
+    // the rest as open.
     match aurora_io::read_aur(file, store) {
-        Ok((layers, history, canvas_size, _profile)) => Some((layers, history, canvas_size)),
+        Ok(document) => Some((document.layers, document.history, document.canvas_size)),
         Err(err) => {
             tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
             None
@@ -1997,6 +2015,46 @@ fn incomplete_composite_message(skipped: usize, first: &str) -> String {
         "Nothing was written. {skipped} layer tile read{plural} failed while compositing this \
          document, so the exported image would have been missing content. The first failure was: \
          {first}. Any existing file at that path is unchanged."
+    )
+}
+
+const SKIPPED_TILES_DISMISS: &str = "skipped.tiles.dismiss";
+
+/// The missing-content dialog's own action — a single "OK", for the
+/// same reason [`export_refused_dialog_actions`] has one: there is
+/// nothing to choose. The file has already been opened, and what it is
+/// missing cannot be recovered from it, so acknowledging is the whole
+/// interaction.
+fn skipped_tiles_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(SKIPPED_TILES_DISMISS, "OK")]
+}
+
+/// The itemized message for a `.aur` file that was written by
+/// `aurora_io::write_aur_best_effort` with tiles it could not read
+/// (`aurora_io::AurDocument::skipped_tiles`).
+///
+/// Itemized for the same reason [`incomplete_composite_message`] is —
+/// CLAUDE.md's own "warn with an itemized list" rule — and it carries
+/// the one fact that separates this case from that one: **the content
+/// is already gone from the file**, so unlike a refused export there is
+/// nothing left untouched to reassure the user about. Saying so plainly
+/// is the point; a user who is told only "some tiles were skipped" will
+/// reasonably assume a reopen fixes it.
+///
+/// `first_reason` is **file-controlled text** — it came out of the
+/// container being opened, and it is heading for a rendered label and
+/// an `accesskit` announcement — so it goes through
+/// `aurora_doc::sanitize_display_name` here, exactly as the layer names
+/// out of the same file already do on their way to the Layers panel.
+fn skipped_tiles_message(skipped: usize, first_reason: &str) -> String {
+    let plural = if skipped == 1 { "" } else { "s" };
+    let was = if skipped == 1 { "was" } else { "were" };
+    let reason = aurora_doc::sanitize_display_name(first_reason);
+    format!(
+        "This file was saved by crash-recovery autosave while {skipped} tile{plural} of image \
+         data could not be read, so {was} left out of it. That content is not in this file and \
+         cannot be recovered by reopening it. The first tile was skipped because: {reason}. \
+         Everything else in the document opened normally."
     )
 }
 
@@ -9815,13 +9873,20 @@ impl App {
         // first place, so every `.aur` file this app has ever written
         // only ever carries `None` in practice. Discarded here rather
         // than invented a field to hold, honestly, until that UI exists.
-        let (layers, history, canvas_size, _profile) = match aurora_io::read_aur(file, store) {
+        let document = match aurora_io::read_aur(file, store) {
             Ok(result) => result,
             Err(err) => {
                 tracing::warn!(path = %path.display(), ?err, "failed to read the chosen .aur file");
                 return;
             }
         };
+        let aurora_io::AurDocument {
+            layers,
+            history,
+            canvas_size,
+            profile: _profile,
+            skipped_tiles,
+        } = document;
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
@@ -9886,6 +9951,56 @@ impl App {
         // is right; see `commit_ending_drag`.
         self.drag = None;
         self.push_accessibility();
+        // After `push_accessibility`, deliberately: the dialog opens
+        // against the already-rebuilt workspace, and
+        // `open_skipped_tiles_dialog` pushes accessibility again itself
+        // so the alert is announced.
+        if let Some(first) = skipped_tiles.first() {
+            let message = skipped_tiles_message(skipped_tiles.len(), &first.reason);
+            tracing::warn!(
+                skipped = skipped_tiles.len(),
+                path = %path.display(),
+                "opened a .aur file that was written with tiles missing"
+            );
+            self.open_skipped_tiles_dialog(&message);
+        }
+    }
+
+    /// Opens the "this document is missing content" dialog with
+    /// `message` — a near-copy of [`Self::open_export_refused_dialog`],
+    /// including its relayout-then-announce pair and its "returns
+    /// whether a dialog actually opened" signal, for exactly the same
+    /// reasons that one documents.
+    ///
+    /// The two are kept separate rather than merged behind a `title`
+    /// parameter because they are opposite facts: the export-refused
+    /// dialog says *nothing was written and your file is untouched*,
+    /// while this one says *this file is already missing content*. A
+    /// shared helper would invite one message to be reused for the
+    /// other, which is the failure mode both exist to prevent.
+    fn open_skipped_tiles_dialog(&mut self, message: &str) -> bool {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a dialog");
+                return false;
+            }
+        };
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            "This Document Is Missing Content",
+            message,
+            skipped_tiles_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        opened
     }
 
     /// Opens the export-refused dialog with `message` and makes it real
@@ -11640,11 +11755,11 @@ mod tests {
         perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
         previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
         replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
-        run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds, splitmix64,
-        tile_overlaps_doc_rect, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, splitmix64, tile_overlaps_doc_rect,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
+        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -12150,11 +12265,10 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err}"),
         };
-        let (reopened, _history, _canvas, _profile) =
-            match aurora_io::read_aur(file, &mut fresh_store) {
-                Ok(result) => result,
-                Err(err) => unreachable!("{err:?}"),
-            };
+        let reopened = match aurora_io::read_aur(file, &mut fresh_store) {
+            Ok(result) => result.layers,
+            Err(err) => unreachable!("{err:?}"),
+        };
         let Some(active) = topmost_pixel_layer(&reopened) else {
             unreachable!("the reopened document has pixel layers");
         };
@@ -18281,11 +18395,10 @@ mod tests {
         }
         bytes.set_position(0);
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let (reopened, _history, _canvas, _profile) =
-            match aurora_io::read_aur(bytes, &mut fresh_store) {
-                Ok(result) => result,
-                Err(err) => unreachable!("{err:?}"),
-            };
+        let reopened = match aurora_io::read_aur(bytes, &mut fresh_store) {
+            Ok(result) => result.layers,
+            Err(err) => unreachable!("{err:?}"),
+        };
         let (Some(reopened_mask), Some(reopened_surface)) =
             (reopened.mask(id), reopened.mask_surface_id(id))
         else {
@@ -25263,6 +25376,245 @@ mod tests {
             PointerButton::Primary,
             (0.0, 0.0),
         ));
+    }
+
+    /// The whole point of 0.74.0, exercised end to end on a real file
+    /// on a real disk: a best-effort autosave writes a container with
+    /// one tile it could not read, a **fresh** tile store (what a new
+    /// process has) reads it back, and the reopened document still
+    /// names the loss -- which is the condition `App::open_aur_file`'s
+    /// own wiring line branches on.
+    ///
+    /// **What this does and does not cover, plainly.** It covers the
+    /// read that `open_aur_file` performs, the condition it tests, and
+    /// the dialog it opens -- the last through the same `open_dialog`
+    /// helper `App::open_skipped_tiles_dialog` calls, which is the same
+    /// split (and the same reason) as
+    /// `the_export_refused_dialog_opens_through_the_shared_helper`
+    /// above: constructing a real `App` needs a window, a GPU device
+    /// and an event-loop proxy, none of which exist in a headless test.
+    /// The three lines of `self.` plumbing between them are covered by
+    /// inspection only.
+    #[test]
+    fn open_aur_file_warns_when_the_file_was_written_with_tiles_missing() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // One resident tile at a time, so the second layer's first touch
+        // evicts the first layer's tile to the scratch disk.
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = aurora_doc::LayerTree::new();
+        let history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (name, rgba) in [
+            ("broken", [1.0, 0.0, 0.0, 1.0]),
+            ("intact", [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_tile(dir.path());
+
+        let path = dir.path().join("partial.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let skipped = match aurora_io::write_aur_best_effort(
+            file,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &mut store,
+        ) {
+            Ok(skipped) => skipped,
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        };
+        assert_eq!(skipped.len(), 1, "exactly one tile was unreadable");
+
+        // From here on, exactly what `App::open_aur_file` does: open the
+        // path, read it into a store this process has not painted into,
+        // and look at what the file says was left out.
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let reopened = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let document = match aurora_io::read_aur(reopened, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("the partial container must still open: {err:?}"),
+        };
+        let Some(first) = document.skipped_tiles.first() else {
+            unreachable!(
+                "a file written with a tile missing must say so on reopen, got {:?}",
+                document.skipped_tiles
+            );
+        };
+        assert!(
+            first.reason.contains("corrupt tile file"),
+            "the persisted reason must be the real underlying tile error: {}",
+            first.reason
+        );
+
+        // And the dialog that condition opens really opens, through the
+        // same shared helper `App::open_skipped_tiles_dialog` uses.
+        let message = skipped_tiles_message(document.skipped_tiles.len(), &first.reason);
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert!(open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "This Document Is Missing Content",
+            &message,
+            skipped_tiles_dialog_actions(),
+        ));
+        assert!(dialog.is_some(), "the missing-content dialog must be open");
+    }
+
+    /// The negative case on the same path: a healthy document saved by
+    /// the ordinary `write_aur` reopens with an empty skip list, so
+    /// `App::open_aur_file`'s `if let Some(first)` guard never fires and
+    /// no dialog interrupts an ordinary open.
+    #[test]
+    fn open_aur_file_opens_no_dialog_for_a_complete_file() {
+        let (dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("only", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        let path = dir.path().join("whole.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (10, 10), None, &mut store)
+        {
+            unreachable!("a healthy document must save: {err:?}");
+        }
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let reopened = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let document = match aurora_io::read_aur(reopened, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            document.skipped_tiles.is_empty(),
+            "an ordinary save lost nothing, so nothing must warn: {:?}",
+            document.skipped_tiles
+        );
+    }
+
+    /// The skip reason comes out of a file, and this message heads for a
+    /// rendered label and an `accesskit` announcement -- the same
+    /// untrusted-text path `a_hostile_layer_name_reaches_the_label...`
+    /// in `aurora_ui::layers_panel` covers for layer names, and it gets
+    /// the same `aurora_doc::sanitize_display_name` treatment here.
+    #[test]
+    fn skipped_tiles_message_sanitizes_a_hostile_reason() {
+        let hostile = format!(
+            "boom{}nrut{}{}{}",
+            '\u{202E}',                                     // bidi override
+            '\u{0007}',                                     // BEL
+            '\u{2028}',                                     // line separator
+            char::from_u32(0xE_0041).unwrap_or('\u{FFFD}'), // Tag 'A'
+        );
+        let message = skipped_tiles_message(1, &hostile);
+        for hostile_char in ['\u{202E}', '\u{0007}', '\u{2028}'] {
+            assert!(
+                !message.contains(hostile_char),
+                "{hostile_char:?} must not survive into a rendered label: {message:?}"
+            );
+        }
+        assert!(
+            message.contains("boom"),
+            "the readable part of the reason must survive: {message}"
+        );
+        // The count and the "it is already gone" fact, the two things
+        // this message exists to carry.
+        assert!(message.contains('1'), "{message}");
+        assert!(
+            message.contains("cannot be recovered"),
+            "the user must be told a reopen will not bring the content back: {message}"
+        );
+    }
+
+    /// Truncates the one `*.tile` file under `dir` to half its length,
+    /// leaving a well-formed-but-short ATIL file that
+    /// `aurora_tile::codec::decode` rejects on every read -- the same
+    /// recipe `composite_document_refuses_to_export_when_a_layer_tile_
+    /// cannot_be_read` uses, and `aurora_io::aur`'s own tests too.
+    fn break_the_only_scratch_tile(dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
+        let [victim] = files.as_slice() else {
+            unreachable!("exactly one tile should have been evicted: {files:?}");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
     }
 
     #[test]

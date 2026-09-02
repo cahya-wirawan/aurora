@@ -10150,29 +10150,69 @@ structural design work.
     within budget, the dropped count is exact, a dropped tile reads back
     as a loud error rather than blank, and a retained one is still served
     from memory. Confirmed to fail with the cap disabled.
-- [ ] **A tile dropped from a best-effort autosave is indistinguishable
+- [x] **A tile dropped from a best-effort autosave is indistinguishable
     from a genuinely blank one inside the file.** Opened 2026-08-25 by
-    the second 0.52.2 review round (red-team RT-04). `aurora_io::aur`
-    already omits an all-zero tile from a `.aur` container as a size
-    optimisation, and a *skipped* tile is omitted the same way — so the
-    container records no difference between "this tile was empty" and
-    "this tile's pixels could not be read". `write_best_effort` returns
-    the list, and `write_autosave` logs it and now routes the whole file
-    to `aurora-autosave.partial.aur` rather than the canonical path, so
-    within one session and for a human reading either the log or the file
-    name the loss is visible. What is *not* visible is the per-tile
-    detail after a restart, in a different process: reopening the partial
-    container cannot say which tiles were dropped or offer to warn about
-    them.
+    the second 0.52.2 review round (red-team RT-04); closed in 0.74.0.
+    `aurora_io::aur` already omits an all-zero tile from a `.aur`
+    container as a size optimisation, and a *skipped* tile was omitted
+    the same way — so the container recorded no difference between "this
+    tile was empty" and "this tile's pixels could not be read".
+    `write_best_effort` returned the list and `write_autosave` logged it
+    and routed the whole file to `aurora-autosave.partial.aur`, so within
+    one session the loss was visible; after a restart, in a different
+    process, it was not.
 
-    Not fixed here because the honest fix is a **file-format change** —
-    a `skipped_tiles` list in the manifest and a `MANIFEST_VERSION` bump,
-    which is an ADR 0009 backward-compatibility decision (every past
-    version must keep reading) rather than a patch-scope edit, and it
-    wants the reader side and a user-facing warning designed with it.
-    The same still-open "an export refused for unreadable tiles is only
-    logged, never shown to the user" item above is where that warning
-    surface belongs, and the two should be done together.
+    **What shipped (0.74.0).** A new **optional, separate top-level ZIP
+    entry**, `skipped-tiles`, holding a `postcard`-encoded
+    `Vec<SkippedTileRecord>` (`surface` as a raw `u64`, `tile`, and a
+    reason truncated to 512 chars), written by `write_with_policy` only
+    when the skip list is non-empty. `aurora_io::read_aur` now returns a
+    named `AurDocument` struct (was a private four-tuple) whose fifth
+    field is `skipped_tiles`; absence of the entry reads as an empty
+    list. `App::open_aur_file` warns on it with a modal
+    "This Document Is Missing Content" dialog
+    (`skipped_tiles_message`/`open_skipped_tiles_dialog`), itemized with
+    the count and the first reason, stating plainly that the content
+    cannot be recovered from the file — the reason string is
+    `aurora_doc::sanitize_display_name`d first, since it is
+    file-controlled text heading for an `accesskit` label.
+
+    **Deliberately not a manifest field, and not a `MANIFEST_VERSION`
+    bump** — the previous note here proposed exactly that, and both are
+    wrong. `postcard`'s wire format is positional (no field names or
+    tags), so a trailing struct field fails with
+    `DeserializeUnexpectedEnd` against old-shaped bytes before
+    `#[serde(default)]` is ever consulted; measured directly against this
+    workspace's pinned `postcard`, not recalled. And `read` hard-refuses
+    an unrecognised `MANIFEST_VERSION`, so a bump would make every
+    existing `.aur` file and every existing autosave permanently
+    unopenable. The reasoning is recorded in `aur.rs`'s own module doc
+    so nobody re-derives it. An ordinary `write()` — the `Refuse` policy,
+    every user-facing save — still produces byte-identical output,
+    pinned by `an_ordinary_write_carries_no_skipped_tiles_entry`.
+
+    Tests: `a_skipped_tile_survives_as_skipped_across_a_fresh_read`,
+    `a_container_without_the_skipped_tiles_entry_reads_as_none_skipped`
+    (the real backward-compatibility proof — a container with no such
+    entry), `an_ordinary_write_carries_no_skipped_tiles_entry`,
+    `a_hostile_skipped_tiles_entry_is_bounded` (over-long list truncated
+    to `MAX_SKIPPED_TILE_RECORDS`; garbage bytes →
+    `IoError::ManifestDeserialization`, not a panic) in `aurora-io`; and
+    `open_aur_file_warns_when_the_file_was_written_with_tiles_missing`,
+    `open_aur_file_opens_no_dialog_for_a_complete_file`,
+    `skipped_tiles_message_sanitizes_a_hostile_reason` in `aurora-app`.
+
+    **Still open, named rather than dropped: the crash-recovery path
+    does not warn.** `read_autosave_container` (and so `recover_document`
+    and `App::new`'s startup route) still discards `skipped_tiles`
+    silently, and that is exactly the path where a partial autosave is
+    most likely to be read. It was scoped out of 0.74.0 for two concrete
+    reasons: that path has its own separate primary-then-`.partial`
+    fallback logic and its own test suite, and its single modal dialog
+    slot at startup is already claimed by the crash-recovery dialog, so
+    warning there is a message-design decision rather than one more call.
+    A code comment at `read_autosave_container` names it. Do not read
+    this checkbox as covering it.
 
     Minor related note from the same round (red-team RT-05): a
     `debug_assert!` is **not** caught by this workspace's

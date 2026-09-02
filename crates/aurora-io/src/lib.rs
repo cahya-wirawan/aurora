@@ -39,7 +39,8 @@ pub mod png;
 pub mod tiff;
 
 pub use aur::{
-    SkippedTile, read as read_aur, write as write_aur, write_best_effort as write_aur_best_effort,
+    AurDocument, SkippedTile, SkippedTileRecord, read as read_aur, write as write_aur,
+    write_best_effort as write_aur_best_effort,
 };
 pub use error::IoError;
 pub use image::Image;
