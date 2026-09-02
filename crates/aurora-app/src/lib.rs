@@ -4201,10 +4201,40 @@ fn active_pixel_layer(
     Some((id, bounds))
 }
 
+/// The document-space point every composite `aurora_tile::TileId` is
+/// measured from — the active layer's own `bounds.x`/`bounds.y`, or
+/// `(0, 0)` when there is no active layer or it isn't a pixel layer
+/// (the same absent-precondition honesty [`active_pixel_layer`] already
+/// uses).
+///
+/// **This is the grid anchor, and it is the *only* way "which layer is
+/// active" reaches the composite at all.** `recomposite_visible_tiles`
+/// takes `active_layer` solely to compute this value; every function it
+/// then calls (`begin_gpu_composite_tile`, `composite_roots_into_tile`,
+/// `resolve_tile`) receives `reference_origin` and never the active
+/// layer's own id. So two different active layers that share an origin
+/// produce byte-identical composites for every `TileId`, which is what
+/// lets a layer *switch* skip invalidating the cache when the origin
+/// didn't actually move (`press_layer_row`), and what lets an
+/// undo/redo's own narrowed invalidation be measured against a single,
+/// unmoved anchor (`after_undo_redo`).
+///
+/// One definition, shared: [`active_layer_origin`] is this same value in
+/// `f32` for the pan-bound/canvas-local-origin math, and
+/// `recomposite_visible_tiles` calls this directly.
+#[must_use]
+fn composite_reference_origin(
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+) -> (i64, i64) {
+    active_pixel_layer(layers, active_layer).map_or((0, 0), |(_, bounds)| (bounds.x, bounds.y))
+}
+
 /// The active layer's own document-space origin (`bounds.x`/`bounds.y`,
 /// as `f32`), or `(0.0, 0.0)` if there's no active layer or it isn't a
-/// pixel layer — the same absent-precondition honesty
-/// [`active_pixel_layer`] already uses. What [`canvas_local_origin`]
+/// pixel layer — the `f32` face of [`composite_reference_origin`], which
+/// it delegates to so the anchor has exactly one definition. What
+/// [`canvas_local_origin`]
 /// needs to convert a document-space point into the active layer's own
 /// surface-local space, now that a layer can actually sit somewhere
 /// other than the document's own origin (`aurora_doc::LayerTree::set_bounds`,
@@ -4234,8 +4264,8 @@ fn active_layer_origin(
     layers: &aurora_doc::LayerTree,
     active_layer: Option<aurora_doc::LayerId>,
 ) -> (f32, f32) {
-    active_pixel_layer(layers, active_layer)
-        .map_or((0.0, 0.0), |(_, bounds)| (bounds.x as f32, bounds.y as f32))
+    let (x, y) = composite_reference_origin(layers, active_layer);
+    (x as f32, y as f32)
 }
 
 /// The whole canvas pan bound, both edges, as one value — what every
@@ -6478,9 +6508,11 @@ fn recomposite_visible_tiles(
     // *active* layer's own origin (`canvas_local_origin`'s own doc
     // comment) — every other layer's own document-space tile boundaries
     // only line up with it by coincidence, so this is the one origin
-    // every `tile_id` below needs converting back out of.
-    let reference_origin =
-        active_pixel_layer(layers, active_layer).map_or((0, 0), |(_, b)| (b.x, b.y));
+    // every `tile_id` below needs converting back out of. This is also
+    // the *only* use `active_layer` gets in this function or anything it
+    // calls — see `composite_reference_origin`'s own doc comment for
+    // what that buys the two narrowed invalidation paths.
+    let reference_origin = composite_reference_origin(layers, active_layer);
 
     // Document-wide, computed once per call, not once per tile — see
     // `document_qualifies_for_gpu_compositing`'s own doc comment for why
@@ -7238,9 +7270,27 @@ fn composite_document(
 /// [`commit_ending_drag`]'s own doc comment describes for the other
 /// gestures.
 ///
-/// Pushing the updated accessibility tree and bumping the composite
-/// cache stay the caller's job — the same split [`select_layer`] itself
-/// already documents.
+/// **The composite-cache invalidation is this function's job too, and
+/// it is guarded rather than unconditional** (0.71.0). A layer switch
+/// can only change what an already-cached composite `TileId` means by
+/// moving the grid anchor itself — [`composite_reference_origin`], the
+/// single value through which `active_layer` reaches
+/// [`recomposite_visible_tiles`] at all; nothing else about *which*
+/// layer is active is an input to compositing (every tile still
+/// composites the whole `LayerTree`, active layer or not). So switching
+/// between two layers that share an origin — which is every layer this
+/// app's own UI creates, all of them starting at `(0, 0)` — leaves every
+/// cached tile exactly as valid as it was, and bumping there threw away
+/// a whole visible grid's worth of composited tiles on every Layers-panel
+/// click for nothing. The anchor is read before the switch and again
+/// after; only a real move bumps.
+///
+/// Taking `composite_cache` rather than leaving the bump to the caller
+/// is the same reasoning [`select_layer`] already applies to the pan
+/// clamp: the guard is only sound *because* it sits next to the switch
+/// that could invalidate it, and a caller doing it by hand is a caller
+/// that can get it wrong. Pushing the updated accessibility tree stays
+/// the caller's job — that half really is one platform side effect.
 #[allow(clippy::too_many_arguments)]
 fn press_layer_row(
     workspace: &mut aurora_ui::Workspace,
@@ -7251,6 +7301,7 @@ fn press_layer_row(
     history: &mut aurora_doc::History,
     pixel_history: &mut aurora_brush::PixelHistory,
     undo_order: &mut UndoOrder,
+    composite_cache: &mut CompositeCache,
     drag: &mut Option<Drag>,
     layer_id: aurora_doc::LayerId,
 ) {
@@ -7264,7 +7315,14 @@ fn press_layer_row(
         *active_layer,
         canvas_area_logical_size(workspace),
     );
+    // Read across `select_layer` alone, the one statement that moves
+    // `*active_layer`. `layers` is immutable for this whole function, so
+    // the commit above cannot have moved the anchor under us either.
+    let before = composite_reference_origin(layers, *active_layer);
     select_layer(workspace, layer_rows, active_layer, view, layers, layer_id);
+    if composite_reference_origin(layers, *active_layer) != before {
+        composite_cache.bump();
+    }
 }
 
 /// Selects `layer_id` as the active layer: sets `*active_layer`, marks
@@ -9596,14 +9654,10 @@ impl App {
                 &mut self.history,
                 &mut self.pixel_history,
                 &mut self.undo_order,
+                &mut self.composite_cache,
                 &mut self.drag,
                 layer_id,
             );
-            // Changes `recomposite_visible_tiles`'s own reference origin
-            // (the newly active layer's own bounds) -- every cached
-            // `TileId` would otherwise keep meaning the *previous* active
-            // layer's own document-space window.
-            self.composite_cache.bump();
             self.push_accessibility();
             return;
         }
@@ -10935,18 +10989,18 @@ mod tests {
         canvas_area_logical_size, canvas_area_physical_rect, canvas_area_physical_size,
         canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer, clean_shutdown_cleanup,
         clear_session_marker, close_command_palette, close_dialog, collect_widget_paints,
-        commit_ending_drag, composite_document, composite_surface_id, continue_drag,
-        crash_recovery_dialog_message, create_dir_owner_only, create_tile_store_scratch_dir,
-        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_local_point, load_document_view, load_scales, load_theme, logical_point,
-        logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        commit_ending_drag, composite_document, composite_reference_origin, composite_surface_id,
+        continue_drag, crash_recovery_dialog_message, create_dir_owner_only,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
+        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        incomplete_composite_message, is_aur_path, layer_local_point, load_document_view,
+        load_scales, load_theme, logical_point, logical_size, mark_move_refusal_reported,
+        move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
+        open_command_palette, open_crash_recovery_dialog, open_dialog, open_image, open_tile_store,
+        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
         pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
         recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
         resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
@@ -12006,6 +12060,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CompositeCache::default(),
             &mut drag,
             b,
         );
@@ -12064,6 +12119,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CompositeCache::default(),
             &mut drag,
             b,
         );
@@ -12108,6 +12164,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CompositeCache::default(),
             &mut drag,
             b,
         );
@@ -12118,6 +12175,152 @@ mod tests {
             "the interrupted stroke must have its own entry in the unified order"
         );
         assert!(pixel_history.can_undo());
+    }
+
+    /// Two pixel layers that share the document origin — the shape every
+    /// document this app's own UI can build actually has, since
+    /// `add_pixel_layer` is only ever called at `(0, 0)` outside a Move.
+    /// `two_layers_one_moved` deliberately offsets its second layer, so
+    /// the same-origin case needs its own fixture.
+    fn two_layers_same_origin() -> (
+        aurora_ui::Workspace,
+        aurora_doc::LayerTree,
+        std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+    ) {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut layers = aurora_doc::LayerTree::new();
+        let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match layers.add_pixel_layer("b", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (workspace, layers, layer_rows, a, b)
+    }
+
+    /// The guard [`press_layer_row`] gained in 0.71.0. Two layers at the
+    /// same origin mean the same `composite_reference_origin`, so every
+    /// cached composite `TileId` still names the same document-space
+    /// window and still composites the same whole `LayerTree` — nothing
+    /// about the switch can change a single composited texel, and the
+    /// unconditional `bump()` this replaced threw the whole visible grid
+    /// away anyway.
+    #[test]
+    fn switching_to_a_layer_at_the_same_origin_keeps_every_cached_tile() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_same_origin();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let cached = [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+        ];
+        for tile in cached {
+            cache.mark_current(tile);
+        }
+        assert_eq!(
+            composite_reference_origin(&layers, Some(a)),
+            composite_reference_origin(&layers, Some(b)),
+            "setup: both layers really do share one grid anchor"
+        );
+
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut cache,
+            &mut drag,
+            b,
+        );
+
+        assert_eq!(active_layer, Some(b), "the switch itself must still happen");
+        for tile in cached {
+            assert!(
+                cache.is_current(tile),
+                "a same-origin switch must not invalidate {tile:?} -- this is the whole \
+                 point of the guard; the unconditional bump() it replaced fails here"
+            );
+        }
+    }
+
+    /// The other half of the same guard: a switch that really does move
+    /// the anchor still has to invalidate everything, because every
+    /// cached `TileId` now names a *different* document-space window.
+    #[test]
+    fn switching_to_a_layer_at_a_different_origin_invalidates_every_cached_tile() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let cached = [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+        ];
+        for tile in cached {
+            cache.mark_current(tile);
+        }
+        assert_ne!(
+            composite_reference_origin(&layers, Some(a)),
+            composite_reference_origin(&layers, Some(b)),
+            "setup: `b` really is somewhere else"
+        );
+
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut cache,
+            &mut drag,
+            b,
+        );
+
+        assert_eq!(active_layer, Some(b));
+        for tile in cached {
+            assert!(
+                !cache.is_current(tile),
+                "the anchor moved, so {tile:?} names a different window now and must be \
+                 recomputed"
+            );
+        }
     }
 
     /// `demo_document`'s whole point (unlike a plain `LayerTree` built
