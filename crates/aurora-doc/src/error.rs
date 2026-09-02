@@ -305,7 +305,7 @@ pub enum DocError {
     /// caller can match on and report the file's actual numbers from.
     /// Origin is checked there for that reason, and because the same
     /// guard then also covers the *write* path (`tile_grid` and
-    /// `validate_mask_origins` are shared by `read`, `write` and
+    /// `validate_persisted_rects` are shared by `read`, `write` and
     /// `write_best_effort`), which a deserializer cannot reach at all.
     /// `validate_opacities` stays in the deserializer because it is
     /// load-bearing for a second, non-`.aur` entry point —

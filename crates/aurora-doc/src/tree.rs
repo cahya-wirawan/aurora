@@ -586,7 +586,7 @@ fn offending_opacity(entry: &LayerEntry) -> Option<f32> {
 /// The mask check sits *outside* the `kind` match on purpose. A group
 /// carries a mask too, so testing only the `Pixel` arm would leave a
 /// masked group's own origin unchecked — the same reasoning
-/// `aurora-io`'s `validate_mask_origins` follows when it walks every
+/// `aurora-io`'s `validate_persisted_rects` follows when it walks every
 /// layer id regardless of kind.
 ///
 /// [`LayerTree::restore`] and [`LayerTree::restore_mask`] still do not
@@ -596,7 +596,7 @@ fn offending_opacity(entry: &LayerEntry) -> Option<f32> {
 /// bar is applied instead where an *untrusted* whole tree arrives —
 /// [`LayerTree::validate`], which `crate::History::replay` runs as its
 /// closing step — and, on the `.aur` file-read path, by `aurora-io`'s
-/// own `tile_grid`/`validate_mask_origins`. See [`validate_origin`] for
+/// own `tile_grid`/`validate_persisted_rects`. See [`validate_origin`] for
 /// exactly which routes into the tree that does and does not cover:
 /// [`LayerTree`]'s bare `Deserialize` is deliberately not one of them.
 ///
@@ -662,7 +662,7 @@ fn offending_origin(entry: &LayerEntry) -> Option<Rect> {
 /// **What "already validated on the way in" does and does not mean.**
 /// It covers the *live-edit API* (`set_bounds`, `add_mask`,
 /// `insert_unchecked`) and the *`.aur` file-read path* (`aurora-io`'s
-/// own `tile_grid` and `validate_mask_origins`, which is where the
+/// own `tile_grid` and `validate_persisted_rects`, which is where the
 /// read-time origin bar lives — see
 /// [`DocError::LayerOriginOutOfRange`] for why it is there and not in
 /// this crate's deserializer). It does **not** cover [`LayerTree`]'s
@@ -1964,7 +1964,7 @@ impl LayerTree {
     /// the same reason [`Self::restore`] gives: it puts back a rectangle
     /// that reached the tree through a checked route (the live-edit API,
     /// via [`Self::add_mask`], or the `.aur` file-read path, via
-    /// `aurora-io`'s `validate_mask_origins`), and re-checking would let
+    /// `aurora-io`'s `validate_persisted_rects`), and re-checking would let
     /// an ordinary undo fail on a value the tree itself produced. This
     /// type's own bare `Deserialize` is *not* one of those checked
     /// routes — see [`validate_origin`] for what that leaves open, and
