@@ -4913,6 +4913,84 @@ structural design work.
   pixel rendering, no gallery coverage added — same explicit scope
   boundary `history_panel.rs`/`layers_panel.rs` already draw, and
   neither of those has gallery coverage either.
+
+  **The Layers panel uses the real `TreeView` widget now, 2026-09-02
+  (0.77.0)** — the integration half of the widget landed in 0.76.0/
+  0.76.1. `populate_layers_panel` no longer writes its own
+  `Role::List`/`Role::ListItem` nodes and its own `row_style`: it calls
+  `aurora_widgets::widgets::insert_tree_view` to put a real `Role::Tree`
+  under the panel body and `insert_tree_item` for each layer, so every
+  row now carries a 0-based `level` derived from its real parent, a
+  `selected` state that lives in the row's *payload* (which is what
+  `paint_widget` reads to draw the highlight at all), and — on a
+  non-empty group — an `expanded` state plus exactly one of
+  `Action::Expand`/`Action::Collapse`.
+
+  Three real bugs were found and closed on the way in, none of them
+  cosmetic:
+
+  1. **The rows needed a container of their own.** `insert_panel` builds
+     `panel.body` with `Style::default()`, i.e. `FlexDirection::Row`, and
+     tree rows are `width: percent(1.0)` — parented straight to the body
+     they would have laid out *side by side*, not stacked. Setting the
+     body's own style to `Column` instead would not have held either:
+     `set_panel_collapsed` resets it to `Style::default()` on every
+     expand, so the first collapse/expand round trip would have
+     scrambled the panel. `insert_tree_view` brings its own `Column`
+     container, which that reset path cannot reach. Pinned by
+     `populate_layers_panel_stacks_rows_vertically_and_indents_each_level`,
+     which lays out under a *sized* root and asserts the second root row
+     sits directly below the first rather than beside it.
+  2. **`has_children` is "non-empty group", not "is a group".**
+     `LayerTree::children` returns `None` for a pixel layer and
+     `Some(&[])` for an empty group, so the naive `is_some()` test would
+     have declared an empty group expandable — and `tree_view`
+     deliberately refuses to announce "expanded" over nothing, which
+     would have left such a row offering an `Expand` that changes
+     nothing forever. An empty group is now a leaf row whose description
+     still reads "Group" (`an_empty_group_is_a_leaf_row_with_no_expand_action`).
+  3. **`aurora-app`'s `select_layer` was hand-mutating the accessibility
+     node** (`Node::set_selected` + `set_accessibility`), bypassing
+     `TreeItemState` entirely. Under the swap that is three separate
+     failures at once: `paint_tree_item` reads `TreeItemState::selected`,
+     so the selection would have been announced to a screen reader and
+     never painted; the next `refresh_node` any other row mutator
+     triggered would have rebuilt the node from the untouched state and
+     reverted the announcement too; and `set_accessibility` alone never
+     widens the tree-wide damage region, so even a correct highlight
+     would not have repainted. It now calls
+     `aurora_widgets::widgets::set_tree_item_selected`, which updates
+     payload, node and damage together (`warn!` on error, not `?` — the
+     function returns `()`).
+
+  A new `TreeItemState::description` field carries the row's second line
+  ("Multiply, 80%, hidden"), with `set_tree_item_description` as its only
+  setter. It has to live in state rather than being written onto the node
+  after `insert_tree_item` returns, because `refresh_node` rebuilds the
+  whole node from `TreeItemState` on every mutation — including the
+  `refresh_node(ancestor)` `insert_tree_item` itself performs when a
+  child row arrives, which happens *before* population even finishes, so
+  an externally-set description on a group row would be destroyed by
+  populating its own children. `a_description_survives_selection_
+  expansion_and_a_new_child_row` is the regression test for exactly that.
+
+  8 new tests (4 in `aurora-widgets`, 4 in `aurora-ui`), 1,499 passing
+  across the workspace. Verified: `cargo fmt --all --check`, `python3
+  scripts/check_layering.py`, `python3 scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace`,
+  `cargo test --workspace --doc`, and `RUSTDOCFLAGS="-D warnings" cargo
+  doc --workspace --no-deps --all-features` all clean.
+
+  **What this does *not* do**, stated plainly: nothing in `aurora-app`
+  routes an incoming `Action::Expand`/`Action::Collapse` request on a
+  layer row into `set_tree_item_expanded` yet — the actions are declared
+  and announced but not yet actionable, which is separate, still-open
+  work. And it **does not fix, and does not claim to fix, the VoiceOver
+  linear-navigation gap recorded above** (2026-08-04): there is no
+  display server in this sandbox, so whether a real `Role::Tree` helps
+  that is untested either way and still needs a human on real macOS
+  hardware.
 - [~] **Command palette, keyboard shortcuts** — first slice done
   2026-08-04. Two new generic mechanisms in `aurora-widgets`, following
   the same "abstract steps, not `winit` types — translating real

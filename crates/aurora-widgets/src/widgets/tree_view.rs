@@ -64,7 +64,10 @@
 //! # The accessibility vocabulary, and which platforms actually read it
 //!
 //! [`node`] sets `Role::TreeItem`, `set_label`, `set_level(depth)`, and
-//! `set_selected`. **`level` is 0-based here** — `accesskit`'s own
+//! `set_selected`, plus `set_description` when the row has one
+//! ([`TreeItemState::description`] — a second line announced *alongside*
+//! the label, absent entirely rather than empty when there is nothing to
+//! add). **`level` is 0-based here** — `accesskit`'s own
 //! `usize` property, not ARIA's 1-based `aria-level`, so a top-level
 //! row is level `0`; converting to ARIA's convention is a platform
 //! adapter's job, not this crate's.
@@ -209,6 +212,29 @@ pub struct TreeItemState {
     /// and nothing else — see this module's own doc comment on why no
     /// pixels come of it yet.
     pub label: String,
+    /// A second line of accessible detail, announced **alongside** the
+    /// label rather than instead of it (`accesskit`'s own `description`
+    /// property — a layers panel's "Multiply, 80%, hidden" next to the
+    /// layer's own name). `None` when the row has nothing to add, and
+    /// no property is emitted at all in that case rather than an empty
+    /// string, the same shape [`super::ScrollbarState::label`] uses.
+    ///
+    /// **Unsanitized, exactly like [`Self::label`]** — this crate
+    /// bounds neither, and a description built from document data is
+    /// the caller's to bound before it gets here (`aurora-ui`'s Layers
+    /// panel does that for the label via
+    /// `aurora_doc::sanitize_display_name`).
+    ///
+    /// **Why it lives in state at all**, rather than the caller setting
+    /// it on the node after [`insert_tree_item`] returns: `refresh_node`
+    /// rebuilds the *whole* node from this struct on every mutation, so
+    /// an externally-set description survives only until the next one —
+    /// and that is sooner than "eventually". [`insert_tree_item`] itself
+    /// calls `refresh_node(ancestor)` whenever a child row is inserted,
+    /// so a parent row's externally-set description would be destroyed
+    /// by populating its own children, before the caller had even
+    /// finished building the tree.
+    pub description: Option<String>,
     /// How deep this row sits, **0-based** (a top-level row is `0`).
     /// Derived by [`insert_tree_item`] from the row's real parent, not
     /// supplied by the caller — two rows that are siblings in the
@@ -244,6 +270,12 @@ fn node(state: &TreeItemState, showing_children: bool) -> Node {
     let expanded = state.expanded && showing_children;
     let mut node = Node::new(Role::TreeItem);
     node.set_label(state.label.clone());
+    // Only when there is one -- an absent description is no property at
+    // all, not an empty one, the same way `label`/`ScrollbarState::label`
+    // are handled elsewhere in this crate.
+    if let Some(description) = &state.description {
+        node.set_description(description.clone());
+    }
     node.set_level(state.depth);
     node.set_selected(state.selected);
     // Only a real group carries this property at all -- a leaf setting
@@ -537,6 +569,11 @@ pub fn insert_tree_item(
     }
     let state = TreeItemState {
         label: label.to_owned(),
+        // Not a sixth parameter: most rows have nothing to add, and
+        // `set_tree_item_description` is the one way to set it, which
+        // keeps the field's "rebuilt from state, never set on the node
+        // directly" rule true from the only entry point there is.
+        description: None,
         depth,
         // Not unconditionally `true`: see this function's own doc
         // comment, and `TreeItemState`'s.
@@ -658,6 +695,37 @@ pub fn set_tree_item_label(
     })
 }
 
+/// Sets (or, with `None`, clears) `id`'s second line of accessible
+/// detail — [`TreeItemState::description`], announced alongside the
+/// label rather than in place of it.
+///
+/// Routed through the same path as every other mutator here for the
+/// same reason [`set_tree_item_label`] is, and it is the *only*
+/// supported way to set this: a description written straight onto the
+/// accessibility node is destroyed by the next `refresh_node`, which
+/// [`insert_tree_item`] triggers on a row the moment a child is
+/// inserted under it. See [`TreeItemState::description`].
+///
+/// Allowed on a **disabled** row, matching [`set_tree_item_label`]
+/// rather than [`set_tree_item_selected`]: describing what a row *is*
+/// is owner-driven, not a user gesture the disabled state exists to
+/// refuse.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a tree row.
+pub fn set_tree_item_description(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    description: Option<&str>,
+) -> Result<(), WidgetError> {
+    with_tree_item_mut(tree, id, |state| {
+        state.description = description.map(ToOwned::to_owned);
+        Ok(())
+    })
+}
+
 /// Sets whether `id` (a tree row) is selected. Selection is per-row
 /// here: nothing in this module enforces "one row at a time", which is
 /// an owning widget's own policy (a layers panel allows multi-select, a
@@ -723,8 +791,9 @@ fn with_tree_item_mut(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_disabled,
-        set_tree_item_expanded, set_tree_item_label, set_tree_item_selected,
+        MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view,
+        set_tree_item_description, set_tree_item_disabled, set_tree_item_expanded,
+        set_tree_item_label, set_tree_item_selected,
     };
     use crate::WidgetError;
     use crate::widgets::{
@@ -1183,6 +1252,7 @@ mod tests {
             set_tree_item_selected(&mut tree, root, true),
             set_tree_item_disabled(&mut tree, root, true),
             set_tree_item_expanded(&mut tree, root, false),
+            set_tree_item_description(&mut tree, root, Some("x")),
         ] {
             match result {
                 Err(WidgetError::WrongWidgetKind(id)) => assert_eq!(id, root),
@@ -1199,6 +1269,7 @@ mod tests {
             set_tree_item_selected(&mut tree, bogus, true),
             set_tree_item_disabled(&mut tree, bogus, true),
             set_tree_item_expanded(&mut tree, bogus, false),
+            set_tree_item_description(&mut tree, bogus, Some("x")),
         ] {
             match result {
                 Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
@@ -1695,6 +1766,149 @@ mod tests {
         assert_eq!(accessibility.label(), Some("Background"));
         assert_eq!(tree.is_dirty(row), Some(true));
         assert_eq!(tree.take_damage(), Some(bounds));
+    }
+
+    /// The description's own sanctioned setter, held to the same
+    /// standard as the label's: it must reach the node *and* the damage
+    /// region, or a screen reader and the pixels disagree.
+    #[test]
+    fn set_tree_item_description_reaches_the_node_and_widens_the_damage_region() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(accessibility) = tree.accessibility(row) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(
+            accessibility.description(),
+            None,
+            "a fresh row carries no description property at all"
+        );
+        let bounds = Rect {
+            x: 4,
+            y: 8,
+            width: 200,
+            height: 21,
+        };
+        if let Err(err) = tree.set_bounds(row, bounds) {
+            unreachable!("{err:?}");
+        }
+        tree.take_damage();
+
+        if let Err(err) = set_tree_item_description(&mut tree, row, Some("Multiply, 80%")) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            state_of(&tree, row).description.as_deref(),
+            Some("Multiply, 80%")
+        );
+        let Some(accessibility) = tree.accessibility(row) else {
+            unreachable!("still exists");
+        };
+        assert_eq!(accessibility.description(), Some("Multiply, 80%"));
+        assert_eq!(
+            accessibility.label(),
+            Some("Layer 1"),
+            "a description is announced alongside the label, not instead of it"
+        );
+        assert_eq!(tree.is_dirty(row), Some(true));
+        assert_eq!(tree.take_damage(), Some(bounds));
+    }
+
+    /// Why the description has to live in [`TreeItemState`] rather than
+    /// being written onto the node after the fact. `refresh_node`
+    /// rebuilds the whole node from state on *every* mutation, and
+    /// `insert_tree_item` triggers one on a row the moment a child
+    /// arrives under it — so an externally-set description would be
+    /// destroyed by populating a group's own children, before the caller
+    /// had even finished building the panel.
+    #[test]
+    fn a_description_survives_selection_expansion_and_a_new_child_row() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let group = match insert_tree_item(&mut tree, root, &scales, "Effects", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_description(&mut tree, group, Some("Group")) {
+            unreachable!("{err:?}");
+        }
+        let described = |tree: &crate::WidgetTree<WidgetKind>, step: &str| {
+            let Some(accessibility) = tree.accessibility(group) else {
+                unreachable!("still exists after {step}");
+            };
+            assert_eq!(
+                accessibility.description(),
+                Some("Group"),
+                "the description must survive {step}"
+            );
+        };
+        described(&tree, "being set");
+
+        if let Err(err) = set_tree_item_selected(&mut tree, group, true) {
+            unreachable!("{err:?}");
+        }
+        described(&tree, "selection");
+
+        if let Err(err) = set_tree_item_expanded(&mut tree, group, false) {
+            unreachable!("{err:?}");
+        }
+        described(&tree, "collapsing");
+
+        if let Err(err) = insert_tree_item(&mut tree, group, &scales, "Glow", false) {
+            unreachable!("{err:?}");
+        }
+        described(&tree, "a new child row's own refresh of its parent");
+    }
+
+    #[test]
+    fn clearing_a_description_removes_it_from_the_node() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_description(&mut tree, row, Some("Normal, 100%")) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_tree_item_description(&mut tree, row, None) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(state_of(&tree, row).description, None);
+        let Some(accessibility) = tree.accessibility(row) else {
+            unreachable!("still exists");
+        };
+        assert_eq!(
+            accessibility.description(),
+            None,
+            "clearing must remove the property, not leave an empty string"
+        );
+    }
+
+    /// A description is owner-driven, like a rename — a locked layer
+    /// still changes blend mode.
+    #[test]
+    fn set_tree_item_description_is_allowed_on_a_disabled_row() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Locked", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_disabled(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_tree_item_description(&mut tree, row, Some("Multiply, 80%")) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            state_of(&tree, row).description.as_deref(),
+            Some("Multiply, 80%")
+        );
     }
 
     /// A rename is owner-driven, not a user gesture, so it is the one

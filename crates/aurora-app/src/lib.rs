@@ -8151,10 +8151,24 @@ fn press_layer_row(
 
 /// Selects `layer_id` as the active layer: sets `*active_layer`, marks
 /// its own Layers-panel row (`layer_rows` —
-/// `aurora_ui::populate_layers_panel`'s own return value) as accessibly
-/// selected (`accesskit::Node::set_selected`), clearing that state from
-/// every other row, and re-establishes `view`'s own pan bound against
-/// the newly active layer ([`clamp_pan_to_active_layer`]). Pushing the
+/// `aurora_ui::populate_layers_panel`'s own return value) selected via
+/// `aurora_widgets::widgets::set_tree_item_selected`, clearing that
+/// state from every other row, and re-establishes `view`'s own pan bound
+/// against
+/// the newly active layer ([`clamp_pan_to_active_layer`]).
+///
+/// **Through the widget's own setter, not `accesskit::Node::set_selected`
+/// on the row's node.** Since 0.77.0 those rows are real
+/// `aurora_widgets::widgets::TreeItem`s, and a hand-written node loses
+/// three separate things: `aurora_widgets::paint_widget` reads
+/// `TreeItemState::selected` to decide whether to draw the highlight at
+/// all (so the selection would be announced and never painted), the next
+/// `refresh_node` any other row mutator triggers would rebuild the node
+/// from that untouched state and silently revert the announcement too,
+/// and `WidgetTree::set_accessibility` alone never widens the tree-wide
+/// damage region, so even a correct highlight would not repaint.
+///
+/// Pushing the
 /// updated accessibility tree to the platform is still the caller's job
 /// (`App::push_accessibility`), the same "pure dispatch, caller owns the
 /// one real platform side-effect" split every other function in this
@@ -8180,12 +8194,15 @@ fn select_layer(
     let canvas_size = canvas_area_logical_size(workspace);
     *active_layer = Some(layer_id);
     for (&row, &id) in layer_rows {
-        let Some(node) = workspace.tree.accessibility(row) else {
-            continue;
-        };
-        let mut node = node.clone();
-        node.set_selected(id == layer_id);
-        if let Err(err) = workspace.tree.set_accessibility(row, node) {
+        // `warn!`, not `?`: this function returns `()`, and a row that
+        // has somehow gone missing must not take the rest of the
+        // selection with it -- nor become a panic, which this workspace
+        // denies outright.
+        if let Err(err) = aurora_widgets::widgets::set_tree_item_selected(
+            &mut workspace.tree,
+            row,
+            id == layer_id,
+        ) {
             tracing::warn!(?err, "failed to update a layer row's selection state");
         }
     }
@@ -12255,6 +12272,20 @@ mod tests {
             unreachable!("just populated");
         };
         assert_eq!(node_b.is_selected(), Some(false));
+        // The *payload*, not only the node. `aurora_widgets::
+        // paint_widget` reads `TreeItemState::selected` to decide
+        // whether to draw the highlight at all, so a selection that
+        // reached the accessibility node alone would be announced to a
+        // screen reader and never painted on screen -- exactly the bug
+        // the pre-0.77.0 hand-rolled `set_selected` had.
+        assert!(matches!(
+            workspace.tree.payload(row_a),
+            Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if state.selected
+        ));
+        assert!(matches!(
+            workspace.tree.payload(row_b),
+            Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if !state.selected
+        ));
 
         // Selecting the other layer must flip both rows, not just add
         // to whatever was already selected.
@@ -12275,6 +12306,14 @@ mod tests {
             unreachable!("just populated");
         };
         assert_eq!(node_b.is_selected(), Some(true));
+        assert!(matches!(
+            workspace.tree.payload(row_a),
+            Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if !state.selected
+        ));
+        assert!(matches!(
+            workspace.tree.payload(row_b),
+            Some(aurora_widgets::widgets::WidgetKind::TreeItem(state)) if state.selected
+        ));
     }
 
     // -- the pan bound and a *changing* active layer --
@@ -13505,10 +13544,20 @@ mod tests {
         {
             unreachable!("a freshly built workspace's own panel body must accept this");
         }
+        // One level deeper than `layers.body`: since 0.77.0
+        // `populate_layers_panel` inserts a `Role::Tree` container of
+        // its own under the body and parents every row to *that*, so
+        // `children(body)` is always exactly `[the tree]`.
+        let layer_tree_root =
+            |workspace: &aurora_ui::Workspace| match workspace.tree.children(workspace.layers.body)
+            {
+                Some([only]) => *only,
+                other => unreachable!("expected exactly one tree container, got {other:?}"),
+            };
         assert!(
             workspace
                 .tree
-                .children(workspace.layers.body)
+                .children(layer_tree_root(&workspace))
                 .unwrap_or(&[])
                 .len()
                 > 1,
@@ -13531,7 +13580,7 @@ mod tests {
         assert_eq!(
             workspace
                 .tree
-                .children(workspace.layers.body)
+                .children(layer_tree_root(&workspace))
                 .map(<[_]>::len),
             Some(1),
             "old demo rows must be gone, replaced by exactly the new layer's own row"
