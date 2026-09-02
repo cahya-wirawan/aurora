@@ -10150,7 +10150,7 @@ structural design work.
     within budget, the dropped count is exact, a dropped tile reads back
     as a loud error rather than blank, and a retained one is still served
     from memory. Confirmed to fail with the cap disabled.
-- [x] **A tile dropped from a best-effort autosave is indistinguishable
+- [~] **A tile dropped from a best-effort autosave is indistinguishable
     from a genuinely blank one inside the file.** Opened 2026-08-25 by
     the second 0.52.2 review round (red-team RT-04); closed in 0.74.0.
     `aurora_io::aur` already omits an all-zero tile from a `.aur`
@@ -10162,20 +10162,79 @@ structural design work.
     one session the loss was visible; after a restart, in a different
     process, it was not.
 
-    **What shipped (0.74.0).** A new **optional, separate top-level ZIP
-    entry**, `skipped-tiles`, holding a `postcard`-encoded
-    `Vec<SkippedTileRecord>` (`surface` as a raw `u64`, `tile`, and a
-    reason truncated to 512 chars), written by `write_with_policy` only
-    when the skip list is non-empty. `aurora_io::read_aur` now returns a
-    named `AurDocument` struct (was a private four-tuple) whose fifth
-    field is `skipped_tiles`; absence of the entry reads as an empty
-    list. `App::open_aur_file` warns on it with a modal
+    **Marked `[~]`, not `[x]`, deliberately** (0.74.1): the crash-recovery
+    half named at the bottom of this item is real, deferred, and still
+    open, and the prose has always said so. The marker now agrees with
+    it.
+
+    **What shipped (0.74.0, corrected in 0.74.1).** A new **optional,
+    separate top-level ZIP entry**, `skipped-tiles`, holding a
+    `postcard`-encoded versioned wrapper — a schema `version`, the
+    **true, untruncated** `total` number of tiles dropped, and up to
+    `MAX_SKIPPED_TILE_RECORDS` (4096) `SkippedTileRecord`s (`surface`,
+    `tile_x`, `tile_y` and a reason, all raw scalars this module owns,
+    the reason truncated to 128 chars on write *and* on read) — written
+    by `write_with_policy` only when the skip list is non-empty.
+    `aurora_io::read_aur` now returns a named `AurDocument` struct (was a
+    private four-tuple) whose fifth field is `skipped_tiles`, an
+    `aurora_io::SkippedTiles`; absence of the entry reads as "nothing was
+    dropped". `App::open_aur_file` warns on it with a modal
     "This Document Is Missing Content" dialog
-    (`skipped_tiles_message`/`open_skipped_tiles_dialog`), itemized with
-    the count and the first reason, stating plainly that the content
-    cannot be recovered from the file — the reason string is
-    `aurora_doc::sanitize_display_name`d first, since it is
-    file-controlled text heading for an `accesskit` label.
+    (`skipped_tiles_warning`/`skipped_tiles_message`/
+    `open_skipped_tiles_dialog`), itemized with the count and the first
+    reason, stating plainly that the content cannot be recovered from the
+    file — the reason string is `aurora_doc::sanitize_display_name`d
+    first, since it is file-controlled text heading for an `accesskit`
+    label.
+
+    **Three defects a two-reviewer round found in the 0.74.0 shape, all
+    fixed in 0.74.1 before the format reached anyone:**
+
+    1. **The record was erased by the very next save.** Nothing stored
+       the opened file's skip list, so it was built into one dialog line
+       and dropped — and `write_with_policy` could not rediscover it,
+       because a tile an earlier writer dropped is not in the tile store
+       at all and reads as "never painted". Reproduced live: open a
+       lossy file → `skipped_tiles = 1` → the autosave `open_aur_file`
+       itself performs (*before* the dialog appears) already recorded
+       `0` → an ordinary Save produced a file with no `skipped-tiles`
+       entry → reopening *that* file warned about nothing. A crash
+       between the open and the dialog restored a document with no
+       record either. `App::skipped_tiles` now carries it, every writer
+       (`write_aur`, `write_aur_best_effort`, `write_autosave`) takes it
+       as `known_missing` and unions it with what it finds fresh, and
+       `read_autosave_container` keeps it too (through a named
+       `RecoveredDocument`) so a recovered autosave does not erase its
+       own record on the next write. `SkippedTiles::record` is the one
+       union implementation, shared by writer and app.
+    2. **The cap became a floor presented as a fact.** A real
+       17,920 × 15,872 px layer — inside the documented ceiling — with
+       its scratch tiles gone produces 4339 skips, of which 4096
+       survived, after which the dialog said "4096 tiles … could not be
+       read" as an exact number. The entry now carries `total` beside
+       the capped list and the message says "at least N" exactly when
+       `SkippedTiles::is_truncated`.
+    3. **Decode-before-truncate was a ~11,000× memory amplifier on the
+       untrusted startup path.** `read_skipped_tiles` shared the
+       manifest's 64 MiB `MAX_METADATA_ENTRY_BYTES` and truncated the
+       `Vec` *after* `postcard` had decoded all of it, which bounds what
+       is retained and not what is allocated — measured at ~790 MiB of
+       peak RSS from a 64 KiB DEFLATE-compressed file, through the real
+       shipped path, reachable from crash recovery before a window
+       exists. The entry now has its own
+       `MAX_SKIPPED_TILES_ENTRY_BYTES` (~2.1 MiB, derived from
+       `MAX_SKIPPED_TILE_RECORDS × MAX_SKIPPED_RECORD_BYTES`), enforced
+       by `read_capped` **before** any decode.
+
+    Two smaller corrections in the same round: the message no longer
+    claims "this file was saved by crash-recovery autosave" (a
+    provenance the file cannot prove — `write_aur_best_effort` is public
+    API), and it now uses the `MASK_SURFACE_BIT` distinction the record
+    has always carried, so a lost mask tile is not described as image
+    data. `handle_dropped_file` gained the `self.dialog.is_some()` gate
+    `handle_menu_event` already had, and `open_aur_file` now logs the
+    full itemized message when the modal slot was already occupied,
+    matching `save_file`'s own precedent.
 
     **Deliberately not a manifest field, and not a `MANIFEST_VERSION`
     bump** — the previous note here proposed exactly that, and both are
@@ -10191,22 +10250,40 @@ structural design work.
     every user-facing save — still produces byte-identical output,
     pinned by `an_ordinary_write_carries_no_skipped_tiles_entry`.
 
-    Tests: `a_skipped_tile_survives_as_skipped_across_a_fresh_read`,
+    Tests: `a_skipped_tile_survives_as_skipped_across_a_fresh_read`
+    (which now also runs the open → save → reopen sequence and asserts
+    the record survives it),
     `a_container_without_the_skipped_tiles_entry_reads_as_none_skipped`
     (the real backward-compatibility proof — a container with no such
     entry), `an_ordinary_write_carries_no_skipped_tiles_entry`,
     `a_hostile_skipped_tiles_entry_is_bounded` (over-long list truncated
-    to `MAX_SKIPPED_TILE_RECORDS`; garbage bytes →
-    `IoError::ManifestDeserialization`, not a panic) in `aurora-io`; and
-    `open_aur_file_warns_when_the_file_was_written_with_tiles_missing`,
-    `open_aur_file_opens_no_dialog_for_a_complete_file`,
+    to `MAX_SKIPPED_TILE_RECORDS` while `total` keeps the true count;
+    garbage bytes → `IoError::ManifestDeserialization`, not a panic),
+    `a_skipped_tiles_entry_past_its_own_byte_cap_is_refused_before_it_is_decoded`,
+    `an_unrecognised_skipped_tiles_version_still_reports_the_count`,
+    `an_overlong_multibyte_reason_is_cut_on_a_char_boundary_on_read`, and
+    `postcard_really_is_positional_so_a_trailing_field_breaks_old_bytes`
+    (the throwaway gate test that proved the design's premise, now
+    permanent and referenced by name from `aur.rs`'s own module doc) in
+    `aurora-io`; and
+    `open_aur_file_warns_when_the_file_was_written_with_tiles_missing`
+    (now going through the real `skipped_tiles_warning` helper rather
+    than a hand-rolled copy of the condition),
+    `a_complete_file_produces_no_missing_content_warning` (renamed from
+    `open_aur_file_opens_no_dialog_for_a_complete_file`, which promised a
+    dialog assertion it never made),
+    `an_opened_documents_missing_tiles_survive_the_next_autosave`,
+    `a_truncated_skip_list_is_reported_as_a_floor_not_a_fact`,
+    `the_message_distinguishes_lost_mask_coverage_from_lost_image_data`,
     `skipped_tiles_message_sanitizes_a_hostile_reason` in `aurora-app`.
 
     **Still open, named rather than dropped: the crash-recovery path
     does not warn.** `read_autosave_container` (and so `recover_document`
-    and `App::new`'s startup route) still discards `skipped_tiles`
-    silently, and that is exactly the path where a partial autosave is
-    most likely to be read. It was scoped out of 0.74.0 for two concrete
+    and `App::new`'s startup route) now *keeps* `skipped_tiles` as of
+    0.74.1 — it reaches `App::skipped_tiles` and is written out again by
+    every later save, so the record is no longer lost — but nothing
+    **tells the user** on that route, and that is exactly the path where
+    a partial autosave is most likely to be read. It was scoped out of 0.74.0 for two concrete
     reasons: that path has its own separate primary-then-`.partial`
     fallback logic and its own test suite, and its single modal dialog
     slot at startup is already claimed by the crash-recovery dialog, so

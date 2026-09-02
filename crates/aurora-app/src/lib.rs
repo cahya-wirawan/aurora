@@ -1296,11 +1296,20 @@ fn autosave_path() -> PathBuf {
 /// healing into a blank one, so without this one bad tile would have
 /// aborted every autosave for the rest of the session — every other
 /// layer, every subsequent edit, silently unprotected.
+/// `skipped` is the document's own carried record of what it is already
+/// missing ([`App::skipped_tiles`]), **in and out**: it is handed to the
+/// writer so previously-known losses land in this container too, and any
+/// tile *this* write has to drop is folded back into it
+/// (`aurora_io::SkippedTiles::record`) so the next write carries that as
+/// well. Nothing else can: a tile an earlier writer dropped is not in
+/// `store` at all, so this pass would otherwise walk past it as "never
+/// painted".
 fn write_autosave(
     path: &Path,
     layers: &aurora_doc::LayerTree,
     history: &aurora_doc::History,
     canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
 ) {
     let temp_path = autosave_temp_path(path);
@@ -1317,22 +1326,45 @@ fn write_autosave(
     // Where this write is allowed to land, decided by whether it turned
     // out to be complete -- see this function's own doc comment.
     let destination;
-    match aurora_io::write_aur_best_effort(&mut file, layers, history, canvas_size, None, store) {
-        Ok(skipped) if skipped.is_empty() => {
+    match aurora_io::write_aur_best_effort(
+        &mut file,
+        layers,
+        history,
+        canvas_size,
+        None,
+        skipped,
+        store,
+    ) {
+        // The complete-vs-`.partial` choice keys on what *this* write
+        // dropped, never on the carried record, and that is deliberate.
+        // A document opened from a file that already lost tiles is
+        // permanently missing them, so keying on the carried total would
+        // route every autosave for the rest of the session to
+        // `.partial` -- and the primary autosave, the one crash
+        // recovery reaches for first, would then never be updated again.
+        // The loss is still recorded *inside* whichever file is written;
+        // it just no longer disables the primary path forever.
+        Ok(fresh) if fresh.is_empty() => {
             destination = path.to_path_buf();
         }
-        Ok(skipped) => {
+        Ok(fresh) => {
+            // Folded into the carried record before anything else, so
+            // even the log line below and every later write of this
+            // document agree on what has been lost.
+            skipped.record(&fresh);
+            let skipped_now = fresh;
             // Loud, and every time: the file about to be written is
             // knowingly incomplete, which is exactly the thing that must
             // never be silent. The first one is named in full; the count
             // covers the rest without turning a broken scratch disk into
             // an unbounded log.
-            let first = skipped
+            let first = skipped_now
                 .first()
                 .map_or_else(String::new, |tile| format!("{tile:?}"));
             destination = partial_autosave_path(path);
             tracing::warn!(
-                skipped = skipped.len(),
+                skipped = skipped_now.len(),
+                known_total = skipped.total(),
                 %first,
                 path = %destination.display(),
                 "autosaving with tiles missing to the *partial* autosave path; the last complete \
@@ -1496,10 +1528,7 @@ fn remove_autosave(path: &Path) {
 /// this mid-session would need more thought than just a fresh call site
 /// — the recovered surfaces would overwrite whatever those same
 /// `SurfaceId`s currently hold.
-fn recover_document(
-    path: &Path,
-    store: &mut aurora_tile::TileStore,
-) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+fn recover_document(path: &Path, store: &mut aurora_tile::TileStore) -> Option<RecoveredDocument> {
     // A complete autosave always wins, even if a partial one is newer
     // (0.52.2, second review round). The partial file exists only for
     // the case where the scratch disk went bad before any complete
@@ -1561,7 +1590,7 @@ fn recover_document(
 fn recover_partial_after_a_failed_read(
     path: &Path,
     store_slot: &mut Option<aurora_tile::TileStore>,
-) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+) -> Option<RecoveredDocument> {
     let partial = partial_autosave_path(path);
     if !partial.exists() {
         return None;
@@ -1583,7 +1612,7 @@ fn recover_partial_after_a_failed_read(
 fn read_autosave_container(
     path: &Path,
     store: &mut aurora_tile::TileStore,
-) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+) -> Option<RecoveredDocument> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -1599,30 +1628,57 @@ fn read_autosave_container(
     // colour-management UI exists to have set one -- and an autosave this
     // crate wrote always carries `None` anyway ([`write_autosave`]).
     //
-    // `skipped_tiles` is discarded here too, and that one is *not* a
-    // "nothing to restore it into" case -- it is real, named, deliberately
-    // deferred follow-on work. A recovered autosave written by
-    // `write_aur_best_effort` can genuinely be missing tiles, and this
-    // path -- crash recovery, on the pre-window startup route -- is
-    // exactly where a user would most want to be told. It is out of
-    // scope for 0.74.0 for two concrete reasons: this path has its own
-    // separate partial-autosave fallback logic (`recover_document` tries
-    // the `.partial` container after the primary one) and its own test
-    // suite, so warning correctly here means getting the interaction
-    // between two fallbacks and a modal dialog right on a path that runs
-    // before there is a window; and the dialog slot at startup is
-    // already claimed by the crash-recovery dialog itself
-    // (`open_crash_recovery_dialog`), so this needs a message design
-    // decision, not just a call. 0.74.0 warns on the explicit
-    // "File > Open" path only (`App::open_aur_file`). PLAN.md records
-    // the rest as open.
+    // `skipped_tiles` is **kept** as of 0.74.1, and carried into
+    // `App::skipped_tiles` like any other opened document's -- so a
+    // recovered autosave that really was written with tiles missing goes
+    // on saying so in every file this session writes next, instead of
+    // having the record erased by its own first autosave.
+    //
+    // What is still deliberately deferred is *warning about it here*.
+    // A recovered autosave written by `write_aur_best_effort` can
+    // genuinely be missing tiles, and this path -- crash recovery, on
+    // the pre-window startup route -- is exactly where a user would most
+    // want to be told. Two concrete reasons it is not done yet: this
+    // path has its own separate partial-autosave fallback logic
+    // (`recover_document` tries the `.partial` container after the
+    // primary one) and its own test suite, so warning correctly here
+    // means getting the interaction between two fallbacks and a modal
+    // dialog right on a path that runs before there is a window; and the
+    // dialog slot at startup is already claimed by the crash-recovery
+    // dialog itself (`open_crash_recovery_dialog`), so this needs a
+    // message design decision, not just a call. The warning still fires
+    // on the explicit "File > Open" path only
+    // (`App::open_aur_file`). PLAN.md records the rest as open, and its
+    // checkbox is `[~]`, not `[x]`.
     match aurora_io::read_aur(file, store) {
-        Ok(document) => Some((document.layers, document.history, document.canvas_size)),
+        Ok(document) => Some(RecoveredDocument {
+            layers: document.layers,
+            history: document.history,
+            canvas_size: document.canvas_size,
+            skipped_tiles: document.skipped_tiles,
+        }),
         Err(err) => {
             tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
             None
         }
     }
+}
+
+/// One `.aur` autosave container, read back — what
+/// [`read_autosave_container`] and [`recover_document`] hand up.
+///
+/// A named struct rather than the tuple this was until 0.74.1, for the
+/// same reason `aurora_io::AurDocument` is one: `skipped_tiles` is a
+/// field a caller must not silently drop, and a fourth positional
+/// element is exactly the thing a tuple makes easy to drop.
+struct RecoveredDocument {
+    layers: aurora_doc::LayerTree,
+    history: aurora_doc::History,
+    canvas_size: (u32, u32),
+    /// What this recovered document is already known to be missing —
+    /// carried into [`App::skipped_tiles`], not warned about yet; see
+    /// [`read_autosave_container`]'s own comment.
+    skipped_tiles: aurora_io::SkippedTiles,
 }
 
 /// What [`App::new`] starts this session with — see
@@ -1634,6 +1690,12 @@ struct StartupDocument {
     /// manifest carries one), or [`document_canvas_size`]'s fallback for
     /// a [`demo_document`], which has none of its own.
     canvas_size: (u32, u32),
+    /// What the recovered document is already known to be missing
+    /// (`aurora_io::SkippedTiles`) — empty for a [`demo_document`],
+    /// which has never been written at all, and carried straight into
+    /// [`App::skipped_tiles`] so this session's own writes keep the
+    /// record instead of erasing it.
+    skipped_tiles: aurora_io::SkippedTiles,
     /// Whether this really came from an autosave — what the
     /// crash-recovery dialog's own message reports
     /// ([`crash_recovery_dialog_message`]).
@@ -1678,6 +1740,7 @@ fn startup_document(
             layers,
             history,
             canvas_size,
+            skipped_tiles: aurora_io::SkippedTiles::new(),
             was_recovered: false,
         };
     }
@@ -1699,7 +1762,13 @@ fn startup_document(
         }
         None => None,
     };
-    if let Some((layers, history, canvas_size)) = recovered {
+    if let Some(RecoveredDocument {
+        layers,
+        history,
+        canvas_size,
+        skipped_tiles,
+    }) = recovered
+    {
         // Nothing written back out: the file on disk *is* this
         // document, read back a few lines ago and not touched since.
         // Rewriting it here would be a full container rebuild (see
@@ -1715,6 +1784,7 @@ fn startup_document(
             layers,
             history,
             canvas_size,
+            skipped_tiles,
             was_recovered: true,
         };
     }
@@ -1740,8 +1810,20 @@ fn startup_document(
         *store_slot = open_tile_store();
     }
     let (layers, history, canvas_size) = fresh();
+    // A brand-new document has lost nothing, so this starts empty --
+    // but it is still threaded through rather than passed as a throwaway
+    // temporary, because this write can itself hit an unreadable tile
+    // and what it drops has to reach `App::skipped_tiles`.
+    let mut skipped_tiles = aurora_io::SkippedTiles::new();
     if let Some(store) = store_slot.as_mut() {
-        write_autosave(autosave_path, &layers, &history, canvas_size, store);
+        write_autosave(
+            autosave_path,
+            &layers,
+            &history,
+            canvas_size,
+            &mut skipped_tiles,
+            store,
+        );
     } else {
         tracing::warn!("no live tile store; skipping this session's autosave");
     }
@@ -1749,6 +1831,7 @@ fn startup_document(
         layers,
         history,
         canvas_size,
+        skipped_tiles,
         was_recovered: false,
     }
 }
@@ -2041,21 +2124,85 @@ fn skipped_tiles_dialog_actions() -> Vec<DialogAction> {
 /// is the point; a user who is told only "some tiles were skipped" will
 /// reasonably assume a reopen fixes it.
 ///
-/// `first_reason` is **file-controlled text** — it came out of the
+/// A record's `reason` is **file-controlled text** — it came out of the
 /// container being opened, and it is heading for a rendered label and
 /// an `accesskit` announcement — so it goes through
 /// `aurora_doc::sanitize_display_name` here, exactly as the layer names
 /// out of the same file already do on their way to the Layers panel.
-fn skipped_tiles_message(skipped: usize, first_reason: &str) -> String {
-    let plural = if skipped == 1 { "" } else { "s" };
-    let was = if skipped == 1 { "was" } else { "were" };
-    let reason = aurora_doc::sanitize_display_name(first_reason);
+///
+/// **Three things it deliberately no longer claims** (0.74.1):
+///
+/// - *Who wrote it.* The wording said "this file was saved by
+///   crash-recovery autosave", which the file cannot prove and the
+///   record does not carry. `aurora_io::write_aur_best_effort` is public
+///   API, and a `.aur` file is a file a user may have been sent. What is
+///   provable is that content is missing, and that is what it says.
+/// - *An exact count for a truncated list.* The entry's own `total` may
+///   exceed the records it carries (`aurora_io::SkippedTiles::
+///   is_truncated`), so the count becomes "at least N" exactly when it
+///   is a floor. Presenting a capped number as a fact is the failure
+///   this whole message exists to avoid.
+/// - *That every loss is image data.* The writer already distinguishes a
+///   lost **mask coverage** tile from a lost pixel-layer tile
+///   (`aurora_doc::MASK_SURFACE_BIT`), and the record persists it; until
+///   0.74.1 every reader threw that away and said "image data" for both.
+fn skipped_tiles_message(skipped: &aurora_io::SkippedTiles) -> String {
+    let total = skipped.total();
+    let plural = if total == 1 { "" } else { "s" };
+    let was = if total == 1 { "was" } else { "were" };
+    let count = if skipped.is_truncated() {
+        format!("at least {total}")
+    } else {
+        total.to_string()
+    };
+    // What was lost, in the terms the record actually supports. A file
+    // whose detail this build could not decode (an unrecognised
+    // `skipped-tiles` schema version) carries a count and no records at
+    // all, and "content" is the honest word for that.
+    let (mask, layer) = skipped
+        .records()
+        .iter()
+        .fold((false, false), |(mask, layer), record| {
+            if record.is_mask() {
+                (true, layer)
+            } else {
+                (mask, true)
+            }
+        });
+    let kind = match (mask, layer) {
+        (true, true) => "image data and mask coverage",
+        (true, false) => "mask coverage",
+        (false, true) => "image data",
+        (false, false) => "content",
+    };
+    let first = skipped.first().map_or_else(String::new, |record| {
+        let reason = aurora_doc::sanitize_display_name(&record.reason);
+        format!(" The first one was left out because: {reason}.")
+    });
     format!(
-        "This file was saved by crash-recovery autosave while {skipped} tile{plural} of image \
-         data could not be read, so {was} left out of it. That content is not in this file and \
-         cannot be recovered by reopening it. The first tile was skipped because: {reason}. \
-         Everything else in the document opened normally."
+        "{count} tile{plural} of {kind} could not be read when this file was written, so {was} \
+         left out of it. That content is not in this file and cannot be recovered by reopening \
+         it.{first} Everything else in the document opened normally."
     )
+}
+
+/// Whether an opened document needs the missing-content warning, and
+/// what it should say — `None` when the file lost nothing, which is
+/// every ordinary save and every file written before the
+/// `skipped-tiles` entry existed.
+///
+/// **The decision itself, extracted so it can be tested** (0.74.1).
+/// [`App::open_aur_file`] calls exactly this and does nothing else with
+/// `skipped_tiles`, so a test of this function is a test of the branch
+/// that really runs. The tests around it previously re-implemented the
+/// condition and the dialog title by hand, and so would have passed
+/// unchanged if `open_aur_file`'s own wiring had been deleted or pointed
+/// at the wrong field.
+fn skipped_tiles_warning(skipped: &aurora_io::SkippedTiles) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    Some(skipped_tiles_message(skipped))
 }
 
 const MOVE_REFUSED_DISMISS: &str = "move.refused.dismiss";
@@ -9210,6 +9357,29 @@ struct App {
     /// from its topmost layer's own bounds used to silently shrink (or
     /// grow) the canvas to match that layer instead of preserving it.
     canvas_size: (u32, u32),
+    /// What this document is already known to be **missing** — the
+    /// tiles some earlier best-effort write could not read
+    /// (`aurora_io::SkippedTiles`).
+    ///
+    /// **State, not a one-shot notification** (0.74.1). It is populated
+    /// from a `.aur` file's own `skipped-tiles` entry when one is opened
+    /// ([`Self::open_aur_file`]) and handed to *every* subsequent write
+    /// of that document ([`write_autosave`], [`Self::save_aur_file`]),
+    /// because nothing else can carry it: a tile a previous writer
+    /// dropped is not in the tile store at all, so a later write walks
+    /// past it as "never painted" and rediscovers nothing. 0.74.0 read
+    /// the list, built one dialog line out of it and discarded it, so
+    /// the very next save — including the autosave `open_aur_file`
+    /// itself performs, before the warning has even appeared on
+    /// screen — wrote a file that no longer recorded the loss at all.
+    /// Open, Save, reopen, and the file said nothing; open and crash,
+    /// and crash recovery restored a document with no record either.
+    ///
+    /// Reset to empty wherever the document is *replaced* by one with
+    /// no such history ([`Self::open_file`]'s flat-image path), for the
+    /// same reason `pixel_history` and `undo_order` are: it describes
+    /// the document that is open, not the session.
+    skipped_tiles: aurora_io::SkippedTiles,
     /// `layers`' own undo/redo history — built alongside it (same
     /// source: [`demo_document`] or a recovered autosave) and, since
     /// Undo/Redo (`Ctrl+Z`/`Ctrl+Shift+Z`, [`run_command`]), also kept
@@ -9454,6 +9624,13 @@ impl ShutdownState for App {
 impl App {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
+    // 102 lines against a 100-line lint: this is a linear constructor
+    // that reads one field per line, and 0.74.1 added exactly one field
+    // (`skipped_tiles`) to it. Splitting a constructor in half to buy
+    // two lines would make it harder to read, not easier, so the lint is
+    // silenced here rather than obeyed by a worse shape -- the same
+    // trade `aurora_doc::history` and the GPU test modules already make.
+    #[allow(clippy::too_many_lines)]
     fn new(
         proxy: EventLoopProxy<accesskit_winit::Event>,
         theme: Theme,
@@ -9476,6 +9653,7 @@ impl App {
             layers,
             history,
             canvas_size,
+            skipped_tiles,
             was_recovered,
         } = startup_document(had_previous_marker, autosave_path, &mut tile_store);
         let layer_rows = match aurora_ui::populate_layers_panel(
@@ -9568,6 +9746,7 @@ impl App {
             dialog,
             marker_path,
             layout_path,
+            skipped_tiles,
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
@@ -9733,6 +9912,28 @@ impl App {
     /// a dropped file and a chosen one are the same kind of "the user
     /// wants to open this" signal, whichever route it arrived by.
     fn handle_dropped_file(&mut self, path: &Path) {
+        // The same gate `handle_menu_event` applies, for the same
+        // reason: the modal dialog is a `Role::AlertDialog` with
+        // `set_modal()` set, and neither a native menu bar nor a
+        // platform file drop is dialog-aware, so nothing but this
+        // enforces that claim on either route. Without it a file dropped
+        // under the crash-recovery dialog replaces the whole document
+        // silently, and any warning the open itself raises is swallowed
+        // by the occupied slot (`open_dialog` is a no-op then). The
+        // keyboard route was already immune.
+        //
+        // **Covered by inspection, not by a test**, on the same
+        // disclosed footing as the menu route: `WindowEvent::DroppedFile`
+        // comes from a real windowing system, and this sandbox is Linux
+        // with no display server, so no such event can be constructed
+        // here.
+        if self.dialog.is_some() {
+            tracing::debug!(
+                path = %path.display(),
+                "ignoring a dropped file while a modal dialog is open"
+            );
+            return;
+        }
         self.open_file(path);
     }
 
@@ -9799,7 +10000,22 @@ impl App {
             // After the pixels land in the store, not before: the
             // autosave container carries this document's real tiles now,
             // so writing it first would persist an empty one.
-            write_autosave(&autosave_path(), &layers, &history, canvas_size, store);
+            //
+            // A fresh, empty carried record: a document decoded from a
+            // PNG/JPEG/TIFF has no `skipped-tiles` history of its own,
+            // and keeping the *previous* document's would attach one
+            // file's losses to another file entirely. Assigned before
+            // the write for the same reason `open_aur_file` assigns its
+            // own before its write.
+            self.skipped_tiles = aurora_io::SkippedTiles::new();
+            write_autosave(
+                &autosave_path(),
+                &layers,
+                &history,
+                canvas_size,
+                &mut self.skipped_tiles,
+                store,
+            );
         } else {
             tracing::warn!("no live tile store; skipping the opened document's autosave");
         }
@@ -9905,6 +10121,14 @@ impl App {
                     return;
                 }
             };
+        // Before the autosave below, and that ordering is load-bearing
+        // rather than tidy: `write_autosave` hands this straight back to
+        // the writer, so the autosave `open_aur_file` performs -- which
+        // runs before the user has even seen the warning -- carries the
+        // opened file's own record of what it lost. Set here, it also
+        // means a crash between opening a lossy file and acting on the
+        // dialog leaves crash recovery a document that still knows.
+        self.skipped_tiles = skipped_tiles;
         // Re-borrowed rather than reusing the `store` binding above:
         // that borrow of `self.tile_store` has to end before
         // `replace_document`'s own `&mut self.workspace` above, and
@@ -9912,7 +10136,14 @@ impl App {
         // container this writes carries the opened document's real
         // tiles.
         if let Some(store) = self.tile_store.as_mut() {
-            write_autosave(&autosave_path(), &layers, &history, canvas_size, store);
+            write_autosave(
+                &autosave_path(),
+                &layers,
+                &history,
+                canvas_size,
+                &mut self.skipped_tiles,
+                store,
+            );
         }
 
         self.layers = layers;
@@ -9955,14 +10186,27 @@ impl App {
         // against the already-rebuilt workspace, and
         // `open_skipped_tiles_dialog` pushes accessibility again itself
         // so the alert is announced.
-        if let Some(first) = skipped_tiles.first() {
-            let message = skipped_tiles_message(skipped_tiles.len(), &first.reason);
+        if let Some(message) = skipped_tiles_warning(&self.skipped_tiles) {
             tracing::warn!(
-                skipped = skipped_tiles.len(),
+                skipped = self.skipped_tiles.total(),
+                listed = self.skipped_tiles.records().len(),
                 path = %path.display(),
                 "opened a .aur file that was written with tiles missing"
             );
-            self.open_skipped_tiles_dialog(&message);
+            if !self.open_skipped_tiles_dialog(&message) {
+                // The one modal slot was already occupied, so the
+                // itemized warning never reached the screen. It is not
+                // allowed to vanish with it -- the same answer
+                // `Self::save_file` already gives for a suppressed
+                // export refusal, and the reason
+                // `open_skipped_tiles_dialog` returns this at all.
+                tracing::warn!(
+                    path = %path.display(),
+                    %message,
+                    "the missing-content warning could not be shown (a dialog is already open); \
+                     the document is still missing what it names"
+                );
+            }
         }
     }
 
@@ -10237,6 +10481,13 @@ impl App {
                 &self.history,
                 self.canvas_size,
                 None,
+                // What this document already knows it is missing, so an
+                // explicit Save of a file opened with tiles gone writes
+                // that fact out again instead of erasing it. `write_aur`
+                // still *refuses* rather than degrades -- a carried
+                // record names tiles that are not in the store at all,
+                // so it can never turn into a fresh skip here.
+                &self.skipped_tiles,
                 store,
             )
         })();
@@ -11734,32 +11985,33 @@ mod tests {
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, Drag,
         ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord,
         MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PanBounds, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, ShutdownState, UndoKind, UndoOrder,
-        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
-        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
-        begin_drag, brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
-        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message, create_dir_owner_only,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
-        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
-        load_document_view, load_scales, load_theme, logical_point, logical_size,
-        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
-        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
-        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
-        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
-        run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
-        skipped_tiles_dialog_actions, skipped_tiles_message, splitmix64, tile_overlaps_doc_rect,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, RecoveredDocument, ShutdownState, UndoKind,
+        UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
+        apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
+        background_color_from_theme, begin_drag, brush_stroke_mut, canvas_area_logical_size,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
+        composite_document, composite_reference_origin, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, create_dir_owner_only, create_tile_store_scratch_dir,
+        default_shortcuts, demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
+        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
+        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
+        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
+        move_refused_dialog_actions, move_refused_message, open_command_palette,
+        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
+        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
+        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
+        select_layer, shift_bounds, skipped_tiles_dialog_actions, skipped_tiles_message,
+        skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -12191,10 +12443,20 @@ mod tests {
         let _painted = paint_one_texel(&mut store, &layers, moved);
 
         let path = dir.path().join("aurora-autosave.aur");
-        write_autosave(&path, &layers, &history, (320, 160), &mut store);
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (320, 160),
+            &mut aurora_io::SkippedTiles::new(),
+            &mut store,
+        );
 
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let Some((recovered, _history, _canvas)) = recover_document(&path, &mut fresh_store) else {
+        let Some(RecoveredDocument {
+            layers: recovered, ..
+        }) = recover_document(&path, &mut fresh_store)
+        else {
             unreachable!("the autosave just written must reopen");
         };
         let Some(active) = topmost_pixel_layer(&recovered) else {
@@ -12254,9 +12516,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err}"),
         };
-        if let Err(err) =
-            aurora_io::write_aur(file, &layers, &history, (320, 160), None, &mut store)
-        {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (320, 160),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -13314,7 +13582,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), None, &mut store) {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
         assert!(
@@ -15669,9 +15945,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) =
-            aurora_io::write_aur(file, &layers, &history, (SIDE, SIDE), None, &mut store)
-        {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (SIDE, SIDE),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -16209,7 +16491,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), None, &mut store) {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -18389,6 +18679,7 @@ mod tests {
             &history,
             (1000, 1000),
             None,
+            &aurora_io::SkippedTiles::new(),
             &mut store,
         ) {
             unreachable!("{err:?}");
@@ -24457,7 +24748,15 @@ mod tests {
         let path = dir.path().join("aurora-autosave.aur");
         let (layers, history, id) = small_autosave_document();
         let _painted = paint_one_texel(&mut store, &layers, id);
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         let full_len = match std::fs::metadata(&path) {
             Ok(meta) => meta.len(),
@@ -24526,7 +24825,15 @@ mod tests {
         // Autosave #1, with every tile readable: complete, and it lands
         // on the canonical path.
         let path = dir.path().join("aurora-autosave.aur");
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
         let Ok(complete) = std::fs::read(&path) else {
             unreachable!("the complete autosave must have been written");
         };
@@ -24569,7 +24876,15 @@ mod tests {
         }
 
         // Autosave #2, degraded.
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         let Ok(after) = std::fs::read(&path) else {
             unreachable!("the complete autosave must still be there");
@@ -24584,7 +24899,10 @@ mod tests {
         );
         // And recovery still prefers the complete snapshot.
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let Some((recovered, ..)) = recover_document(&path, &mut fresh_store) else {
+        let Some(RecoveredDocument {
+            layers: recovered, ..
+        }) = recover_document(&path, &mut fresh_store)
+        else {
             unreachable!("the complete autosave must reopen");
         };
         assert_eq!(recovered.len(), 2);
@@ -24605,6 +24923,10 @@ mod tests {
     /// truncating the file it landed in leaves a tile whose every
     /// subsequent read fails.
     #[test]
+    // Setup-dominated: building a real broken-scratch-disk scenario on
+    // a real disk is most of these lines, and the assertions are the
+    // point. Split further and each half stops being a scenario.
+    #[allow(clippy::too_many_lines)]
     fn write_autosave_still_protects_the_rest_of_the_document_when_one_tile_is_unreadable() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -24665,7 +24987,15 @@ mod tests {
         }
 
         let path = dir.path().join("aurora-autosave.aur");
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         // Nothing complete was ever written here, so the salvaged
         // snapshot is all there is -- and it lands on the *partial* path,
@@ -24679,7 +25009,11 @@ mod tests {
             "one unreadable tile must not leave the document with no autosave at all"
         );
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let Some((recovered_layers, ..)) = recover_document(&path, &mut fresh_store) else {
+        let Some(RecoveredDocument {
+            layers: recovered_layers,
+            ..
+        }) = recover_document(&path, &mut fresh_store)
+        else {
             unreachable!("the salvaged autosave must reopen from the partial path");
         };
         assert_eq!(recovered_layers.len(), 2, "no layer was dropped");
@@ -24727,7 +25061,15 @@ mod tests {
         let (layers, history, id) = small_autosave_document();
         let _painted = paint_one_texel(&mut store, &layers, id);
 
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
@@ -24807,15 +25149,26 @@ mod tests {
             // A canvas size deliberately unequal to the layer's own
             // 10x10 bounds, so this proves the manifest's own value came
             // back rather than `document_canvas_size` re-deriving it.
-            write_autosave(&path, &layers, &history, (37, 21), &mut store);
+            write_autosave(
+                &path,
+                &layers,
+                &history,
+                (37, 21),
+                &mut aurora_io::SkippedTiles::new(),
+                &mut store,
+            );
             painted
         };
         drop(layers);
         drop(history);
 
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let Some((recovered_layers, recovered_history, canvas_size)) =
-            recover_document(&path, &mut fresh_store)
+        let Some(RecoveredDocument {
+            layers: recovered_layers,
+            history: recovered_history,
+            canvas_size,
+            ..
+        }) = recover_document(&path, &mut fresh_store)
         else {
             unreachable!("just wrote a real autosave container");
         };
@@ -24863,8 +25216,24 @@ mod tests {
         let (_store_dir, mut store) = real_tile_store();
         let (layers, history, id) = small_autosave_document();
         let _painted = paint_one_texel(&mut store, &layers, id);
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         let leftovers: Vec<String> = match std::fs::read_dir(dir.path()) {
             Ok(entries) => entries
@@ -24902,7 +25271,15 @@ mod tests {
         let path = dir.path().join("aurora-autosave.aur");
         let (_store_dir, mut store) = real_tile_store();
         let (layers, history, _id) = small_autosave_document();
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
         let mode = match std::fs::metadata(&path) {
             Ok(meta) => meta.permissions().mode() & 0o777,
             Err(err) => unreachable!("{err}"),
@@ -24927,7 +25304,14 @@ mod tests {
         {
             let (_store_dir, mut store) = real_tile_store();
             let _painted = paint_one_texel(&mut store, &layers, id);
-            write_autosave(&path, &layers, &history, (37, 21), &mut store);
+            write_autosave(
+                &path,
+                &layers,
+                &history,
+                (37, 21),
+                &mut aurora_io::SkippedTiles::new(),
+                &mut store,
+            );
         }
         // A good partial snapshot beside a canonical file that is then
         // corrupted -- a half-written ZIP, the realistic shape.
@@ -24980,7 +25364,14 @@ mod tests {
         {
             let (_store_dir, mut store) = real_tile_store();
             let _painted = paint_one_texel(&mut store, &layers, id);
-            write_autosave(&path, &layers, &history, (10, 10), &mut store);
+            write_autosave(
+                &path,
+                &layers,
+                &history,
+                (10, 10),
+                &mut aurora_io::SkippedTiles::new(),
+                &mut store,
+            );
         }
         let before = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -25396,6 +25787,10 @@ mod tests {
     /// The three lines of `self.` plumbing between them are covered by
     /// inspection only.
     #[test]
+    // Setup-dominated: building a real broken-scratch-disk scenario on
+    // a real disk is most of these lines, and the assertions are the
+    // point. Split further and each half stops being a scenario.
+    #[allow(clippy::too_many_lines)]
     fn open_aur_file_warns_when_the_file_was_written_with_tiles_missing() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -25448,6 +25843,7 @@ mod tests {
             &history,
             (10, 10),
             None,
+            &aurora_io::SkippedTiles::new(),
             &mut store,
         ) {
             Ok(skipped) => skipped,
@@ -25479,9 +25875,28 @@ mod tests {
             first.reason
         );
 
-        // And the dialog that condition opens really opens, through the
+        // The decision itself, through the very function
+        // `App::open_aur_file` calls -- not a hand-rolled copy of its
+        // condition, which is what this test did until 0.74.1 and which
+        // would have passed unchanged with that wiring deleted.
+        let Some(message) = skipped_tiles_warning(&document.skipped_tiles) else {
+            unreachable!("a file that lost a tile must produce a warning");
+        };
+        assert!(
+            !message.contains("crash-recovery autosave"),
+            "the message must not claim a provenance the file cannot prove: {message}"
+        );
+        assert!(
+            message.contains("1 tile of image data"),
+            "one lost pixel-layer tile, counted and named exactly: {message}"
+        );
+        assert!(
+            !message.contains("at least"),
+            "an untruncated count is a fact, not a floor: {message}"
+        );
+
+        // And the dialog that decision opens really opens, through the
         // same shared helper `App::open_skipped_tiles_dialog` uses.
-        let message = skipped_tiles_message(document.skipped_tiles.len(), &first.reason);
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -25501,12 +25916,20 @@ mod tests {
         assert!(dialog.is_some(), "the missing-content dialog must be open");
     }
 
-    /// The negative case on the same path: a healthy document saved by
-    /// the ordinary `write_aur` reopens with an empty skip list, so
-    /// `App::open_aur_file`'s `if let Some(first)` guard never fires and
-    /// no dialog interrupts an ordinary open.
+    /// The negative case on the same decision: a healthy document saved
+    /// by the ordinary `write_aur` reopens with an empty skip list, and
+    /// `skipped_tiles_warning` — the function `App::open_aur_file`
+    /// really calls — answers `None`, so no dialog interrupts an
+    /// ordinary open.
+    ///
+    /// Renamed from `open_aur_file_opens_no_dialog_for_a_complete_file`
+    /// in 0.74.1, which promised a dialog assertion it never made (it
+    /// only checked that the reopened list was empty, duplicating
+    /// `aurora-io`'s own `an_ordinary_write_carries_no_skipped_tiles_
+    /// entry`). It now asserts the real decision instead of restating
+    /// the input to it.
     #[test]
-    fn open_aur_file_opens_no_dialog_for_a_complete_file() {
+    fn a_complete_file_produces_no_missing_content_warning() {
         let (dir, mut store) = real_tile_store();
         let mut layers = aurora_doc::LayerTree::new();
         let history = aurora_doc::History::new();
@@ -25534,8 +25957,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (10, 10), None, &mut store)
-        {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("a healthy document must save: {err:?}");
         }
 
@@ -25550,8 +25980,216 @@ mod tests {
         };
         assert!(
             document.skipped_tiles.is_empty(),
-            "an ordinary save lost nothing, so nothing must warn: {:?}",
+            "an ordinary save lost nothing: {:?}",
             document.skipped_tiles
+        );
+        assert!(
+            skipped_tiles_warning(&document.skipped_tiles).is_none(),
+            "nothing was lost, so `App::open_aur_file` must open no dialog"
+        );
+    }
+
+    /// The count a user is shown must never be the *capped* count
+    /// presented as a fact — the defect a red-team measurement found
+    /// with a real 17,920 x 15,872 px layer, whose 4339 lost tiles were
+    /// persisted as 4096 and then reported as "4096 tiles ... could not
+    /// be read" with no qualifier.
+    #[test]
+    fn a_truncated_skip_list_is_reported_as_a_floor_not_a_fact() {
+        let records = vec![aurora_io::SkippedTileRecord {
+            surface: 1,
+            tile_x: 0,
+            tile_y: 0,
+            reason: "corrupt tile file".to_owned(),
+        }];
+        let truncated = aurora_io::SkippedTiles::from_parts(4339, records);
+        let Some(message) = skipped_tiles_warning(&truncated) else {
+            unreachable!("4339 lost tiles must warn");
+        };
+        assert!(
+            message.contains("at least 4339 tiles"),
+            "a count larger than the records backing it is a floor: {message}"
+        );
+    }
+
+    /// A lost *mask coverage* tile and a lost pixel-layer tile are
+    /// different losses to a user, and the record has carried the
+    /// distinction (`aurora_doc::MASK_SURFACE_BIT`) since 0.74.0 -- it
+    /// was simply thrown away by everything that read it back.
+    #[test]
+    fn the_message_distinguishes_lost_mask_coverage_from_lost_image_data() {
+        let mask_only = aurora_io::SkippedTiles::from_parts(
+            1,
+            vec![aurora_io::SkippedTileRecord {
+                surface: aurora_doc::MASK_SURFACE_BIT | 3,
+                tile_x: 0,
+                tile_y: 0,
+                reason: "corrupt tile file".to_owned(),
+            }],
+        );
+        let Some(message) = skipped_tiles_warning(&mask_only) else {
+            unreachable!("a lost mask tile must warn");
+        };
+        assert!(
+            message.contains("mask coverage") && !message.contains("image data"),
+            "a lost mask tile must not be described as image data: {message}"
+        );
+
+        let both = aurora_io::SkippedTiles::from_parts(
+            2,
+            vec![
+                aurora_io::SkippedTileRecord {
+                    surface: aurora_doc::MASK_SURFACE_BIT | 3,
+                    tile_x: 0,
+                    tile_y: 0,
+                    reason: "corrupt tile file".to_owned(),
+                },
+                aurora_io::SkippedTileRecord {
+                    surface: 3,
+                    tile_x: 1,
+                    tile_y: 0,
+                    reason: "corrupt tile file".to_owned(),
+                },
+            ],
+        );
+        let Some(message) = skipped_tiles_warning(&both) else {
+            unreachable!("two lost tiles must warn");
+        };
+        assert!(
+            message.contains("image data and mask coverage"),
+            "a mixed loss must name both: {message}"
+        );
+    }
+
+    /// **The carry-forward, at the app layer**: a document opened from a
+    /// lossy `.aur` file must keep saying so in every file this session
+    /// writes next.
+    ///
+    /// This is red-team's own sequence, minus the `App` that a headless
+    /// test cannot build: a best-effort write drops a tile, the file is
+    /// reopened into a **fresh** store (what a new process has), and the
+    /// carried record is handed to `write_autosave` exactly as
+    /// `App::open_aur_file` hands `App::skipped_tiles` to it. The
+    /// autosave that write produces must still name the loss.
+    ///
+    /// Before 0.74.1 it did not, and could not: the dropped tile is not
+    /// in the store at all, so the writer walked past it as "never
+    /// painted" and produced a container with no `skipped-tiles` entry
+    /// — after which one ordinary Save, or one crash, erased the record
+    /// entirely. Note the autosave lands on the *primary* path, not
+    /// `.partial`: this write itself dropped nothing.
+    #[test]
+    // Setup-dominated: building a real broken-scratch-disk scenario on
+    // a real disk is most of these lines, and the assertions are the
+    // point. Split further and each half stops being a scenario.
+    #[allow(clippy::too_many_lines)]
+    fn an_opened_documents_missing_tiles_survive_the_next_autosave() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = aurora_doc::LayerTree::new();
+        let history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (name, rgba) in [
+            ("broken", [1.0, 0.0, 0.0, 1.0]),
+            ("intact", [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_tile(dir.path());
+
+        let lossy_path = dir.path().join("lossy.aur");
+        let file = match std::fs::File::create(&lossy_path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match aurora_io::write_aur_best_effort(
+            file,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(fresh) => assert_eq!(fresh.len(), 1, "exactly one tile was unreadable"),
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        }
+
+        // Reopened into a store that has never held any of this -- a new
+        // process, in every way that matters here.
+        let (fresh_dir, mut fresh_store) = real_tile_store();
+        let reopened = match std::fs::File::open(&lossy_path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let document = match aurora_io::read_aur(reopened, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("the lossy container must reopen: {err:?}"),
+        };
+        let mut carried = document.skipped_tiles;
+        assert!(!carried.is_empty(), "the reopened file must name its loss");
+
+        let autosave = fresh_dir.path().join("aurora-autosave.aur");
+        write_autosave(
+            &autosave,
+            &document.layers,
+            &document.history,
+            document.canvas_size,
+            &mut carried,
+            &mut fresh_store,
+        );
+        assert!(
+            autosave.exists(),
+            "this write dropped nothing of its own, so it belongs on the primary path"
+        );
+        assert!(
+            !partial_autosave_path(&autosave).exists(),
+            "a carried-forward loss must not route every later autosave to .partial"
+        );
+
+        let (_third_dir, mut third_store) = real_tile_store();
+        let saved = match std::fs::File::open(&autosave) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let after = match aurora_io::read_aur(saved, &mut third_store) {
+            Ok(after) => after,
+            Err(err) => unreachable!("the autosave must reopen: {err:?}"),
+        };
+        assert_eq!(
+            after.skipped_tiles.total(),
+            1,
+            "the record must survive the save, not be erased by it: {:?}",
+            after.skipped_tiles
+        );
+        assert!(
+            skipped_tiles_warning(&after.skipped_tiles).is_some(),
+            "and it must still warn on the next open"
         );
     }
 
@@ -25569,7 +26207,15 @@ mod tests {
             '\u{2028}',                                     // line separator
             char::from_u32(0xE_0041).unwrap_or('\u{FFFD}'), // Tag 'A'
         );
-        let message = skipped_tiles_message(1, &hostile);
+        let message = skipped_tiles_message(&aurora_io::SkippedTiles::from_parts(
+            1,
+            vec![aurora_io::SkippedTileRecord {
+                surface: 0,
+                tile_x: 0,
+                tile_y: 0,
+                reason: hostile.clone(),
+            }],
+        ));
         for hostile_char in ['\u{202E}', '\u{0007}', '\u{2028}'] {
             assert!(
                 !message.contains(hostile_char),

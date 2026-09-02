@@ -19,12 +19,24 @@
 //!   `aurora-app` writes today.
 //! - `skipped-tiles` (**optional**, since 0.74.0): the tiles a
 //!   [`write_best_effort`] writer could not read and therefore left
-//!   out, `postcard`-encoded as a `Vec<SkippedTileRecord>`. Written
-//!   only when that list is non-empty, so an ordinary [`write()`] —
-//!   every user-facing save — still produces byte-identical output to
-//!   what it produced before this entry existed. Absent means "nothing
-//!   was dropped", which is exactly what every file written before
-//!   0.74.0 means too.
+//!   out, `postcard`-encoded as a versioned `SkippedTilesWire` —
+//!   a schema `version`, the **true** `total` number dropped, and up to
+//!   `MAX_SKIPPED_TILE_RECORDS` individual `SkippedTileRecord`s.
+//!   Written only when that list is non-empty, so an ordinary
+//!   [`write()`] of a document that has lost nothing — every ordinary
+//!   user-facing save — still produces byte-identical output to what it
+//!   produced before this entry existed. Absent means "nothing was
+//!   dropped", which is exactly what every file written before 0.74.0
+//!   means too.
+//!
+//!   It was a bare `Vec<SkippedTileRecord>` in 0.74.0, for one day and
+//!   in no user's hands, and 0.74.1 changed it before it could ship
+//!   further. Two defects, both real: the count a user is shown was
+//!   silently the *capped* count rather than the true one, and the entry
+//!   had no room to grow — reproducing at the entry level exactly the
+//!   `postcard`-is-positional problem the manifest section below spends
+//!   thirty lines on. A wrapper whose first two fields are frozen
+//!   answers both.
 //! - One entry per non-blank persisted tile — a pixel layer's own
 //!   content **and, since 0.71.0, a layer mask's coverage** — named by
 //!   `tile_entry_name` from its own `(SurfaceId, TileId)` pair, holding
@@ -194,6 +206,15 @@
 //!    the exact "certain, universal loss" the mask-persistence decision
 //!    above already rejected for the same reason.
 //!
+//! That `postcard` finding is the foundation the whole design rests on,
+//! so it is pinned by a permanent test rather than left as prose:
+//! `postcard_really_is_positional_so_a_trailing_field_breaks_old_bytes`
+//! in this module's own test module encodes an old-shaped two-field
+//! struct and proves a new-shaped three-field one — `#[serde(default)]`
+//! and all — genuinely fails to decode those bytes. It was a throwaway
+//! gate test until 0.74.1; a `postcard` version bump that quietly
+//! invalidated the premise would otherwise have had nothing to fail.
+//!
 //! A separate, optional, top-level entry has neither problem, and it is
 //! how this format already evolves additively: tile entries are probed
 //! by name and a `ZipError::FileNotFound` simply means "not present"
@@ -248,12 +269,16 @@ const SKIPPED_TILES_ENTRY: &str = "skipped-tiles";
 /// Real skips are rare and correlated (a broken scratch file loses the
 /// handful of tiles that lived in it), so this is far above anything a
 /// genuine best-effort write produces. It exists because the read side
-/// parses a file that may be crafted or corrupt: the entry is already
-/// bounded in *bytes* by [`MAX_METADATA_ENTRY_BYTES`], but 64 MiB of
-/// `postcard`-encoded records is still millions of heap-allocated
-/// `String`s, and the whole point of this list is to be summarized in
-/// one dialog line. Truncating is the honest answer — the count the
-/// user is shown is then a floor, not a fiction.
+/// parses a file that may be crafted or corrupt: millions of
+/// `postcard`-encoded records are millions of heap-allocated `String`s,
+/// and the whole point of this list is to be summarized in one dialog
+/// line.
+///
+/// **Truncating the list does not truncate the count.** The entry
+/// carries [`SkippedTiles::total`] — the writer's own true, untruncated
+/// number — beside the capped list, precisely so that capping the
+/// *detail* never quietly shrinks the *disclosure*. A reader past this
+/// cap knows it is past it, and says "at least N".
 const MAX_SKIPPED_TILE_RECORDS: usize = 4096;
 
 /// The most characters of one skip's own `reason` this format stores.
@@ -261,13 +286,64 @@ const MAX_SKIPPED_TILE_RECORDS: usize = 4096;
 /// well under this in practice; the bound is here so a pathological
 /// error string cannot make the entry itself large.
 ///
+/// **128, matching `aurora_doc::sanitize_display_name`'s own cap**
+/// (0.74.1). It was 512 until then, which was a bound nobody could
+/// honour: the one thing that ever renders a reason puts it through
+/// that sanitizer first, and the sanitizer caps at 128 characters — so
+/// the extra 384 were storage nothing could ever show. Matching the two
+/// makes the stored string exactly what a user can be told, and shrinks
+/// [`MAX_SKIPPED_TILES_ENTRY_BYTES`] by a factor of four for free. The
+/// cost, stated plainly: a `TileError` embedding a long `PathBuf` or a
+/// platform `std::io::Error` string is now cut in storage as well as on
+/// screen. It was already cut on screen.
+///
 /// **Characters, not bytes, deliberately.** Truncating a `String` by
 /// byte offset splits UTF-8 sequences (and would need slicing, which
 /// this workspace denies), so the cut is made with `chars().take(..)`
 /// and this bound counts what that counts. It still bounds the byte
-/// length — at four bytes per `char`, 2 KiB — which is all the storage
-/// bound needs.
-const MAX_SKIPPED_REASON_CHARS: usize = 512;
+/// length — at four bytes per `char`, 512 bytes — which is all the
+/// storage bound needs.
+const MAX_SKIPPED_REASON_CHARS: usize = 128;
+
+/// The most bytes one [`SkippedTileRecord`] can occupy once
+/// `postcard`-encoded, worst case, field by field: `surface` is a `u64`
+/// varint (10), `tile_x`/`tile_y` are `u32` varints (5 each), and
+/// `reason` is a length varint (5) plus at most
+/// [`MAX_SKIPPED_REASON_CHARS`] characters at 4 UTF-8 bytes each.
+///
+/// This is the reason [`SkippedTileRecord`] holds nothing but raw
+/// scalars it owns: a field whose serde shape belongs to another crate
+/// would make this number that crate's to change.
+const MAX_SKIPPED_RECORD_BYTES: u64 = 10 + 5 + 5 + 5 + (MAX_SKIPPED_REASON_CHARS as u64) * 4;
+
+/// The largest size [`read`] will accept for the [`SKIPPED_TILES_ENTRY`]
+/// entry — checked by [`read_capped`] **before** a byte is deserialized,
+/// which is the whole point.
+///
+/// Until 0.74.1 this entry shared the manifest's 64 MiB
+/// [`MAX_METADATA_ENTRY_BYTES`], and the [`MAX_SKIPPED_TILE_RECORDS`]
+/// cap was applied by truncating the `Vec` *after* `postcard` had
+/// already decoded all of it. That bounded what was retained, not what
+/// was allocated: a minimal record encodes in about four bytes, so
+/// 64 MiB of (highly DEFLATE-compressible) entry data decoded to
+/// millions of records — measured at ~790 MiB of peak RSS from a 64 KiB
+/// file, on `aurora-app`'s own pre-window crash-recovery startup path.
+/// The cap now matches what [`MAX_SKIPPED_TILE_RECORDS`] records could
+/// legitimately need — about 2.1 MiB — plus a little slack for the
+/// wrapper's own `version`/`total`/length varints, so an oversized entry
+/// is refused by size rather than decoded and then discarded.
+///
+/// Unlike the manifest, this entry has a small, principled bound: it is
+/// a summary, and both sides of the format agree on how large a summary
+/// gets.
+const MAX_SKIPPED_TILES_ENTRY_BYTES: u64 =
+    (MAX_SKIPPED_TILE_RECORDS as u64) * MAX_SKIPPED_RECORD_BYTES + 64;
+
+/// The [`SKIPPED_TILES_ENTRY`] payload's own schema version, independent
+/// of [`MANIFEST_VERSION`] — see [`SkippedTilesWire`] for why this entry
+/// carries one of its own and what a reader that does not recognise it
+/// still manages to report.
+const SKIPPED_TILES_VERSION: u32 = 1;
 
 /// The manifest's own current schema version (`ManifestWrite`/
 /// `ManifestRead`) — bump this whenever their shape changes, and keep
@@ -554,12 +630,20 @@ enum ColorSpaceTag {
 /// file — crash-recovery autosave, and only that — wants
 /// [`write_best_effort`] instead, which skips the unreadable tiles and
 /// names them.
+///
+/// `known_missing` is what this document already knew it had lost
+/// before this write — see [`SkippedTiles`] for why an explicit save has
+/// to carry it forward rather than rediscover it, and
+/// [`SkippedTiles::new`] for the "nothing was ever lost" value that
+/// keeps this function's output byte-identical to what it produced
+/// before the `skipped-tiles` entry existed.
 pub fn write<W: Write + Seek>(
     writer: W,
     layers: &LayerTree,
     history: &History,
     canvas_size: (u32, u32),
     profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
     store: &mut TileStore,
 ) -> Result<(), IoError> {
     // The returned list is empty by construction, not by assumption:
@@ -576,9 +660,12 @@ pub fn write<W: Write + Seek>(
         layers,
         history,
         canvas_size,
-        profile,
+        WritePolicy {
+            profile,
+            known_missing,
+            unreadable: UnreadableTile::Refuse,
+        },
         store,
-        UnreadableTile::Refuse,
     )?;
     Ok(())
 }
@@ -606,20 +693,33 @@ pub struct SkippedTile {
 /// is the same silence. This record is what closes that gap — see
 /// the `skipped-tiles` entry, and this module's own doc comment.
 ///
-/// **`surface` is a raw `u64`, not a `SurfaceId`, on purpose.** This is
+/// **Every field is a raw scalar this module owns, on purpose.** This is
 /// a persisted format that has to keep decoding forever, and encoding a
 /// field as another crate's type would mean inheriting that type's
 /// serde shape as part of this format's wire contract — a change there
 /// would silently become a change here. `SurfaceId::to_raw` /
-/// `SurfaceId::from_raw` is the conversion, and it is this module's own
-/// to make.
+/// `SurfaceId::from_raw` is the conversion for `surface`, and it is this
+/// module's own to make; `tile_x`/`tile_y` are `TileId`'s own two
+/// coordinates, spelled out here for exactly the same reason.
+///
+/// `tile` was a bare `aurora_tile::TileId` until 0.74.1 — which did
+/// inherit another crate's derived `Serialize`/`Deserialize`, one line
+/// below a doc comment saying this format does not do that. The
+/// principle was the right one; the code now follows it. Splitting it
+/// also makes `MAX_SKIPPED_RECORD_BYTES` a number this module can
+/// actually derive.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SkippedTileRecord {
     /// The skipped tile's own surface, as `SurfaceId::to_raw`.
     pub surface: u64,
-    pub tile: TileId,
+    /// The skipped tile's own `TileId::x`.
+    pub tile_x: u32,
+    /// The skipped tile's own `TileId::y`.
+    pub tile_y: u32,
     /// The underlying `aurora_tile::TileError`'s own message, truncated
-    /// to `MAX_SKIPPED_REASON_CHARS` (512) characters.
+    /// to `MAX_SKIPPED_REASON_CHARS` (128) characters — **on the way in
+    /// and on the way back out**, so the bound is a real invariant of
+    /// this format rather than a convention only the writer keeps.
     ///
     /// **Untrusted on the way back in.** On read this is bytes out of a
     /// file, so anything that renders it — `aurora-app`'s own
@@ -629,28 +729,217 @@ pub struct SkippedTileRecord {
     pub reason: String,
 }
 
+impl SkippedTileRecord {
+    /// This record's own tile, back as the type it came from.
+    #[must_use]
+    pub fn tile(&self) -> TileId {
+        TileId {
+            x: self.tile_x,
+            y: self.tile_y,
+        }
+    }
+
+    /// Whether this skip lost *mask coverage* rather than a pixel
+    /// layer's own content — the same `aurora_doc::MASK_SURFACE_BIT`
+    /// test `write_with_policy`'s own warning line already makes, kept
+    /// here so a reader can make it too. They are different losses to a
+    /// user, and until 0.74.1 the distinction was computed by the writer
+    /// and then thrown away by everything that read the record back.
+    #[must_use]
+    pub fn is_mask(&self) -> bool {
+        self.surface & aurora_doc::MASK_SURFACE_BIT != 0
+    }
+
+    /// `reason`, cut to [`MAX_SKIPPED_REASON_CHARS`].
+    ///
+    /// `chars().take(..)`, never a byte slice: a byte cut can land
+    /// mid-sequence, and `indexing_slicing` is denied workspace-wide
+    /// anyway. Shared by the write side (which truncates what it
+    /// records) and the read side (which truncates what a file claims),
+    /// so both halves enforce one bound.
+    fn bounded_reason(reason: &str) -> String {
+        reason.chars().take(MAX_SKIPPED_REASON_CHARS).collect()
+    }
+}
+
 impl From<&SkippedTile> for SkippedTileRecord {
     fn from(skipped: &SkippedTile) -> Self {
         Self {
             surface: skipped.surface.to_raw(),
-            tile: skipped.tile,
-            // `chars().take(..)`, never a byte slice: a byte cut can
-            // land mid-sequence, and `indexing_slicing` is denied
-            // workspace-wide anyway.
-            reason: skipped
-                .reason
-                .chars()
-                .take(MAX_SKIPPED_REASON_CHARS)
-                .collect(),
+            tile_x: skipped.tile.x,
+            tile_y: skipped.tile.y,
+            reason: Self::bounded_reason(&skipped.reason),
         }
     }
+}
+
+/// Everything one container records about tiles a [`write_best_effort`]
+/// writer could not read: the **true, untruncated count**, and up to
+/// `MAX_SKIPPED_TILE_RECORDS` individual [`SkippedTileRecord`]s
+/// describing them.
+///
+/// **Why a count beside the list** (0.74.1). Until then the entry was a
+/// bare `Vec<SkippedTileRecord>` capped at 4096 on both sides, and the
+/// cap was silently lossy in the one message whose entire job is honest
+/// disclosure: a 17,920 × 15,872 px layer — well inside the documented
+/// ceiling — with its scratch tiles gone produces 4339 skips, of which
+/// 4096 survived a save/reload and 243 simply vanished, after which
+/// `aurora-app` told the user "4096 tiles could not be read" as a bare
+/// fact. Carrying `total` makes the capped case say *at least* 4096,
+/// which is true.
+///
+/// **Why it is also carried across saves.** The list a document opens
+/// with is state, not a one-shot notification. The tiles a previous
+/// writer dropped are not in the tile store at all, so a later write
+/// rediscovers nothing about them (`write_with_policy` cannot tell
+/// "never painted" from "lost before this process started"), and until
+/// 0.74.1 the very next save of an opened lossy file produced a
+/// container with no `skipped-tiles` entry — erasing the record this
+/// entry exists to keep. [`Self::record`] is how a live session folds
+/// fresh skips into what it already knew, and every writer takes the
+/// carried value so it lands in the file again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkippedTiles {
+    total: u64,
+    records: Vec<SkippedTileRecord>,
+}
+
+impl SkippedTiles {
+    /// Nothing was dropped — what an ordinary [`write()`] carries, what a
+    /// container with no `skipped-tiles` entry reads back as, and what a
+    /// freshly created document starts with.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// From an explicit count and list — the read side's own
+    /// constructor, and the one tests use to build a truncated case.
+    ///
+    /// `total` is raised to the number of records if a file claims fewer
+    /// than it carries: `total` is documented as a floor on the real
+    /// loss, and a floor below the evidence in the same entry is not one.
+    #[must_use]
+    pub fn from_parts(total: u64, mut records: Vec<SkippedTileRecord>) -> Self {
+        records.truncate(MAX_SKIPPED_TILE_RECORDS);
+        for record in &mut records {
+            record.reason = SkippedTileRecord::bounded_reason(&record.reason);
+        }
+        let total = total.max(records.len() as u64);
+        Self { total, records }
+    }
+
+    /// The true number of tiles dropped, which may exceed
+    /// `records().len()` when the list hit `MAX_SKIPPED_TILE_RECORDS`.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// The individual records, at most `MAX_SKIPPED_TILE_RECORDS` of
+    /// them.
+    #[must_use]
+    pub fn records(&self) -> &[SkippedTileRecord] {
+        &self.records
+    }
+
+    /// The first record, if this carries any detail at all.
+    #[must_use]
+    pub fn first(&self) -> Option<&SkippedTileRecord> {
+        self.records.first()
+    }
+
+    /// Whether anything was dropped. False for every ordinary save and
+    /// every file written before this entry existed — deliberately
+    /// indistinguishable, since neither lost anything.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Whether [`Self::records`] is a *partial* view of
+    /// [`Self::total`] — the condition a message must say "at least" for.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.total > self.records.len() as u64
+    }
+
+    /// Folds a best-effort write's own fresh skips into what was already
+    /// known, in place.
+    ///
+    /// A skip already present — same surface, same tile — is not counted
+    /// twice, so re-saving a document whose losses are unchanged leaves
+    /// the count unchanged. Anything genuinely new raises `total` even
+    /// once `records` has hit its cap.
+    ///
+    /// One honest imprecision, since this is the number a user is shown:
+    /// when `total` already exceeds `records`, a fresh skip cannot be
+    /// checked against the records that were dropped by the cap, so in
+    /// principle it could be counted twice. It cannot happen in
+    /// practice — a carried-forward loss is a tile the store does not
+    /// hold at all, and a fresh skip is a tile it holds but cannot
+    /// read, so the two sets are disjoint — and the number is presented
+    /// as a floor either way.
+    pub fn record(&mut self, fresh: &[SkippedTile]) {
+        for skipped in fresh {
+            let record = SkippedTileRecord::from(skipped);
+            if self
+                .records
+                .iter()
+                .any(|known| known.surface == record.surface && known.tile() == record.tile())
+            {
+                continue;
+            }
+            self.total = self.total.saturating_add(1);
+            if self.records.len() < MAX_SKIPPED_TILE_RECORDS {
+                self.records.push(record);
+            }
+        }
+    }
+}
+
+/// [`SkippedTiles`] as it is written into [`SKIPPED_TILES_ENTRY`].
+///
+/// **Version-first, and the first two fields are frozen forever.**
+/// `postcard` is positional, so a future shape cannot simply grow a
+/// field and expect old bytes to decode (this module's own doc comment
+/// spends thirty lines on exactly that, about the manifest). What it
+/// *can* do is decode a fixed prefix: [`SkippedTilesPrefix`] is
+/// `version` and `total`, and any future version of this payload must
+/// keep starting with those two. That way a build that does not
+/// recognise a newer `version` still reports the honest headline — "at
+/// least N tiles of this document's content are missing" — instead of
+/// either refusing the whole file or, far worse, reading a newer file
+/// as though nothing had been lost.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SkippedTilesWire {
+    version: u32,
+    total: u64,
+    records: Vec<SkippedTileRecord>,
+}
+
+/// The frozen prefix of [`SkippedTilesWire`] — see its doc comment.
+#[derive(serde::Deserialize)]
+struct SkippedTilesPrefix {
+    version: u32,
+    total: u64,
 }
 
 /// [`write()`], except that a tile which cannot be read out of `store` is
 /// **left out** of the container instead of aborting the whole write.
 /// Returns whatever it had to skip, in the order it hit them, so a
-/// caller can say so; an empty vector means the file is complete and
-/// identical to what [`write()`] would have produced.
+/// caller can say so; an empty vector means **this write** read
+/// everything the store still holds.
+///
+/// It does **not** mean the file is complete: `known_missing` is what
+/// the document already knew it had lost (see [`SkippedTiles`]), and
+/// this writer unions it with what it discovers here before writing the
+/// `skipped-tiles` entry. The two are kept apart in the return value on
+/// purpose — `aurora-app` routes an autosave to its `.partial` path on
+/// *fresh* skips only, since a document permanently missing tiles from
+/// a file opened an hour ago must not be barred from ever writing a
+/// primary autosave again. Fold the return value into the carried state
+/// with [`SkippedTiles::record`].
 ///
 /// **This exists for autosave, and deliberately not for Save/Export.**
 /// An explicit save is a professional's deliberate action on their own
@@ -697,6 +986,7 @@ pub fn write_best_effort<W: Write + Seek>(
     history: &History,
     canvas_size: (u32, u32),
     profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
     store: &mut TileStore,
 ) -> Result<Vec<SkippedTile>, IoError> {
     write_with_policy(
@@ -704,9 +994,12 @@ pub fn write_best_effort<W: Write + Seek>(
         layers,
         history,
         canvas_size,
-        profile,
+        WritePolicy {
+            profile,
+            known_missing,
+            unreadable: UnreadableTile::Skip,
+        },
         store,
-        UnreadableTile::Skip,
     )
 }
 
@@ -721,15 +1014,35 @@ enum UnreadableTile {
     Skip,
 }
 
+/// Everything [`write_with_policy`] needs beyond the document itself:
+/// the colour profile to embed, what the document already knows it has
+/// lost, and what to do about a tile that will not read.
+///
+/// Grouped into a struct rather than passed as three more parameters
+/// only because the workspace's own `too_many_arguments` lint is a real
+/// bound and this function is at it; the three genuinely travel
+/// together, since each is a *policy* decision the two public writers
+/// make differently.
+#[derive(Clone, Copy)]
+struct WritePolicy<'a> {
+    profile: Option<&'a aurora_color::IccProfile>,
+    known_missing: &'a SkippedTiles,
+    unreadable: UnreadableTile,
+}
+
 fn write_with_policy<W: Write + Seek>(
     writer: W,
     layers: &LayerTree,
     history: &History,
     canvas_size: (u32, u32),
-    profile: Option<&aurora_color::IccProfile>,
+    policy: WritePolicy<'_>,
     store: &mut TileStore,
-    unreadable: UnreadableTile,
 ) -> Result<Vec<SkippedTile>, IoError> {
+    let WritePolicy {
+        profile,
+        known_missing,
+        unreadable,
+    } = policy;
     // Before a single byte is written: every rectangle the tile loop
     // below will derive a grid from, range-checked, and their grids
     // summed against the whole-document budget. A refusal here leaves
@@ -822,18 +1135,30 @@ fn write_with_policy<W: Write + Seek>(
     }
 
     // The one place the skip list becomes part of the *file* rather
-    // than just the return value. The `is_empty` guard is load-bearing
-    // and not an optimization: it is what keeps `write()` -- the
-    // `Refuse` policy, and so every ordinary user-facing save -- byte-
-    // identical to what it produced before this entry existed. Only a
-    // best-effort write that really dropped something adds an entry.
-    if !skipped.is_empty() {
-        let records: Vec<SkippedTileRecord> = skipped
-            .iter()
-            .take(MAX_SKIPPED_TILE_RECORDS)
-            .map(SkippedTileRecord::from)
-            .collect();
-        let bytes = postcard::to_allocvec(&records)
+    // than just the return value, and the one place `known_missing` is
+    // read.
+    //
+    // The union, not just `skipped`: a tile a *previous* writer dropped
+    // is not in the store at all, so the loop above walked straight
+    // past it as "never painted" and rediscovered nothing. Writing only
+    // what this pass found is what made the very next save of an opened
+    // lossy file erase the record entirely (0.74.0's own defect --
+    // open, save, reopen, and the file said nothing).
+    //
+    // The `is_empty` guard is load-bearing and not an optimization: it
+    // is what keeps `write()` -- the `Refuse` policy, and so every
+    // ordinary user-facing save -- byte-identical to what it produced
+    // before this entry existed, since an ordinary save of a document
+    // that never lost anything unions an empty list with an empty list.
+    let mut recorded = known_missing.clone();
+    recorded.record(&skipped);
+    if !recorded.is_empty() {
+        let wire = SkippedTilesWire {
+            version: SKIPPED_TILES_VERSION,
+            total: recorded.total(),
+            records: recorded.records().to_vec(),
+        };
+        let bytes = postcard::to_allocvec(&wire)
             .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
         zip.start_file(SKIPPED_TILES_ENTRY, deflated)?;
         zip.write_all(&bytes)?;
@@ -858,15 +1183,19 @@ pub struct AurDocument {
     pub canvas_size: (u32, u32),
     pub profile: Option<aurora_color::IccProfile>,
     /// Tiles a [`write_best_effort`] writer could not read and
-    /// therefore left out. Empty for every file [`write()`] produced,
-    /// and for every file written before the `skipped-tiles` entry
-    /// existed — the two are deliberately indistinguishable, since
-    /// neither lost anything.
+    /// therefore left out. Empty for every file [`write()`] produced
+    /// from a document that had lost nothing, and for every file written
+    /// before the `skipped-tiles` entry existed — the two are
+    /// deliberately indistinguishable, since neither lost anything.
     ///
     /// Non-empty means this document is **missing content that cannot
     /// be recovered from this file**. A caller that shows a document to
     /// a user should say so; `aurora-app`'s own `open_aur_file` does.
-    pub skipped_tiles: Vec<SkippedTileRecord>,
+    ///
+    /// It is also the value that caller must **keep** and hand back to
+    /// the next [`write()`]/[`write_best_effort`] of the same document
+    /// — see [`SkippedTiles`] for why nothing rediscovers it.
+    pub skipped_tiles: SkippedTiles,
 }
 
 /// Reads a complete `.aur` document from `reader`, writing every
@@ -1002,27 +1331,61 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
 /// [`write()`] means. The `FileNotFound` arm below is that contract,
 /// modelled on the same arm in `read_persisted_tiles`.
 ///
+/// **The size cap comes before the decode, and that is the whole
+/// hardening** (0.74.1). This entry has its own tight
+/// [`MAX_SKIPPED_TILES_ENTRY_BYTES`] rather than the manifest's 64 MiB,
+/// and [`read_capped`] rejects an oversized entry from its declared size
+/// before a byte is deserialized. Truncating a decoded `Vec` — what this
+/// did until 0.74.1 — bounds only what is *retained*: a minimal record
+/// encodes in about four `postcard` bytes, so 64 MiB of highly
+/// compressible entry data decoded to millions of `String`-carrying
+/// records first, measured at ~790 MiB of peak RSS from a 64 KiB file on
+/// the pre-window crash-recovery startup path.
+///
+/// What the tight cap leaves is a real, small worst case rather than an
+/// unbounded one: ~2.1 MiB of input at ~4 bytes per minimal record is
+/// on the order of half a million transient records (~20 MiB) before
+/// [`SkippedTiles::from_parts`] cuts the list to
+/// [`MAX_SKIPPED_TILE_RECORDS`]. Bounded, and two orders of magnitude
+/// below what it replaced.
+///
 /// # Errors
 ///
 /// [`IoError::EntryTooLarge`] if the entry declares or holds more than
-/// [`MAX_METADATA_ENTRY_BYTES`], [`IoError::ManifestDeserialization`]
-/// if its bytes are not a `postcard`-encoded `Vec<SkippedTileRecord>`,
-/// or [`IoError::Zip`]/[`IoError::Io`] for a real container failure.
-fn read_skipped_tiles<R: Read + Seek>(
-    zip: &mut ZipArchive<R>,
-) -> Result<Vec<SkippedTileRecord>, IoError> {
+/// [`MAX_SKIPPED_TILES_ENTRY_BYTES`],
+/// [`IoError::ManifestDeserialization`] if its bytes are not a
+/// `postcard`-encoded [`SkippedTilesWire`] (or do not even carry its
+/// frozen `version`/`total` prefix), or [`IoError::Zip`]/[`IoError::Io`]
+/// for a real container failure.
+fn read_skipped_tiles<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<SkippedTiles, IoError> {
     let bytes = match zip.by_name(SKIPPED_TILES_ENTRY) {
-        Ok(file) => read_capped(file, SKIPPED_TILES_ENTRY, MAX_METADATA_ENTRY_BYTES)?,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(Vec::new()),
+        Ok(file) => read_capped(file, SKIPPED_TILES_ENTRY, MAX_SKIPPED_TILES_ENTRY_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(SkippedTiles::new()),
         Err(err) => return Err(err.into()),
     };
-    let mut records: Vec<SkippedTileRecord> = postcard::from_bytes(&bytes)
+    // The frozen prefix first, so a payload written by a future,
+    // unrecognised schema version still yields its honest headline
+    // count instead of being read as "nothing was lost" -- the one
+    // answer this entry must never give by accident. See
+    // `SkippedTilesWire`.
+    let (prefix, _rest) = postcard::take_from_bytes::<SkippedTilesPrefix>(&bytes)
         .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
-    // A real bound on untrusted input, not cosmetic: the byte cap above
-    // still admits millions of records, and every one of them carries a
-    // heap-allocated `String`. See `MAX_SKIPPED_TILE_RECORDS`.
-    records.truncate(MAX_SKIPPED_TILE_RECORDS);
-    Ok(records)
+    if prefix.version != SKIPPED_TILES_VERSION {
+        tracing::warn!(
+            version = prefix.version,
+            understood = SKIPPED_TILES_VERSION,
+            total = prefix.total,
+            "a .aur file records dropped tiles in a newer skipped-tiles schema; keeping the count, \
+             dropping the detail"
+        );
+        return Ok(SkippedTiles::from_parts(prefix.total, Vec::new()));
+    }
+    let wire: SkippedTilesWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    // `from_parts` applies both remaining bounds -- the record cap and
+    // the per-reason character cap -- so the read side enforces what the
+    // write side promises rather than trusting a file to have kept it.
+    Ok(SkippedTiles::from_parts(wire.total, wire.records))
 }
 
 /// [`read`]'s own tile scan: every grid position of every persisted
@@ -1396,9 +1759,9 @@ fn tile_entry_name(surface: SurfaceId, id: TileId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{read, write, write_best_effort};
+    use super::{SkippedTile, SkippedTiles, read, write, write_best_effort};
     use aurora_doc::{BlendMode, History, LayerKind, LayerTree};
-    use aurora_tile::{TileId, TileStore};
+    use aurora_tile::{SurfaceId, TileId, TileStore};
     use half::f16;
     use std::io::Cursor;
     use std::num::NonZeroUsize;
@@ -1513,7 +1876,15 @@ mod tests {
         // 10x10 bounds -- proving canvas size round-trips as its own,
         // independent document-level value, not something derived from
         // whichever layer happens to be on top.
-        if let Err(err) = write(&mut bytes, &layers, &history, (20, 15), None, &mut store) {
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (20, 15),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -1592,6 +1963,7 @@ mod tests {
             &history,
             (1, 1),
             Some(&profile),
+            &SkippedTiles::new(),
             &mut store,
         ) {
             unreachable!("{err:?}");
@@ -1633,7 +2005,15 @@ mod tests {
         };
 
         let mut bytes = Cursor::new(Vec::new());
-        if let Err(err) = write(&mut bytes, &layers, &history, (10, 10), None, &mut store) {
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -2185,7 +2565,15 @@ mod tests {
 
         let (_dir, mut store) = real_tile_store();
         let mut out = Cursor::new(Vec::new());
-        match write(&mut out, &layers, &history, (1, 1), None, &mut store) {
+        match write(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
                 assert_eq!(x, 0);
                 assert_eq!(y, i64::MAX);
@@ -2200,7 +2588,15 @@ mod tests {
         // unreadable *tile*, and a bad rectangle says the tree itself is
         // wrong, not that one piece of input is unreadable.
         let mut out = Cursor::new(Vec::new());
-        match write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store) {
+        match write_best_effort(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::LayerOriginOutOfRange { .. }) => {}
             other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
         }
@@ -2525,7 +2921,15 @@ mod tests {
 
         // The explicit-save contract, unchanged.
         let mut refused = Cursor::new(Vec::new());
-        match write(&mut refused, &layers, &history, (10, 10), None, &mut store) {
+        match write(
+            &mut refused,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::Tile(_)) => {}
             Ok(()) => unreachable!("an explicit save must not silently drop an unreadable tile"),
             Err(other) => unreachable!("expected IoError::Tile, got {other:?}"),
@@ -2534,11 +2938,18 @@ mod tests {
         // The autosave contract: write what can be written, and say what
         // could not.
         let mut salvaged = Cursor::new(Vec::new());
-        let skipped =
-            match write_best_effort(&mut salvaged, &layers, &history, (10, 10), None, &mut store) {
-                Ok(skipped) => skipped,
-                Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
-            };
+        let skipped = match write_best_effort(
+            &mut salvaged,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(skipped) => skipped,
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        };
         let [only] = skipped.as_slice() else {
             unreachable!("exactly one tile is unreadable, got {skipped:?}");
         };
@@ -2699,6 +3110,7 @@ mod tests {
             &history,
             (1000, 1000),
             None,
+            &SkippedTiles::new(),
             &mut store,
         ) {
             unreachable!("{err:?}");
@@ -2788,6 +3200,7 @@ mod tests {
             &history,
             (1000, 1000),
             None,
+            &SkippedTiles::new(),
             &mut store,
         ) {
             unreachable!("{err:?}");
@@ -2840,6 +3253,7 @@ mod tests {
             &history,
             (1000, 1000),
             None,
+            &SkippedTiles::new(),
             &mut store,
         ) {
             unreachable!("{err:?}");
@@ -2952,6 +3366,7 @@ mod tests {
             &history,
             (1000, 1000),
             None,
+            &SkippedTiles::new(),
             &mut store,
         ) {
             unreachable!("{err:?}");
@@ -3037,7 +3452,15 @@ mod tests {
 
         let started = std::time::Instant::now();
         let mut out = Cursor::new(Vec::new());
-        match write(&mut out, &layers, &history, (1, 1), None, &mut store) {
+        match write(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::LayerBoundsTooLarge { width, max, .. }) => {
                 assert_eq!(width, u32::MAX);
                 assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
@@ -3052,7 +3475,15 @@ mod tests {
         );
 
         let mut out = Cursor::new(Vec::new());
-        match write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store) {
+        match write_best_effort(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::LayerBoundsTooLarge { .. }) => {}
             other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
         }
@@ -3120,6 +3551,7 @@ mod tests {
                 aurora_core::MAX_DOCUMENT_EXTENT,
             ),
             None,
+            &SkippedTiles::new(),
             &mut store,
         ) {
             unreachable!("the largest legal document must still save: {err:?}");
@@ -3193,7 +3625,15 @@ mod tests {
 
         let started = std::time::Instant::now();
         let mut out = Cursor::new(Vec::new());
-        match write(&mut out, &layers, &history, (1, 1), None, &mut store) {
+        match write(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::TooManyTiles { total, max }) => {
                 assert!(total > max, "{total} must exceed the {max}-tile budget");
                 assert_eq!(max, super::MAX_TOTAL_TILES_PER_DOCUMENT);
@@ -3208,7 +3648,15 @@ mod tests {
         // The autosave path refuses it too. `write_best_effort` tolerates
         // an unreadable *tile*, never a tree it cannot finish scanning.
         let mut out = Cursor::new(Vec::new());
-        match write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store) {
+        match write_best_effort(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::TooManyTiles { .. }) => {}
             other => unreachable!("expected TooManyTiles, got {other:?}"),
         }
@@ -3253,9 +3701,26 @@ mod tests {
         for policy in 0..2 {
             let mut out = Cursor::new(Vec::new());
             let result = if policy == 0 {
-                write(&mut out, &layers, &history, (1, 1), None, &mut store).map(|()| Vec::new())
+                write(
+                    &mut out,
+                    &layers,
+                    &history,
+                    (1, 1),
+                    None,
+                    &SkippedTiles::new(),
+                    &mut store,
+                )
+                .map(|()| Vec::new())
             } else {
-                write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store)
+                write_best_effort(
+                    &mut out,
+                    &layers,
+                    &history,
+                    (1, 1),
+                    None,
+                    &SkippedTiles::new(),
+                    &mut store,
+                )
             };
             match result {
                 Err(super::IoError::LayerBoundsTooLarge { width, max, .. }) => {
@@ -3383,7 +3848,15 @@ mod tests {
         break_the_only_scratch_file(&dir);
 
         let mut refused = Cursor::new(Vec::new());
-        match write(&mut refused, &layers, &history, (10, 10), None, &mut store) {
+        match write(
+            &mut refused,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::Tile(_)) => {}
             Ok(()) => {
                 unreachable!("an explicit save must not silently drop unreadable mask coverage")
@@ -3392,11 +3865,18 @@ mod tests {
         }
 
         let mut salvaged = Cursor::new(Vec::new());
-        let skipped =
-            match write_best_effort(&mut salvaged, &layers, &history, (10, 10), None, &mut store) {
-                Ok(skipped) => skipped,
-                Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
-            };
+        let skipped = match write_best_effort(
+            &mut salvaged,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(skipped) => skipped,
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        };
         let [only] = skipped.as_slice() else {
             unreachable!("exactly one tile is unreadable, got {skipped:?}");
         };
@@ -3600,8 +4080,21 @@ mod tests {
     /// tile". So this reads back into a *completely fresh* store, which
     /// is what a new process has, and asserts the file itself carries
     /// the loss.
-    #[test]
-    fn a_skipped_tile_survives_as_skipped_across_a_fresh_read() {
+    /// A two-layer document written best-effort with the first layer's
+    /// only tile unreadable, plus what the writer said it dropped.
+    ///
+    /// Shared by the tests below so each can assert one thing: building
+    /// the broken-scratch-disk scenario is a dozen lines of setup, and
+    /// inlining it twice is what pushed the round-trip test past this
+    /// workspace's own function-length lint.
+    struct LossyContainer {
+        _dir: tempfile::TempDir,
+        container: Cursor<Vec<u8>>,
+        broken_surface: SurfaceId,
+        in_memory: Vec<SkippedTile>,
+    }
+
+    fn lossy_container_with_one_unreadable_tile() -> LossyContainer {
         let (dir, mut store) = one_tile_store();
         let mut layers = LayerTree::new();
         let mut history = History::new();
@@ -3628,44 +4121,130 @@ mod tests {
         }
         break_the_only_scratch_file(&dir);
 
-        let mut salvaged = Cursor::new(Vec::new());
-        let skipped =
-            match write_best_effort(&mut salvaged, &layers, &history, (10, 10), None, &mut store) {
-                Ok(skipped) => skipped,
-                Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
-            };
-        let [in_memory] = skipped.as_slice() else {
-            unreachable!("exactly one tile is unreadable, got {skipped:?}");
+        let mut container = Cursor::new(Vec::new());
+        let skipped = match write_best_effort(
+            &mut container,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(skipped) => skipped,
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        };
+        assert_eq!(skipped.len(), 1, "exactly one tile is unreadable");
+        let Some(&broken_surface) = surfaces.first() else {
+            unreachable!("two layers were just created");
+        };
+        container.set_position(0);
+        LossyContainer {
+            _dir: dir,
+            container,
+            broken_surface,
+            in_memory: skipped,
+        }
+    }
+
+    #[test]
+    fn a_skipped_tile_survives_as_skipped_across_a_fresh_read() {
+        let lossy = lossy_container_with_one_unreadable_tile();
+        let [in_memory] = lossy.in_memory.as_slice() else {
+            unreachable!("exactly one tile is unreadable");
         };
 
         // A fresh store, standing in for a fresh process: nothing here
         // knows what the writer knew.
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        salvaged.set_position(0);
-        let document = match read(salvaged, &mut fresh_store) {
+        let document = match read(lossy.container, &mut fresh_store) {
             Ok(document) => document,
             Err(err) => unreachable!("the salvaged autosave must reopen: {err:?}"),
         };
-        let [persisted] = document.skipped_tiles.as_slice() else {
+        let [persisted] = document.skipped_tiles.records() else {
             unreachable!(
                 "the reopened document must name the dropped tile, got {:?}",
                 document.skipped_tiles
             );
         };
+        assert_eq!(
+            document.skipped_tiles.total(),
+            1,
+            "one loss, counted once: {:?}",
+            document.skipped_tiles
+        );
+        assert!(
+            !document.skipped_tiles.is_truncated(),
+            "one record is not a truncated view of one loss"
+        );
         // The persisted record and the in-memory one describe the same
         // loss -- surface, tile, and reason all round-trip.
         assert_eq!(persisted.surface, in_memory.surface.to_raw());
-        assert_eq!(persisted.tile, in_memory.tile);
+        assert_eq!(persisted.tile(), in_memory.tile);
         assert_eq!(persisted.reason, in_memory.reason);
         assert!(
             persisted.reason.contains("corrupt tile file"),
             "the persisted skip must carry the real underlying tile error: {}",
             persisted.reason
         );
-        let Some(&broken_surface) = surfaces.first() else {
-            unreachable!("two layers were just created");
+        assert_eq!(persisted.surface, lossy.broken_surface.to_raw());
+    }
+
+    /// **The defect 0.74.1 closed, in the exact sequence that found it**:
+    /// reopen a lossy file, then save it normally, then reopen *that*.
+    ///
+    /// The tiles the first writer dropped are not in the reading store
+    /// at all, so the second write rediscovers nothing about them —
+    /// `write_with_policy` cannot tell "never painted" from "lost before
+    /// this process started". Carrying `AurDocument::skipped_tiles` back
+    /// in as `known_missing` is the only reason the record survives.
+    /// Without it the second file has no `skipped-tiles` entry at all,
+    /// and one ordinary Save makes a professional's data loss invisible.
+    #[test]
+    fn an_ordinary_save_of_an_opened_lossy_document_keeps_its_skip_record() {
+        let lossy = lossy_container_with_one_unreadable_tile();
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let document = match read(lossy.container, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("the salvaged autosave must reopen: {err:?}"),
         };
-        assert_eq!(persisted.surface, broken_surface.to_raw());
+        let Some(persisted) = document.skipped_tiles.first() else {
+            unreachable!("the reopened file must name its loss");
+        };
+        let first_reason = persisted.reason.clone();
+
+        let mut resaved = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut resaved,
+            &document.layers,
+            &document.history,
+            document.canvas_size,
+            None,
+            &document.skipped_tiles,
+            &mut fresh_store,
+        ) {
+            unreachable!("resaving an opened lossy document must succeed: {err:?}");
+        }
+        let (_third_dir, mut third_store) = real_tile_store();
+        resaved.set_position(0);
+        let reopened = match read(resaved, &mut third_store) {
+            Ok(reopened) => reopened,
+            Err(err) => unreachable!("the resaved container must reopen: {err:?}"),
+        };
+        let [still_named] = reopened.skipped_tiles.records() else {
+            unreachable!(
+                "an ordinary save of an opened lossy document must not erase what it lost, got \
+                 {:?}",
+                reopened.skipped_tiles
+            );
+        };
+        assert_eq!(still_named.surface, lossy.broken_surface.to_raw());
+        assert_eq!(still_named.reason, first_reason);
+        assert_eq!(
+            reopened.skipped_tiles.total(),
+            1,
+            "re-saving must carry the count forward, not double it"
+        );
     }
 
     /// The backward-compatibility proof, and the reason the skip list is
@@ -3732,7 +4311,15 @@ mod tests {
             }
         }
         let mut bytes = Cursor::new(Vec::new());
-        if let Err(err) = write(&mut bytes, &layers, &history, (10, 10), None, &mut store) {
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("a healthy document must save: {err:?}");
         }
         bytes.set_position(0);
@@ -3747,13 +4334,10 @@ mod tests {
         }
     }
 
-    /// `skipped-tiles` is read out of a file that may be crafted or
-    /// corrupt, so both of its failure shapes get a real answer rather
-    /// than a panic or an unbounded allocation: too many records is
-    /// truncated to `MAX_SKIPPED_TILE_RECORDS`, and bytes that are not a
-    /// record list at all become `IoError::ManifestDeserialization`.
-    #[test]
-    fn a_hostile_skipped_tiles_entry_is_bounded() {
+    /// A manifest for a small one-layer document — what
+    /// [`container_with`] needs to build a container whose *other*
+    /// entries are the thing under test.
+    fn small_manifest_bytes() -> Vec<u8> {
         let mut layers = LayerTree::new();
         if let Err(err) = layers.add_pixel_layer("small", bounds(), None) {
             unreachable!("{err:?}");
@@ -3765,18 +4349,39 @@ mod tests {
             color_space: super::ColorSpaceTag::Srgb,
             layers,
         };
-        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+        match postcard::to_allocvec(&manifest) {
             Ok(bytes) => bytes,
             Err(err) => unreachable!("{err:?}"),
-        };
+        }
+    }
 
-        let overlong: Vec<super::SkippedTileRecord> = (0..super::MAX_SKIPPED_TILE_RECORDS + 500)
-            .map(|i| super::SkippedTileRecord {
-                surface: i as u64,
-                tile: TileId { x: 0, y: 0 },
-                reason: "crafted".to_owned(),
-            })
-            .collect();
+    fn crafted_record(index: usize) -> super::SkippedTileRecord {
+        super::SkippedTileRecord {
+            surface: index as u64,
+            tile_x: 0,
+            tile_y: 0,
+            reason: "crafted".to_owned(),
+        }
+    }
+
+    /// `skipped-tiles` is read out of a file that may be crafted or
+    /// corrupt, so both of its failure shapes get a real answer rather
+    /// than a panic or an unbounded allocation: too many records is
+    /// truncated to `MAX_SKIPPED_TILE_RECORDS` (**while the entry's own
+    /// `total` keeps the true count, so the truncation is disclosed
+    /// rather than hidden**), and bytes that are not a skip payload at
+    /// all become `IoError::ManifestDeserialization`.
+    #[test]
+    fn a_hostile_skipped_tiles_entry_is_bounded() {
+        let manifest_bytes = small_manifest_bytes();
+
+        let overlong = super::SkippedTilesWire {
+            version: super::SKIPPED_TILES_VERSION,
+            total: (super::MAX_SKIPPED_TILE_RECORDS + 500) as u64,
+            records: (0..super::MAX_SKIPPED_TILE_RECORDS + 500)
+                .map(crafted_record)
+                .collect(),
+        };
         let overlong_bytes = match postcard::to_allocvec(&overlong) {
             Ok(bytes) => bytes,
             Err(err) => unreachable!("{err:?}"),
@@ -3795,9 +4400,18 @@ mod tests {
             }
         };
         assert_eq!(
-            document.skipped_tiles.len(),
+            document.skipped_tiles.records().len(),
             super::MAX_SKIPPED_TILE_RECORDS,
             "the skip list must be truncated to its own bound"
+        );
+        assert_eq!(
+            document.skipped_tiles.total(),
+            (super::MAX_SKIPPED_TILE_RECORDS + 500) as u64,
+            "truncating the detail must not truncate the count"
+        );
+        assert!(
+            document.skipped_tiles.is_truncated(),
+            "a capped list over a larger total is exactly the 'at least N' case"
         );
 
         let (_garbage_dir, mut garbage_store) = real_tile_store();
@@ -3810,6 +4424,190 @@ mod tests {
         ) {
             Err(super::IoError::ManifestDeserialization(_)) => {}
             other => unreachable!("expected ManifestDeserialization, got {other:?}"),
+        }
+    }
+
+    /// The memory-amplification defect 0.74.1 closed, in its own repro
+    /// shape: a `skipped-tiles` entry far larger than
+    /// `MAX_SKIPPED_TILE_RECORDS` records could ever need, made of
+    /// highly compressible bytes so the container on disk stays tiny.
+    ///
+    /// It must be refused **by size**, before `postcard` allocates
+    /// anything — which is why the assertion is on
+    /// `IoError::EntryTooLarge` and not merely on "the list came back
+    /// bounded". Decoding first and truncating afterwards, as 0.74.0
+    /// did, bounds what is retained and not what is allocated: the same
+    /// shape measured at ~790 MiB of peak RSS from a 64 KiB file.
+    #[test]
+    fn a_skipped_tiles_entry_past_its_own_byte_cap_is_refused_before_it_is_decoded() {
+        let manifest_bytes = small_manifest_bytes();
+        // One byte past the cap is the boundary; this is comfortably
+        // past it, and DEFLATE takes a repeated byte down to almost
+        // nothing on disk.
+        let oversized = vec![0x01_u8; (super::MAX_SKIPPED_TILES_ENTRY_BYTES as usize) + 1024];
+        let container = container_with(
+            &manifest_bytes,
+            &[(super::SKIPPED_TILES_ENTRY.to_owned(), oversized)],
+        );
+        let on_disk = container.get_ref().len();
+        assert!(
+            (on_disk as u64) < super::MAX_SKIPPED_TILES_ENTRY_BYTES,
+            "the crafted container must be far smaller on disk than the entry it declares, or \
+             this test is not exercising the amplification it exists for ({on_disk} bytes)"
+        );
+        let (_dir, mut store) = real_tile_store();
+        match read(container, &mut store) {
+            Err(super::IoError::EntryTooLarge { name, cap, .. }) => {
+                assert_eq!(name, super::SKIPPED_TILES_ENTRY);
+                assert_eq!(cap, super::MAX_SKIPPED_TILES_ENTRY_BYTES);
+            }
+            other => unreachable!("expected EntryTooLarge, got {other:?}"),
+        }
+    }
+
+    /// The frozen `version`/`total` prefix, doing the one job it exists
+    /// for: a payload written by a schema version this build does not
+    /// understand must still report **how much was lost**, never "you
+    /// lost nothing".
+    #[test]
+    fn an_unrecognised_skipped_tiles_version_still_reports_the_count() {
+        let manifest_bytes = small_manifest_bytes();
+        let future = super::SkippedTilesWire {
+            version: super::SKIPPED_TILES_VERSION + 7,
+            total: 12,
+            records: vec![crafted_record(0)],
+        };
+        let bytes = match postcard::to_allocvec(&future) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        let document = match read(
+            container_with(
+                &manifest_bytes,
+                &[(super::SKIPPED_TILES_ENTRY.to_owned(), bytes)],
+            ),
+            &mut store,
+        ) {
+            Ok(document) => document,
+            Err(err) => unreachable!("an unreadable *detail* must not fail the file: {err:?}"),
+        };
+        assert_eq!(
+            document.skipped_tiles.total(),
+            12,
+            "the frozen prefix must survive a version this build cannot decode"
+        );
+        assert!(
+            document.skipped_tiles.records().is_empty(),
+            "detail from an unknown schema must not be guessed at"
+        );
+        assert!(
+            !document.skipped_tiles.is_empty(),
+            "twelve lost tiles is not 'nothing was lost'"
+        );
+    }
+
+    /// The `reason` bound is a format invariant, not a write-side
+    /// convention: a crafted file whose reason runs past
+    /// `MAX_SKIPPED_REASON_CHARS` is cut on the way back in too, and cut
+    /// on a **character** boundary — the multi-byte case, which a byte
+    /// slice would have split mid-sequence.
+    #[test]
+    fn an_overlong_multibyte_reason_is_cut_on_a_char_boundary_on_read() {
+        let manifest_bytes = small_manifest_bytes();
+        // Four bytes per character, so a byte-offset cut anywhere but a
+        // multiple of four lands inside a sequence.
+        let long_reason: String =
+            std::iter::repeat_n('\u{1F600}', super::MAX_SKIPPED_REASON_CHARS * 3).collect();
+        let crafted = super::SkippedTilesWire {
+            version: super::SKIPPED_TILES_VERSION,
+            total: 1,
+            records: vec![super::SkippedTileRecord {
+                surface: 0,
+                tile_x: 0,
+                tile_y: 0,
+                reason: long_reason,
+            }],
+        };
+        let bytes = match postcard::to_allocvec(&crafted) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        let document = match read(
+            container_with(
+                &manifest_bytes,
+                &[(super::SKIPPED_TILES_ENTRY.to_owned(), bytes)],
+            ),
+            &mut store,
+        ) {
+            Ok(document) => document,
+            Err(err) => unreachable!("an over-long reason must be cut, not refused: {err:?}"),
+        };
+        let [record] = document.skipped_tiles.records() else {
+            unreachable!("exactly one record, got {:?}", document.skipped_tiles);
+        };
+        assert_eq!(
+            record.reason.chars().count(),
+            super::MAX_SKIPPED_REASON_CHARS,
+            "the read side must apply the same character bound the writer does"
+        );
+        assert!(
+            record.reason.chars().all(|c| c == '\u{1F600}'),
+            "the cut must land on a character boundary, not inside a UTF-8 sequence"
+        );
+        assert_eq!(
+            record.reason.len(),
+            super::MAX_SKIPPED_REASON_CHARS * 4,
+            "every kept character is a real four-byte one"
+        );
+    }
+
+    /// **The premise the whole `skipped-tiles`-is-a-separate-entry
+    /// design rests on**, pinned permanently rather than measured once
+    /// and thrown away.
+    ///
+    /// `postcard`'s wire format is positional: no field names, no tags.
+    /// So growing a struct by a trailing field makes the decoder run off
+    /// the end of old bytes, and `#[serde(default)]` does not rescue it
+    /// — `default` fills a field a *self-describing* format omitted by
+    /// name, and there are no names here, so the hard decode error
+    /// arrives before serde consults the attribute. If a future
+    /// `postcard` ever changed that, this module's doc comment would
+    /// become wrong and this test is what says so.
+    #[test]
+    fn postcard_really_is_positional_so_a_trailing_field_breaks_old_bytes() {
+        #[derive(serde::Serialize)]
+        struct OldShape {
+            version: u32,
+            canvas_width: u32,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct NewShape {
+            #[allow(dead_code)]
+            version: u32,
+            #[allow(dead_code)]
+            canvas_width: u32,
+            #[serde(default)]
+            #[allow(dead_code)]
+            added_later: u32,
+        }
+
+        let old_bytes = match postcard::to_allocvec(&OldShape {
+            version: 1,
+            canvas_width: 10,
+        }) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match postcard::from_bytes::<NewShape>(&old_bytes) {
+            Err(_) => {}
+            Ok(_) => unreachable!(
+                "postcard decoded a three-field struct from two-field bytes -- the premise behind \
+                 `skipped-tiles` being a separate entry no longer holds, and this module's doc \
+                 comment needs rewriting, not this test deleting"
+            ),
         }
     }
 
