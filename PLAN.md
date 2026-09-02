@@ -2160,6 +2160,48 @@ check licenses` clean with the new `toml` dependency.
   Verified: `cargo fmt --all --check` clean, `cargo clippy -p
   aurora-widgets --all-targets --all-features -- -D warnings` clean,
   `cargo test -p aurora-widgets` — 58/58 passed.
+  **`Scrollbar` landed 2026-09-02 (0.75.0) — 4 of 12 named widgets**,
+  `crates/aurora-widgets/src/widgets/scrollbar.rs` plus `paint_scrollbar`
+  in `paint.rs`: `ScrollbarState`/`ScrollbarRange`, `insert_scrollbar`/
+  `set_scrollbar_value`/`set_scrollbar_disabled`, a `Role::ScrollBar`
+  node carrying its own `Orientation` and clamped numeric value/min/max,
+  and a two-shape paint (a `surface.sunken` full-length track, an
+  `accent.primary` thumb whose *length* is proportional to
+  `page_size`/span — the one real geometric difference from a slider's
+  fixed-size knob). Layout thickness is resolved per orientation from
+  the type scale (`type_size(scales.typography.size.md)`), the same "no
+  dedicated control-size token exists yet" grounding `Checkbox`/`Slider`
+  already use — putting it on the wrong axis would silently make a
+  vertical scrollbar a 13px-tall horizontal bar, so `style` branches on
+  orientation rather than reusing `slider::style`. The range travels as
+  a `ScrollbarRange` struct rather than three more parameters,
+  specifically because the workspace's own `too_many_arguments` lint is
+  a real bound an 8-parameter `insert_scrollbar` would cross — the same
+  reason `aurora_io`'s own `WritePolicy` exists.
+  **Accessibility vocabulary, checked against the pinned source rather
+  than assumed**: `numeric_value`/`min_numeric_value`/`max_numeric_value`
+  plus `SetValue`/`Increment`/`Decrement`/`Focus`, *not* `ScrollX`/
+  `ScrollXMin`/`ScrollXMax`/`SetScrollOffset` — the scroll-offset
+  properties are read by no shipping `accesskit` 0.24 platform adapter,
+  while the numeric-value ones drive Windows UIA's RangeValue pattern
+  and the macOS/AT-SPI Value interfaces directly. **Stated honestly:
+  this is a position *model* only.** Nothing in this crate scrolls any
+  content — no viewport, no clip rect, no content offset, and no widget
+  observes a `ScrollbarState` — so a real scrolling container (which
+  `Tree` also still needs, on top of hierarchical expand/collapse this
+  crate models nowhere) remains open, exactly as before. No gallery
+  tree and no golden either: goldens need a human bless on real GPU
+  hardware, which is out of scope for this round; the three `paint.rs`
+  unit tests cover shape count/order, thumb travel, and disabled
+  dimming, and none of them is evidence that a scrollbar looks right on
+  a real display. 13 new lib tests (176 → 189 in the crate; workspace
+  1,410 → 1,423). Verified: `cargo fmt --all --check`,
+  `python3 scripts/check_layering.py`,
+  `python3 scripts/check_no_hardcoded_style.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace`, `cargo test
+  --workspace --doc`, and `cargo doc --workspace --no-deps
+  --all-features` all clean.
 - [~] **Vector-first rendering via `aurora-vector` (resolution-independent)**
   — first real slice done 2026-08-06, picked up as a direct prerequisite
   the "Component gallery + golden-image tests" bullet below was found to

@@ -4,7 +4,8 @@
 //! this pipeline" step `render`'s own doc comment names as still open.
 //!
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
-//! `Checkbox`, `Slider`, `TextField`, `CommandPalette`, `ColorSwatch`,
+//! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
+//! `ColorSwatch`,
 //! `ListRow`, and `Panel` — solid rounded-rect shapes, the simplest of
 //! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
@@ -25,9 +26,13 @@
 //! [`paint_list_row`] highlights the selected one with `accent.primary`
 //! — an unselected row still paints nothing, the same "nothing to
 //! highlight" `Ok(vec![])` every other unselected-state widget already
-//! returns. Every other [`WidgetKind`] (`Container` on its own) returns
-//! `Ok(vec![])` too — a real, deliberate "nothing to paint," not an
-//! error.
+//! returns. `Scrollbar` paints a full-length track and a proportional
+//! thumb on top of it, but that is *all* it is: nothing in this crate
+//! scrolls any content, so the thumb's own position and length are a
+//! pure function of its state's numbers and never of a real viewport
+//! (`widgets::scrollbar`'s own module doc comment). Every other
+//! [`WidgetKind`] (`Container` on its own) returns `Ok(vec![])` too — a
+//! real, deliberate "nothing to paint," not an error.
 //!
 //! [`paint_widget`] returns a `Vec<Paint>`, not a single `Paint` —
 //! `Button`/`Checkbox` only ever needed one shape, but `Slider` is the
@@ -61,7 +66,7 @@
 //! not a design decision made by Cahya (PRD FR-027 *Ownership*); revisit
 //! if/when real per-widget radius tokens are added.
 
-use accesskit::Toggled;
+use accesskit::{Orientation, Toggled};
 use aurora_core::Rect;
 use aurora_theme::{Scales, Theme};
 use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor};
@@ -69,8 +74,8 @@ use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
-    ButtonState, CheckboxState, ColorSwatchState, ListRowState, SliderState, TextFieldState,
-    WidgetKind,
+    ButtonState, CheckboxState, ColorSwatchState, ListRowState, ScrollbarState, SliderState,
+    TextFieldState, WidgetKind,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -149,6 +154,9 @@ pub fn paint_widget(
         WidgetKind::Button(state) => paint_button(state, bounds, theme, scales, scale_factor),
         WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales, scale_factor),
         WidgetKind::Slider(state) => paint_slider(state, bounds, theme, scales, scale_factor),
+        WidgetKind::Scrollbar(state) => {
+            paint_scrollbar(*state, bounds, theme, scales, scale_factor)
+        }
         WidgetKind::TextField(state) => {
             paint_text_field(state, bounds, theme, scales, scale_factor)
         }
@@ -300,6 +308,96 @@ fn paint_slider(
     // The thumb, not the track: the track is a groove, not itself a
     // focusable control -- the thumb is the actual interactive handle a
     // user grabs (this module's own doc comment / `control_outline`'s).
+    if let Some(outline) = control_outline(&thumb_path, theme, alpha, scale_factor)? {
+        paints.push(outline);
+    }
+    Ok(paints)
+}
+
+/// `Scrollbar`'s own two shapes, in draw order: a full-length track
+/// (`surface.sunken`, the same "recessed control" token a `Slider`'s own
+/// track already uses) and a thumb on top of it (`accent.primary`), both
+/// `scales.radius.pill`. `disabled_opacity` is applied to both shapes
+/// uniformly, exactly as [`paint_slider`] already does.
+///
+/// The one real difference from a slider: a scrollbar's thumb has a
+/// *length* of its own, proportional to how much of the scrolled content
+/// is visible (`state.page_size` against the whole scrollable span), not
+/// a fixed square knob. It is floored at the bar's own cross-axis
+/// thickness so a huge document still leaves something grabbable, and
+/// capped at the track's own length so it can never overhang its track
+/// (which a very short, thick bar would otherwise do).
+///
+/// Every degenerate input is handled before any division: a zero or
+/// negative span (`min == max` with no page, or a caller that ignored
+/// `insert_scrollbar`'s own documented `min <= max` precondition) paints
+/// a full-length thumb parked at the track's own start, rather than
+/// dividing by zero and tessellating a NaN rectangle.
+fn paint_scrollbar(
+    state: ScrollbarState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    let alpha = if state.disabled {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let radius = scales.radius.pill as f32;
+
+    let left = bounds.x as f32;
+    let top = bounds.y as f32;
+    let width = bounds.width as f32;
+    let height = bounds.height as f32;
+    let vertical = matches!(state.orientation, Orientation::Vertical);
+    let (track_len, thickness) = if vertical {
+        (height, width)
+    } else {
+        (width, height)
+    };
+
+    let track_path = rounded_rect(left, top, width, height, radius);
+    let track_mesh = fill(&track_path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.surface.sunken.to_srgb_f32();
+    let track = (track_mesh, [r, g, b, alpha]);
+
+    // The whole scrollable extent is the travel *plus* one page -- a bar
+    // whose page covers the entire content (`max == min`) is a
+    // full-length thumb, not a zero-length one.
+    let span = (state.max - state.min) + state.page_size;
+    let thumb_fraction = if span > 0.0 {
+        (state.page_size / span).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let thumb_len = (track_len * thumb_fraction as f32)
+        .max(thickness)
+        .min(track_len);
+
+    let range = state.max - state.min;
+    let position_fraction = if range > 0.0 {
+        ((state.value - state.min) / range).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let offset = position_fraction as f32 * (track_len - thumb_len).max(0.0);
+
+    let (thumb_left, thumb_top, thumb_width, thumb_height) = if vertical {
+        (left, top + offset, thickness, thumb_len)
+    } else {
+        (left + offset, top, thumb_len, thickness)
+    };
+    let thumb_path = rounded_rect(thumb_left, thumb_top, thumb_width, thumb_height, radius);
+    let thumb_mesh = fill(&thumb_path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.accent.primary.to_srgb_f32();
+    let thumb = (thumb_mesh, [r, g, b, alpha]);
+
+    let mut paints = vec![track, thumb];
+    // The thumb, not the track -- the same reasoning `paint_slider`
+    // already records: the track is a groove, the thumb is the handle.
     if let Some(outline) = control_outline(&thumb_path, theme, alpha, scale_factor)? {
         paints.push(outline);
     }
@@ -532,13 +630,14 @@ mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        CommandEntry, ListRowState, WidgetKind, command_palette_state, insert_button,
-        insert_checkbox, insert_color_swatch, insert_command_palette, insert_slider,
-        insert_text_field, new_tree, set_button_disabled, set_button_pressed,
-        set_checkbox_disabled, set_color_swatch_disabled, set_slider_disabled, set_slider_value,
+        CommandEntry, ListRowState, ScrollbarRange, WidgetKind, command_palette_state,
+        insert_button, insert_checkbox, insert_color_swatch, insert_command_palette,
+        insert_scrollbar, insert_slider, insert_text_field, new_tree, set_button_disabled,
+        set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
+        set_scrollbar_disabled, set_scrollbar_value, set_slider_disabled, set_slider_value,
         set_text_field_disabled, toggle_checkbox,
     };
-    use accesskit::Toggled;
+    use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
     use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
 
@@ -992,6 +1091,179 @@ mod tests {
         let theme = dark_theme();
 
         let paints = match paint_widget(&tree, slider, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(paints.len(), 2);
+        for (_, color) in &paints {
+            assert_eq!(color[3], theme.state.disabled_opacity);
+        }
+    }
+
+    /// A vertical scrollbar over a 0..=100 range showing a 20-unit page
+    /// — the shared fixture the three scrollbar paint tests below use.
+    fn scrollbar_range() -> ScrollbarRange {
+        ScrollbarRange {
+            min: 0.0,
+            max: 100.0,
+            page_size: 20.0,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_vertical_scrollbar_paints_a_track_then_a_thumb() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let scrollbar = match insert_scrollbar(
+            &mut tree,
+            root,
+            &scales,
+            Orientation::Vertical,
+            0.0,
+            scrollbar_range(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            scrollbar,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 13,
+                height: 300,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let mut paints = match paint_widget(&tree, scrollbar, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(paints.len(), 2, "a scrollbar paints a track and a thumb");
+        let (thumb_mesh, thumb_color) = paints.remove(1);
+        let (track_mesh, track_color) = paints.remove(0);
+        assert!(
+            !track_mesh.vertices.is_empty() && !track_mesh.indices.is_empty(),
+            "the track must tessellate to real geometry"
+        );
+        assert!(
+            !thumb_mesh.vertices.is_empty() && !thumb_mesh.indices.is_empty(),
+            "the thumb must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.surface.sunken.to_srgb_f32();
+        assert_eq!(
+            track_color,
+            [r, g, b, 1.0],
+            "the track must use surface.sunken, the same recessed-control token a slider's own \
+             track already uses"
+        );
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert_eq!(
+            thumb_color,
+            [r, g, b, 1.0],
+            "the thumb must use accent.primary at full opacity"
+        );
+
+        // A 20-of-120 page over a 300px track is a 50px thumb -- shorter
+        // than the track, which is the whole visual point of a
+        // scrollbar as against a slider.
+        let thumb_top = thumb_mesh
+            .vertices
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min);
+        let thumb_bottom = thumb_mesh
+            .vertices
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            thumb_bottom - thumb_top < 300.0,
+            "a partial page must give a thumb shorter than its own track: \
+             {thumb_top} -> {thumb_bottom}"
+        );
+    }
+
+    #[test]
+    fn a_scrollbars_thumb_moves_along_its_track_as_its_value_increases() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let scrollbar = match insert_scrollbar(
+            &mut tree,
+            root,
+            &scales,
+            Orientation::Vertical,
+            0.0,
+            scrollbar_range(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            scrollbar,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 13,
+                height: 300,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let thumb_min_y = |tree: &WidgetTree<WidgetKind>| -> f32 {
+            let mut paints = match paint_widget(tree, scrollbar, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(paints.len(), 2);
+            let (thumb_mesh, _) = paints.remove(1);
+            thumb_mesh
+                .vertices
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        let at_min = thumb_min_y(&tree);
+        if let Err(err) = set_scrollbar_value(&mut tree, scrollbar, 100.0) {
+            unreachable!("{err:?}");
+        }
+        let at_max = thumb_min_y(&tree);
+        assert!(
+            at_max > at_min,
+            "a vertical scrollbar's thumb must move down as the value increases: \
+             {at_min} -> {at_max}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_scrollbar_applies_the_theme_disabled_opacity_to_both_shapes() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let scrollbar = match insert_scrollbar(
+            &mut tree,
+            root,
+            &scales,
+            Orientation::Horizontal,
+            0.0,
+            scrollbar_range(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_scrollbar_disabled(&mut tree, scrollbar, true) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let paints = match paint_widget(&tree, scrollbar, &theme, &scales, 1.0) {
             Ok(paints) => paints,
             Err(err) => unreachable!("{err:?}"),
         };
