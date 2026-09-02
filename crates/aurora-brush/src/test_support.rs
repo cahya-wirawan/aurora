@@ -68,7 +68,17 @@ pub fn break_the_only_scratch_file(dir: &tempfile::TempDir) {
     let Ok(entries) = std::fs::read_dir(dir.path()) else {
         unreachable!("the scratch directory must be readable");
     };
-    let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    // Filtered by extension, not counted raw (0.68.5): a scratch
+    // directory may hold `aurora_tile::LOCK_FILE_NAME` beside its tiles,
+    // and an exact-one-element destructure over *every* entry would then
+    // fail on a file this function has no business truncating. The seven
+    // other enumerators in this workspace were hardened this way in
+    // 0.67.0; this one was missed.
+    let files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "tile"))
+        .collect();
     let [victim] = files.as_slice() else {
         unreachable!("exactly one tile should have been evicted: {files:?}");
     };

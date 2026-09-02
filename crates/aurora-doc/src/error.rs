@@ -305,7 +305,7 @@ pub enum DocError {
     /// caller can match on and report the file's actual numbers from.
     /// Origin is checked there for that reason, and because the same
     /// guard then also covers the *write* path (`tile_grid` and
-    /// `validate_mask_origins` are shared by `read`, `write` and
+    /// `validate_persisted_rects` are shared by `read`, `write` and
     /// `write_best_effort`), which a deserializer cannot reach at all.
     /// `validate_opacities` stays in the deserializer because it is
     /// load-bearing for a second, non-`.aur` entry point —
@@ -315,4 +315,73 @@ pub enum DocError {
         "layer origin ({x}, {y}) is further than {max}px from the document origin on at least one axis"
     )]
     LayerOriginOutOfRange { x: i64, y: i64, max: i64 },
+    /// A rectangle's own *extent* is past the document ceiling
+    /// ([`aurora_core::MAX_DOCUMENT_EXTENT`], 300,000 px — PRD §7.3.1 /
+    /// ADR 0002). [`Self::LayerOriginOutOfRange`]'s companion: that one
+    /// is about where a rectangle sits, this one about how big it is.
+    ///
+    /// **Only [`crate::LayerTree::add_mask`] raises it today, and that
+    /// asymmetry is deliberate rather than an oversight** (0.71.3). A
+    /// mask's rectangle drives a real tile grid in `aurora-io`'s `.aur`
+    /// writer, and an oversized one there is not a big loop but an
+    /// unfinishable one — so it is refused at the point the mask is
+    /// created, not only at the file boundary, because a tree that
+    /// already holds one makes *every* save and *every* autosave for
+    /// the rest of the session fail. `add_pixel_layer`/`set_bounds` do
+    /// **not** carry this check: a layer's extent has meaning beyond
+    /// the tile grid (it is the document's own content extent, and
+    /// `aurora_core::Size::new` is where that ceiling is owned), and
+    /// tightening it here would be a live-editing policy change rather
+    /// than a hardening fix. `aurora-io`'s own hoisted
+    /// `validate_persisted_rects` refuses an oversized layer before it
+    /// writes a byte, which is what keeps that gap from producing a
+    /// partial file.
+    #[error("rectangle extent {width}x{height} is past the {max}px document ceiling")]
+    LayerBoundsTooLarge { width: u32, height: u32, max: u32 },
+    /// A [`LayerId`] read back from an untrusted manifest (or journal)
+    /// has [`crate::MASK_SURFACE_BIT`] set, which would put its own
+    /// *pixel* surface into the half of the `aurora_tile::SurfaceId`
+    /// space reserved for **mask** surfaces.
+    ///
+    /// # The collision this refuses
+    ///
+    /// [`crate::LayerTree::surface_id`] is `id.to_raw()` and
+    /// [`crate::LayerTree::mask_surface_id`] is
+    /// `id.to_raw() | MASK_SURFACE_BIT`. Those two ranges are disjoint
+    /// only while every live id keeps that bit clear. A crafted `.aur`
+    /// manifest holding both layer `5` (with a mask) and layer
+    /// `5 | MASK_SURFACE_BIT` (an ordinary pixel layer) makes the
+    /// second layer's own pixel surface and the first layer's mask
+    /// surface the *same* `SurfaceId` — one tile-store slot with two
+    /// owners, so painting one silently rewrites the other's coverage,
+    /// with no error anywhere.
+    ///
+    /// Nothing built through this crate's own API can reach it:
+    /// `aurora_core::IdGenerator` starts at `0` and hands ids out one
+    /// at a time, so a real session would need `2^63` layer creations.
+    /// But `IdGenerator` and `LayerId` are both `Deserialize`, and
+    /// [`Self::StaleLayerIdGenerator`]'s counter check compares ids
+    /// only against `peek_next()` — which a crafted manifest is free to
+    /// set to `u64::MAX`. That is why this is a validation rule and not
+    /// merely a comment.
+    #[error(
+        "layer id {id:?} has the reserved mask-surface bit set: layer ids must stay below {limit}"
+    )]
+    ReservedLayerIdBit { id: LayerId, limit: u64 },
+    /// The layer tree's own id *counter* is at or past
+    /// [`crate::MASK_SURFACE_BIT`], so the next ordinary
+    /// `add_pixel_layer`/`add_group` would hand out an id
+    /// [`Self::ReservedLayerIdBit`] refuses.
+    ///
+    /// [`Self::ReservedLayerIdBit`] is to this what
+    /// [`Self::LayerIdCollision`] is to
+    /// [`Self::StaleLayerIdGenerator`]: that one refuses ids the file
+    /// already carries, this one refuses a counter positioned to
+    /// *create* one on the very next insert. Both halves are needed
+    /// for the same reason the stale-counter pair is — a manifest can
+    /// be shape-perfect and still be unsafe to add to.
+    #[error(
+        "the layer tree's id counter is at {next}, at or past the reserved mask-surface bit {limit}"
+    )]
+    ReservedLayerIdCounter { next: u64, limit: u64 },
 }

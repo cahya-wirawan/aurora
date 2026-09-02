@@ -39,5 +39,13 @@ unicode-segmentation = { workspace = true }
 wgpu = { workspace = true }
 
 [dev-dependencies]
+# The same `aurora-gpu` already in `[dependencies]` above, with its
+# `test-support` feature on -- Cargo allows a package in both positions
+# with different feature sets, and a dev-dependency's features only
+# reach the graph when dev-targets are actually built. Needed by
+# `src/test_support.rs` and `tests/gallery.rs`, so this crate's
+# real-GPU tests share one copy of the "skip, or fail because
+# `AURORA_REQUIRE_GPU` is set" decision rather than duplicating it.
+aurora-gpu = { workspace = true, features = ["test-support"] }
 accesskit_consumer = { workspace = true }
 aurora-testkit = { workspace = true }

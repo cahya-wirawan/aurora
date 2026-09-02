@@ -12,6 +12,38 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `aurora_gpu::test_support`'s "real GPU adapter, or skip --
+# unless `AURORA_REQUIRE_GPU` says otherwise" decision to the other
+# crates whose own real-GPU tests need it (`aurora-render`,
+# `aurora-widgets`, `aurora-app`), which turn it on from their
+# `[dev-dependencies]` only. Same shape, and same reasoning, as
+# `aurora-doc`'s own `test-support` feature.
+#
+# What the feature gates is only the *shared decision* -- the env-var
+# read, the `GpuError` -> skip/fail mapping, and the thin
+# `real_context_or_skip` wrapper. Everything else in that module (the
+# `GPU_TEST_LOCK`, the tempdir-backed tile store, the canvas pipeline
+# builders) stays `#[cfg(test)]`-only and is not reachable from another
+# crate at all.
+#
+# Stated precisely, because "off in every normal build" overclaims it:
+#
+#   off  -- `cargo build --workspace`, `cargo check --workspace`,
+#           `cargo doc --workspace --no-deps`; i.e. every path that
+#           produces a shipped binary. `cargo check --workspace
+#           --locked` is a CI gate step (`.github/workflows/verify.yml`)
+#           specifically so a test-only symbol leaking into non-test
+#           code fails the build rather than passing every other job.
+#   ON   -- anything passing `--all-features` (this project's own clippy
+#           and rustdoc gate commands both do), and anything building
+#           dev-targets: `cargo test`, `cargo nextest run`, `cargo
+#           clippy --all-targets`, `cargo build --all-targets`.
+#
+# So the guarantee is "absent from a shipped build", not "absent from
+# any build CI runs".
+test-support = []
+
 [dependencies]
 aurora-core = { workspace = true }
 aurora-tile = { workspace = true }

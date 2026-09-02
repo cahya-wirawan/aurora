@@ -35,6 +35,16 @@ pub enum WidgetError {
     /// toggle, drag) a widget whose own state marks it disabled.
     #[error("widget {0:?} is disabled")]
     WidgetDisabled(WidgetId),
+    /// A widget constructor or mutator was handed a numeric range that
+    /// cannot describe a real position: a non-finite bound, or `min >
+    /// max`. Returned rather than letting `f64::clamp`'s own internal
+    /// `assert!(min <= max)` fire — that assertion lives in `core`, not
+    /// in this workspace, so the root `Cargo.toml`'s `panic = "deny"`
+    /// lint cannot see it, and a panic in a crate holding a
+    /// professional's unsaved work is exactly what that lint exists to
+    /// prevent.
+    #[error("invalid numeric range: min={min}, max={max} (both must be finite, with min <= max)")]
+    InvalidRange { min: f64, max: f64 },
     /// [`crate::paint_widget`] failed to tessellate a widget's own paint
     /// geometry into a `Mesh`. In practice unreachable from this crate's
     /// own callers today: `rounded_rect`'s own cubic-Bézier output never

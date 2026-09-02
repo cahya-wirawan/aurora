@@ -117,8 +117,11 @@ pub(crate) struct RemovedSubtree {
 /// visibility, and locking (see [`Self::set_opacity`] and neighbours) —
 /// stored state only, since nothing yet composites or paints to actually
 /// interpret them. Any layer, pixel or group, may also carry one
-/// [`LayerMask`] (see [`Self::add_mask`] and neighbours) — likewise
-/// stored state only, no real mask pixels yet.
+/// [`LayerMask`] (see [`Self::add_mask`] and neighbours). The mask's
+/// own grayscale *pixels* do not live in the tree either: they live in
+/// the document's shared `aurora_tile::TileStore`, under
+/// [`Self::mask_surface_id`] — see [`crate::mask`] for the storage
+/// convention and for what is deliberately still missing around it.
 ///
 /// `Serialize`/`Deserialize`: a `.aur` file's own manifest entry (ADR
 /// 0009) is the whole tree, `postcard`-encoded — every field here
@@ -220,6 +223,11 @@ impl TryFrom<LayerTreeRepr> for LayerTree {
         // out-of-range opacity renders wrongly, which is worth refusing
         // but strictly less urgent than a traversal that never returns.
         validate_id_allocator(&ids, &layers)?;
+        // Same family as the allocator check, and for the same reason
+        // it sits next to it rather than inside `validate_shape`: an id
+        // with `MASK_SURFACE_BIT` set makes a perfectly well-formed
+        // tree that aliases another layer's mask storage.
+        validate_layer_id_range(&ids, &layers)?;
         validate_opacities(&layers)?;
         Ok(Self { ids, layers, roots })
     }
@@ -416,6 +424,61 @@ fn validate_id_allocator(
     Ok(())
 }
 
+/// Rejects any [`LayerId`] — present in `layers`, or about to be handed
+/// out by `ids` — that has [`crate::MASK_SURFACE_BIT`] set.
+///
+/// [`validate_id_allocator`]'s neighbour, and a *different* defect
+/// again. That one holds the counter ahead of the ids present; this one
+/// holds both to the half of the `aurora_tile::SurfaceId` space that
+/// belongs to layer pixels. [`LayerTree::surface_id`] is
+/// `id.to_raw()` unchanged and [`LayerTree::mask_surface_id`] is
+/// `id.to_raw() | MASK_SURFACE_BIT`, so the two ranges are disjoint
+/// only while no live id sets that bit — and a crafted manifest can set
+/// it, since both [`LayerId`] and `IdGenerator` are `Deserialize` and
+/// [`validate_id_allocator`] compares ids only against a `peek_next()`
+/// the same file supplies. A document holding layer `5` (masked) and
+/// layer `5 | MASK_SURFACE_BIT` (a plain pixel layer) then addresses
+/// the second layer's pixels and the first layer's mask coverage
+/// through one and the same tile-store slot.
+///
+/// Both halves are checked because either alone leaves a door open: the
+/// map check refuses the ids the file already carries, the counter
+/// check refuses a counter positioned to create one on the next
+/// ordinary insert. See [`DocError::ReservedLayerIdBit`] and
+/// [`DocError::ReservedLayerIdCounter`].
+///
+/// Deterministic despite `HashMap`'s arbitrary iteration order: the
+/// *lowest* offending id is reported, which is unique.
+///
+/// Only `layers.keys()` is walked, for the same reason
+/// [`validate_id_allocator`] can get away with it — [`validate_shape`]
+/// refuses a name with no entry behind it, so "every id present" and
+/// "every id named" are the same set.
+fn validate_layer_id_range(
+    ids: &IdGenerator<Layer>,
+    layers: &HashMap<LayerId, LayerEntry>,
+) -> Result<(), DocError> {
+    if let Some(id) = layers
+        .keys()
+        .copied()
+        .filter(|id| id.to_raw() >= crate::MASK_SURFACE_BIT)
+        .min_by_key(|id| id.to_raw())
+    {
+        return Err(DocError::ReservedLayerIdBit {
+            id,
+            limit: crate::MASK_SURFACE_BIT,
+        });
+    }
+    let next = ids.peek_next();
+    if next >= crate::MASK_SURFACE_BIT {
+        return Err(DocError::ReservedLayerIdCounter {
+            next,
+            limit: crate::MASK_SURFACE_BIT,
+        });
+    }
+    Ok(())
+}
+
 /// Rejects a group `children` reference that points from one of two
 /// about-to-be-merged maps into the other.
 ///
@@ -523,7 +586,7 @@ fn offending_opacity(entry: &LayerEntry) -> Option<f32> {
 /// The mask check sits *outside* the `kind` match on purpose. A group
 /// carries a mask too, so testing only the `Pixel` arm would leave a
 /// masked group's own origin unchecked — the same reasoning
-/// `aurora-io`'s `validate_mask_origins` follows when it walks every
+/// `aurora-io`'s `validate_persisted_rects` follows when it walks every
 /// layer id regardless of kind.
 ///
 /// [`LayerTree::restore`] and [`LayerTree::restore_mask`] still do not
@@ -533,7 +596,7 @@ fn offending_opacity(entry: &LayerEntry) -> Option<f32> {
 /// bar is applied instead where an *untrusted* whole tree arrives —
 /// [`LayerTree::validate`], which `crate::History::replay` runs as its
 /// closing step — and, on the `.aur` file-read path, by `aurora-io`'s
-/// own `tile_grid`/`validate_mask_origins`. See [`validate_origin`] for
+/// own `tile_grid`/`validate_persisted_rects`. See [`validate_origin`] for
 /// exactly which routes into the tree that does and does not cover:
 /// [`LayerTree`]'s bare `Deserialize` is deliberately not one of them.
 ///
@@ -599,7 +662,7 @@ fn offending_origin(entry: &LayerEntry) -> Option<Rect> {
 /// **What "already validated on the way in" does and does not mean.**
 /// It covers the *live-edit API* (`set_bounds`, `add_mask`,
 /// `insert_unchecked`) and the *`.aur` file-read path* (`aurora-io`'s
-/// own `tile_grid` and `validate_mask_origins`, which is where the
+/// own `tile_grid` and `validate_persisted_rects`, which is where the
 /// read-time origin bar lives — see
 /// [`DocError::LayerOriginOutOfRange`] for why it is there and not in
 /// this crate's deserializer). It does **not** cover [`LayerTree`]'s
@@ -622,6 +685,30 @@ fn offending_origin(entry: &LayerEntry) -> Option<Rect> {
 /// `aurora_core::MAX_DOCUMENT_ORIGIN` for why. It is bounded where it
 /// is owned instead (`aurora_core::Size::new`, and `aurora-io`'s own
 /// `tile_grid` for a manifest read off disk).
+/// Refuses a *mask* rectangle whose extent is past the document ceiling
+/// ([`aurora_core::MAX_DOCUMENT_EXTENT`]).
+///
+/// Deliberately narrower than [`validate_origin`], which every
+/// rectangle-taking entry point runs: this is only called from
+/// [`LayerTree::add_mask`], and [`DocError::LayerBoundsTooLarge`]'s own
+/// doc comment records why a layer's own bounds are *not* held to the
+/// same bar here. It is not called from `restore_mask` either, for the
+/// reason that one already documents: it puts back a rectangle that
+/// reached the tree through a checked route, and re-checking would let
+/// an undo fail on a value the tree itself produced.
+fn validate_mask_extent(bounds: Rect) -> Result<(), DocError> {
+    if bounds.width <= aurora_core::MAX_DOCUMENT_EXTENT
+        && bounds.height <= aurora_core::MAX_DOCUMENT_EXTENT
+    {
+        return Ok(());
+    }
+    Err(DocError::LayerBoundsTooLarge {
+        width: bounds.width,
+        height: bounds.height,
+        max: aurora_core::MAX_DOCUMENT_EXTENT,
+    })
+}
+
 pub(crate) fn validate_origin(bounds: Rect) -> Result<(), DocError> {
     if bounds.origin_in_document_range() {
         return Ok(());
@@ -1447,8 +1534,9 @@ impl LayerTree {
 
     /// Holds this whole tree to exactly the bar
     /// `#[serde(try_from = "LayerTreeRepr")]` holds a deserialized one
-    /// to — literally the same [`validate_shape`], [`validate_opacities`]
-    /// and [`validate_id_allocator`] calls, rooted at [`Self::roots`]
+    /// to — literally the same [`validate_shape`], [`validate_opacities`],
+    /// [`validate_id_allocator`] and [`validate_layer_id_range`] calls,
+    /// rooted at [`Self::roots`]
     /// with no parent above them, plus [`validate_origins`] for the
     /// stored `Rect` origins the per-call guards cover on the live edit
     /// paths.
@@ -1468,6 +1556,9 @@ impl LayerTree {
     /// the four rules — plus [`DocError::StaleLayerIdGenerator`] from
     /// [`validate_id_allocator`], the same pairing
     /// `#[serde(try_from = "LayerTreeRepr")]` runs; plus
+    /// [`DocError::ReservedLayerIdBit`] and
+    /// [`DocError::ReservedLayerIdCounter`] from
+    /// [`validate_layer_id_range`]; plus
     /// [`DocError::OpacityOutOfRange`] from [`validate_opacities`] and
     /// [`DocError::LayerOriginOutOfRange`] from [`validate_origins`].
     ///
@@ -1489,10 +1580,11 @@ impl LayerTree {
     /// [`Self::restore`]'s own `validate_opacities` — were guarded
     /// before this.)
     pub(crate) fn validate(&self) -> Result<(), DocError> {
-        // Shape, allocator, opacity, origin -- `try_from`'s own
-        // ordering, one step further.
+        // Shape, allocator, id range, opacity, origin -- `try_from`'s
+        // own ordering, one step further.
         validate_shape(&self.layers, &self.roots, None, 1)?;
         validate_id_allocator(&self.ids, &self.layers)?;
+        validate_layer_id_range(&self.ids, &self.layers)?;
         validate_opacities(&self.layers)?;
         validate_origins(&self.layers)
     }
@@ -1562,12 +1654,87 @@ impl LayerTree {
     /// Returns `None` for an unknown `id`, or one that names a
     /// [`LayerKind::Group`] — a group has no pixels of its own to store,
     /// so it never needs a surface.
+    ///
+    /// # And for an id with [`crate::MASK_SURFACE_BIT`] set
+    ///
+    /// Also `None`, and this branch is the mirror image of the one
+    /// [`Self::mask_surface_id`] already carries. A layer's pixel
+    /// surface is the *bottom* half of the id space by construction;
+    /// an id with the top bit set would put it in the half reserved for
+    /// mask surfaces, where it aliases the mask storage of the layer
+    /// whose id is this one with that bit cleared — one tile-store slot
+    /// with two owners.
+    ///
+    /// `validate_layer_id_range` (this module's own, crate-private)
+    /// refuses such an id at the deserialization boundary, so this
+    /// guard should be unreachable.
+    /// It is here anyway, deliberately, so the invariant is enforced at
+    /// the type's own boundary rather than only at the one call site
+    /// that validates: `LayerEntry`/`LayerId` are both `Deserialize`
+    /// and a `LayerTree` can also be assembled by `restore`, and this
+    /// crate would rather return "no surface" than hand a caller an id
+    /// that addresses somebody else's pixels. Before 0.70.1 the
+    /// validation half was missing entirely, and a crafted `.aur`
+    /// manifest could reach exactly that collision — see
+    /// [`DocError::ReservedLayerIdBit`].
     #[must_use]
     pub fn surface_id(&self, id: LayerId) -> Option<aurora_tile::SurfaceId> {
+        if id.to_raw() >= crate::MASK_SURFACE_BIT {
+            return None;
+        }
         match self.kind(id)? {
             LayerKind::Pixel { .. } => Some(aurora_tile::SurfaceId::from_raw(id.to_raw())),
             LayerKind::Group { .. } => None,
         }
+    }
+
+    /// The [`aurora_tile::SurfaceId`] `id`'s own **mask** coverage is
+    /// addressed under in the same shared `aurora_tile::TileStore` —
+    /// `id`'s own raw value with [`crate::MASK_SURFACE_BIT`] set. Like
+    /// [`Self::surface_id`], it is derived, not allocated: there is no
+    /// stored field, no second id scheme, and nothing in the `.aur`
+    /// format has to change to carry it.
+    ///
+    /// **Unlike [`Self::surface_id`], this returns `Some` for a
+    /// [`LayerKind::Group`] too.** Photoshop masks groups, and
+    /// `aurora-app`'s own compositor already masks a group's whole
+    /// isolated buffer as one unit — a group has no pixels of its own,
+    /// but it certainly can have a mask.
+    ///
+    /// # Why the bit partition cannot collide
+    ///
+    /// See [`crate::MASK_SURFACE_BIT`] for the full partition. In
+    /// short: layer pixel surfaces are the bottom half, mask surfaces
+    /// the top half, and `aurora-app`'s reserved composite surface is
+    /// `u64::MAX` — which is why the guard below excludes
+    /// `MASK_SURFACE_BIT - 1` as well as everything above it, since
+    /// `(MASK_SURFACE_BIT - 1) | MASK_SURFACE_BIT == u64::MAX` is the
+    /// one layer id that would otherwise land on the composite
+    /// surface.
+    ///
+    /// # When this is `None`
+    ///
+    /// For an unknown `id`, and — structurally unreachably — for a real
+    /// id at or above `MASK_SURFACE_BIT - 1`.
+    /// `aurora_core::IdGenerator` starts at `0` and hands ids out one
+    /// at a time, monotonically, so reaching `2^63 - 1` would take
+    /// `2^63` layer creations in a single session; and an id
+    /// deserialized from an untrusted file cannot get there either,
+    /// because this module's own crate-private
+    /// `validate_layer_id_range` refuses anything at or above
+    /// `MASK_SURFACE_BIT` outright. The branch exists because this
+    /// crate refuses to `panic` (see CLAUDE.md's "Lints worth
+    /// knowing": a panic costs a professional their unsaved work), so
+    /// an unreachable case still has to return something honest rather
+    /// than assert.
+    #[must_use]
+    pub fn mask_surface_id(&self, id: LayerId) -> Option<aurora_tile::SurfaceId> {
+        if !self.contains(id) || id.to_raw() >= crate::MASK_SURFACE_BIT - 1 {
+            return None;
+        }
+        Some(aurora_tile::SurfaceId::from_raw(
+            id.to_raw() | crate::MASK_SURFACE_BIT,
+        ))
     }
 
     #[must_use]
@@ -1730,20 +1897,33 @@ impl LayerTree {
     /// # Errors
     ///
     /// Returns [`DocError::UnknownLayer`] if `id` doesn't exist,
-    /// [`DocError::MaskAlreadyExists`] if it already has a mask, or
+    /// [`DocError::MaskAlreadyExists`] if it already has a mask,
     /// [`DocError::LayerOriginOutOfRange`] if `bounds`' own origin sits
     /// further than [`aurora_core::MAX_DOCUMENT_ORIGIN`] from the
     /// document origin — the same bound (and the same "negative is
     /// still legal") [`Self::set_bounds`] documents, applied to a
-    /// mask's own rectangle. Nothing is changed when any of these
-    /// happens; in particular a refused origin leaves the layer
-    /// maskless rather than half-masked.
+    /// mask's own rectangle — or [`DocError::LayerBoundsTooLarge`] if
+    /// its *extent* is past [`aurora_core::MAX_DOCUMENT_EXTENT`].
+    /// Nothing is changed when any of these happens; in particular a
+    /// refused rectangle leaves the layer maskless rather than
+    /// half-masked.
+    ///
+    /// **The extent check is here, and not only at the `.aur` file
+    /// boundary** (0.71.3). Since 0.71.0 a mask's rectangle drives a
+    /// real tile grid in `aurora-io`, and an oversized one is not a
+    /// large loop there but an unfinishable one. `aurora-io` refuses it
+    /// — but by then the tree already holds it, and that writer refuses
+    /// the *whole document*, so one oversized mask silently disables
+    /// every save and every crash-recovery autosave for the rest of the
+    /// session. A rectangle no writer will accept has no business
+    /// entering the tree, so it is refused where it is created.
     pub fn add_mask(&mut self, id: LayerId, bounds: Rect) -> Result<(), DocError> {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
         if entry.mask.is_some() {
             return Err(DocError::MaskAlreadyExists(id));
         }
         validate_origin(bounds)?;
+        validate_mask_extent(bounds)?;
         entry.mask = Some(LayerMask {
             bounds,
             enabled: true,
@@ -1784,7 +1964,7 @@ impl LayerTree {
     /// the same reason [`Self::restore`] gives: it puts back a rectangle
     /// that reached the tree through a checked route (the live-edit API,
     /// via [`Self::add_mask`], or the `.aur` file-read path, via
-    /// `aurora-io`'s `validate_mask_origins`), and re-checking would let
+    /// `aurora-io`'s `validate_persisted_rects`), and re-checking would let
     /// an ordinary undo fail on a value the tree itself produced. This
     /// type's own bare `Deserialize` is *not* one of those checked
     /// routes — see [`validate_origin`] for what that leaves open, and
@@ -1882,12 +2062,14 @@ impl LayerTree {
     /// level up — the only semantic `aurora_doc::BlendMode` can express,
     /// since it has no "Pass Through" variant to model Photoshop's own
     /// isolated-vs-pass-through distinction with — and, on both a plain
-    /// layer and a group's own isolated composite alike, clipping to the
-    /// layer's own [`LayerMask::bounds`] when it has one and
-    /// [`LayerMask::enabled`] is true; that clip is a hard rectangular
-    /// inside/outside test only — `LayerMask` still carries no per-pixel
-    /// mask data, so there is no feathering or soft edge, real grayscale
-    /// masking either), not a feature of this method. Callers that need
+    /// layer and a group's own isolated composite alike, masking by the
+    /// layer's own [`LayerMask`] when it has one and
+    /// [`LayerMask::enabled`] is true — real per-pixel grayscale
+    /// coverage since 0.70.0, read from the mask's own surface
+    /// ([`Self::mask_surface_id`], [`crate::mask`]) and multiplied with
+    /// the [`LayerMask::bounds`] rectangle, so feathering and soft
+    /// edges are expressible; it was a hard rectangular inside/outside
+    /// test only before that), not a feature of this method. Callers that need
     /// real per-group compositing should walk the tree shape directly
     /// rather than call `paint_order`, which remains what it always was:
     /// a flat, group-blind paint list for callers (a Layers-panel row
@@ -2092,6 +2274,154 @@ mod tests {
         let tree = LayerTree::new();
         let bogus: super::LayerId = Id::from_raw(0);
         assert_eq!(tree.surface_id(bogus), None);
+    }
+
+    #[test]
+    // A layer's mask coverage and its own pixels must never share a
+    // surface -- writing one would clobber the other.
+    fn mask_surface_id_differs_from_the_same_layers_own_pixel_surface() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_ne!(tree.mask_surface_id(id), tree.surface_id(id));
+        assert_eq!(
+            tree.mask_surface_id(id),
+            Some(aurora_tile::SurfaceId::from_raw(
+                id.to_raw() | crate::MASK_SURFACE_BIT
+            ))
+        );
+    }
+
+    #[test]
+    fn mask_surface_id_is_distinct_for_two_different_layers() {
+        let mut tree = LayerTree::new();
+        let a = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match tree.add_pixel_layer("b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_ne!(a, b);
+        assert_ne!(tree.mask_surface_id(a), tree.mask_surface_id(b));
+    }
+
+    #[test]
+    // The deliberate contrast with `surface_id`, which is `None` for a
+    // group: a group has no pixels of its own, but Photoshop masks
+    // groups and so does this compositor.
+    fn mask_surface_id_is_some_for_a_group_where_surface_id_is_none() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.surface_id(group), None);
+        assert!(tree.mask_surface_id(group).is_some());
+    }
+
+    #[test]
+    fn mask_surface_id_is_none_for_an_unknown_id() {
+        let tree = LayerTree::new();
+        let bogus: super::LayerId = Id::from_raw(0);
+        assert_eq!(tree.mask_surface_id(bogus), None);
+    }
+
+    #[test]
+    // `aurora-app`'s reserved composite surface is
+    // `SurfaceId::from_raw(u64::MAX)`; no mask surface may ever land on
+    // it. `IdGenerator` allocates from 0 upward, so a handful of real
+    // ids stands in for "every id a document could hold" -- and the one
+    // id that *would* collide (`MASK_SURFACE_BIT - 1`) is refused
+    // outright.
+    fn mask_surface_id_never_collides_with_the_reserved_composite_surface() {
+        let mut tree = LayerTree::new();
+        let composite = aurora_tile::SurfaceId::from_raw(u64::MAX);
+        for index in 0..64 {
+            let id = match tree.add_pixel_layer(format!("layer {index}"), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_ne!(tree.mask_surface_id(id), Some(composite));
+            assert_ne!(tree.surface_id(id), Some(composite));
+        }
+        // The single id whose masked form *would* be `u64::MAX`, and
+        // the two above it -- each **actually present in the tree**, so
+        // the arithmetic guard is what refuses them rather than
+        // `contains`. (This test asserted the same thing against a tree
+        // that did *not* contain those ids until 0.70.1, which made it
+        // vacuous: `mask_surface_id` short-circuits on `!contains`
+        // before it ever reaches the guard, so it would have stayed
+        // green with the guard deleted outright.)
+        //
+        // Built by struct literal because no other path can produce
+        // them: `IdGenerator` would need `2^63` allocations, and
+        // `validate_layer_id_range` refuses exactly these ids on the
+        // deserialization path. That is the point -- the guard is the
+        // last line behind a validator, so the test has to reach past
+        // the validator to exercise it.
+        for raw in [
+            crate::MASK_SURFACE_BIT - 1,
+            crate::MASK_SURFACE_BIT,
+            u64::MAX,
+        ] {
+            let colliding: super::LayerId = Id::from_raw(raw);
+            let mut layers = HashMap::new();
+            layers.insert(colliding, pixel_entry("boundary", None));
+            let forced = LayerTree {
+                ids: ids_for(&layers),
+                layers,
+                roots: vec![colliding],
+            };
+            assert!(forced.contains(colliding), "the guard, not `contains`");
+            assert_eq!(
+                forced.mask_surface_id(colliding),
+                None,
+                "layer id {raw} must not get a mask surface"
+            );
+        }
+
+        // ... while an ordinary id one step below the boundary block
+        // still gets one, so the guard is a boundary and not a blanket
+        // refusal.
+        let below: super::LayerId = Id::from_raw(crate::MASK_SURFACE_BIT - 2);
+        let mut layers = HashMap::new();
+        layers.insert(below, pixel_entry("below", None));
+        let forced = LayerTree {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![below],
+        };
+        assert_eq!(
+            forced.mask_surface_id(below),
+            Some(aurora_tile::SurfaceId::from_raw(u64::MAX - 1)),
+        );
+    }
+
+    #[test]
+    // The partition itself: every mask surface is in the top half of
+    // the id space, every pixel surface in the bottom half, so the two
+    // sets cannot overlap for *any* pair of layers, not just the same
+    // layer.
+    fn mask_surfaces_and_pixel_surfaces_occupy_opposite_halves_of_the_id_space() {
+        let mut tree = LayerTree::new();
+        for index in 0..8 {
+            let id = match tree.add_pixel_layer(format!("layer {index}"), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(mask) = tree.mask_surface_id(id) else {
+                unreachable!("a freshly generated id is far below MASK_SURFACE_BIT");
+            };
+            let Some(pixels) = tree.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            assert!(mask.to_raw() >= crate::MASK_SURFACE_BIT);
+            assert!(pixels.to_raw() < crate::MASK_SURFACE_BIT);
+        }
     }
 
     #[test]
@@ -3617,6 +3947,53 @@ mod tests {
     }
 
     #[test]
+    fn add_mask_rejects_an_extent_past_the_document_ceiling_and_leaves_the_layer_maskless() {
+        // The origin bar's companion (0.71.3). Since 0.71.0 a mask's
+        // rectangle drives a real tile grid in `aurora-io`'s `.aur`
+        // writer, so an oversized one there is an unfinishable loop --
+        // and `aurora-io` refusing it means refusing the *whole
+        // document*, so a single oversized mask would silently disable
+        // every save and every crash-recovery autosave for the rest of
+        // the session. Refused where it is created instead.
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let huge = Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT + 1,
+            height: 1,
+        };
+        match tree.add_mask(id, huge) {
+            Err(DocError::LayerBoundsTooLarge { width, height, max }) => {
+                assert_eq!(width, aurora_core::MAX_DOCUMENT_EXTENT + 1);
+                assert_eq!(height, 1);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+            }
+            other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+        }
+        assert!(
+            tree.mask(id).is_none(),
+            "a refused mask must leave the layer maskless, not half-masked"
+        );
+
+        // And the documented ceiling itself is still legal scope (PRD
+        // §7.3.1) -- the bar must not be what rejects the largest mask a
+        // real document can carry.
+        let at_ceiling = Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        if let Err(err) = tree.add_mask(id, at_ceiling) {
+            unreachable!("a mask exactly at the document ceiling must be accepted: {err:?}");
+        }
+    }
+
+    #[test]
     fn add_group_is_unaffected_by_the_origin_check() {
         // A group carries no bounds of its own, so `insert_unchecked`'s
         // `LayerKind::Pixel` guard must skip it entirely -- including a
@@ -4403,6 +4780,135 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_holding_a_layer_id_with_the_mask_surface_bit_set_is_rejected() {
+        // The cross-layer surface collision, as the crafted file that
+        // reaches it. Shape-wise flawless again -- two root pixel
+        // layers, no cycle, no orphan, no dangling reference, and a
+        // counter comfortably ahead of both ids, so every other
+        // validator passes. What is wrong is only which *numbers* the
+        // ids are: `victim` is an ordinary layer that carries a mask,
+        // and `attacker` is `victim`'s id with `MASK_SURFACE_BIT` set.
+        //
+        // `LayerTree::surface_id(attacker)` is `attacker.to_raw()` and
+        // `LayerTree::mask_surface_id(victim)` is
+        // `victim.to_raw() | MASK_SURFACE_BIT` -- the same number. One
+        // `aurora_tile` slot, two owners: painting the attacker layer's
+        // pixels rewrites what the victim layer's mask reads back as
+        // coverage, and vice versa, with no error raised anywhere.
+        let victim = super::LayerId::from_raw(5);
+        let attacker = super::LayerId::from_raw(5 | crate::MASK_SURFACE_BIT);
+        assert_eq!(
+            attacker.to_raw(),
+            victim.to_raw() | crate::MASK_SURFACE_BIT,
+            "the two ids really do alias one surface -- that is the bug"
+        );
+
+        let mut layers = HashMap::new();
+        layers.insert(victim, pixel_entry("victim", None));
+        layers.insert(attacker, pixel_entry("attacker", None));
+        let roots = vec![victim, attacker];
+
+        // Neither of the pre-0.70.1 whole-tree checks has a complaint,
+        // which is exactly why this shipped.
+        if let Err(err) = super::validate_shape(&layers, &roots, None, 1) {
+            unreachable!("the shape is valid; only the id numbering is: {err:?}");
+        }
+        let ids = ids_for(&layers);
+        if let Err(err) = super::validate_id_allocator(&ids, &layers) {
+            unreachable!("the counter is ahead of both ids: {err:?}");
+        }
+
+        match super::validate_layer_id_range(&ids, &layers) {
+            Err(DocError::ReservedLayerIdBit { id, limit }) => {
+                assert_eq!(id, attacker);
+                assert_eq!(limit, crate::MASK_SURFACE_BIT);
+            }
+            other => unreachable!("expected ReservedLayerIdBit, got {other:?}"),
+        }
+
+        // And refused at the door, through real bytes -- the reason
+        // pinned against the validator above rather than the message,
+        // for the same reason every neighbouring test does it that way.
+        let repr = TreeReprForTest { ids, layers, roots };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a manifest whose layer id aliases another layer's mask surface must be refused"
+        );
+    }
+
+    #[test]
+    fn a_manifest_whose_id_counter_is_already_in_the_mask_surface_half_is_rejected() {
+        // The other half of the same door. This file carries no
+        // offending id at all -- just one ordinary layer 0 -- but its
+        // counter is parked so that the *next* ordinary
+        // `add_pixel_layer` hands out an id with `MASK_SURFACE_BIT`
+        // set, which is the same collision one user action later.
+        let held = super::LayerId::from_raw(0);
+        let mut layers = HashMap::new();
+        layers.insert(held, pixel_entry("held", None));
+        let roots = vec![held];
+
+        let mut ids: IdGenerator<Layer> = IdGenerator::new();
+        ids.advance_past(crate::MASK_SURFACE_BIT - 1);
+        assert_eq!(ids.peek_next(), crate::MASK_SURFACE_BIT);
+        if let Err(err) = super::validate_id_allocator(&ids, &layers) {
+            unreachable!("the counter is far ahead of layer 0: {err:?}");
+        }
+
+        match super::validate_layer_id_range(&ids, &layers) {
+            Err(DocError::ReservedLayerIdCounter { next, limit }) => {
+                assert_eq!(next, crate::MASK_SURFACE_BIT);
+                assert_eq!(limit, crate::MASK_SURFACE_BIT);
+            }
+            other => unreachable!("expected ReservedLayerIdCounter, got {other:?}"),
+        }
+
+        let repr = TreeReprForTest { ids, layers, roots };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a manifest whose id counter is about to hand out a mask-surface id must be refused"
+        );
+    }
+
+    #[test]
+    fn surface_id_refuses_an_id_in_the_mask_surface_half_even_past_validation() {
+        // The belt-and-braces half of the fix: the guard lives on the
+        // accessor too, not only in the validator, so a tree assembled
+        // some third way still cannot hand out an aliasing surface.
+        // Struct literal, because `validate_layer_id_range` is exactly
+        // what stops every ordinary path from producing this.
+        let victim = super::LayerId::from_raw(5);
+        let attacker = super::LayerId::from_raw(5 | crate::MASK_SURFACE_BIT);
+        let mut layers = HashMap::new();
+        layers.insert(victim, pixel_entry("victim", None));
+        layers.insert(attacker, pixel_entry("attacker", None));
+        let forced = LayerTree {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![victim, attacker],
+        };
+
+        assert!(forced.contains(attacker));
+        assert_eq!(
+            forced.surface_id(attacker),
+            None,
+            "a pixel surface must never be addressed in the mask half"
+        );
+        // The victim's own mask surface is unaffected, and so is its
+        // own pixel surface -- the guard is one-sided.
+        assert_eq!(
+            forced.mask_surface_id(victim),
+            Some(aurora_tile::SurfaceId::from_raw(
+                5 | crate::MASK_SURFACE_BIT
+            ))
+        );
+        assert_eq!(
+            forced.surface_id(victim),
+            Some(aurora_tile::SurfaceId::from_raw(5))
+        );
+    }
+
+    #[test]
     fn a_stale_counter_cannot_silently_destroy_the_layer_already_under_that_id() {
         // The whole reason the counter is checked at all, reproduced as
         // the sequence it would actually take. This builds the tree the
@@ -4626,6 +5132,77 @@ mod tests {
             unreachable!("a tree with a subtree restored must still decode: {err}");
         }
         assert_eq!(tree.roots(), &[sibling, outer]);
+    }
+
+    /// The root leads `RemovedSubtree::entries`, and something outside
+    /// this file depends on it.
+    ///
+    /// `capture_subtree` documents its visit order as "root first, then
+    /// each child's own subtree in stored order", and
+    /// `History::describe`'s `Restore` arm now searches only the first
+    /// `MAX_ROOT_SEARCH_ENTRIES` entries for the root's recorded name —
+    /// so a capture that stopped leading with the root would silently
+    /// turn every deep subtree's History-panel description into the
+    /// `"layer"` placeholder. A review round proved the gap by mutation:
+    /// reversing `entries` after the capture left all 199 tests in this
+    /// crate green. This is the test that would have failed.
+    ///
+    /// Deliberately a *multi-entry* capture (a group, three children,
+    /// one of them a nested group with its own child), because a
+    /// one-element list satisfies "root first" no matter what the walk
+    /// does. The whole subtree must be captured, too — a bound that
+    /// holds only because entries went missing would be no bound at all.
+    #[test]
+    fn remove_capturing_puts_the_root_first_in_its_captured_entries() {
+        let mut tree = LayerTree::new();
+        let root = match tree.add_group("root", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let nested = match tree.add_group("nested", Some(root)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut expected = vec![root, nested];
+        for (name, parent) in [
+            ("deep", nested),
+            ("first", root),
+            ("second", root),
+            ("third", root),
+        ] {
+            match tree.add_pixel_layer(name, bounds(), Some(parent)) {
+                Ok(id) => expected.push(id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        let removed = match tree.remove_capturing(root) {
+            Ok(removed) => removed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some((first, _)) = removed.entries.first() else {
+            unreachable!(
+                "a captured subtree is never empty: {}",
+                removed.entries.len()
+            );
+        };
+        assert_eq!(
+            *first, removed.root,
+            "the root must lead the captured entries -- `History::describe` searches only \
+             the first MAX_ROOT_SEARCH_ENTRIES of them for it"
+        );
+
+        // `LayerId` is `Eq` but not `Ord`, so compare the raw values --
+        // this is about *which* layers were captured, not their order
+        // (the order assertion above is the one that matters).
+        let mut captured: Vec<_> = removed.entries.iter().map(|(id, _)| id.to_raw()).collect();
+        captured.sort_unstable();
+        let mut expected: Vec<_> = expected.iter().map(|id| id.to_raw()).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            captured, expected,
+            "the whole subtree must be captured, not merely a prefix of it"
+        );
     }
 
     // --- restore: cross-references, in both directions -----------------

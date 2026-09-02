@@ -1,11 +1,18 @@
 //! Shared "get a real device or skip" pattern for this crate's real-GPU
 //! tests — same rationale as `aurora_gpu::test_support` (real hardware
-//! verification, not a mock, matching this project's general practice),
-//! duplicated locally since that helper is private to `aurora-gpu`.
+//! verification, not a mock, matching this project's general practice).
+//!
+//! The skip-vs-fail *decision* is not duplicated here: it lives once in
+//! `aurora_gpu::test_support::real_context_or_skip`, reached through
+//! `aurora-gpu`'s `test-support` feature (enabled from this crate's
+//! `[dev-dependencies]`). What stays local is only the crate-local
+//! [`GPU_TEST_LOCK`] and the wrapper that bundles its guard with the
+//! context — this crate compiles to its own test binary, so a lock in
+//! another crate would not cover it.
 
 #![cfg(test)]
 
-use aurora_gpu::{GpuContext, GpuError};
+use aurora_gpu::GpuContext;
 use std::sync::{Mutex, MutexGuard};
 
 /// Serializes this crate's real-GPU tests. `aurora-gpu` found a real
@@ -30,26 +37,19 @@ impl std::ops::Deref for GpuTestContext {
 }
 
 /// `None` is an inconclusive skip (no GPU adapter on this machine/CI
-/// runner); any other failure is a real bug and panics — matching
-/// `aurora_gpu::test_support::real_context`'s own reasoning exactly.
+/// runner, and `AURORA_REQUIRE_GPU` unset); any other failure — and a
+/// missing adapter with that variable set — is a real bug and panics.
+/// The decision itself lives in
+/// `aurora_gpu::test_support::real_context_or_skip`, which this crate
+/// reaches via its `test-support` dev-dependency feature; only the lock
+/// and the guard-bundling wrapper are local, since this crate compiles
+/// to its own test binary.
 pub(crate) fn real_context() -> Option<GpuTestContext> {
     let guard = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match GpuContext::new() {
-        Ok(context) => Some(GpuTestContext {
-            _guard: guard,
-            context,
-        }),
-        Err(GpuError::NoSuitableAdapter) => {
-            eprintln!("SKIPPED: no GPU adapter available on this machine/CI runner");
-            None
-        }
-        Err(err) => {
-            #[allow(clippy::panic)]
-            {
-                panic!("device request failed with a real adapter present: {err}");
-            }
-        }
-    }
+    aurora_gpu::test_support::real_context_or_skip().map(|context| GpuTestContext {
+        _guard: guard,
+        context,
+    })
 }

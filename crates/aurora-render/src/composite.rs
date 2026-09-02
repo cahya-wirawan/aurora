@@ -589,9 +589,12 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 ///   whole tile. That is the one that closed the real, reachable hole: a
 ///   truncated or corrupted scratch-disk file used to page in as a short
 ///   slice, and is now a `TileError` at its source.
-/// * `aurora-app`'s `dissolve_gate` and `apply_mask_clip` — both
-///   allocate `vec![…; texels.len()]`, so they are length-preserving
-///   whatever they are handed.
+/// * `aurora-app`'s `dissolve_gate` and `apply_mask` — both allocate
+///   `vec![…; texels.len()]`, so they are length-preserving whatever
+///   they are handed. (`apply_mask` was called `apply_mask_clip` until
+///   0.70.0 gave layer masks real per-pixel coverage; the mask
+///   coverage window it now reads is a separate buffer and does not
+///   change the length of what it returns.)
 /// * `aurora-app`'s `decode_f16_samples` (the GPU readback path) —
 ///   enforces `out.len() == aurora_tile::SAMPLES` itself and returns
 ///   `None` otherwise, entirely independently of this crate.

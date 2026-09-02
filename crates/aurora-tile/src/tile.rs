@@ -117,6 +117,18 @@ impl Tile {
     pub fn take_dirty(&mut self) -> Option<Rect> {
         self.dirty.take()
     }
+
+    /// Whether anything is currently marked dirty, **without clearing
+    /// it** — [`Tile::take_dirty`]'s non-consuming counterpart.
+    ///
+    /// For a caller that has to *decide* whether it can act on the
+    /// dirtiness before consuming it: taking the rectangle and then
+    /// declining to upload loses the flag, and the tile is then never
+    /// uploaded again until some unrelated edit marks it dirty afresh.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.is_some()
+    }
 }
 
 #[cfg(test)]

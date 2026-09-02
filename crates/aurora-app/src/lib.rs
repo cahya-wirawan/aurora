@@ -151,8 +151,15 @@
 //! are plain data, constructible with no window either.
 //!
 //! **Crash recovery and autosave** (PLAN.md M1.9): `run` writes a small
-//! marker file (`std::env::temp_dir()`) at startup and clears it on a
-//! clean `WindowEvent::CloseRequested` shutdown; if a *previous* run's
+//! marker file (`std::env::temp_dir()`) at startup and clears it on
+//! every clean shutdown — both the `WindowEvent::CloseRequested` arm
+//! and `ApplicationHandler::exiting`, which is the one macOS's own menu
+//! Quit (a path that never produces a close request) goes through. A run
+//! that aborts through `App::fail` reaches `exiting` too but is
+//! deliberately exempt: it never got a window up, so it may be holding a
+//! *previous* crash's recovered document whose only on-disk copy is that
+//! autosave, behind a recovery dialog that was never shown — see
+//! `aborted_startup_cleanup`. If a *previous* run's
 //! marker is still there, this run shows a real, modal
 //! `Role::AlertDialog` (`aurora_widgets::widgets::dialog`) saying so.
 //! Document recovery is now real, not just detected: `aurora-doc`'s
@@ -891,6 +898,13 @@ fn aur_verify_scratch_dir() -> Option<tempfile::TempDir> {
                 "could not recreate this session's scratch directory for .aur verification"
             );
         }
+        // Recreating the directory does not bring its lock file back,
+        // and the guard this process holds is attached to the deleted
+        // inode -- so without this the session becomes permanently
+        // invisible to every future startup sweep. See
+        // `ensure_session_scratch_lock`, which is a no-op in the
+        // overwhelmingly common case where nothing was removed.
+        ensure_session_scratch_lock(session);
         match builder.tempdir_in(session) {
             Ok(dir) => return Some(dir),
             Err(err) => {
@@ -924,16 +938,46 @@ fn aur_verify_scratch_dir() -> Option<tempfile::TempDir> {
 
 /// Creates `dir` (and any missing parent) owner-only on Unix, and
 /// accepts one that already exists — `aurora_tile`'s own
-/// `create_private_dir` without the hardening checks, which is all this
-/// needs: the only caller ([`aur_verify_scratch_dir`]) is recreating a
-/// directory this process itself created under a random name, not
-/// adopting an arbitrary caller-supplied path.
+/// `create_private_dir` without its full `O_NOFOLLOW`/ownership
+/// treatment, which this deliberately does not need: the only caller
+/// ([`aur_verify_scratch_dir`]) is recreating a directory this process
+/// itself created under a random name, not adopting an arbitrary
+/// caller-supplied path, and the directory this recreates is nested
+/// under an already-`0o700` session directory — bounding the impact of a
+/// planted symlink here to a forced, attacker-triggerable verification
+/// failure, not a data leak (PLAN.md).
+///
+/// **Refuses a symlink rather than following it** — the cheap half of
+/// `create_private_dir`'s hardening, `symlink_metadata`-based and
+/// `std`-only, deliberately stopping short of that function's
+/// descriptor-based `fchmod`/ownership check. That fuller treatment
+/// needs a `libc` dependency and `aurora-tile`'s `unsafe_code`
+/// exception; pulling both into `aurora-app` for a gap this bounded is
+/// not worth it today. `std::fs::DirBuilder::create` on its own already
+/// refuses a symlink no differently than any other pre-existing
+/// non-directory — the *point* of this check is the specific, honest
+/// error message a bare `EEXIST` would not give.
 ///
 /// Windows gets the parent's inherited ACL, the same gap
 /// [`create_autosave_temp`] already discloses.
 #[cfg(unix)]
 fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
     use std::os::unix::fs::DirBuilderExt as _;
+
+    if let Ok(existing) = std::fs::symlink_metadata(dir)
+        && existing.file_type().is_symlink()
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to recreate {} as a scratch directory: it is a symlink, and following \
+                 it would create and chmod whatever it points at",
+                dir.display()
+            ),
+        ));
+    }
+
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -1252,11 +1296,20 @@ fn autosave_path() -> PathBuf {
 /// healing into a blank one, so without this one bad tile would have
 /// aborted every autosave for the rest of the session — every other
 /// layer, every subsequent edit, silently unprotected.
+/// `skipped` is the document's own carried record of what it is already
+/// missing ([`App::skipped_tiles`]), **in and out**: it is handed to the
+/// writer so previously-known losses land in this container too, and any
+/// tile *this* write has to drop is folded back into it
+/// (`aurora_io::SkippedTiles::record`) so the next write carries that as
+/// well. Nothing else can: a tile an earlier writer dropped is not in
+/// `store` at all, so this pass would otherwise walk past it as "never
+/// painted".
 fn write_autosave(
     path: &Path,
     layers: &aurora_doc::LayerTree,
     history: &aurora_doc::History,
     canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
 ) {
     let temp_path = autosave_temp_path(path);
@@ -1273,22 +1326,45 @@ fn write_autosave(
     // Where this write is allowed to land, decided by whether it turned
     // out to be complete -- see this function's own doc comment.
     let destination;
-    match aurora_io::write_aur_best_effort(&mut file, layers, history, canvas_size, None, store) {
-        Ok(skipped) if skipped.is_empty() => {
+    match aurora_io::write_aur_best_effort(
+        &mut file,
+        layers,
+        history,
+        canvas_size,
+        None,
+        skipped,
+        store,
+    ) {
+        // The complete-vs-`.partial` choice keys on what *this* write
+        // dropped, never on the carried record, and that is deliberate.
+        // A document opened from a file that already lost tiles is
+        // permanently missing them, so keying on the carried total would
+        // route every autosave for the rest of the session to
+        // `.partial` -- and the primary autosave, the one crash
+        // recovery reaches for first, would then never be updated again.
+        // The loss is still recorded *inside* whichever file is written;
+        // it just no longer disables the primary path forever.
+        Ok(fresh) if fresh.is_empty() => {
             destination = path.to_path_buf();
         }
-        Ok(skipped) => {
+        Ok(fresh) => {
+            // Folded into the carried record before anything else, so
+            // even the log line below and every later write of this
+            // document agree on what has been lost.
+            skipped.record(&fresh);
+            let skipped_now = fresh;
             // Loud, and every time: the file about to be written is
             // knowingly incomplete, which is exactly the thing that must
             // never be silent. The first one is named in full; the count
             // covers the rest without turning a broken scratch disk into
             // an unbounded log.
-            let first = skipped
+            let first = skipped_now
                 .first()
                 .map_or_else(String::new, |tile| format!("{tile:?}"));
             destination = partial_autosave_path(path);
             tracing::warn!(
-                skipped = skipped.len(),
+                skipped = skipped_now.len(),
+                known_total = skipped.total(),
                 %first,
                 path = %destination.display(),
                 "autosaving with tiles missing to the *partial* autosave path; the last complete \
@@ -1452,10 +1528,7 @@ fn remove_autosave(path: &Path) {
 /// this mid-session would need more thought than just a fresh call site
 /// — the recovered surfaces would overwrite whatever those same
 /// `SurfaceId`s currently hold.
-fn recover_document(
-    path: &Path,
-    store: &mut aurora_tile::TileStore,
-) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+fn recover_document(path: &Path, store: &mut aurora_tile::TileStore) -> Option<RecoveredDocument> {
     // A complete autosave always wins, even if a partial one is newer
     // (0.52.2, second review round). The partial file exists only for
     // the case where the scratch disk went bad before any complete
@@ -1497,18 +1570,27 @@ fn recover_document(
 /// **The store is replaced first**, the same reopen (and for the same
 /// reason) [`startup_document`] already performs after a failed
 /// recovery: `aurora_io::read_aur` writes each tile into the store as it
-/// goes, so an attempt that fails partway through leaves real pixels
+/// goes, so an attempt that fails partway through can leave real pixels
 /// behind on surfaces the partial container's own layers are about to
 /// claim. Recovering *into* those leftovers would show fragments of the
 /// container that failed to read, mixed into the document that
-/// succeeded. This takes `&mut Option<_>` for exactly that reason —
+/// succeeded.
+///
+/// Since 0.71.2 `read_aur` also rolls its own committed tiles back
+/// before returning `Err`, which closes that hole at its root and for
+/// *every* caller, this one included. The reopen stays anyway, as
+/// defence in depth on the one path where the cost is a fresh temp
+/// directory and the failure mode is showing a professional someone
+/// else's pixels: it is the only guard that does not depend on
+/// `aurora-io` getting its own rollback right. This takes
+/// `&mut Option<_>` for exactly that reason —
 /// `None` from [`open_tile_store`] means the session simply continues
 /// without painting, which is what `None` already means everywhere else
 /// on this path.
 fn recover_partial_after_a_failed_read(
     path: &Path,
     store_slot: &mut Option<aurora_tile::TileStore>,
-) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+) -> Option<RecoveredDocument> {
     let partial = partial_autosave_path(path);
     if !partial.exists() {
         return None;
@@ -1530,7 +1612,7 @@ fn recover_partial_after_a_failed_read(
 fn read_autosave_container(
     path: &Path,
     store: &mut aurora_tile::TileStore,
-) -> Option<(aurora_doc::LayerTree, aurora_doc::History, (u32, u32))> {
+) -> Option<RecoveredDocument> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -1545,13 +1627,58 @@ fn read_autosave_container(
     // tracks a "current document profile" to restore it into, because no
     // colour-management UI exists to have set one -- and an autosave this
     // crate wrote always carries `None` anyway ([`write_autosave`]).
+    //
+    // `skipped_tiles` is **kept** as of 0.74.1, and carried into
+    // `App::skipped_tiles` like any other opened document's -- so a
+    // recovered autosave that really was written with tiles missing goes
+    // on saying so in every file this session writes next, instead of
+    // having the record erased by its own first autosave.
+    //
+    // What is still deliberately deferred is *warning about it here*.
+    // A recovered autosave written by `write_aur_best_effort` can
+    // genuinely be missing tiles, and this path -- crash recovery, on
+    // the pre-window startup route -- is exactly where a user would most
+    // want to be told. Two concrete reasons it is not done yet: this
+    // path has its own separate partial-autosave fallback logic
+    // (`recover_document` tries the `.partial` container after the
+    // primary one) and its own test suite, so warning correctly here
+    // means getting the interaction between two fallbacks and a modal
+    // dialog right on a path that runs before there is a window; and the
+    // dialog slot at startup is already claimed by the crash-recovery
+    // dialog itself (`open_crash_recovery_dialog`), so this needs a
+    // message design decision, not just a call. The warning still fires
+    // on the explicit "File > Open" path only
+    // (`App::open_aur_file`). PLAN.md records the rest as open, and its
+    // checkbox is `[~]`, not `[x]`.
     match aurora_io::read_aur(file, store) {
-        Ok((layers, history, canvas_size, _profile)) => Some((layers, history, canvas_size)),
+        Ok(document) => Some(RecoveredDocument {
+            layers: document.layers,
+            history: document.history,
+            canvas_size: document.canvas_size,
+            skipped_tiles: document.skipped_tiles,
+        }),
         Err(err) => {
             tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
             None
         }
     }
+}
+
+/// One `.aur` autosave container, read back — what
+/// [`read_autosave_container`] and [`recover_document`] hand up.
+///
+/// A named struct rather than the tuple this was until 0.74.1, for the
+/// same reason `aurora_io::AurDocument` is one: `skipped_tiles` is a
+/// field a caller must not silently drop, and a fourth positional
+/// element is exactly the thing a tuple makes easy to drop.
+struct RecoveredDocument {
+    layers: aurora_doc::LayerTree,
+    history: aurora_doc::History,
+    canvas_size: (u32, u32),
+    /// What this recovered document is already known to be missing —
+    /// carried into [`App::skipped_tiles`], not warned about yet; see
+    /// [`read_autosave_container`]'s own comment.
+    skipped_tiles: aurora_io::SkippedTiles,
 }
 
 /// What [`App::new`] starts this session with — see
@@ -1563,6 +1690,12 @@ struct StartupDocument {
     /// manifest carries one), or [`document_canvas_size`]'s fallback for
     /// a [`demo_document`], which has none of its own.
     canvas_size: (u32, u32),
+    /// What the recovered document is already known to be missing
+    /// (`aurora_io::SkippedTiles`) — empty for a [`demo_document`],
+    /// which has never been written at all, and carried straight into
+    /// [`App::skipped_tiles`] so this session's own writes keep the
+    /// record instead of erasing it.
+    skipped_tiles: aurora_io::SkippedTiles,
     /// Whether this really came from an autosave — what the
     /// crash-recovery dialog's own message reports
     /// ([`crash_recovery_dialog_message`]).
@@ -1607,6 +1740,7 @@ fn startup_document(
             layers,
             history,
             canvas_size,
+            skipped_tiles: aurora_io::SkippedTiles::new(),
             was_recovered: false,
         };
     }
@@ -1628,7 +1762,13 @@ fn startup_document(
         }
         None => None,
     };
-    if let Some((layers, history, canvas_size)) = recovered {
+    if let Some(RecoveredDocument {
+        layers,
+        history,
+        canvas_size,
+        skipped_tiles,
+    }) = recovered
+    {
         // Nothing written back out: the file on disk *is* this
         // document, read back a few lines ago and not touched since.
         // Rewriting it here would be a full container rebuild (see
@@ -1644,15 +1784,21 @@ fn startup_document(
             layers,
             history,
             canvas_size,
+            skipped_tiles,
             was_recovered: true,
         };
     }
     if had_previous_marker {
-        // A recovery attempt that failed can still have committed real
-        // pixels: `aurora_io::read_aur` writes each tile into the store
-        // as it goes, so a container whose central directory is intact
-        // but whose *last* tile entry is corrupt leaves earlier
-        // surfaces already populated before it returns `Err`. Those are
+        // A recovery attempt that failed could still have committed
+        // real pixels: `aurora_io::read_aur` writes each tile into the
+        // store as it goes, so a container whose central directory is
+        // intact but whose *last* tile entry is corrupt left earlier
+        // surfaces already populated before it returned `Err` -- until
+        // 0.71.2, which made that read roll its own committed tiles
+        // back. This reopen is kept as defence in depth: it costs a
+        // fresh temp directory once per failed recovery, and it is the
+        // only guard here that does not rest on another crate's
+        // rollback being right. Those surfaces are
         // the same `SurfaceId`s [`demo_document`]'s own fresh layers are
         // about to claim, so keeping the store would show the user
         // fragments of the document that failed to recover, painted
@@ -1664,8 +1810,20 @@ fn startup_document(
         *store_slot = open_tile_store();
     }
     let (layers, history, canvas_size) = fresh();
+    // A brand-new document has lost nothing, so this starts empty --
+    // but it is still threaded through rather than passed as a throwaway
+    // temporary, because this write can itself hit an unreadable tile
+    // and what it drops has to reach `App::skipped_tiles`.
+    let mut skipped_tiles = aurora_io::SkippedTiles::new();
     if let Some(store) = store_slot.as_mut() {
-        write_autosave(autosave_path, &layers, &history, canvas_size, store);
+        write_autosave(
+            autosave_path,
+            &layers,
+            &history,
+            canvas_size,
+            &mut skipped_tiles,
+            store,
+        );
     } else {
         tracing::warn!("no live tile store; skipping this session's autosave");
     }
@@ -1673,6 +1831,7 @@ fn startup_document(
         layers,
         history,
         canvas_size,
+        skipped_tiles,
         was_recovered: false,
     }
 }
@@ -1823,46 +1982,260 @@ fn crash_recovery_dialog_message(recovered: bool) -> &'static str {
     }
 }
 
-/// Opens the crash-recovery dialog (a no-op if one is already open):
-/// inserts it into `workspace.tree` under `workspace.root` and moves
-/// keyboard focus to its first (only, today) action.
+/// Opens a modal dialog (a no-op if one is already open): inserts it
+/// into `workspace.tree` under `workspace.root` and moves keyboard focus
+/// to its first action.
+///
+/// The generic mechanism every dialog this crate opens goes through —
+/// [`open_crash_recovery_dialog`] is one thin wrapper, and
+/// [`App::save_file`]'s and [`App::apply_move`]'s own refusals are the
+/// other two. **The "already open is a no-op" guard lives here, not in
+/// the wrappers**, so every caller inherits it: `App` holds exactly one
+/// dialog slot, a modal alert already blocks everything else, and a
+/// caller that fires repeatedly (a pointer-move during a refused drag,
+/// say) must not stack or replace what the user is currently reading.
+///
+/// **Returns whether it actually opened**, which is not decoration
+/// (0.68.2): a caller that latches "the user has now been told" — as
+/// [`App::apply_move`] does, on the drag itself — must latch only when
+/// the dialog genuinely appeared. Latching unconditionally means a
+/// refusal suppressed by an unrelated dialog is never offered again for
+/// the rest of that gesture, and the user is shown nothing at all. The
+/// suppressed case is also logged here, naming the dialog that lost, so
+/// the event survives in the record even when it never reached a screen.
+///
+/// Pushing the updated accessibility tree to the platform, and re-running
+/// layout so the new subtree actually has bounds, stay the caller's job
+/// (`App::push_accessibility`/`App::apply_resize`) — the same "pure
+/// dispatch, caller owns the one real platform side-effect" split
+/// [`select_layer`] already uses.
+fn open_dialog(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<DialogHandle>,
+    scales: &Scales,
+    title: &str,
+    message: &str,
+    actions: Vec<DialogAction>,
+) -> bool {
+    if dialog.is_some() {
+        tracing::warn!(
+            suppressed = title,
+            "a modal dialog is already open, so this one was not shown; \
+             the condition it reports is still recorded in the log above"
+        );
+        return false;
+    }
+    let handle = match insert_dialog(
+        &mut workspace.tree,
+        workspace.root,
+        scales,
+        title,
+        message,
+        actions,
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(?err, title, "failed to open a dialog");
+            return false;
+        }
+    };
+    if let Some(button) = handle.first_action()
+        && let Err(err) = focus.focus(&mut workspace.tree, button)
+    {
+        tracing::warn!(?err, title, "failed to focus a dialog");
+    }
+    *dialog = Some(handle);
+    true
+}
+
+/// Opens the crash-recovery dialog — [`open_dialog`] with this dialog's
+/// own title, message ([`crash_recovery_dialog_message`]) and actions
+/// ([`crash_recovery_dialog_actions`]), and therefore a no-op if a
+/// dialog is already open.
 fn open_crash_recovery_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     dialog: &mut Option<DialogHandle>,
     scales: &Scales,
     recovered: bool,
-) {
-    if dialog.is_some() {
-        return;
-    }
-    let handle = match insert_dialog(
-        &mut workspace.tree,
-        workspace.root,
+) -> bool {
+    open_dialog(
+        workspace,
+        focus,
+        dialog,
         scales,
         "Aurora Didn't Close Properly",
         crash_recovery_dialog_message(recovered),
         crash_recovery_dialog_actions(),
-    ) {
-        Ok(handle) => handle,
-        Err(err) => {
-            tracing::warn!(?err, "failed to open the crash recovery dialog");
-            return;
-        }
-    };
-    if let Some(button) = handle.first_action()
-        && let Err(err) = focus.focus(&mut workspace.tree, button)
-    {
-        tracing::warn!(?err, "failed to focus the crash recovery dialog");
-    }
-    *dialog = Some(handle);
+    )
 }
 
-/// Closes the crash-recovery dialog (a no-op if none is open): removes
-/// it from `workspace.tree` and clears any focus left dangling on it —
-/// the same [`FocusManager::validate`] pattern
-/// [`close_command_palette`] already uses.
-fn close_crash_recovery_dialog(
+const EXPORT_REFUSED_DISMISS: &str = "export.refused.dismiss";
+
+/// The export-refused dialog's own action — a single "OK", because there
+/// is nothing to choose: the export already refused, and no file was
+/// touched. Acknowledging is the whole interaction, the same shape
+/// [`crash_recovery_dialog_actions`] settled on for the same reason.
+fn export_refused_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(EXPORT_REFUSED_DISMISS, "OK")]
+}
+
+/// The itemized message for an export refused because
+/// [`composite_document`] could not read every tile it needed
+/// ([`aurora_io::IoError::IncompleteComposite`]).
+///
+/// Itemized, not generic, because that is what makes it actionable and
+/// what CLAUDE.md's own "warn with an itemized list" rule asks for: the
+/// count of failed tile reads and the first failure's own message, both
+/// of which the error already carries. It also states plainly that
+/// nothing was written and that whatever was already at the path is
+/// untouched — the single most important fact for someone who just hit
+/// Save on unsaved work.
+fn incomplete_composite_message(skipped: usize, first: &str) -> String {
+    let plural = if skipped == 1 { "" } else { "s" };
+    format!(
+        "Nothing was written. {skipped} layer tile read{plural} failed while compositing this \
+         document, so the exported image would have been missing content. The first failure was: \
+         {first}. Any existing file at that path is unchanged."
+    )
+}
+
+const SKIPPED_TILES_DISMISS: &str = "skipped.tiles.dismiss";
+
+/// The missing-content dialog's own action — a single "OK", for the
+/// same reason [`export_refused_dialog_actions`] has one: there is
+/// nothing to choose. The file has already been opened, and what it is
+/// missing cannot be recovered from it, so acknowledging is the whole
+/// interaction.
+fn skipped_tiles_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(SKIPPED_TILES_DISMISS, "OK")]
+}
+
+/// The itemized message for a `.aur` file that was written by
+/// `aurora_io::write_aur_best_effort` with tiles it could not read
+/// (`aurora_io::AurDocument::skipped_tiles`).
+///
+/// Itemized for the same reason [`incomplete_composite_message`] is —
+/// CLAUDE.md's own "warn with an itemized list" rule — and it carries
+/// the one fact that separates this case from that one: **the content
+/// is already gone from the file**, so unlike a refused export there is
+/// nothing left untouched to reassure the user about. Saying so plainly
+/// is the point; a user who is told only "some tiles were skipped" will
+/// reasonably assume a reopen fixes it.
+///
+/// A record's `reason` is **file-controlled text** — it came out of the
+/// container being opened, and it is heading for a rendered label and
+/// an `accesskit` announcement — so it goes through
+/// `aurora_doc::sanitize_display_name` here, exactly as the layer names
+/// out of the same file already do on their way to the Layers panel.
+///
+/// **Three things it deliberately no longer claims** (0.74.1):
+///
+/// - *Who wrote it.* The wording said "this file was saved by
+///   crash-recovery autosave", which the file cannot prove and the
+///   record does not carry. `aurora_io::write_aur_best_effort` is public
+///   API, and a `.aur` file is a file a user may have been sent. What is
+///   provable is that content is missing, and that is what it says.
+/// - *An exact count for a truncated list.* The entry's own `total` may
+///   exceed the records it carries (`aurora_io::SkippedTiles::
+///   is_truncated`), so the count becomes "at least N" exactly when it
+///   is a floor. Presenting a capped number as a fact is the failure
+///   this whole message exists to avoid.
+/// - *That every loss is image data.* The writer already distinguishes a
+///   lost **mask coverage** tile from a lost pixel-layer tile
+///   (`aurora_doc::MASK_SURFACE_BIT`), and the record persists it; until
+///   0.74.1 every reader threw that away and said "image data" for both.
+fn skipped_tiles_message(skipped: &aurora_io::SkippedTiles) -> String {
+    let total = skipped.total();
+    let plural = if total == 1 { "" } else { "s" };
+    let was = if total == 1 { "was" } else { "were" };
+    let count = if skipped.is_truncated() {
+        format!("at least {total}")
+    } else {
+        total.to_string()
+    };
+    // What was lost, in the terms the record actually supports. A file
+    // whose detail this build could not decode (an unrecognised
+    // `skipped-tiles` schema version) carries a count and no records at
+    // all, and "content" is the honest word for that.
+    let (mask, layer) = skipped
+        .records()
+        .iter()
+        .fold((false, false), |(mask, layer), record| {
+            if record.is_mask() {
+                (true, layer)
+            } else {
+                (mask, true)
+            }
+        });
+    let kind = match (mask, layer) {
+        (true, true) => "image data and mask coverage",
+        (true, false) => "mask coverage",
+        (false, true) => "image data",
+        (false, false) => "content",
+    };
+    let first = skipped.first().map_or_else(String::new, |record| {
+        let reason = aurora_doc::sanitize_display_name(&record.reason);
+        format!(" The first one was left out because: {reason}.")
+    });
+    format!(
+        "{count} tile{plural} of {kind} could not be read when this document was last written \
+         to disk, so {was} left out. That content is not in this file and cannot be recovered \
+         by reopening it.{first} Everything else in the document opened normally."
+    )
+}
+
+/// Whether an opened document needs the missing-content warning, and
+/// what it should say — `None` when the file lost nothing, which is
+/// every ordinary save and every file written before the
+/// `skipped-tiles` entry existed.
+///
+/// **The decision itself, extracted so it can be tested** (0.74.1).
+/// [`App::open_aur_file`] calls exactly this and does nothing else with
+/// `skipped_tiles`, so a test of this function is a test of the branch
+/// that really runs. The tests around it previously re-implemented the
+/// condition and the dialog title by hand, and so would have passed
+/// unchanged if `open_aur_file`'s own wiring had been deleted or pointed
+/// at the wrong field.
+fn skipped_tiles_warning(skipped: &aurora_io::SkippedTiles) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    Some(skipped_tiles_message(skipped))
+}
+
+const MOVE_REFUSED_DISMISS: &str = "move.refused.dismiss";
+
+/// The move-refused dialog's own action — a single "OK", for the same
+/// reason [`export_refused_dialog_actions`] has one: nothing is being
+/// chosen. The drag is still live and still the user's to finish or
+/// abandon; this only tells them why it stopped moving.
+fn move_refused_dialog_actions() -> Vec<DialogAction> {
+    vec![DialogAction::new(MOVE_REFUSED_DISMISS, "OK")]
+}
+
+/// The message for a `Drag::Move` that `aurora_doc::LayerTree::set_bounds`
+/// refused with `DocError::LayerOriginOutOfRange`.
+///
+/// **It must not claim anything was undone**, because nothing was: the
+/// rejected origin was never written to the document, so there is no
+/// state to restore. What actually happens is that the layer stops
+/// following the pointer while the drag itself keeps running normally,
+/// and that is what this says — the user is looking at a layer that has
+/// visibly stopped tracking their cursor and needs to know that is the
+/// document's limit, not a hang.
+fn move_refused_message() -> &'static str {
+    "This layer can't move any further in that direction: its origin would leave the document's \
+     own coordinate range. The layer has been left where it was, and the drag itself is \
+     unaffected — keep dragging back the other way, or release to finish."
+}
+
+/// Closes the open dialog (a no-op if none is open): removes it from
+/// `workspace.tree` and clears any focus left dangling on it — the same
+/// [`FocusManager::validate`] pattern [`close_command_palette`] already
+/// uses.
+fn close_dialog(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
     dialog: &mut Option<DialogHandle>,
@@ -1871,12 +2244,12 @@ fn close_crash_recovery_dialog(
         return;
     };
     if let Err(err) = workspace.tree.remove(handle.root) {
-        tracing::warn!(?err, "failed to close the crash recovery dialog");
+        tracing::warn!(?err, "failed to close the open dialog");
     }
     focus.validate(&workspace.tree);
 }
 
-/// Routes one key press while the crash-recovery dialog is open —
+/// Routes one key press while a modal dialog is open —
 /// captures the keyboard directly, the same modal precedence
 /// [`handle_palette_key`] uses for the command palette (and, per
 /// [`handle_key`]'s own routing order, this dialog takes priority over
@@ -1891,7 +2264,7 @@ fn handle_dialog_key(
         return;
     };
     match chord.key {
-        Key::Named(NamedKey::Escape) => close_crash_recovery_dialog(workspace, focus, dialog),
+        Key::Named(NamedKey::Escape) => close_dialog(workspace, focus, dialog),
         Key::Named(NamedKey::Enter) => {
             let action = focus
                 .focused()
@@ -1903,7 +2276,7 @@ fn handle_dialog_key(
     }
 }
 
-/// Closes the crash-recovery dialog and, if `action` names one of its
+/// Closes the open dialog and, if `action` names one of its
 /// own action ids, logs it as chosen — the shared "resolve, then close"
 /// step [`handle_dialog_key`]'s own `Enter` case and
 /// [`handle_dialog_pointer`]'s own button-click case both need, factored
@@ -1914,13 +2287,13 @@ fn run_dialog_action(
     dialog: &mut Option<DialogHandle>,
     action: Option<String>,
 ) {
-    close_crash_recovery_dialog(workspace, focus, dialog);
+    close_dialog(workspace, focus, dialog);
     if let Some(action) = action {
-        tracing::info!(action, "crash recovery dialog action chosen");
+        tracing::info!(action, "dialog action chosen");
     }
 }
 
-/// Routes a real pointer press while the crash-recovery dialog is open
+/// Routes a real pointer press while a modal dialog is open
 /// — the same modal precedence [`handle_dialog_key`] already gives the
 /// keyboard, extended to the pointer now that this crate has real
 /// pointer input (PLAN.md M1.9) — previously this dialog's own named,
@@ -2649,6 +3022,156 @@ impl UndoOrder {
     }
 }
 
+/// One pixel-history undo *or* redo, whole: peek at the stroke the call
+/// is about to restore, apply it, and report what that changed in
+/// document space.
+///
+/// **The peek has to happen first, and this is the only place it can.**
+/// `aurora_brush::PixelHistory::undo`/`redo` report a bare `bool`, and
+/// by the time either returns, the snapshot naming the touched tiles has
+/// moved to the opposite stack replaced by its own inverse. The tile set
+/// is copied out rather than borrowed so the immutable borrow ends
+/// before the mutable one begins.
+///
+/// `None` means nothing was applied — an empty stack or a failed restore
+/// — so the caller must leave its own undo-order bookkeeping alone.
+/// `Some` carries what to invalidate, which is
+/// [`CompositeInvalidation::Everything`] when the stroke's own layer
+/// can't be placed in document space any more (see
+/// [`stroke_invalidation`]).
+fn apply_pixel_step(
+    layers: &aurora_doc::LayerTree,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    store: &mut aurora_tile::TileStore,
+    direction: UndoDirection,
+) -> Option<CompositeInvalidation> {
+    let peeked = match direction {
+        UndoDirection::Undo => pixel_history.peek_undo(),
+        UndoDirection::Redo => pixel_history.peek_redo(),
+    }
+    .map(|stroke| (stroke.surface(), stroke.captured().collect::<Vec<_>>()));
+    let applied = match direction {
+        UndoDirection::Undo => pixel_history.undo(store),
+        UndoDirection::Redo => pixel_history.redo(store),
+    };
+    match applied {
+        Ok(true) => Some(
+            peeked.map_or(CompositeInvalidation::Everything, |(surface, tiles)| {
+                stroke_invalidation(layers, surface, &tiles)
+            }),
+        ),
+        Ok(false) => {
+            tracing::warn!(
+                ?direction,
+                "pixel history had nothing to apply, unexpectedly"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(?err, ?direction, "pixel undo/redo failed");
+            None
+        }
+    }
+}
+
+/// Which way [`apply_pixel_step`] is stepping — the one difference
+/// between [`run_command`]'s two pixel arms, which are otherwise the
+/// same handful of lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UndoDirection {
+    Undo,
+    Redo,
+}
+
+/// What a **structural** (`aurora_doc::History`) undo/redo invalidates in
+/// the composite cache: [`CompositeInvalidation::Everything`], always,
+/// whatever rect `History::undo`/`redo` reported.
+///
+/// `dirtied` is taken and dropped on purpose, so the discard is a named,
+/// documented decision at both call sites rather than an omission
+/// somebody has to notice.
+///
+/// # Why the reported rect cannot be narrowed on (0.73.1)
+///
+/// 0.73.0 shipped this arm as `Regions(vec![rect])`, resting on the
+/// claim that every rect `aurora_doc::History::apply` returns is a
+/// superset of that step's true visual effect. For the pixel path that
+/// claim holds; for the structural path **it does not**, and the
+/// difference is not a rounding detail.
+///
+/// Every `Set*`/`Reparent`/mask arm of `apply` derives its rect from
+/// `layer_dirty_rect`, which returns the layer's own **declared**
+/// `aurora_doc::LayerKind::Pixel::bounds`. Nothing in this workspace
+/// makes `bounds` an authoritative extent of that layer's real content:
+///
+/// - `aurora_doc::LayerKind::Pixel`'s own doc comment says the content is
+///   "positioned at `bounds`" — a position, not a clip — and
+///   `aurora_doc::LayerLock`'s names `bounds` outright as having the
+///   "data now, enforcement once a concrete consumer exists" shape.
+/// - The paint path never clips to it. [`layer_local_point`] is a bare
+///   subtraction with no clamp, [`App::paint_dab`]/[`App::erase_dab`]
+///   pass no extent to `aurora_brush::stamp_dab`/`erase_dab`, and those
+///   clip only at surface-local `(0, 0)` (where `aurora_tile::TileId`'s
+///   unsigned fields run out), never at `bounds.width`/`bounds.height`.
+/// - [`pan_bounds`]' far edge is the active layer's origin plus the
+///   *document* ceiling, explicitly "not the layer's own width/height"
+///   — so a user can pan well past a layer's declared extent and paint
+///   there, with no path refusing it.
+/// - The composite reads that content straight back: [`resolve_tile`]'s
+///   same-origin fast path calls `store.get(surface, tile_id)` and its
+///   other branch calls [`read_layer_window`], and neither intersects
+///   anything against `bounds`' extent.
+///
+/// So out-of-`bounds` painted content is real, is composited, and is
+/// *outside* the rect a structural step reports. Narrowing on that rect
+/// leaves the composite tiles covering that content marked current with
+/// pre-operation pixels — and [`CompositeCache`] never re-checks a tile
+/// once it is current, so nothing later repairs it for the rest of the
+/// session.
+///
+/// `SetBounds` is not an exception. Its `old ∪ new` is a union of two
+/// *declared* rects, so it misses out-of-bounds content at both the old
+/// and the new position in exactly the same way. (Undoing a Move of the
+/// *active* layer is separately forced to `Everything` by
+/// [`perform_undo_redo`]'s anchor guard, but a Move of any other layer
+/// is not.)
+///
+/// # What this does not give up
+///
+/// The overwhelmingly common undo — reverting a brush stroke — is a
+/// *pixel* step, and keeps its narrowing. [`stroke_invalidation`] builds
+/// its rects from the tiles the stroke actually captured plus the
+/// layer's origin, and never reads `bounds.width`/`bounds.height` at
+/// all, so it is a genuine superset however far outside its declared
+/// bounds a layer has been painted.
+///
+/// # The follow-on work, named rather than assumed
+///
+/// Two real options, neither a bug fix:
+///
+/// 1. **Make `bounds` authoritative** — clip both the paint path and the
+///    composite read path to it. That is a design decision, not a
+///    correction: it changes what a user who already painted outside a
+///    layer's declared bounds sees (their pixels stop being composited),
+///    and it has to land in the paint path and the read path together or
+///    the two disagree.
+/// 2. **Widen the reported rect to the layer's real stored extent.**
+///    Cheap in principle — one pass over a surface's stored tile ids —
+///    but it needs two things that do not exist today:
+///    `aurora_doc::History::undo`/`redo` reporting *which* layer(s) a
+///    step touched rather than only a rect, and an
+///    `aurora_tile::TileStore` accessor for a surface's stored tile
+///    extent (`contains_tile` answers only about one id at a time).
+///
+/// Until one of those lands, a full recomposite per structural undo is
+/// the honest answer: wasteful, never wrong.
+// No `#[must_use]` on the function: `CompositeInvalidation` itself
+// carries it, and clippy's `double_must_use` rejects both.
+fn structural_invalidation(dirtied: Option<aurora_core::Rect>) -> CompositeInvalidation {
+    let _ = dirtied;
+    CompositeInvalidation::Everything
+}
+
 /// Runs a global shortcut's own command — [`handle_key`]'s dispatch
 /// target once a [`KeyChord`] resolves via [`ShortcutRegistry::resolve`].
 ///
@@ -2667,6 +3190,17 @@ impl UndoOrder {
 /// ([`refresh_history_panel`]) since undoing/redoing is itself a
 /// journaled step; a pixel undo/redo has no such panel to refresh — the
 /// canvas alone shows the result, on the next redraw.
+///
+/// **The return value is what the caller must invalidate in the
+/// composite cache**, and every arm except `Undo`/`Redo` returns
+/// [`CompositeInvalidation::None`] — not because "nothing changed" is a
+/// deep truth about them, but because none of them touches the document
+/// model at all today (focus, the command palette, tool selection).
+/// **This is a trap for whoever adds the next layer-mutating command
+/// here**: a new arm that edits `layers` and leaves the `None` in place
+/// will composite stale tiles, silently, with no test failing — so a new
+/// arm must return its own [`CompositeInvalidation::Regions`], or
+/// [`CompositeInvalidation::Everything`] if it can't name one.
 #[allow(clippy::too_many_arguments)]
 fn run_command(
     workspace: &mut aurora_ui::Workspace,
@@ -2679,72 +3213,125 @@ fn run_command(
     store: Option<&mut aurora_tile::TileStore>,
     undo_order: &mut UndoOrder,
     command: AppCommand,
-) {
+) -> CompositeInvalidation {
     match command {
         AppCommand::FocusNext => {
             focus.focus_next(&mut workspace.tree);
+            CompositeInvalidation::None
         }
         AppCommand::FocusPrevious => {
             focus.focus_previous(&mut workspace.tree);
+            CompositeInvalidation::None
         }
-        AppCommand::ToggleCommandPalette => toggle_command_palette(workspace, focus, palette),
+        AppCommand::ToggleCommandPalette => {
+            toggle_command_palette(workspace, focus, palette);
+            CompositeInvalidation::None
+        }
         AppCommand::SelectTool(selected) => {
             *tool = selected;
             refresh_properties_panel(workspace, selected);
+            CompositeInvalidation::None
         }
         AppCommand::Undo => match undo_order.undo.last().copied() {
-            Some(UndoKind::Structural) => match history.undo(layers) {
-                Ok(_) => {
-                    undo_order.undo.pop();
-                    undo_order.redo.push(UndoKind::Structural);
-                    refresh_history_panel(workspace, history);
+            // The rect `History::undo` reports is deliberately thrown
+            // away here -- see [`structural_invalidation`] for the whole
+            // reason, which is not a small one.
+            //
+            // `can_undo` is checked *first* because `History::undo`'s own
+            // `Ok(None)` conflates "there was nothing to undo" with "a
+            // step was undone whose dirtied region isn't knowable" (its
+            // own doc comment says so, and names this check as the way to
+            // tell them apart). Without it, an empty `History` behind a
+            // `Structural` order entry would pop that entry and push a
+            // matching `Redo` one for a step that does not exist,
+            // desyncing `UndoOrder` from its backing store permanently.
+            // That is not reachable today -- the two stay in sync by
+            // construction, since every `UndoKind::Structural` entry is
+            // pushed alongside a real `History` step -- so this is
+            // closing a latent hole, not a live bug, and it matches the
+            // shape the `Pixel` arm below already uses for its own
+            // missing-precondition case.
+            Some(UndoKind::Structural) => {
+                if history.can_undo() {
+                    match history.undo(layers) {
+                        Ok(dirty) => {
+                            undo_order.undo.pop();
+                            undo_order.redo.push(UndoKind::Structural);
+                            refresh_history_panel(workspace, history);
+                            structural_invalidation(dirty)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "undo failed");
+                            CompositeInvalidation::None
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "the undo order names a structural step the document history does not \
+                         have; leaving both untouched"
+                    );
+                    CompositeInvalidation::None
                 }
-                Err(err) => tracing::warn!(?err, "undo failed"),
-            },
+            }
             Some(UndoKind::Pixel) => {
                 if let Some(store) = store {
-                    match pixel_history.undo(store) {
-                        Ok(true) => {
+                    match apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo) {
+                        Some(invalidation) => {
                             undo_order.undo.pop();
                             undo_order.redo.push(UndoKind::Pixel);
+                            invalidation
                         }
-                        Ok(false) => {
-                            tracing::warn!("pixel history had nothing to undo, unexpectedly");
-                        }
-                        Err(err) => tracing::warn!(?err, "pixel undo failed"),
+                        None => CompositeInvalidation::None,
                     }
                 } else {
                     tracing::warn!("no live tile store; cannot undo a pixel edit");
+                    CompositeInvalidation::None
                 }
             }
-            None => {}
+            None => CompositeInvalidation::None,
         },
         AppCommand::Redo => match undo_order.redo.last().copied() {
-            Some(UndoKind::Structural) => match history.redo(layers) {
-                Ok(_) => {
-                    undo_order.redo.pop();
-                    undo_order.undo.push(UndoKind::Structural);
-                    refresh_history_panel(workspace, history);
+            // Same deliberate discard, and the same `can_redo`
+            // precondition, as the `Undo` arm above -- `History::redo`
+            // conflates its own `Ok(None)` exactly the same way.
+            Some(UndoKind::Structural) => {
+                if history.can_redo() {
+                    match history.redo(layers) {
+                        Ok(dirty) => {
+                            undo_order.redo.pop();
+                            undo_order.undo.push(UndoKind::Structural);
+                            refresh_history_panel(workspace, history);
+                            structural_invalidation(dirty)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "redo failed");
+                            CompositeInvalidation::None
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "the undo order names a structural step the document history cannot \
+                         redo; leaving both untouched"
+                    );
+                    CompositeInvalidation::None
                 }
-                Err(err) => tracing::warn!(?err, "redo failed"),
-            },
+            }
             Some(UndoKind::Pixel) => {
                 if let Some(store) = store {
-                    match pixel_history.redo(store) {
-                        Ok(true) => {
+                    match apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo) {
+                        Some(invalidation) => {
                             undo_order.redo.pop();
                             undo_order.undo.push(UndoKind::Pixel);
+                            invalidation
                         }
-                        Ok(false) => {
-                            tracing::warn!("pixel history had nothing to redo, unexpectedly");
-                        }
-                        Err(err) => tracing::warn!(?err, "pixel redo failed"),
+                        None => CompositeInvalidation::None,
                     }
                 } else {
                     tracing::warn!("no live tile store; cannot redo a pixel edit");
+                    CompositeInvalidation::None
                 }
             }
-            None => {}
+            None => CompositeInvalidation::None,
         },
     }
 }
@@ -2915,24 +3502,33 @@ fn handle_palette_key(
     None
 }
 
-/// One key press's full routing, most-modal-first: the crash-recovery
-/// dialog owns the keyboard while open ([`handle_dialog_key`]) — a modal
+/// One key press's full routing, most-modal-first: an open modal
+/// dialog owns the keyboard ([`handle_dialog_key`]) — a modal
 /// alert blocks everything else, including the palette; otherwise the
 /// command palette owns it while open ([`handle_palette_key`]);
 /// otherwise a chord that resolves in `shortcuts` runs its command
 /// ([`run_command`], which is also where a tool-switch shortcut updates
-/// `tool` and `Ctrl+Z`/`Ctrl+Shift+Z` undo/redo against `layers`/
-/// `history`/`pixel_history`, in `undo_order`'s own unified sequence).
-/// Anything else (an unbound chord, with nothing modal open) is
-/// silently ignored — there's no text field to fall back to routing
+/// `tool`) — **except** `Ctrl+Z`/`Ctrl+Shift+Z`, which this function
+/// cannot finish itself (see below) and instead reports back the same
+/// way [`handle_palette_key`] already does for the identical two
+/// commands. Anything else (an unbound chord, with nothing modal open)
+/// is silently ignored — there's no text field to fall back to routing
 /// into yet.
 ///
-/// Returns `Some(ActivatedCommand)` only in the one case no pure
-/// `WidgetTree` mutation can finish on its own — see
-/// [`handle_palette_key`]'s own doc comment for exactly which commands
-/// that covers. The caller (`App::handle_key_event`) is what actually
-/// has somewhere to put it (real document state for `Undo`/`Redo`, a
-/// read/decode or encode/write step for an opened/saved file).
+/// Returns `Some(ActivatedCommand)` in two cases, both because no pure
+/// `WidgetTree` mutation can finish them on their own: the palette-key
+/// cases [`handle_palette_key`]'s own doc comment names, and — since
+/// 0.69.1 — `Undo`/`Redo` resolved straight from a global shortcut.
+/// The latter used to run inline, through [`run_command`] alone; that
+/// was PLAN.md's own disclosed 0.57.7/0.57.8 residual (`Ctrl+Z` reaching
+/// neither the mid-stroke commit nor the pan re-clamp every other
+/// undo/redo entry point already gets) rather than a design choice, and
+/// closing it meant deferring to the caller instead of reimplementing
+/// [`perform_undo_redo`]'s three-step order here. The caller
+/// (`App::handle_key_event`) is what actually has somewhere to put
+/// either kind (real document state — `view`, `active_layer`, the live
+/// `drag` — for `Undo`/`Redo`; a read/decode or encode/write step for
+/// an opened/saved file).
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     workspace: &mut aurora_ui::Workspace,
@@ -2945,7 +3541,6 @@ fn handle_key(
     pixel_history: &mut aurora_brush::PixelHistory,
     store: Option<&mut aurora_tile::TileStore>,
     undo_order: &mut UndoOrder,
-    composite_cache: &mut CompositeCache,
     shortcuts: &ShortcutRegistry<AppCommand>,
     modifiers: Modifiers,
     key: Key,
@@ -2970,7 +3565,38 @@ fn handle_key(
         );
     }
     if let Some(&command) = shortcuts.resolve(chord) {
-        run_command(
+        // `Undo`/`Redo` need `perform_undo_redo`'s full three-step order
+        // (commit whatever drag is still live, run the command, then
+        // re-clamp the pan and bump the composite cache) -- exactly what
+        // `App::run_undo_redo` already gives the command palette and
+        // (macOS) native menu, through the very `ActivatedCommand` this
+        // function otherwise reserves for cases it cannot finish itself.
+        // Running `run_command` inline here, as before 0.69.1, skipped
+        // both halves: no commit of a live stroke before the undo (so a
+        // mid-stroke `Ctrl+Z` could reach past pixels the stroke hadn't
+        // recorded yet), and no pan re-clamp after an undone Move (so
+        // the next pointer-move event could compute its delta against a
+        // view that had silently moved out from under it). See
+        // `perform_undo_redo`'s own doc comment for why the order itself
+        // is load-bearing, not just the two extra steps.
+        if let AppCommand::Undo | AppCommand::Redo = command {
+            return Some(if command == AppCommand::Undo {
+                ActivatedCommand::Undo
+            } else {
+                ActivatedCommand::Redo
+            });
+        }
+        // Spelled out rather than discarded bare, and annotated so the
+        // type is visible at the call site: every command that can reach
+        // here is `FocusNext`, `FocusPrevious`, `ToggleCommandPalette` or
+        // `SelectTool` -- `Undo`/`Redo` returned above -- and each of
+        // those arms returns `CompositeInvalidation::None`, because none
+        // of them touches the document model. So there is genuinely
+        // nothing to invalidate. A new `AppCommand` arm that edits
+        // `layers` would land here reporting a real region, and this
+        // binding is where somebody has to decide what to do with it --
+        // see `run_command`'s own doc comment, which names that trap.
+        let _: CompositeInvalidation = run_command(
             workspace,
             focus,
             palette,
@@ -2982,20 +3608,6 @@ fn handle_key(
             undo_order,
             command,
         );
-        // Only Undo/Redo can change what a composite tile shows -- see
-        // `App::run_undo_redo`'s own matching bump for the command-
-        // palette/menu path to the same two commands.
-        //
-        // And that split is a disclosed, still-open gap, not a detail:
-        // `Ctrl+Z`/`Ctrl+Shift+Z` runs Undo/Redo *here*, inline, so it
-        // reaches neither half of `perform_undo_redo` -- no commit of a
-        // live stroke before the undo, and no pan re-clamp after an
-        // undone Move. See PLAN.md's own residual disclosure (0.57.7)
-        // before editing this branch; closing it is a change to this
-        // function's contract, not a line here.
-        if matches!(command, AppCommand::Undo | AppCommand::Redo) {
-            composite_cache.bump();
-        }
     }
     None
 }
@@ -3315,6 +3927,17 @@ enum Drag {
         start_doc: (f32, f32),
         start_bounds: aurora_core::Rect,
         current_bounds: aurora_core::Rect,
+        /// Whether this drag has already told the user it hit the
+        /// document's own coordinate range.
+        ///
+        /// Same reasoning as `Drag::Brush`'s own `warned` set above, and
+        /// the same reason it lives here rather than on `App`: a drag
+        /// held past the range refuses on *every* pointer-move event for
+        /// the rest of the gesture, so without this the user would be
+        /// re-told once per event. Its lifetime is exactly the drag's by
+        /// construction — a new `Drag::Move` cannot inherit a stale
+        /// `true`, and no caller has to remember to clear it.
+        refused: bool,
     },
     Eyedropper,
 }
@@ -3386,6 +4009,46 @@ fn unwarned_failures<'a>(
         .filter(|(tile, _)| warned.insert(*tile))
         .map(|(tile, err)| (*tile, err))
         .collect()
+}
+
+/// Whether this drag's boundary refusal still needs reporting to the
+/// user — so a `Drag::Move` held past the document's own coordinate
+/// range opens one dialog for the whole gesture rather than one per
+/// pointer-move event.
+///
+/// **A pure query, deliberately (0.68.2).** Until then this marked the
+/// refusal reported as it answered, and [`App::apply_move`] then called
+/// `open_move_refused_dialog` — which is a *no-op* whenever another
+/// dialog already occupies the one modal slot ([`open_dialog`]'s own
+/// guard). The flag was therefore latched for a dialog nobody ever saw,
+/// and because the flag lives on the drag, the refusal was never offered
+/// again for the rest of that gesture: the user saw nothing at all, even
+/// after dismissing whatever had been in the way. Marking is now
+/// [`mark_move_refusal_reported`]'s job and happens only once a dialog
+/// has genuinely opened.
+///
+/// [`unwarned_failures`]'s exact shape, for exactly the same reason and
+/// with the same stance on being wrong: a drag that is somehow *not* a
+/// `Drag::Move` returns `true` (report it), because under-reporting a
+/// refusal the user cannot otherwise see is the wrong way to be wrong
+/// about it. Unreachable in practice — only [`App::apply_move`] calls
+/// this, and it only runs while a `Drag::Move` is live.
+fn move_refusal_unreported(drag: Option<&Drag>) -> bool {
+    let Some(Drag::Move { refused, .. }) = drag else {
+        return true;
+    };
+    !*refused
+}
+
+/// Marks this drag's boundary refusal as reported, so the rest of the
+/// gesture stays silent — see [`move_refusal_unreported`] for why this
+/// is separate from asking, and why it must run only after a dialog
+/// actually opened. A no-op for any other drag, matching the query's own
+/// "not a `Move` is always still unreported" answer.
+fn mark_move_refusal_reported(drag: &mut Option<Drag>) {
+    if let Some(Drag::Move { refused, .. }) = drag {
+        *refused = true;
+    }
 }
 
 /// Records a completed `Drag::Move` as a single undo step, from
@@ -3602,6 +4265,7 @@ fn begin_drag(
                 start_doc: view.to_document(canvas_point),
                 start_bounds: bounds,
                 current_bounds: bounds,
+                refused: false,
             })
         }
         (aurora_ui::Tool::Eyedropper, PointerButton::Primary) => Some(Drag::Eyedropper),
@@ -3966,10 +4630,40 @@ fn active_pixel_layer(
     Some((id, bounds))
 }
 
+/// The document-space point every composite `aurora_tile::TileId` is
+/// measured from — the active layer's own `bounds.x`/`bounds.y`, or
+/// `(0, 0)` when there is no active layer or it isn't a pixel layer
+/// (the same absent-precondition honesty [`active_pixel_layer`] already
+/// uses).
+///
+/// **This is the grid anchor, and it is the *only* way "which layer is
+/// active" reaches the composite at all.** `recomposite_visible_tiles`
+/// takes `active_layer` solely to compute this value; every function it
+/// then calls (`begin_gpu_composite_tile`, `composite_roots_into_tile`,
+/// `resolve_tile`) receives `reference_origin` and never the active
+/// layer's own id. So two different active layers that share an origin
+/// produce byte-identical composites for every `TileId`, which is what
+/// lets a layer *switch* skip invalidating the cache when the origin
+/// didn't actually move (`press_layer_row`), and what lets an
+/// undo/redo's own narrowed invalidation be measured against a single,
+/// unmoved anchor (`after_undo_redo`).
+///
+/// One definition, shared: [`active_layer_origin`] is this same value in
+/// `f32` for the pan-bound/canvas-local-origin math, and
+/// `recomposite_visible_tiles` calls this directly.
+#[must_use]
+fn composite_reference_origin(
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+) -> (i64, i64) {
+    active_pixel_layer(layers, active_layer).map_or((0, 0), |(_, bounds)| (bounds.x, bounds.y))
+}
+
 /// The active layer's own document-space origin (`bounds.x`/`bounds.y`,
 /// as `f32`), or `(0.0, 0.0)` if there's no active layer or it isn't a
-/// pixel layer — the same absent-precondition honesty
-/// [`active_pixel_layer`] already uses. What [`canvas_local_origin`]
+/// pixel layer — the `f32` face of [`composite_reference_origin`], which
+/// it delegates to so the anchor has exactly one definition. What
+/// [`canvas_local_origin`]
 /// needs to convert a document-space point into the active layer's own
 /// surface-local space, now that a layer can actually sit somewhere
 /// other than the document's own origin (`aurora_doc::LayerTree::set_bounds`,
@@ -3999,8 +4693,8 @@ fn active_layer_origin(
     layers: &aurora_doc::LayerTree,
     active_layer: Option<aurora_doc::LayerId>,
 ) -> (f32, f32) {
-    active_pixel_layer(layers, active_layer)
-        .map_or((0.0, 0.0), |(_, bounds)| (bounds.x as f32, bounds.y as f32))
+    let (x, y) = composite_reference_origin(layers, active_layer);
+    (x as f32, y as f32)
 }
 
 /// The whole canvas pan bound, both edges, as one value — what every
@@ -4205,10 +4899,31 @@ fn clamp_pan_to_active_layer(
 /// pan half was the missing counterpart, and an undone Move reproduced
 /// the same `canvas_local_origin` divergence a layer *switch* does.
 ///
-/// Unconditional rather than "only when the command really was a
-/// structural one": both are idempotent no-ops when nothing moved (the
-/// clamp leaves a pan already within its bound untouched), and
-/// `run_command` deliberately reports nothing back about what it ran.
+/// The pan clamp stays unconditional — it is an idempotent no-op when
+/// nothing moved (a pan already within its bound is left untouched), and
+/// it is unrelated to what the command changed *inside* the document.
+///
+/// **The cache half is no longer unconditional** (0.73.0), and since
+/// 0.73.1 exactly one kind of step reaches here narrowed: a *pixel*
+/// undo/redo, whose rects [`stroke_invalidation`] builds from the tiles
+/// the stroke really captured. A *structural* one is always
+/// [`CompositeInvalidation::Everything`] — see
+/// [`structural_invalidation`] for why the rect `aurora_doc::History`
+/// reports cannot be narrowed on.
+///
+/// **What makes resolving `Regions` against the post-command anchor
+/// safe**: [`perform_undo_redo`] re-reads [`composite_reference_origin`]
+/// after `run_command` and forces `Everything` if it moved. A `TileId`
+/// means nothing without the anchor it was composited under, so a step
+/// that shifts the anchor re-points *every* cached tile at a different
+/// document window at once — recomputing only the tiles a narrow rect
+/// touches would leave the rest showing content from the old anchor. On
+/// the `Regions` branch the caller has already established before ==
+/// after. Since 0.73.1 no *structural* step can reach that branch at
+/// all, so the guard is defence in depth rather than the only thing
+/// standing between an undone Move and a wrong composite; it is kept
+/// (and tested) precisely so a future narrowing cannot reopen the hole.
+///
 /// Kept a free function so the pairing is testable with no `App` — and
 /// therefore no GPU adapter — to build.
 fn after_undo_redo(
@@ -4217,8 +4932,16 @@ fn after_undo_redo(
     active_layer: Option<aurora_doc::LayerId>,
     composite_cache: &mut CompositeCache,
     canvas_size: Option<(f32, f32)>,
+    invalidation: &CompositeInvalidation,
 ) {
-    composite_cache.bump();
+    match invalidation {
+        CompositeInvalidation::None => {}
+        CompositeInvalidation::Regions(rects) => {
+            let reference_origin = composite_reference_origin(layers, active_layer);
+            composite_cache.invalidate_doc_rects(rects, reference_origin);
+        }
+        CompositeInvalidation::Everything => composite_cache.bump(),
+    }
     clamp_pan_to_active_layer(view, layers, active_layer, canvas_size);
 }
 
@@ -4278,7 +5001,7 @@ fn perform_undo_redo(
     active_layer: Option<aurora_doc::LayerId>,
     drag: &mut Option<Drag>,
     command: AppCommand,
-) {
+) -> CompositeInvalidation {
     let canvas_size = canvas_area_logical_size(workspace);
     commit_ending_drag(
         drag.take(),
@@ -4290,7 +5013,74 @@ fn perform_undo_redo(
         active_layer,
         canvas_size,
     );
-    run_command(
+    // **The two safety guards for the whole narrowed-invalidation
+    // scheme.** Both have the same shape -- read a document-wide fact
+    // immediately before the command and again immediately after, and
+    // force `Everything` if it moved -- because both describe something
+    // `run_command` structurally cannot report. It reports what changed
+    // *inside* the document, as absolute document coordinates; neither
+    // the frame those coordinates are converted into `TileId`s through
+    // nor the code path that composites them is expressible as a `Rect`
+    // at all.
+    //
+    // **Guard 1, the grid anchor.** `composite_reference_origin` is the
+    // frame every cached composite `TileId` is measured in. Undoing or
+    // redoing a Move shifts it: `LayerOp::SetBounds` on the active layer
+    // moves that layer's own `bounds.x`/`bounds.y`, which re-points
+    // *every* cached `TileId` at a different document window at once.
+    // Narrowing there would recompute only the tiles the (correct,
+    // `old ∪ new`) rect touches and leave every other cached tile
+    // showing content composited under the old anchor -- comprehensively
+    // wrong, and invisible to any test that only compares the tiles the
+    // rect covers.
+    //
+    // `active_layer` itself cannot change across `run_command` (it is a
+    // `Copy` argument, not a `&mut`), so the anchor can only move for
+    // two reasons, and the guard is correct for both because it
+    // *compares* the value rather than assuming which one happened: the
+    // active layer's own `bounds` moving under it (the Move case), and
+    // the undone/redone step removing the active layer outright, which
+    // collapses `composite_reference_origin` to its `(0, 0)` no-active-
+    // pixel-layer default.
+    //
+    // **Guard 2, the compositing path** (0.73.2).
+    // `document_qualifies_for_gpu_compositing` inspects every root-level
+    // layer's visibility, kind and blend mode to choose the GPU fast
+    // path or the CPU fallback **for the whole document**, and several
+    // undoable structural steps flip it: `SetBlendMode` on a root-level
+    // pixel layer across the `Normal` boundary, and `SetVisible`,
+    // `Reparent`, `RemoveById` or `Restore` of a root-level non-`Normal`
+    // layer. When it flips, every visible tile's compositing *path*
+    // changes while a per-layer `Rect` names only one layer's own
+    // region -- a quantity no `Rect` can express.
+    //
+    // **And the flip really does change pixels -- measured, not
+    // assumed.** It would be tempting to call this guard optional on the
+    // grounds that the two paths agree anyway; they do not.
+    // `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_
+    // opacity_document` runs one fixture through both paths on a real
+    // NVIDIA GeForce RTX 3090 and they differ by one `f16` ULP on three
+    // of four channels. The two older sibling tests that *do* show
+    // bit-identical output only ever use exact power-of-two binary
+    // fractions (1.0, 0.5, 0.25, 0.75), where no rounding latitude is in
+    // play at all -- so they never tested the question. Switching a
+    // document between the paths therefore dirties every visible tile
+    // for real -- that *finding* is load-bearing, and is why this guard
+    // exists. **The guard itself is currently dead-in-effect, not
+    // dead code**: today the only producer of `CompositeInvalidation::
+    // Regions` is the pixel-stroke path (`apply_pixel_step`), which
+    // touches only `pixel_history`/`store` behind an immutable
+    // `&LayerTree` -- it cannot move `anchor_before` or
+    // `gpu_path_before`, so neither guard can fire on that path, and
+    // structural undo/redo (the only other caller) already returns
+    // `Everything` unconditionally (0.73.1) before either guard is
+    // reached. Keeping both is still correct: they re-arm the instant
+    // structural narrowing (or some future narrowed path) returns, and
+    // deleting them now would be removing a check for a condition this
+    // function's own contract says it must keep handling.
+    let anchor_before = composite_reference_origin(layers, active_layer);
+    let gpu_path_before = document_qualifies_for_gpu_compositing(layers);
+    let reported = run_command(
         workspace,
         focus,
         palette,
@@ -4302,27 +5092,57 @@ fn perform_undo_redo(
         undo_order,
         command,
     );
-    after_undo_redo(view, layers, active_layer, composite_cache, canvas_size);
+    let anchor_held = composite_reference_origin(layers, active_layer) == anchor_before;
+    let gpu_path_held = document_qualifies_for_gpu_compositing(layers) == gpu_path_before;
+    let invalidation = if anchor_held && gpu_path_held {
+        reported
+    } else {
+        CompositeInvalidation::Everything
+    };
+    after_undo_redo(
+        view,
+        layers,
+        active_layer,
+        composite_cache,
+        canvas_size,
+        &invalidation,
+    );
+    invalidation
 }
 
 /// The reserved `aurora_tile::SurfaceId` this crate uses for its own
 /// live, composited multi-layer preview — never a real layer's own
-/// surface. Every real one reuses a `LayerId`'s own raw value
-/// (`LayerTree::surface_id`), sequentially allocated from near zero by
-/// `aurora_core::IdGenerator`; `u64::MAX` is guaranteed never to
-/// collide with one in any document this process could ever build.
+/// surface. Every real pixel layer's own surface reuses a `LayerId`'s
+/// own raw value (`LayerTree::surface_id`), sequentially allocated from
+/// near zero by `aurora_core::IdGenerator`; since 0.70.0 a mask's own
+/// surface (`LayerTree::mask_surface_id`) also lives in this same
+/// `SurfaceId` space, in its top half (`id.to_raw() |
+/// aurora_doc::MASK_SURFACE_BIT`) — `u64::MAX` is in that same top half,
+/// so it collides with exactly one derived mask surface
+/// (`MASK_SURFACE_BIT - 1`'s own), which is why both `surface_id` and
+/// `mask_surface_id` refuse to hand back a `SurfaceId` for that one id.
+/// `u64::MAX` is therefore guaranteed never to collide with a real
+/// layer's pixel surface OR a real layer's mask surface, in any
+/// document this process could ever build.
 #[must_use]
 fn composite_surface_id() -> aurora_tile::SurfaceId {
     aurora_tile::SurfaceId::from_raw(u64::MAX)
 }
 
-/// `id`'s own `SurfaceId`, computed directly rather than through
-/// `LayerTree::surface_id` — a pure conversion of `id`'s own raw value
-/// (`aurora_tile::SurfaceId::from_raw(id.to_raw())`, exactly what that
-/// method does for a pixel layer), usable from a context like
-/// [`begin_drag`] that already knows `id` names a real pixel layer
-/// (`active_pixel_layer`'s own contract) without needing a `&LayerTree`
-/// reference just to re-derive what the id itself already encodes.
+/// `id`'s own **pixel** `SurfaceId`, computed directly rather than
+/// through `LayerTree::surface_id` — a pure conversion of `id`'s own
+/// raw value (`aurora_tile::SurfaceId::from_raw(id.to_raw())`), usable
+/// from a context like [`begin_drag`] that already knows `id` names a
+/// real pixel layer (`active_pixel_layer`'s own contract) without
+/// needing a `&LayerTree` reference just to re-derive what the id
+/// itself already encodes. **No longer "exactly what `surface_id`
+/// does"** since 0.70.1: that method also refuses an id with
+/// [`aurora_doc::MASK_SURFACE_BIT`] set (`LayerTree::surface_id`'s own
+/// doc comment). This free function has no such guard — every caller
+/// already holds an id `active_pixel_layer` vouched for, which the live
+/// `IdGenerator` can never set that bit on, so the two agree in
+/// practice; they would disagree only for an id this crate should never
+/// have been handed in the first place.
 #[must_use]
 fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
     aurora_tile::SurfaceId::from_raw(id.to_raw())
@@ -4630,31 +5450,80 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
     gated
 }
 
-/// Clips one layer's own straight-alpha `texels` (the same
+/// Masks one layer's own straight-alpha `texels` (the same
 /// `aurora_tile::TILE`×`aurora_tile::TILE`-window-at-`doc_origin` buffer
 /// shape [`dissolve_gate`] takes — row-major, `aurora_tile::CHANNELS`
-/// `half::f16` samples per texel) to `mask`'s own rectangular
-/// `mask.bounds`, which — like a [`aurora_doc::LayerKind::Pixel`]
-/// layer's own `bounds` — is already document-absolute, so each texel's
-/// absolute position is recovered the same way [`dissolve_gate`] already
-/// does: `doc_origin` plus its own row/col within the tile. A texel whose
-/// absolute position falls inside `mask.bounds`
-/// ([`aurora_core::Rect::contains_point`]) passes through unchanged;
-/// outside it, it comes back fully transparent (`(0, 0, 0, 0)`, the same
-/// "hidden" convention [`dissolve_gate`] uses). `mask.inverted` flips
-/// which side is shown — XOR'd against the containment test, mirroring
-/// the two toggles [`aurora_doc::LayerMask`] itself exposes
+/// `half::f16` samples per texel) by `mask`.
+///
+/// # The two factors, and how they combine
+///
+/// 1. **`mask.bounds`**, which — like a [`aurora_doc::LayerKind::Pixel`]
+///    layer's own `bounds` — is already document-absolute, so each
+///    texel's absolute position is recovered the same way
+///    [`dissolve_gate`] already does: `doc_origin` plus its own row/col
+///    within the tile. Outside `mask.bounds`
+///    ([`aurora_core::Rect::contains_point`]) coverage is `0.0`, full
+///    stop; a mask never shows anything beyond its own rectangle.
+/// 2. **Real per-pixel coverage**, read from `mask_surface` when the
+///    caller passes one. That is
+///    `aurora_doc::LayerTree::mask_surface_id(id)`, and it is read
+///    through [`read_layer_window`] exactly once per call, before the
+///    per-texel loop — with `(mask.bounds.x, mask.bounds.y)` as the
+///    window's own origin, because mask coverage tiles are addressed
+///    relative to the mask's own rectangle, not to the layer's bounds
+///    and not to `doc_origin`. `read_layer_window` already handles the
+///    up-to-four-tile overlap of a non-tile-aligned origin, and its own
+///    store-error handling (`CompositeBudget::note_store_error`) is
+///    reused as-is — see [`WindowKind::MaskCoverage`] for what a mask
+///    read failure does and does not do to an export.
+///
+/// # Failing open, in both directions
+///
+/// Every degenerate case — a short slice, a `NaN`, an unreadable tile
+/// — resolves to **final** coverage `1.0`: the layer stays visible. A
+/// mask that cannot be read must never silently erase a layer's
+/// content.
+///
+/// The word doing the work there is *final*. Until 0.70.2 the
+/// substitution happened one step too early — an unreadable texel was
+/// given a raw coverage of `1.0` and then went through the
+/// `mask.inverted` step like any other value, so with `inverted` set,
+/// `1.0 - 1.0` was `0.0` and the failure erased the layer exactly where
+/// the read had failed. That is fail-*closed*, and it contradicted the
+/// promise in the paragraph above rather than fulfilling it. The
+/// "could not be read" signal is therefore carried as a `None` all the
+/// way past inversion (via [`LayerWindow::was_read`], which is why a
+/// window read is not merely a `Vec`), and only then resolved to `1.0`.
+/// A never-*painted* texel is a different thing and still inverts
+/// normally: it was read successfully, and `1.0` is genuinely what it
+/// says.
+///
+/// The two multiply — inside the bounds, coverage is whatever the mask
+/// surface says; outside, it is zero. **A never-painted mask surface
+/// therefore reproduces the old rectangle-only clip exactly**, per
+/// texel, because `aurora_tile::TileStore::get` materializes an
+/// untouched tile as all zeros and `read_mask_coverage` reads a
+/// zero-alpha texel as `1.0`. `mask_surface: None` is the same thing
+/// stated without a store read, for callers (and tests) that have no
+/// mask pixels at all.
+///
+/// `mask.inverted` is applied to the **combined** coverage
+/// (`1.0 - c`), not to the containment test alone — inverting a
+/// half-painted mask has to flip the painted greys too, not just swap
+/// which side of the rectangle shows. That mirrors the two toggles
+/// [`aurora_doc::LayerMask`] itself exposes
 /// (`LayerTree::set_mask_enabled`/`set_mask_inverted`).
 ///
-/// **A rectangular clip — not real grayscale masking.**
-/// [`aurora_doc::LayerMask`] carries no per-pixel mask data yet (its own
-/// doc comment explains why: the same one-`TileStore`-per-layer-vs-
-/// shared resource-management question [`aurora_doc::LayerKind::Pixel`]'s
-/// own `bounds` field already flags, not yet decided), so there is
-/// nothing to sample per-pixel beyond the mask's own bounding rectangle —
-/// no feathering, no soft edges, no partial coverage. A texel is either
-/// fully shown or fully hidden; there is no in-between, and this function
-/// does not pretend otherwise.
+/// # Output convention
+///
+/// A texel at combined coverage `0.0` comes back as `(0, 0, 0, 0)` —
+/// *all four* channels zero, the same "hidden" convention
+/// [`dissolve_gate`] uses, and deliberately not `(r, g, b, 0)`: a
+/// zero-alpha texel that kept its colour would carry stale colour into
+/// `aurora_render::un_premultiply_in_place` and into the eyedropper.
+/// At coverage `c > 0.0` the colour passes through unchanged and only
+/// alpha is scaled, `(r, g, b, a * c)` — straight alpha in, straight
+/// alpha out.
 ///
 /// Callers are responsible for checking `mask.enabled` themselves before
 /// calling this — a disabled mask should never reach here at all (see
@@ -4664,43 +5533,148 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
 /// output — the same defensive shape [`dissolve_gate`] and
 /// `aurora_render::un_premultiply_in_place` (the un-premultiply step
 /// `resolve_tile`'s `Group` arm calls) both already use.
-fn apply_mask_clip(
+///
+/// # Deliberately still open
+///
+/// Coverage can be *written* ([`aurora_doc::write_mask_coverage`]),
+/// composited here, and — since 0.71.0 — persisted through a `.aur`
+/// round trip. Three follow-ons are named, not built: a brush/tool UI
+/// for painting a mask, mask-pixel undo/history, and mask-surface
+/// lifecycle (nothing clears a mask's tiles when the mask or its layer
+/// is removed, so a re-added mask inherits the old one's coverage). See
+/// the `aurora_doc::mask` module's own doc comment for all three.
+fn apply_mask(
     texels: &[half::f16],
     mask: &aurora_doc::LayerMask,
+    mask_surface: Option<aurora_tile::SurfaceId>,
+    store: &mut aurora_tile::TileStore,
     doc_origin: (i64, i64),
+    budget: &mut CompositeBudget,
 ) -> Vec<half::f16> {
     let tile_side = i64::from(aurora_tile::TILE);
-    let mut clipped = vec![half::f16::from_f32(0.0); texels.len()];
+    // One windowed read for the whole tile, ahead of the loop -- not one
+    // store lookup per texel.
+    let coverage_window = mask_surface.map(|surface| {
+        read_layer_window(
+            store,
+            surface,
+            (mask.bounds.x, mask.bounds.y),
+            doc_origin,
+            budget,
+            WindowKind::MaskCoverage,
+        )
+    });
+    // A coverage window that is blank *and known to be* says exactly
+    // what no window at all says -- coverage `1.0` inside the bounds --
+    // so it is dropped here rather than consulted 65,536 times to be
+    // told the same thing. This is the common case today and probably
+    // for a long time: nothing paints mask coverage yet, and once
+    // something does, most masks still will not be painted on most
+    // tiles.
+    let coverage_window = coverage_window.filter(|window| !window.is_blank());
+    let mut masked = vec![half::f16::from_f32(0.0); texels.len()];
     for (index, (src, dst)) in texels
         .chunks_exact(aurora_tile::CHANNELS)
-        .zip(clipped.chunks_exact_mut(aurora_tile::CHANNELS))
+        .zip(masked.chunks_exact_mut(aurora_tile::CHANNELS))
         .enumerate()
     {
         let [r, g, b, a] = src else { continue };
         let [dst_r, dst_g, dst_b, dst_a] = dst else {
             continue;
         };
-        let Ok(index) = i64::try_from(index) else {
+        let Ok(signed_index) = i64::try_from(index) else {
             continue;
         };
-        let col = index % tile_side;
-        let row = index / tile_side;
+        let col = signed_index % tile_side;
+        let row = signed_index / tile_side;
         let abs_x = doc_origin.0 + col;
         let abs_y = doc_origin.1 + row;
 
-        let inside = mask.bounds.contains_point(abs_x, abs_y);
-        let shown = inside != mask.inverted;
+        // `None` means "this texel's coverage could not be determined",
+        // which is deliberately *not* a coverage value: it has to
+        // survive past the `inverted` step below, or inverting turns
+        // the fail-open default into a fail-*closed* one. See this
+        // function's own "Failing open, in both directions" note.
+        let raw: Option<f32> = if mask.bounds.contains_point(abs_x, abs_y) {
+            match coverage_window.as_ref() {
+                Some(window) => {
+                    let (Ok(window_col), Ok(window_row)) =
+                        (usize::try_from(col), usize::try_from(row))
+                    else {
+                        continue;
+                    };
+                    if window.was_read(window_col, window_row) {
+                        let base = index * aurora_tile::CHANNELS;
+                        match window.texels.as_ref() {
+                            // `map` on the `get`: a window that cannot
+                            // be indexed says the same thing a failed
+                            // read does -- no coverage determined --
+                            // and so stays `None`.
+                            Some(texels) => texels
+                                .get(base..base + aurora_tile::CHANNELS)
+                                .map(aurora_doc::read_mask_coverage),
+                            // Read cleanly, nothing ever stored under
+                            // this part of the surface: the
+                            // never-painted default.
+                            None => Some(1.0),
+                        }
+                    } else {
+                        // A texel whose own source tile failed to read
+                        // is all-zeros for that reason, not because
+                        // nobody painted it -- so it carries no
+                        // coverage, rather than the zeros' usual
+                        // meaning of `1.0`.
+                        None
+                    }
+                }
+                // No mask surface: `mask.bounds` alone decides, and
+                // inside it the layer is fully covered.
+                None => Some(1.0),
+            }
+        } else {
+            // Outside the rectangle a mask shows nothing, and this is a
+            // real determination -- `inverted` is meant to flip it.
+            Some(0.0)
+        };
+        let coverage = match raw {
+            Some(raw) => {
+                if mask.inverted {
+                    1.0 - raw
+                } else {
+                    raw
+                }
+            }
+            // Fail open *after* `inverted`, never before. Substituting
+            // `1.0` into `raw` instead (as this did until 0.70.2) is
+            // fail-open only while `inverted` is false: with it true,
+            // `1.0 - 1.0` is `0.0` and an unreadable mask erased the
+            // layer on screen -- the exact opposite of what the
+            // surrounding contract promises.
+            None => 1.0,
+        };
 
-        if shown {
-            *dst_r = *r;
-            *dst_g = *g;
-            *dst_b = *b;
-            *dst_a = *a;
+        if coverage > 0.0 {
+            let scaled = half::f16::from_f32(a.to_f32() * coverage);
+            // The `(0, 0, 0, 0)`-at-zero rule has to be checked on the
+            // *scaled* alpha, not on `coverage` alone: at a tiny but
+            // nonzero coverage the product can underflow to `f16` zero
+            // while `r`/`g`/`b` were about to be copied through intact,
+            // producing exactly the `(r, g, b, 0)` shape this function
+            // promises never to emit. `abs() > 0.0` rather than
+            // `!= 0.0` both dodges this workspace's `clippy::float_cmp`
+            // and treats `-0.0` (and a `NaN` alpha, which compares
+            // false) as zero.
+            if scaled.to_f32().abs() > 0.0 {
+                *dst_r = *r;
+                *dst_g = *g;
+                *dst_b = *b;
+                *dst_a = scaled;
+            }
         }
-        // else: leave fully transparent -- `clipped` is already
+        // else: leave fully transparent -- `masked` is already
         // zero-initialized above, and that is exactly `(0, 0, 0, 0)`.
     }
-    clipped
+    masked
 }
 
 /// The shared, per-composite-pass half of [`resolve_tile`]'s recursion
@@ -4983,9 +5957,9 @@ impl CompositeBudget {
 /// solve).
 ///
 /// **[`aurora_doc::LayerMask`] aggregation, the other real gap this
-/// function used to leave open**: both branches below now check
+/// function used to leave open**: both branches below check
 /// `layers.mask(id)` and, when a mask is present and `mask.enabled`,
-/// clip that branch's own texels through [`apply_mask_clip`] before
+/// mask that branch's own texels through [`apply_mask`] before
 /// anything else touches them — for `Pixel`, right after reading
 /// `texels`, ahead of the `Dissolve` interception above; for `Group`,
 /// right after the un-premultiply step below, on the group's own
@@ -4996,11 +5970,21 @@ impl CompositeBudget {
 /// masked-out pixel never gets a chance to win the stochastic gate,
 /// because it never reaches `dissolve_gate` with nonzero alpha. A
 /// disabled mask (`mask.enabled == false`) is skipped entirely, same as
-/// having no mask at all. **Rectangular clip only, stated the same way
-/// [`apply_mask_clip`]'s own doc comment states it**: `LayerMask` has no
-/// per-pixel mask data yet, so this is a hard inside/outside test against
-/// `mask.bounds`, not real grayscale masking — no feathering, no soft
-/// edges.
+/// having no mask at all.
+///
+/// **Real per-pixel grayscale coverage, not a rectangular clip.** Each
+/// branch passes `layers.mask_surface_id(id)` alongside the mask, so
+/// [`apply_mask`] samples real coverage out of the shared store (see
+/// the `aurora_doc::mask` module for the storage convention) and
+/// multiplies it into alpha — feathered and soft-edged masks composite
+/// correctly. `mask.bounds` still hard-clips: coverage is zero outside
+/// it regardless of what the surface holds. An **unpainted** mask
+/// surface reads back as full coverage everywhere, per texel, so a
+/// document that has never had mask pixels written composites exactly
+/// as it did before this existed. What is deliberately still missing is
+/// upstream of here, not in the compositor: no brush/tool paints mask
+/// coverage yet, `.aur` does not persist it, and mask-pixel edits have
+/// no undo/history entry.
 ///
 /// **The regression-safety property, precisely**: `composite_tile_cpu`
 /// already reproduces a single full-opacity (`opacity = 1.0`) layer's
@@ -5182,16 +6166,31 @@ fn resolve_tile(
                     }
                 }
             } else {
-                read_layer_window(store, surface, origin, doc_origin, budget)
+                read_layer_window(
+                    store,
+                    surface,
+                    origin,
+                    doc_origin,
+                    budget,
+                    WindowKind::LayerPixels,
+                )
+                .into_texels()
             };
-            // Mask clip runs first, ahead of `Dissolve` below: it
-            // restricts which pixels are even in play before any blend
-            // mode acts on what's left. See `resolve_tile`'s own doc
-            // comment for the full ordering rationale and
-            // `apply_mask_clip`'s own doc comment for the rectangular-
-            // clip-only scope boundary.
+            // Masking runs first, ahead of `Dissolve` below: it
+            // restricts which pixels are even in play, and by how much,
+            // before any blend mode acts on what's left. See
+            // `resolve_tile`'s own doc comment for the full ordering
+            // rationale and `apply_mask`'s own doc comment for how
+            // `mask.bounds` and real per-pixel coverage combine.
             let texels = match layers.mask(id) {
-                Some(mask) if mask.enabled => apply_mask_clip(&texels, mask, doc_origin),
+                Some(mask) if mask.enabled => apply_mask(
+                    &texels,
+                    mask,
+                    layers.mask_surface_id(id),
+                    store,
+                    doc_origin,
+                    budget,
+                ),
                 _ => texels,
             };
             // `Dissolve` is intercepted here, ahead of the translated
@@ -5301,18 +6300,28 @@ fn resolve_tile(
             // accumulation, never inside `composite_layer_into`'s own
             // fold).
             aurora_render::un_premultiply_in_place(&mut isolated);
-            // A group's own mask clips its *whole* isolated composite as
+            // A group's own mask masks its *whole* isolated composite as
             // one unit, ahead of `Dissolve` below -- the same "group's
             // own opacity/blend mode apply one level up, to the isolated
             // result, not per-child" precedent this function's own doc
             // comment already establishes for opacity/blend mode, applied
             // identically here. See `resolve_tile`'s own doc comment for
-            // the full ordering rationale and `apply_mask_clip`'s own doc
-            // comment for the rectangular-clip-only scope boundary.
+            // the full ordering rationale and `apply_mask`'s own doc
+            // comment for how bounds and per-pixel coverage combine.
+            // `mask_surface_id` deliberately returns `Some` for a group
+            // where `surface_id` returns `None`: a group has no pixels
+            // of its own, but it can certainly carry a mask.
             if let Some(mask) = layers.mask(id)
                 && mask.enabled
             {
-                isolated = apply_mask_clip(&isolated, mask, doc_origin);
+                isolated = apply_mask(
+                    &isolated,
+                    mask,
+                    layers.mask_surface_id(id),
+                    store,
+                    doc_origin,
+                    budget,
+                );
             }
             // `Dissolve` on a *group* is intercepted here too, symmetric
             // with the `Pixel` branch above (see `dissolve_gate`'s own
@@ -5685,7 +6694,7 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// own fixed-function "source-over" *is* that formula exactly, so unlike
 /// `composite_tile_cpu` this needs no blend-mode dispatch of its own.
 ///
-/// For each collected layer (bottom to top): uploads its own tile-sized
+/// For each resolved layer (bottom to top), immediately: uploads its own tile-sized
 /// texel window into a fresh scratch `Rgba16Float` source texture
 /// (`TEXTURE_BINDING | COPY_DST`), then
 /// `aurora_render::TileCompositor::composite_over_with_opacity` blends it
@@ -5758,14 +6767,33 @@ fn begin_gpu_composite_tile(
     reference_origin: (i64, i64),
     budget: &mut CompositeBudget,
 ) -> Option<PendingGpuReadback> {
-    let mut layer_texels: Vec<(Vec<half::f16>, f32)> = Vec::new();
+    let device = gpu.device();
+    let queue = gpu.queue();
+    let tile_extent = wgpu::Extent3d {
+        width: aurora_tile::TILE,
+        height: aurora_tile::TILE,
+        depth_or_array_layers: 1,
+    };
+
+    // Built lazily, on the first root layer that actually resolves to
+    // real content for this tile -- a tile with no touched layer
+    // anywhere must do zero GPU work and return `None`, exactly as the
+    // collect-then-check-empty shape this replaces did. Resolving and
+    // compositing one layer at a time this way (rather than collecting
+    // every root's own `Vec<half::f16>` before uploading any of them)
+    // means this tile's peak memory is one resolved layer's texels plus
+    // one GPU-side src/dst texture pair, not one texel buffer per
+    // visible root -- the same shape `composite_roots_into_tile`'s own
+    // CPU path already has (0.51.0).
+    let mut dst: Option<(wgpu::Texture, wgpu::TextureView)> = None;
+
     for &id in layers.roots().iter().rev() {
         // `1`: a root-level layer, the same depth `aurora-doc`'s own
         // validator starts its budget at. One `budget` for all of this
         // tile's roots, not one each: in a well-formed tree their
         // subtrees are disjoint, so the sum of their node counts is
         // still bounded by the tree's own length.
-        if let Some((texels, opacity, _blend_mode)) = resolve_tile(
+        let Some((texels, opacity, _blend_mode)) = resolve_tile(
             id,
             layers,
             store,
@@ -5774,66 +6802,58 @@ fn begin_gpu_composite_tile(
             reference_origin,
             1,
             budget,
-        ) {
-            layer_texels.push((texels, opacity));
-        }
-    }
-    if layer_texels.is_empty() {
-        return None;
-    }
+        ) else {
+            continue;
+        };
 
-    let device = gpu.device();
-    let queue = gpu.queue();
-    let tile_extent = wgpu::Extent3d {
-        width: aurora_tile::TILE,
-        height: aurora_tile::TILE,
-        depth_or_array_layers: 1,
-    };
-    let dst_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("gpu-composite-dst"),
-        size: tile_extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        // `RENDER_ATTACHMENT` for the per-layer blend passes, `COPY_SRC`
-        // for the readback below -- nothing samples this texture, so it
-        // needs no `TEXTURE_BINDING`.
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let dst_view = dst_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    // Clear to fully transparent black -- `composite_over_with_opacity`
-    // always preserves existing content (`LoadOp::Load`), so the
-    // destination needs real, known-transparent content before the first
-    // real layer blends onto it.
-    {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpu-composite-clear"),
-        });
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gpu-composite-clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
+        let (_dst_texture, dst_view) = &*dst.get_or_insert_with(|| {
+            let dst_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gpu-composite-dst"),
+                size: tile_extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                // `RENDER_ATTACHMENT` for the per-layer blend passes, `COPY_SRC`
+                // for the readback below -- nothing samples this texture, so it
+                // needs no `TEXTURE_BINDING`.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
             });
-        }
-        queue.submit(std::iter::once(encoder.finish()));
-    }
+            let dst_view = dst_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    for (texels, opacity) in &layer_texels {
+            // Clear to fully transparent black -- `composite_over_with_opacity`
+            // always preserves existing content (`LoadOp::Load`), so the
+            // destination needs real, known-transparent content before the first
+            // real layer blends onto it.
+            {
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("gpu-composite-clear"),
+                });
+                {
+                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("gpu-composite-clear"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &dst_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
+                queue.submit(std::iter::once(encoder.finish()));
+            }
+
+            (dst_texture, dst_view)
+        });
+
         let src_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gpu-composite-src"),
             size: tile_extent,
@@ -5845,7 +6865,7 @@ fn begin_gpu_composite_tile(
             view_formats: &[],
         });
         let mut bytes = Vec::with_capacity(texels.len() * 2);
-        for sample in texels {
+        for sample in &texels {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         queue.write_texture(
@@ -5864,8 +6884,10 @@ fn begin_gpu_composite_tile(
             tile_extent,
         );
         let src_view = src_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        compositor.composite_over_with_opacity(gpu, &dst_view, &src_view, *opacity);
+        compositor.composite_over_with_opacity(gpu, dst_view, &src_view, opacity);
     }
+
+    let (dst_texture, _dst_view) = dst?;
 
     // `dst_texture` now holds this tile's finished composite in
     // *premultiplied* alpha -- the fixed-function `AlphaBlending` fold
@@ -6026,9 +7048,11 @@ fn recomposite_visible_tiles(
     // *active* layer's own origin (`canvas_local_origin`'s own doc
     // comment) — every other layer's own document-space tile boundaries
     // only line up with it by coincidence, so this is the one origin
-    // every `tile_id` below needs converting back out of.
-    let reference_origin =
-        active_pixel_layer(layers, active_layer).map_or((0, 0), |(_, b)| (b.x, b.y));
+    // every `tile_id` below needs converting back out of. This is also
+    // the *only* use `active_layer` gets in this function or anything it
+    // calls — see `composite_reference_origin`'s own doc comment for
+    // what that buys the two narrowed invalidation paths.
+    let reference_origin = composite_reference_origin(layers, active_layer);
 
     // Document-wide, computed once per call, not once per tile — see
     // `document_qualifies_for_gpu_compositing`'s own doc comment for why
@@ -6182,20 +7206,46 @@ fn recomposite_visible_tiles(
 /// back over already-composited, unedited territory is a real cache
 /// hit, not just an idle redraw with nothing to do.
 ///
-/// [`Self::bump`] is the coarse invalidation primitive, called by every
-/// `aurora-app` operation whose effect on "what a given `TileId` now
-/// composites to" isn't confined to a known, small set of tiles: a live
-/// Move, Undo/Redo, opening or replacing the active document, and
-/// selecting a different active layer (which changes the reference
-/// origin every `TileId` is measured from, shifting every tile's own
-/// meaning at once). [`Self::invalidate`] is the precise counterpart: a
-/// brush/eraser dab (`App::paint_dab`/`App::erase_dab`) knows exactly
-/// which tiles it really wrote (`aurora_brush::DabOutcome::painted`, in
-/// the same document-space-relative-to-the-active-layer's-own-origin
-/// frame `reference_origin` already uses — see those functions' own
-/// call sites) and invalidates only those, since a full bump on every dab of
+/// # The three invalidation primitives, and who reaches for each
+///
+/// Rewritten for what 0.72.0 and 0.73.0–0.73.2 actually left in place;
+/// before that there was only `bump`, and the account below said so.
+///
+/// [`Self::bump`] is the coarse one — every cached tile at once — for an
+/// operation whose effect on "what a given `TileId` now composites to"
+/// isn't confined to a known, small set of tiles. What still reaches for
+/// it *unconditionally* is now a short list, and it is the whole list:
+/// a live Move ([`App::apply_move`], which shifts the grid anchor on
+/// every pointer-move event of the drag), and opening a document —
+/// [`App::open_file`] and [`App::open_aur_file`]. Two callers that used to be on that list no longer are:
+///
+/// - **Selecting a different active layer** ([`press_layer_row`], 0.72.0)
+///   bumps only when the switch really moves
+///   [`composite_reference_origin`]. Two layers sharing an origin
+///   composite every `TileId` identically, and that is every layer this
+///   app's own UI creates.
+/// - **Undo/Redo** ([`perform_undo_redo`], 0.73.0) dispatches on the
+///   [`CompositeInvalidation`] the command reports, and reaches `bump`
+///   only for [`CompositeInvalidation::Everything`] — which is still
+///   every *structural* step ([`structural_invalidation`]), plus any
+///   step that moved the grid anchor or flipped
+///   [`document_qualifies_for_gpu_compositing`], but no longer a
+///   stroke's own undo.
+///
+/// [`Self::invalidate`] is the single-tile counterpart: a brush/eraser
+/// dab (`App::paint_dab`/`App::erase_dab`) knows exactly which tiles it
+/// really wrote (`aurora_brush::DabOutcome::painted`, in the same
+/// document-space-relative-to-the-active-layer's-own-origin frame
+/// `reference_origin` already uses — see those functions' own call
+/// sites) and invalidates only those, since a full bump on every dab of
 /// a stroke would mean recompositing the *entire* visible grid on every
 /// dab rather than just the tile(s) the dab actually changed.
+///
+/// [`Self::invalidate_doc_rects`] is the region-shaped one, for a caller
+/// that knows what changed as document-space rectangles rather than as a
+/// tile list — today exactly one: a *pixel* undo/redo, via
+/// [`stroke_invalidation`]. It is the reason `bump` no longer fires on
+/// every Ctrl+Z.
 ///
 /// **Bump itself stays coarse, stated honestly**: it invalidates every
 /// currently cached tile at once, not just the one(s) the triggering
@@ -6248,6 +7298,397 @@ impl CompositeCache {
     fn mark_current(&mut self, id: aurora_tile::TileId) {
         self.current.insert(id);
     }
+
+    /// Invalidates every cached tile that `rect` — a **document-space**
+    /// region, measured in the same absolute frame
+    /// `aurora_doc::LayerKind::Pixel`'s own `bounds` are — actually
+    /// overlaps, against a grid anchored at `reference_origin`. The
+    /// region-shaped counterpart to [`Self::invalidate`], for a caller
+    /// that knows what changed as a rectangle rather than as a tile list
+    /// (a *pixel* undo/redo: `aurora_brush::PixelHistory::peek_undo`
+    /// names the tiles the next undo will rewrite, and
+    /// [`stroke_invalidation`] places them in document space). A
+    /// *structural* undo/redo deliberately does not reach here at all —
+    /// see [`structural_invalidation`].
+    ///
+    /// **`reference_origin` must be the anchor the cached tiles were
+    /// composited under** — [`composite_reference_origin`] for the
+    /// *current* active layer. A `TileId` means nothing without it, so
+    /// calling this across a change that moved the anchor would
+    /// invalidate the wrong tiles and leave stale ones current;
+    /// [`perform_undo_redo`]'s own before/after check is what guarantees
+    /// the anchor did not move on the path that reaches here.
+    ///
+    /// **Retained in place, deliberately not expanded into a tile list.**
+    /// Converting `rect` to the `TileId`s it covers would allocate up to
+    /// one id per tile of the region, and at the 300,000 × 300,000 px
+    /// document ceiling a single layer's bounds is ~1,373,000 tiles —
+    /// an unbounded allocation driven by document size, to invalidate a
+    /// cache that only ever holds the tiles a session actually visited.
+    /// Retaining costs one overlap test per *cached* tile instead, which
+    /// is bounded by what the cache holds.
+    /// **Test-only since 0.73.3.** [`Self::invalidate_doc_rects`] is
+    /// what production code calls, in one pass; this single-rect entry
+    /// point survives because the tests that pin the half-open overlap
+    /// edges read far better one rect at a time, and pinning them
+    /// through a one-element slice would add noise to eight tests to
+    /// save one delegating line.
+    #[cfg(test)]
+    fn invalidate_doc_rect(&mut self, rect: aurora_core::Rect, reference_origin: (i64, i64)) {
+        self.invalidate_doc_rects(std::slice::from_ref(&rect), reference_origin);
+    }
+
+    /// [`Self::invalidate_doc_rect`] for a whole set of regions at once,
+    /// in **one** pass over the cache — every rule that method documents
+    /// applies unchanged, `reference_origin` requirement included.
+    ///
+    /// **One pass, not one per rect** (0.73.3), and the difference is a
+    /// real regression this fixes rather than a micro-optimisation.
+    /// Before narrowing existed, every undo/redo called [`Self::bump`],
+    /// which *cleared* `current` — so the cache was periodically reset
+    /// to empty for the whole session. Narrowing removed those resets
+    /// without removing the growth: `current` only ever grows between
+    /// bumps (this type's own doc comment says so), and dispatching one
+    /// `retain` per rect made the cost
+    /// `O(rects x cached_tiles)` against a second factor that now climbs
+    /// monotonically across a long session. A stroke's undo reports one
+    /// rect per captured tile, so a wide stroke multiplies a growing
+    /// walk.
+    ///
+    /// Folding the rects into the predicate instead costs one walk of
+    /// `current`, with `Iterator::any` short-circuiting on the first
+    /// rect that matches — and no merging pass, no allocation, and no
+    /// dependence on the rects being disjoint or sorted.
+    ///
+    /// An empty slice returns without touching the cache: `any` over
+    /// nothing is `false`, so the `retain` would keep every tile and
+    /// achieve nothing at the cost of a full walk.
+    fn invalidate_doc_rects(&mut self, rects: &[aurora_core::Rect], reference_origin: (i64, i64)) {
+        if rects.is_empty() {
+            return;
+        }
+        self.current.retain(|&id| {
+            !rects
+                .iter()
+                .any(|&rect| tile_overlaps_doc_rect(id, rect, reference_origin))
+        });
+    }
+}
+
+/// Whether composite tile `id`, on a grid anchored at
+/// `reference_origin`, covers any pixel of the document-space region
+/// `rect`.
+///
+/// **Half-open on both sides**, the same convention
+/// `aurora_core::Rect` itself uses: a tile owns
+/// `[x0, x0 + TILE) × [y0, y0 + TILE)`, and a rect owns
+/// `[x, x + width) × [y, y + height)`. So a rect ending *exactly* at a
+/// tile's first pixel does not touch that tile, and a rect starting
+/// exactly at a tile's last-pixel-plus-one does not either. Getting this
+/// edge wrong in the permissive direction only wastes work; getting it
+/// wrong in the strict direction leaves a one-pixel-wide stale seam in
+/// the composite that no later redraw ever repairs, which is why both
+/// directions have their own test.
+///
+/// **A zero-width or zero-height rect touches nothing**, and returns
+/// `false` before any arithmetic — an empty region is what
+/// `aurora_core::Rect::union` produces as its own identity, so it does
+/// reach here (an undone `SetBounds` between two empty layers, say), and
+/// treating it as "touches the tile at its corner" would invalidate a
+/// tile for a change that could not have altered a single texel.
+///
+/// **All arithmetic in `i64`, never a cast.** `aurora_tile::TileId`'s
+/// own fields are `u32`, so document territory left of or above
+/// `reference_origin` has no `TileId` at all; the comparison has to
+/// happen in a signed type wide enough for both, and `i64::from` is
+/// lossless for every `u32`. `saturating_*` rather than plain operators
+/// so that a crafted id/rect cannot overflow-panic a debug build — with
+/// real values it can never trigger (a `u32` tile index times 256 is at
+/// most ~1.1e12, and `aurora_core::MAX_DOCUMENT_ORIGIN` bounds the
+/// origins), so this is belt-and-braces, not a behaviour a caller should
+/// rely on.
+#[must_use]
+fn tile_overlaps_doc_rect(
+    id: aurora_tile::TileId,
+    rect: aurora_core::Rect,
+    reference_origin: (i64, i64),
+) -> bool {
+    if rect.width == 0 || rect.height == 0 {
+        return false;
+    }
+    let tile_size = i64::from(aurora_tile::TILE);
+    let tile_x0 = reference_origin
+        .0
+        .saturating_add(i64::from(id.x).saturating_mul(tile_size));
+    let tile_y0 = reference_origin
+        .1
+        .saturating_add(i64::from(id.y).saturating_mul(tile_size));
+    let tile_x1 = tile_x0.saturating_add(tile_size);
+    let tile_y1 = tile_y0.saturating_add(tile_size);
+    let rect_x1 = rect.x.saturating_add(i64::from(rect.width));
+    let rect_y1 = rect.y.saturating_add(i64::from(rect.height));
+    rect.x < tile_x1 && rect_x1 > tile_x0 && rect.y < tile_y1 && rect_y1 > tile_y0
+}
+
+/// What an already-applied command changed about the composite, as
+/// reported by [`run_command`] and dispatched by [`after_undo_redo`].
+///
+/// The point of the type is that "I don't know" is a *named* answer
+/// rather than the absence of one. Before it, `run_command` returned
+/// nothing at all and its one caller compensated with an unconditional
+/// [`CompositeCache::bump`] — correct, but it paid a whole visible
+/// grid's recomposite for every Ctrl+Z, including the overwhelmingly
+/// common case of undoing a stroke that touched one or two tiles.
+///
+/// **`#[must_use]` is the structural half of that** (0.73.3). Dropping
+/// this value is dropping the instruction to invalidate — the composite
+/// keeps showing pre-command pixels, silently, with no test failing and
+/// nothing on screen to suggest a step was skipped. There is exactly one
+/// call site that legitimately discards it ([`handle_key`], whose
+/// reachable arms are all [`Self::None`]), and it says so explicitly;
+/// this attribute is what makes the *next* one a compile error instead
+/// of a stale-tile bug.
+#[must_use]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompositeInvalidation {
+    /// Nothing composited changed — either the command wasn't a document
+    /// edit at all, or it failed and was not applied.
+    None,
+    /// Exactly these document-space regions changed, in the absolute
+    /// frame `aurora_doc::LayerKind::Pixel`'s own `bounds` use. Every
+    /// composite tile overlapping any of them needs recomputing; every
+    /// other cached tile is still valid.
+    ///
+    /// **Only [`stroke_invalidation`] produces this** (0.73.1). Its
+    /// rects come from the tiles a stroke actually captured plus the
+    /// layer's origin, which is a genuine superset of that step's visual
+    /// effect. A *structural* step's rect is not — see
+    /// [`structural_invalidation`] — so that path reports
+    /// [`Self::Everything`] instead.
+    Regions(Vec<aurora_core::Rect>),
+    /// The changed region isn't knowable (a group-level change, whose
+    /// on-canvas extent needs subtree-bounds aggregation `aurora-doc`
+    /// deliberately doesn't have yet), **or** the grid anchor itself
+    /// moved, which re-points every cached `TileId` at a different
+    /// document window at once. Recomposite everything.
+    Everything,
+}
+
+/// The [`aurora_doc::LayerId`] whose own pixel surface is `surface`, by
+/// scanning the tree — `None` if no layer in `layers` owns it (the layer
+/// was deleted since the stroke that captured it was recorded).
+///
+/// **A real scan, not a reversal of `LayerTree::surface_id`'s derived-id
+/// trick.** That method happens to reuse a `LayerId`'s own raw value
+/// today, and inverting it here would be one line — but it would make
+/// this function silently wrong the moment that derivation changes,
+/// with nothing in either crate saying the two are coupled. Documents
+/// hold tens of layers, this runs once per undo/redo of a stroke, and
+/// `layers.len()` bounds the walk.
+#[must_use]
+fn layer_for_surface(
+    layers: &aurora_doc::LayerTree,
+    surface: aurora_tile::SurfaceId,
+) -> Option<aurora_doc::LayerId> {
+    let mut stack: Vec<aurora_doc::LayerId> = layers.roots().to_vec();
+    // One visit per layer the tree actually holds. Only ever exhausted
+    // by a malformed (cyclic) tree, which `LayerTree`'s own
+    // `Deserialize` already rejects -- the same belt-and-braces bound
+    // `LayerTree::paint_order` uses for the same walk, for the same
+    // reason: this is reached from an edit path, and "the tree is
+    // somehow cyclic" must stay a wrong answer rather than a hang.
+    let mut budget = layers.len();
+    while let Some(id) = stack.pop() {
+        if budget == 0 {
+            tracing::warn!(
+                ?surface,
+                "gave up scanning for a stroke's own layer; treating it as unknown"
+            );
+            return None;
+        }
+        budget -= 1;
+        if layers.surface_id(id) == Some(surface) {
+            return Some(id);
+        }
+        if let Some(children) = layers.children(id) {
+            stack.extend_from_slice(children);
+        }
+    }
+    None
+}
+
+/// The document-space regions a pixel undo/redo is about to rewrite:
+/// one whole-tile rect per captured `aurora_tile::TileId`, translated
+/// out of the owning layer's own surface-local tile grid into absolute
+/// document space by that layer's own `bounds` origin.
+///
+/// [`CompositeInvalidation::Everything`] when the owning layer can't be
+/// found or has no bounds — a stroke whose layer was deleted after the
+/// stroke was recorded still has to invalidate *something*, and an empty
+/// [`CompositeInvalidation::Regions`] would silently invalidate nothing
+/// at all.
+// `CompositeInvalidation`'s own `#[must_use]` covers this return
+// value; repeating it here trips clippy's `double_must_use`.
+fn stroke_invalidation(
+    layers: &aurora_doc::LayerTree,
+    surface: aurora_tile::SurfaceId,
+    tiles: &[aurora_tile::TileId],
+) -> CompositeInvalidation {
+    let Some(layer) = layer_for_surface(layers, surface) else {
+        return CompositeInvalidation::Everything;
+    };
+    let Some(bounds) = layers.bounds(layer) else {
+        return CompositeInvalidation::Everything;
+    };
+    let tile_size = i64::from(aurora_tile::TILE);
+    CompositeInvalidation::Regions(
+        tiles
+            .iter()
+            .map(|tile| aurora_core::Rect {
+                x: bounds
+                    .x
+                    .saturating_add(i64::from(tile.x).saturating_mul(tile_size)),
+                y: bounds
+                    .y
+                    .saturating_add(i64::from(tile.y).saturating_mul(tile_size)),
+                width: aurora_tile::TILE,
+                height: aurora_tile::TILE,
+            })
+            .collect(),
+    )
+}
+
+/// What a [`read_layer_window`] call is reading, which decides how a
+/// failed `aurora_tile::TileStore::get` inside it is described.
+///
+/// Purely a reporting distinction: both variants charge
+/// [`CompositeBudget::note_store_error`] identically. The variant
+/// exists because the log line used to say "skipping a moved layer's
+/// source tile" for a *mask* read too, which sends whoever reads it
+/// looking at the wrong surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowKind {
+    /// A [`aurora_doc::LayerKind::Pixel`] layer's own pixels, re-tiled
+    /// because that layer's origin isn't a whole number of tiles away
+    /// from the composite tile's.
+    LayerPixels,
+    /// A [`aurora_doc::LayerMask`]'s grayscale coverage, on the layer's
+    /// own `aurora_doc::LayerTree::mask_surface_id`.
+    ///
+    /// # Why an unreadable mask tile still refuses an export
+    ///
+    /// Masking fails *open* on the canvas — an unreadable mask shows
+    /// the layer rather than erasing it, so a user never watches their
+    /// work vanish because a scratch file went bad. That is
+    /// deliberately **not** the same as saying the failure is harmless,
+    /// and the two paths get different answers on purpose:
+    ///
+    /// - **Canvas** (`recomposite_visible_tiles`): show the layer.
+    ///   Being briefly un-masked on screen is recoverable; the pixels
+    ///   are all still there.
+    /// - **Export** (`composite_document`): refuse. The image that
+    ///   would be written is not the document — a layer that should
+    ///   have been masked isn't — and CLAUDE.md is explicit that
+    ///   silently degrading a professional's file is the worst failure
+    ///   this project can have. A refusal is loud and retryable; a
+    ///   wrongly un-masked export is silent and permanent.
+    ///
+    /// So this variant charges `note_store_error` exactly like
+    /// [`Self::LayerPixels`] does. It is a real behaviour change from
+    /// before mask pixels existed (a mask could not fail to read at
+    /// all then), stated here rather than left to be discovered.
+    MaskCoverage,
+}
+
+impl WindowKind {
+    /// The `surface_kind` field on this kind's own warning.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LayerPixels => "layer-pixels",
+            Self::MaskCoverage => "mask-coverage",
+        }
+    }
+
+    /// What was skipped, said in terms of the surface actually read.
+    const fn skip_message(self) -> &'static str {
+        match self {
+            Self::LayerPixels => "skipping a moved layer's source tile for this composite tile",
+            Self::MaskCoverage => "skipping a layer mask's coverage tile for this composite tile",
+        }
+    }
+}
+
+/// A rectangle of a [`LayerWindow`] that a failed
+/// `aurora_tile::TileStore::get` left at the blank default, in
+/// window-local texel coordinates (`col_start..col_end` by
+/// `row_start..row_end`, both half-open).
+#[derive(Clone, Copy, Debug)]
+struct UnreadRegion {
+    col_start: usize,
+    col_end: usize,
+    row_start: usize,
+    row_end: usize,
+}
+
+/// One [`read_layer_window`] result: the window's texels, plus which
+/// parts of it (if any) are blank *because a read failed* rather than
+/// because nothing was ever painted there.
+///
+/// Keeping those apart is the whole reason this type exists — see
+/// [`read_layer_window`]'s own doc comment.
+#[derive(Debug)]
+struct LayerWindow {
+    /// `None` when no source tile overlapping this window was ever
+    /// stored on the surface — every texel is the blank default, and
+    /// nothing was allocated, paged in, or materialized to establish
+    /// that. See [`read_layer_window`]'s own doc comment.
+    texels: Option<Vec<half::f16>>,
+    /// At most four entries: one window overlaps at most four source
+    /// tiles. Empty in the overwhelmingly common case, which is what
+    /// makes [`Self::was_read`] a no-op scan rather than a per-texel
+    /// cost.
+    unread: Vec<UnreadRegion>,
+}
+
+impl LayerWindow {
+    /// Whether this window is blank *and known to be* — nothing stored
+    /// and nothing that failed to read, so every texel really is the
+    /// surface's own default.
+    ///
+    /// [`apply_mask`] uses this to drop straight onto its
+    /// `mask_surface: None` path, which is bit-identical for a blank
+    /// coverage window and skips the per-texel window lookups
+    /// entirely.
+    fn is_blank(&self) -> bool {
+        self.texels.is_none() && self.unread.is_empty()
+    }
+
+    /// The window as a plain buffer, materializing the all-zero default
+    /// if nothing was stored — for a caller that needs texels either
+    /// way and gives blank its ordinary meaning (fully transparent).
+    fn into_texels(self) -> Vec<half::f16> {
+        self.texels.unwrap_or_else(|| {
+            vec![
+                half::f16::from_f32(0.0);
+                aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
+            ]
+        })
+    }
+
+    /// Whether the texel at window-local `(col, row)` reflects an
+    /// actual read of the surface.
+    ///
+    /// `false` means a `aurora_tile::TileStore::get` covering it
+    /// failed, so the zeros sitting there say nothing about what the
+    /// surface holds. A caller that gives zeros a *meaning* — as
+    /// [`apply_mask`] does, where they mean "never painted, fully
+    /// visible" — must consult this before believing them.
+    fn was_read(&self, col: usize, row: usize) -> bool {
+        !self.unread.iter().any(|region| {
+            (region.col_start..region.col_end).contains(&col)
+                && (region.row_start..region.row_end).contains(&row)
+        })
+    }
 }
 
 /// Assembles one `aurora_tile::TILE`-sized window of `surface`'s own
@@ -6270,6 +7711,43 @@ impl CompositeCache {
 /// own unsigned fields mean there is no tile to read — is left fully
 /// transparent, the same as any pixel `surface` has genuinely never
 /// been painted at.
+///
+/// # A surface with nothing stored under it costs nothing
+///
+/// Neither the up-to-four `aurora_tile::TileStore::get` calls nor the
+/// destination buffer happen for a source tile that was never written.
+/// `TileStore::get` *materializes* an untouched tile — allocates it,
+/// makes it resident, and can evict a real tile to make room, paying a
+/// synchronous encode and scratch-disk write — all to hand back zeros
+/// this window already holds; `contains_tile` answers the same question
+/// in three hash lookups. The buffer is likewise allocated on the first
+/// tile that really exists, so a wholly-unstored surface returns
+/// `texels: None` having touched nothing at all.
+///
+/// That case is not hypothetical: today it is *every* mask surface,
+/// because nothing in the app paints one yet, and it stays the common
+/// case afterwards (most masks will never be painted on most tiles).
+/// Measured at ~2.9× the per-tile cost of the bounds-only path before
+/// this, on the frame path CLAUDE.md already records as over its 60 FPS
+/// budget — see [`apply_mask`].
+///
+/// # Why the result is a [`LayerWindow`] and not a bare `Vec`
+///
+/// Because "this texel is blank" and "this texel could not be read"
+/// are *different facts* that both come out as all-zeros in the buffer,
+/// and one caller has to tell them apart. [`apply_mask`] reads a mask's
+/// coverage through here, where a zero texel means "never painted, so
+/// fully visible" — the fail-open default — and if a failed
+/// `aurora_tile::TileStore::get` is indistinguishable from that, then
+/// `mask.inverted` flips the *default* along with everything else and
+/// the failure fails **closed** instead, erasing the layer. See
+/// [`LayerWindow::was_read`] and [`apply_mask`]'s own doc comment.
+///
+/// `kind` decides only how a failed read is *described* in the log
+/// line; both kinds still charge `CompositeBudget::note_store_error`,
+/// which is what an export refusal is built on. See
+/// [`WindowKind::MaskCoverage`] for why a mask read counts too, even
+/// though masking otherwise fails open.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn read_layer_window(
     store: &mut aurora_tile::TileStore,
@@ -6277,15 +7755,21 @@ fn read_layer_window(
     layer_origin: (i64, i64),
     doc_origin: (i64, i64),
     budget: &mut CompositeBudget,
-) -> Vec<half::f16> {
+    kind: WindowKind,
+) -> LayerWindow {
     let tile_size = i64::from(aurora_tile::TILE);
     let window_x = doc_origin.0 - layer_origin.0;
     let window_y = doc_origin.1 - layer_origin.1;
-    let mut out =
-        vec![
-            half::f16::from_f32(0.0);
-            aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
-        ];
+    // Allocated on the first source tile that actually exists, not up
+    // front: a window over a surface with nothing stored under it at
+    // all -- today, *every* mask surface, since nothing paints one yet
+    // -- would otherwise pay a half-megabyte zero-fill to learn that
+    // it is blank. `None` is the caller's signal for exactly that. See
+    // this function's own doc comment.
+    let mut out: Option<Vec<half::f16>> = None;
+    // At most four source tiles overlap one window, so at most four
+    // regions can fail; the `Vec` never grows past that.
+    let mut unread: Vec<UnreadRegion> = Vec::new();
 
     for tile_y in [
         window_y.div_euclid(tile_size),
@@ -6311,13 +7795,23 @@ fn read_layer_window(
             if col_lo >= col_hi {
                 continue;
             }
-            let src = match store.get(
-                surface,
-                aurora_tile::TileId {
-                    x: tile_col,
-                    y: tile_row,
-                },
-            ) {
+            let tile_id = aurora_tile::TileId {
+                x: tile_col,
+                y: tile_row,
+            };
+            // Nothing was ever stored here, so `TileStore::get` would
+            // materialize a blank tile -- allocate it, make it
+            // resident, and (residency being capped) very possibly
+            // evict a *real* tile to make room, paying a synchronous
+            // encode and scratch-disk write -- purely to copy zeros
+            // over the zeros `out` already holds. Skipping is
+            // bit-identical output at a fraction of the cost, and
+            // leaves the LRU cache alone. See
+            // `aurora_tile::TileStore::contains_tile`.
+            if !store.contains_tile(surface, tile_id) {
+                continue;
+            }
+            let src = match store.get(surface, tile_id) {
                 Ok(src) => src,
                 Err(err) => {
                     // Same reason as `resolve_tile`'s own direct
@@ -6326,23 +7820,44 @@ fn read_layer_window(
                     // unless somebody upstream is told. See
                     // `CompositeBudget::note_store_error`.
                     budget.note_store_error(&err);
+                    // Recorded per *region*, not merely per window, so
+                    // `apply_mask` can force the fail-open default on
+                    // exactly the texels this failed read covers and
+                    // leave the rest of the window alone. Charged
+                    // whatever `kind` is; only `apply_mask` reads it.
+                    unread.push(UnreadRegion {
+                        col_start: (col_lo - window_x) as usize,
+                        col_end: (col_hi - window_x) as usize,
+                        row_start: (row_lo - window_y) as usize,
+                        row_end: (row_hi - window_y) as usize,
+                    });
                     // Gated for the same reason as `resolve_tile`'s own
-                    // sibling warning, and doubly so here: a moved
-                    // layer's window reads up to four source tiles per
-                    // composite tile, so one broken file is up to four
-                    // log lines per tile per frame.
+                    // sibling warning, and doubly so here: a window
+                    // reads up to four source tiles per composite tile,
+                    // so one broken file is up to four log lines per
+                    // tile per frame.
                     if budget.should_report() {
                         tracing::warn!(
                             ?err,
                             tile_x = tile_col,
                             tile_y = tile_row,
-                            "skipping a moved layer's source tile for this composite tile"
+                            surface_kind = kind.as_str(),
+                            "{}",
+                            kind.skip_message()
                         );
                     }
                     continue;
                 }
             };
             let texels = src.texels().to_vec();
+            // First real source tile for this window: now, and only
+            // now, is a destination buffer worth having.
+            let out = out.get_or_insert_with(|| {
+                vec![
+                    half::f16::from_f32(0.0);
+                    aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
+                ]
+            });
             for src_row in row_lo..row_hi {
                 let dst_row = (src_row - window_y) as usize;
                 let in_tile_row = (src_row - tile_y * tile_size) as usize;
@@ -6365,7 +7880,10 @@ fn read_layer_window(
             }
         }
     }
-    out
+    LayerWindow {
+        texels: out,
+        unread,
+    }
 }
 
 /// Composites every visible pixel layer in `layers` across the whole
@@ -6576,9 +8094,27 @@ fn composite_document(
 /// [`commit_ending_drag`]'s own doc comment describes for the other
 /// gestures.
 ///
-/// Pushing the updated accessibility tree and bumping the composite
-/// cache stay the caller's job — the same split [`select_layer`] itself
-/// already documents.
+/// **The composite-cache invalidation is this function's job too, and
+/// it is guarded rather than unconditional** (0.72.0). A layer switch
+/// can only change what an already-cached composite `TileId` means by
+/// moving the grid anchor itself — [`composite_reference_origin`], the
+/// single value through which `active_layer` reaches
+/// [`recomposite_visible_tiles`] at all; nothing else about *which*
+/// layer is active is an input to compositing (every tile still
+/// composites the whole `LayerTree`, active layer or not). So switching
+/// between two layers that share an origin — which is every layer this
+/// app's own UI creates, all of them starting at `(0, 0)` — leaves every
+/// cached tile exactly as valid as it was, and bumping there threw away
+/// a whole visible grid's worth of composited tiles on every Layers-panel
+/// click for nothing. The anchor is read before the switch and again
+/// after; only a real move bumps.
+///
+/// Taking `composite_cache` rather than leaving the bump to the caller
+/// is the same reasoning [`select_layer`] already applies to the pan
+/// clamp: the guard is only sound *because* it sits next to the switch
+/// that could invalidate it, and a caller doing it by hand is a caller
+/// that can get it wrong. Pushing the updated accessibility tree stays
+/// the caller's job — that half really is one platform side effect.
 #[allow(clippy::too_many_arguments)]
 fn press_layer_row(
     workspace: &mut aurora_ui::Workspace,
@@ -6589,6 +8125,7 @@ fn press_layer_row(
     history: &mut aurora_doc::History,
     pixel_history: &mut aurora_brush::PixelHistory,
     undo_order: &mut UndoOrder,
+    composite_cache: &mut CompositeCache,
     drag: &mut Option<Drag>,
     layer_id: aurora_doc::LayerId,
 ) {
@@ -6602,7 +8139,14 @@ fn press_layer_row(
         *active_layer,
         canvas_area_logical_size(workspace),
     );
+    // Read across `select_layer` alone, the one statement that moves
+    // `*active_layer`. `layers` is immutable for this whole function, so
+    // the commit above cannot have moved the anchor under us either.
+    let before = composite_reference_origin(layers, *active_layer);
     select_layer(workspace, layer_rows, active_layer, view, layers, layer_id);
+    if composite_reference_origin(layers, *active_layer) != before {
+        composite_cache.bump();
+    }
 }
 
 /// Selects `layer_id` as the active layer: sets `*active_layer`, marks
@@ -6652,9 +8196,18 @@ fn select_layer(
     clamp_pan_to_active_layer(view, layers, Some(layer_id), canvas_size);
 }
 
+/// The name prefix every session's scratch directory carries — what
+/// [`create_tile_store_scratch_dir`] builds one with, and what the
+/// startup sweep in [`run`] matches candidates against. One constant so
+/// the two cannot drift apart; a sweep looking for the wrong prefix
+/// would silently do nothing, which is the failure mode a startup
+/// housekeeping job is least likely to be noticed having.
+const SCRATCH_DIR_PREFIX: &str = "aurora-scratch-";
+
 /// Creates a fresh scratch directory for one session's tile store,
-/// under the platform temp directory, and returns its path. `None`
-/// (logged) if it cannot be created.
+/// under the platform temp directory, takes its liveness lock
+/// (`aurora_tile::lock_scratch_dir`), and returns both. `None` (logged)
+/// if either step fails.
 ///
 /// **Why not a fixed path.** Until 0.53.0 this was
 /// `std::env::temp_dir().join("aurora-tiles")`: one directory, shared by
@@ -6675,9 +8228,9 @@ fn select_layer(
 /// user-facing scratch-disk preference (FR-026), not something to decide
 /// here by silently redirecting a document's paging traffic into
 /// `directories::ProjectDirs`' data directory.
-fn create_tile_store_scratch_dir() -> Option<PathBuf> {
+fn create_tile_store_scratch_dir() -> Option<(PathBuf, aurora_tile::ScratchLock)> {
     let mut builder = tempfile::Builder::new();
-    builder.prefix("aurora-scratch-");
+    builder.prefix(SCRATCH_DIR_PREFIX);
     // `tempfile` creates a *directory* with the process's default
     // permissions (a plain `DirBuilder::create`, so umask-derived and
     // typically `0o755`/`0o775`) -- unlike its temp *files*, which are
@@ -6693,13 +8246,37 @@ fn create_tile_store_scratch_dir() -> Option<PathBuf> {
         use std::os::unix::fs::PermissionsExt as _;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    match builder.tempdir() {
-        Ok(dir) => Some(dir.keep()),
+    let dir = match builder.tempdir() {
+        Ok(dir) => dir.keep(),
         Err(err) => {
             tracing::warn!(
                 ?err,
                 "failed to create this session's tile scratch directory"
             );
+            return None;
+        }
+    };
+    // Immediately after the directory exists, and never the other way
+    // round: the window between `mkdir` and this call is exactly the
+    // race `aurora_tile::sweep_orphaned_scratch_dirs` documents, and it
+    // is safe only in this order (a directory with no lock file yet
+    // reads as "unknown", which never deletes).
+    match aurora_tile::lock_scratch_dir(&dir) {
+        Ok(lock) => Some((dir, lock)),
+        Err(err) => {
+            // Fail closed in the other direction too: without a lock
+            // this session's directory would look dead to the *next*
+            // run's sweep, so rather than run unlocked, give up the
+            // directory entirely and take `open_tile_store`'s existing
+            // "painting is disabled this session" degradation.
+            tracing::warn!(
+                ?err,
+                path = %dir.display(),
+                "failed to lock this session's tile scratch directory; not using it"
+            );
+            if let Err(err) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!(?err, path = %dir.display(), "failed to remove it again");
+            }
             None
         }
     }
@@ -6724,10 +8301,91 @@ fn create_tile_store_scratch_dir() -> Option<PathBuf> {
 /// shutdown), so the cost of the memoization is one empty directory in
 /// the case where nothing needed one.
 fn tile_store_scratch_dir() -> Option<&'static Path> {
-    static SCRATCH_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    session_scratch_entry().map(|(path, _lock)| path.as_path())
+}
+
+/// This session's scratch directory *and* the slot holding its liveness
+/// lock — [`tile_store_scratch_dir`]'s own storage, exposed separately
+/// so [`ensure_session_scratch_lock`] can replace the guard rather than
+/// only read the path.
+///
+/// The `ScratchLock` is held here, in a `'static`, for the rest of the
+/// process's life **on purpose**. It is not an unused value: it is what
+/// tells the next Aurora process that this directory is live. Dropping
+/// it early releases the lock immediately, and the next run's startup
+/// sweep would then correctly conclude the directory is dead and delete
+/// it — while this session is still paging unsaved pixels into it.
+///
+/// The `Mutex` exists only so the guard can be *replaced* when the
+/// directory has to be recreated mid-run (see
+/// [`ensure_session_scratch_lock`]); it is never held across anything
+/// that can block.
+#[allow(clippy::type_complexity)]
+fn session_scratch_entry()
+-> Option<&'static (PathBuf, std::sync::Mutex<Option<aurora_tile::ScratchLock>>)> {
+    static SCRATCH_DIR: std::sync::OnceLock<
+        Option<(PathBuf, std::sync::Mutex<Option<aurora_tile::ScratchLock>>)>,
+    > = std::sync::OnceLock::new();
     SCRATCH_DIR
-        .get_or_init(create_tile_store_scratch_dir)
-        .as_deref()
+        .get_or_init(|| {
+            create_tile_store_scratch_dir()
+                .map(|(path, lock)| (path, std::sync::Mutex::new(Some(lock))))
+        })
+        .as_ref()
+}
+
+/// Re-takes this session's scratch-directory liveness lock if the lock
+/// file is gone — which it is exactly when [`aur_verify_scratch_dir`]
+/// has just had to recreate the directory a temp cleaner removed out
+/// from under a running session.
+///
+/// **Why this is not optional bookkeeping.** `create_dir_owner_only`
+/// brings the *directory* back but not the lock file inside it, and the
+/// `ScratchLock` this session still holds is attached to the deleted
+/// inode — invisible to everything, including its own directory. From
+/// that point the session's directory looks exactly like a pre-0.67.0
+/// leftover to every future run's startup sweep: no lock file, therefore
+/// `Unknown`, therefore never collected. That is fail-closed (nothing is
+/// deleted while it is live, and nothing is deleted afterwards either),
+/// but it is a permanent leak of a directory that can hold gigabytes.
+///
+/// A no-op in the overwhelmingly common case where the lock file is
+/// still there — re-locking then would conflict with the guard this
+/// process already holds, since `flock` is per open file description.
+/// A failure is logged at `warn` and nothing else changes: the session
+/// keeps running, unswept rather than unsafe.
+fn ensure_session_scratch_lock(session: &Path) {
+    if session.join(aurora_tile::LOCK_FILE_NAME).exists() {
+        return;
+    }
+    let Some((_, slot)) = session_scratch_entry() else {
+        return;
+    };
+    let Ok(mut guard) = slot.lock() else {
+        tracing::warn!("the scratch lock slot is poisoned; not re-taking the liveness lock");
+        return;
+    };
+    // The old guard is on an inode nothing can reach any more, so
+    // dropping it releases nothing anyone could observe -- and it must
+    // go before the new one is stored either way.
+    *guard = None;
+    match aurora_tile::lock_scratch_dir(session) {
+        Ok(lock) => {
+            *guard = Some(lock);
+            tracing::info!(
+                path = %session.display(),
+                "re-took the scratch-directory liveness lock after recreating the directory"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                path = %session.display(),
+                "could not re-take this session's scratch-directory liveness lock; the directory \
+                 is now invisible to future startup sweeps and will have to be removed by hand"
+            );
+        }
+    }
 }
 
 /// Everything a clean shutdown has to undo, in one directly callable
@@ -6760,45 +8418,144 @@ fn tile_store_scratch_dir() -> Option<&'static Path> {
 /// ordering it this way removes the question at zero cost rather than
 /// answering it.
 ///
-/// **Crash leftovers are not covered** — see PLAN.md's own follow-up
-/// item. A run that never reaches this leaves its directory behind for
-/// the platform's temp cleaner, and that includes clean quits that
-/// bypass `WindowEvent::CloseRequested` (macOS's own menu Quit,
-/// [`App::fail`]), not only crashes. The marker and the autosave have
-/// exactly the same gap.
+/// **Every *clean* exit reaches this now, not only a window close.**
+/// [`run_shutdown_cleanup`] calls it, [`App::finish_shutdown`] wraps
+/// that, and both `WindowEvent::CloseRequested` and
+/// [`ApplicationHandler::exiting`](App::exiting) call *that* — so
+/// macOS's own menu Quit, which used to leave a marker, an autosave and
+/// a scratch directory behind, is covered. The `CloseRequested` path
+/// runs it twice (its own call, then `exiting`); every step here is
+/// idempotent, which
+/// `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths` pins.
+///
+/// **An *aborted* run is deliberately not one of those exits.** A run
+/// that ends through [`App::fail`] never got a window up, so it may be
+/// holding a *previous* run's recovered document with the autosave as
+/// its only on-disk copy and a recovery dialog that was never shown.
+/// Clearing the marker and the autosave there would destroy that
+/// previous crash's recovery data, so [`run_shutdown_cleanup`] routes
+/// that exit to [`aborted_startup_cleanup`] instead, which removes only
+/// this run's own scratch tiles.
+///
+/// **Crash leftovers reach this function's counterpart, not this
+/// function.** A hard crash, a `SIGKILL`, an OS shutdown, and a
+/// `panic = "abort"` build (the release profile) all end the process
+/// without running any Rust cleanup, so none of them reach `exiting`
+/// either. Since 0.67.0 the *scratch directory* such a run leaves behind
+/// is collected by the startup sweep in [`run`]
+/// (`aurora_tile::sweep_orphaned_scratch_dirs`), which deletes a
+/// directory only once it can take its liveness lock. Two named gaps
+/// remain there, both deliberate: **Windows**, where the `flock`-based
+/// liveness check has no implementation yet and the sweep is an honest
+/// no-op, and **pre-0.67.0 leftovers**, which carry no lock file and are
+/// therefore never swept — "no lock file" cannot mean "dead" without
+/// also meaning it for a directory created microseconds ago. The marker
+/// and the autosave still have the original gap in full: nothing sweeps
+/// those, and a crashed run's marker is load-bearing anyway (it is what
+/// makes the *next* run offer recovery).
 fn clean_shutdown_cleanup(state: &mut impl ShutdownState) {
     clear_session_marker(state.marker_path());
     remove_autosave(&state.autosave_path());
-    // Taken and dropped *before* the directory goes: dropping a
-    // `aurora_tile::TileStore` joins its background writer thread (its
-    // `BackgroundWriter`'s own `Drop` calls `flush`, which drops the
-    // sender and joins), so no eviction can still be in flight against
-    // a directory that is being deleted. Deterministic by construction
-    // rather than a race this has to win.
+    remove_session_scratch(state);
+}
+
+/// The cleanup an **aborted** run may safely do: this run's own scratch
+/// tiles, and nothing else.
+///
+/// [`App::fail`] is the only way here, and it is only ever reached from
+/// `resumed` — before a window, a device or a surface exists. Two facts
+/// about that moment make the marker and the autosave off limits:
+///
+/// - `App::new` may have just recovered a *previous* run's crashed
+///   document out of the autosave and into memory, and `startup_document`
+///   deliberately does not rewrite the file in that case — the autosave
+///   on disk is the only copy of those pixels there is.
+/// - The crash-recovery dialog `App::new` built for it has never been
+///   *shown*: showing it needs the window `resumed` was in the middle of
+///   creating when it failed.
+///
+/// So the user has neither seen nor dismissed anything, and the failure
+/// itself (no GPU adapter, a driver hiccup, a surface that would not
+/// create) is exactly the kind of machine-level trouble that can repeat
+/// or that explains why the previous run died too. Deleting the recovery
+/// data here would be silent, permanent, and would leave a retry with
+/// nothing to recover; leaving it means the next run shows the dialog
+/// and recovers, which is what happened before 0.63.0 and what 0.63.0
+/// broke by routing this path through the full cleanup.
+///
+/// The scratch directory *is* removed: it holds tiles this run paged
+/// out, including the ones `recover_document` just read out of the
+/// autosave, and the autosave itself still holds every one of those
+/// pixels. Nothing recoverable lives only there.
+fn aborted_startup_cleanup(state: &mut impl ShutdownState) {
+    remove_session_scratch(state);
+}
+
+/// The scratch-tile half both exit paths share: drop the live store,
+/// then delete this session's paged-out tiles.
+///
+/// The store is taken and dropped *before* the directory goes, because
+/// dropping a `aurora_tile::TileStore` joins its background writer
+/// thread (its `BackgroundWriter`'s own `Drop` calls `flush`, which
+/// drops the sender and joins), so no eviction can still be in flight
+/// against a directory that is being deleted. Deterministic by
+/// construction rather than a race this has to win.
+fn remove_session_scratch(state: &mut impl ShutdownState) {
     drop(state.take_tile_store());
     if let Some(dir) = state.scratch_dir() {
         remove_scratch_dir(dir);
     }
 }
 
-/// Everything [`clean_shutdown_cleanup`] needs from the running
-/// application, as one source of truth rather than four arguments.
+/// The whole of what a run owes the next one on the way out, and the one
+/// place that decides *which* exit this is — so the decision sits behind
+/// [`ShutdownState`] where a test can reach it, rather than inside
+/// [`App::finish_shutdown`], which needs a real `winit` event loop and a
+/// real window to construct an [`App`] for at all.
 ///
-/// **Why a trait and not four parameters.** A review round showed that
-/// changing the single production call site to pass `None` for the
-/// store and `None` for the scratch directory compiled, ran, and passed
-/// the entire gate — a plausible slip with no protection whatsoever,
-/// and one `dead_code` would not catch either, since the function still
-/// had callers. With the state behind a trait the call site is
-/// `clean_shutdown_cleanup(self)`: there is no argument left to get
-/// wrong, and what remains is a four-line `impl` for [`App`] whose
+/// A run that came all the way up and is ending normally gets
+/// [`clean_shutdown_cleanup`] plus the workspace-layout save. A run
+/// aborting out of [`App::fail`] gets [`aborted_startup_cleanup`]: its
+/// own scratch tiles only, never the marker or the autosave (see that
+/// function for why), and no layout save either — an aborted run never
+/// showed a window, so its in-memory layout is at best the one it just
+/// loaded and at worst the defaults it fell back to when *reading* the
+/// saved layout failed, which is a real possibility on the same
+/// misbehaving machine. Writing that back would overwrite a good saved
+/// layout with defaults for no gain.
+fn run_shutdown_cleanup(state: &mut impl ShutdownState) {
+    if state.aborted() {
+        aborted_startup_cleanup(state);
+        return;
+    }
+    clean_shutdown_cleanup(state);
+    if let Some((path, workspace)) = state.workspace_layout() {
+        save_workspace_layout(path, workspace);
+    }
+}
+
+/// Everything [`run_shutdown_cleanup`] and [`clean_shutdown_cleanup`]
+/// need from the running application, as one source of truth rather than
+/// a handful of arguments.
+///
+/// **Why a trait and not a handful of parameters.** A review round
+/// showed that changing the single production call site to pass `None`
+/// for the store and `None` for the scratch directory compiled, ran, and
+/// passed the entire gate — a plausible slip with no protection
+/// whatsoever, and one `dead_code` would not catch either, since the
+/// function still had callers. With the state behind a trait the call
+/// site is `run_shutdown_cleanup(self)`: there is no argument left to
+/// get wrong, and what remains is a short `impl` for [`App`] whose
 /// bodies are each a single field or function reference.
 ///
-/// It is also what keeps the function testable. The real
+/// It is also what keeps the functions testable. The real
 /// implementation resolves the live session directory and the live
 /// store; a test supplies throwaway paths instead, because removing the
 /// live session directory from a test would pull the scratch disk out
-/// from under every other test sharing this binary.
+/// from under every other test sharing this binary. [`Self::aborted`]
+/// and [`Self::workspace_layout`] are here for the same reason: they are
+/// what let a test drive the failed-vs-clean branch and the layout save
+/// without an event loop.
 trait ShutdownState {
     /// This run's own "I'm still running" marker.
     fn marker_path(&self) -> &Path;
@@ -6810,6 +8567,14 @@ trait ShutdownState {
     /// This session's scratch directory, or `None` if one was never
     /// created (painting disabled for the run).
     fn scratch_dir(&self) -> Option<&Path>;
+    /// Whether this run is ending through [`App::fail`] rather than
+    /// finishing normally — `true` means the marker and the autosave
+    /// must survive it (see [`aborted_startup_cleanup`]).
+    fn aborted(&self) -> bool;
+    /// Where to persist the dock layout, and the workspace to read it
+    /// out of — `None` when the OS couldn't report a config directory
+    /// ([`layout_path`]).
+    fn workspace_layout(&self) -> Option<(&Path, &aurora_ui::Workspace)>;
 }
 
 /// [`clean_shutdown_cleanup`]'s scratch-directory step, split out so it
@@ -6850,7 +8615,18 @@ fn open_tile_store() -> Option<aurora_tile::TileStore> {
         return None;
     };
     match aurora_tile::TileStore::new(scratch_dir.to_path_buf(), budget) {
-        Ok(store) => Some(store),
+        Ok(store) => {
+            // `TileStore::new` recreates `scratch_dir` itself if a temp
+            // cleaner removed it (`create_private_dir`'s own self-heal) --
+            // the same gap `aur_verify_scratch_dir` closes on its own
+            // recreate path, and `TileStore::new` is called here on every
+            // fresh open, not only at startup (`open_tile_store`'s own
+            // callers include mid-run recovery). Without this, a store
+            // reopened after its directory was swept away runs the rest
+            // of the session invisible to every future startup sweep.
+            ensure_session_scratch_lock(scratch_dir);
+            Some(store)
+        }
         Err(err) => {
             tracing::warn!(
                 ?err,
@@ -7486,12 +9262,31 @@ struct App {
     /// in sync (see `aurora_widgets::widgets::command_palette`'s own doc
     /// comment).
     command_palette: Option<WidgetId>,
-    /// The open crash-recovery dialog, if one is open — `None` is
-    /// "closed" or "never needed one," the same "no separate visibility
-    /// flag" shape `command_palette` field above already uses. Opened
-    /// once, at construction, if [`previous_session_left_a_marker`] said
-    /// so — see this crate's own "crash recovery" section.
-    crash_recovery_dialog: Option<DialogHandle>,
+    /// The one open modal dialog, if any — `None` is "closed" or "never
+    /// needed one," the same "no separate visibility flag" shape the
+    /// `command_palette` field above already uses.
+    ///
+    /// **One slot, deliberately.** A modal alert blocks everything else
+    /// ([`handle_key`]'s own routing order, and — since 0.68.2 —
+    /// [`App::handle_menu_event`]'s), so a second one could never be
+    /// interacted with anyway; [`open_dialog`]'s own "already open is a
+    /// no-op" guard is what makes that concrete. **Three callers open
+    /// one today**: crash recovery at construction, if
+    /// [`previous_session_left_a_marker`] said so (see this crate's own
+    /// "crash recovery" section); [`App::save_file`] refusing an export
+    /// whose composite came out incomplete
+    /// ([`incomplete_composite_message`]); and [`App::apply_move`]
+    /// refusing a Move drag that left the document's own coordinate
+    /// range ([`move_refused_message`], 0.66.0).
+    ///
+    /// **The consequence of one slot is mutual exclusion, and it is not
+    /// free.** Any one of those three can silently suppress the other
+    /// two, so a caller that remembers "the user has been told" must ask
+    /// [`open_dialog`] whether it actually opened rather than assuming —
+    /// see [`move_refusal_unreported`] for the bug that assumption
+    /// caused, and `open_dialog`'s own suppression log line for what is
+    /// left behind when a refusal loses the race for the slot.
+    dialog: Option<DialogHandle>,
     /// This run's own "still running" marker file — written in [`run`]
     /// before this `App` is built, cleared on a clean shutdown
     /// (`WindowEvent::CloseRequested`).
@@ -7562,6 +9357,29 @@ struct App {
     /// from its topmost layer's own bounds used to silently shrink (or
     /// grow) the canvas to match that layer instead of preserving it.
     canvas_size: (u32, u32),
+    /// What this document is already known to be **missing** — the
+    /// tiles some earlier best-effort write could not read
+    /// (`aurora_io::SkippedTiles`).
+    ///
+    /// **State, not a one-shot notification** (0.74.1). It is populated
+    /// from a `.aur` file's own `skipped-tiles` entry when one is opened
+    /// ([`Self::open_aur_file`]) and handed to *every* subsequent write
+    /// of that document ([`write_autosave`], [`Self::save_aur_file`]),
+    /// because nothing else can carry it: a tile a previous writer
+    /// dropped is not in the tile store at all, so a later write walks
+    /// past it as "never painted" and rediscovers nothing. 0.74.0 read
+    /// the list, built one dialog line out of it and discarded it, so
+    /// the very next save — including the autosave `open_aur_file`
+    /// itself performs, before the warning has even appeared on
+    /// screen — wrote a file that no longer recorded the loss at all.
+    /// Open, Save, reopen, and the file said nothing; open and crash,
+    /// and crash recovery restored a document with no record either.
+    ///
+    /// Reset to empty wherever the document is *replaced* by one with
+    /// no such history ([`Self::open_file`]'s flat-image path), for the
+    /// same reason `pixel_history` and `undo_order` are: it describes
+    /// the document that is open, not the session.
+    skipped_tiles: aurora_io::SkippedTiles,
     /// `layers`' own undo/redo history — built alongside it (same
     /// source: [`demo_document`] or a recovered autosave) and, since
     /// Undo/Redo (`Ctrl+Z`/`Ctrl+Shift+Z`, [`run_command`]), also kept
@@ -7721,7 +9539,7 @@ struct App {
     pointer_position: Option<(f32, f32)>,
     /// An in-progress pointer drag (Pan, Marquee Select, Brush, or
     /// Eraser), if any — `None` is "not dragging," the same "no separate
-    /// flag" shape `command_palette`/`crash_recovery_dialog` above
+    /// flag" shape `command_palette`/`dialog` above
     /// already use.
     drag: Option<Drag>,
     /// An in-progress dock-rail resize, if any — deliberately separate
@@ -7791,11 +9609,28 @@ impl ShutdownState for App {
     fn scratch_dir(&self) -> Option<&Path> {
         tile_store_scratch_dir()
     }
+
+    fn aborted(&self) -> bool {
+        self.failed
+    }
+
+    fn workspace_layout(&self) -> Option<(&Path, &aurora_ui::Workspace)> {
+        self.layout_path
+            .as_deref()
+            .map(|path| (path, &self.workspace))
+    }
 }
 
 impl App {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
+    // 102 lines against a 100-line lint: this is a linear constructor
+    // that reads one field per line, and 0.74.1 added exactly one field
+    // (`skipped_tiles`) to it. Splitting a constructor in half to buy
+    // two lines would make it harder to read, not easier, so the lint is
+    // silenced here rather than obeyed by a worse shape -- the same
+    // trade `aurora_doc::history` and the GPU test modules already make.
+    #[allow(clippy::too_many_lines)]
     fn new(
         proxy: EventLoopProxy<accesskit_winit::Event>,
         theme: Theme,
@@ -7818,6 +9653,7 @@ impl App {
             layers,
             history,
             canvas_size,
+            skipped_tiles,
             was_recovered,
         } = startup_document(had_previous_marker, autosave_path, &mut tile_store);
         let layer_rows = match aurora_ui::populate_layers_panel(
@@ -7885,12 +9721,12 @@ impl App {
         );
 
         let mut focus = FocusManager::default();
-        let mut crash_recovery_dialog = None;
+        let mut dialog = None;
         if had_previous_marker {
             open_crash_recovery_dialog(
                 &mut workspace,
                 &mut focus,
-                &mut crash_recovery_dialog,
+                &mut dialog,
                 &scales,
                 was_recovered,
             );
@@ -7907,9 +9743,10 @@ impl App {
             shortcuts: default_shortcuts(),
             modifiers: Modifiers::none(),
             command_palette: None,
-            crash_recovery_dialog,
+            dialog,
             marker_path,
             layout_path,
+            skipped_tiles,
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
             file_dialog: SystemFileDialog,
@@ -7987,7 +9824,7 @@ impl App {
         let picked = handle_key(
             &mut self.workspace,
             &mut self.focus,
-            &mut self.crash_recovery_dialog,
+            &mut self.dialog,
             &mut self.command_palette,
             &mut self.tool,
             &mut self.layers,
@@ -7995,7 +9832,6 @@ impl App {
             &mut self.pixel_history,
             self.tile_store.as_mut(),
             &mut self.undo_order,
-            &mut self.composite_cache,
             &self.shortcuts,
             self.modifiers,
             key,
@@ -8026,17 +9862,28 @@ impl App {
     /// function, which needs no `App` (and therefore no GPU adapter) to
     /// test, the same split [`Self::commit_drag`] already uses.
     ///
-    /// What the command palette's and (macOS) native menu's own
-    /// Undo/Redo entries fall back to once `activate_command` hands the
-    /// bare command back up (deliberately kept free of `layers`/
-    /// `history`/`pixel_history`/the tile store — see
-    /// [`ActivatedCommand`]'s own doc comment for why). **Not** the
-    /// `Ctrl+Z`/`Ctrl+Shift+Z` path, which [`handle_key`] resolves and
-    /// runs through [`run_command`] itself without ever returning an
-    /// `ActivatedCommand` — see PLAN.md's own residual disclosure for
-    /// what that costs and why closing it is its own change.
+    /// **All three entry points converge here**, which is the reason
+    /// this method exists: the command palette, the macOS native menu,
+    /// and the `Ctrl+Z`/`Ctrl+Shift+Z` keyboard shortcut. All three
+    /// arrive the same way — `activate_command`/[`handle_key`] hand the
+    /// bare command back up as an [`ActivatedCommand`], deliberately
+    /// kept free of `layers`/`history`/`pixel_history`/the tile store
+    /// (see its own doc comment for why), and
+    /// `App::handle_key_event` dispatches it here.
+    ///
+    /// The keyboard leg has been one of the three since 0.69.1. Before
+    /// that, [`handle_key`] ran `Ctrl+Z` through [`run_command`] inline
+    /// and never returned an `ActivatedCommand`, so that path skipped
+    /// both the live-drag commit and the pan re-clamp
+    /// [`perform_undo_redo`] exists to order correctly. The paragraph
+    /// this replaces still described that split, and had been false
+    /// since.
     fn run_undo_redo(&mut self, command: AppCommand) {
-        perform_undo_redo(
+        // Annotated rather than discarded bare, for the reason
+        // `CompositeInvalidation`'s own `#[must_use]` exists: the report
+        // has already been acted on *inside* `perform_undo_redo`, which
+        // owns the cache. See the note below.
+        let _: CompositeInvalidation = perform_undo_redo(
             &mut self.workspace,
             &mut self.focus,
             &mut self.command_palette,
@@ -8052,6 +9899,12 @@ impl App {
             &mut self.drag,
             command,
         );
+        // `App` itself has nothing further to do with the report -- the
+        // cache it names has already been invalidated inside. It is
+        // returned so a test can assert *which* invalidation a given
+        // undo/redo produced, which is the only way to pin the
+        // anchor-moved guard down directly rather than by inferring it
+        // from pixels that might agree by coincidence.
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -8059,6 +9912,28 @@ impl App {
     /// a dropped file and a chosen one are the same kind of "the user
     /// wants to open this" signal, whichever route it arrived by.
     fn handle_dropped_file(&mut self, path: &Path) {
+        // The same gate `handle_menu_event` applies, for the same
+        // reason: the modal dialog is a `Role::AlertDialog` with
+        // `set_modal()` set, and neither a native menu bar nor a
+        // platform file drop is dialog-aware, so nothing but this
+        // enforces that claim on either route. Without it a file dropped
+        // under the crash-recovery dialog replaces the whole document
+        // silently, and any warning the open itself raises is swallowed
+        // by the occupied slot (`open_dialog` is a no-op then). The
+        // keyboard route was already immune.
+        //
+        // **Covered by inspection, not by a test**, on the same
+        // disclosed footing as the menu route: `WindowEvent::DroppedFile`
+        // comes from a real windowing system, and this sandbox is Linux
+        // with no display server, so no such event can be constructed
+        // here.
+        if self.dialog.is_some() {
+            tracing::debug!(
+                path = %path.display(),
+                "ignoring a dropped file while a modal dialog is open"
+            );
+            return;
+        }
         self.open_file(path);
     }
 
@@ -8125,9 +10000,29 @@ impl App {
             // After the pixels land in the store, not before: the
             // autosave container carries this document's real tiles now,
             // so writing it first would persist an empty one.
-            write_autosave(&autosave_path(), &layers, &history, canvas_size, store);
+            //
+            // A fresh, empty carried record: a document decoded from a
+            // PNG/JPEG/TIFF has no `skipped-tiles` history of its own,
+            // and keeping the *previous* document's would attach one
+            // file's losses to another file entirely. Assigned before
+            // the write for the same reason `open_aur_file` assigns its
+            // own before its write.
+            self.skipped_tiles = aurora_io::SkippedTiles::new();
+            write_autosave(
+                &autosave_path(),
+                &layers,
+                &history,
+                canvas_size,
+                &mut self.skipped_tiles,
+                store,
+            );
         } else {
             tracing::warn!("no live tile store; skipping the opened document's autosave");
+            // `self.skipped_tiles` keeps whatever the *previous* document
+            // carried -- harmlessly stale, not wrong: with no live store,
+            // `save_aur_file` refuses before it would ever read this field
+            // (its own early return), so a record that describes a
+            // different document can never reach a file on disk.
         }
 
         self.layers = layers;
@@ -8199,13 +10094,20 @@ impl App {
         // first place, so every `.aur` file this app has ever written
         // only ever carries `None` in practice. Discarded here rather
         // than invented a field to hold, honestly, until that UI exists.
-        let (layers, history, canvas_size, _profile) = match aurora_io::read_aur(file, store) {
+        let document = match aurora_io::read_aur(file, store) {
             Ok(result) => result,
             Err(err) => {
                 tracing::warn!(path = %path.display(), ?err, "failed to read the chosen .aur file");
                 return;
             }
         };
+        let aurora_io::AurDocument {
+            layers,
+            history,
+            canvas_size,
+            profile: _profile,
+            skipped_tiles,
+        } = document;
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => {
@@ -8224,6 +10126,14 @@ impl App {
                     return;
                 }
             };
+        // Before the autosave below, and that ordering is load-bearing
+        // rather than tidy: `write_autosave` hands this straight back to
+        // the writer, so the autosave `open_aur_file` performs -- which
+        // runs before the user has even seen the warning -- carries the
+        // opened file's own record of what it lost. Set here, it also
+        // means a crash between opening a lossy file and acting on the
+        // dialog leaves crash recovery a document that still knows.
+        self.skipped_tiles = skipped_tiles;
         // Re-borrowed rather than reusing the `store` binding above:
         // that borrow of `self.tile_store` has to end before
         // `replace_document`'s own `&mut self.workspace` above, and
@@ -8231,7 +10141,14 @@ impl App {
         // container this writes carries the opened document's real
         // tiles.
         if let Some(store) = self.tile_store.as_mut() {
-            write_autosave(&autosave_path(), &layers, &history, canvas_size, store);
+            write_autosave(
+                &autosave_path(),
+                &layers,
+                &history,
+                canvas_size,
+                &mut self.skipped_tiles,
+                store,
+            );
         }
 
         self.layers = layers;
@@ -8270,6 +10187,119 @@ impl App {
         // is right; see `commit_ending_drag`.
         self.drag = None;
         self.push_accessibility();
+        // After `push_accessibility`, deliberately: the dialog opens
+        // against the already-rebuilt workspace, and
+        // `open_skipped_tiles_dialog` pushes accessibility again itself
+        // so the alert is announced.
+        if let Some(message) = skipped_tiles_warning(&self.skipped_tiles) {
+            tracing::warn!(
+                skipped = self.skipped_tiles.total(),
+                listed = self.skipped_tiles.records().len(),
+                path = %path.display(),
+                "opened a .aur file that was written with tiles missing"
+            );
+            if !self.open_skipped_tiles_dialog(&message) {
+                // The one modal slot was already occupied, so the
+                // itemized warning never reached the screen. It is not
+                // allowed to vanish with it -- the same answer
+                // `Self::save_file` already gives for a suppressed
+                // export refusal, and the reason
+                // `open_skipped_tiles_dialog` returns this at all.
+                tracing::warn!(
+                    path = %path.display(),
+                    %message,
+                    "the missing-content warning could not be shown (a dialog is already open); \
+                     the document is still missing what it names"
+                );
+            }
+        }
+    }
+
+    /// Opens the "this document is missing content" dialog with
+    /// `message` — a near-copy of [`Self::open_export_refused_dialog`],
+    /// including its relayout-then-announce pair and its "returns
+    /// whether a dialog actually opened" signal, for exactly the same
+    /// reasons that one documents.
+    ///
+    /// The two are kept separate rather than merged behind a `title`
+    /// parameter because they are opposite facts: the export-refused
+    /// dialog says *nothing was written and your file is untouched*,
+    /// while this one says *this file is already missing content*. A
+    /// shared helper would invite one message to be reused for the
+    /// other, which is the failure mode both exist to prevent.
+    fn open_skipped_tiles_dialog(&mut self, message: &str) -> bool {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a dialog");
+                return false;
+            }
+        };
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            "This Document Is Missing Content",
+            message,
+            skipped_tiles_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        opened
+    }
+
+    /// Opens the export-refused dialog with `message` and makes it real
+    /// on screen and to a screen reader: re-runs layout so the freshly
+    /// inserted subtree actually has bounds (otherwise every node in it
+    /// keeps zero-size defaults and nothing is hit-testable), then pushes
+    /// the updated accessibility tree.
+    ///
+    /// **Both steps live here rather than at the call site** so this
+    /// dialog is announced whichever route reached [`Self::save_file`] —
+    /// the keyboard path (`App::handle_key_event`) already pairs
+    /// `apply_resize`/`push_accessibility` around its own dispatch, but
+    /// the macOS native-menu path (`App::handle_menu_event`) only pushes
+    /// accessibility. Doing it unconditionally here costs one redundant
+    /// layout pass on the keyboard path — pure CPU geometry on a small
+    /// tree ([`Self::apply_resize`]'s own doc comment) — and removes a
+    /// whole class of "which call site remembered?" bug.
+    ///
+    /// A silent no-op, logged, if the design scales can't be loaded:
+    /// there is no dialog to build without them, and the export has
+    /// already refused safely either way.
+    ///
+    /// **Returns whether a dialog actually opened** — the same signal
+    /// [`Self::open_move_refused_dialog`] returns and for the same
+    /// reason: the one modal slot may already be occupied, in which case
+    /// the refusal reached the log but not the user, and the caller is
+    /// what knows how to say so.
+    fn open_export_refused_dialog(&mut self, message: &str) -> bool {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a dialog");
+                return false;
+            }
+        };
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            "Couldn't Export This Document",
+            message,
+            export_refused_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        opened
     }
 
     /// Saves to `path` — the whole document, real and multi-layer
@@ -8336,9 +10366,27 @@ impl App {
     /// could not be read out of the store (a corrupted scratch-disk
     /// tile, say), and this function then returns without touching
     /// `path` at all — no partial file, no overwrite of whatever was
-    /// there. That refusal is currently log-only: surfacing it as the
-    /// itemized, user-visible warning FR-001 wants is separate, still-
-    /// open work tracked in PLAN.md.
+    /// there. **That refusal is now user-visible**, not only logged: it
+    /// opens the same modal dialog crash recovery uses ([`open_dialog`]),
+    /// carrying the itemized detail the error already knows — how many
+    /// tile reads failed and what the first one said
+    /// ([`incomplete_composite_message`]) — which is what CLAUDE.md's own
+    /// "warn with an itemized list before any lossy save" rule asks for.
+    /// Every other error from this path stays log-only, deliberately: a
+    /// bad extension or a failed write is a different, narrower failure
+    /// than "the document itself could not be read," and widening the
+    /// match would put a modal alert in front of failures that don't
+    /// warrant one.
+    ///
+    /// **The wiring line itself is covered by inspection, not by a
+    /// test.** Reaching it needs a real `App` — a window, a GPU adapter,
+    /// a live tile store — which this sandbox has none of. What *is*
+    /// unit-tested is both halves it is built from: the message's own
+    /// content ([`incomplete_composite_message`]) and the dialog
+    /// mechanics ([`open_dialog`]/[`handle_dialog_key`]/
+    /// [`run_dialog_action`]), the same split this crate already draws
+    /// everywhere else between pure logic and the one platform-bound
+    /// call site that feeds it.
     fn save_file(&mut self, path: &Path) {
         if is_aur_path(path) {
             self.save_aur_file(path);
@@ -8351,14 +10399,29 @@ impl App {
         let image = match composite_document(&self.layers, store, width, height) {
             Ok(image) => image,
             Err(err) => {
-                // Includes `IoError::IncompleteComposite` -- the export
-                // refused because one or more layer tiles could not be
-                // read (see `composite_document`'s own `# Errors`). The
-                // *file* is safe either way: nothing is written, and
-                // whatever was already at `path` is untouched. What is
-                // still missing is telling the user, rather than only the
-                // log -- tracked in PLAN.md, not solved here.
+                // The *file* is safe either way: nothing is written, and
+                // whatever was already at `path` is untouched. The log
+                // line stays exactly as it was -- a dialog the user
+                // dismisses is not a substitute for a record of what
+                // happened.
                 tracing::error!(?err, "refusing to export: could not composite the document");
+                if let aurora_io::IoError::IncompleteComposite { skipped, first } = &err {
+                    // Only this variant, deliberately -- see this
+                    // method's own doc comment for why the match is not
+                    // widened to a catch-all.
+                    let message = incomplete_composite_message(*skipped, first);
+                    if !self.open_export_refused_dialog(&message) {
+                        // The one modal slot was already occupied, so the
+                        // itemized refusal never reached the screen. It
+                        // is not allowed to vanish with it.
+                        tracing::warn!(
+                            path = %path.display(),
+                            %message,
+                            "the export refusal could not be shown (a dialog is already open); \
+                             the file is still untouched"
+                        );
+                    }
+                }
                 return;
             }
         };
@@ -8423,6 +10486,13 @@ impl App {
                 &self.history,
                 self.canvas_size,
                 None,
+                // What this document already knows it is missing, so an
+                // explicit Save of a file opened with tiles gone writes
+                // that fact out again instead of erasing it. `write_aur`
+                // still *refuses* rather than degrades -- a carried
+                // record names tiles that are not in the store at all,
+                // so it can never turn into a fresh skip here.
+                &self.skipped_tiles,
                 store,
             )
         })();
@@ -8556,14 +10626,14 @@ impl App {
             return;
         };
 
-        // The crash-recovery dialog, if open, owns every pointer press
+        // A modal dialog, if open, owns every pointer press
         // the same way it already owns the keyboard (`handle_key`'s own
         // routing order) — a modal alert blocks everything else,
         // including layer selection and canvas tools.
         if handle_dialog_pointer(
             &mut self.workspace,
             &mut self.focus,
-            &mut self.crash_recovery_dialog,
+            &mut self.dialog,
             button,
             position,
         ) {
@@ -8591,14 +10661,10 @@ impl App {
                 &mut self.history,
                 &mut self.pixel_history,
                 &mut self.undo_order,
+                &mut self.composite_cache,
                 &mut self.drag,
                 layer_id,
             );
-            // Changes `recomposite_visible_tiles`'s own reference origin
-            // (the newly active layer's own bounds) -- every cached
-            // `TileId` would otherwise keep meaning the *previous* active
-            // layer's own document-space window.
-            self.composite_cache.bump();
             self.push_accessibility();
             return;
         }
@@ -8836,11 +10902,73 @@ impl App {
     /// `self.composite_cache` unconditionally — a moved layer's own
     /// content lands at different composite tiles now, whether or not
     /// `set_bounds` itself succeeded.
+    ///
+    /// **One failure is also shown, not only logged**:
+    /// `aurora_doc::DocError::LayerOriginOutOfRange`, the one a user can
+    /// actually cause by dragging a layer far enough that its origin
+    /// would leave the document's own coordinate range. Without this the
+    /// drag simply stops advancing with no explanation — correct
+    /// behaviour, indistinguishable from a hang. The dialog opens **once
+    /// per drag** ([`move_refusal_unreported`], whose flag lives on the
+    /// `Drag::Move` itself so its lifetime is exactly the gesture's), not
+    /// once per pointer-move event, and the drag's own behaviour is
+    /// completely unchanged: position stops advancing, exactly as before.
+    ///
+    /// Every other `DocError` from `set_bounds` stays log-only,
+    /// deliberately — an unknown or non-pixel `layer_id` is a bug in this
+    /// crate rather than something the user did, and a modal alert is the
+    /// wrong response to it.
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
         if let Err(err) = self.layers.set_bounds(layer_id, bounds) {
             tracing::warn!(?err, "failed to reposition the active layer");
+            // Ask, open, and only then latch. The latch must not happen
+            // when `open_move_refused_dialog` was a no-op because another
+            // dialog holds the one modal slot -- see
+            // `move_refusal_unreported`'s own doc comment for the bug
+            // that ordering had until 0.68.2.
+            if matches!(err, aurora_doc::DocError::LayerOriginOutOfRange { .. })
+                && move_refusal_unreported(self.drag.as_ref())
+                && self.open_move_refused_dialog()
+            {
+                mark_move_refusal_reported(&mut self.drag);
+            }
         }
         self.composite_cache.bump();
+    }
+
+    /// Opens the move-refused dialog, on exactly the terms
+    /// [`Self::open_export_refused_dialog`] documents — same shared
+    /// [`open_dialog`], same `apply_resize` + `push_accessibility`
+    /// pairing owned here rather than at the call site, same silent
+    /// logged no-op if the design scales can't be loaded.
+    ///
+    /// **Returns whether a dialog actually opened**, which the caller
+    /// ([`Self::apply_move`]) needs in order to latch "reported" only
+    /// when the user was genuinely shown something — see
+    /// [`move_refusal_unreported`].
+    fn open_move_refused_dialog(&mut self) -> bool {
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => {
+                tracing::error!(%err, "failed to load design scales; cannot open a dialog");
+                return false;
+            }
+        };
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &scales,
+            "Can't Move This Layer Further",
+            move_refused_message(),
+            move_refused_dialog_actions(),
+        );
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        opened
     }
 
     /// Commits `drag`, whatever it turns out to be, into this
@@ -8979,8 +11107,38 @@ impl App {
     /// Routes one native menu activation to [`activate_command`] — the
     /// same dispatch the command palette's `Enter` key already uses,
     /// just reached from the menu bar instead.
+    ///
+    /// **An open modal dialog swallows the whole event (0.68.2)**, the
+    /// same early return [`handle_key`] opens with, and for the same
+    /// reason: the dialog is a `Role::AlertDialog` with `set_modal()`
+    /// set, so it claims to block everything else — and a native menu
+    /// bar is not dialog-aware, so nothing else enforces that claim on
+    /// this path. Without the gate a user could pick File > Save As
+    /// underneath the crash-recovery dialog, reach
+    /// `IoError::IncompleteComposite`, and be shown nothing at all,
+    /// because the refusal's own dialog is a no-op while the slot is
+    /// occupied ([`open_dialog`]). The keyboard route was already
+    /// immune; this closes the other door.
+    ///
+    /// **Covered by inspection, not by a test.** `muda` is macOS-only,
+    /// and this sandbox is Linux with no display server, so no
+    /// `muda::MenuEvent` can be constructed here at all — the same
+    /// disclosed-inspection-only footing the rest of this crate's
+    /// platform-gated code sits on. What *is* tested headlessly is the
+    /// invariant the gate exists to preserve: see
+    /// `a_menu_routed_save_is_gated_by_the_same_dialog_check_the_keyboard_uses`.
     #[cfg(target_os = "macos")]
     fn handle_menu_event(&mut self, event: &muda::MenuEvent) {
+        if self.dialog.is_some() {
+            // Annotated rather than inferred: `MenuId`'s `AsRef` has no
+            // `&str`-typed context to resolve against inside the macro.
+            let id: &str = event.id().as_ref();
+            tracing::debug!(
+                id,
+                "ignoring a native menu activation while a modal dialog is open"
+            );
+            return;
+        }
         let picked = activate_command(
             &mut self.workspace,
             &mut self.focus,
@@ -9002,10 +11160,78 @@ impl App {
     /// which are `&mut self` with no `Result` return) can surface an
     /// unrecoverable error, matching `aurora-gpu`'s own
     /// `examples/surface_smoke.rs::report_failure`.
+    ///
+    /// **This path still reaches the shutdown cleanup, despite calling
+    /// nothing itself — but a deliberately narrower one.** `el.exit()`
+    /// is what makes `winit` dispatch `Event::LoopExiting`, and this
+    /// crate's [`ApplicationHandler::exiting`](App::exiting)
+    /// implementation runs [`App::finish_shutdown`] there. Setting
+    /// `self.failed` *before* `el.exit()` is load-bearing, not
+    /// bookkeeping for `run`'s exit code alone: it is what
+    /// [`run_shutdown_cleanup`] reads to take the
+    /// [`aborted_startup_cleanup`] branch, which removes this run's own
+    /// scratch tiles and leaves the session marker and the autosave
+    /// alone.
+    ///
+    /// **Why the marker and the autosave must survive this.** Every call
+    /// site is inside `resumed`, before a window exists, so a
+    /// crash-recovery dialog `App::new` may have just built has not been
+    /// shown yet — and `App::new` may equally have just recovered a
+    /// *previous* crash's document out of the autosave without rewriting
+    /// it (`startup_document`'s recovered branch deliberately doesn't:
+    /// the file already holds exactly that document). Deleting either
+    /// here would destroy that previous run's only on-disk copy, unseen
+    /// and unrecoverably, on a path whose own trigger — no adapter, a
+    /// driver hiccup, a surface that would not create — is exactly the
+    /// sort of thing that can also explain why the previous run died.
+    /// 0.63.0 routed this path through the full cleanup and did exactly
+    /// that; 0.64.1 is the correction. See [`aborted_startup_cleanup`].
     fn fail(&mut self, el: &ActiveEventLoop, message: &str) {
         tracing::error!("{message}");
         self.failed = true;
         el.exit();
+    }
+
+    /// Everything this run owes the *next* one on the way out, for
+    /// whichever way out this is — [`run_shutdown_cleanup`] holds the
+    /// branch and the reasoning, and this method exists to give it
+    /// `self`.
+    ///
+    /// A run that came all the way up and is now closing gets the
+    /// [`clean_shutdown_cleanup`] trio — clear this run's own marker so
+    /// the next run's `previous_session_left_a_marker` reads false, not
+    /// true (see this crate's own "crash recovery" section); delete the
+    /// autosave, since nothing is left to recover once this run has
+    /// ended cleanly and the file holds real pixel content at a
+    /// predictable path in a shared temp directory (see
+    /// [`remove_autosave`]); and delete this session's paged-out tiles,
+    /// which are its unsaved pixels and which nothing recovers after a
+    /// clean exit — plus saving the current dock layout so the next
+    /// run's own `App::new` can restore it (see the "persisted workspace
+    /// layout" section for why this is the one point this crate writes
+    /// it).
+    ///
+    /// A run aborting out of [`App::fail`] gets only its own scratch
+    /// tiles removed: the marker and the autosave may be a *previous*
+    /// crash's recovery data that nobody has been shown yet, and the
+    /// layout is one this run never had a window to change. See
+    /// [`aborted_startup_cleanup`].
+    ///
+    /// **Why a method rather than statements in one event arm.** There
+    /// is more than one way out of a running Aurora, and they do not all
+    /// pass through `WindowEvent::CloseRequested`: macOS's own menu Quit
+    /// and [`App::fail`] both end the loop without one. Both callers —
+    /// that arm and [`ApplicationHandler::exiting`](App::exiting) — need
+    /// the identical work, and the cleanup itself is idempotent, so
+    /// running it twice on the paths that reach both is a no-op rather
+    /// than a hazard.
+    ///
+    /// `run_shutdown_cleanup` takes `self` as its only argument on
+    /// purpose — an earlier four-argument shape let the single call site
+    /// silently pass `None` for the store and the scratch directory and
+    /// still pass the whole gate. See [`ShutdownState`].
+    fn finish_shutdown(&mut self) {
+        run_shutdown_cleanup(self);
     }
 
     /// Recomputes the workspace layout for `physical_size`, then
@@ -9496,31 +11722,14 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                // A clean shutdown -- clear this run's own marker so the
-                // *next* run's `previous_session_left_a_marker` reads
-                // false, not true (see this crate's own "crash
-                // recovery" section), and save the current dock layout
-                // so the *next* run's own `App::new` can restore it
-                // (see the "persisted workspace layout" section's own
-                // doc comment for why this is the one point this crate
-                // writes it).
-                // All three cleanups -- the marker, the autosave
-                // (nothing is left to recover once this run has ended
-                // cleanly, and the file holds real pixel content at a
-                // predictable path in a shared temp directory; see
-                // [`remove_autosave`]'s own doc comment), and this
-                // session's paged-out tiles, which are its unsaved
-                // pixels and which nothing recovers after a clean exit
-                // -- go through one function so a test can execute them
-                // as a unit; this arm itself needs a real event loop
-                // to reach. `self` is the only argument on purpose --
-                // an earlier four-argument shape let this call site
-                // silently pass `None` for the store and the scratch
-                // directory and still pass the whole gate.
-                clean_shutdown_cleanup(self);
-                if let Some(layout_path) = self.layout_path.as_deref() {
-                    save_workspace_layout(layout_path, &self.workspace);
-                }
+                // A clean shutdown -- see `App::finish_shutdown` for
+                // what it undoes and why it is one method. `exiting`
+                // would run it anyway once `el.exit()` takes effect;
+                // it is called here too so the marker, the autosave,
+                // the scratch tiles and the dock layout are all settled
+                // before the loop starts unwinding, and running it
+                // twice is a no-op.
+                self.finish_shutdown();
                 el.exit();
             }
             WindowEvent::Resized(size) => self.apply_resize((size.width, size.height)),
@@ -9638,6 +11847,49 @@ impl ApplicationHandler<accesskit_winit::Event> for App {
             self.needs_redraw = false;
         }
     }
+
+    /// The catch-all for every way out of the loop, including the ones
+    /// that never produce a `WindowEvent::CloseRequested`: macOS's own
+    /// menu Quit (`applicationWillTerminate:` reaches
+    /// `ApplicationDelegate::internal_exit`, which dispatches
+    /// `Event::LoopExiting`) and [`App::fail`]'s `el.exit()`, which is
+    /// how an unrecoverable error during window/device/surface creation
+    /// ends the run. Before this existed, either of those left the
+    /// session marker behind — so the *next* run opened claiming a crash
+    /// had happened — along with the autosave and every unsaved pixel
+    /// paged out to this session's scratch directory.
+    ///
+    /// **The two exits are not the same cleanup.** A run that came up
+    /// and is closing gets the full one; a run aborting out of
+    /// [`App::fail`] gets only its own scratch tiles, because the marker
+    /// and the autosave it would otherwise delete may be a *previous*
+    /// crash's recovery data that no dialog has managed to show yet.
+    /// [`run_shutdown_cleanup`] holds that branch, on `self.failed`.
+    ///
+    /// `winit` 0.30.13 (the pinned version, and the one this was read
+    /// against) makes this irreversible and terminal: it fires once,
+    /// after `about_to_wait`, and the loop exits right after — macOS
+    /// explicitly queues its own end-of-iteration observer at the lowest
+    /// priority so `LoopExiting` cannot precede `AboutToWait`. **That
+    /// paragraph comes from reading `winit`'s source, not from watching
+    /// it happen**: nothing here has been observed on real macOS or
+    /// Windows hardware, the same caveat
+    /// `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`
+    /// already carries, and it is a claim about one pinned version
+    /// rather than about `winit` in general.
+    ///
+    /// The `CloseRequested` arm calls [`App::finish_shutdown`] too, so
+    /// that path runs it twice; `clean_shutdown_cleanup` is idempotent,
+    /// which `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`
+    /// pins, and so is the whole of `run_shutdown_cleanup`, which
+    /// `finish_shutdown_is_idempotent_across_two_exit_paths` pins.
+    ///
+    /// What still escapes it: a hard crash, `SIGKILL`, an OS shutdown,
+    /// and a `panic = "abort"` build — none of which run any Rust
+    /// cleanup at all. See [`clean_shutdown_cleanup`].
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        self.finish_shutdown();
+    }
 }
 
 impl std::fmt::Debug for App {
@@ -9686,6 +11938,18 @@ pub fn run() -> anyhow::Result<()> {
     // *previous* run crashed.
     let had_previous_marker = previous_session_left_a_marker(&marker_path);
     write_session_marker(&marker_path);
+    // Strictly before this session's own scratch directory is first
+    // created (`tile_store_scratch_dir` is lazy, and `App::new` below is
+    // the earliest thing that reaches it): "never delete the current
+    // session's own directory" is then true by construction, because it
+    // does not exist yet. See `aurora_tile::sweep_orphaned_scratch_dirs`
+    // for what it will and -- far more importantly -- will not delete.
+    let sweep = aurora_tile::sweep_orphaned_scratch_dirs(&std::env::temp_dir(), SCRATCH_DIR_PREFIX);
+    tracing::info!(
+        removed = sweep.removed,
+        skipped = sweep.skipped,
+        "swept scratch directories left by sessions that are no longer running"
+    );
     let autosave_path = autosave_path();
     let layout_path = layout_path();
 
@@ -9723,36 +11987,58 @@ mod tests {
         COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
-        ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS, FileDialogAccess,
-        Key, KeyChord, Modifiers, NamedKey, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE,
-        RailResize, ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin,
-        after_undo_redo, apply_canvas_min_zoom, apply_mask_clip, apply_scroll_zoom,
-        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
-        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette,
-        close_crash_recovery_dialog, collect_widget_paints, commit_ending_drag, composite_document,
-        composite_surface_id, continue_drag, crash_recovery_dialog_message,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eraser_stroke_mut, eyedropper_sample, guarded_scale_factor,
-        handle_dialog_key, handle_dialog_pointer, handle_key, handle_palette_key,
-        handle_zoom_tool_click, hash_position, hash_to_unit_f32, is_aur_path, layer_local_point,
-        load_document_view, load_scales, load_theme, logical_point, logical_size,
-        open_command_palette, open_crash_recovery_dialog, open_image, open_tile_store,
-        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, Drag,
+        ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord,
+        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PanBounds, PointerButton,
+        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, RecoveredDocument, ShutdownState, UndoKind,
+        UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
+        apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
+        background_color_from_theme, begin_drag, brush_stroke_mut, canvas_area_logical_size,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
+        composite_document, composite_reference_origin, composite_surface_id, continue_drag,
+        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
+        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
+        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
+        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
+        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
+        move_refused_dialog_actions, move_refused_message, open_command_palette,
+        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
+        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
         pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
         recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
-        resized_rail_width, resolve_tile, run_command, sample_pixel, select_layer, shift_bounds,
-        splitmix64, tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer,
-        translate_key, translate_modifiers, translate_pointer_button, unwarned_failures,
-        verify_aur, write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
+        select_layer, shift_bounds, skipped_tiles_dialog_actions, skipped_tiles_message,
+        skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
+    // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
+    // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
+    // doesn't exist on Windows. An unconditional import here is unused
+    // (and `-D warnings` denies that) on every platform that test doesn't
+    // run on.
+    #[cfg(unix)]
+    use super::create_dir_owner_only;
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
     use aurora_widgets::widgets::{insert_button, new_tree};
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
+
+    /// Only `*.tile` files, never a bare directory-entry count: since
+    /// 0.67.0 a scratch directory also holds
+    /// `aurora_tile::LOCK_FILE_NAME`, and an enumerator that counted
+    /// entries would silently include it and start asserting the wrong
+    /// number.
+    fn is_tile_file(path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|ext| ext == "tile")
+    }
 
     /// [`ClipboardAccess`]'s test double — a plain in-memory slot, no
     /// real OS clipboard involved (this sandbox has no display server
@@ -10169,10 +12455,20 @@ mod tests {
         let _painted = paint_one_texel(&mut store, &layers, moved);
 
         let path = dir.path().join("aurora-autosave.aur");
-        write_autosave(&path, &layers, &history, (320, 160), &mut store);
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (320, 160),
+            &mut aurora_io::SkippedTiles::new(),
+            &mut store,
+        );
 
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let Some((recovered, _history, _canvas)) = recover_document(&path, &mut fresh_store) else {
+        let Some(RecoveredDocument {
+            layers: recovered, ..
+        }) = recover_document(&path, &mut fresh_store)
+        else {
             unreachable!("the autosave just written must reopen");
         };
         let Some(active) = topmost_pixel_layer(&recovered) else {
@@ -10232,9 +12528,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err}"),
         };
-        if let Err(err) =
-            aurora_io::write_aur(file, &layers, &history, (320, 160), None, &mut store)
-        {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (320, 160),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -10243,11 +12545,10 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err}"),
         };
-        let (reopened, _history, _canvas, _profile) =
-            match aurora_io::read_aur(file, &mut fresh_store) {
-                Ok(result) => result,
-                Err(err) => unreachable!("{err:?}"),
-            };
+        let reopened = match aurora_io::read_aur(file, &mut fresh_store) {
+            Ok(result) => result.layers,
+            Err(err) => unreachable!("{err:?}"),
+        };
         let Some(active) = topmost_pixel_layer(&reopened) else {
             unreachable!("the reopened document has pixel layers");
         };
@@ -10471,6 +12772,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: layer_bounds(),
                 current_bounds: moved_layer_bounds(),
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -10542,6 +12844,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: moved_layer_bounds(),
                 current_bounds: layer_bounds(),
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -10563,7 +12866,11 @@ mod tests {
         );
 
         cache.mark_current(aurora_tile::TileId { x: 0, y: 0 });
-        run_command(
+        // `perform_undo_redo`'s own guard, spelled out: the anchor is
+        // read across `run_command`, and an anchor that moved forces
+        // `Everything` no matter what the command reported.
+        let anchor_before = composite_reference_origin(&layers, active_layer);
+        let reported = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -10575,6 +12882,11 @@ mod tests {
             &mut undo_order,
             AppCommand::Undo,
         );
+        let invalidation = if composite_reference_origin(&layers, active_layer) == anchor_before {
+            reported
+        } else {
+            CompositeInvalidation::Everything
+        };
         assert_eq!(
             layers.bounds(moved),
             Some(moved_layer_bounds()),
@@ -10589,7 +12901,14 @@ mod tests {
             "setup: the undo really does reopen the divergence: ({before_x}, {before_y})"
         );
 
-        after_undo_redo(&mut view, &layers, active_layer, &mut cache, None);
+        after_undo_redo(
+            &mut view,
+            &layers,
+            active_layer,
+            &mut cache,
+            None,
+            &invalidation,
+        );
 
         let (local_x, local_y) =
             canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
@@ -10661,6 +12980,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: moved_layer_bounds(),
                 current_bounds: layer_bounds(),
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -10685,7 +13005,7 @@ mod tests {
         }
         assert!(commit_test_alpha(&mut store, 30, 30) > 0.5, "setup");
 
-        perform_undo_redo(
+        let _ = perform_undo_redo(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -10787,6 +13107,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CompositeCache::default(),
             &mut drag,
             b,
         );
@@ -10833,6 +13154,7 @@ mod tests {
             start_doc: (0.0, 0.0),
             start_bounds: layer_bounds(),
             current_bounds: dragged_to,
+            refused: false,
         });
 
         press_layer_row(
@@ -10844,6 +13166,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CompositeCache::default(),
             &mut drag,
             b,
         );
@@ -10888,6 +13211,7 @@ mod tests {
             &mut history,
             &mut pixel_history,
             &mut undo_order,
+            &mut CompositeCache::default(),
             &mut drag,
             b,
         );
@@ -10898,6 +13222,152 @@ mod tests {
             "the interrupted stroke must have its own entry in the unified order"
         );
         assert!(pixel_history.can_undo());
+    }
+
+    /// Two pixel layers that share the document origin — the shape every
+    /// document this app's own UI can build actually has, since
+    /// `add_pixel_layer` is only ever called at `(0, 0)` outside a Move.
+    /// `two_layers_one_moved` deliberately offsets its second layer, so
+    /// the same-origin case needs its own fixture.
+    fn two_layers_same_origin() -> (
+        aurora_ui::Workspace,
+        aurora_doc::LayerTree,
+        std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+    ) {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut layers = aurora_doc::LayerTree::new();
+        let a = match layers.add_pixel_layer("a", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match layers.add_pixel_layer("b", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (workspace, layers, layer_rows, a, b)
+    }
+
+    /// The guard [`press_layer_row`] gained in 0.71.0. Two layers at the
+    /// same origin mean the same `composite_reference_origin`, so every
+    /// cached composite `TileId` still names the same document-space
+    /// window and still composites the same whole `LayerTree` — nothing
+    /// about the switch can change a single composited texel, and the
+    /// unconditional `bump()` this replaced threw the whole visible grid
+    /// away anyway.
+    #[test]
+    fn switching_to_a_layer_at_the_same_origin_keeps_every_cached_tile() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_same_origin();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let cached = [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+        ];
+        for tile in cached {
+            cache.mark_current(tile);
+        }
+        assert_eq!(
+            composite_reference_origin(&layers, Some(a)),
+            composite_reference_origin(&layers, Some(b)),
+            "setup: both layers really do share one grid anchor"
+        );
+
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut cache,
+            &mut drag,
+            b,
+        );
+
+        assert_eq!(active_layer, Some(b), "the switch itself must still happen");
+        for tile in cached {
+            assert!(
+                cache.is_current(tile),
+                "a same-origin switch must not invalidate {tile:?} -- this is the whole \
+                 point of the guard; the unconditional bump() it replaced fails here"
+            );
+        }
+    }
+
+    /// The other half of the same guard: a switch that really does move
+    /// the anchor still has to invalidate everything, because every
+    /// cached `TileId` now names a *different* document-space window.
+    #[test]
+    fn switching_to_a_layer_at_a_different_origin_invalidates_every_cached_tile() {
+        let (mut workspace, layers, layer_rows, a, b) = two_layers_one_moved();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut active_layer = Some(a);
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let cached = [
+            aurora_tile::TileId { x: 0, y: 0 },
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+        ];
+        for tile in cached {
+            cache.mark_current(tile);
+        }
+        assert_ne!(
+            composite_reference_origin(&layers, Some(a)),
+            composite_reference_origin(&layers, Some(b)),
+            "setup: `b` really is somewhere else"
+        );
+
+        press_layer_row(
+            &mut workspace,
+            &layer_rows,
+            &mut active_layer,
+            &mut view,
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut cache,
+            &mut drag,
+            b,
+        );
+
+        assert_eq!(active_layer, Some(b));
+        for tile in cached {
+            assert!(
+                !cache.is_current(tile),
+                "the anchor moved, so {tile:?} names a different window now and must be \
+                 recomputed"
+            );
+        }
     }
 
     /// `demo_document`'s whole point (unlike a plain `LayerTree` built
@@ -11124,7 +13594,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), None, &mut store) {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
         assert!(
@@ -11378,7 +13856,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11391,7 +13869,7 @@ mod tests {
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.layers.root));
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11404,7 +13882,7 @@ mod tests {
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.properties.root));
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11418,7 +13896,7 @@ mod tests {
         );
         assert_eq!(focus.focused(), Some(workspace.history.root));
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11448,7 +13926,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11474,7 +13952,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11512,7 +13990,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11550,7 +14028,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11590,7 +14068,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11611,7 +14089,7 @@ mod tests {
             "Brush must seed its own Radius row first"
         );
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11630,7 +14108,7 @@ mod tests {
              the previous tool's row behind"
         );
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11686,7 +14164,7 @@ mod tests {
         let mut undo_order = UndoOrder::default();
         undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11714,7 +14192,7 @@ mod tests {
             "the History panel must reflect the undo's own journal entry"
         );
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11729,6 +14207,273 @@ mod tests {
         assert_eq!(layers.bounds(id), Some(moved), "redo must reapply the move");
     }
 
+    /// **The regression test for 0.73.1.** A pixel layer's declared
+    /// `bounds` is not an enforced extent of its real content anywhere
+    /// in this workspace, so a structural undo must not narrow on the
+    /// rect derived from it — see [`structural_invalidation`] for the
+    /// whole argument. This proves the three links of that argument on
+    /// real data rather than by reading:
+    ///
+    /// 1. A document point far outside the layer's declared 64x64 extent
+    ///    maps, unclamped, to a positive layer-local point
+    ///    ([`layer_local_point`]) — and [`pan_bounds`] really does let
+    ///    the view reach it, since its far edge is the document ceiling
+    ///    and not the layer's own width/height.
+    /// 2. Painting there writes a real tile
+    ///    (`aurora_brush::stamp_dab` clips only at local `(0, 0)`), and
+    ///    that tile lies **outside** the rect
+    ///    `aurora_doc::History` reports for a structural step on this
+    ///    layer — checked with [`tile_overlaps_doc_rect`], the very
+    ///    predicate [`CompositeCache::invalidate_doc_rect`] narrows by.
+    ///    So a narrowed invalidation would have left that tile stale.
+    /// 3. The structural undo therefore reports
+    ///    [`CompositeInvalidation::Everything`], not `Regions`.
+    ///
+    /// Headless on purpose: none of this needs a GPU adapter, so it runs
+    /// in CI rather than self-skipping the way the differential test
+    /// does.
+    // Three numbered steps of one argument, each meaningless without
+    // the others: splitting them into separate tests would duplicate the
+    // whole fixture three times and let a later edit break the chain
+    // without any single test failing.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn structural_undo_falls_back_to_everything_because_paint_escapes_declared_bounds() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let (_dir, mut store) = real_tile_store();
+
+        // Deliberately smaller than one tile, so "outside the declared
+        // bounds" and "outside the tile the declared bounds covers" are
+        // the same thing and the check below cannot pass by accident.
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+
+        // (1) Reachability: nothing clamps the document -> layer-local
+        // conversion, and the pan bound extends to the document ceiling.
+        let far_doc = (800.0_f32, 800.0_f32);
+        assert_eq!(
+            layer_local_point(bounds, far_doc),
+            far_doc,
+            "layer_local_point is a bare subtraction -- a point 800 px into a 64 px layer is \
+             not clamped back onto it"
+        );
+        let reachable = pan_bounds(&layers, Some(id), Some((256.0, 256.0)));
+        assert!(
+            reachable.max_doc.0 > far_doc.0 && reachable.max_doc.1 > far_doc.1,
+            "the pan bound's far edge is the document ceiling, not the layer's own extent, so \
+             the user can pan out to {far_doc:?} and paint there: {reachable:?}"
+        );
+
+        // (2) Painting there writes a real tile the declared-bounds rect
+        // does not cover.
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            far_doc,
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert!(
+            !outcome.painted().is_empty(),
+            "the dab must really paint outside the declared bounds: {outcome:?}"
+        );
+        for &tile in outcome.painted() {
+            assert!(
+                store.contains_tile(surface, tile),
+                "{tile:?} must really exist on the layer's surface"
+            );
+            assert!(
+                !tile_overlaps_doc_rect(tile, bounds, (bounds.x, bounds.y)),
+                "{tile:?} holds real, composited content that the declared-bounds rect \
+                 {bounds:?} does not cover -- narrowing on that rect would leave it stale"
+            );
+        }
+
+        // (3) A structural step on that layer, undone, must report
+        // `Everything`.
+        match history.set_visible(&mut layers, id, false) {
+            Ok(Some(reported)) => assert_eq!(
+                reported, bounds,
+                "History still reports the declared bounds -- which is exactly why this arm \
+                 cannot narrow on it"
+            ),
+            other => unreachable!("a pixel layer has a knowable rect, got {other:?}"),
+        }
+        let mut undo_order = UndoOrder::default();
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+
+        let invalidation = run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            AppCommand::Undo,
+        );
+        assert_eq!(layers.visible(id), Some(true), "setup: the undo must apply");
+        assert_eq!(
+            invalidation,
+            CompositeInvalidation::Everything,
+            "a structural undo must not narrow on a rect that misses real painted content"
+        );
+
+        let invalidation = run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            AppCommand::Redo,
+        );
+        assert_eq!(
+            layers.visible(id),
+            Some(false),
+            "setup: the redo must apply"
+        );
+        assert_eq!(
+            invalidation,
+            CompositeInvalidation::Everything,
+            "redo has the same exposure as undo and must fall back the same way"
+        );
+    }
+
+    /// **The regression test for 0.73.2's compositing-path guard.**
+    ///
+    /// `document_qualifies_for_gpu_compositing` is a *document-wide*
+    /// predicate: it chooses the GPU fast path or the CPU fallback for
+    /// every visible tile at once. Undoing a `SetBlendMode` on a
+    /// root-level pixel layer across the `Normal` boundary flips it, so
+    /// the whole document's compositing path changes while the step's own
+    /// reported rect names one layer's region. This pins both halves:
+    /// that the flip is real, and that [`perform_undo_redo`] answers
+    /// [`CompositeInvalidation::Everything`].
+    ///
+    /// The two paths are **not** bit-identical on real hardware — see
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_
+    /// opacity_document` for the measured one-ULP divergence — so this
+    /// is a real staleness source, not a theoretical one.
+    ///
+    /// Two independent mechanisms force `Everything` here today: this
+    /// guard, and [`structural_invalidation`]'s own blanket fallback
+    /// (0.73.1). That is deliberate belt-and-braces, and the assertion
+    /// is on the observable outcome, so the test keeps its meaning if
+    /// either mechanism is later narrowed. The `assert_ne!` on the
+    /// predicate is what keeps it from passing vacuously.
+    #[test]
+    fn undoing_a_blend_mode_change_that_flips_the_compositing_path_invalidates_everything() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 256,
+        };
+
+        // Two root-level pixel layers, both `Normal`, so the document
+        // starts out GPU-tractable. The *active* one is left alone, so
+        // the anchor guard cannot be what fires.
+        let active = match history.add_pixel_layer(&mut layers, "active", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let other = match history.add_pixel_layer(&mut layers, "other", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "setup: two Normal-blend root pixel layers must qualify for the GPU path"
+        );
+
+        if let Err(err) =
+            history.set_blend_mode(&mut layers, other, aurora_doc::BlendMode::Multiply)
+        {
+            unreachable!("{err:?}");
+        }
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+        let before = document_qualifies_for_gpu_compositing(&layers);
+        assert!(
+            !before,
+            "setup: a root-level Multiply layer must route the whole document to the CPU path"
+        );
+
+        let invalidation = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            Some(active),
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(
+            layers.blend_mode(other),
+            Some(aurora_doc::BlendMode::Normal),
+            "setup: the undo must really revert the blend mode"
+        );
+        assert_ne!(
+            document_qualifies_for_gpu_compositing(&layers),
+            before,
+            "the whole document's compositing path really does flip across this one undo -- \
+             if it stopped doing so this test would be proving nothing"
+        );
+        assert_eq!(
+            composite_reference_origin(&layers, Some(active)),
+            (bounds.x, bounds.y),
+            "the anchor did not move, so the anchor guard is not what forces Everything here"
+        );
+        assert_eq!(
+            invalidation,
+            CompositeInvalidation::Everything,
+            "a step that changes every visible tile's compositing path must invalidate \
+             everything, not one layer's own region"
+        );
+    }
+
     #[test]
     fn run_command_undo_with_nothing_to_undo_is_a_safe_no_op() {
         let mut workspace = aurora_ui::build_workspace();
@@ -11740,7 +14485,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11812,7 +14557,7 @@ mod tests {
 
         // The pixel stroke was the more recent edit -- Ctrl+Z must
         // reach it first, leaving the structural change untouched.
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11838,7 +14583,7 @@ mod tests {
         );
 
         // A second Ctrl+Z must now reach the structural edit.
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11858,7 +14603,7 @@ mod tests {
 
         // Redo walks the exact same order back: structural first, then
         // pixel.
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11876,7 +14621,7 @@ mod tests {
             "the first redo must reapply the structural edit"
         );
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11923,7 +14668,7 @@ mod tests {
         undo_order.record(UndoKind::Pixel, &mut history, &mut pixel_history);
         assert!(pixel_history.can_undo());
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -12126,7 +14871,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -12139,7 +14883,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Tab),
@@ -12161,7 +14904,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -12174,7 +14916,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('h'),
@@ -12185,8 +14926,17 @@ mod tests {
         assert_eq!(tool, Tool::Pan);
     }
 
+    /// Since 0.69.1, `handle_key` no longer runs `Undo`/`Redo` itself —
+    /// it defers to the caller via `ActivatedCommand`, exactly as
+    /// `handle_palette_key`/`activate_command` already do for the same
+    /// two commands (see `activate_command_resolves_undo_and_redo_
+    /// without_focusing_anything`), so `App::handle_key_event` can route
+    /// either through `perform_undo_redo`'s full commit-drag/re-clamp
+    /// order instead of the bare `run_command` call this function used
+    /// to make on its own. The layer added above must therefore still
+    /// be present after this call — the undo itself never runs here.
     #[test]
-    fn handle_key_routes_ctrl_z_to_undo_when_the_palette_is_closed() {
+    fn handle_key_reports_ctrl_z_as_undo_instead_of_running_it_when_the_palette_is_closed() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -12214,9 +14964,8 @@ mod tests {
         // called above.
         let mut undo_order = UndoOrder::default();
         undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
-        handle_key(
+        let picked = handle_key(
             &mut workspace,
             &mut focus,
             &mut dialog,
@@ -12227,7 +14976,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers {
                 control: true,
@@ -12238,9 +14986,76 @@ mod tests {
             &mut FakeClipboard::default(),
             &mut FakeFileDialog::default(),
         );
+        assert_eq!(picked, Some(ActivatedCommand::Undo));
+        assert!(
+            layers.contains(id),
+            "handle_key must not run the undo itself -- that is now the caller's job, through \
+             perform_undo_redo"
+        );
+    }
+
+    /// The `Redo` half of the test just above — same contract, the
+    /// other command.
+    #[test]
+    fn handle_key_reports_ctrl_shift_z_as_redo_instead_of_running_it_when_the_palette_is_closed() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let id = match history.add_pixel_layer(
+            &mut layers,
+            "a",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+        // A real undo first, so there is something on the redo stack.
+        if let Err(err) = history.undo(&mut layers) {
+            unreachable!("{err:?}");
+        }
+        undo_order.undo.pop();
+        undo_order.redo.push(UndoKind::Structural);
+        let shortcuts = default_shortcuts();
+        let picked = handle_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &shortcuts,
+            Modifiers {
+                control: true,
+                shift: true,
+                ..Modifiers::none()
+            },
+            Key::Character('z'),
+            None,
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
+        );
+        assert_eq!(picked, Some(ActivatedCommand::Redo));
         assert!(
             !layers.contains(id),
-            "Ctrl+Z must undo the just-added layer"
+            "handle_key must not run the redo itself -- that is now the caller's job, through \
+             perform_undo_redo"
         );
     }
 
@@ -12255,7 +15070,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         // 'q' is deliberately not one of `default_shortcuts`' own
         // tool-switch letters (v/m/z/h/i) or anything else bound.
@@ -12270,7 +15084,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('q'),
@@ -12294,7 +15107,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
@@ -12312,7 +15124,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('p'),
@@ -12890,7 +15701,7 @@ mod tests {
     /// path every process and every user shared.
     #[test]
     fn each_scratch_directory_is_a_new_one() {
-        let (Some(first), Some(second)) = (
+        let (Some((first, first_lock)), Some((second, second_lock))) = (
             create_tile_store_scratch_dir(),
             create_tile_store_scratch_dir(),
         ) else {
@@ -12902,6 +15713,10 @@ mod tests {
         let fixed = std::env::temp_dir().join("aurora-tiles");
         assert_ne!(first, fixed);
         assert_ne!(second, fixed);
+        // Released before the directories go away, so the removal below
+        // is not racing the guard's own file.
+        drop(first_lock);
+        drop(second_lock);
         // These two are deliberately *not* the memoized session
         // directory, so nothing else is using them -- clean up rather
         // than leaving two directories behind per test run.
@@ -12927,9 +15742,10 @@ mod tests {
     fn a_fresh_scratch_directory_is_owner_only_before_any_store_opens() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let Some(dir) = create_tile_store_scratch_dir() else {
+        let Some((dir, lock)) = create_tile_store_scratch_dir() else {
             unreachable!("a scratch directory is always creatable in a real test environment");
         };
+        drop(lock);
         let mode = match std::fs::metadata(&dir) {
             Ok(meta) => meta.permissions().mode() & 0o777,
             Err(err) => unreachable!("the directory was just created: {err}"),
@@ -13000,9 +15816,12 @@ mod tests {
         // Deliberately a throwaway directory, not the live memoized
         // session one: removing the real one would pull the scratch
         // disk out from under every other test sharing this binary.
-        let Some(dir) = create_tile_store_scratch_dir() else {
+        let Some((dir, lock)) = create_tile_store_scratch_dir() else {
             unreachable!("a scratch directory is always creatable in a real test environment");
         };
+        // Released before the removal below: the guard's own lock file
+        // lives inside the directory this test is about to delete.
+        drop(lock);
         let tile = dir.join("0-0-0_0_0_0.tile");
         if let Err(err) = std::fs::write(&tile, [0_u8; 4]) {
             unreachable!("a fresh scratch directory must be writable: {err}");
@@ -13048,7 +15867,7 @@ mod tests {
                     if entry.path().is_dir() {
                         count_files(&entry.path())
                     } else {
-                        1
+                        usize::from(is_tile_file(&entry.path()))
                     }
                 })
                 .sum()
@@ -13138,9 +15957,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) =
-            aurora_io::write_aur(file, &layers, &history, (SIDE, SIDE), None, &mut store)
-        {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (SIDE, SIDE),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -13218,6 +16043,51 @@ mod tests {
         drop(second);
     }
 
+    /// A symlink at the path `create_dir_owner_only` is asked to
+    /// recreate must be *refused*, not followed.
+    ///
+    /// The only caller ([`aur_verify_scratch_dir`]) reaches this path
+    /// specifically when the directory it expects is *missing* -- the
+    /// same precondition under which a local attacker could plant a
+    /// symlink at that exact name first. `DirBuilder::create` alone
+    /// would already refuse a symlink no differently than any other
+    /// pre-existing non-directory (some `io::Error`); this test pins the
+    /// specific, honest `InvalidInput` this function's own check adds,
+    /// mirroring `aurora_tile::store`'s
+    /// `new_refuses_a_symlinked_scratch_directory` for the sibling
+    /// hardening this deliberately took the cheaper half of.
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_owner_only_refuses_a_symlink() {
+        let parent = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("tempdir creation must succeed in a test environment: {err}"),
+        };
+        let target = parent.path().join("someone-elses-directory");
+        if let Err(err) = std::fs::create_dir(&target) {
+            unreachable!("creating a directory inside a fresh tempdir must succeed: {err}");
+        }
+        let link = parent.path().join("scratch");
+        if let Err(err) = std::os::unix::fs::symlink(&target, &link) {
+            unreachable!("creating a symlink inside a fresh tempdir must succeed: {err}");
+        }
+
+        match create_dir_owner_only(&link) {
+            Err(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    err.to_string().contains("symlink"),
+                    "the symlink check is what must reject this, not an overlapping one: {err}"
+                );
+            }
+            Ok(()) => unreachable!("a symlink at the target path must be refused, not followed"),
+        }
+        assert!(
+            target.is_dir(),
+            "a refused call must not have touched the symlink's target"
+        );
+    }
+
     /// The three things a clean shutdown must undo, exercised as a unit.
     ///
     /// The `WindowEvent::CloseRequested` arm that calls this needs a
@@ -13229,6 +16099,257 @@ mod tests {
     /// handler is left to inspection.
     #[test]
     fn clean_shutdown_cleanup_removes_the_marker_the_autosave_and_the_scratch_tiles() {
+        let ShutdownFixture {
+            _dir,
+            marker,
+            autosave,
+            scratch,
+            mut state,
+        } = shutdown_fixture(Aborted::No, None);
+        clean_shutdown_cleanup(&mut state);
+        assert!(
+            state.store.is_none(),
+            "the store must be taken out of the slot and dropped, not left alive holding a \
+             writer thread against a directory that is being deleted"
+        );
+
+        assert!(!marker.exists(), "the session marker must be cleared");
+        assert!(!autosave.exists(), "the autosave must be removed");
+        assert!(
+            !scratch.exists(),
+            "the session's scratch directory and its unsaved pixels must be removed"
+        );
+    }
+
+    /// Running the clean-shutdown cleanup twice must be as safe as
+    /// running it once.
+    ///
+    /// This is the premise the two-call-site shape rests on:
+    /// `WindowEvent::CloseRequested` calls `App::finish_shutdown`, and
+    /// `ApplicationHandler::exiting` — which `winit` dispatches on the
+    /// way out of *every* exit, that close request included — calls it
+    /// again. If the second pass could fail, error, or undo something,
+    /// closing a window would be worse than quitting from the menu.
+    ///
+    /// **What it does not prove.** Only that the function is idempotent.
+    /// It does not prove either call site is actually wired to a real
+    /// event loop, because no test in this crate can drive one: both
+    /// `window_event` and `exiting` need a live `winit` loop and a real
+    /// window to reach, and that wiring is left to inspection (a review
+    /// round showed that deleting the scratch-directory cleanup from the
+    /// `CloseRequested` arm left every test in this binary green). Nor
+    /// does it say anything about `exiting` firing on any particular
+    /// platform — that is `winit`'s own guarantee, unverified here on
+    /// real hardware.
+    #[test]
+    fn clean_shutdown_cleanup_is_idempotent_across_two_exit_paths() {
+        let ShutdownFixture {
+            _dir,
+            marker,
+            autosave,
+            scratch,
+            mut state,
+        } = shutdown_fixture(Aborted::No, None);
+
+        // The `CloseRequested` arm's own call.
+        clean_shutdown_cleanup(&mut state);
+        assert!(state.store.is_none(), "the store must be taken and dropped");
+        assert!(!marker.exists(), "the session marker must be cleared");
+        assert!(!autosave.exists(), "the autosave must be removed");
+        assert!(
+            !scratch.exists(),
+            "the session's scratch directory and its unsaved pixels must be removed"
+        );
+
+        // ...and then `exiting`'s, on the very same state, which is
+        // exactly what closing a window produces.
+        clean_shutdown_cleanup(&mut state);
+        assert!(
+            state.store.is_none(),
+            "a second pass must not resurrect a store slot it already emptied"
+        );
+        assert!(
+            !marker.exists(),
+            "a second pass must leave the marker gone, not recreate it"
+        );
+        assert!(
+            !autosave.exists(),
+            "a second pass must leave the autosave gone"
+        );
+        assert!(
+            !scratch.exists(),
+            "a second pass must leave the scratch directory gone"
+        );
+    }
+
+    /// A run that never got a window up must not delete the *previous*
+    /// run's crash-recovery data on its way out.
+    ///
+    /// `App::fail` is only ever called from inside `resumed`, before a
+    /// window, a device or a surface exists — and by then `App::new` may
+    /// already have recovered a previous crash's document out of the
+    /// autosave without rewriting it (`startup_document`'s recovered
+    /// branch deliberately doesn't: the file *is* the document), with
+    /// the crash-recovery dialog built but never shown, because showing
+    /// it needs the window that just failed to create. 0.63.0 routed
+    /// this exit through the full clean-shutdown cleanup, so a failed
+    /// startup deleted that marker, that autosave and the partial
+    /// autosave — unseen, permanently, on a path whose own triggers (no
+    /// GPU adapter, a driver hiccup, a surface that would not create)
+    /// can be exactly why the previous run died too. Before 0.63.0 the
+    /// data survived and a retry recovered normally; this pins that
+    /// behaviour back.
+    ///
+    /// The scratch directory is a different matter and *is* removed:
+    /// those tiles are this run's own, the autosave still holds every
+    /// pixel `recover_document` read out of it, and nothing recoverable
+    /// lives only there.
+    #[test]
+    fn a_failed_startup_preserves_the_previous_runs_crash_recovery_data() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // A layout path this run really could have written to, so the
+        // "no layout was written" assertion below is a real one rather
+        // than a state that names nowhere to write in the first place.
+        let layout = dir.path().join("workspace-layout.postcard");
+        let ShutdownFixture {
+            _dir,
+            marker,
+            autosave,
+            scratch,
+            mut state,
+        } = shutdown_fixture(Aborted::Yes, Some(layout));
+
+        // What `ApplicationHandler::exiting` runs after `App::fail`.
+        run_shutdown_cleanup(&mut state);
+
+        assert!(
+            marker.exists(),
+            "a failed startup must leave the session marker alone -- it is what makes the \
+             next run offer recovery at all"
+        );
+        assert!(
+            autosave.exists(),
+            "a failed startup must leave the autosave alone -- it can be the only on-disk \
+             copy of a previous crash's document, and nobody has been shown the dialog"
+        );
+        assert!(
+            !scratch.exists(),
+            "this run's own scratch tiles are still its own to remove"
+        );
+        assert!(
+            state.store.is_none(),
+            "the store must still be taken and dropped before its directory goes"
+        );
+        assert!(
+            !state.layout_written(),
+            "a run that never had a window has no layout worth writing back, and its \
+             in-memory one may be the default it fell back to when the *read* failed"
+        );
+    }
+
+    /// The whole of `App::finish_shutdown`, twice — the real double
+    /// invocation closing a window produces, not two raw calls to the
+    /// inner trio.
+    ///
+    /// `WindowEvent::CloseRequested` calls `App::finish_shutdown`, and
+    /// `ApplicationHandler::exiting` — which `winit` dispatches on the
+    /// way out of *every* exit, that close request included — calls it
+    /// again. `finish_shutdown` is `run_shutdown_cleanup(self)`, which
+    /// is the cleanup trio *plus* a `save_workspace_layout` the
+    /// trio-only idempotency test never touches. If the second pass
+    /// could fail, error, or write a different layout than the first,
+    /// closing a window would be worse than quitting from the menu.
+    ///
+    /// **What it does not prove.** Only that the function is idempotent.
+    /// It does not prove either call site is actually wired to a real
+    /// event loop: constructing an `App` needs an `EventLoopProxy`,
+    /// which needs a live `winit` loop, so no test in this crate can
+    /// call `App::finish_shutdown` itself — `run_shutdown_cleanup` over
+    /// [`ShutdownState`] is the closest seam there is, and it is the
+    /// whole of that method's body. That wiring is left to inspection.
+    #[test]
+    fn finish_shutdown_is_idempotent_across_two_exit_paths() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let layout = dir.path().join("nested").join("workspace-layout.postcard");
+        let ShutdownFixture {
+            _dir,
+            marker,
+            autosave,
+            scratch,
+            mut state,
+        } = shutdown_fixture(Aborted::No, Some(layout.clone()));
+
+        // The `CloseRequested` arm's own call.
+        run_shutdown_cleanup(&mut state);
+        assert!(!marker.exists(), "the session marker must be cleared");
+        assert!(!autosave.exists(), "the autosave must be removed");
+        assert!(!scratch.exists(), "the scratch tiles must be removed");
+        let first = match std::fs::read(&layout) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("the layout must have been written: {err}"),
+        };
+        assert!(!first.is_empty(), "a written layout is not empty");
+
+        // ...and then `exiting`'s, on the very same state, which is
+        // exactly what closing a window produces.
+        run_shutdown_cleanup(&mut state);
+        assert!(
+            !marker.exists(),
+            "a second pass must leave the marker gone, not recreate it"
+        );
+        assert!(
+            !autosave.exists(),
+            "a second pass must leave the autosave gone"
+        );
+        assert!(
+            !scratch.exists(),
+            "a second pass must leave the scratch directory gone"
+        );
+        let second = match std::fs::read(&layout) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("the layout must still be there: {err}"),
+        };
+        assert_eq!(
+            first, second,
+            "a second pass must rewrite the identical layout, not a degraded one"
+        );
+    }
+
+    /// Whether the run [`shutdown_fixture`] builds is ending through
+    /// `App::fail` — a named pair rather than a bare `bool`, so a call
+    /// site says which exit it is testing.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Aborted {
+        Yes,
+        No,
+    }
+
+    /// What both exit-path tests are built on, held together so the
+    /// temp directory outlives them.
+    struct ShutdownFixture {
+        /// Held only to keep the temp directory alive for the test.
+        _dir: tempfile::TempDir,
+        marker: PathBuf,
+        autosave: PathBuf,
+        scratch: PathBuf,
+        state: FakeShutdownState,
+    }
+
+    /// A marker and an autosave that really exist, and a *real* tile
+    /// store with real paged-out tiles in a real scratch directory — not
+    /// an empty one, which would let a removal pass while removing
+    /// nothing.
+    ///
+    /// Throwaway paths throughout, never the live session's: removing
+    /// the live scratch directory from a test would pull the scratch
+    /// disk out from under every other test sharing this binary.
+    fn shutdown_fixture(aborted: Aborted, layout: Option<PathBuf>) -> ShutdownFixture {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
             Err(err) => unreachable!("{err:?}"),
@@ -13242,12 +16363,13 @@ mod tests {
             unreachable!("a fresh tempdir must be writable: {err}");
         }
 
-        // A real, live store with a real paged-out tile in a real
-        // scratch directory -- not an empty directory, which would pass
-        // even if the removal never ran against anything.
-        let Some(scratch) = create_tile_store_scratch_dir() else {
+        let Some((scratch, scratch_lock)) = create_tile_store_scratch_dir() else {
             unreachable!("a scratch directory is always creatable in a real test environment");
         };
+        // This fixture hands the directory to a `ShutdownState` that
+        // will delete it, so the liveness guard must not still be
+        // holding a file inside it.
+        drop(scratch_lock);
         let Some(budget) = std::num::NonZeroUsize::new(1) else {
             unreachable!("1 is non-zero");
         };
@@ -13268,43 +16390,53 @@ mod tests {
             unreachable!("a test-local scratch disk must accept the write: {err}");
         }
         let tiles = match std::fs::read_dir(&scratch) {
-            Ok(entries) => entries.flatten().count(),
+            Ok(entries) => entries
+                .flatten()
+                .filter(|entry| is_tile_file(&entry.path()))
+                .count(),
             Err(err) => unreachable!("the scratch directory is readable: {err}"),
         };
         assert!(
             tiles > 0,
-            "this test's premise is a scratch directory with real paged-out tiles in it"
+            "this fixture's premise is a scratch directory with real paged-out tiles in it"
         );
 
-        let mut state = FakeShutdownState {
+        let state = FakeShutdownState {
             marker: marker.clone(),
             autosave: autosave.clone(),
             store: Some(store),
             scratch: Some(scratch.clone()),
+            aborted: aborted == Aborted::Yes,
+            layout: layout.map(|path| (path, aurora_ui::build_workspace())),
         };
-        clean_shutdown_cleanup(&mut state);
-        assert!(
-            state.store.is_none(),
-            "the store must be taken out of the slot and dropped, not left alive holding a \
-             writer thread against a directory that is being deleted"
-        );
-
-        assert!(!marker.exists(), "the session marker must be cleared");
-        assert!(!autosave.exists(), "the autosave must be removed");
-        assert!(
-            !scratch.exists(),
-            "the session's scratch directory and its unsaved pixels must be removed"
-        );
+        ShutdownFixture {
+            _dir: dir,
+            marker,
+            autosave,
+            scratch,
+            state,
+        }
     }
 
-    /// [`ShutdownState`]'s test double — the four things a clean
-    /// shutdown reads out of the running application, backed by
-    /// throwaway paths instead of the live session's.
+    /// [`ShutdownState`]'s test double — the six things a shutdown reads
+    /// out of the running application, backed by throwaway paths instead
+    /// of the live session's.
     struct FakeShutdownState {
         marker: PathBuf,
         autosave: PathBuf,
         store: Option<aurora_tile::TileStore>,
         scratch: Option<PathBuf>,
+        aborted: bool,
+        layout: Option<(PathBuf, aurora_ui::Workspace)>,
+    }
+
+    impl FakeShutdownState {
+        /// Whether a layout file was actually written where this state
+        /// says one should go — `false` when it names no layout path at
+        /// all, which is also a run that wrote nothing.
+        fn layout_written(&self) -> bool {
+            self.layout.as_ref().is_some_and(|(path, _)| path.exists())
+        }
     }
 
     impl ShutdownState for FakeShutdownState {
@@ -13322,6 +16454,16 @@ mod tests {
 
         fn scratch_dir(&self) -> Option<&std::path::Path> {
             self.scratch.as_deref()
+        }
+
+        fn aborted(&self) -> bool {
+            self.aborted
+        }
+
+        fn workspace_layout(&self) -> Option<(&std::path::Path, &aurora_ui::Workspace)> {
+            self.layout
+                .as_ref()
+                .map(|(path, workspace)| (path.as_path(), workspace))
         }
     }
 
@@ -13361,7 +16503,15 @@ mod tests {
             Ok(file) => file,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = aurora_io::write_aur(file, &layers, &history, (4, 4), None, &mut store) {
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (4, 4),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -13383,6 +16533,27 @@ mod tests {
             session.is_dir(),
             "the session directory must be recreated, not merely worked around once"
         );
+        // And the liveness lock came back with it (0.68.6). Recreating
+        // the directory does not recreate its lock file, and the guard
+        // this process still held was attached to the deleted inode --
+        // so without the re-take the session would look exactly like a
+        // pre-0.67.0 leftover to every future startup sweep: no lock
+        // file, therefore `Unknown`, therefore leaked forever.
+        #[cfg(unix)]
+        {
+            assert!(
+                session.join(aurora_tile::LOCK_FILE_NAME).is_file(),
+                "the recreated session directory must carry a lock file again, or it is \
+                 permanently invisible to future sweeps"
+            );
+            match aurora_tile::lock_scratch_dir(session) {
+                Ok(_) => unreachable!(
+                    "the re-taken lock must actually be held -- an unheld lock file would let \
+                     the next run's sweep delete this live session's directory"
+                ),
+                Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock),
+            }
+        }
         // And it is owner-only again, not whatever the umask says.
         #[cfg(unix)]
         {
@@ -13397,6 +16568,54 @@ mod tests {
                 "a recreated session directory holds the same unsaved pixels the original did \
                  (mode {mode:o})"
             );
+        }
+    }
+
+    /// `open_tile_store` is the *other* path (besides `verify_aur`, just
+    /// above) that recreates this session's scratch directory when a temp
+    /// cleaner has removed it mid-run — `aurora_tile::TileStore::new`
+    /// self-heals via `create_private_dir` on every open, not only at
+    /// startup. 0.68.6 re-took the liveness lock after `verify_aur`'s own
+    /// recreate but missed this second call site; fixed alongside PLAN.md's
+    /// correction of the `TileResidency::sync` caller claim (0.68.8).
+    #[test]
+    fn open_tile_store_survives_the_session_scratch_directory_being_swept_away() {
+        let _guard = AUR_VERIFY_SCRATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let Some(session) = tile_store_scratch_dir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        super::remove_scratch_dir(session);
+        assert!(
+            !session.exists(),
+            "this test's premise is a session directory that has been swept away"
+        );
+
+        assert!(
+            open_tile_store().is_some(),
+            "reopening the tile store must still succeed after the session scratch \
+             directory has been swept away"
+        );
+        assert!(
+            session.is_dir(),
+            "the session directory must be recreated, not merely worked around once"
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                session.join(aurora_tile::LOCK_FILE_NAME).is_file(),
+                "the recreated session directory must carry a lock file again, or it is \
+                 permanently invisible to future sweeps"
+            );
+            match aurora_tile::lock_scratch_dir(session) {
+                Ok(_) => unreachable!(
+                    "the re-taken lock must actually be held -- an unheld lock file would let \
+                     the next run's sweep delete this live session's directory"
+                ),
+                Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock),
+            }
         }
     }
 
@@ -13418,6 +16637,8 @@ mod tests {
             autosave: autosave.clone(),
             store: None,
             scratch: None,
+            aborted: false,
+            layout: None,
         };
         clean_shutdown_cleanup(&mut state);
         assert!(!marker.exists());
@@ -13467,30 +16688,24 @@ mod tests {
     }
 
     /// `NoSuitableAdapter` is an inconclusive skip (this sandbox/CI
-    /// runner may genuinely have no usable GPU); any other error means
-    /// an adapter *was* found but device/queue creation failed, a real
-    /// bug worth a hard test failure — same distinction
-    /// `aurora-gpu::test_support::real_context` already draws.
+    /// runner may genuinely have no usable GPU) *unless*
+    /// `AURORA_REQUIRE_GPU` is set, in which case a runner that is
+    /// supposed to have an adapter fails instead of going green on a
+    /// suite of skips; any other error means an adapter *was* found but
+    /// device/queue creation failed, a real bug worth a hard test
+    /// failure either way. That whole decision now lives once, in
+    /// `aurora_gpu::test_support::real_context_or_skip` (reached via
+    /// this crate's `test-support` dev-dependency feature); only the
+    /// lock and the guard-bundling wrapper stay local, since this
+    /// crate's tests are their own binary.
     fn real_gpu_context() -> Option<GpuTestContext> {
         let guard = GPU_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match aurora_gpu::GpuContext::new() {
-            Ok(context) => Some(GpuTestContext {
-                _guard: guard,
-                context,
-            }),
-            Err(aurora_gpu::GpuError::NoSuitableAdapter) => {
-                eprintln!("SKIPPED: no GPU adapter available on this machine/CI runner");
-                None
-            }
-            Err(err) => {
-                #[allow(clippy::panic)]
-                {
-                    panic!("device request failed with a real adapter present: {err}");
-                }
-            }
-        }
+        aurora_gpu::test_support::real_context_or_skip().map(|context| GpuTestContext {
+            _guard: guard,
+            context,
+        })
     }
 
     fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
@@ -14399,7 +17614,9 @@ mod tests {
             unreachable!("the scratch directory must be readable");
         };
         for entry in entries.flatten() {
-            scratch_files.push(entry.path());
+            if is_tile_file(&entry.path()) {
+                scratch_files.push(entry.path());
+            }
         }
         assert_eq!(
             scratch_files.len(),
@@ -15147,22 +18364,41 @@ mod tests {
         }
     }
 
+    /// `apply_mask` in its bounds-only configuration: no mask surface,
+    /// so nothing is read from the store at all and the result is
+    /// exactly the rectangle-only clip that predates real mask pixels.
+    ///
+    /// Kept as a helper so the four tests below still assert, verbatim,
+    /// what they asserted before real coverage existed — a rename of
+    /// the function under test must not turn into a quiet retune of its
+    /// oldest regression tests.
+    fn apply_mask_bounds_only(
+        texels: &[half::f16],
+        mask: &aurora_doc::LayerMask,
+        doc_origin: (i64, i64),
+    ) -> Vec<half::f16> {
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        apply_mask(texels, mask, None, &mut store, doc_origin, &mut budget)
+    }
+
     #[test]
     // A texel whose absolute position lands inside `mask.bounds` passes
     // through unchanged -- exactly its own source colour and alpha, not
     // forced to any particular value the way `dissolve_gate`'s own
     // "shown" branch forces alpha to `1.0`.
-    fn apply_mask_clip_passes_through_a_texel_inside_the_mask_bounds() {
+    fn apply_mask_passes_through_a_texel_inside_the_mask_bounds() {
         let texels = solid_tile_buffer([0.25, 0.5, 0.75, 0.6]);
         let mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
-        let clipped = apply_mask_clip(&texels, &mask, (0, 0));
+        let clipped = apply_mask_bounds_only(&texels, &mask, (0, 0));
         assert_eq!(clipped, texels);
     }
 
     #[test]
     // A texel outside `mask.bounds` comes back fully transparent -- the
     // same `(0, 0, 0, 0)` "hidden" convention `dissolve_gate` uses.
-    fn apply_mask_clip_zeroes_a_texel_outside_the_mask_bounds() {
+    fn apply_mask_zeroes_a_texel_outside_the_mask_bounds() {
         let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
         // Bounds cover none of doc-space (0, 0)..(TILE, TILE) -- entirely
         // to the right of the tile this buffer covers.
@@ -15172,7 +18408,7 @@ mod tests {
             aurora_tile::TILE,
             aurora_tile::TILE,
         );
-        let clipped = apply_mask_clip(&texels, &mask, (0, 0));
+        let clipped = apply_mask_bounds_only(&texels, &mask, (0, 0));
         for chunk in clipped.chunks_exact(aurora_tile::CHANNELS) {
             let [r, g, b, a] = chunk else {
                 unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
@@ -15187,12 +18423,12 @@ mod tests {
     #[test]
     // `inverted` flips both of the above cases: what was shown becomes
     // hidden and vice versa.
-    fn apply_mask_clip_inverted_flips_shown_and_hidden() {
+    fn apply_mask_inverted_flips_shown_and_hidden() {
         let texels = solid_tile_buffer([0.1, 0.2, 0.3, 1.0]);
 
         let mut inside_mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
         inside_mask.inverted = true;
-        let clipped_inside = apply_mask_clip(&texels, &inside_mask, (0, 0));
+        let clipped_inside = apply_mask_bounds_only(&texels, &inside_mask, (0, 0));
         for chunk in clipped_inside.chunks_exact(aurora_tile::CHANNELS) {
             let [r, g, b, a] = chunk else {
                 unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
@@ -15211,7 +18447,7 @@ mod tests {
             aurora_tile::TILE,
         );
         outside_mask.inverted = true;
-        let clipped_outside = apply_mask_clip(&texels, &outside_mask, (0, 0));
+        let clipped_outside = apply_mask_bounds_only(&texels, &outside_mask, (0, 0));
         assert_eq!(
             clipped_outside, texels,
             "inverting a mask that would otherwise hide this texel must show it unchanged"
@@ -15226,7 +18462,7 @@ mod tests {
     // `doc_origin`/local-coordinate split reaches it -- tile `(0, 0)`'s
     // own local `(200, 100)` vs. a `doc_origin` shifted by `(-1, -1)`
     // whose local `(201, 101)` lands on that same absolute point.
-    fn apply_mask_clip_matches_at_the_same_absolute_position_reached_via_different_doc_origins() {
+    fn apply_mask_matches_at_the_same_absolute_position_reached_via_different_doc_origins() {
         let rgba = [0.2, 0.4, 0.6, 1.0];
         let texels_a = solid_tile_buffer(rgba);
         let texels_b = solid_tile_buffer(rgba);
@@ -15235,10 +18471,10 @@ mod tests {
         let mask = rect_mask(195, 95, 10, 10);
 
         let tile_side = aurora_tile::TILE as usize;
-        let clipped_a = apply_mask_clip(&texels_a, &mask, (0, 0));
+        let clipped_a = apply_mask_bounds_only(&texels_a, &mask, (0, 0));
         let index_a = 100 * tile_side + 200;
 
-        let clipped_b = apply_mask_clip(&texels_b, &mask, (-1, -1));
+        let clipped_b = apply_mask_bounds_only(&texels_b, &mask, (-1, -1));
         let index_b = 101 * tile_side + 201;
 
         let channels = aurora_tile::CHANNELS;
@@ -15262,6 +18498,612 @@ mod tests {
             a.to_f32() > 0.0,
             "absolute (200, 100) is inside mask.bounds and must be shown"
         );
+    }
+
+    #[test]
+    // The named backward-compatibility guarantee, asserted rather than
+    // argued: a mask surface that exists but has never been written must
+    // produce *byte-identical* output to passing no surface at all. This
+    // is what makes real mask pixels a purely additive change -- every
+    // document that predates them composites exactly as it did.
+    fn apply_mask_with_an_unpainted_mask_surface_matches_the_bounds_only_clip() {
+        let texels = solid_tile_buffer([0.25, 0.5, 0.75, 0.6]);
+        let mask = rect_mask(0, 0, 100, 100);
+        let bounds_only = apply_mask_bounds_only(&texels, &mask, (0, 0));
+
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let unpainted_surface =
+            aurora_tile::SurfaceId::from_raw(0x2a | aurora_doc::MASK_SURFACE_BIT);
+        let with_surface = apply_mask(
+            &texels,
+            &mask,
+            Some(unpainted_surface),
+            &mut store,
+            (0, 0),
+            &mut budget,
+        );
+
+        assert_eq!(
+            with_surface, bounds_only,
+            "an unpainted mask surface must be byte-identical to the bounds-only clip"
+        );
+    }
+
+    #[test]
+    // Half the mask painted to coverage 1.0, half to 0.0, at texel
+    // granularity -- the smallest thing a rectangle clip could not do
+    // on its own (here it *could*, but the point is that the decision
+    // now comes from real pixels, not from `mask.bounds`, which covers
+    // the whole buffer).
+    fn apply_mask_hides_exactly_the_texels_painted_to_zero_coverage() {
+        let texels = solid_tile_buffer([0.2, 0.4, 0.6, 1.0]);
+        let mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0x09 | aurora_doc::MASK_SURFACE_BIT);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let side = aurora_tile::TILE as usize;
+        for y in 0..side {
+            for x in 0..side {
+                let coverage = if x < side / 2 { 1.0 } else { 0.0 };
+                if let Err(err) =
+                    aurora_doc::write_mask_coverage(&mut store, surface, tile, x, y, coverage)
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let masked = apply_mask(
+            &texels,
+            &mask,
+            Some(surface),
+            &mut store,
+            (0, 0),
+            &mut budget,
+        );
+
+        for (index, chunk) in masked.chunks_exact(aurora_tile::CHANNELS).enumerate() {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            if index % side < side / 2 {
+                // `f16` cannot hold 0.2/0.4/0.6 exactly, so the
+                // expectation is what those quantize to -- which is
+                // also exactly what `solid_tile_buffer` stored.
+                assert_eq!(
+                    (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                    (
+                        half::f16::from_f32(0.2).to_f32(),
+                        half::f16::from_f32(0.4).to_f32(),
+                        half::f16::from_f32(0.6).to_f32(),
+                        1.0
+                    ),
+                    "coverage 1.0 must pass the texel through unchanged"
+                );
+            } else {
+                assert_eq!(
+                    (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                    (0.0, 0.0, 0.0, 0.0),
+                    "coverage 0.0 must zero all four channels, not just alpha"
+                );
+            }
+        }
+    }
+
+    /// A non-negative `i64` difference as a `usize` -- the one cast the
+    /// cross-crate frame test below needs, kept honest rather than
+    /// `as`-cast, since a *negative* difference would mean the test's
+    /// own arithmetic had drifted and silently wrapping it would hide
+    /// exactly the frame error the test exists to catch.
+    fn offset(from: i64, to: i64) -> usize {
+        match usize::try_from(to - from) {
+            Ok(offset) => offset,
+            Err(err) => unreachable!("{to} must be at or past {from}: {err:?}"),
+        }
+    }
+
+    /// The document this crate and `aurora-io` have to agree about: a
+    /// 1000x1000 pixel layer carrying a mask at a deliberately different
+    /// origin *and* extent (300x200 at (500, 300) -- two tile columns
+    /// where the layer is four, and nowhere near the layer's origin).
+    /// Returns the tree and the layer's own id.
+    fn masked_document_for_the_frame_check() -> (aurora_doc::LayerTree, aurora_doc::LayerId) {
+        let mut layers = aurora_doc::LayerTree::new();
+        let layer_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 1000,
+        };
+        let id = match layers.add_pixel_layer("masked", layer_bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, frame_check_mask_rect()) {
+            unreachable!("{err:?}");
+        }
+        (layers, id)
+    }
+
+    fn frame_check_mask_rect() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 500,
+            y: 300,
+            width: 300,
+            height: 200,
+        }
+    }
+
+    #[test]
+    fn painted_mask_coverage_survives_a_real_aur_round_trip_at_the_same_absolute_position() {
+        // **The property the whole mask-persistence design hinges on,
+        // and nothing tested it end to end until 0.71.4.** Two crates
+        // independently derive a frame from the *mask's* own
+        // `bounds.x/y`: `aurora-io`'s `persisted_surfaces` decides which
+        // tile indices to write and read, and this crate's `apply_mask`
+        // (via `read_layer_window`) decides which document position a
+        // coverage texel lands at. `aurora-io`'s own round-trip tests
+        // check the format agrees with itself; `apply_mask`'s own tests
+        // check the compositor agrees with itself. Neither can catch the
+        // two disagreeing with *each other* -- a mask persisted in one
+        // frame and composited in another shifts a user's mask by the
+        // offset between the layer's origin and the mask's, silently,
+        // and only after a save/load.
+        //
+        // So: paint coverage at a known document-*absolute* position,
+        // round trip it through the real `write_aur`/`read_aur` into a
+        // fresh store, and check the pixel it hides through the real
+        // `apply_mask` compositing path -- not by reading coverage back
+        // directly, which would only re-test `aurora-io`'s own frame
+        // against itself.
+        let (layers, id) = masked_document_for_the_frame_check();
+        let mask_rect = frame_check_mask_rect();
+        let history = aurora_doc::History::new();
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer in the tree has a mask surface");
+        };
+
+        // Hide exactly one document-absolute texel: (510, 320), which is
+        // mask-relative (10, 20) -- tile (0, 0) of the mask's own grid.
+        // Spelled as absolute-minus-origin rather than as a literal, so
+        // the test states the frame it means.
+        let hidden_abs = (510_i64, 320_i64);
+        let (_dir, mut store) = real_tile_store();
+        if let Err(err) = aurora_doc::write_mask_coverage(
+            &mut store,
+            mask_surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            offset(mask_rect.x, hidden_abs.0),
+            offset(mask_rect.y, hidden_abs.1),
+            0.0,
+        ) {
+            unreachable!("{err:?}");
+        }
+
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        if let Err(err) = aurora_io::write_aur(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        bytes.set_position(0);
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let reopened = match aurora_io::read_aur(bytes, &mut fresh_store) {
+            Ok(result) => result.layers,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (Some(reopened_mask), Some(reopened_surface)) =
+            (reopened.mask(id), reopened.mask_surface_id(id))
+        else {
+            unreachable!("the reopened document still carries the mask");
+        };
+
+        // Composite the 256x256 document tile at (256, 256), which
+        // contains (510, 320) at local (254, 64). Everything below is
+        // derived from `hidden_abs` and `doc_origin` rather than
+        // restated, so a frame error cannot be absorbed by a matching
+        // typo in the expectation.
+        let doc_origin = (256_i64, 256_i64);
+        let local = (
+            offset(doc_origin.0, hidden_abs.0),
+            offset(doc_origin.1, hidden_abs.1),
+        );
+        let side = aurora_tile::TILE as usize;
+        assert!(local.0 < side && local.1 < side, "{local:?} is in the tile");
+
+        let texels = solid_tile_buffer([0.2, 0.4, 0.6, 1.0]);
+        let mut budget = CompositeBudget::for_pass(&reopened);
+        let masked = apply_mask(
+            &texels,
+            reopened_mask,
+            Some(reopened_surface),
+            &mut fresh_store,
+            doc_origin,
+            &mut budget,
+        );
+
+        // Bit equality, not `==`: this workspace denies
+        // `clippy::float_cmp`, and these values really are exact.
+        let alpha_bits_at = |x: usize, y: usize| {
+            let base = (y * side + x) * aurora_tile::CHANNELS;
+            match masked.get(base..base + aurora_tile::CHANNELS) {
+                Some([_, _, _, a]) => a.to_f32().to_bits(),
+                _ => unreachable!("(x, y) is constructed in range for a whole tile"),
+            }
+        };
+        assert_eq!(
+            alpha_bits_at(local.0, local.1),
+            0.0_f32.to_bits(),
+            "the texel painted to zero coverage must still be hidden at the same absolute \
+             document position after a .aur round trip"
+        );
+        // Its immediate neighbours are untouched, which is what makes
+        // this a position check and not merely a "something got hidden"
+        // check: a one-texel frame error would move the hole, and a
+        // whole-tile one would swallow these too.
+        for (nx, ny) in [
+            (local.0 + 1, local.1),
+            (local.0 - 1, local.1),
+            (local.0, local.1 + 1),
+            (local.0, local.1 - 1),
+        ] {
+            assert_eq!(
+                alpha_bits_at(nx, ny),
+                1.0_f32.to_bits(),
+                "only {local:?} was painted; its neighbour at ({nx}, {ny}) must stay fully visible"
+            );
+        }
+    }
+
+    /// Builds a store whose one mask-coverage tile is genuinely
+    /// unreadable, and returns it alongside the surface that tile is on.
+    ///
+    /// The corruption is real, not mocked, and follows
+    /// `composite_document_refuses_to_export_when_a_layer_tile_cannot_be_read`'s
+    /// own recipe: a budget-of-1 store, a mask tile painted and then
+    /// evicted to the scratch directory by the next surface touched,
+    /// `flush` to make that write real, and the file truncated the way a
+    /// crash mid-write or a full disk leaves it. Since 0.52.2 a failed
+    /// page-in does not heal into a blank tile, so every later read of
+    /// that tile fails too — which is what lets one fixture serve both
+    /// halves of the test below.
+    ///
+    /// The mask is painted to coverage `0.0` everywhere on purpose: if
+    /// the read ever *did* succeed, the layer would be fully hidden, so
+    /// a "layer is visible" assertion cannot pass by accidentally
+    /// reading real data.
+    fn store_with_an_unreadable_mask_tile() -> (
+        tempfile::TempDir,
+        aurora_tile::TileStore,
+        aurora_tile::SurfaceId,
+    ) {
+        let Ok(dir) = tempfile::tempdir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("a freshly created tempdir must be usable: {err:?}"),
+        };
+
+        let mask_surface = aurora_tile::SurfaceId::from_raw(0x11 | aurora_doc::MASK_SURFACE_BIT);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let side = aurora_tile::TILE as usize;
+        for y in 0..side {
+            for x in 0..side {
+                if let Err(err) =
+                    aurora_doc::write_mask_coverage(&mut store, mask_surface, tile, x, y, 0.0)
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+        // One resident tile at a time, so touching any other surface
+        // evicts the mask tile to disk.
+        fill_solid(
+            &mut store,
+            aurora_tile::SurfaceId::from_raw(0x11),
+            tile,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        let mut scratch_files: Vec<std::path::PathBuf> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        for entry in entries.flatten() {
+            if is_tile_file(&entry.path()) {
+                scratch_files.push(entry.path());
+            }
+        }
+        assert_eq!(
+            scratch_files.len(),
+            1,
+            "exactly the mask tile should have been evicted: {scratch_files:?}"
+        );
+        let Some(victim) = scratch_files.first() else {
+            unreachable!("just asserted there is exactly one");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        (dir, store, mask_surface)
+    }
+
+    #[test]
+    // The measured regression this round fixes, pinned as a property
+    // rather than as a timing threshold. Before this, `apply_mask`
+    // read the mask coverage window unconditionally for every enabled
+    // mask with a surface -- and since nothing in the app paints mask
+    // coverage yet, every one of those reads materialized up to four
+    // never-touched tiles: a full `SAMPLES` allocation each, made
+    // resident, capable of evicting a real layer tile and paying a
+    // synchronous encode plus scratch-disk write for the privilege.
+    //
+    // Timed with a loop over 200 tiles on this machine, before and
+    // after: 453.5us/tile bounds-only vs 1312.6us/tile with an
+    // unpainted mask surface (2.9x), against 364.6us vs 369.3us after
+    // (1.01x) -- recorded in the commit and in PLAN.md rather than
+    // asserted here, because a wall-clock assertion in CI measures the
+    // runner's mood. What *is* asserted is the mechanism the speedup
+    // comes from, which does not vary: nothing is materialized, so the
+    // store is untouched and the residency budget is undisturbed.
+    fn apply_mask_does_not_materialize_tiles_of_an_unpainted_mask_surface() {
+        let texels = solid_tile_buffer([0.25, 0.5, 0.75, 1.0]);
+        let mask = rect_mask(0, 0, 10_000, 10_000);
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let surface = aurora_tile::SurfaceId::from_raw(0x2b | aurora_doc::MASK_SURFACE_BIT);
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let masked = apply_mask(
+            &texels,
+            &mask,
+            Some(surface),
+            &mut store,
+            (0, 0),
+            &mut budget,
+        );
+
+        assert_eq!(
+            store.stats().tiles_created,
+            0,
+            "an unpainted mask surface must not be materialized to discover it is unpainted"
+        );
+        assert_eq!(store.resident_len(), 0, "and must not occupy the LRU cache");
+        assert!(budget.store_error().is_none());
+        // And the output is still exactly the bounds-only clip -- the
+        // skip is an optimization, not a behaviour change. (The
+        // byte-identity of those two is
+        // `apply_mask_with_an_unpainted_mask_surface_matches_the_bounds_only_clip`;
+        // this checks the same buffer arrives.)
+        assert_eq!(masked, apply_mask_bounds_only(&texels, &mask, (0, 0)));
+    }
+
+    #[test]
+    // The other half: skipping must apply per *tile*, not per surface,
+    // so a mask surface that is painted on one tile and untouched on
+    // the next still reads the painted one. A too-eager skip would
+    // silently ignore real mask pixels.
+    fn apply_mask_still_reads_a_mask_surface_that_is_painted_on_only_some_tiles() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        let side = i64::from(aurora_tile::TILE);
+        let mask = rect_mask(0, 0, 10_000, 10_000);
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let surface = aurora_tile::SurfaceId::from_raw(0x2c | aurora_doc::MASK_SURFACE_BIT);
+
+        // Tile (0, 0) painted fully hidden; tile (1, 0) never touched.
+        let painted = aurora_tile::TileId { x: 0, y: 0 };
+        let extent = aurora_tile::TILE as usize;
+        for y in 0..extent {
+            for x in 0..extent {
+                if let Err(err) =
+                    aurora_doc::write_mask_coverage(&mut store, surface, painted, x, y, 0.0)
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+
+        for (origin, expected, why) in [
+            ((0, 0), (0.0, 0.0, 0.0, 0.0), "painted to coverage 0.0"),
+            ((side, 0), (1.0, 1.0, 1.0, 1.0), "never painted"),
+        ] {
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let masked = apply_mask(
+                &texels,
+                &mask,
+                Some(surface),
+                &mut store,
+                origin,
+                &mut budget,
+            );
+            for chunk in masked.chunks_exact(aurora_tile::CHANNELS) {
+                let [r, g, b, a] = chunk else {
+                    unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+                };
+                assert_eq!(
+                    (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                    expected,
+                    "tile at {origin:?} is {why}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    // The regression this whole `LayerWindow`/`was_read` machinery
+    // exists for. `apply_mask`'s contract says every degenerate case
+    // fails *open* -- a mask that cannot be read must never silently
+    // erase a layer -- and until 0.70.2 that held only while
+    // `mask.inverted` was false. The fail-open `1.0` was substituted
+    // into the *raw* coverage and then inverted like any real value, so
+    // `1.0 - 1.0 = 0.0` erased the layer exactly where the read had
+    // failed: fail-closed, on the one path the doc comment singled out
+    // as impossible.
+    //
+    // Both directions are asserted from one genuinely corrupt tile, so
+    // neither half can pass by mocking an error that the real store
+    // would not produce. The non-inverted half is the case the original
+    // suite already covered; it is kept here so a future change cannot
+    // fix one direction by breaking the other.
+    fn apply_mask_fails_open_on_an_unreadable_mask_tile_whether_or_not_inverted() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        let layers = aurora_doc::LayerTree::new();
+
+        for inverted in [false, true] {
+            let (_dir, mut store, mask_surface) = store_with_an_unreadable_mask_tile();
+            let mut mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+            mask.inverted = inverted;
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let masked = apply_mask(
+                &texels,
+                &mask,
+                Some(mask_surface),
+                &mut store,
+                (0, 0),
+                &mut budget,
+            );
+
+            assert!(
+                budget.store_error().is_some(),
+                "inverted={inverted}: the fixture's tile must really have failed to read, \
+                 or this test proves nothing"
+            );
+            for chunk in masked.chunks_exact(aurora_tile::CHANNELS) {
+                let [r, g, b, a] = chunk else {
+                    unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+                };
+                assert_eq!(
+                    (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                    (1.0, 1.0, 1.0, 1.0),
+                    "inverted={inverted}: an unreadable mask tile must leave the layer \
+                     fully visible, not erase it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    // The counterpart that keeps the fix from being a blanket "inverted
+    // masks always show everything": a mask surface that was read
+    // successfully and has simply never been painted still inverts
+    // normally, hiding the layer. The difference between this and the
+    // test above is entirely whether the read succeeded -- the buffer
+    // contents are identical zeros either way, which is exactly why the
+    // "could not be read" signal has to travel beside them.
+    fn apply_mask_inverted_over_a_readable_unpainted_mask_surface_still_hides_the_layer() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let mut mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+        mask.inverted = true;
+        let surface = aurora_tile::SurfaceId::from_raw(0x12 | aurora_doc::MASK_SURFACE_BIT);
+
+        let masked = apply_mask(
+            &texels,
+            &mask,
+            Some(surface),
+            &mut store,
+            (0, 0),
+            &mut budget,
+        );
+
+        assert!(
+            budget.store_error().is_none(),
+            "an untouched surface reads cleanly -- nothing failed here"
+        );
+        for chunk in masked.chunks_exact(aurora_tile::CHANNELS) {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            assert_eq!(
+                (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                (0.0, 0.0, 0.0, 0.0),
+                "an inverted mask over never-painted coverage hides the layer"
+            );
+        }
+    }
+
+    #[test]
+    // The `(r, g, b, 0)` shape `apply_mask`'s own output convention
+    // forbids, at the one input that used to produce it: coverage and
+    // source alpha both small enough that their product underflows to
+    // `f16` zero, while the colour channels are large and were copied
+    // through before anything checked the alpha. `f16`'s smallest
+    // subnormal is about 6e-8, so 1e-4 * 1e-4 = 1e-8 rounds to zero.
+    fn apply_mask_zeroes_the_whole_texel_when_the_scaled_alpha_underflows_to_f16_zero() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1e-4]);
+        let mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0x13 | aurora_doc::MASK_SURFACE_BIT);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let side = aurora_tile::TILE as usize;
+        for y in 0..side {
+            for x in 0..side {
+                if let Err(err) =
+                    aurora_doc::write_mask_coverage(&mut store, surface, tile, x, y, 1e-4)
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+        // The premise, asserted rather than assumed: coverage really is
+        // above zero (so the texel takes the "shown" branch) and the
+        // product really does underflow.
+        let coverage = half::f16::from_f32(1e-4).to_f32();
+        assert!(coverage > 0.0);
+        let alpha = half::f16::from_f32(1e-4).to_f32();
+        assert!(
+            half::f16::from_f32(alpha * coverage).to_f32().abs() <= 0.0,
+            "this test's premise is that the scaled alpha underflows"
+        );
+
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let masked = apply_mask(
+            &texels,
+            &mask,
+            Some(surface),
+            &mut store,
+            (0, 0),
+            &mut budget,
+        );
+
+        for chunk in masked.chunks_exact(aurora_tile::CHANNELS) {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            assert_eq!(
+                (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                (0.0, 0.0, 0.0, 0.0),
+                "an alpha that underflows to f16 zero must not keep its colour"
+            );
+        }
     }
 
     #[test]
@@ -17111,8 +20953,12 @@ mod tests {
     // full coverage, no mask. Expected: left half shows `top`'s own
     // blue (inside the mask), right half shows `bottom`'s red through
     // (outside the mask, `top` contributes nothing there) -- a hard
-    // edge at x = 5, not a blend, since this is a rectangular clip, not
-    // real grayscale masking.
+    // edge at x = 5, not a blend -- not because masks are rectangular
+    // (since 0.70.0 they are not: `apply_mask` reads real per-pixel
+    // grayscale coverage) but because *this fixture's* mask surface is
+    // never painted, so `mask.bounds` is the only thing deciding
+    // anything. `composite_document_shows_and_hides_a_pixel_layer_by_real_mask_coverage`
+    // is the counterpart that paints one.
     fn composite_document_clips_a_masked_pixel_layer_to_its_mask_bounds() {
         let (_dir, mut store) = real_tile_store();
         let mut layers = aurora_doc::LayerTree::new();
@@ -17173,6 +21019,370 @@ mod tests {
                         (r - 1.0).abs() < epsilon && g.abs() < epsilon && b.abs() < epsilon,
                         "outside the mask (x={x}) must show bottom's red through, \
                          got ({r}, {g}, {b}, {a})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Paints every texel of `id`'s own mask, from a closure taking
+    /// **document** coordinates.
+    ///
+    /// Mask coverage tiles are addressed relative to the mask's own
+    /// `bounds` origin — not the layer's bounds, and not the document
+    /// origin — so this converts into that frame exactly the way
+    /// `apply_mask` reads back out of it. Getting the two to disagree
+    /// is the bug
+    /// `composite_document_reads_mask_coverage_relative_to_the_masks_own_origin`
+    /// exists to catch.
+    fn paint_mask(
+        store: &mut aurora_tile::TileStore,
+        layers: &aurora_doc::LayerTree,
+        id: aurora_doc::LayerId,
+        coverage: impl Fn(i64, i64) -> f32,
+    ) {
+        let Some(mask) = layers.mask(id) else {
+            unreachable!("the caller adds the mask before painting it");
+        };
+        let Some(surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer that is in the tree always has a mask surface");
+        };
+        let side = aurora_tile::TILE as usize;
+        for local_y in 0..mask.bounds.height as usize {
+            for local_x in 0..mask.bounds.width as usize {
+                let (Ok(tile_x), Ok(tile_y)) =
+                    (u32::try_from(local_x / side), u32::try_from(local_y / side))
+                else {
+                    unreachable!("test masks are far smaller than u32::MAX tiles");
+                };
+                let (Ok(offset_x), Ok(offset_y)) = (i64::try_from(local_x), i64::try_from(local_y))
+                else {
+                    unreachable!("test masks are far smaller than i64::MAX");
+                };
+                if let Err(err) = aurora_doc::write_mask_coverage(
+                    store,
+                    surface,
+                    aurora_tile::TileId {
+                        x: tile_x,
+                        y: tile_y,
+                    },
+                    local_x % side,
+                    local_y % side,
+                    coverage(mask.bounds.x + offset_x, mask.bounds.y + offset_y),
+                ) {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    // The headline case for real per-pixel masks, on the same fixture
+    // shape as
+    // `composite_document_clips_a_masked_pixel_layer_to_its_mask_bounds`
+    // above -- except `mask.bounds` now covers the *whole* document, so
+    // the rectangle decides nothing at all. What decides is painted
+    // coverage: 1.0 on the left half, 0.0 on the right. Blue where
+    // coverage is 1.0, red showing through where it is 0.0.
+    fn composite_document_shows_and_hides_a_pixel_layer_by_real_mask_coverage() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // The whole document -- the rectangle hides nothing.
+        if let Err(err) = layers.add_mask(top, bounds) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        paint_mask(
+            &mut store,
+            &layers,
+            top,
+            |x, _| if x < 5 { 1.0 } else { 0.0 },
+        );
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        for y in 0..10 {
+            for x in 0..10 {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                assert!((a - 1.0).abs() < epsilon, "backdrop is opaque");
+                if x < 5 {
+                    assert!(
+                        r.abs() < epsilon && g.abs() < epsilon && (b - 1.0).abs() < epsilon,
+                        "coverage 1.0 at (x={x}) must show top's own blue, \
+                         got ({r}, {g}, {b}, {a})"
+                    );
+                } else {
+                    assert!(
+                        (r - 1.0).abs() < epsilon && g.abs() < epsilon && b.abs() < epsilon,
+                        "coverage 0.0 at (x={x}) must show bottom's red through, \
+                         got ({r}, {g}, {b}, {a})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    // The proof a rectangular clip could never produce: coverage varies
+    // continuously with x, so the composited result has to vary
+    // continuously too -- intermediate blues, not the two-valued
+    // shown/hidden a rectangle gives. Asserted as strict monotonicity
+    // plus real intermediate values rather than exact equality, since
+    // coverage round-trips through `f16` (`clippy::float_cmp` is on in
+    // this workspace, and exact float equality would be the wrong
+    // assertion here anyway).
+    fn composite_document_composites_a_gradient_mask_as_real_partial_coverage() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(top, bounds) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        paint_mask(&mut store, &layers, top, |x, _| x as f32 / 10.0);
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        let mut previous_blue = -1.0_f32;
+        let mut intermediates = 0;
+        for x in 0..10 {
+            let [r, g, b, a] = image_pixel(&image, x, 0);
+            assert!((a - 1.0).abs() < epsilon, "backdrop is opaque");
+            assert!(g.abs() < epsilon, "neither layer contributes green");
+            assert!(
+                b > previous_blue,
+                "blue must rise strictly with coverage; at x={x} got {b} after {previous_blue}"
+            );
+            // Straight-alpha `over` of opaque blue at alpha `c` onto
+            // opaque red: red falls exactly as blue rises.
+            assert!(
+                (r + b - 1.0).abs() < epsilon,
+                "red and blue must sum to 1 at x={x}, got ({r}, {b})"
+            );
+            if b > epsilon && b < 1.0 - epsilon {
+                intermediates += 1;
+            }
+            previous_blue = b;
+        }
+        assert!(
+            intermediates >= 8,
+            "a gradient mask must produce genuinely partial coverage, not a \
+             two-valued clip; only {intermediates} of 10 columns were intermediate"
+        );
+        // The two endpoints, pinned: fully hidden at x=0 (coverage 0.0),
+        // and 90% blue at x=9.
+        let [r0, _, b0, _] = image_pixel(&image, 0, 0);
+        assert!(
+            b0.abs() < epsilon && (r0 - 1.0).abs() < epsilon,
+            "coverage 0.0 at x=0 must be fully hidden, got ({r0}, {b0})"
+        );
+        let [_, _, b9, _] = image_pixel(&image, 9, 0);
+        assert!(
+            (b9 - 0.9).abs() < 0.01,
+            "coverage 0.9 at x=9 must be 90% blue, got {b9}"
+        );
+    }
+
+    #[test]
+    // `inverted` applies to the *combined* coverage, not just to the
+    // bounds test -- so inverting a gradient reverses the ramp itself,
+    // per pixel. The existing
+    // `composite_document_inverting_a_mask_shows_the_complementary_region`
+    // only covers inverted + uniform, which a bounds-only XOR would
+    // also pass.
+    fn composite_document_inverts_a_gradient_masks_own_per_pixel_coverage() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(top, bounds) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_mask_inverted(top, true) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        paint_mask(&mut store, &layers, top, |x, _| x as f32 / 10.0);
+
+        let image = match composite_document(&layers, &mut store, 10, 10) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        let mut previous_blue = 2.0_f32;
+        for x in 0..10 {
+            let [_, _, b, a] = image_pixel(&image, x, 0);
+            assert!((a - 1.0).abs() < epsilon, "backdrop is opaque");
+            assert!(
+                b < previous_blue,
+                "inverting the gradient must reverse the ramp; at x={x} got {b} \
+                 after {previous_blue}"
+            );
+            previous_blue = b;
+        }
+        // Endpoints, complementary to the un-inverted test above.
+        let [_, _, b0, _] = image_pixel(&image, 0, 0);
+        assert!(
+            (b0 - 1.0).abs() < epsilon,
+            "inverted coverage 0.0 must be fully shown at x=0, got {b0}"
+        );
+        let [_, _, b9, _] = image_pixel(&image, 9, 0);
+        assert!(
+            (b9 - 0.1).abs() < 0.01,
+            "inverted coverage 0.9 must be 10% blue at x=9, got {b9}"
+        );
+    }
+
+    #[test]
+    // Mask coverage tiles are addressed relative to the *mask's own*
+    // `bounds` origin, not the layer's bounds origin and not the
+    // document/tile origin. Here the mask sits at (3, 5) while the layer
+    // sits at (0, 0), and neither is tile-aligned -- so passing the
+    // wrong origin to `read_layer_window` would shift the painted
+    // transition by exactly (3, 5) and this test would see blue start at
+    // x=5 instead of x=8. `read_layer_window`'s own up-to-four-tile
+    // overlap handling is what makes the non-aligned case work; this is
+    // the test that it is actually being fed the right origin.
+    fn composite_document_reads_mask_coverage_relative_to_the_masks_own_origin() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 20,
+        };
+        let mask_bounds = aurora_core::Rect {
+            x: 3,
+            y: 5,
+            width: 10,
+            height: 10,
+        };
+
+        let bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(top, mask_bounds) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(bottom, [1.0, 0.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        // Painted in *document* coordinates: hidden left of x=8, shown
+        // from x=8 -- which is mask-local x=5, deliberately not the same
+        // number.
+        paint_mask(
+            &mut store,
+            &layers,
+            top,
+            |x, _| if x < 8 { 0.0 } else { 1.0 },
+        );
+
+        let image = match composite_document(&layers, &mut store, 20, 20) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let epsilon = 1e-3;
+        for y in 0..20 {
+            for x in 0..20 {
+                let [r, g, b, a] = image_pixel(&image, x, y);
+                assert!((a - 1.0).abs() < epsilon, "backdrop is opaque");
+                let inside = mask_bounds.contains_point(i64::from(x), i64::from(y));
+                let shown = inside && x >= 8;
+                if shown {
+                    assert!(
+                        r.abs() < epsilon && g.abs() < epsilon && (b - 1.0).abs() < epsilon,
+                        "({x}, {y}) is inside the mask and painted to full coverage; \
+                         must be blue, got ({r}, {g}, {b})"
+                    );
+                } else {
+                    assert!(
+                        (r - 1.0).abs() < epsilon && b.abs() < epsilon,
+                        "({x}, {y}) is outside the mask bounds or painted to zero \
+                         coverage; must be red, got ({r}, {g}, {b})"
                     );
                 }
             }
@@ -17657,6 +21867,586 @@ mod tests {
         );
     }
 
+    // -- `CompositeCache::invalidate_doc_rect` and the narrowed
+    // undo/redo invalidation it backs (0.73.0). These are pure,
+    // headless tests: no GPU adapter, no `App`. The differential
+    // real-GPU test further down is what proves the narrowed path and a
+    // full `bump()` agree texel for texel.
+
+    #[test]
+    fn invalidate_doc_rect_invalidates_a_tile_the_rect_touches_by_one_pixel() {
+        let mut cache = CompositeCache::default();
+        let tile = aurora_tile::TileId { x: 1, y: 1 };
+        cache.mark_current(tile);
+
+        // Tile (1, 1) owns [256, 512) x [256, 512) at a (0, 0) anchor.
+        // This rect ends at 257, so it covers exactly the tile's own
+        // first pixel (256, 256) and nothing else of it.
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 200,
+                y: 200,
+                width: 57,
+                height: 57,
+            },
+            (0, 0),
+        );
+        assert!(
+            !cache.is_current(tile),
+            "one shared pixel is a real overlap; missing it leaves a stale seam"
+        );
+    }
+
+    #[test]
+    fn invalidate_doc_rect_leaves_a_tile_the_rect_only_abuts() {
+        let mut cache = CompositeCache::default();
+        let far = aurora_tile::TileId { x: 1, y: 1 };
+        let near = aurora_tile::TileId { x: 0, y: 0 };
+        cache.mark_current(far);
+        cache.mark_current(near);
+
+        // Direction 1: the rect ends exactly where tile (1, 1) begins.
+        // Half-open, so 256 is not one of its own pixels.
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 200,
+                y: 200,
+                width: 56,
+                height: 56,
+            },
+            (0, 0),
+        );
+        assert!(
+            cache.is_current(far),
+            "a rect ending at a tile's first pixel does not touch that tile"
+        );
+
+        // Direction 2: the rect begins exactly where tile (0, 0) ends.
+        // Re-marked first: direction 1's own rect genuinely overlaps
+        // tile (0, 0) (it lives at (200, 200)), so `near` was correctly
+        // invalidated by that call and has to be current again for this
+        // half to be testing anything.
+        cache.mark_current(near);
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 256,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            (0, 0),
+        );
+        assert!(
+            cache.is_current(near),
+            "a rect starting one past a tile's last pixel does not touch that tile"
+        );
+    }
+
+    #[test]
+    fn invalidate_doc_rect_ignores_a_rect_entirely_left_of_the_grid_origin() {
+        // `aurora_tile::TileId`'s own fields are `u32`, so document
+        // territory left of or above the anchor has no `TileId` at all.
+        // The comparison has to survive that without ever constructing a
+        // negative `u32`.
+        let mut cache = CompositeCache::default();
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        cache.mark_current(tile);
+
+        // Anchor at (500, 500): tile (0, 0) is [500, 756). The rect sits
+        // entirely before it, in territory the grid cannot name.
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            (500, 500),
+        );
+        assert!(cache.is_current(tile), "no overlap, so nothing to redo");
+
+        // And with a negative rect origin against a (0, 0) anchor.
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: -1000,
+                y: -1000,
+                width: 500,
+                height: 500,
+            },
+            (0, 0),
+        );
+        assert!(
+            cache.is_current(tile),
+            "a rect wholly in negative territory touches no tile"
+        );
+
+        // Straddling the origin from the left *does* touch tile (0, 0).
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: -1000,
+                y: -1000,
+                width: 1001,
+                height: 1001,
+            },
+            (0, 0),
+        );
+        assert!(
+            !cache.is_current(tile),
+            "a rect reaching one pixel past the origin really does overlap"
+        );
+    }
+
+    #[test]
+    fn invalidate_doc_rect_ignores_a_zero_width_rect() {
+        let mut cache = CompositeCache::default();
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        cache.mark_current(tile);
+
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 100,
+            },
+            (0, 0),
+        );
+        assert!(
+            cache.is_current(tile),
+            "an empty region cannot have changed a texel"
+        );
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 0,
+            },
+            (0, 0),
+        );
+        assert!(cache.is_current(tile), "same for zero height");
+    }
+
+    /// `invalidate_doc_rects` walks the cache **once** and folds every
+    /// rect into the predicate, rather than dispatching one `retain` per
+    /// rect (0.73.3). Getting that fold wrong is easy in a way that
+    /// still looks right on a one-rect input, so this uses three cached
+    /// tiles and two disjoint rects: each rect must claim its own tile,
+    /// and the tile neither touches must survive. An `all` where the
+    /// code needs `any` would clear nothing; a missing negation would
+    /// clear everything.
+    #[test]
+    fn invalidate_doc_rects_removes_the_union_of_every_rect_in_one_pass() {
+        let mut cache = CompositeCache::default();
+        let hit_by_first = aurora_tile::TileId { x: 0, y: 0 };
+        let hit_by_second = aurora_tile::TileId { x: 4, y: 0 };
+        let untouched = aurora_tile::TileId { x: 2, y: 0 };
+        for tile in [hit_by_first, hit_by_second, untouched] {
+            cache.mark_current(tile);
+        }
+
+        // Tile n spans document x in [256n, 256n + 256).
+        cache.invalidate_doc_rects(
+            &[
+                aurora_core::Rect {
+                    x: 10,
+                    y: 10,
+                    width: 20,
+                    height: 20,
+                },
+                aurora_core::Rect {
+                    x: 1030,
+                    y: 10,
+                    width: 20,
+                    height: 20,
+                },
+            ],
+            (0, 0),
+        );
+
+        assert!(
+            !cache.is_current(hit_by_first),
+            "the first rect's own tile must be invalidated"
+        );
+        assert!(
+            !cache.is_current(hit_by_second),
+            "a rect after the first must invalidate its own tile too -- the fold cannot stop \
+             at rect 0"
+        );
+        assert!(
+            cache.is_current(untouched),
+            "a tile no rect touches must survive: this is narrowing, not a bump"
+        );
+    }
+
+    /// An empty region list returns without touching the cache — `any`
+    /// over nothing is `false`, so a `retain` would keep every tile and
+    /// achieve nothing at the cost of a full walk of a cache that grows
+    /// monotonically between bumps.
+    #[test]
+    fn invalidate_doc_rects_with_no_regions_leaves_every_cached_tile_alone() {
+        let mut cache = CompositeCache::default();
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        cache.mark_current(tile);
+
+        cache.invalidate_doc_rects(&[], (0, 0));
+
+        assert!(cache.is_current(tile));
+    }
+
+    /// **The most important test in this round.** Undoing a Move
+    /// re-points every cached `TileId` at a different document window,
+    /// because the composite grid is anchored to the active layer's own
+    /// origin. `History::undo` reports a perfectly correct `old ∪ new`
+    /// rect for that step — and narrowing to it would still be
+    /// comprehensively wrong, leaving every tile the rect misses showing
+    /// content composited under the *old* anchor. `perform_undo_redo`'s
+    /// before/after anchor check is what stops that, and this asserts
+    /// the `CompositeInvalidation` it actually produces rather than
+    /// inferring it from pixels that could agree by coincidence.
+    #[test]
+    fn undoing_a_move_of_the_active_layer_still_invalidates_everything() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+        // Dragged from (300, 150) to the document origin and let go:
+        // one `LayerOp::SetBounds` step on the *active* layer.
+        if let Err(err) = layers.set_bounds(moved, layer_bounds()) {
+            unreachable!("{err:?}");
+        }
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: moved,
+                start_doc: (0.0, 0.0),
+                start_bounds: moved_layer_bounds(),
+                current_bounds: layer_bounds(),
+                refused: false,
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            active_layer,
+            None,
+        );
+        assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
+
+        // Two tiles the undone Move's own `old ∪ new` rect
+        // ((0, 0)..(310, 160)) does *not* cover -- exactly the tiles a
+        // narrowed invalidation would wrongly leave current.
+        let far = [
+            aurora_tile::TileId { x: 4, y: 4 },
+            aurora_tile::TileId { x: 9, y: 2 },
+        ];
+        for tile in far {
+            cache.mark_current(tile);
+        }
+
+        let reported = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            active_layer,
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(
+            layers.bounds(moved),
+            Some(moved_layer_bounds()),
+            "setup: the undo really did move the layer back, so the anchor really did move"
+        );
+        assert_eq!(
+            reported,
+            CompositeInvalidation::Everything,
+            "an undone Move moves the grid anchor itself; the guard must override whatever \
+             narrow region `run_command` reported"
+        );
+        for tile in far {
+            assert!(
+                !cache.is_current(tile),
+                "{tile:?} names a different document window now and must be recomputed"
+            );
+        }
+    }
+
+    /// `aurora-doc` reports `None` for a step whose dirtied region isn't
+    /// knowable from that crate alone — a group has no `bounds` of its
+    /// own, and the subtree-bounds aggregation that would give it one
+    /// doesn't exist anywhere yet. `None` must mean "recomposite
+    /// everything", never "recomposite nothing".
+    #[test]
+    fn undoing_a_group_level_change_with_no_knowable_rect_invalidates_everything() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let base = match history.add_pixel_layer(&mut layers, "base", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut layers, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match history.set_opacity(&mut layers, group, 0.5) {
+            Ok(None) => {}
+            other => unreachable!("a group has no knowable dirty rect, got {other:?}"),
+        }
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+
+        let tile = aurora_tile::TileId { x: 7, y: 7 };
+        cache.mark_current(tile);
+
+        let reported = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            Some(base),
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(reported, CompositeInvalidation::Everything);
+        assert!(!cache.is_current(tile));
+    }
+
+    /// A pixel undo names its tiles in the *layer's* own surface-local
+    /// grid, so translating them into document space needs that layer's
+    /// `bounds`. If the layer is gone, there is no translation — and an
+    /// empty `Regions` would silently invalidate nothing at all, which
+    /// is the one answer that must not come out of here.
+    #[test]
+    fn undoing_a_stroke_whose_layer_was_deleted_invalidates_everything() {
+        let (_dir, mut store) = commit_test_store();
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let layer = match layers.add_pixel_layer("a", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(layer) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            (50.0, 50.0),
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            Some(&mut snapshot),
+        );
+        assert!(!outcome.painted().is_empty(), "setup: the dab must paint");
+        assert!(pixel_history.push(snapshot), "setup");
+        undo_order.undo.push(UndoKind::Pixel);
+
+        // The layer is deleted afterwards; the stroke's own tiles are
+        // still on its surface in the store, so the undo itself
+        // succeeds -- there is simply no layer left to place them
+        // against in document space.
+        if let Err(err) = layers.remove(layer) {
+            unreachable!("{err:?}");
+        }
+
+        let tile = aurora_tile::TileId { x: 6, y: 6 };
+        cache.mark_current(tile);
+
+        let reported = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            None,
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(reported, CompositeInvalidation::Everything);
+        assert!(!cache.is_current(tile));
+    }
+
+    /// The payoff, stated as a test: undoing an ordinary stroke pays for
+    /// the tiles it touched, not for the whole visible grid. This is the
+    /// Ctrl+Z-after-a-stroke case the round is actually for.
+    #[test]
+    fn undoing_a_stroke_invalidates_only_the_composite_tiles_it_touched() {
+        let (_dir, mut store) = commit_test_store();
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let layer = match layers.add_pixel_layer(
+            "a",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 512,
+                height: 512,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(layer) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+        // Well inside layer-local tile (0, 0).
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            (50.0, 50.0),
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            Some(&mut snapshot),
+        );
+        assert_eq!(
+            outcome.painted(),
+            &[aurora_tile::TileId { x: 0, y: 0 }],
+            "setup: this dab must touch exactly one tile"
+        );
+        assert!(pixel_history.push(snapshot), "setup");
+        undo_order.undo.push(UndoKind::Pixel);
+
+        let untouched = [
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+            aurora_tile::TileId { x: 1, y: 1 },
+        ];
+        cache.mark_current(aurora_tile::TileId { x: 0, y: 0 });
+        for tile in untouched {
+            cache.mark_current(tile);
+        }
+
+        let reported = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            Some(layer),
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(
+            reported,
+            CompositeInvalidation::Regions(vec![aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: aurora_tile::TILE,
+                height: aurora_tile::TILE,
+            }]),
+            "the stroke's one layer-local tile, in document space"
+        );
+        assert!(
+            !cache.is_current(aurora_tile::TileId { x: 0, y: 0 }),
+            "the tile the stroke really touched must be recomputed"
+        );
+        for tile in untouched {
+            assert!(
+                cache.is_current(tile),
+                "{tile:?} must survive -- a full bump() would fail this, and that is the \
+                 whole point of the narrowing"
+            );
+        }
+    }
+
+    #[test]
+    fn layer_for_surface_finds_a_nested_layer_and_reports_an_unknown_one() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let group = match layers.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let nested = match layers.add_pixel_layer("nested", layer_bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(nested) else {
+            unreachable!("just created as a pixel layer");
+        };
+        assert_eq!(layer_for_surface(&layers, surface), Some(nested));
+        assert_eq!(
+            layer_for_surface(&layers, composite_surface_id()),
+            None,
+            "the reserved composite surface belongs to no layer"
+        );
+    }
+
     // -- `CompositeCache::invalidate`: the per-tile counterpart to `bump`
     // that `App::paint_dab`/`App::erase_dab` now use instead of a full
     // `bump()` on every dab. `App` itself can't be constructed headlessly
@@ -17740,6 +22530,460 @@ mod tests {
         }
 
         Some((context, dir, store, layers, id, surface, residency, cache))
+    }
+
+    /// The one operation a [`narrowed_invalidation_matches_a_full_bump_pixel_for_pixel`]
+    /// case performs after both worlds are fully composited.
+    #[derive(Clone, Copy, Debug)]
+    enum DiffOp {
+        UndoStrokeOnActive,
+        RedoStrokeOnActive,
+        UndoStrokeOnOther,
+        RedoStrokeOnOther,
+        /// The guard case: the undone step moves the *active* layer, so
+        /// the composite grid's own anchor moves with it.
+        UndoMove,
+        UndoSetOpacity,
+        SwitchToSameOrigin,
+        SwitchToDifferentOrigin,
+    }
+
+    /// Everything one side of the differential test needs. Two of these
+    /// are built identically per case; only how the composite cache is
+    /// invalidated afterwards differs.
+    struct DiffWorld {
+        _dir: tempfile::TempDir,
+        store: aurora_tile::TileStore,
+        layers: aurora_doc::LayerTree,
+        history: aurora_doc::History,
+        pixel_history: aurora_brush::PixelHistory,
+        undo_order: UndoOrder,
+        cache: CompositeCache,
+        workspace: aurora_ui::Workspace,
+        focus: FocusManager,
+        palette: Option<WidgetId>,
+        tool: Tool,
+        view: aurora_ui::CanvasView,
+        drag: Option<Drag>,
+        layer_rows: std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        active: Option<aurora_doc::LayerId>,
+        same: aurora_doc::LayerId,
+        other: aurora_doc::LayerId,
+    }
+
+    /// The differential comparison's own viewport, in physical pixels.
+    /// Wide enough that the visible grid extends well past the region
+    /// any single edit here dirties — which is exactly what makes the
+    /// comparison able to fail. At 256 px tiles this is a 5x5 grid, and
+    /// removing `perform_undo_redo`'s anchor guard makes the `UndoMove`
+    /// case fail on the tiles outside the moved layer's own
+    /// `old ∪ new` rect.
+    const DIFF_VIEWPORT: (u32, u32) = (1024, 1024);
+
+    /// A scratch store with room for the whole differential grid
+    /// resident at once — `real_tile_store`'s own 16-tile budget would
+    /// page constantly across a 5x5 visible grid plus three layers, and
+    /// this test is about invalidation, not eviction.
+    fn diff_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(512) else {
+            unreachable!("512 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+        (dir, store)
+    }
+
+    fn diff_layer_bounds(x: i64, y: i64) -> aurora_core::Rect {
+        aurora_core::Rect {
+            x,
+            y,
+            width: 512,
+            height: 512,
+        }
+    }
+
+    /// The 2x2 layer-local tile grid each differential layer's own
+    /// 512x512 px of content occupies. **Not** the visible grid the
+    /// comparison runs over — that is deliberately much larger (see
+    /// `DIFF_VIEWPORT`), because a grid only as big as the edited region
+    /// cannot tell a narrowed invalidation apart from a full bump: every
+    /// visible tile would be invalidated either way.
+    const DIFF_LAYER_TILES: [aurora_tile::TileId; 4] = [
+        aurora_tile::TileId { x: 0, y: 0 },
+        aurora_tile::TileId { x: 1, y: 0 },
+        aurora_tile::TileId { x: 0, y: 1 },
+        aurora_tile::TileId { x: 1, y: 1 },
+    ];
+
+    /// Paints one whole 2x2 layer-local tile grid of `surface` a solid
+    /// colour, so every layer contributes real, distinguishable content
+    /// to the composite rather than transparency.
+    fn fill_diff_layer(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        rgba: [f32; 4],
+    ) {
+        for tile in DIFF_LAYER_TILES {
+            fill_solid(store, surface, tile, rgba);
+        }
+    }
+
+    /// Builds one side of a differential case, up to and including the
+    /// first full recomposite (so every visible tile is cached and
+    /// current) — deliberately one function called twice rather than two
+    /// call sites, so the two worlds cannot drift apart.
+    // The op-specific setup is one `match` with eight short arms next to
+    // a fixed preamble; splitting it would separate each arm from the
+    // shared state it seeds.
+    #[allow(clippy::too_many_lines)]
+    fn diff_world(context: &GpuTestContext, op: DiffOp) -> (DiffWorld, aurora_gpu::TileResidency) {
+        let (dir, mut store) = diff_tile_store();
+        let mut workspace = aurora_ui::build_workspace();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut view = CanvasView::new();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut drag = None;
+
+        // Bottom to top: an opaque base at the document origin, a
+        // translucent layer sharing that origin, and a translucent one
+        // at a deliberately non-tile-aligned offset (so the composite
+        // really does exercise `read_layer_window`'s re-tiling).
+        let base = match history.add_pixel_layer(&mut layers, "base", diff_layer_bounds(0, 0), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let same = match history.add_pixel_layer(&mut layers, "same", diff_layer_bounds(0, 0), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let other = match history.add_pixel_layer(
+            &mut layers,
+            "other",
+            diff_layer_bounds(300, 150),
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (Some(base_surface), Some(same_surface), Some(other_surface)) = (
+            layers.surface_id(base),
+            layers.surface_id(same),
+            layers.surface_id(other),
+        ) else {
+            unreachable!("all three were just created as pixel layers");
+        };
+        // Alphas below 1.0 on every layer, deliberately: `stamp_dab`
+        // accumulates alpha by *maximum*, so a dab over an
+        // already-opaque texel writes nothing at all and the two
+        // stroke cases would silently be testing an empty edit.
+        fill_diff_layer(&mut store, base_surface, [0.20, 0.40, 0.80, 0.60]);
+        fill_diff_layer(&mut store, same_surface, [0.90, 0.10, 0.10, 0.35]);
+        fill_diff_layer(&mut store, other_surface, [0.10, 0.80, 0.20, 0.50]);
+
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let active = Some(base);
+        let mut cache = CompositeCache::default();
+
+        // Op-specific setup: whatever has to already be on the undo/redo
+        // stacks (and already composited) for the measured operation to
+        // be the thing under test.
+        let record_stroke = |store: &mut aurora_tile::TileStore,
+                             pixel_history: &mut aurora_brush::PixelHistory,
+                             undo_order: &mut UndoOrder,
+                             surface: aurora_tile::SurfaceId| {
+            let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+            let outcome = aurora_brush::stamp_dab(
+                store,
+                surface,
+                (50.0, 50.0),
+                BRUSH_RADIUS,
+                [1.0, 0.9, 0.1],
+                Some(&mut snapshot),
+            );
+            assert!(
+                !outcome.painted().is_empty(),
+                "setup: the dab must really paint: {outcome:?}"
+            );
+            assert!(pixel_history.push(snapshot), "setup");
+            undo_order.undo.push(UndoKind::Pixel);
+        };
+
+        match op {
+            DiffOp::UndoStrokeOnActive | DiffOp::RedoStrokeOnActive => {
+                record_stroke(
+                    &mut store,
+                    &mut pixel_history,
+                    &mut undo_order,
+                    base_surface,
+                );
+            }
+            DiffOp::UndoStrokeOnOther | DiffOp::RedoStrokeOnOther => {
+                record_stroke(
+                    &mut store,
+                    &mut pixel_history,
+                    &mut undo_order,
+                    other_surface,
+                );
+            }
+            DiffOp::UndoMove => {
+                // The active layer, dragged to a non-tile-aligned
+                // offset and let go. Undoing this is what moves the
+                // grid anchor.
+                let moved = diff_layer_bounds(128, 64);
+                if let Err(err) = layers.set_bounds(base, moved) {
+                    unreachable!("{err:?}");
+                }
+                commit_ending_drag(
+                    Some(Drag::Move {
+                        layer_id: base,
+                        start_doc: (0.0, 0.0),
+                        start_bounds: diff_layer_bounds(0, 0),
+                        current_bounds: moved,
+                        refused: false,
+                    }),
+                    &layers,
+                    &mut history,
+                    &mut pixel_history,
+                    &mut undo_order,
+                    &mut view,
+                    active,
+                    None,
+                );
+                assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
+            }
+            DiffOp::UndoSetOpacity => {
+                // On `other`, whose bounds cover only part of the
+                // visible grid -- so the narrowed path really does leave
+                // some cached tiles alone here.
+                match history.set_opacity(&mut layers, other, 0.15) {
+                    Ok(Some(_)) => {}
+                    other => unreachable!("a pixel layer has a knowable rect, got {other:?}"),
+                }
+                undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+            }
+            DiffOp::SwitchToSameOrigin | DiffOp::SwitchToDifferentOrigin => {}
+        }
+
+        // For the two redo cases, the undo they redo happens *here*,
+        // through the same real code path -- so the measured operation
+        // starts from a genuinely undone, genuinely re-composited state.
+        if matches!(op, DiffOp::RedoStrokeOnActive | DiffOp::RedoStrokeOnOther) {
+            let _ = perform_undo_redo(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                &mut tool,
+                &mut layers,
+                &mut history,
+                &mut pixel_history,
+                Some(&mut store),
+                &mut undo_order,
+                &mut cache,
+                &mut view,
+                active,
+                &mut drag,
+                AppCommand::Undo,
+            );
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), DIFF_VIEWPORT);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            active,
+            &mut store,
+            &mut cache,
+            Some(&**context),
+            Some(&mut compositor),
+        );
+        for tile in residency.visible_tiles() {
+            assert!(
+                cache.is_current(tile),
+                "setup: every visible tile must be composited and current before the op"
+            );
+        }
+
+        (
+            DiffWorld {
+                _dir: dir,
+                store,
+                layers,
+                history,
+                pixel_history,
+                undo_order,
+                cache,
+                workspace,
+                focus,
+                palette,
+                tool,
+                view,
+                drag,
+                layer_rows,
+                active,
+                same,
+                other,
+            },
+            residency,
+        )
+    }
+
+    /// Performs `op` on `world` through the real, production code path —
+    /// including that path's own (narrowed) composite invalidation.
+    fn diff_apply(world: &mut DiffWorld, op: DiffOp) {
+        match op {
+            DiffOp::UndoStrokeOnActive
+            | DiffOp::UndoStrokeOnOther
+            | DiffOp::UndoMove
+            | DiffOp::UndoSetOpacity
+            | DiffOp::RedoStrokeOnActive
+            | DiffOp::RedoStrokeOnOther => {
+                let command =
+                    if matches!(op, DiffOp::RedoStrokeOnActive | DiffOp::RedoStrokeOnOther) {
+                        AppCommand::Redo
+                    } else {
+                        AppCommand::Undo
+                    };
+                let _ = perform_undo_redo(
+                    &mut world.workspace,
+                    &mut world.focus,
+                    &mut world.palette,
+                    &mut world.tool,
+                    &mut world.layers,
+                    &mut world.history,
+                    &mut world.pixel_history,
+                    Some(&mut world.store),
+                    &mut world.undo_order,
+                    &mut world.cache,
+                    &mut world.view,
+                    world.active,
+                    &mut world.drag,
+                    command,
+                );
+            }
+            DiffOp::SwitchToSameOrigin | DiffOp::SwitchToDifferentOrigin => {
+                let target = if matches!(op, DiffOp::SwitchToSameOrigin) {
+                    world.same
+                } else {
+                    world.other
+                };
+                press_layer_row(
+                    &mut world.workspace,
+                    &world.layer_rows,
+                    &mut world.active,
+                    &mut world.view,
+                    &world.layers,
+                    &mut world.history,
+                    &mut world.pixel_history,
+                    &mut world.undo_order,
+                    &mut world.cache,
+                    &mut world.drag,
+                    target,
+                );
+                assert_eq!(world.active, Some(target), "the switch must have happened");
+            }
+        }
+    }
+
+    /// **The strong evidence for this round.** For each operation, two
+    /// identical documents are built and fully composited; the same
+    /// operation is applied to both through the real code path; then one
+    /// keeps only the narrowed invalidation that path performed and the
+    /// other additionally gets a full [`CompositeCache::bump`] — the
+    /// old, unconditional behaviour, which by construction recomputes
+    /// everything and so is the reference answer. Both are recomposited
+    /// and every visible tile is compared texel for texel.
+    ///
+    /// A narrowing that misses a tile shows up as that tile keeping its
+    /// pre-operation content in the narrowed world while the bumped
+    /// world recomputes it — which is exactly the "thin stale seam" or
+    /// "everything is stale at the old anchor" failure this is for.
+    /// `DiffOp::UndoMove` is the case that fails without
+    /// `perform_undo_redo`'s anchor guard.
+    #[test]
+    fn narrowed_invalidation_matches_a_full_bump_pixel_for_pixel() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+
+        for op in [
+            DiffOp::UndoStrokeOnActive,
+            DiffOp::RedoStrokeOnActive,
+            DiffOp::UndoStrokeOnOther,
+            DiffOp::RedoStrokeOnOther,
+            DiffOp::UndoMove,
+            DiffOp::UndoSetOpacity,
+            DiffOp::SwitchToSameOrigin,
+            DiffOp::SwitchToDifferentOrigin,
+        ] {
+            let (mut narrowed, narrowed_residency) = diff_world(&context, op);
+            let (mut bumped, bumped_residency) = diff_world(&context, op);
+
+            diff_apply(&mut narrowed, op);
+            diff_apply(&mut bumped, op);
+            // The reference world throws its whole cache away, which is
+            // what `after_undo_redo`/`press_layer_row` used to do
+            // unconditionally.
+            bumped.cache.bump();
+
+            for (world, residency) in [
+                (&mut narrowed, &narrowed_residency),
+                (&mut bumped, &bumped_residency),
+            ] {
+                let mut compositor = aurora_render::TileCompositor::new(context.device());
+                recomposite_visible_tiles(
+                    residency,
+                    &world.layers,
+                    world.active,
+                    &mut world.store,
+                    &mut world.cache,
+                    Some(&*context),
+                    Some(&mut compositor),
+                );
+            }
+
+            for tile in narrowed_residency.visible_tiles() {
+                let (Ok(a), Ok(b)) = (
+                    narrowed.store.get(composite_surface_id(), tile),
+                    bumped.store.get(composite_surface_id(), tile),
+                ) else {
+                    unreachable!("both composites were just written");
+                };
+                assert_eq!(
+                    a.texels(),
+                    b.texels(),
+                    "{op:?}: composite tile {tile:?} differs between the narrowed \
+                     invalidation and a full bump -- the narrowing left stale content"
+                );
+            }
+        }
     }
 
     #[test]
@@ -18221,6 +23465,112 @@ mod tests {
         assert_eq!(gpu_result, (0.375, 0.375, 0.25, 1.0));
     }
 
+    /// `begin_gpu_composite_tile` builds its shared destination texture
+    /// lazily now, on the first root layer that actually resolves at
+    /// this tile (0.69.0) — before, it collected every root's own
+    /// `Vec<half::f16>` into memory first, so which root happened to
+    /// resolve first never mattered structurally. This is the specific
+    /// case the streaming rewrite must get right: the *bottom* root has
+    /// no content at this tile at all (never filled, so `resolve_tile`
+    /// returns `None` and the loop `continue`s past it), so the
+    /// destination texture is only created on the *middle* root, the
+    /// first one that actually has something to composite — not on the
+    /// first root in iteration order. A bug that created the
+    /// destination unconditionally on the first iteration (or that
+    /// mishandled the lazily-created reference across further
+    /// iterations) would either panic, composite the wrong first layer,
+    /// or disagree with the CPU path, which this test would catch via
+    /// the exact-equality assertion below.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_skips_an_early_root_with_no_content_at_this_tile() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        // `bottom` is added and left completely unfilled -- it has no
+        // tile at all for this position, so `resolve_tile` returns
+        // `None` for it and the streaming loop must skip it without
+        // creating the destination texture yet.
+        let _bottom = match layers.add_pixel_layer("bottom", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let middle = match layers.add_pixel_layer("middle", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match layers.add_pixel_layer("top", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_opacity(top, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (id, rgba) in [(middle, [0.0, 1.0, 0.0, 1.0]), (top, [0.0, 0.0, 1.0, 1.0])] {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "three Normal-blend, non-grouped pixel layers must qualify for the GPU path"
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        assert_eq!(
+            gpu_result, cpu_result,
+            "the GPU path and the CPU path must agree even when an early root layer has no \
+             content at this tile"
+        );
+
+        // Hand-computed, bottom to top: the unfilled bottom root
+        // contributes nothing (as if it weren't there); middle (opaque
+        // green, opacity 1.0) over transparent black reproduces the
+        // source exactly, then top (opaque blue, opacity 0.5) blends
+        // over it: as = 1.0*0.5 = 0.5,
+        //   r = 0.5*0.0 + 0.5*0.0 = 0.0, g = 0.5*1.0 + 0.5*0.0 = 0.5,
+        //   b = 0.5*0.0 + 0.5*1.0 = 0.5, a = 0.5 + 1.0*0.5 = 1.0.
+        assert_eq!(gpu_result, (0.0, 0.5, 0.5, 1.0));
+    }
+
     /// AC-2's own regression test: the same fixture as
     /// `composite_document_un_premultiplies_a_translucent_root_level_layer`
     /// (one opaque-white root-level pixel layer at layer opacity 0.5,
@@ -18424,6 +23774,155 @@ mod tests {
                 result,
                 (0.75, 0.0, 0.0, 0.75),
                 "{path} path: the premultiplied value both paths produced before 0.52.0"
+            );
+        }
+    }
+
+    /// **The measurement that makes `perform_undo_redo`'s
+    /// compositing-path guard load-bearing rather than optional**
+    /// (0.73.2). Read this before assuming the GPU and CPU composite
+    /// paths are interchangeable.
+    ///
+    /// Its two sibling tests above both prove GPU/CPU agreement on
+    /// values chosen to make agreement *easy*: every input and
+    /// intermediate (1.0, 0.5, 0.25, 0.75) is an exact power-of-two
+    /// binary fraction, so no rounding latitude is even in play. That is
+    /// the right choice for what those tests are for, and it means
+    /// neither of them probes whether the two paths agree at values a
+    /// real document would produce.
+    ///
+    /// This one does: three root-level `Normal`-blend pixel layers at
+    /// opacities 0.3, 0.7 and 0.35, filled with colours (0.1, 0.37,
+    /// 0.82) and friends that are *not* exactly representable in binary
+    /// at any precision, so the `f16` storage round trip, the `f32`
+    /// fold, and the straight-alpha division all carry real rounding.
+    ///
+    /// # Measured: they do not agree bit-for-bit
+    ///
+    /// On a real NVIDIA `GeForce` RTX 3090 (Vulkan, `DiscreteGpu`,
+    /// 2026-09-02) this fixture composites to
+    ///
+    /// ```text
+    /// GPU: (0.34179688, 0.50146484, 0.31762695, 0.62011720)
+    /// CPU: (0.34155273, 0.50097656, 0.31762695, 0.62060547)
+    /// ```
+    ///
+    /// — differing on three of four channels by exactly one `f16` ULP at
+    /// *each channel's own* magnitude, not one shared number: 2^-12
+    /// (≈2.44e-4) for red, which sits in `[0.25, 0.5)`; 2^-11 (≈4.88e-4)
+    /// for green and alpha, in `[0.5, 1)`; blue does not differ at all.
+    /// Vulkan permits an `f32` multiply-add about 2.5 ULP of latitude
+    /// and the two paths fold in different orders and precisions, so
+    /// this is expected behaviour, not a defect in either path. It is
+    /// asserted as a **tolerance** for that reason — `2 * f16::EPSILON`
+    /// (2^-9), which is 4 ULP at green/alpha's own magnitude and 8 ULP
+    /// at red's (`f16::EPSILON` is the ULP at 1.0, not at these smaller
+    /// values, so the tolerance is looser than "2 ULP" in the sense that
+    /// matters here) — still tight enough that a real divergence fails,
+    /// loose enough to accept the measured one-ULP-at-its-own-magnitude
+    /// rounding.
+    ///
+    /// The consequence is the point: **switching a document between the
+    /// two paths changes pixels.** So an undoable step that flips
+    /// `document_qualifies_for_gpu_compositing` really does dirty every
+    /// visible tile, a fact no per-layer `Rect` can express — which is
+    /// why `perform_undo_redo` forces `CompositeInvalidation::Everything`
+    /// on such a flip instead of narrowing. The earlier reading, that a
+    /// flip was harmless because the paths happened to agree, is
+    /// contradicted by the numbers above.
+    ///
+    /// No hand-computed expected value here: the two sibling tests
+    /// already pin absolute correctness against arithmetic worked out by
+    /// hand, and this one exists for the *differential* question.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_opacity_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (name, opacity, rgba) in [
+            ("bottom", 0.3_f32, [0.1_f32, 0.37, 0.82, 0.9]),
+            ("middle", 0.7, [0.63, 0.11, 0.29, 0.44]),
+            ("top", 0.35, [0.21, 0.94, 0.06, 0.71]),
+        ] {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "three Normal-blend, non-grouped pixel layers must qualify for the GPU path -- \
+             otherwise this test would compare the CPU path against itself"
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        assert_ne!(
+            gpu_result,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: the fixture must really composite to something"
+        );
+        // `2 * f16::EPSILON` -- looser than "2 ULP" sounds, since
+        // `EPSILON` is the ULP at 1.0, not at these channels' own
+        // smaller magnitudes: this is 4 ULP at green/alpha's bracket and
+        // 8 ULP at red's. Still tight enough that a real divergence (a
+        // wrong blend, a wrong layer order, a premultiply that never got
+        // undone) fails, loose enough to accept the one-ULP-at-its-own-
+        // magnitude rounding measured on real hardware -- see this
+        // test's own doc comment for the exact numbers.
+        let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the GPU and CPU paths diverged by more than {tolerance} \
+                 at arbitrary opacities ({gpu} vs {cpu}) -- that is a real finding to report, \
+                 not a reason to loosen this assertion. Full texels: {gpu_result:?} vs \
+                 {cpu_result:?}"
             );
         }
     }
@@ -19261,7 +24760,15 @@ mod tests {
         let path = dir.path().join("aurora-autosave.aur");
         let (layers, history, id) = small_autosave_document();
         let _painted = paint_one_texel(&mut store, &layers, id);
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         let full_len = match std::fs::metadata(&path) {
             Ok(meta) => meta.len(),
@@ -19330,7 +24837,15 @@ mod tests {
         // Autosave #1, with every tile readable: complete, and it lands
         // on the canonical path.
         let path = dir.path().join("aurora-autosave.aur");
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
         let Ok(complete) = std::fs::read(&path) else {
             unreachable!("the complete autosave must have been written");
         };
@@ -19345,7 +24860,11 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(scratch.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
         assert!(
             !files.is_empty(),
             "at least one tile should have been evicted"
@@ -19369,7 +24888,15 @@ mod tests {
         }
 
         // Autosave #2, degraded.
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         let Ok(after) = std::fs::read(&path) else {
             unreachable!("the complete autosave must still be there");
@@ -19384,7 +24911,10 @@ mod tests {
         );
         // And recovery still prefers the complete snapshot.
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let Some((recovered, ..)) = recover_document(&path, &mut fresh_store) else {
+        let Some(RecoveredDocument {
+            layers: recovered, ..
+        }) = recover_document(&path, &mut fresh_store)
+        else {
             unreachable!("the complete autosave must reopen");
         };
         assert_eq!(recovered.len(), 2);
@@ -19405,6 +24935,10 @@ mod tests {
     /// truncating the file it landed in leaves a tile whose every
     /// subsequent read fails.
     #[test]
+    // Setup-dominated: building a real broken-scratch-disk scenario on
+    // a real disk is most of these lines, and the assertions are the
+    // point. Split further and each half stops being a scenario.
+    #[allow(clippy::too_many_lines)]
     fn write_autosave_still_protects_the_rest_of_the_document_when_one_tile_is_unreadable() {
         let dir = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -19446,7 +24980,11 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(scratch.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
         let [victim] = files.as_slice() else {
             unreachable!("exactly one tile should have been evicted: {files:?}");
         };
@@ -19461,7 +24999,15 @@ mod tests {
         }
 
         let path = dir.path().join("aurora-autosave.aur");
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         // Nothing complete was ever written here, so the salvaged
         // snapshot is all there is -- and it lands on the *partial* path,
@@ -19475,7 +25021,11 @@ mod tests {
             "one unreadable tile must not leave the document with no autosave at all"
         );
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let Some((recovered_layers, ..)) = recover_document(&path, &mut fresh_store) else {
+        let Some(RecoveredDocument {
+            layers: recovered_layers,
+            ..
+        }) = recover_document(&path, &mut fresh_store)
+        else {
             unreachable!("the salvaged autosave must reopen from the partial path");
         };
         assert_eq!(recovered_layers.len(), 2, "no layer was dropped");
@@ -19523,7 +25073,15 @@ mod tests {
         let (layers, history, id) = small_autosave_document();
         let _painted = paint_one_texel(&mut store, &layers, id);
 
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
@@ -19603,15 +25161,26 @@ mod tests {
             // A canvas size deliberately unequal to the layer's own
             // 10x10 bounds, so this proves the manifest's own value came
             // back rather than `document_canvas_size` re-deriving it.
-            write_autosave(&path, &layers, &history, (37, 21), &mut store);
+            write_autosave(
+                &path,
+                &layers,
+                &history,
+                (37, 21),
+                &mut aurora_io::SkippedTiles::new(),
+                &mut store,
+            );
             painted
         };
         drop(layers);
         drop(history);
 
         let (_fresh_dir, mut fresh_store) = real_tile_store();
-        let Some((recovered_layers, recovered_history, canvas_size)) =
-            recover_document(&path, &mut fresh_store)
+        let Some(RecoveredDocument {
+            layers: recovered_layers,
+            history: recovered_history,
+            canvas_size,
+            ..
+        }) = recover_document(&path, &mut fresh_store)
         else {
             unreachable!("just wrote a real autosave container");
         };
@@ -19659,8 +25228,24 @@ mod tests {
         let (_store_dir, mut store) = real_tile_store();
         let (layers, history, id) = small_autosave_document();
         let _painted = paint_one_texel(&mut store, &layers, id);
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
 
         let leftovers: Vec<String> = match std::fs::read_dir(dir.path()) {
             Ok(entries) => entries
@@ -19698,7 +25283,15 @@ mod tests {
         let path = dir.path().join("aurora-autosave.aur");
         let (_store_dir, mut store) = real_tile_store();
         let (layers, history, _id) = small_autosave_document();
-        write_autosave(&path, &layers, &history, (10, 10), &mut store);
+        let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
+        write_autosave(
+            &path,
+            &layers,
+            &history,
+            (10, 10),
+            &mut nothing_lost_yet,
+            &mut store,
+        );
         let mode = match std::fs::metadata(&path) {
             Ok(meta) => meta.permissions().mode() & 0o777,
             Err(err) => unreachable!("{err}"),
@@ -19723,7 +25316,14 @@ mod tests {
         {
             let (_store_dir, mut store) = real_tile_store();
             let _painted = paint_one_texel(&mut store, &layers, id);
-            write_autosave(&path, &layers, &history, (37, 21), &mut store);
+            write_autosave(
+                &path,
+                &layers,
+                &history,
+                (37, 21),
+                &mut aurora_io::SkippedTiles::new(),
+                &mut store,
+            );
         }
         // A good partial snapshot beside a canonical file that is then
         // corrupted -- a half-written ZIP, the realistic shape.
@@ -19776,7 +25376,14 @@ mod tests {
         {
             let (_store_dir, mut store) = real_tile_store();
             let _painted = paint_one_texel(&mut store, &layers, id);
-            write_autosave(&path, &layers, &history, (10, 10), &mut store);
+            write_autosave(
+                &path,
+                &layers,
+                &history,
+                (10, 10),
+                &mut aurora_io::SkippedTiles::new(),
+                &mut store,
+            );
         }
         let before = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -20174,12 +25781,939 @@ mod tests {
         ));
     }
 
+    /// The whole point of 0.74.0, exercised end to end on a real file
+    /// on a real disk: a best-effort autosave writes a container with
+    /// one tile it could not read, a **fresh** tile store (what a new
+    /// process has) reads it back, and the reopened document still
+    /// names the loss -- which is the condition `App::open_aur_file`'s
+    /// own wiring line branches on.
+    ///
+    /// **What this does and does not cover, plainly.** It covers the
+    /// read that `open_aur_file` performs, the condition it tests, and
+    /// the dialog it opens -- the last through the same `open_dialog`
+    /// helper `App::open_skipped_tiles_dialog` calls, which is the same
+    /// split (and the same reason) as
+    /// `the_export_refused_dialog_opens_through_the_shared_helper`
+    /// above: constructing a real `App` needs a window, a GPU device
+    /// and an event-loop proxy, none of which exist in a headless test.
+    /// The three lines of `self.` plumbing between them are covered by
+    /// inspection only.
     #[test]
-    fn close_crash_recovery_dialog_on_an_already_closed_dialog_is_a_no_op() {
+    // Setup-dominated: building a real broken-scratch-disk scenario on
+    // a real disk is most of these lines, and the assertions are the
+    // point. Split further and each half stops being a scenario.
+    #[allow(clippy::too_many_lines)]
+    fn open_aur_file_warns_when_the_file_was_written_with_tiles_missing() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // One resident tile at a time, so the second layer's first touch
+        // evicts the first layer's tile to the scratch disk.
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = aurora_doc::LayerTree::new();
+        let history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (name, rgba) in [
+            ("broken", [1.0, 0.0, 0.0, 1.0]),
+            ("intact", [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_tile(dir.path());
+
+        let path = dir.path().join("partial.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let skipped = match aurora_io::write_aur_best_effort(
+            file,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(skipped) => skipped,
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        };
+        assert_eq!(skipped.len(), 1, "exactly one tile was unreadable");
+
+        // From here on, exactly what `App::open_aur_file` does: open the
+        // path, read it into a store this process has not painted into,
+        // and look at what the file says was left out.
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let reopened = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let document = match aurora_io::read_aur(reopened, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("the partial container must still open: {err:?}"),
+        };
+        let Some(first) = document.skipped_tiles.first() else {
+            unreachable!(
+                "a file written with a tile missing must say so on reopen, got {:?}",
+                document.skipped_tiles
+            );
+        };
+        assert!(
+            first.reason.contains("corrupt tile file"),
+            "the persisted reason must be the real underlying tile error: {}",
+            first.reason
+        );
+
+        // The decision itself, through the very function
+        // `App::open_aur_file` calls -- not a hand-rolled copy of its
+        // condition, which is what this test did until 0.74.1 and which
+        // would have passed unchanged with that wiring deleted.
+        let Some(message) = skipped_tiles_warning(&document.skipped_tiles) else {
+            unreachable!("a file that lost a tile must produce a warning");
+        };
+        assert!(
+            !message.contains("crash-recovery autosave"),
+            "the message must not claim a provenance the file cannot prove: {message}"
+        );
+        assert!(
+            message.contains("1 tile of image data"),
+            "one lost pixel-layer tile, counted and named exactly: {message}"
+        );
+        assert!(
+            !message.contains("at least"),
+            "an untruncated count is a fact, not a floor: {message}"
+        );
+
+        // And the dialog that decision opens really opens, through the
+        // same shared helper `App::open_skipped_tiles_dialog` uses.
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
-        close_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog);
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert!(open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "This Document Is Missing Content",
+            &message,
+            skipped_tiles_dialog_actions(),
+        ));
+        assert!(dialog.is_some(), "the missing-content dialog must be open");
+    }
+
+    /// The negative case on the same decision: a healthy document saved
+    /// by the ordinary `write_aur` reopens with an empty skip list, and
+    /// `skipped_tiles_warning` — the function `App::open_aur_file`
+    /// really calls — answers `None`, so no dialog interrupts an
+    /// ordinary open.
+    ///
+    /// Renamed from `open_aur_file_opens_no_dialog_for_a_complete_file`
+    /// in 0.74.1, which promised a dialog assertion it never made (it
+    /// only checked that the reopened list was empty, duplicating
+    /// `aurora-io`'s own `an_ordinary_write_carries_no_skipped_tiles_
+    /// entry`). It now asserts the real decision instead of restating
+    /// the input to it.
+    #[test]
+    fn a_complete_file_produces_no_missing_content_warning() {
+        let (dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("only", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        let path = dir.path().join("whole.aur");
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = aurora_io::write_aur(
+            file,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("a healthy document must save: {err:?}");
+        }
+
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let reopened = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let document = match aurora_io::read_aur(reopened, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            document.skipped_tiles.is_empty(),
+            "an ordinary save lost nothing: {:?}",
+            document.skipped_tiles
+        );
+        assert!(
+            skipped_tiles_warning(&document.skipped_tiles).is_none(),
+            "nothing was lost, so `App::open_aur_file` must open no dialog"
+        );
+    }
+
+    /// The count a user is shown must never be the *capped* count
+    /// presented as a fact — the defect a red-team measurement found
+    /// with a real 17,920 x 15,872 px layer, whose 4339 lost tiles were
+    /// persisted as 4096 and then reported as "4096 tiles ... could not
+    /// be read" with no qualifier.
+    #[test]
+    fn a_truncated_skip_list_is_reported_as_a_floor_not_a_fact() {
+        let records = vec![aurora_io::SkippedTileRecord {
+            surface: 1,
+            tile_x: 0,
+            tile_y: 0,
+            reason: "corrupt tile file".to_owned(),
+        }];
+        let truncated = aurora_io::SkippedTiles::from_parts(4339, records);
+        let Some(message) = skipped_tiles_warning(&truncated) else {
+            unreachable!("4339 lost tiles must warn");
+        };
+        assert!(
+            message.contains("at least 4339 tiles"),
+            "a count larger than the records backing it is a floor: {message}"
+        );
+    }
+
+    /// A lost *mask coverage* tile and a lost pixel-layer tile are
+    /// different losses to a user, and the record has carried the
+    /// distinction (`aurora_doc::MASK_SURFACE_BIT`) since 0.74.0 -- it
+    /// was simply thrown away by everything that read it back.
+    #[test]
+    fn the_message_distinguishes_lost_mask_coverage_from_lost_image_data() {
+        let mask_only = aurora_io::SkippedTiles::from_parts(
+            1,
+            vec![aurora_io::SkippedTileRecord {
+                surface: aurora_doc::MASK_SURFACE_BIT | 3,
+                tile_x: 0,
+                tile_y: 0,
+                reason: "corrupt tile file".to_owned(),
+            }],
+        );
+        let Some(message) = skipped_tiles_warning(&mask_only) else {
+            unreachable!("a lost mask tile must warn");
+        };
+        assert!(
+            message.contains("mask coverage") && !message.contains("image data"),
+            "a lost mask tile must not be described as image data: {message}"
+        );
+
+        let both = aurora_io::SkippedTiles::from_parts(
+            2,
+            vec![
+                aurora_io::SkippedTileRecord {
+                    surface: aurora_doc::MASK_SURFACE_BIT | 3,
+                    tile_x: 0,
+                    tile_y: 0,
+                    reason: "corrupt tile file".to_owned(),
+                },
+                aurora_io::SkippedTileRecord {
+                    surface: 3,
+                    tile_x: 1,
+                    tile_y: 0,
+                    reason: "corrupt tile file".to_owned(),
+                },
+            ],
+        );
+        let Some(message) = skipped_tiles_warning(&both) else {
+            unreachable!("two lost tiles must warn");
+        };
+        assert!(
+            message.contains("image data and mask coverage"),
+            "a mixed loss must name both: {message}"
+        );
+    }
+
+    /// **The carry-forward, at the app layer**: a document opened from a
+    /// lossy `.aur` file must keep saying so in every file this session
+    /// writes next.
+    ///
+    /// This is red-team's own sequence, minus the `App` that a headless
+    /// test cannot build: a best-effort write drops a tile, the file is
+    /// reopened into a **fresh** store (what a new process has), and the
+    /// carried record is handed to `write_autosave` exactly as
+    /// `App::open_aur_file` hands `App::skipped_tiles` to it. The
+    /// autosave that write produces must still name the loss.
+    ///
+    /// Before 0.74.1 it did not, and could not: the dropped tile is not
+    /// in the store at all, so the writer walked past it as "never
+    /// painted" and produced a container with no `skipped-tiles` entry
+    /// — after which one ordinary Save, or one crash, erased the record
+    /// entirely. Note the autosave lands on the *primary* path, not
+    /// `.partial`: this write itself dropped nothing.
+    #[test]
+    // Setup-dominated: building a real broken-scratch-disk scenario on
+    // a real disk is most of these lines, and the assertions are the
+    // point. Split further and each half stops being a scenario.
+    #[allow(clippy::too_many_lines)]
+    fn an_opened_documents_missing_tiles_survive_the_next_autosave() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = aurora_doc::LayerTree::new();
+        let history = aurora_doc::History::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (name, rgba) in [
+            ("broken", [1.0, 0.0, 0.0, 1.0]),
+            ("intact", [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_tile(dir.path());
+
+        let lossy_path = dir.path().join("lossy.aur");
+        let file = match std::fs::File::create(&lossy_path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match aurora_io::write_aur_best_effort(
+            file,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &aurora_io::SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(fresh) => assert_eq!(fresh.len(), 1, "exactly one tile was unreadable"),
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        }
+
+        // Reopened into a store that has never held any of this -- a new
+        // process, in every way that matters here.
+        let (fresh_dir, mut fresh_store) = real_tile_store();
+        let reopened = match std::fs::File::open(&lossy_path) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let document = match aurora_io::read_aur(reopened, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("the lossy container must reopen: {err:?}"),
+        };
+        let mut carried = document.skipped_tiles;
+        assert!(!carried.is_empty(), "the reopened file must name its loss");
+
+        let autosave = fresh_dir.path().join("aurora-autosave.aur");
+        write_autosave(
+            &autosave,
+            &document.layers,
+            &document.history,
+            document.canvas_size,
+            &mut carried,
+            &mut fresh_store,
+        );
+        assert!(
+            autosave.exists(),
+            "this write dropped nothing of its own, so it belongs on the primary path"
+        );
+        assert!(
+            !partial_autosave_path(&autosave).exists(),
+            "a carried-forward loss must not route every later autosave to .partial"
+        );
+
+        let (_third_dir, mut third_store) = real_tile_store();
+        let saved = match std::fs::File::open(&autosave) {
+            Ok(file) => file,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let after = match aurora_io::read_aur(saved, &mut third_store) {
+            Ok(after) => after,
+            Err(err) => unreachable!("the autosave must reopen: {err:?}"),
+        };
+        assert_eq!(
+            after.skipped_tiles.total(),
+            1,
+            "the record must survive the save, not be erased by it: {:?}",
+            after.skipped_tiles
+        );
+        assert!(
+            skipped_tiles_warning(&after.skipped_tiles).is_some(),
+            "and it must still warn on the next open"
+        );
+    }
+
+    /// The skip reason comes out of a file, and this message heads for a
+    /// rendered label and an `accesskit` announcement -- the same
+    /// untrusted-text path `a_hostile_layer_name_reaches_the_label...`
+    /// in `aurora_ui::layers_panel` covers for layer names, and it gets
+    /// the same `aurora_doc::sanitize_display_name` treatment here.
+    #[test]
+    fn skipped_tiles_message_sanitizes_a_hostile_reason() {
+        let hostile = format!(
+            "boom{}nrut{}{}{}",
+            '\u{202E}',                                     // bidi override
+            '\u{0007}',                                     // BEL
+            '\u{2028}',                                     // line separator
+            char::from_u32(0xE_0041).unwrap_or('\u{FFFD}'), // Tag 'A'
+        );
+        let message = skipped_tiles_message(&aurora_io::SkippedTiles::from_parts(
+            1,
+            vec![aurora_io::SkippedTileRecord {
+                surface: 0,
+                tile_x: 0,
+                tile_y: 0,
+                reason: hostile.clone(),
+            }],
+        ));
+        for hostile_char in ['\u{202E}', '\u{0007}', '\u{2028}'] {
+            assert!(
+                !message.contains(hostile_char),
+                "{hostile_char:?} must not survive into a rendered label: {message:?}"
+            );
+        }
+        assert!(
+            message.contains("boom"),
+            "the readable part of the reason must survive: {message}"
+        );
+        // The count and the "it is already gone" fact, the two things
+        // this message exists to carry.
+        assert!(message.contains('1'), "{message}");
+        assert!(
+            message.contains("cannot be recovered"),
+            "the user must be told a reopen will not bring the content back: {message}"
+        );
+    }
+
+    /// Truncates the one `*.tile` file under `dir` to half its length,
+    /// leaving a well-formed-but-short ATIL file that
+    /// `aurora_tile::codec::decode` rejects on every read -- the same
+    /// recipe `composite_document_refuses_to_export_when_a_layer_tile_
+    /// cannot_be_read` uses, and `aurora_io::aur`'s own tests too.
+    fn break_the_only_scratch_tile(dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
+        let [victim] = files.as_slice() else {
+            unreachable!("exactly one tile should have been evicted: {files:?}");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+    }
+
+    #[test]
+    fn incomplete_composite_message_names_the_count_and_the_first_failure() {
+        let message = incomplete_composite_message(3, "tile (2, 7): checksum mismatch");
+        assert!(message.contains('3'), "{message}");
+        assert!(
+            message.contains("tile (2, 7): checksum mismatch"),
+            "the first failure's own detail must survive verbatim: {message}"
+        );
+        assert!(
+            message.contains("Nothing was written"),
+            "the user's first question is whether their file was touched: {message}"
+        );
+    }
+
+    #[test]
+    fn incomplete_composite_message_agrees_with_itself_about_plurality() {
+        let one = incomplete_composite_message(1, "boom");
+        assert!(one.contains("1 layer tile read failed"), "{one}");
+        let many = incomplete_composite_message(2, "boom");
+        assert!(many.contains("2 layer tile reads failed"), "{many}");
+    }
+
+    /// The export-refusal dialog goes through exactly the same
+    /// [`open_dialog`] mechanism crash recovery does — this asserts the
+    /// generic helper, since `App::save_file`'s own wiring line needs a
+    /// real window/GPU/tile store to reach and is covered by inspection
+    /// (see that method's own doc comment).
+    #[test]
+    fn open_dialog_focuses_its_first_action() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+
+        let Some(handle) = dialog else {
+            unreachable!("must open");
+        };
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .map(accesskit::Node::role),
+            Some(accesskit::Role::AlertDialog)
+        );
+        assert_eq!(focus.focused(), handle.first_action());
+        let Some((id, _)) = handle.actions.first() else {
+            unreachable!("the export-refused dialog always has one action");
+        };
+        assert_eq!(id, EXPORT_REFUSED_DISMISS);
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.message)
+                .and_then(accesskit::Node::label),
+            Some(incomplete_composite_message(1, "boom").as_str())
+        );
+    }
+
+    #[test]
+    fn open_dialog_a_second_time_is_a_no_op_even_for_a_different_dialog() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+        let first = dialog.clone();
+        // A *different* dialog, to pin that the guard is about the slot
+        // being occupied at all -- not about opening the same one twice.
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        assert_eq!(
+            dialog, first,
+            "a dialog already on screen must not be replaced under the user"
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_export_refused_dialog_through_the_same_routing() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
+        );
+
+        assert_eq!(dialog, None);
+        assert!(!workspace.tree.contains(handle.root));
+        assert_eq!(focus.focused(), None);
+    }
+
+    #[test]
+    fn enter_on_the_export_refused_dialogs_action_closes_it() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Enter)),
+        );
+
+        assert_eq!(dialog, None);
+    }
+
+    /// A `Drag::Move` positioned wherever — the fields
+    /// [`move_refusal_unreported`] does not look at are irrelevant to it
+    /// by construction, so they get placeholder values here.
+    fn move_drag() -> Drag {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        Drag::Move {
+            layer_id: aurora_core::Id::from_raw(0),
+            start_doc: (0.0, 0.0),
+            start_bounds: bounds,
+            current_bounds: bounds,
+            refused: false,
+        }
+    }
+
+    #[test]
+    fn move_refusal_is_reported_once_per_drag_and_again_for_a_fresh_one() {
+        // The shape of a drag held past the document's own coordinate
+        // range: `set_bounds` refuses on every pointer-move event for the
+        // rest of the gesture, and the user must be told exactly once.
+        // Asking and marking are two calls since 0.68.2 -- `apply_move`
+        // marks only once a dialog has genuinely opened -- so this test
+        // performs the pair the way the real call site does.
+        let mut drag = Some(move_drag());
+        assert!(
+            move_refusal_unreported(drag.as_ref()),
+            "the first refusal in a drag must be reported"
+        );
+        mark_move_refusal_reported(&mut drag);
+        for _ in 0..10 {
+            assert!(
+                !move_refusal_unreported(drag.as_ref()),
+                "a drag still out of range must not re-report on every event"
+            );
+        }
+
+        // A *new* drag starts from a clean slate -- the flag lives on the
+        // drag, so it cannot outlive the gesture it belongs to.
+        let next = Some(move_drag());
+        assert!(
+            move_refusal_unreported(next.as_ref()),
+            "a new drag must report again rather than inheriting a stale flag"
+        );
+    }
+
+    /// The 0.68.2 regression: asking must not itself latch, or a refusal
+    /// whose dialog never opened is marked reported anyway and the user
+    /// is shown nothing for the rest of the gesture.
+    #[test]
+    fn asking_whether_a_move_refusal_needs_reporting_does_not_mark_it_reported() {
+        let drag = Some(move_drag());
+        for _ in 0..10 {
+            assert!(
+                move_refusal_unreported(drag.as_ref()),
+                "an unanswered refusal must stay unreported however often it is asked about"
+            );
+        }
+    }
+
+    #[test]
+    fn move_refusal_is_reported_when_the_live_drag_is_not_a_move() {
+        // Unreachable in practice (only `App::apply_move` calls this, and
+        // only while a `Drag::Move` is live), but under-reporting a
+        // refusal the user cannot otherwise see is the wrong way to be
+        // wrong about it -- the same stance `unwarned_failures` takes.
+        // Marking one is correspondingly a no-op rather than a panic.
+        let mut none = None;
+        assert!(move_refusal_unreported(none.as_ref()));
+        mark_move_refusal_reported(&mut none);
+        assert!(move_refusal_unreported(none.as_ref()));
+        let mut pan = Some(Drag::Pan {
+            last_screen: (0.0, 0.0),
+        });
+        assert!(move_refusal_unreported(pan.as_ref()));
+        mark_move_refusal_reported(&mut pan);
+        assert!(move_refusal_unreported(pan.as_ref()));
+        let eyedropper = Some(Drag::Eyedropper);
+        assert!(move_refusal_unreported(eyedropper.as_ref()));
+    }
+
+    /// **RT-02, as a test.** `App::apply_move`'s exact sequence, replayed
+    /// against the real `open_dialog` with another dialog (crash
+    /// recovery) already occupying the one modal slot.
+    ///
+    /// Before 0.68.2 the refusal was latched on the drag regardless of
+    /// whether anything opened, so the user was shown nothing *and* the
+    /// refusal was never offered again for the rest of the gesture — even
+    /// after the blocking dialog was dismissed. Now the latch follows the
+    /// open, so the refusal survives to be shown once the slot frees.
+    ///
+    /// An `App` cannot be constructed here (window, GPU adapter, live
+    /// tile store), so this drives the same free functions `apply_move`
+    /// drives, in the same order, rather than the method itself.
+    #[test]
+    fn a_move_refusal_suppressed_by_another_dialog_is_not_latched_as_reported() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        // Something else got there first -- crash recovery at startup is
+        // the realistic one.
+        assert!(open_crash_recovery_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            false
+        ));
+
+        let mut drag = Some(move_drag());
+        assert!(move_refusal_unreported(drag.as_ref()));
+        let opened = open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Can't Move This Layer Further",
+            move_refused_message(),
+            move_refused_dialog_actions(),
+        );
+        assert!(!opened, "the occupied slot must refuse the second dialog");
+        if opened {
+            mark_move_refusal_reported(&mut drag);
+        }
+        assert!(
+            move_refusal_unreported(drag.as_ref()),
+            "a refusal the user never saw must still be pending"
+        );
+
+        // And once the slot frees, the same sequence does show it, and
+        // only then latches.
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
+        );
+        assert_eq!(dialog, None);
+        let opened = open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Can't Move This Layer Further",
+            move_refused_message(),
+            move_refused_dialog_actions(),
+        );
+        assert!(opened, "an empty slot must accept the refusal");
+        if opened {
+            mark_move_refusal_reported(&mut drag);
+        }
+        assert!(
+            !move_refusal_unreported(drag.as_ref()),
+            "a refusal the user has now seen must not repeat for the rest of the drag"
+        );
+    }
+
+    /// **RT-03's invariant, headlessly.** `handle_menu_event` is
+    /// macOS-only (`muda`) and cannot be constructed on this platform, so
+    /// what is asserted here is the property its new early return exists
+    /// to give it — the same property `handle_key` already has, pinned
+    /// against the same shared state — rather than the `cfg`-gated method
+    /// itself. The method's own two lines stay inspection-only, disclosed
+    /// on its doc comment.
+    #[test]
+    fn a_menu_routed_save_is_gated_by_the_same_dialog_check_the_keyboard_uses() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert!(open_crash_recovery_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            false
+        ));
+
+        // The gate itself, spelled exactly as both routes spell it.
+        assert!(
+            dialog.is_some(),
+            "a dialog is open, so neither route may dispatch a command"
+        );
+
+        // And the failure it prevents: a save that got through anyway
+        // would try to report its own refusal into an occupied slot and
+        // be silently swallowed.
+        let swallowed = open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Couldn't Export This Document",
+            &incomplete_composite_message(1, "boom"),
+            export_refused_dialog_actions(),
+        );
+        assert!(
+            !swallowed,
+            "this is what a menu-routed Save would have hit without the gate"
+        );
+    }
+
+    #[test]
+    fn move_refused_message_names_the_layer_and_its_coordinate_range() {
+        let message = move_refused_message();
+        assert!(!message.is_empty());
+        assert!(message.contains("layer"), "{message}");
+        assert!(message.contains("coordinate range"), "{message}");
+        // The move was never applied, so nothing was undone -- claiming
+        // otherwise would describe a state change that did not happen.
+        assert!(
+            !message.contains("undone") && !message.contains("undo"),
+            "the refusal must not claim the move was reverted: {message}"
+        );
+    }
+
+    #[test]
+    fn the_move_refused_dialog_opens_and_closes_through_the_same_shared_routing() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        open_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Can't Move This Layer Further",
+            move_refused_message(),
+            move_refused_dialog_actions(),
+        );
+
+        let Some(handle) = dialog.clone() else {
+            unreachable!("must open");
+        };
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(handle.root)
+                .map(accesskit::Node::role),
+            Some(accesskit::Role::AlertDialog)
+        );
+        assert_eq!(focus.focused(), handle.first_action());
+        let Some((id, _)) = handle.actions.first() else {
+            unreachable!("the move-refused dialog always has one action");
+        };
+        assert_eq!(id, MOVE_REFUSED_DISMISS);
+
+        handle_dialog_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            KeyChord::new(Modifiers::none(), Key::Named(NamedKey::Escape)),
+        );
+        assert_eq!(dialog, None);
+        assert!(!workspace.tree.contains(handle.root));
+        assert_eq!(focus.focused(), None);
+    }
+
+    #[test]
+    fn close_dialog_on_an_already_closed_dialog_is_a_no_op() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        close_dialog(&mut workspace, &mut focus, &mut dialog);
         assert_eq!(dialog, None);
     }
 
@@ -20200,7 +26734,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -20220,7 +26753,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Escape),
@@ -21071,7 +27603,11 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(dir.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
         let [victim] = files.as_slice() else {
             unreachable!("exactly one tile should have been evicted: {files:?}");
         };
@@ -21175,7 +27711,11 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(dir.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| is_tile_file(path))
+            .collect();
         assert_eq!(
             files.len(),
             broken.len(),
@@ -21666,6 +28206,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: bounds,
                 current_bounds: moved,
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -21688,6 +28229,7 @@ mod tests {
                 start_doc: (0.0, 0.0),
                 start_bounds: moved,
                 current_bounds: moved,
+                refused: false,
             }),
             &layers,
             &mut history,
@@ -21751,10 +28293,12 @@ mod tests {
                 start_doc,
                 start_bounds,
                 current_bounds,
+                refused,
             }) => {
                 assert_eq!(layer_id, id);
                 assert_eq!(start_doc, (5.0, 5.0));
                 assert_eq!(start_bounds, bounds);
+                assert!(!refused, "a fresh drag has told the user nothing yet");
                 assert_eq!(current_bounds, bounds);
             }
             other => unreachable!("{other:?}"),
@@ -21961,6 +28505,7 @@ mod tests {
             start_doc: (0.0, 0.0),
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
         let dabs = continue_drag(
             &mut drag,
@@ -22722,6 +29267,7 @@ mod tests {
             start_doc: view.to_document(pointer),
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
 
         let moved = bounds_at((300.0, 150.0), None);
@@ -22852,6 +29398,7 @@ mod tests {
             start_doc: view.to_document(pointer),
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
 
         // (a) A zoom that hits the bound.
@@ -23017,6 +29564,7 @@ mod tests {
             start_doc: view.to_document(pointer),
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
         let mut selection = SelectionSet::new();
 
@@ -23188,6 +29736,7 @@ mod tests {
             start_doc,
             start_bounds,
             current_bounds: start_bounds,
+            refused: false,
         };
         for point in path {
             let _ = continue_drag(

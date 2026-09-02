@@ -9,11 +9,22 @@
 //! trigger, a toggle, and a continuous drag — enough to validate the
 //! pattern every other widget follows; `TextField`
 //! ([`TextFieldState`]), `CommandPalette` ([`CommandPaletteState`]),
-//! and `ColorSwatch` ([`ColorSwatchState`]) followed. The rest need
-//! infrastructure that doesn't exist yet (real text shaping for
-//! dropdowns, scrolling for scrollbars/trees, popover layering for
-//! menus/tooltips, `aurora-vector` path rendering for the curve editor)
-//! and are deliberately left open rather than stubbed out half-built.
+//! `ColorSwatch` ([`ColorSwatchState`]), and now `Scrollbar`
+//! ([`ScrollbarState`]) followed — **4 of the 12 named widgets**.
+//! `Scrollbar` is a deliberately narrow landing: a bounded position
+//! *model* with an accessibility node, a layout style, and a paint, but
+//! nothing in this crate scrolls any content yet. It has a real
+//! component-gallery entry with a contrast check passing in every
+//! built-in theme; only its golden-image diff tests are unblessed
+//! (`#[ignore]`d pending a human bless on real GPU hardware, the same
+//! discipline every other widget's goldens already follow — see
+//! `scrollbar.rs`'s own module doc comment for the full account). The
+//! rest still need infrastructure that doesn't exist yet
+//! (real text shaping for dropdowns, a real scrolling container for
+//! `Tree` — which additionally needs hierarchical expand/collapse this
+//! crate models nowhere — popover layering for menus/tooltips,
+//! `aurora-vector` path rendering for the curve editor) and are
+//! deliberately left open rather than stubbed out half-built.
 //!
 //! **No rendering**: every widget here produces layout (a `taffy::Style`,
 //! resolved from `aurora_theme::Scales` — invariant §7.3.10, no
@@ -36,6 +47,7 @@ mod color_swatch;
 mod command_palette;
 mod dialog;
 mod list_row;
+mod scrollbar;
 mod slider;
 mod text_field;
 
@@ -50,6 +62,9 @@ pub use command_palette::{
 };
 pub use dialog::{DialogAction, DialogHandle, insert_dialog};
 pub use list_row::ListRowState;
+pub use scrollbar::{
+    ScrollbarRange, ScrollbarState, insert_scrollbar, set_scrollbar_disabled, set_scrollbar_value,
+};
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
 pub use text_field::{
     Composition, TextFieldState, UnderlineStyle, composition_segments, insert_text_field,
@@ -76,6 +91,10 @@ pub enum WidgetKind {
     Button(ButtonState),
     Checkbox(CheckboxState),
     Slider(SliderState),
+    /// A bounded position along one axis — a position *model* only, not
+    /// a scrolling container: nothing in this crate scrolls any content
+    /// yet. See `scrollbar.rs`'s own module doc comment.
+    Scrollbar(ScrollbarState),
     TextField(TextFieldState),
     CommandPalette(CommandPaletteState),
     ColorSwatch(ColorSwatchState),

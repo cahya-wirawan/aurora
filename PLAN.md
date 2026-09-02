@@ -72,7 +72,9 @@ paragraph is a pointer, not a substitute for them.
 This session specifically (six landed rounds, 0.37.0–0.40.1) grew
 M1.9's own compositing engine substantially: all 27
 `aurora_doc::BlendMode` variants real on flat layers and groups, real
-mask aggregation (rectangular clip), GPU-accelerated compositing with
+mask aggregation (a rectangular clip at the time — superseded by
+0.70.0, which gave layer masks real per-pixel grayscale coverage),
+GPU-accelerated compositing with
 its readback batched to one synchronization point per frame, a real
 data-integrity race in `aurora-tile` found and fixed, and the
 project's first real, live-app-level end-to-end frame-timing
@@ -135,12 +137,12 @@ that means concretely.
 | **Phase 1 — M1.1** | **Complete, 2026-07-28.** `aurora-core` (geometry, colour descriptors, IDs, errors, 16 tests) and `aurora-tile` (sparse/LRU/compressed/paged tile store, 13 tests, ADR 0005 — 12 original plus one CI-gated latency regression test added 2026-08-02, see 0.2). Full local CI gate clean. See M1.1 |
 | **Phase 1 — M1.2** | **Complete except Windows/DX12 (needs hardware not available to this session) — updated 2026-08-12, was "In progress, 2026-07-29."** Device/queue management, shader library/pipeline cache, GPU tile residency, and budgeted upload scheduling (`GpuContext`/`ShaderLibrary`/`PipelineCache`/`TileResidency`) all done and verified against this machine's real RTX 3090 (Vulkan) with actual rendered/uploaded-pixel checks. Surface configuration/resize (`GpuSurface`) is implemented **and now verified against a real window** on a different machine's live macOS/Metal session — same "GDM greeter only" gap as the a11y Orca leg, resolved the same way (a machine with an actual desktop session). A real cross-test GPU deadlock under `cargo test`'s default runner was found and fixed along the way (test-only `Mutex`). `TileResidency`'s atlas gained a real 4-level mip chain and `upload_mip` 2026-07-30, in service of M1.3's progressive rendering (see below) — the atlas itself is still M1.2 scope even though the reason for the growth is M1.3's. Only cross-platform validation (DX12 — Vulkan and Metal are both real now) is fully unstarted. See M1.2 |
 | **Phase 1 — M1.3** | **Most items done, 2 of 5 top-level items still `[~]` — updated 2026-08-12, was "In progress, 2026-07-30."** Open: progressive rendering's real consumer (picking a mip level from interaction state) and async evaluation's real consumer (submitting actual render work through `Executor`) — both wait on later crates that now exist, so this is a real, actionable gap, not blocked on anything external. `aurora-graph`'s node definitions, dependency DAG, and dirty-region propagation (`RenderGraph<N>`) done, 12 tests. `aurora-render`: `schedule()` translates a graph's node-granular dirty `Rect`s into tile-granular work lists (9 tests); `TileCompositor` blends one tile over another on the GPU via the fixed-function alpha blend unit (3 tests, verified against real hardware, plus a fourth added 2026-08-02 comparing the whole composited tile against a golden image via the new `aurora-testkit` harness — see 0.2); progressive rendering's `mip::downsample` and `preview::upload_preview` land a downsampled tile in `aurora_gpu::TileResidency`'s atlas, verified end-to-end against real hardware (9 tests); `Executor` runs submitted work on a background thread without blocking the caller, async evaluation's first piece (5 tests). A CI-gated GPU-dependent latency regression test (`latency.rs`, 1 more test) added 2026-08-02 — see 0.2. 28 tests total in the crate. What's left is real consumers for the last two: picking a mip level from interaction state, and submitting actual render work through `Executor` — both wait on `aurora-doc`/`aurora-filters`, which don't exist yet. See M1.3 |
-| **Phase 1 — M1.4** | **Most items done, 1 of 6 top-level items still `[~]` — updated 2026-08-12, was "In progress, 2026-08-01."** Open: the crash-recovery journal's durable disk persistence (the in-memory half is done and proven correct across undo/redo; no on-disk encoding decided yet). `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted, deliberately no real mask pixels yet) done 2026-08-01, 8 more tests (40 total) — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. History (`History` — mirrors all 14 `LayerTree` mutators with undo-recording versions, unlimited undo/redo, §7.3.3) done 2026-08-01, 20 more tests (70 total) — add/remove turned out to be exact inverses of two new id-preserving `LayerTree` primitives (`remove_capturing`/`restore`), one symmetric apply function drives both undo and redo, and dirtied `Rect`s are reported when knowable (pixel bounds, or a union over a removed subtree) and honestly `None` for group-level changes. Crash recovery journal's **in-memory half** (`History::replay`, an ever-growing chronological op log distinct from the undo/redo stacks) done 2026-08-01, 8 more tests (78 total) — proven to reflect *current* state after undo/redo, not just full history; **durable disk persistence deliberately deferred**, no on-disk encoding decided (see M1.4). fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. See M1.4 |
+| **Phase 1 — M1.4** | **Most items done, 1 of 6 top-level items still `[~]` — updated 2026-08-12, was "In progress, 2026-08-01."** Open: the crash-recovery journal's durable disk persistence (the in-memory half is done and proven correct across undo/redo; no on-disk encoding decided yet). `aurora-doc`'s `LayerTree` (`Pixel`/`Group` layers, nesting, top-to-bottom ordering, cascading delete, cycle-checked reparenting) done, 2026-07-30, 25 tests. Per-layer opacity/fill opacity/blend mode (full 27-mode Photoshop set)/visibility/locking (`BlendMode`, `LayerLock` mirroring PSD's `lspf` bits) done 2026-08-01, 7 more tests (32 total). Per-layer masks (`LayerMask` — bounds/enabled/inverted) done 2026-08-01, 8 more tests (40 total); real per-pixel grayscale coverage added 0.70.0 (`mask.rs`, `LayerTree::mask_surface_id`), 14 more tests — lives on `LayerEntry` so both pixel layers and groups can carry one. Document-level selection representation (`Selection`, `SelectionSet` — active selection plus named saved ones, FR-004's Save/Load/Inverse) done 2026-08-01, 11 more tests (51 total), a new module rather than a `LayerTree` method since a selection isn't per-layer. History (`History` — mirrors all 14 `LayerTree` mutators with undo-recording versions, unlimited undo/redo, §7.3.3) done 2026-08-01, 20 more tests (70 total) — add/remove turned out to be exact inverses of two new id-preserving `LayerTree` primitives (`remove_capturing`/`restore`), one symmetric apply function drives both undo and redo, and dirtied `Rect`s are reported when knowable (pixel bounds, or a union over a removed subtree) and honestly `None` for group-level changes. Crash recovery journal's **in-memory half** (`History::replay`, an ever-growing chronological op log distinct from the undo/redo stacks) done 2026-08-01, 8 more tests (78 total) — proven to reflect *current* state after undo/redo, not just full history; **durable disk persistence deliberately deferred**, no on-disk encoding decided (see M1.4). fmt/clippy (`-D warnings`)/`cargo test -p aurora-doc` all verified clean throughout. See M1.4 |
 | **Phase 1 — M1.5** | **Most items done, 1 of 4 top-level items still `[~]` — corrected 2026-08-12, this row's own "Complete" label was already wrong before this session started and had never been caught.** Open: working-space policy/linear-light-conversion's own real consumer (the conversion functions exist; an explicit working-space type stays deliberately undesigned until a real compositor/filter needs one). `aurora-color`'s ICC transforms (`IccProfile`, `Transform`, `RenderingIntent`) wiring in `lcms2` per ADR 0008 — `Gray`/`Rgb`/`Rgba`/`Cmyk` channel layouts, verified against real, committed CC0 ICC profiles (`corpora/icc/`, copied from `spike/raw-icc`'s own fixtures), reproducing `spike/raw-icc/FINDINGS.md`'s cross-validated sRGB→ECI-RGBv2 values plus the permanent extended-range/no-clamping regression test that spike's finding 4 asked for (`cargo deny check all` clean with the new dependency; `Cmyk` wired but untested against a real CMYK profile — honest gap, none in the corpus yet). Colour-space descriptor tagging (§7.3.6) was already done from M1.1. Linear-light conversion (`linear_to_srgb`/`srgb_to_linear`, IEC 61966-2-1's real curve, HDR/negative-safe) — an explicit working-space *policy* type stays deliberately undesigned until a real compositor/filter consumer exists. Promote-on-import/dither-on-export (`promote_u8`/`quantize_u8`/`dither_quantize`, classic 8×8 Bayer ordered dithering generated from its recursive definition and cross-checked against the published 4×4 table, not a hand-transcribed 64-entry table) — exhaustive 256-value round-trip test, dedicated test confirming dithering actually breaks up banding. 22 tests total. fmt/clippy (`-D warnings`)/`cargo test -p aurora-color`/`cargo deny check all` all verified clean throughout. See M1.5 |
 | **Phase 1 — M1.6** | **Complete, all five built-in themes landed — updated 2026-08-12, was "In progress, 2026-08-01."** `aurora-theme`'s token types (`Color`, `SurfaceTokens`/`TextTokens`/`IconTokens`/`BorderTokens`/`AccentTokens`/`StateTokens`, `Scales`) match the already owner-approved `design/tokens/vocabulary.md`/`scales.toml` exactly. `Palette`/`ThemeSet` parse real TOML (`toml` added to `[workspace.dependencies]` — `serde`'s first real use), resolve dotted palette references generically, and merge an `extends` inheritance chain (child overrides parent) — verified against the real, committed Dark theme end to end, plus a synthetic child theme proving the merge logic without inventing a real second design. `contrast::check_gated_pairs` is the real, CI-enforced version of `design/check_contrast.py`'s Phase-0 prototype (same 17 gated pairs, same WCAG formula reusing `aurora_color::srgb_to_linear`) — independently reproduces that script's own prior "17/17 pass" finding. 28 tests total (`cargo test -p aurora-theme`). **Light landed 2026-08-09** (`design/themes/light.toml`, `contrast::tests::the_real_light_theme_passes_every_gated_pair`, 17/17) once Cahya delegated design-owner authority for it specifically. **Still blocked**: the 2× high-contrast/Colour-Critical themes need Cahya's own design work (FR-027 *Ownership*) before they can exist, not an engineering gap. **Deferred, no consumer yet**: hot-reload file-watching. fmt/clippy (`-D warnings`)/`cargo test -p aurora-theme`/`cargo deny check licenses` all verified clean. **The CI lint rejecting hardcoded style values landed 2026-08-07**, once real widget code existed to lint against: `scripts/check_no_hardcoded_style.py` (same plain-stdlib-Python shape as `check_layering.py`) rejects bare hex colour literals and `length(<literal>)` calls in `aurora-widgets`/`aurora-ui` source, wired into CI and `CLAUDE.md`'s own local gate — verified by hand (no `python3` in this sandbox) against the real codebase, zero violations found. See M1.6 |
 | **Phase 1 — M1.7** | **Most items done, 3 of 17 top-level items still `[~]` — updated 2026-08-12, was "In progress, 2026-08-02."** Open: several of `design/gallery/index.html`'s own named widgets (dropdown, tab bar, tooltip, scrollbar, tree, menu, colour picker, curve editor — see M1.7's own section for the exact, current count), vector-first (resolution-independent) rendering, and finishing the component gallery/golden-image coverage per theme and density. `aurora-widgets`' `WidgetTree<W>` (generic over payload, same shape `RenderGraph<N>` uses) done: identity/nesting (one root, children appended in paint/tab order — a deliberate departure from `LayerTree`'s "newest on top"), damage tracking (`aurora_tile::Tile`'s own `Option<Rect>`/`Rect::union` idiom, per-widget and tree-wide), a *required* `accesskit::Node` per widget from creation (`WidgetId` **is** `accesskit::NodeId`, not a wrapper — no second id space, `accessibility_update` matches `spike/a11y-ime`'s own proven `TreeUpdate` shape), and a `taffy`-backed flexbox layout engine (`compute_layout` — style in, absolute bounds out, rebuilding `taffy`'s own tree fresh each call rather than keeping two trees in sync). Found and verified, not assumed: an `Auto`-sized childless root does **not** implicitly fill the viewport in `taffy` (no CSS-body-100%-style default) — both that and the `percent(1.0)` opt-in are now permanent regression tests. Input routing/focus (`hit_test`, `FocusManager`) done 2026-08-02, 18 more tests (38 total) — platform-agnostic (document-space point + `Tab`/`Shift+Tab` steps, not `winit::WindowEvent`s), reuses `accesskit`'s own `Action::Focus` for "focusable" rather than a parallel flag, `focus_at` bubbles a hit-test to the nearest focusable ancestor. Concrete widget set: a first slice (`WidgetKind`, `Button`/`Checkbox`/`Slider` — 3 of 12 named widgets, covering three genuinely different interaction shapes) done 2026-08-02, 20 more tests (58 total) — layout resolved from `aurora_theme::Scales` per invariant §7.3.10, `Checkbox` reuses `accesskit::Toggled` directly rather than a parallel enum, no rendering yet (blocked on `aurora-vector`). A real bug (`toggle_checkbox`'s indeterminate-state resolution contradicting its own doc comment) was caught by its own test before commit. Text field (`TextFieldState` — selection, grapheme-cluster-aware caret motion, Unicode word motion, text-buffer clipboard, per-widget undo/redo) done 2026-08-02, 28 more tests (86 total) — one generic `with_text_field_mut` rather than a hand-written wrapper per operation, given how many mutating methods this widget alone has; `accesskit::TextSelection` deliberately left unexposed, inheriting an already-known gap from `spike/a11y-ime/FINDINGS.md` rather than introducing a new one. IME composition (`Composition`, `UnderlineStyle`, `composition_segments`, `set_composition`/`commit_composition`) done 2026-08-02, 15 more tests (101 total) — mirrors `winit::event::Ime::Preedit`/`Commit` exactly, composition updates are not undo steps except the one real content change (removing a selection to start a fresh composition), `composition_segments` produces thin/thick underline-style *data* for a future renderer (this crate still draws nothing), and composing state is announced via `set_description` — the exact mechanism `spike/a11y-ime` already proved reaches VoiceOver, closing that finding's own recorded follow-up. A real bug (`composition_segments` emitting two abutting segments for a degenerate empty target range) was caught by its own test before commit. Headless mode as an explicit, checked feature done 2026-08-02: found `aurora-gpu`/`aurora-vector`/`aurora-text` declared as dependencies but never actually used anywhere in the crate's source — real `wgpu` was in this crate's own dependency graph despite its doc comments claiming headlessness. Removed all three (each goes back exactly when vector-first rendering starts; `scripts/layering.json` already allows them and didn't need to change); `cargo tree -p aurora-widgets -i wgpu` now finds no match at all. Added `crates/aurora-widgets/tests/headless.rs`, a real integration test (new pattern for this workspace) proving the whole pipeline — tree, layout, focus/hit-test, all four widgets, IME — end to end through the crate's public API alone, 102 tests total (101 unit + 1 integration). fmt/clippy (`-D warnings`)/rustdoc (`-D warnings`)/`cargo build --workspace`/`cargo test -p aurora-widgets`/`cargo deny check licenses` all verified clean throughout. The other 9 named widgets, vector-first rendering, and the component gallery all remain — each blocked on infrastructure (scrolling, popover layering, `aurora-vector`) that doesn't exist yet, not a natural next slice. **`aurora-vector` gained a first real slice, 2026-08-06**: `PathBuilder`/`Path` (lines + quadratic/cubic Bézier, wrapping `lyon_path`), `fill`/`stroke` tessellation into a `Mesh` (via `lyon_tessellation`, PRD §8's own pre-decided choice), and `rounded_rect`, the first real shape — 11 new tests, real area-based geometry checks. Deliberately GPU-agnostic (`Mesh` is plain CPU data; the GPU path renderer, widget-to-`Mesh` painting, and the golden-image gallery tests all remain separate, still-open follow-on work — see M1.7's own detailed section for the full account). `aurora-widgets` itself is unchanged by this — it still has no `aurora-vector` dependency (removed as unused during the headless-mode cleanup above) until real widget rendering actually starts. **The GPU path renderer landed the same day too**: `aurora-widgets` now has real `aurora-gpu`/`aurora-vector` (and `wgpu`) dependencies for the first time — new `PathPipeline` (`aurora_gpu::CanvasPipeline`'s own self-contained shape, reusing its real `PipelineCache`) and `GpuMesh` (this codebase's first real GPU *vertex buffer* — every pipeline before this drew a fixed fullscreen triangle from `@builtin(vertex_index)` alone). Solid-fill only, colour always a real per-draw uniform (invariant §7.3.10). 6 new tests (143 total), including 2 real pixel-readback tests proving actual rendered output, not just "compiles" — unverified against real hardware in this sandbox (no adapter here), the same "written, not yet human-verified" state `aurora-gpu`'s own render tests were once in. The core widget toolkit (layout/input/accessibility) stays exactly as headlessly testable as before. **Widget-to-`Mesh` painting landed the same day**: new `paint_widget` resolves a widget's own layout bounds and state into a real `(Mesh, [f32; 4])`, `Button` only (a solid `rounded_rect` background coloured from `accent.primary`/`primary_active`/`state.disabled_opacity`, every other `WidgetKind` a deliberate `Ok(None)`) — 5 new tests (148 total). **And the `aurora-app` render-loop integration landed the same day too**: `App::redraw` now draws every widget in the real workspace tree on top of the canvas, in the same pass (invariant §7.3.8) — new `WidgetTree::paint_order`, `collect_widget_paints`/`draw_widget_paints`, `linearize_paint_color` (resolving `paint_widget`'s own open sRGB-linearization question the same way `background_color_from_theme` — renamed from `load_background_color` — already handles the window clear colour), and new `App` fields `theme`/`scales`/`path_pipeline`. 2 new tests (149 `aurora-widgets`, 129 `aurora-app`). Still genuinely open: unverified on real hardware (no GPU adapter in this sandbox, nobody has run the app on a real window at a real DPI scale yet), and 8 of 12 named widgets still have no paint at all. **And the headless render harness for the component gallery landed the same day too**: new `crates/aurora-widgets/tests/gallery.rs` renders a real `Button` gallery (enabled/pressed/disabled) to an offscreen target and reads it back as a real `aurora_testkit::Image` — no window, no event loop, only a real GPU adapter (new `aurora-testkit` dev-dependency, `scripts/layering.json` updated). One test runs for real here (proves the three states render distinct pixels); the actual golden-diff test is `#[ignore]`d until a human on real GPU hardware blesses and reviews the first golden PNG — blessing one blind, with no display, would be exactly the unreviewed-baseline failure that gate exists to prevent. Remaining: that human bless step, paint for the other 8 widgets, and per-theme/per-density coverage. **`Checkbox` gained paint too, 2026-08-06**: the same solid-`rounded_rect` shape as `Button`, `accent.primary` when checked/mixed, `surface.sunken` when unchecked, `state.disabled_opacity` when disabled — 4 new tests (153 total). Honest gap: `Toggled::True` and `Toggled::Mixed` render identically today, since no check/dash glyph exists yet to tell them apart (this crate still draws solid fills only). `Slider`/`TextField`/`CommandPalette` still have none; the gallery harness still only exercises `Button`. **`Slider` gained paint 2026-08-07** — the first widget needing more than one shape, so `paint_widget` returns `Vec<Paint>` now (`Result<Option<Paint>, WidgetError>` before), an empty `Vec` the new "nothing to paint"; `paint_slider` draws a `surface.sunken` track then an `accent.primary` thumb positioned at the value's own proportional offset, `disabled_opacity` applied to both. 3 new tests (156 `aurora-widgets` total). `TextField`/`CommandPalette` still have none. **`TextField` gained paint too, 2026-08-07**: the same single-shape `surface.sunken` background `Checkbox`'s unchecked box and `Slider`'s track already use, `disabled_opacity` when disabled — 2 new tests (158 total). Honest gap: content/cursor/selection/composition don't affect its paint at all, since drawing a caret or selection highlight needs real text shaping (`aurora-text` is still a skeleton) this crate doesn't have. `CommandPalette` is the one remaining unpainted `WidgetKind`. **`CommandPalette` gained paint too, 2026-08-07** — closing out every `WidgetKind` this crate defines: `surface.raised` (checked against `design/tokens/vocabulary.md` directly — "Elevation 1: dropdowns, popovers, context menus," not `surface.overlay`'s "modals, dialogs"), `scales.radius.md` for a floating panel. Real, structural gap: no query text, no result-row highlighting — every row is a plain `WidgetKind::Container`, indistinguishable from any other by its own payload alone, so highlighting the selected one needs either a tree walk or a new `WidgetKind` variant, a real architecture decision this doesn't attempt. 2 new tests (160 total), including one proving a real result row paints nothing. **The gallery's own golden was blessed and reviewed 2026-08-07**: Cahya ran the bless command on real macOS GPU hardware, confirmed `tests/golden/button_gallery.png` genuinely shows three visually distinct buttons in the right Dark-theme colours, committed it, and the `button_gallery_matches_the_golden_image` test's `#[ignore]` was removed the same day — GitHub Actions confirmed green (also closing out the `PathPipeline::draw` empty-mesh panic fix and the macOS menu bar fix from the same session, both now confirmed on real hardware too). **The gallery harness was extended to every painted widget, 2026-08-07**: `Checkbox`/`Slider`/`TextField`/`CommandPalette` each got their own gallery tree, `render_gallery` call, and golden target — no changes needed to `render_gallery` itself, it was already generic. 10 tests total now (was 2): 6 real, self-contained "distinct pixels" tests (all passing here); 4 golden-diff tests, all `#[ignore]`d pending the same human-on-real-GPU-hardware bless step `Button`'s own golden already went through. **Cahya's own bless run found a real usability bug, 2026-08-07**: `command_palette_gallery.png` came back "just a black image" — decoded its raw pixel bytes directly (not by eye) and confirmed the data was correct (`surface.raised`, `[40,40,44]`), just nearly imperceptible against the gallery's own plain black backdrop, since that token is deliberately near-black by design; `text_field_gallery.png` had the same root cause, `checkbox_gallery.png` didn't (a real bright `accent.primary` cell gives it a reference point). Fixed with a new `NEUTRAL_CLEAR` mid-grey backdrop for `CommandPalette`/`TextField` specifically (Cahya's own explicit choice, asked rather than assumed) — `Button`/`Checkbox`/`Slider` keep plain black, no reason to force a re-bless of goldens that were already fine. The two now-wrong goldens were removed (`git rm`) rather than left stale; both tests are `#[ignore]`d again pending a fresh bless. `Checkbox`/`Slider` are now un-ignored (confirmed correct and reviewable) — `gallery.rs`: 8 passed + 2 ignored. **`text_field_gallery.png`'s own re-bless confirmed fine as-is** (decoded: `[20,20,20]`/`[85,85,85]`, genuinely distinct since `TextField` has two states to contrast against each other) — un-ignored. **`command_palette_gallery.png`'s own re-bless came back "still looks dark" — a second real bug, found only because Cahya looked again**: `NEUTRAL_CLEAR` alone wasn't enough — the panel still filled the whole frame with no margin, only `scales.radius.md`'s tiny rounded corners ever showing the backdrop. Fixed with a real `COMMAND_PALETTE_MARGIN` (32px) via new `command_palette_style`, verified headlessly before asking for a third bless (`command_palette_style_positions_the_panel_with_a_real_margin`, pure `WidgetTree` layout math, no GPU needed, proves the panel's own bounds sit inset exactly as intended). `gallery.rs`: 10 passed + 1 ignored (`command_palette` only, pending that third bless). **`command_palette_gallery.png`'s third bless confirmed correct, 2026-08-07**: Cahya reported it "looks better now"; decoded raw bytes confirmed a real, visible margin (backdrop `[127,127,127]` outside the panel, `surface.raised` `[40,40,44]` inside it, boundary exactly where `COMMAND_PALETTE_MARGIN` predicts). Un-ignored — `gallery.rs`: 11 passed, 0 ignored. Every painted widget's golden is now blessed and reviewed; full workspace `cargo test`/`clippy` clean. **`ColorSwatch` added, 2026-08-07** — a seventh `WidgetKind`, not just paint for an existing one: `design/gallery/index.html`'s own "Color swatch" section (one of the 12 named widgets, `Role::ColorWell`, `accesskit`'s own `set_color_value` used for the first time in this crate). Deliberately different from every other widget here: the colour it displays (`ColorSwatchState::color`, an `aurora_theme::Color`) is arbitrary caller data, not resolved from a `Theme` token — the same "content, not chrome" distinction that already lets `TextField::content` hold arbitrary text without being a hardcoded-style-value violation; `paint_color_swatch` still resolves `scales.radius.sm`/`state.disabled_opacity` from real tokens, since those *are* chrome. Sized via the same "no dedicated control-size token yet" grounding `Checkbox` already established (`type_size(scales.typography.size.md)`), not the design mockup's own hardcoded 32px literal. 7 new `aurora-widgets` lib tests (167 total): 5 in `widgets::color_swatch` (insert/mutate/disable, mirroring `checkbox.rs`'s own shape), 2 in `paint.rs` (own-colour fill, disabled dimming). Gallery extended too: `color_swatch_gallery_tree` (two different arbitrary colours plus a disabled repeat of the first), a real self-contained distinct-pixels test, and a golden-diff test — `#[ignore]`d pending a human bless, matching every other golden's own "never bless blind" discipline. `gallery.rs`: 12 passed + 1 ignored. Full workspace `cargo test`/`clippy --all-targets --all-features -- -D warnings` clean. Remaining: `color_swatch_gallery.png`'s own bless step; the other ~6 named widgets from `design/gallery/index.html`'s own list (dropdown, tab bar, tooltip; scrollbar/tree/menu/curve editor deliberately deferred further, per that file's own "needs more structural design work" note); per-theme/per-density gallery coverage (blocked on Light/high-contrast/Colour-Critical actually existing as real themes — still Cahya's own design decision, `aurora-theme`'s own doc comment); and the `CommandPalette` result-row-highlighting architecture decision. **That last one landed 2026-08-08**, resolved by asking Cahya directly (`AskUserQuestion`, two rounds) rather than guessing: a new, deliberately generic `WidgetKind::ListRow(ListRowState { selected, disabled })` (`widgets::list_row`), not a `CommandPalette`-specific variant — the same "which row is highlighted" concept `Dropdown`/`Tree`/`Menu` will need once they exist, so this is meant to be reused, not re-invented, when they land. `command_palette::rebuild_rows` now inserts real `ListRow` widgets instead of plain `Container`s (the first `selected: true`, matching `CommandPaletteState::selected`), and `move_command_palette_selection` flips the payload's own `selected` flag alongside the `accesskit` one it already updated — `paint_widget` reads the payload, not the accessibility node, so both had to change together. New `paint_list_row` (`paint.rs`): nothing at all for an unselected row (a real `Ok(vec![])`, the same "nothing to paint" every other widget's off-state already returns), `accent.primary` for the selected one — `design/tokens/vocabulary.md`'s own entry for that token names "selection highlight" explicitly, so this isn't a new use invented here. **A real, necessary follow-on found along the way, not scope creep**: `body`/each row previously had no layout style at all (`Style::default()`), which a headless probe confirmed resolves to 0×0 bounds — the highlight would have been correctly computed and completely invisible. Fixed with `body_style` (`Column`, `percent(1.0)` both axes — the same "labeled region, `Column`, `flex_grow`" shape `aurora_ui::insert_panel` already established) and `row_style` (`width: percent(1.0)`, `flex_grow: 1.0` — rows dividing their shared height evenly, the same idiom `aurora_ui::workspace`'s own docked-panel rail already uses for panels). Deliberately not a `Scales`-derived pixel height: an even flexbox split needs no absolute size at all, so `insert_command_palette`/`rebuild_rows` still don't need a `&Scales` parameter, and nothing downstream (`aurora-app::open_command_palette`, `run_command`) had to change. Verified headlessly before trusting it (`results_stack_vertically_and_share_the_panels_height`, real `compute_layout`, no GPU) — 3 new tests in `command_palette.rs`, 3 in `paint.rs` (net +2, one replaced), 172 `aurora-widgets` lib tests total. **This is a real, visible change to the already-blessed `command_palette_gallery.png`** (the gallery's one command is always selected, and now fills the whole panel, so the rendered image gained a real `accent.primary` rectangle the third bless never had) — the stale golden was removed (`git rm`), and `command_palette_gallery_matches_the_golden_image` is `#[ignore]`d again pending a fourth bless, the same "never bless blind" discipline as every other golden here. A new self-contained (non-golden) test, `command_palette_gallery_paints_the_selected_rows_own_highlight`, asserts the exact expected byte value (`[120,172,255]`, reusing the value `checkbox_gallery_matches_the_golden_image`'s own doc comment already confirmed for `accent.primary` against the committed Dark theme) so this doesn't depend on the pending bless to be checked on every GPU-having run. `gallery.rs`: 12 passed + 2 ignored. Full workspace `cargo build`/`cargo test`/`cargo clippy --all-targets --all-features -- -D warnings`/`cargo doc --no-deps -D warnings` all verified clean. Version bumped `0.0.1` → `0.1.0` per `CLAUDE.md`'s own versioning convention (a PLAN.md step). Remaining, unchanged from before: `color_swatch_gallery.png`'s own bless step, the `command_palette_gallery.png` re-bless this change now needs, the other ~6 named widgets, and per-theme/per-density coverage. **Both pending blesses landed 2026-08-08**: Cahya ran the bless command on real macOS GPU hardware and pushed both PNGs. Verified by decoding raw pixel bytes directly, not eyeballing: `color_swatch_gallery.png` — `[220,40,40]`/`[40,80,220]`/`[88,16,16]` (the third being the first colour at `disabled_opacity` `0.4`, exact arithmetic match) against a `[0,0,0]` corner; `command_palette_gallery.png` — `[127,127,127]` (`NEUTRAL_CLEAR`) at the corner and one pixel outside the panel's left edge, `[120,172,255]` (`accent.primary`) at the panel centre and one pixel inside it, the margin boundary exactly where `COMMAND_PALETTE_MARGIN` predicts. Both tests un-ignored — `gallery.rs`: 14 passed, 0 ignored. Every painted `WidgetKind` this crate defines now has a real, reviewed golden. Remaining, still unchanged: the other ~6 named widgets, and per-theme/per-density coverage (both blocked on infrastructure/design work that doesn't exist yet, not a natural next slice). **`WidgetKind::Panel` added 2026-08-09** — an eighth `WidgetKind`, prompted by Cahya asking "when will the panels actually be visible" after confirming the command palette works: the answer split into "a real background — close, nothing blocks it" vs. "readable content — far, needs real text shaping this crate doesn't have," and he chose to land the first. `insert_panel` (`aurora-ui`) now gives a panel's own root `WidgetKind::Panel` instead of plain `Container`; new `paint_panel` (`paint.rs`) fills it with `surface.panel` — `design/tokens/vocabulary.md`'s own entry for exactly this ("Default panel background (Layers, Properties, Tool Options, ...)"), not a use invented here — at `scales.radius.sm`, the same small-control radius every non-floating shape here already uses. Deliberately stateless (a bare unit variant, no fields): a collapsed panel's own root already resolves to a near-zero-height rect via `aurora_ui::set_panel_collapsed`'s own `flex_grow: 0.0`, so an unconditional fill reads as "invisible" without `paint_panel` needing to know about collapse at all — one function, no special-casing. Not one of `design/gallery/index.html`'s own 12 named widgets (it's workspace chrome, not a gallery component), so no gallery/golden coverage was added for it, unlike every other `WidgetKind` here. 1 new test in `paint.rs` (`aurora-widgets`: 173 total, `gallery.rs`'s own count unchanged). `aurora-ui`'s own `insert_panel` test updated to expect `WidgetKind::Panel`, not `Container`; that module's own doc comment also refreshed while touching it — it had gone stale after the resize/persistence work landed without anyone updating panel.rs's own account of what's done. Full workspace `cargo build`/`clippy --workspace --all-targets --all-features -- -D warnings`/`cargo test --workspace` (0 failures)/`cargo doc --no-deps --all-features -D warnings`/`cargo deny check all` all clean. Version bumped per `CLAUDE.md`'s own convention. Rail and canvas-area backgrounds deliberately untouched — Cahya's ask was specifically about panels, not the whole workspace's chrome, and a distinct decision (do they want the *same* `surface.panel` treatment, or something else) rather than one to assume here. **A real, found-not-assumed contrast bug, fixed the same day**: Cahya tried it on real hardware and reported not seeing the panels after toggling one via the native menu. The real numbers, computed and checked rather than guessed: `surface.panel` (`#212124`) against the window's own background `surface.app` (`#1a1a1b`) is only a ~7-in-255 per-channel difference — `design/tokens/palette.toml`'s own neutral ramp is deliberately "quiet ... must never compete with a user's image," which explains the near-invisibility without it being a code bug (the fill was and is the exact right token). Cahya's own call (`AskUserQuestion`), once he had the real numbers: add a border via `border.default` (`#404048`, real contrast) rather than leave it as intentionally quiet or brighten the fill itself — both real design decisions, not this crate's to make alone. `paint_panel` now returns two shapes (`aurora_vector::fill` then `aurora_vector::stroke`, the same "more than one shape, drawn in order" pattern `paint_slider` already established, `paint_panel`'s own return type widened from `Paint` to `Vec<Paint>` to match) — `border.default`, not `border.strong` (`vocabulary.md` reserves that one for "emphasized ... active panel edge, pressed/selected state," not a resting default). Border width (`1.0` logical px, a plain engineering default — no "border width" token exists yet, and a one-pixel hairline is standard practice, not really a design decision the way an arbitrary size or colour would be) lives as a named local const, not a bare literal. The existing `paint_panel` test extended (not a new one) to assert both shapes and both colours. Full workspace gate clean. Version bumped per `CLAUDE.md`'s own convention. The real, authoritative check is still Cahya looking at it again on his own Mac. **A real crash on real macOS hardware, 2026-08-03**: `accessibility_update` cloned each widget's `accesskit::Node` without ever setting its `children`, so every node but the root reached `accesskit_consumer` looking disconnected — invisible until M1.8's docking/panels work finally gave `aurora-app` a tree with more than one node to send. Fixed (set `children` from the tree's own real structure); added a real regression test using `accesskit_consumer::Tree::new` (the exact library that caught it) as a dev-dependency, and verified the test actually fails without the fix, not just that it passes with it. (Merged into this row 2026-08-12 — this paragraph used to sit outside the table, after a blank line that silently broke the markdown table's own rendering for every row after M1.7, including M1.8/M1.9/M1.10's rows this same pass just wrote; found and fixed while re-verifying this table's own structure.) See M1.7 |
 | **Phase 1 — M1.8** | **Substantial and real, but every one of its 10 top-level items is still `[~]` — corrected 2026-08-12, an earlier pass of this same update wrongly labeled this row "Complete," caught only by a fresh independent check of the actual marks.** Window/event loop, docking, layers/history/tool-options panels, command palette, native menus, and crash-recovery UI are all real, working, and (for the window/event loop and command palette) human-verified on real macOS hardware 2026-08-03 — but each of the 10 items also names real, unbuilt remaining scope of its own (Windows/Linux hardware verification; per-monitor DPI edge cases; rotation/rulers/guides/grid/snap/true-infinite-zoom for the canvas specifically — atlas-resize itself was fixed 2026-08-12, see M1.8's own section), so none of them are actually done by this file's own `[x]` bar yet. Don't read "substantial real functionality" as "complete" for this milestone — see M1.8's own section for the precise, per-item remaining scope. `aurora-app`'s first real code (was a placeholder `main()`): a real `winit::ApplicationHandler` implementing the "create hidden → attach `accesskit_winit` adapter → show" ordering ADR 0001's escape-hatch check found, reusing `aurora-gpu`'s already-proven `GpuContext`/`GpuSurface` and `aurora-widgets`' `WidgetTree`/`FocusManager` for a (currently content-free) accessibility tree rather than hand-rolling either. Real error handling throughout, `main` now fallible. Written blind (no `pkg-config` in this sandbox, no root to install it) and pushed; CI's first real run immediately caught a genuine bug — `wgpu` used directly but never declared as a dependency — fixed the same day. Cahya then installed `pkg-config`/`libfontconfig1-dev` in this same sandbox, closing the gap that had blocked `cargo clippy --workspace --all-targets --all-features -- -D warnings`/`cargo test --workspace` (the exact CI gates) all session — both now pass completely, every crate. **Then Cahya ran `cargo run -p aurora-app` on real macOS hardware**: the window opens (create-hidden → adapt → show all working for real), resizing works with no crash, and **VoiceOver announces the window** — the accessibility tree genuinely reaches a real screen reader, this project's first non-spike code to do so. The window's clear colour is now a real theme token too (`load_background_color`, `design/themes/dark.toml`'s `surface.app`, correctly converted sRGB→linear for the `Bgra8UnormSrgb` surface via `aurora_color::srgb_to_linear` — using the raw sRGB bytes would have washed the colour out), 2 more tests. `aurora-ui`'s first real code (was a placeholder too): a static docking/panel skeleton matching the owner-approved workspace mockup — canvas area + a side rail of three labeled (`Role::Region`) panels (Layers/Properties/History), reusing `aurora_widgets::WidgetTree<WidgetKind>` directly rather than inventing a parallel widget model, flex-ratio sized (no un-tokenized pixel widths) — wired into `aurora-app` so `compute_layout` runs live on window creation and resize. Verified empirically (a real 1000×800 layout test), not assumed. No drag-to-redock/resize/persisted-layout or real panel content yet — that's the actual "docking"/"custom workspaces" half, still open. **Two real bugs found and fixed from this same live-hardware session**: (1) `WidgetTree::accessibility_update` never set `node.children`, so any tree past a trivial single root looked disconnected to `accesskit_consumer` and crashed on launch — fixed, plus a real regression test using `accesskit_consumer::Tree::new` itself; (2) even after that fix, the workspace was completely unreachable from VoiceOver (the Rotor's "Window Spots" came back empty, not even the window title) — root cause was the tree's root using `Role::GenericContainer` instead of `Role::Window`, fixed and **re-verified live**: VoiceOver's Rotor now lists both "Aurora" (the window) and "Layers." "Properties"/"History" didn't show in that same Rotor listing (likely a Rotor display quirk, not a structural gap — all three are built identically and verified by the test suite). The Layers *and* History panels now have real content: `aurora-ui`'s new `populate_layers_panel`/`populate_history_panel` turn a real `aurora_doc::LayerTree`/`History` into accessible `Role::ListItem` rows (nested for layer groups) — the History half needed a small, real `aurora-doc` feature addition first (`History::journal_descriptions`, closing a gap that module's own doc comment had named). Wired into `aurora-app` via `demo_document()` (renamed from `demo_layers`), a small, clearly-fake three-layer document built *through* `History`'s own methods so its journal has something real to show. **Re-verified live, 2026-08-04**: structure confirmed correct again (Rotor still shows "Aurora"/"Layers Group"), but a real, reproducible gap found — VoiceOver's linear/interact keyboard navigation into the nested content doesn't reliably work (gets stuck, or one attempt landed on the native window's own title-bar buttons), reproduced across multiple attempts including a full VoiceOver restart. Not a structural bug (the same tree is proven correct by both the Rotor and the test suite) — a real, open UX gap in `spike/a11y-ime/FINDINGS.md` finding #5's own flagged territory (deep nested custom content), now confirmed concretely rather than speculatively, worse than that spike's flat two-child tree ever exercised. Deliberately not chased further via more blind remote code changes — recorded as real, scoped follow-up work needing either deeper native macOS accessibility expertise or a systematic minimal-repro comparison. **Command palette + keyboard shortcuts added 2026-08-04** — this crate's first real keyboard input at all (`Tab`/`Shift+Tab` finally reach `FocusManager`; `Ctrl+Shift+P` opens a real, filterable command palette from two new generic `aurora-widgets` mechanisms, `shortcut::{KeyChord, ShortcutRegistry}` and `widgets::command_palette`), with panel regions now real `Tab` stops (`insert_panel` gained `Action::Focus`). All dispatch logic is free functions decoupled from `App`/`winit` window types, so it's fully unit-tested (14 new `aurora-app` tests, 17 total; 26 new `aurora-widgets` tests, 128 total) with no display server needed — not yet real-hardware-verified. **Crash recovery UI added 2026-08-05** — a real, narrow first slice: a session marker file written at startup and cleared on clean shutdown, and a new generic `aurora-widgets::widgets::dialog` (`Role::AlertDialog`) shown when a *previous* run's marker is still present. Deliberately does not restore any document state yet — `aurora-doc`'s crash-recovery journal has no on-disk encoding decided (see M1.4), so the dialog's one honest action is "Continue," not "Recover Document." 4 new `aurora-widgets` tests (132 total), 11 new `aurora-app` tests (28 total, including real filesystem I/O against a `tempfile::TempDir`). **Per-monitor DPI/fractional scaling added 2026-08-05** — found and fixed a real, latent bug: layout was computed straight from `winit`'s physical-pixel window size, but widget layout styles are logical-unit, DPI-independent values, so any `scale_factor != 1.0` display would have rendered every widget the wrong size once real rendering exists. New pure `logical_size` conversion function (deliberately total — falls back to `1.0` only for a non-positive/non-finite factor, not for a real fractional factor below `1.0`, which some Linux compositors use), wired into both initial layout and every resize, kept current via a new `WindowEvent::ScaleFactorChanged` handler. 6 new tests (34 total). **File dialogs and clipboard added 2026-08-05** — picked the two dependencies PRD §8.3/§14's own table had already named but never added: `rfd` (native dialogs) and `arboard` (system clipboard, text-only). `arboard`'s Windows backend is BSL-1.0-licensed, a real permissive licence not previously allow-listed — added to `deny.toml` with a comment, not silently. Wired into the command palette (its own only live text-input surface right now): `Ctrl+C`/`Ctrl+V` against the real OS clipboard, a new "Open File…" entry showing a real native `rfd::FileDialog`. Kept the pure dispatch logic testable by isolating both platform calls behind `&mut dyn ClipboardAccess`/`&mut dyn FileDialogAccess` seams (`FakeClipboard`/`FakeFileDialog` in tests) — same shape `translate_key`/`translate_modifiers` already used. Honest about its limit: a chosen file is only recorded (`pending_open_path`), not imported — `aurora-io` is still an empty skeleton. 11 new tests (39 total). **Drag & drop added the same day** — real, native `winit` events (`DroppedFile`/`HoveredFile`/`HoveredFileCancelled`), no new dependency; a dropped file writes the exact same `pending_open_path` slot "Open File…" does, since both are the same "open this" signal. **Native menu bar added the same day, macOS only** — investigated `muda` on all three platforms before writing code: Linux's only backend needs a real `gtk::Window` a plain `winit` window structurally never is, and `muda` doesn't even compile on Linux without the heavy `gtk` feature (no fallback backend); Windows needs its own `unsafe_code` lint override for a raw-HWND call. Asked Cahya which scope to take given this; picked macOS-only, matching PRD §8.3/§14's own wording, which only names macOS for the native menu bar. `build_menu`/`activate_command` (the latter refactored out of the palette's own `Enter` handling so both UI surfaces share one command-dispatch path) are cross-platform logic. 3 new tests (42 total): `activate_command` is real and unit-tested; a fourth test walking `build_menu`'s own item tree was written but **failed on the first real macOS CI run** — `muda::Menu::new()` panics with "can only be created on the main thread" under `cargo nextest run`, and this isn't fixable by test-side changes: neither nextest nor libtest's own default harness ever runs an individual `#[test]` fn on the process's real main thread (both dispatch to worker threads even at `--test-threads=1`), so no attribute or flag makes a `muda`-constructing test satisfy this. Removed that test; `build_menu` remains real production code (called from `App::new` on the winit event loop's own main thread, where the constraint is naturally satisfied) but is only exercised by actually running the app, not by this crate's `#[test]` suite. **Confirmed 2026-08-06**: after removing the test, the full CI matrix (lint, Linux/macOS/Windows test, docs, deny) passed green — `muda` compiles and links cleanly on all three platforms. Windows/Linux native menus deliberately deferred to Aurora's own future in-window menu. **Canvas rendering added 2026-08-06** (picking up from M1.9's "wire a live document" step, which gave the Brush tool somewhere to paint but no way to see it): `aurora-gpu` gained `CanvasPipeline`, a real, public type promoting bind-group-layout/pipeline logic that crate's own tests had only exercised privately (2 new tests, 12 total); `aurora-app`'s `resumed`/`redraw` now build a real `TileResidency`/`CanvasPipeline` sized to the canvas dock area and draw the live tile store's content within it every frame, `CanvasView`'s own pan reflected (zoom deliberately not, at first — `TileResidency` had no scale support yet) (6 new tests, 84 total). A real finding along the way: `aurora_widgets::WidgetTree::bounds` returns a widget's current (zero by default) bounds unconditionally once it exists, not `None` before the first layout — a test wrongly assumed the latter and was fixed. **Zoom made visible the same week (2026-08-05)**: `TileResidency::set_origin` gained a `zoom` parameter that shrinks/grows the atlas's own sampled `uv_scale` by that factor (shader-side magnification, no bigger upload); `tile_origin_for_view` now goes through `CanvasView::to_document` instead of assuming 100% zoom. A new real-GPU test proves the shader actually magnifies, not just accepts the argument (1 new `aurora-gpu` test, 13 total; 2 new `aurora-app` tests, 88 total). **"Open File…" actually opens a file now (2026-08-05)**: `aurora-io` gained `import::write_into_store` (copies a decoded `Image`'s own samples into a document layer's tile-store surface) and `import::decode_by_extension` (dispatches to png/jpeg/tiff by extension) (12 new tests, 27 total); `aurora-ui` gained `clear_panel_body`, the missing "empty it first" step for repopulating a panel (2 new tests, 28 total); `aurora-app`'s `pending_open_path` field is gone, replaced by a real `App::open_file` that reads, decodes, replaces the current document with a fresh single-layer one sized to the image, rebuilds both panels, and writes the image's own pixels into the live tile store — all three "the user chose a file" paths (palette, drag-and-drop, native menu) call it now (5 new tests, 93 total). **"Save As…" added the same day**: `aurora-io` gained the reverse bridge, `import::read_from_store`/`import::encode_by_extension` (5 new tests, 32 total); `aurora-app` gained a new `ChosenFile` enum (Open vs. Save now flow through the same `activate_command`/`handle_palette_key`/`handle_key` chain that used to return a bare path), `FileDialogAccess::save_file`, a "Save As…" palette entry/macOS menu item, and `App::save_file` — reads the active layer's own pixels out of the tile store, encodes by the chosen extension, and writes via a new `write_verified` helper (sibling temp file, verified by reading it back and decoding it, then renamed over the real destination — CLAUDE.md's PSD/PSB "never overwrite in place" rule applied here too, even for non-round-trip formats). Exports the active layer's own pixels only — no document compositor wired in yet, matching what the canvas itself already shows (6 new tests, 99 total). **`LayerTree::set_bounds` added the same day** (M1.9's Move-tool blocker, revisited): a pixel layer's `bounds` could previously only be set once, at creation — real repositioning needed a way to change it afterward, plus `History::set_bounds` for undo (9 new `aurora-doc` tests, 94 total). **Move finished end to end, 2026-08-06**: `tile_origin_for_view` now subtracts the active layer's own document-space origin before converting a screen point into a surface-local tile — the missing renderer half, since every layer built before Move sat at document `(0, 0)` and nothing had needed the distinction; a new `Drag::Move` shifts the active layer's own bounds by the pointer's travelled delta each move event (mirroring how `Drag::Pan` updates `last_screen` in place), applied via `App::apply_move` (`LayerTree::set_bounds`, bypassing `History` the same way Brush/Eraser already bypass it for pixel edits — not undoable today). 7 new/changed `aurora-app` tests (103 total). Still `[~]` overall: Windows and Linux remain unverified on real hardware, the crash-recovery/command-palette/keyboard-shortcut/DPI-scaling/clipboard/file-dialog/drag-and-drop/native-menu/canvas-rendering work all still needs a real-hardware pass, and rotation/rulers/guides/grid/snap/true-infinite-zoom remain open on the Canvas bullet itself (atlas-resize and sub-tile fractional scroll were both fixed later in the session, 2026-08-12/13). See M1.8 |
-| **Phase 1 — M1.9** | **33 of 53 top-level items done, 8 still `[~]`, 12 not started — updated 2026-08-26, was "20 of 27 top-level items done, 7 still `[~]` — updated 2026-08-12."** That 2026-08-12 count was badly stale, exactly as its own "worth a fresh, item-by-item check... not done as part of this pass" caveat warned: this section has grown from 27 to 53 top-level items as heavy compositing/blend-mode/undo/format work landed afterward (most of the 12 `[ ]` items are small, named hardening bugs found during later review rounds — a stale scratch-directory race, an unbounded `make_room` clone, a non-finite-pan edge case, and similar — not unstarted scope). A fresh, item-by-item check of all 8 `[~]` marks (2026-08-26) found: **two stale and now `[x]`**, confirmed against passing tests rather than prose alone — `.aur` format (13 `aurora-io` + 8 `aurora-app` tests passing, including a real moved-layer round-trip; every gap the bullet itself named was already closed elsewhere) and Pixel-edit undo (Brush/Eraser) (unified chronological undo/redo and whole-stroke coalescing both confirmed by passing tests); **one stale claim corrected in place** — Multi-layer compositing's own text still said "GPU-side compositing remain[s]... still-open," but `begin_gpu_composite_tile` has in fact been wired into `recomposite_visible_tiles` for a while (confirmed by a passing GPU/CPU-agreement test), so only per-tile-dirty-aware invalidation across every edit path (Move, undo/redo, document-open, active-layer-switch still bump the whole composite cache; only brush/eraser dabs invalidate a single tile) remains genuinely open — the same gap CLAUDE.md's own "60 FPS is measured and failing" section names; and **five confirmed still genuinely open**, each already stating its own real gap accurately: Basic brush and eraser (the real engine — size/hardness/colour — is Phase 2 scope, not started; only a fixed-radius dab exists); Import/export PNG/JPEG/TIFF and Format gaps (both share one remaining gap, TIFF Palette/CMYK decode, blocked on a real ICC-aware `aurora_color::Transform` and a CMYK profile `corpora/icc/` still doesn't have); Incremental compositing (GPU-side compositing now real, but only the brush/eraser path invalidates single tiles); and The live canvas rendered pure checkerboard... (added later, 2026-08-24, deliberately `[~]` — the reported symptom is fixed but the atlas still cannot render minified content at all). See M1.9's own entries below for the full, chronological account. |
+| **Phase 1 — M1.9** | **33 of 53 top-level items done, 8 still `[~]`, 12 not started — updated 2026-08-26, was "20 of 27 top-level items done, 7 still `[~]` — updated 2026-08-12."** That 2026-08-12 count was badly stale, exactly as its own "worth a fresh, item-by-item check... not done as part of this pass" caveat warned: this section has grown from 27 to 53 top-level items as heavy compositing/blend-mode/undo/format work landed afterward (most of the 12 `[ ]` items are small, named hardening bugs found during later review rounds — a stale scratch-directory race, an unbounded `make_room` clone, a non-finite-pan edge case, and similar — not unstarted scope). A fresh, item-by-item check of all 8 `[~]` marks (2026-08-26) found: **two stale and now `[x]`**, confirmed against passing tests rather than prose alone — `.aur` format (13 `aurora-io` + 8 `aurora-app` tests passing, including a real moved-layer round-trip; every gap the bullet itself named was already closed elsewhere) and Pixel-edit undo (Brush/Eraser) (unified chronological undo/redo and whole-stroke coalescing both confirmed by passing tests); **one stale claim corrected in place** — Multi-layer compositing's own text still said "GPU-side compositing remain[s]... still-open," but `begin_gpu_composite_tile` has in fact been wired into `recomposite_visible_tiles` for a while (confirmed by a passing GPU/CPU-agreement test), so only per-tile-dirty-aware invalidation across every edit path remains genuinely open — **narrowed further on 2026-09-02 (0.72.0/0.73.0): the active-layer switch and undo/redo halves are now guarded/narrowed too, document-open turned out never to have been a gap, and only a live Move still bumps the whole cache, which is not narrowable without re-anchoring the composite grid to the document instead of the active layer; then partly walked back the same day (0.73.1–0.73.4) after an independent review found the *structural* undo/redo half unsound — a layer's declared `bounds` is not an enforced extent of its real content, so only the pixel (stroke) half still narrows; see the Incremental compositing bullet's two 2026-09-02 addenda** — the same gap CLAUDE.md's own "60 FPS is measured and failing" section names; and **five confirmed still genuinely open**, each already stating its own real gap accurately: Basic brush and eraser (the real engine — size/hardness/colour — is Phase 2 scope, not started; only a fixed-radius dab exists); Import/export PNG/JPEG/TIFF and Format gaps (both share one remaining gap, TIFF Palette/CMYK decode, blocked on a real ICC-aware `aurora_color::Transform` and a CMYK profile `corpora/icc/` still doesn't have); Incremental compositing (GPU-side compositing now real; as of 2026-09-02 brush/eraser dabs, pixel-stroke undo/redo, and same-origin active-layer switches invalidate narrowly — structural undo/redo and a live Move both still bump the whole cache, the former reverted the same day after review found it unsound, see the bullet's own addenda); and The live canvas rendered pure checkerboard... (added later, 2026-08-24, deliberately `[~]` — the reported symptom is fixed but the atlas still cannot render minified content at all). See M1.9's own entries below for the full, chronological account. |
 | **Phase 1 — M1.10** | **Phase 1 gate — in progress, added to this table 2026-08-12 (never had a row before).** Two items are genuinely blocked on hardware not available to this session: the accessibility audit and the IME audit, both explicitly "all three platforms." A third, "60 FPS at the Phase 0 document size," is done in the sense that a real measurement now exists (see M1.9 above) — the honest result is over budget, not passing, and no real GPU hardware has confirmed or refuted whether that holds outside this sandbox's software Vulkan renderer. The fourth, "Component gallery complete, contrast checks green," needs a real design-owner decision (which of design/gallery/index.html's remaining named components to build next) before it's actionable, not an engineering gap. See M1.10 |
 
 **The single most important open item, updated:** on macOS, a screen reader
@@ -491,7 +493,7 @@ workspace, same pattern as `spike/`), commit
 - [x] Type scale, spacing scale, radius, elevation, motion values — [design/tokens/scales.toml](design/tokens/scales.toml), owner-approved; font family still an open placeholder (`[type].family`), not blocking
 - [x] One complete built-in theme (Dark), all pairs passing contrast — [design/themes/dark.toml](design/themes/dark.toml), owner-approved; every gated pair passes WCAG 2.1 AA via [design/check_contrast.py](design/check_contrast.py) (17/17 gated pairs pass; `border.default` and disabled text are informational, not gated — see script comments for the WCAG 1.4.11 rationale)
 - [x] Static mockups: main workspace + 2–3 panels — [design/mockups/workspace.html](design/mockups/workspace.html) (Layers/Properties/History docked), owner-approved; HTML/CSS is a Phase 0 review tool only, not how `aurora-widgets` renders
-- [x] Component gallery skeleton — review surface and golden-image target — [design/gallery/index.html](design/gallery/index.html), owner-approved; covers button/checkbox/slider/field/dropdown/tab bar/tooltip/swatch across forced states; scrollbar/tree/menu/curve editor deliberately left for a later pass
+- [x] Component gallery skeleton — review surface and golden-image target — [design/gallery/index.html](design/gallery/index.html), owner-approved; covers button/checkbox/slider/field/dropdown/tab bar/tooltip/swatch across forced states; tree/menu/curve editor deliberately left for a later pass (scrollbar was in that deferred group too until 2026-09-02, when the design owner approved building it — it now has a real widget, paint, and gallery entry in all five themes; the HTML file's own section for it is still unwritten)
 - [x] Outside critique on the mockups (risk R2f mitigation) — **2026-07-28: a colleague reviewed the scaffold and signed off as fine for a start**, with the explicit understanding it can be revised later if needed. Not a formal design-professional audit, but it satisfies R2f's actual gap (no second opinion at all) — good enough to unblock widget work; deeper critique can still happen opportunistically as the token system gets exercised for real.
 
 ### 0.6 Format feasibility — PSD partially done; RAW/ICC spiked
@@ -1338,9 +1340,12 @@ every widget in every state across all built-in themes with contrast checks gree
   crate). Lives on `LayerEntry` itself, not inside `LayerKind` — Photoshop
   allows a mask on both pixel layers and groups (a group mask clips the
   whole subtree), so it can't be a `Pixel`-only field; a dedicated test
-  (`add_mask_works_on_a_group_too`) confirms this. **Deliberately no real
-  mask pixels yet** — same open resource-management question
-  `LayerKind::Pixel`'s own `bounds` field already flagged, and masks are
+  (`add_mask_works_on_a_group_too`) confirms this. **Mask pixels were
+  deliberately absent when this landed; they arrived in 0.70.0** (see
+  M1.9's own "Real per-pixel grayscale mask coverage" bullet) — stored
+  on their own tile surface via `LayerTree::mask_surface_id`, the same
+  answer ADR 0010 already gave for pixel layers, so `LayerMask` itself
+  still carries only `bounds`/`enabled`/`inverted`. Masks are
   still genuinely unspiked on the PSD side
   (`spike/psd-write/FINDINGS.md`: "Layer masks, vector masks, smart
   objects, layer styles, adjustment layers" all unstarted) — so
@@ -2155,6 +2160,138 @@ check licenses` clean with the new `toml` dependency.
   Verified: `cargo fmt --all --check` clean, `cargo clippy -p
   aurora-widgets --all-targets --all-features -- -D warnings` clean,
   `cargo test -p aurora-widgets` — 58/58 passed.
+  **`Scrollbar` landed 2026-09-02 (0.75.0) — 4 of 12 named widgets**,
+  `crates/aurora-widgets/src/widgets/scrollbar.rs` plus `paint_scrollbar`
+  in `paint.rs`: `ScrollbarState`/`ScrollbarRange`, `insert_scrollbar`/
+  `set_scrollbar_value`/`set_scrollbar_disabled`, a `Role::ScrollBar`
+  node carrying its own `Orientation` and clamped numeric value/min/max,
+  and a two-shape paint (a `surface.sunken` full-length track, an
+  `accent.primary` thumb whose *length* is proportional to
+  `page_size`/span — the one real geometric difference from a slider's
+  fixed-size knob). Layout thickness is resolved per orientation from
+  the type scale (`type_size(scales.typography.size.md)`), the same "no
+  dedicated control-size token exists yet" grounding `Checkbox`/`Slider`
+  already use — putting it on the wrong axis would silently make a
+  vertical scrollbar a 13px-tall horizontal bar, so `style` branches on
+  orientation rather than reusing `slider::style`. The range travels as
+  a `ScrollbarRange` struct rather than three more parameters,
+  specifically because the workspace's own `too_many_arguments` lint is
+  a real bound an 8-parameter `insert_scrollbar` would cross — the same
+  reason `aurora_io`'s own `WritePolicy` exists.
+  **Accessibility vocabulary, checked against the pinned source rather
+  than assumed**: `numeric_value`/`min_numeric_value`/`max_numeric_value`
+  plus `SetValue`/`Increment`/`Decrement`/`Focus`, *not* `ScrollX`/
+  `ScrollXMin`/`ScrollXMax`/`SetScrollOffset` — the scroll-offset
+  properties are read by no shipping `accesskit` 0.24 platform adapter,
+  while the numeric-value ones drive Windows UIA's RangeValue pattern
+  and the macOS/AT-SPI Value interfaces directly. **Stated honestly:
+  this is a position *model* only.** Nothing in this crate scrolls any
+  content — no viewport, no clip rect, no content offset, and no widget
+  observes a `ScrollbarState` — so a real scrolling container (which
+  `Tree` also still needs, on top of hierarchical expand/collapse this
+  crate models nowhere) remains open, exactly as before. No gallery
+  tree and no golden either: goldens need a human bless on real GPU
+  hardware, which is out of scope for this round; the three `paint.rs`
+  unit tests cover shape count/order, thumb travel, and disabled
+  dimming, and none of them is evidence that a scrollbar looks right on
+  a real display. 13 new lib tests (176 → 189 in the crate; workspace
+  1,410 → 1,423). Verified: `cargo fmt --all --check`,
+  `python3 scripts/check_layering.py`,
+  `python3 scripts/check_no_hardcoded_style.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace`, `cargo test
+  --workspace --doc`, and `cargo doc --workspace --no-deps
+  --all-features` all clean.
+  **An independent review round found five real defects in that commit,
+  all fixed 2026-09-02 (0.75.1).** Recorded in full because four of the
+  five were invisible to the green gate above, which is the point:
+  1. **A build-profile-dependent panic.** `paint_scrollbar` guarded
+     every *divisor* (`span > 0.0`, `range > 0.0`) and no *quotient*. A
+     `NaN` `value`, or `min = f64::NEG_INFINITY` with `max =
+     f64::INFINITY` (which satisfies `min <= max` perfectly), makes
+     `(value - min) / range` an honest `inf / inf = NaN`, which reached
+     `lyon` and tripped its own `assert!(p.y.is_finite())` in a debug
+     build while merely returning `Err(Paint)` in a release one. Both
+     fractions are now forced finite *after* the division.
+  2. **A public `Result`-returning API panicking anyway.** `f64::clamp`
+     asserts `min <= max` internally; that assertion lives in `core`,
+     so the workspace's own `panic = "deny"` lint could not see it, and
+     `insert_scrollbar(min = 100.0, max = 0.0)` (or either bound `NaN`)
+     panicked instead of returning. Both entry points now validate
+     explicitly and return a new `WidgetError::InvalidRange { min, max }`.
+  3. **A layout bug that made the widget swallow its whole parent.**
+     `style()` used `flex_grow: 1.0` with `auto()` on the scrolling
+     axis, borrowed from `slider::style`. `flex_grow` grows the
+     *parent's* main axis and the default `align_items: Stretch`
+     inflates `auto()`'s cross axis to match, so a vertical bar in a
+     300x200 `Row` resolved to **300 x 200** — measured, not deduced,
+     and independently reproduced against a standalone `taffy` program
+     with no Aurora code at all (a Gauntlet verifier round caught the
+     commit's original claim of `13 x 0` for this same scenario as
+     wrong — the fix and its tests were already correct, only that
+     one quoted figure was not). Now `percent(1.0)` on the scrolling
+     axis with
+     `flex_grow: 0.0`/`flex_shrink: 0.0`, which was the only one of
+     three candidate styles to resolve to `13 x 200` in *both* a `Row`
+     and a `Column` parent (`flex_grow` + `align_self: STRETCH` gives
+     `300 x 200` in a `Row`). Two permanent `compute_layout` tests, one
+     per orientation, assert the two differ.
+  4. **Value changes never reached the renderer.** `with_scrollbar_mut`
+     called only `set_accessibility`, which sets the per-widget `dirty`
+     flag but never unions the widget's bounds into the tree-wide damage
+     region `take_damage` hands a renderer — so a moved thumb was never
+     repainted, and the existing test passed because it asserted on
+     `is_dirty` alone. Now calls `mark_dirty` too, asserted against
+     `take_damage`. **The identical gap still exists in
+     `with_slider_mut` and the `text_field` mutators** and is left for
+     its own change rather than fixed as a drive-by here.
+  5. **The definition-of-done gap.** CLAUDE.md requires a widget to
+     appear "in the component gallery in every state" before it counts,
+     and the original commit skipped it. `tests/gallery.rs` now has
+     `scrollbar_gallery_tree` — four cells (vertical at minimum, at
+     maximum, disabled mid-travel, and a horizontal bar mid-travel, the
+     one cell whose shape differs, since a bar only has travel along its
+     own axis) — with a real rendered-pixel test in all five built-in
+     themes and five `#[ignore]`d golden-diff tests. Backdrops are
+     inherited from `Slider`'s own per-theme reasoning rather than
+     re-derived: a scrollbar resolves exactly the same two tokens.
+     Contrast re-checked, not assumed — all five themes pass every gated
+     pair, and the widget's own thumb-against-track pair (not itself
+     gated, the same as `Slider`'s) computes 8.02:1 Dark, 4.23:1 Light,
+     19.56:1 HC Dark, 8.59:1 HC Light, 9.08:1 Colour-Critical.
+  Smaller fixes in the same round: an `Option<String>` label reaching
+  `set_label` (a standalone bar is otherwise announced as an unnamed
+  "scroll bar" — `insert_scrollbar` gained a `label` parameter, 7 total,
+  still inside the `too_many_arguments` bound); `page_size` reaching
+  `set_numeric_value_jump` (the page-jump amount, the one quantity a
+  scrollbar has that a slider does not); a negative or non-finite
+  `page_size` clamped to `0.0`; a non-finite `value` parked at `min`
+  rather than stored verbatim; and `ScrollbarRange`'s previously
+  unstated `max` convention written down (`max` is the maximum scroll
+  *offset*, `content_size - page_size`, **not** the content size).
+  **Guard strength was measured by mutation, not asserted.** Deleting
+  `.min(track_len)`, `.max(thickness)`, the `span > 0.0` guard, or both
+  finite-quotient guards each now fails at least one test — verified by
+  actually applying each deletion and running the suite. The `range >
+  0.0` guard is the honest exception: it survives deletion because it is
+  *provably unobservable* (whenever `range == 0`, `span` reduces to
+  `page_size`, so the thumb is full-length and its remaining travel is
+  exactly zero, making `offset` `anything * 0.0`). It is kept, and
+  documented as an equivalent mutant rather than passed off as covered.
+  **Design-owner note**: Cahya approved keeping `Scrollbar` and
+  finishing it properly this round, retroactively resolving the "needs
+  more structural design work" deferral `design/gallery/index.html` and
+  the three PLAN.md passages below had recorded. **Still open and not
+  claimed**: no human has blessed any of the five scrollbar goldens (the
+  images were generated once on this box's real discrete adapter and
+  looked structurally right, which is not a bless and is not committed);
+  a `Role::ScrollBar` reports read-only through Windows UIA regardless
+  of the `SetValue` action declared, an `accesskit` role-mapping
+  property now noted in the module doc rather than implied away; and
+  this is still a position model with nothing that scrolls. 27 new lib
+  tests (189 → 203 in `aurora-widgets`, plus 5 gallery tests and 5
+  ignored goldens; workspace 1,423 → 1,442 passing). Full gate re-run
+  clean.
 - [~] **Vector-first rendering via `aurora-vector` (resolution-independent)**
   — first real slice done 2026-08-06, picked up as a direct prerequisite
   the "Component gallery + golden-image tests" bullet below was found to
@@ -3045,9 +3182,15 @@ check licenses` clean with the new `toml` dependency.
   highlighting (still Cahya's own architecture decision, not picked
   unilaterally); the remaining named widgets from that file's own list
   (`Dropdown`, `Tab bar`, `Tooltip` — each needs real text shaping,
-  which `aurora-text` doesn't have yet; `Scrollbar`/`Tree`/`Menu`/
-  `Curve editor` are explicitly deferred further by that file's own
-  "needs more structural design work" note).
+  which `aurora-text` doesn't have yet; `Tree`/`Menu`/`Curve editor`
+  are explicitly deferred further by that file's own "needs more
+  structural design work" note). **`Scrollbar` was in that deferred
+  group until 2026-09-02**, when the design owner approved building it
+  anyway; it landed in 0.75.0 and got its gallery entry — all four
+  states, all five built-in themes — plus its review fixes in 0.75.1,
+  see this section's own `Scrollbar` entry above. What is still open for
+  it is a *scrolling container*, not the structural design work this
+  note originally described.
 
   **Per-theme coverage partially unblocked, 2026-08-09**: the Light
   theme now exists (`design/themes/light.toml`) and passes its own
@@ -7381,27 +7524,48 @@ structural design work.
     has been run in a live session on real hardware, and none of it
     changes the still-open 60 FPS finding — this reduces peak *memory*,
     not per-tile cost.
-- [ ] **`begin_gpu_composite_tile` has the same collect-all-siblings
+- [x] **`begin_gpu_composite_tile` has the same collect-all-siblings
     shape the CPU path just lost** — named 2026-08-24, when
     `resolve_tile`'s own version was fixed (0.51.0), and deliberately
-    left open. It collects one buffer per visible root-level layer
+    left open. It collected one buffer per visible root-level layer
     before its upload/composite loop, reachable specifically when the
     document qualifies for GPU compositing (flat, groupless, all-
     `Normal`) — plausibly the *more* common shape for a many-layer
-    document, so this is not a smaller problem than the one just fixed.
-    Not fixed here. **Correction, from an independent judgment pass**: an
-    earlier draft of this bullet overstated the code obstacle — the
-    `dst_texture` accumulator already exists and is already cleared
-    before the loop, and each iteration already builds its own
-    `src_texture` and calls `composite_over_with_opacity` immediately, so
-    merging the resolve loop into the upload loop is close to the same
-    code motion the CPU side got, not a real batch/readback
-    restructuring; only the `layer_texels.is_empty()` early-return needs
-    rework. The real, honest blocker is that **there is no real GPU in
-    this sandbox to verify such a change against** (CLAUDE.md: a green
-    headless run is not evidence about GPU behaviour) — that alone is
-    reason enough to defer it, without overstating the code-side
-    difficulty too. Sized, not scheduled.
+    document, so this was not a smaller problem than the one just fixed.
+
+    **Closed 2026-09-01 (0.69.0)**, once the real blocker this item
+    itself named was actually gone: an earlier round of this same
+    session found this sandbox has a real NVIDIA RTX 3090 (`vulkaninfo`/
+    `nvidia-smi`, `DeviceType::DiscreteGpu`), not the Mesa llvmpipe
+    software rendering CLAUDE.md's text still assumes for "a typical
+    Linux dev box here" — so the change below is verified against real
+    hardware, not just a headless software-Vulkan run. The prior
+    independent-judgment correction on this item was right about the
+    code shape: the `dst_texture` accumulator now builds lazily, on the
+    first root layer that actually resolves at a given tile (via
+    `Option<(Texture, TextureView)>::get_or_insert_with`), rather than
+    resolving every root into a `Vec<(Vec<half::f16>, f32)>` before
+    uploading any of them — one root's own texels plus one GPU texture
+    pair is now this function's peak per-tile memory, the same shape
+    `composite_roots_into_tile`'s CPU path already had after 0.51.0. A
+    tile with no content on any root layer still returns `None` doing
+    zero GPU work (`dst?` after the loop), exactly as the old
+    collect-then-check-empty shape did — no behaviour change, only the
+    memory shape. New test
+    `recomposite_visible_tiles_gpu_path_skips_an_early_root_with_no_content_at_this_tile`
+    specifically exercises the case this rewrite had to get right: the
+    *bottom* root has no tile at all at the position under test, so the
+    loop must `continue` past it without creating the destination
+    texture, and only build it once the *middle* root resolves —
+    checked against both an independently hand-computed expected pixel
+    and the CPU path's own result, on real hardware
+    (`AURORA_REQUIRE_GPU=1`, adapter logged as `NVIDIA GeForce RTX 3090
+    (Vulkan, DiscreteGpu)`). All pre-existing GPU-path tests
+    (`..._batches_multiple_real_tiles_in_one_call_without_mixing_them_up`
+    included, the one that most exercises this function's control flow)
+    still pass unchanged. 310 `aurora-app` tests, up from 309.
+    (Corrected 2026-09-02: this originally said 311/310 — off by the
+    one test the very next round, 0.69.1, actually added.)
 - [x] **Every saved file with translucent pixels has premultiplied
     alpha where straight alpha belongs — the un-premultiply step runs
     only inside a group** — found 2026-08-24 by the review of the
@@ -7681,7 +7845,7 @@ structural design work.
     That check is still owed, and it is the one part of this round where
     a wrong result would be immediately obvious to a person and is not
     obvious from any test.
-- [ ] **Atlas filtering may produce dark halos at translucent edges when
+- [x] **Atlas filtering may produce dark halos at translucent edges when
     zoomed out — needs real-hardware verification.** Raised 2026-08-24 by
     the 0.52.0 review, independently derived by two reviewers by hand
     computation, and **unconfirmed** — recorded as a plausible risk, not
@@ -7734,7 +7898,33 @@ structural design work.
     of its own size, and doing it blind on unconfirmed evidence, with no
     real GPU to check it against, is exactly the mistake CLAUDE.md's own
     "lesson from the last round" warns about.
-- [ ] **GPU-backed tests self-skip silently instead of failing when no
+
+    **Closed 2026-09-01 (0.68.0, refined through 0.68.4)**, once the
+    real GPU this item's own text says it needs actually became
+    available — this sandbox has a real NVIDIA RTX 3090, not the Mesa
+    llvmpipe software rendering CLAUDE.md's text still assumes for "a
+    typical Linux dev box here." Took candidate fix (ii): the tile store
+    stays straight alpha, unchanged; `TileResidency::sync`/`upload_mip`
+    now premultiply at atlas-upload time, and `canvas.wgsl`'s `fs_canvas`
+    is back to the pre-0.52.0 premultiplied "over" formula, so
+    `min_filter: Linear` interpolates in the colour space where linear
+    filtering is actually defined. 0.68.4 closed an adjacent gap the
+    initial fix missed: `aurora-render`'s mip/preview box filter
+    (`mip::downsample`) was still averaging in the straight domain
+    *before* handing texels to the now-premultiplying upload path,
+    which would have baked the same halo into every preview mip one
+    step upstream of the fix — it now premultiplies before averaging,
+    the same domain the atlas fix picked. Verified by real-hardware
+    pixel readback (`AURORA_REQUIRE_GPU=1`, adapter logged as `NVIDIA
+    GeForce RTX 3090 (Vulkan, DiscreteGpu)`), with a genuine negative
+    control: the shader-only revert and the upload-only revert were each
+    applied, run, and confirmed failing before being restored. **Stated
+    honestly, not overclaimed**: the original halo was never reproduced
+    as a user-visible artifact by either reviewer, on any hardware — this
+    closes a real, mathematically-justified correctness gap in the
+    sampling math, not a confirmed visual bug. Full detail in the
+    0.68.0/0.68.4 addenda under "Next action" below.
+- [~] **GPU-backed tests self-skip silently instead of failing when no
     adapter is present — a systemic CI gap.** Not introduced by 0.52.0,
     but newly and sharply highlighted by it. Review demonstrated that
     reverting either half of the premultiplied-alpha fix — the GPU
@@ -7755,6 +7945,141 @@ structural design work.
     hatch stays available on a dev box and is impossible on a runner
     where a green run is being treated as evidence. Untouched by the
     0.52.0 round on purpose.
+
+    **Built in 0.60.0.** The escape hatch is now one function, not six
+    copies: `aurora_gpu::test_support::real_context_or_skip()`, exposed
+    through a new `test-support` Cargo feature on `aurora-gpu` (the same
+    shape, and the same "absent from a shipped build, present under
+    `--all-features` and dev-targets" guarantee, as `aurora-doc`'s own
+    `test-support` feature). It returns `None` and prints the unchanged
+    `SKIPPED: no GPU adapter available on this machine/CI runner` line
+    when `GpuContext::new()` reports `NoSuitableAdapter` and
+    `AURORA_REQUIRE_GPU` is off; with that variable on, the same
+    condition panics instead, so a runner that is supposed to have a
+    real adapter fails rather than going green on a suite of skips. Any
+    *other* error still panics regardless, as before. All five
+    previously-duplicated call sites now delegate: `aurora-gpu`'s own
+    `real_context`, `aurora-render`'s and `aurora-widgets`'
+    `src/test_support.rs`, `aurora-widgets/tests/gallery.rs`, and
+    `aurora-app`'s `real_gpu_context`. Each keeps its own
+    `GPU_TEST_LOCK` and its own `GpuTestContext` wrapper — those are
+    per-test-binary and cannot be shared; only the decision moved.
+
+    **Corrected in-round (still 0.60.0), after review.** The first cut
+    had two defects serious enough that the item would have shipped
+    claiming a guarantee it did not provide.
+
+    *An adapter is not the same as a GPU.* The first cut branched only
+    on `GpuContext::new()`'s `Err`, so `AURORA_REQUIRE_GPU=1 cargo test
+    -p aurora-gpu` passed cleanly on this llvmpipe-only sandbox — the
+    exact failure mode this item exists to close (a runner supposed to
+    have hardware whose driver silently fell back to a software
+    rasterizer: llvmpipe on Linux, WARP / "Microsoft Basic Render
+    Driver" on Windows) surviving in its most likely real-world form.
+    `real_context_or_skip` now also checks `adapter_info().device_type`
+    on the success path and fails when it is `wgpu::DeviceType::Cpu` and
+    the variable is on. Only `Cpu` is rejected and only when the
+    variable is on: with it off this is a no-op (a CPU adapter is a fine
+    dev box), and every other `DeviceType` — `Other` included, since
+    some backends report genuine hardware that way — is accepted, so an
+    unrecognised future variant fails open rather than failing a real
+    runner. The adapter's name, backend and device type are now printed
+    on *every* successful creation, so a CI log records what was
+    actually tested rather than only that something was.
+
+    *`AURORA_REQUIRE_GPU=0` meant on.* The first cut parsed by presence
+    (`var_os(..).is_some()`), so `0`, `false` and the empty string all
+    enabled it. Two concrete reasons that is wrong, not merely
+    surprising: `wgpu-types`, a direct dependency of this workspace,
+    documents the opposite convention for its own `WGPU_*` variables
+    ("if the value is `0`, the flag is unset"); and GitHub Actions sets
+    a variable to the **empty string** when a `${{ }}` expression
+    evaluates to empty or null, so a natural `AURORA_REQUIRE_GPU: ${{
+    matrix.gpu }}` would have turned it on for every matrix leg,
+    including the GPU-less ones, failing the whole matrix for a reason
+    the workflow file never states. Parsing is now: unset is off; the
+    present-but-falsy values `` (empty), `0`, `false`, `off`, `no`
+    (trimmed, ASCII-lowercased) are off; anything else present is on. A
+    non-UTF-8 value is on, since it is certainly none of those. The
+    falsy set is pinned by its own test in both directions.
+
+    **Evidence.** The pure decision functions —
+    `gpu_error_action(&GpuError, require_gpu: bool) -> GpuTestAction`,
+    `require_gpu_from_value(Option<&str>) -> bool`, and
+    `adapter_is_software_when_gpu_required(wgpu::DeviceType,
+    require_gpu: bool) -> bool` — take every input as a parameter and
+    are unit-tested directly, with no GPU and no environment mutation
+    involved. That shape is not stylistic: `std::env::set_var` is
+    `unsafe` in edition 2024 and this workspace denies `unsafe_code`
+    workspace-wide, so a test can *only* reach the "required" branch by
+    passing `true`.
+
+    Beyond those unit tests, both hard-fail paths were **observed end to
+    end in this sandbox**, which the first cut said was impossible:
+
+    * *Software-adapter rejection* needs no trick at all — this sandbox
+      only has llvmpipe. `AURORA_REQUIRE_GPU=1 cargo test -p aurora-gpu`
+      now fails with `AURORA_REQUIRE_GPU is set, but the only adapter
+      available is a software rasterizer (llvmpipe (LLVM 21.1.8, 256
+      bits), Cpu), not real GPU hardware`, where before the correction
+      it passed 47/47. Reproduced identically in `aurora-render`,
+      `aurora-widgets` (lib *and* the separate `gallery` test binary),
+      and `aurora-app`.
+    * *No adapter at all* is reproducible by breaking Vulkan ICD
+      discovery: `VK_ICD_FILENAMES=/nonexistent/none.json
+      VK_DRIVER_FILES=/nonexistent/none.json`. Vulkan/lavapipe is this
+      sandbox's only backend, and `GpuContext::new_async` uses
+      `InstanceDescriptor::new_without_display_handle()` (so
+      `WGPU_BACKEND`-style overrides do not apply, but ICD discovery
+      does). With those set and the variable off, tests print `SKIPPED`
+      and pass; with the variable on, they fail with
+      `AURORA_REQUIRE_GPU is set, but no GPU adapter was found: no
+      suitable GPU adapter found`. Re-confirmed across all four crates
+      *after* the device-type check was added, not assumed unaffected
+      by it.
+
+    **What is still open, and why this is `[~]` and not `[x]`.**
+    Originally: no file under `.github/workflows/` touched at all, so
+    every existing job behaved byte-identically to before, and which
+    runner (if any) genuinely has a real adapter was an open question
+    needing a human, not a code change.
+
+    **2026-08-31: the question now has a way to answer itself, without
+    committing to an answer first.** `.github/workflows/gpu-probe.yml`
+    is a new, standalone `workflow_dispatch`-only workflow — deliberately
+    *not* folded into `verify.yml`'s regular push/PR matrix — that runs
+    `cargo test --workspace --all-features` on `macos-latest` with
+    `AURORA_REQUIRE_GPU=1` and `--nocapture`, so every GPU-gated test's
+    own "GPU adapter: `<name>` (`<backend>`, `<device_type>`)" line
+    (`aurora_gpu::test_support::real_context_or_skip`'s own log) reaches
+    the run log whether the test passes or fails. `ubuntu-latest` and
+    `windows-latest` are deliberately not probed: their hosted runners
+    are virtualized with no GPU passthrough, so `AURORA_REQUIRE_GPU`
+    there would only reconfirm the already-known llvmpipe/WARP gap, not
+    answer anything new. `macos-latest` is the one case genuinely
+    unverified from a sandbox — it runs on real Apple Silicon hardware,
+    but whether GitHub's sandbox exposes a *usable* Metal adapter to a
+    headless test process is not something this sandbox can determine by
+    reading code.
+
+    **Still open, and now concretely actionable rather than only
+    conceptually so**: Cahya needs to actually trigger the probe (Actions
+    tab → "Run workflow") and read the result. A pass with a non-`Cpu`
+    device type means `AURORA_REQUIRE_GPU` can move into `verify.yml`'s
+    real macOS `test` matrix leg and `gpu-probe.yml` can be deleted; a
+    fail, or a pass reporting `Cpu`, means macOS hosted runners are
+    software-rendered too and this stays open until real GPU-backed
+    infrastructure exists (self-hosted or a paid GPU tier), at which
+    point `gpu-probe.yml` is still deleted, just without the win.
+
+    **A second, narrower limitation, disclosed rather than fixed.** What
+    the mechanism asserts is that a real adapter *exists* — not that any
+    particular GPU-gated test body actually executed. A test marked
+    `#[ignore]`, or one that early-returns for some unrelated reason,
+    still contributes a silent pass with the variable set. Closing that
+    would need per-test accounting (an executed-count assertion, or
+    dropping the `Option` return in favour of an unconditional context),
+    which is a different and larger change than this item.
 - [~] **The live canvas rendered pure checkerboard at zoom 0.5, with all
     tile content invisible across the whole viewport** — found 2026-08-24
     during the 0.52.0 review; **pre-existing and unrelated to that fix**,
@@ -8793,8 +9118,9 @@ structural design work.
     sit on top of a new shared `layer_ids` walk (groups included) that
     keeps the same cycle budget and the same ordering; walking from
     `roots` reaches every entry because `validate_shape` already
-    refuses orphans. A mask's *extent* is deliberately still unbounded:
-    no mask pixels are stored yet, so it drives no loop.
+    refuses orphans. A mask's *extent* is deliberately still unbounded: mask coverage
+    pixels (added 0.70.0) live in the tile store, sparsely, and no
+    validation loop walks a mask's extent.
   - **Doc-comment overclaims this exposed, all corrected in 0.57.13.**
     `aurora-doc`'s `DocError::LayerOriginOutOfRange` claimed to cover
     "every public path that puts a caller-supplied `Rect` into the
@@ -8901,19 +9227,19 @@ structural design work.
     exercised a large `width` with an in-range origin, which is the one
     shape where saturating and plain `+` could have parted company on a
     rectangle the validated API can still produce.
-- [ ] **The Move tool can now silently stop moving a layer once a drag
+- [x] **The Move tool can now silently stop moving a layer once a drag
     would push its origin past ±300,000 px.** Disclosed 2026-08-29
     alongside the 0.57.13 revision of the origin fix above;
-    informational, low, and deliberately **not** fixed — closing it
+    informational, low, and deliberately **not** fixed then — closing it
     means touching `aurora-app` UI code, which that round was scoped out
-    of. `set_bounds` now returns `DocError::LayerOriginOutOfRange`, and
-    the Move drag handler logs a `tracing::warn!` and drops the move
-    with no user-visible feedback: the layer simply stops following the
-    pointer. Correct refusal, poor affordance. Reaching it needs a drag
-    a whole document extent off the canvas, so it is a rough edge rather
-    than an obstacle. Fix when someone is next in the Move tool: surface
-    the refusal the way other rejected edits are surfaced, rather than
-    only in the log.
+    of. `set_bounds` returns `DocError::LayerOriginOutOfRange`, and the
+    Move drag handler logged a `tracing::warn!` and dropped the move
+    with no user-visible feedback: the layer simply stopped following the
+    pointer. Correct refusal, poor affordance. **Fixed 2026-09-01
+    (0.66.0)**, on the shared dialog 0.65.0 generalized out of the
+    crash-recovery path — see the 0.66.0 addendum under "Next action"
+    for what landed, including which part of it is covered only by
+    inspection.
 - [ ] **`aur::write_best_effort` hard-fails on a tree carrying an
     out-of-range origin instead of skipping just that layer.**
     Disclosed 2026-08-29 alongside the 0.57.13 revision above;
@@ -9126,6 +9452,12 @@ structural design work.
       separator, and corrupting a legitimate name is the worse failure.
       Filtering runs *before* counting toward the cap, so invisible
       padding cannot consume the budget and leave a near-empty label.
+      **That cap bounds the output, and 0.64.2 had to add a second one
+      for the input** — finding 128 visible characters in a name made of
+      nothing but stripped ones means walking all of it, which a
+      reviewer measured at 158 ms for a crafted journal (see the 0.64.2
+      addendum); `MAX_SCANNED_CHARS` (1024) now stops that scan without
+      touching any name a real file carries.
     - **In total.** `journal_descriptions()` returns at most
       `MAX_DESCRIPTIONS` = 1000 real entries (Photoshop's own
       History-states maximum, cited as the precedent), keeping the most
@@ -9175,8 +9507,8 @@ structural design work.
     `journal_len()`, a relation that now holds only below 1000 entries;
     it compares against `journal_descriptions().len()` now, which is what
     the panel is actually built from.
-- [ ] **`describe()`'s `Restore` arm scans an unbounded entry list on the
-    UI thread** — disclosed 2026-08-30, **not fixed; informational**.
+- [x] **`describe()`'s `Restore` arm scans an unbounded entry list on the
+    UI thread** — disclosed 2026-08-30, **fixed 2026-09-01 (0.64.0)**.
     Found by a reviewer during the round above. `describe()`'s
     `LayerOp::Restore` arm resolves the subtree's root name with
     `removed.entries.iter().find(|(entry_id, _)| *entry_id == removed.root)`
@@ -9194,12 +9526,66 @@ structural design work.
     in one narrow way: the *output* is capped at 1000 entries and 128
     name characters, but the *compute per kept entry* is bounded only by
     the file's own size.
-    **Suggested direction, not implemented**: bound
-    `RemovedSubtree::entries`' length in `load_journal`, or resolve the
-    root by a map or a first-entry convention instead of a linear scan.
-    Either is a real change to a hot, load-bearing type and belongs with
-    whoever next opens `load_journal`'s validation posture deliberately,
-    not as a drive-by.
+    **Fixed by the first-entry-convention direction, deliberately not the
+    `load_journal` one.** The disclosure offered two shapes; only one of
+    them can be taken without reopening a doctrine. Bounding
+    `RemovedSubtree::entries`' length inside `load_journal` would make
+    that method reject journals it accepts today — exactly the structural
+    validation it documents itself as *not* doing, with `replay()` owning
+    that job — so it would have to come with whoever opens that posture
+    on purpose. Bounding the *search* does not: `describe()` is
+    display-only, so the worst it can do is print a placeholder.
+
+    A new `MAX_ROOT_SEARCH_ENTRIES` (64) in
+    `crates/aurora-doc/src/history.rs` caps the arm's scan with a
+    `.take(..)` ahead of the `.find(..)`. The root sits at index 0 for
+    every subtree this crate produces — `LayerTree::capture_subtree`
+    documents its visit order as "root first", and
+    `History::add_pixel_layer`/`add_group` each build a one-element list —
+    so any limit ≥ 1 is behaviour-preserving for every journal Aurora
+    itself wrote, and every pre-existing exact-string description
+    assertion stayed green unchanged. Past the bound the arm falls back
+    to the `"layer"` placeholder it already used when `entries` names no
+    root at all: **a disclosed, display-only degradation** reachable only
+    by a crafted or foreign journal. `journal_descriptions()`'s
+    "bounded on both axes" list gained a third bullet, so the narrow
+    contradiction this item recorded is gone: total work is now capped at
+    `MAX_DESCRIPTIONS × MAX_ROOT_SEARCH_ENTRIES` rather than by the
+    file's size.
+
+    Two new deterministic tests, no timing in either:
+    `describe_names_a_restore_root_that_leads_a_huge_entry_list` (root
+    first, 50,000 entries — the real case must still print the real
+    name) and
+    `describe_stops_searching_a_restore_entry_list_after_a_bounded_prefix`
+    (same size, root last — asserts the placeholder). The second is a
+    structural negative control: it fails against the unpatched,
+    unbounded `find`, which walks all 50,000 entries and finds the real
+    name. **The reviewer's 232 ms measurement was not re-measured** —
+    these tests prove the bound structurally rather than by timing, which
+    is deliberate (a wall-clock assertion is not stable in CI), so the
+    post-fix latency number is inferred from the bound, not observed.
+
+    **What 232 ms was, and was not, reachable through** (added 0.64.2,
+    after a second review round): it is a measurement against a
+    synthetic in-memory journal, not against a file. Through any `.aur`
+    the app will actually open, `aurora-io`'s
+    `MAX_METADATA_ENTRY_BYTES` (64 MiB, `crates/aurora-io/src/aur.rs`)
+    caps the whole journal entry, and a `(LayerId, LayerEntry)` pair
+    costs roughly 20 bytes on the wire — so *every* `entries` list in
+    the file put together holds a few million elements, and the
+    pre-fix worst case for this scan through a real file is single-digit
+    milliseconds rather than 232. The fix is still right (the bound is
+    now the panel's own caps, not the file's size), but the headline
+    number over-represents what a file could reach.
+
+    **Two follow-ups from that same second review round**, both closed
+    in 0.64.2: the boundary of `MAX_ROOT_SEARCH_ENTRIES` was untested
+    (mutation showed 1 and 49,998 both left the two tests above green),
+    and the root-first convention the whole bound rests on was
+    completely unenforced (injecting `entries.reverse()` after
+    `capture_subtree` left all 199 `aurora-doc` tests green). See that
+    addendum.
 - [x] **Panning past the document's *far* edge has no bound matching the
     origin-side one** — found 2026-08-25, fixed in 0.57.10.
     `clamp_pan_to_minimum` and `TileResidency::clamp_doc_origin` together
@@ -9583,18 +9969,23 @@ structural design work.
     itemized, user-visible warning FR-001's lossy-save rule calls for
     needs a dialog this shell does not have yet — see the new open item
     below.
-- [ ] **An export refused for unreadable tiles is only logged, never
+- [x] **An export refused for unreadable tiles is only logged, never
     shown to the user.** Opened 2026-08-24 by the 0.52.1 review, as the
     named remainder of the item above. `composite_document` now returns
     `IoError::IncompleteComposite` rather than silently writing a file
     with missing content, and `App::save_file` correctly writes nothing —
-    but from the user's side a Save that refuses looks identical to a
-    Save that worked, unless they are reading the log. PRD FR-001's rule
+    but from the user's side a Save that refuses looked identical to a
+    Save that worked, unless they were reading the log. PRD FR-001's rule
     is an *itemized warning before any lossy save*; this is the same
-    obligation on the same path. Needs a modal/notification surface in
-    `aurora-ui` that `save_file` can drive, which is real UI work rather
-    than a one-line change, and is why it was scoped out of 0.52.1 rather
-    than half-built.
+    obligation on the same path. **Fixed 2026-09-01 (0.65.0)** — the
+    modal surface this item said it needed turned out to already exist:
+    the crash-recovery dialog is built on `aurora_widgets`'
+    general-purpose `insert_dialog`, so the work was generalizing this
+    crate's own crash-recovery-specific plumbing into a shared
+    `open_dialog`/`close_dialog` and giving `save_file` an itemized
+    message, not building a new widget. See the 0.65.0 addendum under
+    "Next action" for exactly what landed and what is still only covered
+    by inspection.
 - [x] **A tile whose page-in fails is forgotten, so the *next* read of it
     silently returns a blank tile** — found 2026-08-24 while writing the
     export test above (**pre-existing**, not introduced by 0.52.1, and
@@ -9897,29 +10288,146 @@ structural design work.
     within budget, the dropped count is exact, a dropped tile reads back
     as a loud error rather than blank, and a retained one is still served
     from memory. Confirmed to fail with the cap disabled.
-- [ ] **A tile dropped from a best-effort autosave is indistinguishable
+- [~] **A tile dropped from a best-effort autosave is indistinguishable
     from a genuinely blank one inside the file.** Opened 2026-08-25 by
-    the second 0.52.2 review round (red-team RT-04). `aurora_io::aur`
-    already omits an all-zero tile from a `.aur` container as a size
-    optimisation, and a *skipped* tile is omitted the same way — so the
-    container records no difference between "this tile was empty" and
-    "this tile's pixels could not be read". `write_best_effort` returns
-    the list, and `write_autosave` logs it and now routes the whole file
-    to `aurora-autosave.partial.aur` rather than the canonical path, so
-    within one session and for a human reading either the log or the file
-    name the loss is visible. What is *not* visible is the per-tile
-    detail after a restart, in a different process: reopening the partial
-    container cannot say which tiles were dropped or offer to warn about
-    them.
+    the second 0.52.2 review round (red-team RT-04); closed in 0.74.0.
+    `aurora_io::aur` already omits an all-zero tile from a `.aur`
+    container as a size optimisation, and a *skipped* tile was omitted
+    the same way — so the container recorded no difference between "this
+    tile was empty" and "this tile's pixels could not be read".
+    `write_best_effort` returned the list and `write_autosave` logged it
+    and routed the whole file to `aurora-autosave.partial.aur`, so within
+    one session the loss was visible; after a restart, in a different
+    process, it was not.
 
-    Not fixed here because the honest fix is a **file-format change** —
-    a `skipped_tiles` list in the manifest and a `MANIFEST_VERSION` bump,
-    which is an ADR 0009 backward-compatibility decision (every past
-    version must keep reading) rather than a patch-scope edit, and it
-    wants the reader side and a user-facing warning designed with it.
-    The same still-open "an export refused for unreadable tiles is only
-    logged, never shown to the user" item above is where that warning
-    surface belongs, and the two should be done together.
+    **Marked `[~]`, not `[x]`, deliberately** (0.74.1): the crash-recovery
+    half named at the bottom of this item is real, deferred, and still
+    open, and the prose has always said so. The marker now agrees with
+    it.
+
+    **What shipped (0.74.0, corrected in 0.74.1).** A new **optional,
+    separate top-level ZIP entry**, `skipped-tiles`, holding a
+    `postcard`-encoded versioned wrapper — a schema `version`, the
+    **true, untruncated** `total` number of tiles dropped, and up to
+    `MAX_SKIPPED_TILE_RECORDS` (4096) `SkippedTileRecord`s (`surface`,
+    `tile_x`, `tile_y` and a reason, all raw scalars this module owns,
+    the reason truncated to 128 chars on write *and* on read) — written
+    by `write_with_policy` only when the skip list is non-empty.
+    `aurora_io::read_aur` now returns a named `AurDocument` struct (was a
+    private four-tuple) whose fifth field is `skipped_tiles`, an
+    `aurora_io::SkippedTiles`; absence of the entry reads as "nothing was
+    dropped". `App::open_aur_file` warns on it with a modal
+    "This Document Is Missing Content" dialog
+    (`skipped_tiles_warning`/`skipped_tiles_message`/
+    `open_skipped_tiles_dialog`), itemized with the count and the first
+    reason, stating plainly that the content cannot be recovered from the
+    file — the reason string is `aurora_doc::sanitize_display_name`d
+    first, since it is file-controlled text heading for an `accesskit`
+    label.
+
+    **Three defects a two-reviewer round found in the 0.74.0 shape, all
+    fixed in 0.74.1 before the format reached anyone:**
+
+    1. **The record was erased by the very next save.** Nothing stored
+       the opened file's skip list, so it was built into one dialog line
+       and dropped — and `write_with_policy` could not rediscover it,
+       because a tile an earlier writer dropped is not in the tile store
+       at all and reads as "never painted". Reproduced live: open a
+       lossy file → `skipped_tiles = 1` → the autosave `open_aur_file`
+       itself performs (*before* the dialog appears) already recorded
+       `0` → an ordinary Save produced a file with no `skipped-tiles`
+       entry → reopening *that* file warned about nothing. A crash
+       between the open and the dialog restored a document with no
+       record either. `App::skipped_tiles` now carries it, every writer
+       (`write_aur`, `write_aur_best_effort`, `write_autosave`) takes it
+       as `known_missing` and unions it with what it finds fresh, and
+       `read_autosave_container` keeps it too (through a named
+       `RecoveredDocument`) so a recovered autosave does not erase its
+       own record on the next write. `SkippedTiles::record` is the one
+       union implementation, shared by writer and app.
+    2. **The cap became a floor presented as a fact.** A real
+       17,920 × 15,872 px layer — inside the documented ceiling — with
+       its scratch tiles gone produces 4339 skips, of which 4096
+       survived, after which the dialog said "4096 tiles … could not be
+       read" as an exact number. The entry now carries `total` beside
+       the capped list and the message says "at least N" exactly when
+       `SkippedTiles::is_truncated`.
+    3. **Decode-before-truncate was a ~11,000× memory amplifier on the
+       untrusted startup path.** `read_skipped_tiles` shared the
+       manifest's 64 MiB `MAX_METADATA_ENTRY_BYTES` and truncated the
+       `Vec` *after* `postcard` had decoded all of it, which bounds what
+       is retained and not what is allocated — measured at ~790 MiB of
+       peak RSS from a 64 KiB DEFLATE-compressed file, through the real
+       shipped path, reachable from crash recovery before a window
+       exists. The entry now has its own
+       `MAX_SKIPPED_TILES_ENTRY_BYTES` (~2.1 MiB, derived from
+       `MAX_SKIPPED_TILE_RECORDS × MAX_SKIPPED_RECORD_BYTES`), enforced
+       by `read_capped` **before** any decode.
+
+    Two smaller corrections in the same round: the message no longer
+    claims "this file was saved by crash-recovery autosave" (a
+    provenance the file cannot prove — `write_aur_best_effort` is public
+    API), and it now uses the `MASK_SURFACE_BIT` distinction the record
+    has always carried, so a lost mask tile is not described as image
+    data. `handle_dropped_file` gained the `self.dialog.is_some()` gate
+    `handle_menu_event` already had, and `open_aur_file` now logs the
+    full itemized message when the modal slot was already occupied,
+    matching `save_file`'s own precedent.
+
+    **Deliberately not a manifest field, and not a `MANIFEST_VERSION`
+    bump** — the previous note here proposed exactly that, and both are
+    wrong. `postcard`'s wire format is positional (no field names or
+    tags), so a trailing struct field fails with
+    `DeserializeUnexpectedEnd` against old-shaped bytes before
+    `#[serde(default)]` is ever consulted; measured directly against this
+    workspace's pinned `postcard`, not recalled. And `read` hard-refuses
+    an unrecognised `MANIFEST_VERSION`, so a bump would make every
+    existing `.aur` file and every existing autosave permanently
+    unopenable. The reasoning is recorded in `aur.rs`'s own module doc
+    so nobody re-derives it. An ordinary `write()` — the `Refuse` policy,
+    every user-facing save — still produces byte-identical output,
+    pinned by `an_ordinary_write_carries_no_skipped_tiles_entry`.
+
+    Tests: `a_skipped_tile_survives_as_skipped_across_a_fresh_read`
+    (which now also runs the open → save → reopen sequence and asserts
+    the record survives it),
+    `a_container_without_the_skipped_tiles_entry_reads_as_none_skipped`
+    (the real backward-compatibility proof — a container with no such
+    entry), `an_ordinary_write_carries_no_skipped_tiles_entry`,
+    `a_hostile_skipped_tiles_entry_is_bounded` (over-long list truncated
+    to `MAX_SKIPPED_TILE_RECORDS` while `total` keeps the true count;
+    garbage bytes → `IoError::ManifestDeserialization`, not a panic),
+    `a_skipped_tiles_entry_past_its_own_byte_cap_is_refused_before_it_is_decoded`,
+    `an_unrecognised_skipped_tiles_version_still_reports_the_count`,
+    `an_overlong_multibyte_reason_is_cut_on_a_char_boundary_on_read`, and
+    `postcard_really_is_positional_so_a_trailing_field_breaks_old_bytes`
+    (the throwaway gate test that proved the design's premise, now
+    permanent and referenced by name from `aur.rs`'s own module doc) in
+    `aurora-io`; and
+    `open_aur_file_warns_when_the_file_was_written_with_tiles_missing`
+    (now going through the real `skipped_tiles_warning` helper rather
+    than a hand-rolled copy of the condition),
+    `a_complete_file_produces_no_missing_content_warning` (renamed from
+    `open_aur_file_opens_no_dialog_for_a_complete_file`, which promised a
+    dialog assertion it never made),
+    `an_opened_documents_missing_tiles_survive_the_next_autosave`,
+    `a_truncated_skip_list_is_reported_as_a_floor_not_a_fact`,
+    `the_message_distinguishes_lost_mask_coverage_from_lost_image_data`,
+    `skipped_tiles_message_sanitizes_a_hostile_reason` in `aurora-app`.
+
+    **Still open, named rather than dropped: the crash-recovery path
+    does not warn.** `read_autosave_container` (and so `recover_document`
+    and `App::new`'s startup route) now *keeps* `skipped_tiles` as of
+    0.74.1 — it reaches `App::skipped_tiles` and is written out again by
+    every later save, so the record is no longer lost — but nothing
+    **tells the user** on that route, and that is exactly the path where
+    a partial autosave is most likely to be read. It was scoped out of 0.74.0 for two concrete
+    reasons: that path has its own separate primary-then-`.partial`
+    fallback logic and its own test suite, and its single modal dialog
+    slot at startup is already claimed by the crash-recovery dialog, so
+    warning there is a message-design decision rather than one more call.
+    A code comment at `read_autosave_container` names it. Do not read
+    this checkbox as covering it.
 
     Minor related note from the same round (red-team RT-05): a
     `debug_assert!` is **not** caught by this workspace's
@@ -10954,7 +11462,7 @@ structural design work.
     to the Windows branch — that gap is still correctly disclosed above
     as Unix-only-covered, and its own test stays `#[cfg(unix)]`-gated.
 
-- [ ] **Scratch directories from sessions that never reach the shutdown
+- [~] **Scratch directories from sessions that never reach the shutdown
     cleanup are never cleaned up.** Opened 2026-08-24, split out of the
     item above as the one part of it deliberately left to its own round.
     Any run that does not reach the `WindowEvent::CloseRequested`
@@ -10962,8 +11470,10 @@ structural design work.
     gigabytes of the user's real painted pixels — behind for the
     platform's temp cleaner, which on many machines means indefinitely.
 
-    **That is not only crashes**, as this item first said. It is equally
-    every *clean* quit that bypasses that specific handler: macOS's
+    **That was not only crashes**, as this item first said — though the
+    clean-quit half is fixed as of 0.63.0 (see the addendum below), so
+    what follows describes the state this item opened in. It was equally
+    every *clean* quit that bypassed that specific handler: macOS's
     native menu Quit item terminates through AppKit rather than
     delivering a winit `CloseRequested` event, and `App::fail`'s own
     early-exit path never reaches it either. Nor is it unique to the
@@ -10981,61 +11491,135 @@ structural design work.
     quit through any route runs `clean_shutdown_cleanup`. The second is
     the cheaper one and covers the marker and autosave too.
 
-    Concrete fix shape: a sweep at startup over `aurora-scratch-*`
-    siblings, deleting only those whose owning process is provably gone.
-    That liveness check is the whole reason this is its own round — it is
-    a per-platform question (an advisory lock file inside each directory
-    is the most portable answer; a bare pid check races pid reuse), and
-    getting it wrong deletes a *live* session's scratch tiles, which is
-    worse than the leak it fixes.
+    **First half closed 2026-09-01 (0.63.0)**:
+    `ApplicationHandler::exiting` now runs `clean_shutdown_cleanup` plus
+    the workspace-layout save, via a new `App::finish_shutdown` that the
+    `WindowEvent::CloseRequested` arm calls too; `App::fail`'s existing
+    `el.exit()` reaches it as well, so no separate call was needed there.
+    Verified against the vendored winit 0.30.13 source: `el.exit()`
+    dispatches `Event::LoopExiting`, `event_loop.rs:648` maps it to
+    `ApplicationHandler::exiting`, and each backend emits it —
+    `macos/app_state.rs:224` (`internal_exit`, which
+    `applicationWillTerminate:` at `:171` calls, i.e. the native menu
+    Quit), `windows/event_loop/runner.rs:302/311/322`,
+    `linux/x11/mod.rs:429`, `linux/wayland/event_loop/mod.rs:231`; macOS
+    additionally queues its end-of-iteration observer at lowest priority
+    so `LoopExiting` cannot precede `AboutToWait`
+    (`macos/observer.rs:71`). **Not verified on real hardware — no test
+    in this crate can drive a real event loop**, so the wiring itself is
+    still inspection-only, exactly as the `CloseRequested` arm always
+    was. What *is* tested is the property the two call sites rest on:
+    `clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`
+    (`crates/aurora-app/src/lib.rs`) runs the cleanup twice over a real
+    marker, a real autosave and a real scratch directory holding real
+    flushed tiles, and asserts the second pass is a no-op.
 
-- [ ] **`aurora_tile::create_private_dir` wants `O_NOFOLLOW` and a real
+    **0.63.0's own first cut of this went too far, and 0.64.1 corrected
+    it.** Routing *every* exit through the full cleanup meant
+    `App::fail`'s `el.exit()` deleted the session marker and the
+    autosave too — and `App::fail` runs only from inside `resumed`,
+    before a window exists, where `App::new` may already have recovered
+    a *previous* crash's document out of that autosave without
+    rewriting it and where the recovery dialog it built can never have
+    been shown. That is a data-loss regression against a state (before
+    0.63.0) in which a retry simply recovered. `App::finish_shutdown` is
+    now `run_shutdown_cleanup(self)`, which branches on `self.failed`:
+    an aborted run gets `aborted_startup_cleanup` — this run's own
+    scratch tiles only, no marker, no autosave, no layout write — while
+    `CloseRequested` and the menu Quit are unchanged. Pinned by
+    `a_failed_startup_preserves_the_previous_runs_crash_recovery_data`,
+    and the layout double-write the trio-only idempotency test never
+    reached is now covered by
+    `finish_shutdown_is_idempotent_across_two_exit_paths`. The lesson
+    worth keeping: "clean up on every exit path" is not one rule —
+    *whose* data a path is holding decides what it may delete.
+
+    **The startup sweep landed 2026-09-01 (0.67.0), on Unix only.** A
+    hard crash, a `SIGKILL`, an OS shutdown, and a `panic = "abort"`
+    build (the release profile sets it) all end the process without
+    running any Rust cleanup, so they never reach `exiting` either and
+    used to strand a scratch directory forever. A new
+    `aurora_tile::scratch` module now gives each session's directory an
+    advisory `flock` on an `aurora.lock` file inside it, taken
+    immediately after the directory is created and held for the
+    process's whole life; `aurora_app::run` sweeps
+    `std::env::temp_dir()` for `aurora-scratch-*` siblings once at
+    startup, **before** this session's own directory exists, and deletes
+    one only when it can take that directory's lock — proof no live
+    process holds it. The marker and the autosave still have the
+    original gap in full, and deliberately so: a crashed run's marker is
+    what makes the *next* run offer recovery.
+
+    **Windows is not covered this round.** `flock` is Unix-only; the
+    `#[cfg(not(unix))]` arms are honest no-ops (`lock_scratch_dir`
+    returns a guard that locks nothing, `sweep_orphaned_scratch_dirs`
+    returns a zeroed report and logs once that liveness is not
+    implemented), so a Windows run leaks exactly as it did before rather
+    than guessing at an equivalent. `LockFileEx` is the shape a later
+    round would use.
+
+    **Two other things it deliberately does not do**, both because the
+    same reasoning forbids them: a directory created but not yet locked
+    has no lock file for the few microseconds between `mkdir` and
+    `flock`, and every **pre-0.67.0 leftover** has none forever — so "no
+    lock file" is `Verdict::Unknown`, never `Dead`, and neither is ever
+    swept. Making the second case sweepable would necessarily make the
+    first case deletable, which would destroy a live session's unsaved
+    pixels. Old leftovers are a one-time manual `rm`.
+
+- [x] **`aurora_tile::create_private_dir` wants `O_NOFOLLOW` and a real
     ownership check before FR-026 lets a user choose the scratch
-    location.** Opened 2026-08-25. Today it refuses a symlink, refuses a
-    non-directory, and verifies the settled mode — enough while every
-    caller passes a freshly created `tempfile` directory, so nothing
-    pre-existing is ever adopted. A user-configurable scratch path
-    changes that: a pre-existing directory would then be tightened and
-    adopted without confirming the current user owns it, and with a real
-    (measured) window at its original mode before the chmod. The
-    race-free shape is `open(O_DIRECTORY|O_NOFOLLOW)` plus `fchmod`/
-    `fstat` on the descriptor; `std` exposes neither, nor a `geteuid`,
-    so this is the first thing in the workspace that would need a
-    `libc` dependency and an `unsafe_code` override in one crate's own
-    `[lints]` table. That is an architecture decision, not a bug fix,
-    which is why it is its own item.
+    location.** Opened 2026-08-25, **closed 2026-08-31 (0.61.0)**. Was:
+    refuses a symlink, refuses a non-directory, and verifies the settled
+    mode by re-reading the *path* — enough while every caller passes a
+    freshly created `tempfile` directory, so nothing pre-existing was
+    ever adopted. A user-configurable scratch path changes that: a
+    pre-existing directory would then be tightened and adopted without
+    confirming the current user owns it, and with a real (measured)
+    window at its original mode before the chmod.
 
-    **When it happens, it should cover the scratch *tile file* open
-    too, not just directory creation.** `aurora_tile::writer`'s
-    `write_tile_file` (0.58.0) opens each tile with `.mode(0o600)`, but
-    `open` follows symlinks and its mode argument is consulted only when
-    the call creates a new inode — so a pre-existing file or a planted
-    symlink at that path is truncated and overwritten at *its* mode.
-    Nothing is exploitable today, for the same reason the directory case
-    is not: the `0o700` scratch directory denies every other user the
-    traversal needed to reach or create anything inside it. It is the
-    same class of gap, wants the same `O_NOFOLLOW`, and would ride along
-    on the same `libc`/`unsafe_code` decision.
+    **Now the race-free shape this item originally described**:
+    `open(O_DIRECTORY | O_NOFOLLOW)`, then `fstat` for ownership and
+    mode and `fchmod` to correct it, all against the one held
+    descriptor rather than the path — a path can be raced out from under
+    a second syscall, an open descriptor cannot. `std` exposes neither
+    `fchmod`-on-a-descriptor nor `geteuid`, so this is, as predicted,
+    **the first thing in the workspace needing a `libc` dependency and
+    an `unsafe_code` override** — confined to `aurora-tile`'s own
+    `[lints]` table (`unsafe_code = "allow"`, every other workspace lint
+    copied verbatim so the exception is narrow and visible in review),
+    with exactly two `unsafe` blocks (`geteuid`, `fchmod`), each carrying
+    its own `// SAFETY:` comment. CLAUDE.md's "No crate has needed to
+    yet" line is updated alongside this.
 
-    **Same gap on the `aurora-app` side, found by the round's final
-    judge pass and not yet fixed.** `create_dir_owner_only`
-    (`crates/aurora-app/src/lib.rs`, the self-heal helper
-    `aur_verify_scratch_dir` calls when the session directory has
-    disappeared) does `DirBuilder::recursive(true).mode(0o700)` with no
-    symlink refusal, on the stated reasoning that the only caller is
-    "recreating a directory this process itself created." That
-    precondition is exactly what's false at the one moment this helper
-    exists to handle: the directory is missing because *something else*
-    removed it, which is also the precondition for a local attacker to
-    plant a symlink at that exact name first. Impact is bounded — the
-    live store never takes this path (it goes through the hardened
-    `create_private_dir` above and fails closed), and the nested verify
-    directory it recreates is itself `0o700` and owned by the victim, so
-    the worst realistic outcome is a forced, attacker-triggerable
-    verification failure, not a data leak. Fold into the same
-    `O_NOFOLLOW` round when it happens, or give `create_dir_owner_only`
-    the cheaper symlink-refusal half of `create_private_dir`'s check on
-    its own first.
+    **Ownership-mismatch is disclosed as untested, not silently assumed
+    correct**: exercising it needs a directory owned by a *different*
+    user, which a single-user sandbox or CI runner cannot construct. The
+    two existing tests that already covered this function's other two
+    paths (`new_leaves_the_scratch_directory_owner_only`,
+    `new_refuses_a_symlinked_scratch_directory`) both still pass
+    unchanged against the rewrite — confirming the descriptor-based
+    `fchmod` correction and the symlink refusal both still hold.
+
+    **The scratch *tile file* open is closed too, and needed no
+    `unsafe` at all.** `aurora_tile::writer::write_tile_file` now adds
+    `.custom_flags(libc::O_NOFOLLOW)` to its existing `OpenOptions` —
+    `custom_flags` is a safe `std` method, so this only needed `libc`
+    for the platform-specific flag *value*, not an FFI call. A new test
+    plants a symlink at a tile's target path pointing at a file with
+    known content, submits a write, and asserts both that it errors and
+    that the victim file's content is untouched.
+
+    **`aurora-app`'s `create_dir_owner_only` took the cheaper of the two
+    options this item offered**, rather than folding into the
+    descriptor-based round: a `symlink_metadata`-based refusal,
+    `std`-only, matching `create_private_dir`'s own pre-check. Its
+    impact was already assessed as bounded (a forced, attacker-
+    triggerable verification failure, not a data leak, since the
+    directory it recreates is nested under an already-`0o700` session
+    directory) — not worth pulling `libc`/`unsafe_code` into a second
+    crate for. A new test plants a symlink at the target path and
+    asserts the call is refused rather than followed.
 
 - [x] **Nice-to-have: create the scratch *tile files* `0o600` too** —
     done 2026-08-30. Opened 2026-08-25. Defence in depth only — 0.53.0's
@@ -11684,6 +12268,221 @@ structural design work.
   human-hardware measurement of stroke latency was taken as part of
   this addendum — the original report was qualitative ("very slow"),
   not a number to compare against.
+
+  **Addendum, 2026-09-02 (0.72.0, 0.73.0) — the undo/redo and
+  layer-switch halves closed too, and the earlier "four call sites still
+  bump" framing corrected.** The addendum above listed `apply_move`,
+  undo/redo dispatch, document open/replace and the active-layer switch
+  as four equally-open sites. Re-checked one at a time, that was wrong
+  on two of them:
+
+  - **Active-layer switch (0.72.0) — now guarded, not narrowed.** The
+    active layer reaches compositing through exactly one value,
+    `recomposite_visible_tiles`'s own `reference_origin`; verified by
+    reading the function and every callee (`begin_gpu_composite_tile`,
+    `composite_roots_into_tile`, `resolve_tile`,
+    `document_qualifies_for_gpu_compositing` all take
+    `reference_origin`/`layers`, never the active layer's id). So a
+    switch between two layers at the *same* origin cannot change a
+    single composited texel. That value is now one named function,
+    `composite_reference_origin` (with `active_layer_origin`, its `f32`
+    face, delegating to it), and `press_layer_row` reads it across the
+    switch and bumps only when it really moved. Every layer this app's
+    own UI creates starts at `(0, 0)`, so in practice this is the common
+    case and it used to throw the whole visible grid away on every
+    Layers-panel click.
+
+  - **Undo/redo (0.73.0) — now narrowed to the real dirtied region.**
+    `run_command` returns a new `CompositeInvalidation`
+    (`None`/`Regions(Vec<Rect>)`/`Everything`) instead of nothing.
+    Structural steps use the `Rect` `aurora_doc::History::undo`/`redo`
+    already returned and `aurora-app` was discarding with `Ok(_)`
+    (**wrong — reverted in 0.73.1; see the addendum below**); pixel
+    steps use two new additive `aurora_brush::PixelHistory` accessors,
+    `peek_undo`/`peek_redo`, to read the tile set the *following*
+    `undo`/`redo` will rewrite (the only moment it is available — those
+    methods report a bare `bool`, and afterwards the snapshot has been
+    replaced by its own inverse), translated out of the layer's own
+    surface-local grid into document space. `CompositeCache` gained
+    `invalidate_doc_rect`, which retains in place rather than expanding
+    a rect into `TileId`s — at the 300,000 px ceiling a single layer's
+    bounds is ~1.37M tiles, an unbounded allocation driven by document
+    size.
+
+    **The safety guard is the load-bearing part.** `perform_undo_redo`
+    reads `composite_reference_origin` immediately before `run_command`
+    and again after, and forces `Everything` if it moved. That is what
+    makes undoing a *Move* safe: a reverted `LayerOp::SetBounds` on the
+    active layer moves the grid anchor itself, so every cached `TileId`
+    then names a different document window, and narrowing to the (
+    perfectly correct) `old ∪ new` rect would leave every tile outside
+    it showing content composited under the old anchor. Every
+    `Undo`/`Redo` dispatch path was checked to route through
+    `perform_undo_redo` — `handle_key` already returns
+    `ActivatedCommand::Undo`/`Redo` rather than calling `run_command`
+    inline (0.69.1), and `App::run_undo_redo` is the only other entry —
+    so nothing bypasses it.
+
+  - **Document open/replace was never actually a gap.** Opening a
+    document replaces the whole `LayerTree` with fresh `LayerId`s and a
+    fresh origin, so "recomposite everything" is the genuinely minimal
+    correct answer there, not an over-invalidation. No code change; this
+    line corrects the record.
+
+  - **Move is still open, and is explicitly *not* narrowable as things
+    stand.** The composite tile grid is anchored to the active layer's
+    own bounds origin, so dragging the active layer re-anchors the whole
+    grid on every pointer-move event — there is no narrow region to
+    report, because every tile's meaning changes at once. `apply_move`
+    keeps its full `bump()`. **The real follow-on is re-anchoring the
+    composite grid to the document rather than to the active layer**,
+    which would decouple `TileId` meaning from selection and moves alike
+    and is a separate, larger architectural change, not a tweak to this
+    bullet.
+
+  **Honest framing, stated plainly**: none of this moves the documented
+  60 FPS pan-while-painting p99 number. That path is brush dabs (already
+  narrowed, 2026-08-13) plus genuine tile paging, and it has still not
+  been re-measured on real GPU hardware. What this round buys is Ctrl+Z
+  latency after a stroke and Layers-panel click latency, both of which
+  paid a full visible-grid recomposite before. Do not read it as
+  progress against the Phase 1 60 FPS gate.
+
+  Tests: 2 new in `aurora-brush` (60 total) covering `peek_undo`/
+  `peek_redo` against the real following `undo`/`redo` and the
+  empty-stack case; 12 new in `aurora-app` (335 total, was 323) —
+  four `invalidate_doc_rect` boundary/negative-territory/empty-rect
+  cases, `layer_for_surface` over a nested layer, the two layer-switch
+  guard cases, `undoing_a_move_of_the_active_layer_still_invalidates_everything`,
+  `undoing_a_group_level_change_with_no_knowable_rect_invalidates_everything`,
+  `undoing_a_stroke_whose_layer_was_deleted_invalidates_everything`,
+  `undoing_a_stroke_invalidates_only_the_composite_tiles_it_touched`,
+  and a real-GPU differential test,
+  `narrowed_invalidation_matches_a_full_bump_pixel_for_pixel`, which
+  builds two identical documents per case, applies the same operation to
+  both, keeps only the narrowed invalidation on one and additionally
+  `bump()`s the other, recomposites both and compares every visible
+  tile texel for texel — over eight cases (undo/redo of a stroke on the
+  active layer and on a non-active layer at a different origin, undo of
+  a Move, undo of a `SetOpacity`, and switches to a same-origin and a
+  different-origin layer).
+
+  **The differential test was checked for vacuity, not assumed**:
+  deleting `perform_undo_redo`'s anchor guard makes it fail on
+  `UndoMove` at composite tile `(3, 0)`. Its first shape did *not* catch
+  that — a 2x2 visible grid is entirely covered by the moved layer's own
+  `old ∪ new` rect, so narrowed and bumped agreed by coincidence. The
+  viewport was widened to 1024x1024 (a 5x5 grid) specifically so tiles
+  outside the dirtied region exist to disagree.
+
+  Verified on this machine's real NVIDIA RTX 3090 (`AURORA_REQUIRE_GPU=1
+  cargo test -p aurora-app`, logging "GPU adapter: NVIDIA GeForce RTX
+  3090 (Vulkan, DiscreteGpu)" — genuine hardware, not a silent skip),
+  plus the full local gate: `cargo fmt --all --check`,
+  `scripts/check_layering.py`, `scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace`
+  (42 binaries, 0 failures), `cargo test --workspace --doc`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`.
+
+  **Addendum, 2026-09-02 (0.73.1 – 0.73.4) — an independent review of
+  the two commits above found the structural half unsound, and it is
+  reverted.** Read this before treating the addendum above as current.
+
+  - **Structural undo/redo no longer narrows at all (0.73.1).** The
+    narrowing rested on the claim that every rect
+    `aurora_doc::History::apply` returns is a superset of that step's
+    true visual effect. For pixel steps that holds. For structural ones
+    it does not: every `Set*`/`Reparent`/mask arm derives its rect from
+    `layer_dirty_rect`, i.e. the layer's *declared*
+    `LayerKind::Pixel::bounds` — and nothing in this workspace makes
+    `bounds` an authoritative extent of a layer's real content.
+    `LayerKind::Pixel`'s own doc says the content is "positioned at"
+    bounds, `LayerLock`'s names bounds outright as having the "data now,
+    enforcement once a concrete consumer exists" shape, `layer_local_point`
+    is a bare subtraction with no clamp, `aurora_brush::stamp_dab` clips
+    only at surface-local `(0, 0)`, `pan_bounds`' far edge is the
+    document ceiling and explicitly "not the layer's own width/height",
+    and both composite read paths (`resolve_tile`'s fast path and
+    `read_layer_window`) address the surface's tiles with no
+    intersection against bounds. So a user can pan past a layer's
+    declared extent, paint there, and have it composited — and a
+    structural step's reported rect misses it, leaving stale tiles that
+    `CompositeCache` never re-checks. `SetBounds`' `old ∪ new` is a
+    union of two *declared* rects and is no exception. Structural steps
+    now report `Everything`; the stroke-undo win, which is the common
+    case, is untouched because `stroke_invalidation` builds its rects
+    from captured tiles plus the layer origin, never from bounds'
+    extent. **Follow-on, named rather than assumed**: either make
+    `bounds` authoritative (clip the paint path *and* the composite read
+    path — a design decision, since it changes what a user who already
+    painted outside sees), or let the app widen the rect to a layer's
+    real stored extent, which needs `History::undo`/`redo` to report
+    *which* layer(s) a step touched and a `TileStore` accessor for a
+    surface's stored tile extent. Neither exists today.
+
+  - **A second document-wide guard (0.73.2), and a measurement that
+    matters beyond it.** `document_qualifies_for_gpu_compositing`
+    chooses the GPU fast path or the CPU fallback for the *whole*
+    document, and several structural steps flip it, changing every
+    visible tile's compositing path while a per-layer `Rect` names one
+    layer's region. `perform_undo_redo` now captures it before and after
+    `run_command` alongside the anchor check. The reason this is not
+    merely theoretical: the new test
+    `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_
+    opacity_document` runs one fixture through both paths at opacities
+    0.3/0.7/0.35 with colours not exactly representable in binary, and
+    on the real RTX 3090 they differ by exactly one `f16` ULP on three
+    of four channels (GPU `(0.34179688, 0.50146484, 0.31762695,
+    0.62011720)` vs CPU `(0.34155273, 0.50097656, 0.31762695,
+    0.62060547)`). **The two pre-existing GPU/CPU agreement tests only
+    ever used exact power-of-two binary fractions, so they never tested
+    this**; the paths are *not* interchangeable, and the new test
+    asserts a deliberately tight 2-ULP tolerance rather than exact
+    equality. The anchor guard's own comment was also corrected: a Move
+    is not the only way the anchor changes — removing the active layer
+    collapses it to the `(0, 0)` default. The guard already handled that
+    (it compares rather than assumes); only the reasoning was
+    incomplete.
+
+  - **Residuals (0.73.3).** `invalidate_doc_rects` folds every reported
+    rect into one `retain` pass. Dispatching one `retain` per rect made
+    the cost `O(rects × cached_tiles)` against a second factor that
+    0.73.0 had just made grow monotonically — before narrowing, every
+    undo/redo `bump()`ed and so periodically reset `current` to empty.
+    `CompositeInvalidation` is now `#[must_use]`, with both legitimate
+    discard sites annotated, so the "trap for whoever adds the next
+    layer-mutating arm" that `run_command`'s doc comment already named
+    is a compile error rather than a comment. The structural arms check
+    `can_undo`/`can_redo` first, closing a latent (not reachable today)
+    `UndoOrder` desync on `History::undo`'s conflated `Ok(None)`.
+
+  - **Doc-accuracy pass (0.73.4).** `CompositeCache`'s own doc comment
+    still described the pre-0.72.0 world where `bump` was the only
+    primitive; `press_layer_row`'s guard was attributed to 0.71.0
+    instead of 0.72.0; and `App::run_undo_redo`'s comment still claimed
+    Ctrl+Z does not route through it, which 0.69.1 made false.
+
+  **The differential test is hardware-gated evidence, not a gate.**
+  `narrowed_invalidation_matches_a_full_bump_pixel_for_pixel` and the
+  GPU/CPU agreement tests all self-skip with no real adapter, and
+  CLAUDE.md already records that **no regular push/PR workflow sets
+  `AURORA_REQUIRE_GPU`** — `gpu-probe.yml` is `workflow_dispatch`-only.
+  So CI going green is not evidence any of them ran. This is a
+  pre-existing, project-wide condition rather than a defect of this
+  round, and it carries the same caveat every other GPU-dependent claim
+  here does. The two regression tests added for the items above
+  (`structural_undo_falls_back_to_everything_because_paint_escapes_
+  declared_bounds` and `undoing_a_blend_mode_change_that_flips_the_
+  compositing_path_invalidates_everything`) are deliberately **headless**
+  for exactly this reason, so the guards themselves are CI-enforced even
+  where the pixel-level evidence is not.
+
+  Tests: 5 new in `aurora-app` (340 total, was 335). Verified on this
+  machine's real NVIDIA RTX 3090 (`AURORA_REQUIRE_GPU=1 cargo test -p
+  aurora-app`, logging "GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)"), plus the full local gate on every commit.
 - [x] **Document-level canvas size and real ICC round-trip** — done
   2026-08-06, closing two gaps the `.aur` format bullet named the same
   day it landed, in two committed steps.
@@ -13068,14 +13867,15 @@ severity choice.
   `intersects`/`union` respectively. Version bumped `0.36.0` → `0.37.0`
   per `CLAUDE.md`'s own convention.
 
-  **Still genuinely open, stated honestly**: this is a rectangular clip,
-  not real grayscale masking — no feathering, no soft edges, no partial
-  per-pixel coverage. Real per-pixel/grayscale masking needs real mask
-  pixel storage, a separate, not-yet-made resource-management decision
-  (`LayerMask`'s own doc comment: one `TileStore` per layer vs. some
-  shared scheme, the same open question `LayerKind::Pixel`'s own
-  `bounds` field already flags) — this round deliberately did not invent
-  one as a side effect of wiring up aggregation. The GPU compositing path
+  **Was genuinely open when this landed; closed in 0.70.0** (see "Real
+  per-pixel grayscale mask coverage" at the end of this section): this
+  round produced a rectangular clip only — no feathering, no soft edges,
+  no partial per-pixel coverage — because real per-pixel/grayscale
+  masking needed real mask pixel storage, a separate resource-management
+  decision this round deliberately did not invent as a side effect of
+  wiring up aggregation. 0.70.0 made that decision the same way ADR 0010
+  already had for pixel layers: mask coverage lives on its own surface
+  in the shared `TileStore`. The GPU compositing path
   (`document_qualifies_for_gpu_compositing`/`gpu_composite_tile`) needs no
   changes to handle masks correctly: it doesn't check for a mask at all,
   because `gpu_composite_tile` already resolves each root layer's texels
@@ -13172,9 +13972,10 @@ severity choice.
   non-grouped tiles (this fix is CPU-path-only, since
   `composite_tile_cpu` is a CPU function; the GPU path's own fixed-
   function blend has no equivalent multi-layer accumulation to fix),
-  and real per-pixel/grayscale masking still needs real mask pixel
+  and real per-pixel/grayscale masking still needed real mask pixel
   storage, the same not-yet-made resource-management decision the
-  mask-aggregation round already named.
+  mask-aggregation round already named (that second one closed in
+  0.70.0; the GPU fast path's blend-mode coverage is still open).
 
 - [x] **Batch the GPU compositing readback into one `device.poll` per
   frame, not one per tile — done 2026-08-12.** M1.10's own "60 FPS at
@@ -13311,6 +14112,299 @@ severity choice.
   shows a mixed, not clearly positive, result for reasons that may be
   specific to software rendering. Re-measuring on real hardware before
   treating this as a settled performance win is the honest next step.
+
+- [x] **Real per-pixel grayscale mask coverage — done 2026-09-02
+  (0.70.0), closing the "rectangular clip only" limitation the
+  mask-aggregation round (0.37.0) named and every round since carried
+  forward.** `aurora_doc::LayerMask` had bounds plus two toggles and no
+  pixels, so `aurora-app`'s `apply_mask_clip` could only answer
+  inside/outside. Masks now carry real, per-texel coverage: feathered
+  edges, soft falloff, and partial alpha all composite correctly, on
+  pixel layers and on groups alike.
+
+  **Storage, applying ADR 0010's own answer rather than inventing a
+  second one**: coverage lives in the document's shared
+  `aurora_tile::TileStore` on its own surface, exactly the way a pixel
+  layer's content already does. The surface is a *derived* id, not a
+  stored field — `LayerTree::mask_surface_id(id)` is
+  `id.to_raw() | MASK_SURFACE_BIT` (`1 << 63`), so mask surfaces occupy
+  the top half of the `SurfaceId` space and layer pixel surfaces
+  (`surface_id`, from `IdGenerator`'s near-zero monotone ids) the
+  bottom. `aurora-app`'s reserved composite surface (`u64::MAX`) is in
+  the top half too, so the single layer id that would map onto it
+  (`MASK_SURFACE_BIT - 1`) is refused outright. Consequences: **no new
+  `LayerMask` field, no new `TileStore` API, and no `.aur` format
+  change.** Unlike `surface_id`, `mask_surface_id` returns `Some` for a
+  group too — Photoshop masks groups, and `resolve_tile`'s `Group` arm
+  already masked them.
+
+  **The convention that makes this backward compatible at *texel*
+  granularity** (new `crates/aurora-doc/src/mask.rs`, the one place the
+  writer and reader live so they cannot drift): a mask tile is an
+  opaque grayscale image. Coverage `v` is written as `(v, v, v, 1.0)`;
+  coverage is read from **red**, and **alpha is the "has been painted"
+  flag**, not coverage — a zero alpha reads back as coverage `1.0`.
+  Since `TileStore::get` materializes an untouched tile as
+  `Tile::blank()` (all zeros), an unpainted mask surface reads as fully
+  visible everywhere, and a *half*-painted mask tile still reads fully
+  visible across the half nobody painted. Every degenerate case (short
+  slice, `NaN`, unreadable tile) fails **open** for the same reason: a
+  mask that cannot be read must never silently erase a layer.
+
+  **Compositing** (`aurora-app`): `apply_mask_clip` became `apply_mask`,
+  taking the mask surface, the store, and the existing
+  `CompositeBudget`. It calls the already-existing `read_layer_window`
+  **once** per tile, with `(mask.bounds.x, mask.bounds.y)` as the
+  window's own origin — reusing that helper's up-to-four-tile overlap
+  handling for non-tile-aligned mask origins rather than writing a
+  second windowing loop, and reusing its `note_store_error` handling
+  as-is. Bounds and coverage multiply (`mask.bounds` still hard-clips);
+  `inverted` applies to the **combined** coverage, not to the
+  containment test alone, so inverting a gradient reverses the ramp
+  itself. A texel at zero combined coverage is written `(0, 0, 0, 0)`
+  — all four channels, matching the old behaviour exactly — rather than
+  `(r, g, b, 0)`, which would carry stale colour into
+  `un_premultiply_in_place` and the eyedropper.
+
+  **`aurora-render` and `composite.wgsl` needed zero changes**, and got
+  none: masking is fully resolved CPU-side in `resolve_tile` before any
+  GPU upload, on both the CPU and the GPU compositing path
+  (`begin_gpu_composite_tile` uploads already-resolved texels; the GPU
+  only runs the fixed-function `over` blend).
+
+  **Tests**: 14 new in `aurora-doc` (6 on `mask_surface_id` — distinct
+  from `surface_id`, distinct across layers, `Some` for a group where
+  `surface_id` is `None`, `None` for an unknown id, never equal to the
+  reserved composite surface, and the two halves of the id space
+  provably disjoint; 8 in `mask.rs` — round trip through a *real*
+  `TileStore`, never-painted reads as `1.0`, painted-zero stays zero,
+  neighbours untouched, clamping, out-of-tile refusal, dirty marking).
+  6 new in `aurora-app`: the named regression
+  `apply_mask_with_an_unpainted_mask_surface_matches_the_bounds_only_clip`
+  (byte-identical output with and without an unwritten mask surface),
+  `apply_mask_hides_exactly_the_texels_painted_to_zero_coverage`,
+  `composite_document_shows_and_hides_a_pixel_layer_by_real_mask_coverage`
+  (the headline: mask bounds covering the whole document, so only
+  painted coverage decides),
+  `composite_document_composites_a_gradient_mask_as_real_partial_coverage`
+  (strict monotonicity plus real intermediate values — what a rectangle
+  clip provably cannot produce),
+  `composite_document_inverts_a_gradient_masks_own_per_pixel_coverage`,
+  and
+  `composite_document_reads_mask_coverage_relative_to_the_masks_own_origin`
+  (mask origin at `(3, 5)`, layer at `(0, 0)`, neither tile-aligned —
+  a wrong origin would shift the painted transition by exactly that
+  offset). The four pre-existing `apply_mask_clip_*` tests were renamed
+  to `apply_mask_*` and kept asserting exactly what they asserted
+  before, via a bounds-only test helper; not one assertion was retuned.
+  1,347 workspace tests at 0.70.0, up from 1,324.
+
+  **Deliberately out of scope, named rather than dropped**: (1) a
+  brush/tool UI for painting a mask — `write_mask_coverage` is the API
+  such a tool would call, and today only tests call it; (2) `.aur`
+  persistence of mask pixels — **closed 2026-09-02 (0.71.0), see the
+  next bullet**; it was named here as "`aurora-io` does not yet
+  enumerate mask surfaces, so painted coverage does not survive
+  save/load (the format itself needs no change; the code that walks
+  surfaces does)", and that prediction held exactly: no manifest field
+  and no `MANIFEST_VERSION` bump were needed; (3)
+  mask-pixel undo/history — mask writes go through no `History`
+  operation, so painting a mask would not be undoable; (4) **mask-
+  surface lifecycle cleanup, named in review and added 0.70.4** —
+  because the surface id is *derived*, not allocated fresh, removing a
+  mask and adding a new one to the same layer resurrects the old
+  painted coverage, *shifted* by the delta between the old and new
+  `bounds` origins (there is no `set_mask_bounds`, so this is worse
+  than merely stale); a deleted layer's mask tiles leak the same way
+  its pixel tiles already do. All four were named in
+  `aurora_doc::mask`'s own module doc comment, `LayerMask`'s,
+  `apply_mask`'s, and `resolve_tile`'s; now that 0.71.0 has closed (2),
+  those doc comments name the remaining three.
+
+  **Review found three real defects, all fixed by 0.70.4**: a
+  cross-layer `SurfaceId` collision reachable through a crafted/
+  untrusted `.aur` manifest (a `LayerId` with bit 63 already set
+  aliased another layer's mask surface — `surface_id` had no guard
+  against it; fixed with `validate_layer_id_range` at both the
+  manifest-deserialize and journal-replay validation gates, plus a
+  mirrored guard directly on `surface_id` itself, since `restore`
+  during undo/redo merges a subtree without a closing `validate()`);
+  the fail-open safety guarantee inverting to fail-*closed* exactly
+  when `mask.inverted` was `true` and a read genuinely failed (the
+  "unread" signal now survives past the inversion step; only the
+  *final* combined coverage defaults to `1.0`); and a measured ~2.9x
+  per-tile cost from unconditionally reading an unpainted mask
+  surface's coverage window on every composite (fixed with a new,
+  non-materializing `TileStore::contains_tile` check that skips the
+  read entirely when a surface has nothing stored — remeasured at
+  ~1.01x). See the 0.70.1–0.70.4 addenda under "Next action" for the
+  full account, including the deliberate decision that a mask read
+  failure still refuses an export (fail-open protects the canvas; an
+  export that silently wrote a wrongly un-masked layer would be the
+  exact silent-degradation failure CLAUDE.md names as this project's
+  worst). 1,359 workspace tests as of 0.70.4.
+
+  **Verified (0.70.0; re-verified after each 0.70.1–0.70.4 fix)**:
+  `cargo fmt --all --check`, `check_layering.py`,
+  `check_no_hardcoded_style.py`, `cargo check --workspace --locked`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  `cargo test --workspace` (1,359 passing at 0.70.4), `cargo test
+  --workspace --doc`, and `RUSTDOCFLAGS=-D warnings cargo doc
+  --workspace --no-deps --all-features` all clean locally. `cargo
+  nextest` is not installed on this box; `cargo test --workspace` stood
+  in, per CLAUDE.md. **No GPU or interactive verification** — this is a
+  CPU/data-model change, but CLAUDE.md's own rule applies: a green test
+  run is not evidence about how a mask looks on real hardware.
+
+- [x] **`.aur` persistence of real mask coverage — done 2026-09-02
+  (0.71.0), closing follow-on (2) of the four the 0.70.0 mask round
+  named.** Painted mask coverage now survives a save/load round trip.
+  Before this, `aurora-io`'s writer and reader each walked only a
+  layer's own pixel surface (`layers.surface_id(id)`), never its mask
+  surface, so every mask tile a user could paint was silently dropped
+  on save — the exact shape of failure FR-001 calls the worst this
+  project can have, just aimed at mask pixels rather than at a PSD.
+
+  **One enumerator, so the two halves cannot disagree.** The change is
+  confined to `crates/aurora-io/src/aur.rs` (plus doc-only edits in
+  `aurora-doc`). A new `persisted_surfaces(&LayerTree) -> Vec<(SurfaceId,
+  Rect)>` is now the single place that decides what the format holds:
+  for every layer the existing iterative, cycle-budgeted `layer_ids`
+  walk yields, it emits that layer's content surface paired with its
+  own `bounds`, *and* — when the layer has a mask — its
+  `mask_surface_id` paired with the **mask's** `bounds`. The writer and
+  the reader both iterate it, so neither can grow a surface the other
+  does not know about. The old pixel-only `pixel_layer_ids` helper is
+  gone; nothing else used it.
+
+  **No format change, and deliberately no `MANIFEST_VERSION` bump.**
+  The manifest never stored tile ownership: entries are named
+  `tiles/<surface>/<x>_<y>.tile`, and the reader *derives* the surface
+  it expects per layer and probes by name, treating `FileNotFound` as
+  "blank". Masks slot into exactly that mechanism. A version bump would
+  have hard-rejected every existing `.aur` file and every autosave on
+  disk (`read` refuses any version mismatch outright) in exchange for
+  nothing. An old file simply carries no mask entries, so every mask in
+  it reads back as coverage `1.0` — fully visible, exactly how it
+  composited before — which is `aurora_doc::mask`'s alpha-as-presence
+  convention doing the work it was designed for, asserted by
+  `reads_a_container_written_before_mask_persistence_as_fully_visible_coverage`.
+
+  **Persistence is not gated on `mask.enabled`.** `enabled` is a UI
+  toggle (shift-click a thumbnail); skipping disabled masks would mean
+  toggling one off and saving destroys the painted pixels
+  irrecoverably. `inverted` is composite-time-only and irrelevant to
+  storage. Group masks persist too — `mask_surface_id` returns `Some`
+  for a group, and a group's mask is the only thing it can contribute
+  to the archive at all.
+
+  **A load-bearing hardening gap this round had to close, found in
+  planning rather than by a test.** `validate_mask_origins` (now
+  `validate_persisted_rects` — renamed twice since, once in this round
+  and again during its own 0.71.1-0.71.4 revision; see the addenda
+  below for the full name history) checked a mask's *origin* only, and its own doc
+  comment said the extent check was deliberately deferred and to
+  "revisit the moment mask surfaces are written into the archive" —
+  this was that moment. `LayerTree::add_mask` bounds a mask's origin but
+  never its extent, so once a mask rectangle drives a real tile grid, a
+  crafted manifest declaring a `u32::MAX`-wide mask is an unfinishable
+  loop (~2.8e14 iterations) on `aurora-app`'s own pre-window startup
+  path — the same defect `tile_grid` already closed for layer bounds,
+  reopened through a different rectangle. The validator now runs the
+  whole of `tile_grid` over every mask, extent included, still hoisted
+  ahead of the first written byte and the first probe so a refusal
+  leaves no half-built container. It is reachable from a live session
+  too, not only from a file, because `add_mask` does not bound one —
+  hence the write-side test as well as the read-side one.
+
+  **The whole-document tile budget widened to `2 * side * side`** ("one
+  layer at the documented ceiling, plus its own mask"). Not slack: a
+  masked layer now contributes two grids, so a single *legal*
+  ceiling-sized layer carrying a full-canvas mask would have been
+  refused by a budget sized for one grid — a real document rejected by
+  a check meant for crafted ones. Two is the exact factor, since a
+  layer carries at most one mask. Mask grids are charged against that
+  budget from inside the same unified loop layer grids are, so a
+  manifest cannot stay under it on layers alone and then overrun it in
+  mask rectangles.
+
+  **The real cost, named rather than glossed**: a masked layer's tile
+  range is walked **twice** now, once per surface, at two possibly
+  different origins. The writer offsets part of that with a
+  `TileStore::contains_tile` check before each `store.get` — behaviour
+  is identical (a never-touched tile was already skipped once
+  materialized and found all-zero), it just stops paying to materialize
+  a blank tile in order to throw it away, which matters most for
+  masks, since *every* mask surface in every document today is
+  unpainted. `tracing::warn!` on a skipped tile now also records
+  whether the surface is a mask surface (`MASK_SURFACE_BIT`), so the
+  two losses are distinguishable in a log.
+
+  **Tests**: 10 new in `aur.rs`, all in its existing fixture idioms —
+  `round_trips_real_mask_coverage_painted_at_the_masks_own_origin` (the
+  headline: mask origin `(500, 300)` against a layer at `(0, 0)`,
+  spanning two tiles, with one texel painted to coverage **exactly
+  `0.0`** — the only value that tells "really persisted" apart from
+  "silently defaulted to `1.0`" — plus an unpainted neighbour still
+  reading `1.0` and the entries provably written under the mask
+  surface, not the layer's),
+  `round_trips_mask_coverage_on_a_group_which_has_no_pixel_surface`,
+  `round_trips_mask_coverage_of_a_disabled_mask`,
+  `reads_a_container_written_before_mask_persistence_as_fully_visible_coverage`,
+  `write_skips_a_never_painted_mask_surface_entirely` (zero bytes for
+  masks nobody painted, while the layer's own painted tile is still
+  written),
+  `read_rejects_a_manifest_whose_mask_extent_is_past_the_document_ceiling`
+  (pixel layer and group, both in bounded time),
+  `write_and_best_effort_write_both_refuse_a_mask_extent_past_the_document_ceiling`
+  (and leave no partial container),
+  `the_whole_document_tile_budget_is_one_ceiling_layer_plus_its_own_mask`
+  (deleted in 0.71.4 for being a pure arithmetic tautology — see that
+  addendum — and replaced by the real, behavioral
+  `the_largest_legal_document_still_writes_and_reads_with_its_mask`),
+  `read_rejects_a_manifest_whose_layers_and_masks_together_exceed_the_tile_budget`
+  (tiny layers, ceiling-sized masks — the masks are what overruns it),
+  and
+  `best_effort_write_skips_an_unreadable_mask_tile_while_write_still_refuses`
+  (the refuse-vs-degrade split applied to mask tiles, using the same
+  evict-flush-truncate technique its pixel-tile twin uses; the salvaged
+  file's lost mask reads back fully visible rather than hiding a
+  layer). The five round-trip/budget assertions were checked to be
+  non-vacuous by removing the enumerator's mask arm: exactly those five
+  fail, the rest stay green.
+
+  **Reviewed and revised 0.71.1-0.71.4** (see those addenda below for
+  the full account) — three real defects found by independent review
+  and fixed: the writer had no whole-document tile budget at all, only
+  the reader did, so an ordinary document built through the public API
+  could save successfully and then become permanently unopenable
+  (0.71.1); a failed read left partially-decoded tiles resident in the
+  live store with no rollback, reachable more widely once a masked
+  layer has two surfaces that can independently fail mid-read (0.71.2,
+  new `aurora_tile::TileStore::forget_tile`); and `LayerTree::add_mask`
+  itself gained the extent check named above, closing the gap where the
+  `aurora-io`-boundary guard still had to fail production *after* a
+  live session had already reached a broken state (0.71.3). 0.71.4 also
+  added the cross-crate frame-agreement test the design's addressing
+  convention depends on but which nothing had actually tested until
+  then. Independently re-verified by a Judge pass scoring 0.938/1.00
+  (PASS).
+
+  **Exercised by tests only, and that is not a hedge.** Nothing in the
+  app paints mask coverage yet — follow-on (1), the brush/tool UI, is
+  still open — so this has never run end to end through the editor, and
+  no `aurora-app`, `aurora-ui`, or `aurora-brush` code changed. It was
+  built now rather than deferred because the alternative is a format
+  that silently drops content the moment that tool lands.
+
+  **Verified**: `cargo fmt --all --check`, `check_layering.py`,
+  `check_no_hardcoded_style.py`, `cargo check --workspace --locked`,
+  `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`, `cargo test --workspace`, `cargo test --workspace --doc`,
+  and `cargo doc --workspace --no-deps --all-features` all clean
+  locally. `cargo nextest` is not installed on this box; `cargo test
+  --workspace` stood in, per CLAUDE.md. No GPU or interactive
+  verification, and none is claimed.
 
 ### M1.10 — Phase 1 gate
 
@@ -13671,6 +14765,997 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-02 (0.71.4) — the cross-crate frame agreement mask
+persistence hinges on is finally tested, and three doc-comment claims
+are corrected.** (1) Two crates independently derive a frame from a
+mask's own `bounds.x/y` — `aurora-io`'s `persisted_surfaces` decides
+which tile indices to write and read, `aurora-app`'s
+`apply_mask`/`read_layer_window` decides which document position a
+coverage texel lands at — and nothing tested them agreeing with *each
+other*. Each crate's own tests only prove it is self-consistent, so a
+mask persisted in one frame and composited in another would shift a
+user's mask by the layer-to-mask offset, silently, and only after a
+save/load.
+`painted_mask_coverage_survives_a_real_aur_round_trip_at_the_same_absolute_position`
+paints coverage at a known document-absolute position through
+`write_mask_coverage`, round trips it through the real
+`write_aur`/`read_aur`, and checks the hidden pixel through the real
+`apply_mask` compositing path (not by reading coverage back directly,
+which would only re-test one crate against itself). Verified
+non-vacuous by pointing `apply_mask`'s window at the layer's origin
+instead of the mask's. (2) The headline `.aur` mask round-trip test's
+own comment credited the mask's differing *origin* for making it
+discriminating; `tile_grid` derives a grid from width/height alone and
+the loops walk `0..tiles_x`, so tile indices are origin-independent —
+it is the differing *extent* (two tile columns vs. one) that fails
+under a wrong-frame mutation. Corrected, with the origin's real value
+(the cross-crate check above) named instead. (3) `apply_mask`'s doc
+comment still said "four follow-ons" and listed `.aur` persistence as
+unbuilt, contradicting `mask.rs`'s own corrected "three". Also
+disclosed, not fixed, and deliberately: a build older than 0.71.0 opens
+a 0.71.0-saved file happily and, on re-save, silently drops every
+painted mask pixel — the manifest carries no signal an old reader could
+notice, which is exactly what makes the no-`MANIFEST_VERSION`-bump
+choice work (a bump would instead make every existing `.aur` file and
+autosave unopenable). Recorded in the module doc beside the no-bump
+decision. And `write_mask_coverage` does not check the `TileId` it is
+given against the grid `mask.bounds` spans, so coverage written outside
+it is dropped on save with no error — unreachable while `bounds` is
+immutable after `add_mask`, folded into the existing mask-surface
+lifecycle follow-on rather than tracked as a new one.
+
+**Addendum 2026-09-02 (0.71.3) — an oversized mask is refused where it
+is created, not only where it is saved.** `LayerTree::add_mask` ran
+`validate_origin` and no extent check, so an ordinary in-process caller
+— not just a crafted `.aur` file — could attach a mask larger than the
+document ceiling, after which `aurora-io` refused **both** `write` and
+`write_best_effort` for that document: one oversized mask silently
+disabled every save *and* every crash-recovery autosave for the rest of
+the session, for a state reachable through completely ordinary API
+calls. The file-boundary guard is the right place for a hostile
+manifest; it is the wrong and only place for an invariant the live-edit
+API can break. `add_mask` now also runs an extent check, raising a new
+`DocError::LayerBoundsTooLarge` that mirrors `IoError`'s variant of the
+same name. `add_pixel_layer`/`set_bounds` deliberately do *not* get the
+same bar (a layer's extent has meaning beyond the tile grid, and
+`aurora_core::Size::new` is where that ceiling is owned) — the new
+variant's doc comment records that asymmetry and why, and 0.71.1's
+hoisted writer pre-flight is what keeps the layer case from producing a
+partial file. Same commit: `persisted_surfaces` silently dropped a mask
+whose `mask()` is `Some` but whose `mask_surface_id()` is `None` —
+unreachable today, but the failure mode is painted coverage vanishing
+from every save with no error anywhere, so it now logs rather than
+resting on an argument about another crate's validators holding
+forever.
+
+**Addendum 2026-09-02 (0.71.2) — a failed `.aur` read no longer leaves
+its decoded tiles in the caller's live store.** `aurora_io::read_aur`
+decodes tiles straight into the caller's `TileStore` as it goes
+(deliberately — staging a whole document's pixels elsewhere first would
+double the memory and scratch traffic invariant §7.3.1 exists to
+avoid), and nothing undid that on the error path. A container whose
+*later* entries are corrupt therefore committed its earlier ones in
+full and left them resident under exactly the `SurfaceId`s the caller's
+next document was about to claim — a fresh `LayerTree` restarts layer
+ids, and so surface ids, from the bottom of the space. Red-team
+reproduced it live: after a rejected corrupt autosave, surface 1's tile
+`0_0` read back as attacker data rather than blank. 0.71.0 widened the
+window rather than opening it: a masked layer now has a *second*
+surface, walked after its content surface, that can fail independently
+after the first has already been committed. `read` now records every
+`(surface, tile)` it commits and drops all of them
+(`roll_back_committed_tiles`) before returning `Err`; the mechanism is
+a new `aurora_tile::TileStore::forget_tile`, which reaches all three
+places a tile can live (resident, `pending`, `paged_out`) and deletes
+its scratch file. Regression tests use a real corrupted archive — real
+manifest, real `codec::encode`d content tile, a mask entry
+`codec::decode` genuinely rejects — for exactly the new-in-0.71.0
+shape, and are verified non-vacuous by removing the rollback call.
+`aurora-app`'s own store-swap-after-failed-recovery stays as defence in
+depth (it is the only guard there that does not rest on another crate's
+rollback being right) and its doc comments now say so; the crate's
+*other* read path, `open_aur_file`, never had such a swap, which is why
+fixing this at the `read` boundary rather than per caller was the right
+level.
+
+**Addendum 2026-09-02 (0.71.1) — the `.aur` writer now runs the
+reader's whole pre-flight, and the widened tile budget says what it
+actually does.** Two independent reviews of 0.71.0 converged on the
+same defect and it needed no crafted input at all: the *reader* carried
+a whole-document tile budget and the *writer* carried none, so two
+ordinary layers, each given an ordinary full-canvas mask through the
+public `add_mask`, wrote a valid container that this project's own
+reader then refused with `TooManyTiles` — a file a user saves and can
+never reopen, which is the "silently degrading a professional's file"
+failure CLAUDE.md names as the worst this project can have. A second,
+narrower shape of the same gap: 0.71.0 hoisted the *mask*-extent check
+above `ZipWriter::new` but not the *layer*-bounds one, so an oversized
+layer extent (reachable through `add_pixel_layer`, which bounds a
+layer's origin but not its extent) failed from inside the tile loop,
+after the mimetype/manifest/history entries were already written,
+leaving a well-formed 3-entry partial container behind — bounded in
+practice only because `write_autosave` stages to a temp path. Both are
+closed by one change: `validate_mask_rects` becomes
+`validate_persisted_rects`, walks `persisted_surfaces` (so layer bounds
+and mask rectangles alike), and sums their grids against
+`MAX_TOTAL_TILES_PER_DOCUMENT` — one hoisted pre-flight shared by
+`read` and `write_with_policy`, before the first byte or the first
+archive probe. Also corrected: that constant's own doc comment claimed
+the `2 *` widening admitted "one layer at the documented ceiling, plus
+its own mask" and refused anything bigger. It does not — the check is a
+flat `total > MAX` over every persisted grid, so two *maskless*
+ceiling-sized layers reach exactly the same total and are admitted too.
+The widening is document-wide and now says so, together with the real
+cost asymmetry it does not distinguish (a found tile costs ~2 orders of
+magnitude more than an empty grid position) and the deliberate decision
+*not* to add a second cap on materialized tiles this round, since that
+would bound how much real content a legitimate document may hold — a
+product decision (PRD §6 promises unlimited layers), not one to make
+inside a hardening pass. The single test guarding the constant was an
+arithmetic tautology (`assert!(2*side*side <= MAX)` one line after
+`assert_eq!(MAX, 2*side*side)`); it is replaced by
+`the_largest_legal_document_still_writes_and_reads_with_its_mask`,
+which calls the real `write` and the real `read` on a real
+ceiling-sized layer carrying a full-canvas mask (~2.75M grid positions
+per direction, 0.43 s locally at the workspace's `opt-level = 1` dev
+profile). Two more tests cover the refusals, each asserting zero bytes
+at the destination.
+
+**Addendum 2026-09-02 (0.71.0) — painted mask coverage now survives a
+`.aur` save/load round trip.** Follow-on (2) of the four 0.70.0 named
+is closed. `aurora-io`'s writer and reader each walked only a layer's
+own pixel surface, so mask pixels were silently dropped on save; both
+now iterate one shared `persisted_surfaces` enumerator that yields a
+layer's content surface *and* its mask surface, the latter addressed
+against the **mask's** own `bounds` rather than the layer's. No
+manifest field and **no `MANIFEST_VERSION` bump** — the format never
+stored tile ownership, so masks slot into the existing derive-the-name-
+and-probe mechanism, and every existing `.aur` file and autosave keeps
+opening with its masks reading back fully visible. Persistence is
+**not** gated on `mask.enabled` (that flag is a UI toggle; gating on it
+would make switching a mask off and saving destroy the painted pixels),
+and group masks persist too. Planning also found a real hardening gap
+this round had to close rather than could skip: a mask's *extent* had
+never been validated — deliberately, since nothing looped over it — and
+`add_mask` does not bound one, so the moment a mask rectangle drives a
+tile grid, a crafted `u32::MAX` mask becomes an unfinishable loop on
+the pre-window startup path; `validate_mask_rects` now runs the full
+`tile_grid` check over every mask, and the whole-document tile budget
+widened to `2 * side * side` so a legal ceiling-sized layer carrying a
+full-canvas mask is not refused. 10 new tests, 5 of them verified
+non-vacuous by removing the enumerator's mask arm. **No `aurora-app`,
+`aurora-ui`, or `aurora-brush` changes, and this is exercised by tests
+only** — nothing in the app paints mask coverage yet (follow-on (1),
+the brush/tool UI, is still open), so it has never run end to end
+through the editor. See M1.9's own "`.aur` persistence of real mask
+coverage" bullet for the full record.
+
+**Addendum 2026-09-02 (0.70.0) — layer masks now carry real per-pixel
+grayscale coverage.** The "rectangular clip only" limitation that
+0.37.0's mask-aggregation round named, and that every round since
+carried forward unchanged, is closed. Coverage lives on its own
+`TileStore` surface (`LayerTree::mask_surface_id`, a derived
+`id | 1 << 63` — no stored field, no `.aur` format change), is written
+and read through one `aurora_doc::mask` module so the convention cannot
+drift, and is composited by `aurora-app`'s renamed `apply_mask`.
+Backward compatibility is automatic at texel granularity: alpha is the
+"has been painted" flag, so an unpainted mask surface reads as fully
+visible and reproduces the old clip byte-for-byte (asserted by
+`apply_mask_with_an_unpainted_mask_surface_matches_the_bounds_only_clip`).
+`aurora-render` and `composite.wgsl` needed and got zero changes.
+**Four follow-ons are deliberately not done and are named in doc
+comments plus the commit message rather than dropped**: a brush/tool UI
+for painting a mask, `.aur` persistence of mask pixels, mask-pixel
+undo/history, and mask-surface lifecycle — nothing clears a mask's
+tiles when the mask or its layer is removed, so a mask removed and
+re-added to the same layer would inherit the old one's painted
+coverage (the surface id is derived from the layer id, not allocated
+fresh), and a deleted layer's mask tiles stay in the store the same way
+its own pixel tiles already do. The fourth was added in 0.70.4 after
+review; the first three were named in 0.70.0 itself. See M1.9's own
+"Real per-pixel grayscale mask coverage" bullet for the full record.
+
+**Addendum 2026-09-02 (0.70.1–0.70.4) — four fixes on top of 0.70.0,
+from an independent review of it.** In order: (`0.70.1`) a crafted
+`.aur` manifest could carry a `LayerId` with bit 63 set, whose *pixel*
+surface then aliased another layer's *mask* surface — one tile-store
+slot with two owners, no error anywhere — because nothing validated
+that ids stay in the bottom half of the id space; both whole-tree gates
+now refuse such an id and such an id counter, and `surface_id` carries
+the guard itself. (`0.70.2`) `apply_mask`'s promised fail-open on an
+unreadable mask tile was fail-*closed* whenever `mask.inverted` was
+set, because the substituted `1.0` went through the inversion like a
+real value; the "could not be read" signal now survives past inversion.
+Same commit: an `f16` alpha underflow could emit the `(r, g, b, 0)`
+texel the output convention forbids, and a mask read's warning was
+attributed to a layer's own pixels. (`0.70.3`) every enabled mask read
+its coverage window unconditionally, materializing never-painted tiles
+— measured at 2.9× the per-tile cost of not reading at all (453.5 →
+1312.6 µs/tile), now 1.01× (364.6 → 369.3 µs/tile) via a new
+`TileStore::contains_tile`. Dev-box CPU numbers; per this file's own
+standard they say nothing about real GPU frame timing, and the 60 FPS
+gap above is unchanged. (`0.70.4`) doc-comment corrections left stale
+by 0.70.0, plus the fourth follow-on above.
+
+**Addendum 2026-09-02 (0.69.1) — the `Ctrl+Z`/`Ctrl+Shift+Z` routing gap
+0.57.7/0.57.8 disclosed and deliberately left open is closed.** Both
+addenda said plainly that the keyboard chord ran `Undo`/`Redo` inline,
+through `run_command` alone, so it reached neither `perform_undo_redo`'s
+mid-stroke commit nor its post-command pan re-clamp — the same class of
+bug fixed at four other sites that round, just not at this one, because
+closing it meant changing `handle_key`'s own contract rather than adding
+a line inside it. Closed the way `ActivatedCommand` already exists for:
+`handle_key`'s global-shortcut branch now returns
+`Some(ActivatedCommand::Undo)`/`::Redo` for those two commands instead of
+running them, exactly as `handle_palette_key` already does for the same
+two entries in the command palette — so `App::handle_key_event`'s
+existing `Some(ActivatedCommand::Undo) => self.run_undo_redo(...)` arm
+(already there, unchanged, previously reachable only from the palette
+and the macOS menu) now catches the keyboard path too, and both go
+through the same, already independently-tested `perform_undo_redo`. No
+new logic was written for the commit/re-clamp step itself — it already
+existed and was already covered by
+`an_undo_during_a_live_stroke_commits_it_instead_of_painting_a_line_the_user_never_drew`
+and its Move-tool sibling; this round's job was only routing `Ctrl+Z`
+into it. `composite_cache` dropped out of `handle_key`'s own parameter
+list entirely (its one remaining use, an inline bump on the two commands
+this fix now defers, moved into `perform_undo_redo`'s own
+`after_undo_redo` step, where it already ran for every other entry
+point). Two existing tests exercising the old inline-run behaviour were
+rewritten to assert the new deferred contract instead (one for `Undo`,
+a new sibling added for `Redo`, since only `Undo` had a test before) —
+each now asserts the *opposite* of what it asserted before: the layer
+under test must still be present/absent after the call, proving
+`handle_key` no longer performs the edit itself. 311 `aurora-app` tests,
+up from 310 (one existing test replaced by two: the same `Undo` case,
+rewritten, plus a new `Redo` sibling that didn't exist before).
+
+**Addendum 2026-09-01 (0.69.0) — `begin_gpu_composite_tile`'s
+collect-all-siblings shape, sized but not scheduled since 0.51.0's CPU-
+side fix because this sandbox had no real GPU to check a change against,
+is closed now that it does.** See that item's own entry (M1.2 section)
+for the full change; the short version is that the destination texture
+now builds lazily on the first root layer that actually resolves at a
+tile, rather than resolving every root into memory before uploading any
+of them, matching the CPU path's existing shape. Verified on this
+sandbox's real NVIDIA RTX 3090 (`AURORA_REQUIRE_GPU=1`), not llvmpipe.
+
+**Addendum 2026-09-01 (0.68.8) — the Judge's independent pass found two
+things the Reviser's own ledger had missed, both fixed here.** (1) The
+0.68.6 liveness-lock re-take (`ensure_session_scratch_lock`) only ran on
+`aur_verify_scratch_dir`'s recreate path; `open_tile_store`'s call to
+`aurora_tile::TileStore::new` self-heals the same scratch directory the
+same way (`create_private_dir`'s own recreate-if-missing behaviour) and
+is called on every fresh open, not only at startup — so a store reopened
+after its directory was swept away ran the rest of that session
+permanently invisible to future startup sweeps, the identical leak
+0.68.6 closed one call site short of completely. Fixed by calling
+`ensure_session_scratch_lock` there too; new test
+`open_tile_store_survives_the_session_scratch_directory_being_swept_away`
+mirrors 0.68.6's own regression test. (2) 0.68.3's addendum (below)
+stated `TileResidency::sync` "has no production caller at all" to argue
+against re-measuring its cost — checked against the code by the Judge and
+found false: `App::redraw` calls it every frame
+(`residency.sync(gpu.queue(), store, composite_surface_id(), false,
+usize::MAX)`), which *is* the hot loop the 5.9× figure describes. The
+claim was inherited from a doc comment about a narrower, unrelated
+question (who picks which `SurfaceId`) without checking an actual call
+site — corrected in place below, in the same spirit as 0.68.5's own
+self-correction of an earlier overclaim. The fold itself is still a
+strict improvement either way (fewer allocations, no behaviour change),
+so nothing here was a regression risk, but the reasoning given for
+skipping measurement was wrong and CLAUDE.md's "measured, not assumed"
+rule means that belongs on the record. No new performance number is
+claimed by either fix.
+
+**Addendum 2026-09-01 (0.68.7) — a budget-skipped tile no longer has its
+dirty flag eaten by the call that skipped it.** `TileResidency::sync`
+called `store.take_dirty(...)` three lines above the per-frame byte-budget
+check that can `continue`. A tile the budget skipped had therefore
+already had its dirtiness *consumed* for an upload that never happened —
+and since it was still resident, the next call's own resident check saw
+nothing to do either. The edit was silently invisible until some
+unrelated change marked that tile dirty afresh. This predates the 0.65.0–
+0.68.0 round entirely and was noticed while reading three lines above
+code it touched; it is fixed rather than only disclosed, because the fix
+is small and the failure is a stale canvas, not a stat.
+
+`sync` now *peeks* (`TileStore::is_dirty`, new, non-consuming, and
+`peek`-based so asking does not bump LRU recency — a query is not an
+access) and consumes the flag only once it has committed to uploading.
+Consuming immediately before `get` rather than after is deliberate: `get`
+borrows the store for the rest of the iteration, and a `get` that *fails*
+leaves the tile non-resident, so the next call retries it on the resident
+check regardless.
+
+**The existing budget test could not have caught this**, and that is
+worth saying: `budget_limited_sync_converges_over_multiple_calls`'s
+skipped tiles are also non-resident, so the resident check alone forces
+their retry whatever became of their dirty flags. The new
+`a_resident_tile_skipped_for_budget_is_still_uploaded_on_a_later_call`
+warms the atlas first, *then* edits every tile, then squeezes the budget
+— the only shape in which the dirty flag is the sole thing distinguishing
+a stale tile from a finished one. Measured against the old ordering: the
+follow-up call reports `uploaded == 0` and the edit is dropped.
+`aurora-gpu` is at 62 tests, up from 61.
+
+**Addendum 2026-09-01 (0.68.6) — a session that has to recreate its own
+scratch directory mid-run now re-takes its liveness lock, instead of
+becoming permanently unsweepable.** `aur_verify_scratch_dir` self-heals a
+session directory a temp cleaner removed out from under a running
+process (0.53.x), because failing there reaches `App::save_aur_file` as
+"the export did not verify", which deletes the export. But
+`create_dir_owner_only` brings the *directory* back and not the
+`aurora.lock` file inside it, and the `ScratchLock` the process still
+held was attached to the deleted inode — invisible to everything,
+including its own directory. From that point the session looked exactly
+like a pre-0.67.0 leftover to every future startup sweep: no lock file,
+therefore `Unknown`, therefore never collected. Fail-closed (nothing is
+deleted while it is live, and nothing afterwards either), but a permanent
+leak of a directory that can hold gigabytes.
+
+A new `ensure_session_scratch_lock` re-takes the lock when — and only
+when — the lock file is missing; re-locking while it is still there would
+conflict with the guard this process already holds, since `flock` is per
+open file description. Storing a *replaceable* guard needed
+`tile_store_scratch_dir`'s `OnceLock` to hold a
+`Mutex<Option<ScratchLock>>`, which is what the new
+`session_scratch_entry` exposes; `tile_store_scratch_dir` itself is now a
+one-line wrapper over it and its own contract is unchanged. A failure to
+re-take is logged at `warn` naming the consequence in plain terms — the
+directory will have to be removed by hand — rather than passing silently.
+
+**Covered by extending the existing self-heal test**, which already
+deletes the one live memoized session directory under
+`AUR_VERIFY_SCRATCH_LOCK` and asserts the save still verifies. It now
+also asserts the lock file is back **and is actually held** (a second
+`lock_scratch_dir` must return `WouldBlock`) — an unheld lock file would
+be worse than none, since it invites the next run's sweep to delete a
+live session. Measured: with the `ensure_session_scratch_lock` call
+removed, the test fails on the lock-file assertion; restored, it passes.
+
+**Addendum 2026-09-01 (0.68.4) — the mip/preview box filter now runs in
+the premultiplied domain too, which is where 0.68.0's fix stopped
+short.** 0.68.0 moved premultiplication ahead of GPU *minification* so
+hardware filtering would be mathematically valid. But the progressive-
+rendering path box-filters on the CPU **before** any of that:
+`mip::downsample` averaged straight-alpha texels, and only then did
+`TileResidency::upload_mip` premultiply the already-averaged result. A
+fully transparent texel's RGB was therefore averaged in at full weight
+against an opaque neighbour's — exactly the halo 0.68.0 exists to
+prevent, one step earlier in the pipeline and equally unrecoverable
+afterwards, because the information is gone before the premultiply ever
+runs.
+
+`downsample` now multiplies each texel's RGB by its own alpha before
+summing, averages that, and divides back out by the summed alpha. Alpha
+is still a plain mean; RGB is now the **alpha-weighted** mean, so a texel
+contributes colour in proportion to how present it actually is. A block
+whose alpha sums to zero yields RGB 0 rather than a `0/0`. **The output
+is still straight alpha**, deliberately — that is the workspace's
+universal convention and what `upload_mip` expects, since it applies its
+own premultiply into the atlas. Filtering in the premultiplied domain and
+converting back is what makes the box filter correct; changing what
+`downsample` returns would only move the bug.
+
+**Measured against the old filter, not argued.** The new
+`downsample_does_not_drag_a_transparent_neighbours_colour_into_the_mean`
+builds a block that is half opaque white and half *transparent* black:
+the visible half is white, so the answer must be white at 50% alpha. With
+the straight-domain arithmetic temporarily restored it returned
+**(0.5, 0.5, 0.5)** — the halo itself, as a number — and
+`downsample_of_a_fully_transparent_block_is_transparent_black_not_nan`
+returned **0.8999** for an invisible texel's stale colour instead of 0.
+Both failed on the old code and pass on the new; the mutation was then
+reverted.
+
+**Two existing fixtures were varying alpha in lockstep with RGB**, which
+meant they were asserting the *straight*-domain answer. `downsample_
+averages_a_checkerboard_to_the_exact_midpoint` and `downsample_reads_the_
+correct_source_block_not_a_shifted_one` are now opaque throughout, so
+each still tests exactly what it was written to test (the midpoint, and
+*which rows* were read) without doubling as a claim about alpha weighting.
+`aurora-render` is at 108 tests, up from 105.
+
+**And the latent test gap that hid all of this is closed.**
+`upload_mip`'s only readback test used an **opaque** fixture, where
+premultiplying is the identity — so the suite stayed green even with
+`upload_mip`'s `premultiply_rgba` call deleted outright. Both that test
+(`aurora-gpu`'s `upload_mip_lands_in_the_correct_slot_and_level`) and the
+end-to-end store → downsample → atlas one (`aurora-render`'s
+`upload_preview_lands_a_downsampled_tile_in_the_atlas`) now use
+half-transparent fixtures and assert the premultiplied readback. Verified
+by mutation on real hardware: with the premultiply removed, the readback
+reads `(1.0, 0.0, 1.0, 0.5)` against an expected `(0.5, 0.0, 0.5, 0.5)`
+and the test fails. These ran with `AURORA_REQUIRE_GPU=1` set, on the
+`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)` adapter — real GPU
+readback, not a software rasterizer. As with 0.68.0, that establishes
+one GPU, one vendor, one backend, and nothing interactive: there is no
+display server here, and **the halo has still never been reproduced as a
+user-visible artifact by anyone**. What is claimed is the arithmetic and
+the pixel readback, no more.
+
+**Addendum 2026-09-01 (0.68.3) — the atlas premultiply is folded into
+the byte serialization it always ran next to, removing a per-tile copy
+and a per-tile allocation.** 0.68.0's `TileResidency::sync` copied each
+tile into a staging `Vec<f16>`, premultiplied that in place, then
+allocated a fresh `Vec<u8>` and serialized into it — while the staging
+buffer's own comment justified itself by saying it "avoids allocating a
+fresh half-megabyte buffer per tile", which the very next line then did
+anyway. A new `extend_premultiplied_le_bytes` premultiplies per texel as
+it writes the little-endian bytes, so `sync` now keeps **one** reusable
+`Vec<u8>` for the whole call and the store's tile still never has to be
+copied to stay straight alpha.
+
+**Corrected 2026-09-01 (Judge, this round's review) — the claim below
+that `sync` has no production caller was checked against the code and
+is false; restated honestly.** `App::redraw` (`aurora-app/src/lib.rs`,
+`residency.sync(gpu.queue(), store, composite_surface_id(), false,
+usize::MAX)`) calls it every frame — the very hot loop the review's
+"5.9× over the 60 FPS budget" figure describes. The doc comment this
+entry leaned on (`residency.rs`'s `sync`, "today's only callers (this
+crate's own tests)") is stale and about a different, narrower claim (who
+picks *which* `SurfaceId` to pass, not who calls `sync` at all) —
+inherited without being checked against an actual call site. **Not
+re-measured here either**, but for the honest reason: this round did not
+re-run the pan-while-painting benchmark, so no before/after number
+exists for this specific change. The fold (one fewer half-megabyte copy
+and allocation per tile) is a strict improvement over 0.68.0's shape
+either way, so nothing here is a regression risk — but the prior
+paragraph's justification for skipping measurement was wrong, and
+CLAUDE.md's own "measured, not assumed" rule means that should say so
+rather than stand corrected only in a later addendum.
+
+`upload_mip` deliberately keeps calling `premultiply_rgba` on its own
+copy: it is the cold preview path, one tile at a time, and leaving it
+alone keeps that helper (and its seven arithmetic tests) live rather than
+turning them into tests of nothing. **Two new tests** (`aurora-gpu` 61,
+up from 59) stop the two spellings drifting:
+`the_fused_serializer_matches_premultiply_then_serialize_exactly`
+compares them bit-for-bit across opaque, half, zero and near-zero alpha,
+and `the_fused_serializer_appends_and_ignores_a_trailing_partial_texel`
+pins the append semantics and the same partial-chunk contract.
+
+**Addendum 2026-09-01 (0.68.2) — a refusal that loses the race for the
+one modal slot is no longer marked as if the user had seen it, and the
+macOS menu bar can no longer fire commands underneath a modal.** Two
+faults of the same class, found independently by two reviewers.
+
+**The swallowed refusal.** `App` holds exactly one dialog slot and
+`open_dialog` is correctly a no-op when it is occupied — but the callers
+marked the refusal reported *unconditionally*. `App::apply_move` called
+`move_refusal_unreported(&mut self.drag)`, which both answered "yes,
+report it" **and** latched `refused = true` in the same call, and then
+called `open_move_refused_dialog`, which does nothing at all while
+another dialog (crash recovery from `App::new`, or an earlier export
+refusal) is up. Because the flag lives on the drag, the refusal was then
+never offered again for the rest of that gesture — not even after the
+blocking dialog was dismissed. The user saw nothing, and nothing in the
+log said so either.
+
+`open_dialog` now **returns whether it actually opened**, and logs a
+`tracing::warn!` naming the dialog it suppressed when it did not, so the
+event survives in the record even when it never reaches a screen.
+`move_refusal_unreported` is now a pure query (`Option<&Drag> -> bool`)
+and a separate `mark_move_refusal_reported` does the latching, which
+`apply_move` runs **only** once a dialog genuinely opened. `save_file`'s
+export refusal has no latch to get wrong, but gains its own
+`tracing::warn!` carrying the full itemized message when the dialog could
+not be shown — the detail it would otherwise have taken to the screen and
+nowhere else.
+
+**The unguarded door.** `handle_key` opens with an early return while a
+dialog is open, so no keyboard-routed Save can fire underneath a modal.
+`handle_menu_event` (macOS, `muda`) had no equivalent: it called
+`activate_command` and then `save_file` regardless. A user with the
+crash-recovery dialog up could pick File > Save As from the native menu,
+hit `IoError::IncompleteComposite`, and be shown nothing — the same
+failure class through a different door, and one that specifically
+undermines the dialog's own `Role::AlertDialog` + `set_modal()` claim,
+since a native menu bar is not dialog-aware and nothing else enforces it
+on that path. It now takes the same early return.
+
+**Stated honestly: the menu gate is inspection-only.** `muda` is
+macOS-only and this sandbox is Linux with no display server, so no
+`muda::MenuEvent` can be constructed here and the two new lines were
+never executed. This is a code-path finding from reading, not a live
+reproduction, and it is disclosed on the method's own doc comment as
+well.
+
+**Three new tests** (`aurora-app` 308, up from 305), all headless.
+`a_move_refusal_suppressed_by_another_dialog_is_not_latched_as_reported`
+replays `apply_move`'s exact sequence against the real `open_dialog` with
+crash recovery already occupying the slot, asserts the refusal is still
+pending, then dismisses the blocker and asserts it now shows *and only
+then* latches.
+`asking_whether_a_move_refusal_needs_reporting_does_not_mark_it_reported`
+pins the query's purity directly. `a_menu_routed_save_is_gated_by_the_
+same_dialog_check_the_keyboard_uses` pins the invariant the macOS gate
+exists to give, against the same shared state, since the `cfg`-gated
+method itself cannot be reached here.
+
+**Addendum 2026-09-01 (0.68.1) — the scratch-directory lock file is now
+published already locked, closing a real TOCTOU race that could delete a
+*live* session's directory.** 0.67.0's `lock_scratch_dir` did
+`open(O_CREAT)` on `aurora.lock` and *then* `flock`ed it. Between those
+two syscalls the canonical file — the one and only name
+`sweep_orphaned_scratch_dirs` looks for — existed **unlocked**. A second
+Aurora starting in that window swept the parent, found the lock file,
+acquired the lock itself, concluded `Verdict::Dead`, and
+`remove_dir_all`ed the directory of a session that was at that instant
+still taking its own lock. The victim's `lock_scratch_dir` then returned
+`Ok(ScratchLock)` on an unlinked inode: it believed it was protected
+while holding a lock nothing on disk could ever see, and ran its whole
+life with no `aurora.lock` present — unprotected, and unsweepable by
+every future run. The module's own "residual races" list named the window
+as `mkdir` → `flock` (never read as dead, which is true) and missed that
+the real one was `open` → `flock` (readable as dead). That doc bullet is
+corrected here too, in the same commit as the code.
+
+**The fix is `link(2)`, not a bigger lock.** `lock_scratch_dir` now
+creates a uniquely named temporary file inside the directory
+(`O_EXCL`/`O_NOFOLLOW`/`0o600`), `flock`s *that*, and only then publishes
+it under `LOCK_FILE_NAME` with `std::fs::hard_link`, unlinking the
+temporary name afterwards. `link` is atomic and fails with `EEXIST`
+rather than replacing anything, so the canonical name comes into
+existence already carrying the lock — there is no window in which it
+exists unlocked, by construction rather than by being fast. `EEXIST`
+(the canonical name is already there: a live session's held lock or a
+dead one's leftover) falls through to locking the file that is actually
+there, which is what keeps `flock`'s mutual exclusion, the sweep's
+`Alive` verdict, and the "released and therefore sweepable again"
+property all meaning exactly what they did before. `rename(2)` was the
+obvious alternative and is **wrong** here: it would replace a live
+holder's lock file with a fresh one, leaving the holder's lock on an
+orphaned inode — the same class of bug as the one being fixed.
+
+**The sweep now probes rather than locks.** `liveness` used to call
+`lock_scratch_dir`, which creates. A new private `try_lock_existing`
+opens without `O_CREAT` and `flock`s, so a lock file that vanishes
+between the existence check and the probe reads as `Unknown`, never as a
+directory this sweep just made a lock file for and then called dead.
+
+**Two new tests** (`aurora-tile` 57, up from 55).
+`the_canonical_lock_file_is_never_visible_before_it_is_locked` is a real
+concurrency test, not an inspection: two poller threads spin on
+`try_lock_existing` across a live acquisition, and the guard is released
+only after they have stopped, so any successful probe is a genuine
+violation with no false positives — it also asserts the pollers actually
+saw the file, so a run that raced nothing cannot pass silently.
+**Measured against the pre-fix code**: the `open`-then-`flock` spelling
+was temporarily restored and the test failed, with a poller acquiring the
+lock out from under the acquirer — which is precisely the step the sweep
+takes immediately before `remove_dir_all`. Restored, it passes.
+`the_lock_file_that_ends_up_published_is_the_one_that_is_locked` pins the
+publish step directly: the canonical name exists, is already locked, and
+no temporary name survives beside it.
+
+**Addendum 2026-09-01 (0.68.0) — the atlas is premultiplied at upload,
+so hardware filtering happens in the domain it has to happen in.**
+`TileResidency::sync` and `TileResidency::upload_mip` now run a new
+`premultiply_rgba` over the texels on their way into the atlas texture,
+and `canvas.wgsl`'s `fs_canvas` is back to the premultiplied "over"
+formula `c.rgb + bg * (1.0 - c.a)`.
+
+**Why, in one sentence**: a `textureSample` with `min_filter: Linear`
+averages four texels per channel in fixed-function hardware *before* any
+shader code runs, and in the straight-alpha domain that average weights a
+fully transparent texel's RGB exactly as heavily as an opaque
+neighbour's — so at a hard alpha edge under minification, whatever
+colour sits behind `alpha = 0` bleeds into the visible result and no
+shader formula can undo it, because the information is already gone.
+
+**What did *not* change**: `aurora-tile`'s store is still straight alpha
+(unchanged, its tests unmodified and passing), and so are the CPU and GPU
+composite surfaces — 0.52.0's un-premultiply fix stands untouched. Only
+the atlas texture, whose entire purpose is to be sampled with filtering,
+holds premultiplied texels. The 20-line comment in `fs_canvas` was
+rewritten rather than deleted: it now explains where the boundary is,
+why it cannot be in the shader, **and** keeps the 0.52.0 history, so a
+future reader who is tempted to "fix" the line back is told to check
+whether `premultiply_rgba` still runs first.
+
+**Twelve new tests.** Seven pure-CPU ones on the helper (`aurora-gpu`
+59, up from 51): `(1,1,1,0.5) -> (0.5,0.5,0.5,0.5)`, alpha 0 zeroes a
+*white* texel, alpha 1 is bit-for-bit unchanged, the walk advances
+across a multi-texel buffer, a trailing partial chunk is defined rather
+than corrupted, `f16` rounding near alpha ~ 0 is pinned at four points
+(including the smallest positive `f16`) so a faint texel provably does
+not flush to zero, and the `[r, g, b, a]` pattern is pinned against
+`aurora_tile::CHANNELS` rather than assuming 4. Plus the GPU test below.
+`canvas_pipeline_blends_a_translucent_tile_against_the_checkerboard`
+passed **unchanged**, as expected: for a spatially uniform texel,
+premultiply-then-premultiplied-over is mathematically identical to
+straight-over, so it can only fail if exactly one of the two halves
+moved.
+
+**The negative control, and it is measured rather than asserted by
+inspection.** `canvas_pipeline_does_not_bleed_transparent_black_across_a_hard_alpha_edge`
+carries two controls, one per half of the fix. (a) A self-calibrating
+A/B pair: the same document rendered twice, differing only in the RGB
+stored *behind* the transparent side of a hard edge at minification —
+transparent black versus transparent white. Those are visually identical
+documents, so the frames must match; with `premultiply_rgba` made a
+no-op they diverge by **209/255** at the edge pixel (46 versus 255),
+which is the halo itself. (b) A uniform 50%-alpha white document at the
+same minified zoom, where alpha is 0.5 by construction rather than by
+wherever the sampler's ramp landed, pinned to the premultiplied-domain
+`0.5 + bg * 0.5` (150–158 of 255); with `fs_canvas` reverted to the
+straight-domain formula it reads **94**. In that same reverted run the
+hard edge's single blended pixel moves from **186 to 129**. Each control
+was run against its own mutation and observed failing, then restored.
+
+**Honest statement of what verified this — and a correction.** This
+round's brief assumed the machine had only Mesa llvmpipe. It does not:
+`real_context()` selected and printed `NVIDIA GeForce RTX 3090 (Vulkan,
+DiscreteGpu)`, and `AURORA_REQUIRE_GPU=1` — which hard-fails on a
+`DeviceType::Cpu` adapter — **passes** here. So these are real-GPU pixel
+readbacks, not software-rasterizer ones, and some older llvmpipe
+disclosures elsewhere in `aurora-gpu` describe a different machine or
+session rather than this one. What that establishes is bounded: one GPU,
+one vendor, one backend (NVIDIA, Vulkan) — Metal and DX12 are
+unverified, and one adapter's filtering is indicative, not settled. It
+establishes nothing interactive: there is no display server here, so
+nothing went through a window, a swapchain, or a human's eyes. And most
+importantly, **the original halo was never reproduced as a user-visible
+artifact** — not in software, not on this GPU, not by anyone. The fix
+rests on the arithmetic of texture filtering and is confirmed by pixel
+readback. "The halo is fixed" is a stronger claim than anything here
+supports and is not being made.
+
+**One cross-consumer check, disclosed.** The residency atlas is sampled
+by `fs_canvas` in production and nothing else — `aurora-app`'s GPU
+compositing builds its own per-layer source textures rather than reading
+the atlas. The one other reader is `aurora-render`'s `latency.rs`, which
+hands `residency.view()` to `TileCompositor::composite_over` (a
+straight-alpha `AlphaBlending` pass) purely to time submission; it
+asserts no pixel values, so the convention change does not affect what
+it measures. If a future caller composites *from* the atlas and cares
+about the result, it will need the same treatment.
+
+**Addendum 2026-09-01 (0.67.0) — orphaned `aurora-scratch-*`
+directories are collected at startup, on Unix, by a liveness lock rather
+than a guess.** 0.63.0 closed the clean-exit half of M1.9's scratch-leak
+item and named this as the half left alone, because deleting another
+process's directory needs a liveness check and getting one wrong is far
+worse than the leak. New `crates/aurora-tile/src/scratch.rs`:
+`lock_scratch_dir` takes an exclusive, non-blocking `flock` on an
+`aurora.lock` file inside the directory (opened `O_NOFOLLOW`, mode
+`0o600`), and `sweep_orphaned_scratch_dirs(parent, prefix)` deletes a
+matching directory **only** when it can acquire that lock, holding it
+across the `remove_dir_all` and dropping it after.
+
+**`flock`, not `fcntl`, deliberately**: it attaches to the open file
+*description*, so the kernel releases it when the process dies however
+it dies (that is the entire liveness signal), and a second accidental
+attempt from within the same process conflicts rather than silently
+succeeding — which is also what lets the "live session" test hold a real
+conflicting lock with no child process. `fcntl`/`F_SETLK` is per-process
+and a stray `close(2)` anywhere would drop it.
+
+**Fail-closed at every branch.** An explicit `enum Verdict { Dead,
+Alive, Unknown }` exists so the control flow cannot grow an
+`unwrap_or(true)`-shaped mistake: a missing lock file, `EWOULDBLOCK`,
+`EACCES`, `EISDIR`, a symlink, a plain file, a foreign `euid`, an
+unreadable entry, any `read_dir`/metadata error — all increment
+`skipped`, none delete. `parent` is a required parameter and nothing in
+the module reaches for `std::env::temp_dir()` itself, so every test
+points at a `tempfile::tempdir()` and cannot touch a real running
+Aurora's directory. The new `unsafe` (`flock`, `geteuid`) is confined to
+`aurora-tile`, the one crate already holding the `unsafe_code = "allow"`
+override, and each block carries a `// SAFETY:` comment in the voice of
+`store::create_private_dir`'s existing ones.
+
+**Wiring.** `aurora_app::create_tile_store_scratch_dir` now returns the
+path *and* the guard, and `tile_store_scratch_dir`'s `OnceLock` holds
+both for the process's life — dropping the guard early would release the
+lock and let the *next* Aurora delete this session's live directory. If
+the lock cannot be taken the directory is removed again and the session
+falls back to `open_tile_store`'s existing "painting is disabled"
+degradation, rather than running unlocked and looking dead to the next
+sweep. `run()` sweeps once right after `write_session_marker` and
+strictly before anything touches `tile_store_scratch_dir`, so "never
+delete the current session's own directory" is true *by construction* —
+it does not exist yet.
+
+**A required pre-check found scratch-directory enumerators that counted
+directory *entries* rather than filtering by the `.tile` extension**, and
+a lock file inside each directory would have broken their exact-count
+assertions. Seven were fixed here; an **eighth** — `aurora-brush`'s
+`break_the_only_scratch_file` — was missed and is fixed in 0.68.5.
+
+**Corrected 2026-09-01 (0.68.5): this paragraph originally said all eight
+"would have silently broken", and that overstates the real exposure.**
+Most of those sites enumerate a bare `tempfile::tempdir()` that never
+receives a lock file in the first place, because nothing in them calls
+`lock_scratch_dir` — they were hardened pre-emptively, against a lock
+file appearing there later, not repaired. Exactly **one** was genuinely
+exposed: the production path where `aurora-app` locks the session
+directory a `TileStore` then pages into. Restated honestly, that is one
+real fix and seven pieces of cheap insurance, which is still worth having
+and is not the same claim.
+
+The alternative design — a sibling `<dir>.lock` — was rejected: `/tmp` is
+world-writable and sticky, so a sibling can be pre-created by another
+user, whereas the directory itself is `0700` with its ownership verified
+before anything inside it is opened.
+
+**Eight new tests** in `aurora-tile` (55 up from 47), all `#[cfg(unix)]`
+and all against a `tempfile::tempdir()`: dead-owner removed;
+lock-still-held left completely alone (tiles intact); no lock file
+skipped; lock path is a directory (`EISDIR`, deterministic for root too,
+unlike a permission fixture) skipped; non-matching sibling untouched and
+not even counted; plain file with the prefix untouched; a second lock
+attempt refused with `EWOULDBLOCK` and available again after release;
+and a mixed sweep where two dead, one live and one legacy directory must
+sort into the right counters.
+
+**Manual, multi-process evidence — and what it is not.** This sandbox
+has no display server (`DISPLAY` and `WAYLAND_DISPLAY` are both unset,
+no Xvfb), so the windowed app cannot be run interactively here and the
+two-live-instances check could not be done with `aurora-app` itself. Two
+real things were done instead. (1) The real `aurora-app` binary was run:
+its sweep executed against the live `/tmp`, found the 24 pre-0.67.0
+leftovers already on this machine, and logged `removed=0 skipped=24` —
+deleting none of them, which is exactly the documented "no lock file
+means unknown" behaviour, observed rather than argued. (2) A throwaway
+harness linking the **shipping** `aurora_tile::lock_scratch_dir` /
+`sweep_orphaned_scratch_dirs` was driven from three separate OS
+processes: process A created and locked a directory holding a `.tile`
+file; process B's sweep reported `removed=0 skipped=1` and A's tile
+survived; A was then `kill -9`ed (no Rust cleanup runs at all); process
+C's sweep reported `removed=1 skipped=0` and the orphan was gone. That
+is a real `SIGKILL` across real process boundaries, which is the part
+unit tests genuinely cannot show.
+
+**Addendum 2026-09-01 (0.66.0) — a Move drag that hits the document's
+own coordinate range now says so, once per drag.** M1.9's own open item
+(above) had been waiting on a surface to report into; 0.65.0 built one,
+so this is the second caller of the same `open_dialog`. `App::apply_move`
+keeps its `tracing::warn!` **unchanged** and additionally matches
+`aurora_doc::DocError::LayerOriginOutOfRange` **specifically** — not a
+catch-all `Err(_)`; an unknown or non-pixel `layer_id` is a bug in this
+crate rather than something the user did, and a modal alert is the wrong
+response to it — to open a dialog with a new `move_refused_message()`.
+
+**The drag's own behaviour is completely unchanged**: the position
+simply stops advancing, exactly as before. The message says so, and
+deliberately does **not** claim the move was undone — nothing was
+undone, because the rejected origin was never written to the document in
+the first place. A test asserts that absence, since "we reverted your
+edit" is the specific wrong thing an alert like this tends to say.
+
+**Reported once per drag, not once per pointer-move event.** A drag held
+past the range refuses on *every* subsequent event, so a new
+`refused: bool` on `Drag::Move` and a free
+`move_refusal_unreported(&mut Option<Drag>) -> bool` (modeled directly
+on `unwarned_failures`, including its "a drag that is somehow not a
+`Move` returns `true`" stance — under-reporting a refusal the user
+cannot otherwise see is the wrong way to be wrong) gate the open. The
+flag lives on the drag, not on `App`, for the reason `unwarned_failures`
+already documents: its lifetime is then exactly the gesture's by
+construction, so a new drag cannot inherit a stale `true` and no caller
+has to remember to clear it. `open_dialog`'s own already-open guard is a
+second, independent line of defence, but on its own it would let a user
+who dismissed the dialog with Escape mid-drag see it reopen on the next
+event — which is why the field was worth the twelve-call-site churn
+rather than relying on the guard alone.
+
+**Four new tests** (305 in `aurora-app`, up from 301), all headless:
+`move_refusal_is_reported_once_per_drag_and_again_for_a_fresh_one` (ten
+subsequent events must all stay silent, and a *fresh* drag must report
+again — the stale-flag case),
+`move_refusal_is_reported_when_the_live_drag_is_not_a_move`,
+`move_refused_message_names_the_layer_and_its_coordinate_range`, and
+`the_move_refused_dialog_opens_and_closes_through_the_same_shared_routing`.
+`begin_drag`'s own existing `Drag::Move` assertion was extended to pin
+that a fresh drag starts with `refused: false`.
+
+**Still inspection-only, on the same terms as 0.65.0**: the two lines
+inside `App::apply_move` that call `move_refusal_unreported` and then
+`open_move_refused_dialog` are not covered by a test, because reaching
+them needs a real `App` (window, GPU adapter, live tile store) this
+crate cannot construct. Both halves they are built from are tested.
+
+**Addendum 2026-09-01 (0.65.0) — an export refused for unreadable tiles
+now says so on screen, not only in the log.** M1.9's own open item (see
+above) assumed this needed "a modal/notification surface in `aurora-ui`
+that `save_file` can drive, which is real UI work". That assumption was
+wrong in a useful way: `aurora_widgets::widgets::dialog::insert_dialog`
+is already general — a title, a message, an ordered row of real,
+focusable action buttons, with `Role::AlertDialog` and `set_modal()` —
+and the only thing making it crash-recovery-specific was `aurora-app`'s
+own wrapper. So this round **generalized the plumbing rather than
+building a widget**: `App::crash_recovery_dialog` is now just
+`App::dialog` (one modal slot, since a modal alert blocks everything
+else anyway), `close_crash_recovery_dialog` is `close_dialog`, and
+`open_crash_recovery_dialog`'s body is now a generic `open_dialog(...,
+title, message, actions)` that the crash-recovery wrapper calls with its
+own strings. **The "already open is a no-op" guard moved down into
+`open_dialog`**, deliberately, so every present and future caller
+inherits it. No new widget code, no new design tokens: `insert_dialog`
+and `insert_button` already resolve their own token-based styling
+(FR-027), which is precisely why reusing them was the right shape.
+
+The refusal itself: `save_file` keeps its `tracing::error!` exactly as
+it was — a dialog the user dismisses is not a record of what happened —
+and additionally matches `IoError::IncompleteComposite` **specifically**
+(not a catch-all `Err(_)`; a bad extension or a failed write is a
+narrower failure that does not warrant a modal alert) to open the dialog
+with a new pure `incomplete_composite_message(skipped, first)`. That
+message is itemized in FR-001's sense because the error already carries
+the itemized detail: how many layer tile reads failed, and verbatim what
+the first one said. It leads with "Nothing was written" and ends with
+"Any existing file at that path is unchanged", because that is the first
+thing someone who just hit Save on unsaved work needs to know. A new
+`App::open_export_refused_dialog` owns the `apply_resize` +
+`push_accessibility` pairing itself rather than leaving it to the call
+site, so the dialog is laid out and screen-reader-announced whichever
+route reached `save_file` — the keyboard path already paired both, but
+the macOS native-menu path only pushed accessibility.
+
+**Six new tests** (301 in `aurora-app`, up from 295), all headless:
+`incomplete_composite_message_names_the_count_and_the_first_failure`,
+`incomplete_composite_message_agrees_with_itself_about_plurality`,
+`open_dialog_focuses_its_first_action`,
+`open_dialog_a_second_time_is_a_no_op_even_for_a_different_dialog`
+(deliberately opens a *different* dialog second, to pin that the guard
+is about the slot being occupied at all),
+`escape_closes_the_export_refused_dialog_through_the_same_routing`, and
+`enter_on_the_export_refused_dialogs_action_closes_it`. Every existing
+crash-recovery dialog test was kept and still passes **by name**, not
+merely by count — `open_crash_recovery_dialog_focuses_its_only_action`,
+`opening_the_crash_recovery_dialog_a_second_time_is_a_no_op`,
+`enter_on_the_focused_action_closes_the_dialog`,
+`escape_also_closes_the_dialog`,
+`clicking_the_dialogs_action_button_closes_it`,
+`clicking_elsewhere_while_the_dialog_is_open_swallows_the_click_without_closing_it`,
+`handle_key_routes_to_the_dialog_before_the_palette_when_both_could_be_open`
+— which is what proves the rename did not silently delete coverage.
+
+**Still inspection-only, stated plainly**: the one line inside
+`save_file` that actually calls `open_export_refused_dialog` is not
+covered by a test. Reaching it needs a real `App` — a window, a GPU
+adapter, a live tile store — and this crate has no test that can
+construct one (`App::new` needs an `EventLoopProxy`). Both halves the
+line is built from *are* tested: the message's content, and the dialog
+mechanics through the same `open_dialog`/`handle_dialog_key`/
+`run_dialog_action` routing the crash-recovery dialog uses. That split
+is written into `save_file`'s own doc comment so the next reader is not
+misled about what "tested" covers here.
+
+**Addendum 2026-09-01 (0.64.2) — 0.64.0's "bounded regardless of how
+large the journal on disk was" was only half true; the other half is
+bounded now, and both bounds are pinned.** A second review round, this
+one by live mutation rather than code-tracing, found three things about
+0.64.0. **(1) The wrong half was bounded.** `describe()`'s `Restore`
+scan was capped, but the `sanitize_display_name` every described entry
+then runs was not: its output cap can only stop the walk once it has
+*found* 128 visible characters, so a name made entirely of stripped
+characters is walked end to end however small the cap is. Measured by
+the reviewer: 158 ms for a crafted journal of 200 names × 200,000
+invisible characters, against 170 µs for the same journal with ordinary
+names — about 930×, through the same `History::load_journal` path with
+the same zero structural validation. Fixed the same way and in the same
+spirit as the first half: a new `MAX_SCANNED_CHARS` (1024, eight times
+the output cap) bounds the *input*, so a name of 1024 characters or
+fewer — every real one; PSD's own legacy record is 255 bytes and its
+`luni` block 255 characters — behaves exactly as before, and past that
+the result ends in `…` because something genuinely was dropped unread.
+The `journal_descriptions` doc comment that made the overclaim now says
+which two bounds there are and that only one of them held between
+0.64.0 and 0.64.2. **(2) The `MAX_ROOT_SEARCH_ENTRIES` tests did not
+pin the constant**: mutation showed 1 and 49,998 both left them green.
+`describe_searches_exactly_the_first_max_root_search_entries` now pins
+the boundary one entry apart, and
+`the_root_search_bound_is_generous_but_still_trivial` pins the
+magnitude to a justified band (both of the reviewer's mutations now
+fail; nearby values like 63/65 deliberately do not, since the boundary
+test is written in terms of the constant). **(3) The root-first
+convention the whole bound rests on was unenforced** — injecting
+`entries.reverse()` after `capture_subtree` left all 199 `aurora-doc`
+tests green. `remove_capturing_puts_the_root_first_in_its_captured_entries`
+(`crates/aurora-doc/src/tree.rs`, a group with three children and a
+nested group of its own) now fails against exactly that mutation.
+**Six new tests** (205 in `aurora-doc`, up from 199), five of them
+deterministic; the sixth is a deliberately loose 50× *ratio* between two
+`sanitize_display_name` calls on the same machine, there so an unbounded
+regression cannot land silently, and it is not a benchmark — CLAUDE.md's
+own caveat about wall-clock numbers applies. The 0.64.0 addendum's
+232 ms figure is annotated in place: it came from a synthetic in-memory
+journal, and `aurora-io`'s 64 MiB `MAX_METADATA_ENTRY_BYTES` puts the
+reachable worst case through a real `.aur` at single-digit milliseconds.
+
+**Addendum 2026-09-01 (0.64.1) — 0.63.0's own fix destroyed the previous
+run's crash-recovery data on a failed startup; corrected.** Found by
+review (code-tracing) immediately after 0.63.0 landed, and it is the
+worse failure of the two: hooking `ApplicationHandler::exiting` meant
+`App::fail`'s `el.exit()` now reached `clean_shutdown_cleanup`, which
+deletes the session marker **and** the autosave. But `App::fail` is only
+ever called from inside `resumed`, before a window exists — and by then
+`App::new` may already have recovered a *previous* crash's document out
+of that autosave without rewriting it (`startup_document`'s recovered
+branch deliberately doesn't; the file **is** the document), with the
+crash-recovery dialog built but never shown, because showing it needs
+the window that just failed to create. So an aborted startup silently
+and permanently destroyed a previous crash's only on-disk copy, on a
+path whose own triggers — no GPU adapter, a driver hiccup, a surface
+that would not create — are exactly the machine-level trouble that can
+explain why the previous run died too. Before 0.63.0 the data survived
+and a retry recovered normally. **Fixed** by splitting the exit in two:
+a new `run_shutdown_cleanup` (the whole of `App::finish_shutdown`'s
+body) branches on `self.failed` and routes an aborted run to a new
+`aborted_startup_cleanup`, which removes this run's own scratch tiles
+and nothing else — not the marker, not the autosave, and not the
+workspace layout either, since a run that never had a window may be
+holding the defaults it fell back to when *reading* the saved layout
+failed. `WindowEvent::CloseRequested` is unaffected and still does the
+full cleanup. `App::fail`'s doc comment claimed the opposite of all this
+("clears its own marker, autosave and scratch tiles exactly like a clean
+window close does") and is rewritten; so are `finish_shutdown`'s,
+`exiting`'s, `clean_shutdown_cleanup`'s and the module's own crash-
+recovery paragraph. Two new tests (295 in `aurora-app`, up from 293):
+`a_failed_startup_preserves_the_previous_runs_crash_recovery_data`,
+mutation-checked (forcing the clean branch fails it), and
+`finish_shutdown_is_idempotent_across_two_exit_paths`, which runs the
+*whole* of `finish_shutdown`'s body twice — including the
+`save_workspace_layout` the trio-only idempotency test never touched —
+and requires the second pass to write the identical bytes. `exiting`'s
+winit claims now name the version they were read against (0.30.13) and
+say plainly that they come from reading source, not from real hardware.
+**Still inspection-only**: constructing an `App` needs an
+`EventLoopProxy`, so no test in this crate calls `App::fail`,
+`App::finish_shutdown` or `exiting` themselves — `run_shutdown_cleanup`
+over `ShutdownState` is the closest reachable seam, and it is the
+entirety of `finish_shutdown`'s body.
+
+**Addendum 2026-09-01 (0.64.0) — `describe()`'s unbounded `Restore` scan
+is bounded, by the direction that does not reopen `load_journal`.** The
+2026-08-30 disclosure (M1.9) offered two fixes; only one was takeable
+without a doctrine change. Bounding `RemovedSubtree::entries`' length in
+`load_journal` would have made that method reject journals it accepts
+today — precisely the structural validation it documents itself as not
+doing, with `replay()` owning that job. Bounding the *search* instead
+costs nothing real: a new `MAX_ROOT_SEARCH_ENTRIES` (64) caps the scan,
+the root is at index 0 for every subtree this crate produces
+(`capture_subtree` is root-first; `add_pixel_layer`/`add_group` build
+one-element lists), and every pre-existing exact-string description
+assertion stayed green unchanged. Past the bound the arm prints the
+`"layer"` placeholder it already used for a rootless `entries` list — a
+disclosed, display-only degradation reachable only by a crafted or
+foreign journal. Two new deterministic tests, one of them a structural
+negative control that fails against the unpatched code. **The
+reviewer's 232 ms number was not re-measured**: the tests prove the
+bound by structure, not by wall clock, so the post-fix latency is
+inferred from the cap rather than observed. **Superseded in three ways
+by 0.64.2 (addendum above)** — this round's own summary claim that the
+panel is bounded "regardless of how large the journal on disk was" was
+false while `sanitize_display_name`'s input stayed unbounded; the two
+tests here pin *a* bound but not its magnitude; and 232 ms is not
+reachable through a real `.aur` file.
+
+**Addendum 2026-09-01 (0.63.0) — the clean-shutdown cleanup now runs on
+every exit path, so only the crash half of that item is left.** M1.9's
+"Scratch directories from sessions that never reach the shutdown
+cleanup" item was two halves; the cheaper one is done. A new
+`App::finish_shutdown` holds the `clean_shutdown_cleanup` trio plus the
+workspace-layout save, and `ApplicationHandler::exiting` calls it
+alongside the existing `WindowEvent::CloseRequested` arm — so macOS's
+native menu Quit and `App::fail`'s own `el.exit()`, both of which used to
+strand a session marker (making the *next* run claim a crash), an
+autosave and gigabytes of paged-out pixels, are covered. Verified
+against the vendored winit 0.30.13 source, backend by backend, in that
+item's own addendum. **Not verified on real hardware**: no test in this
+crate can drive a real event loop, so the wiring stays inspection-only,
+exactly as the `CloseRequested` arm always was; the one new test
+(`clean_shutdown_cleanup_is_idempotent_across_two_exit_paths`) pins only
+the property the two call sites rest on. **Next** on that item is the
+half deliberately left alone — a startup sweep of *other* runs'
+`aurora-scratch-*` leftovers, which still needs the per-platform
+liveness check that made it its own round, since a hard crash,
+`SIGKILL`, an OS shutdown and the release profile's `panic = "abort"`
+never reach `exiting` either.
 
 **Addendum 2026-08-26 (0.57.8) — the rule 0.57.7 wrote down had a live
 exception in the same commit.** `App::active_layer`'s doc comment states
@@ -14107,10 +16192,15 @@ tooling-gated, fall into one of four buckets:
 2. **Needs a real design-owner decision, not an engineering call.**
    M1.10's "component gallery complete" gate item — which of
    `design/gallery/index.html`'s remaining named components (dropdown,
-   tab bar, tooltip, scrollbar, tree, menu, curve editor) to build
+   tab bar, tooltip, tree, menu, curve editor) to build
    next is a real product-scope choice, the same category CLAUDE.md's
    own "don't invent tokens ad hoc... that's a design decision to
    raise" guidance already covers for widget work specifically.
+   **`Scrollbar` came off this list 2026-09-02**: Cahya made exactly
+   that call for it — build it, then finish it properly — so it landed
+   (0.75.0) and was completed with its gallery entry and review fixes
+   (0.75.1). The list is one shorter; the decision it describes is
+   unchanged for the six that remain.
 3. **Blocked by this sandbox's own missing tooling, not a design or
    hardware question.** PSD spike work (0.6: layer masks, vector
    masks, smart objects, layer styles, adjustment layers; compression/
@@ -14125,11 +16215,19 @@ tooling-gated, fall into one of four buckets:
    port of all 26 blend-mode formulas, or per-group isolated GPU
    passes — comparable in size to the six-round CPU blend-mode series
    that landed 0.27.0–0.32.0), and real per-pixel/grayscale mask
-   pixel storage (ADR 0010 already resolved the identical storage
-   question for pixel layers, so the *pattern* isn't a new design call,
-   but the full slice — storage, a way to write content, and real
-   per-pixel compositing — is still multi-decision, multi-round scope,
-   not a quick bug-fix-shaped task). Asked Cahya which of these two to
+   pixel storage. **The mask half is now partly done (0.70.0)**: ADR
+   0010's pattern was applied — coverage lives on its own surface in
+   the shared `TileStore`, and `resolve_tile` composites it for real,
+   feathering and all, and **`.aur` persistence landed in 0.71.0**, so
+   painted coverage survives save/load. Three slices of it are still
+   open and named as such: a brush/tool UI for painting a mask,
+   mask-pixel undo/history, and mask-surface lifecycle cleanup (a
+   removed-then-re-added mask resurrects its old, now
+   spatially-shifted coverage; a deleted layer's mask tiles leak the
+   same way its pixel tiles already do) — the last named in 0.70.4
+   after review found it undisclosed. The first is what still keeps
+   every other slice, persistence included, from ever running end to
+   end through the editor. Asked Cahya which of these two to
    pick up next (2026-08-12); answer was to pause rather than commit to
    either without more review first — see the session's own record for
    the exact framing offered.

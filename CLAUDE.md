@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**A real, running editor — Phase 1 in progress.** As of `0.48.1`: roughly 53,000 lines across 20 crates, 985 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
+**A real, running editor — Phase 1 in progress.** As of `0.75.0`: roughly 89,300 lines across 20 crates, 1,423 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
 
 Five crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-text`, `aurora-filters`, `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. Everything else is real code.
 
@@ -12,7 +12,7 @@ Five crates are still skeletons holding only a placeholder `crate_name()` and on
 
 ### What is not done
 
-- **M1.10, the Phase 1 gate, is what is actually open.** Its remaining items are hardware-gated (below), design-owner-gated (which gallery component to build next is Cahya's call, not an engineering one), tooling-gated (the PSD spike needs `psd-tools` as an independent reader), or genuinely large multi-round work (all 26 blend-mode formulas ported to WGSL; real per-pixel/grayscale mask storage — masks clip to a rectangle today).
+- **M1.10, the Phase 1 gate, is what is actually open.** Its remaining items are hardware-gated (below), design-owner-gated (which gallery component to build next is Cahya's call, not an engineering one), tooling-gated (the PSD spike needs `psd-tools` as an independent reader), or genuinely large multi-round work (all 26 blend-mode formulas ported to WGSL). Mask *coverage* is real per-pixel grayscale as of 0.70.0 and survives a `.aur` save/load round trip as of 0.71.0; what is still missing there is a brush/tool UI for painting a mask, mask-pixel undo/history, and mask-surface lifecycle cleanup (a removed-then-re-added mask resurrects stale, spatially-shifted coverage; a deleted layer's mask tiles leak like its pixel tiles already do) — see PLAN.md's M1.9 mask entry for the full account.
 - **Phase 0 has a tail.** Windows/DX12 validation, the Linux and Windows human legs of the accessibility/IME checklist, and macOS/Windows LGPL packaging all need hardware and a human.
 - **[ADR 0001](docs/adr/0001-custom-wgpu-ui.md) is still not de-risked** — the project's most durable open risk. macOS accessibility passes 9/10 ([spike/a11y-ime/FINDINGS.md](spike/a11y-ime/FINDINGS.md)); Linux (AT-SPI) and Windows (UIA) are entirely unverified, and each is a different platform API. Cahya accepted this as a risk rather than a blocker for starting Phase 1 (2026-07-28). It remains the one open item that could overturn the custom-`wgpu`-UI decision.
 - **60 FPS is measured and failing** — see "Measured, not assumed" below.
@@ -96,15 +96,41 @@ than failing. A dev box with only Mesa llvmpipe still runs them, but in software
 — see "The lesson from the last round" above before treating those numbers, or
 those passes, as evidence about real hardware.
 
+Set `AURORA_REQUIRE_GPU` to turn that self-skip into a hard test failure, so a
+runner that is *supposed* to have a real adapter cannot go green while every
+GPU-gated test silently skips. With it set, two things fail the test: no adapter
+at all, **and** an adapter `wgpu` reports as `DeviceType::Cpu` — llvmpipe here,
+WARP / "Microsoft Basic Render Driver" on Windows — since a software rasterizer
+standing in for hardware is the same gap wearing a different hat. Unset it is a
+complete no-op, `SKIPPED` line included, and a CPU adapter stays perfectly fine
+for ordinary dev-box runs. Parsing: unset is off, and so are the present-but-falsy
+values `` (empty), `0`, `false`, `off`, `no` (trimmed, case-insensitive) —
+GitHub Actions sets a variable to the empty string when a `${{ }}` expression is
+empty, and treating that as "on" would fail a whole matrix for a reason the
+workflow file never states. Any other present value is on.
+
+**No regular push/PR workflow sets it yet** — which runner, if any, should is
+still an open decision, but `.github/workflows/gpu-probe.yml` (0.62.0) is a
+manual, `workflow_dispatch`-only job that runs the workspace's GPU-gated
+tests on `macos-latest` with it set, specifically to find out whether that
+runner has a real adapter before committing either way — see PLAN.md for
+how to read its result. The single implementation is
+`aurora_gpu::test_support::real_context_or_skip` (behind `aurora-gpu`'s
+`test-support` feature); every crate's `real_context()`/`real_gpu_context()`
+helper delegates to it, and it prints the selected adapter's name, backend and
+device type on every successful creation so a CI log records what was actually
+tested. What it asserts is that a real adapter *exists*, not that any particular
+test body ran — an `#[ignore]`d test still contributes a silent pass.
+
 Toolchain is pinned in `rust-toolchain.toml` (1.97, edition 2024 — `cosmic-text` requires ≥1.89, so the text stack sets the floor). CI runs on Linux, macOS, and Windows from the first commit — cross-platform breakage is cheap to fix now and catastrophic in month 30.
 
 ## Lints worth knowing
 
-The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `Cargo.toml`). This is deliberate: Aurora holds a professional's unsaved work, and a panic loses it. Return errors instead. A crate needing `unsafe` must override `unsafe_code` in its own `[lints]` table rather than the workspace's, so the exception is visible in review. **No crate has needed to yet** — `wgpu` and the FFI wrappers in use present safe Rust APIs, so the whole workspace is still `unsafe_code = "deny"`. Keep it that way if you can.
+The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `Cargo.toml`). This is deliberate: Aurora holds a professional's unsaved work, and a panic loses it. Return errors instead. A crate needing `unsafe` must override `unsafe_code` in its own `[lints]` table rather than the workspace's, so the exception is visible in review. **`aurora-tile` is the one exception** (0.61.0): `store::create_private_dir`'s scratch-directory hardening needs `fchmod` on an open descriptor and `geteuid` for an ownership check, neither exposed by `std`, only by `libc` FFI. Its `[lints]` table copies every other workspace lint verbatim and overrides only `unsafe_code` to `"allow"`; every other crate is still `unsafe_code = "deny"` — keep it that way if you can.
 
 ## Versioning
 
-SemVer, started at `0.0.1`, currently `0.48.1`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
+SemVer, started at `0.0.1`, currently `0.75.0`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
 
 - **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
 - **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.
@@ -198,7 +224,20 @@ tests assert a deliberately loose CI-safety threshold (350 ms / 180 ms) because
 they exist to produce a true number, not to pass at 60 FPS; do not read a green
 run as the budget being met. Later work reduced *how much* gets recomposited per
 edit, not the per-tile cost, and none of it has been re-measured on real GPU
-hardware.
+hardware. As of 0.73.4, brush/eraser dabs, pixel-stroke undo/redo, and
+same-origin active-layer switches all invalidate the composite cache narrowly.
+**Structural undo/redo (visibility, opacity, blend mode, and similar toggles)
+does not** — 0.73.0 narrowed it too, but review found the narrowing unsound (a
+layer's declared `bounds` is a position hint, not an enforced clip on its real
+painted content, so the reported rect could miss real pixels), and 0.73.1
+reverted it to a full bump. A live Move still bumps the whole thing either way,
+because the composite tile grid is anchored to the *active layer's* own origin,
+so dragging that layer re-anchors every tile at once. Re-anchoring the grid to
+the document instead is the named follow-on (PLAN.md, Incremental compositing)
+that would also be the prerequisite for structural narrowing to become sound.
+**None of that is progress against the 60 FPS gate** — it buys Ctrl+Z-after-a-
+stroke and Layers-panel click latency, on a different path from the one
+measured above.
 
 **PSD/PSB is full layered read *and* write** (PRD FR-001) — Aurora round-trips, so a file edited here must reopen in Photoshop with layers intact. Two rules follow: never overwrite a user's file in place (write to temp, verify by reopening, then swap), and warn with an itemized list before any lossy save. Silently degrading a professional's file is the worst failure this project can have.
 

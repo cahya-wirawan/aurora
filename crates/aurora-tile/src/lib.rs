@@ -14,10 +14,14 @@
 
 pub mod codec;
 mod error;
+mod scratch;
 mod store;
 mod tile;
 mod writer;
 
 pub use error::TileError;
+pub use scratch::{
+    LOCK_FILE_NAME, ScratchLock, SweepReport, lock_scratch_dir, sweep_orphaned_scratch_dirs,
+};
 pub use store::{Stats, TileStore};
 pub use tile::{CHANNELS, SAMPLES, Surface, SurfaceId, TEXELS, TILE, Tile, TileId};

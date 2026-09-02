@@ -4,7 +4,8 @@
 //! this pipeline" step `render`'s own doc comment names as still open.
 //!
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
-//! `Checkbox`, `Slider`, `TextField`, `CommandPalette`, `ColorSwatch`,
+//! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
+//! `ColorSwatch`,
 //! `ListRow`, and `Panel` — solid rounded-rect shapes, the simplest of
 //! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
@@ -25,9 +26,13 @@
 //! [`paint_list_row`] highlights the selected one with `accent.primary`
 //! — an unselected row still paints nothing, the same "nothing to
 //! highlight" `Ok(vec![])` every other unselected-state widget already
-//! returns. Every other [`WidgetKind`] (`Container` on its own) returns
-//! `Ok(vec![])` too — a real, deliberate "nothing to paint," not an
-//! error.
+//! returns. `Scrollbar` paints a full-length track and a proportional
+//! thumb on top of it, but that is *all* it is: nothing in this crate
+//! scrolls any content, so the thumb's own position and length are a
+//! pure function of its state's numbers and never of a real viewport
+//! (`widgets::scrollbar`'s own module doc comment). Every other
+//! [`WidgetKind`] (`Container` on its own) returns `Ok(vec![])` too — a
+//! real, deliberate "nothing to paint," not an error.
 //!
 //! [`paint_widget`] returns a `Vec<Paint>`, not a single `Paint` —
 //! `Button`/`Checkbox` only ever needed one shape, but `Slider` is the
@@ -61,7 +66,7 @@
 //! not a design decision made by Cahya (PRD FR-027 *Ownership*); revisit
 //! if/when real per-widget radius tokens are added.
 
-use accesskit::Toggled;
+use accesskit::{Orientation, Toggled};
 use aurora_core::Rect;
 use aurora_theme::{Scales, Theme};
 use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor};
@@ -69,8 +74,8 @@ use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
-    ButtonState, CheckboxState, ColorSwatchState, ListRowState, SliderState, TextFieldState,
-    WidgetKind,
+    ButtonState, CheckboxState, ColorSwatchState, ListRowState, ScrollbarState, SliderState,
+    TextFieldState, WidgetKind,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -149,6 +154,7 @@ pub fn paint_widget(
         WidgetKind::Button(state) => paint_button(state, bounds, theme, scales, scale_factor),
         WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales, scale_factor),
         WidgetKind::Slider(state) => paint_slider(state, bounds, theme, scales, scale_factor),
+        WidgetKind::Scrollbar(state) => paint_scrollbar(state, bounds, theme, scales, scale_factor),
         WidgetKind::TextField(state) => {
             paint_text_field(state, bounds, theme, scales, scale_factor)
         }
@@ -300,6 +306,129 @@ fn paint_slider(
     // The thumb, not the track: the track is a groove, not itself a
     // focusable control -- the thumb is the actual interactive handle a
     // user grabs (this module's own doc comment / `control_outline`'s).
+    if let Some(outline) = control_outline(&thumb_path, theme, alpha, scale_factor)? {
+        paints.push(outline);
+    }
+    Ok(paints)
+}
+
+/// `value` if it is finite, `fallback` otherwise — the one-line guard
+/// that keeps a `NaN`/infinite fraction from reaching a tessellator.
+/// Written out rather than leaned on `f32::max`'s own NaN-laundering
+/// (which does silently replace a `NaN` operand) because that only
+/// happens to cover *some* of the arithmetic downstream, and relying on
+/// it would leave the rest — an ordinary multiply — still producing
+/// `NaN`. See [`paint_scrollbar`]'s own doc comment.
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
+}
+
+/// `Scrollbar`'s own two shapes, in draw order: a full-length track
+/// (`surface.sunken`, the same "recessed control" token a `Slider`'s own
+/// track already uses) and a thumb on top of it (`accent.primary`), both
+/// `scales.radius.pill`. `disabled_opacity` is applied to both shapes
+/// uniformly, exactly as [`paint_slider`] already does.
+///
+/// The one real difference from a slider: a scrollbar's thumb has a
+/// *length* of its own, proportional to how much of the scrolled content
+/// is visible (`state.page_size` against the whole scrollable span), not
+/// a fixed square knob. It is floored at the bar's own cross-axis
+/// thickness so a huge document still leaves something grabbable, and
+/// capped at the track's own length so it can never overhang its track
+/// (which a very short, thick bar would otherwise do).
+///
+/// Every degenerate input is handled before any division: a zero or
+/// negative span (`min == max` with no page) paints a full-length thumb
+/// parked at the track's own start, rather than dividing by zero and
+/// tessellating a NaN rectangle.
+///
+/// **Guarding the divisor is not enough, and this function learned that
+/// the hard way.** `span > 0.0`/`range > 0.0` only rule out a division
+/// *by* zero; they say nothing about the quotient. `min =
+/// f64::NEG_INFINITY` with `max = f64::INFINITY` satisfies every bound
+/// check there is (it is finite-free but perfectly ordered), yet makes
+/// `range` infinite and `(value - min) / range` an honest `inf / inf =
+/// NaN`; a `NaN` `state.value` does the same with an ordinary range,
+/// since `f64::clamp` propagates `NaN` rather than clamping it. Either
+/// one reaches `lyon` as a `NaN` rectangle, which trips its own
+/// `assert!(p.y.is_finite())` in a debug build and returns
+/// `Err(WidgetError::Paint)` in a release one — a build-profile-
+/// dependent panic in a crate that denies panics. So both *fractions*
+/// are forced finite below, after the division, and this function is
+/// total for every `ScrollbarState` that can be constructed, including
+/// one reached through the public `WidgetTree::payload_mut`.
+fn paint_scrollbar(
+    state: &ScrollbarState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    let alpha = if state.disabled {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let radius = scales.radius.pill as f32;
+
+    let left = bounds.x as f32;
+    let top = bounds.y as f32;
+    let width = bounds.width as f32;
+    let height = bounds.height as f32;
+    let vertical = matches!(state.orientation, Orientation::Vertical);
+    let (track_len, thickness) = if vertical {
+        (height, width)
+    } else {
+        (width, height)
+    };
+
+    let track_path = rounded_rect(left, top, width, height, radius);
+    let track_mesh = fill(&track_path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.surface.sunken.to_srgb_f32();
+    let track = (track_mesh, [r, g, b, alpha]);
+
+    // The whole scrollable extent is the travel *plus* one page -- a bar
+    // whose page covers the entire content (`max == min`) is a
+    // full-length thumb, not a zero-length one.
+    let span = (state.max - state.min) + state.page_size;
+    let thumb_fraction = if span > 0.0 {
+        (state.page_size / span).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    // A non-finite quotient falls back to the same "no proportional
+    // information" answer a zero span already gives: a full-length
+    // thumb. See this function's own doc comment.
+    let thumb_fraction = finite_or(thumb_fraction, 1.0);
+    let thumb_len = (track_len * thumb_fraction as f32)
+        .max(thickness)
+        .min(track_len);
+
+    let range = state.max - state.min;
+    let position_fraction = if range > 0.0 {
+        ((state.value - state.min) / range).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // ... and a non-finite position falls back to the track's own
+    // start, the same answer a zero range already gives.
+    let position_fraction = finite_or(position_fraction, 0.0);
+    let offset = position_fraction as f32 * (track_len - thumb_len).max(0.0);
+
+    let (thumb_left, thumb_top, thumb_width, thumb_height) = if vertical {
+        (left, top + offset, thickness, thumb_len)
+    } else {
+        (left + offset, top, thumb_len, thickness)
+    };
+    let thumb_path = rounded_rect(thumb_left, thumb_top, thumb_width, thumb_height, radius);
+    let thumb_mesh = fill(&thumb_path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.accent.primary.to_srgb_f32();
+    let thumb = (thumb_mesh, [r, g, b, alpha]);
+
+    let mut paints = vec![track, thumb];
+    // The thumb, not the track -- the same reasoning `paint_slider`
+    // already records: the track is a groove, the thumb is the handle.
     if let Some(outline) = control_outline(&thumb_path, theme, alpha, scale_factor)? {
         paints.push(outline);
     }
@@ -532,13 +661,14 @@ mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        CommandEntry, ListRowState, WidgetKind, command_palette_state, insert_button,
-        insert_checkbox, insert_color_swatch, insert_command_palette, insert_slider,
-        insert_text_field, new_tree, set_button_disabled, set_button_pressed,
-        set_checkbox_disabled, set_color_swatch_disabled, set_slider_disabled, set_slider_value,
+        CommandEntry, ListRowState, ScrollbarRange, ScrollbarState, WidgetKind,
+        command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
+        insert_command_palette, insert_scrollbar, insert_slider, insert_text_field, new_tree,
+        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
+        set_scrollbar_disabled, set_scrollbar_value, set_slider_disabled, set_slider_value,
         set_text_field_disabled, toggle_checkbox,
     };
-    use accesskit::Toggled;
+    use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
     use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
 
@@ -998,6 +1128,491 @@ mod tests {
         assert_eq!(paints.len(), 2);
         for (_, color) in &paints {
             assert_eq!(color[3], theme.state.disabled_opacity);
+        }
+    }
+
+    /// A vertical scrollbar over a 0..=100 range showing a 20-unit page
+    /// — the shared fixture the three scrollbar paint tests below use.
+    fn scrollbar_range() -> ScrollbarRange {
+        ScrollbarRange {
+            min: 0.0,
+            max: 100.0,
+            page_size: 20.0,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_vertical_scrollbar_paints_a_track_then_a_thumb() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let scrollbar = match insert_scrollbar(
+            &mut tree,
+            root,
+            &scales,
+            Orientation::Vertical,
+            None,
+            0.0,
+            scrollbar_range(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            scrollbar,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 13,
+                height: 300,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let mut paints = match paint_widget(&tree, scrollbar, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(paints.len(), 2, "a scrollbar paints a track and a thumb");
+        let (thumb_mesh, thumb_color) = paints.remove(1);
+        let (track_mesh, track_color) = paints.remove(0);
+        assert!(
+            !track_mesh.vertices.is_empty() && !track_mesh.indices.is_empty(),
+            "the track must tessellate to real geometry"
+        );
+        assert!(
+            !thumb_mesh.vertices.is_empty() && !thumb_mesh.indices.is_empty(),
+            "the thumb must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.surface.sunken.to_srgb_f32();
+        assert_eq!(
+            track_color,
+            [r, g, b, 1.0],
+            "the track must use surface.sunken, the same recessed-control token a slider's own \
+             track already uses"
+        );
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert_eq!(
+            thumb_color,
+            [r, g, b, 1.0],
+            "the thumb must use accent.primary at full opacity"
+        );
+
+        // A 20-of-120 page over a 300px track is a 50px thumb -- shorter
+        // than the track, which is the whole visual point of a
+        // scrollbar as against a slider.
+        let thumb_top = thumb_mesh
+            .vertices
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min);
+        let thumb_bottom = thumb_mesh
+            .vertices
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            thumb_bottom - thumb_top < 300.0,
+            "a partial page must give a thumb shorter than its own track: \
+             {thumb_top} -> {thumb_bottom}"
+        );
+    }
+
+    #[test]
+    fn a_scrollbars_thumb_moves_along_its_track_as_its_value_increases() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let scrollbar = match insert_scrollbar(
+            &mut tree,
+            root,
+            &scales,
+            Orientation::Vertical,
+            None,
+            0.0,
+            scrollbar_range(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            scrollbar,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 13,
+                height: 300,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let thumb_min_y = |tree: &WidgetTree<WidgetKind>| -> f32 {
+            let mut paints = match paint_widget(tree, scrollbar, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(paints.len(), 2);
+            let (thumb_mesh, _) = paints.remove(1);
+            thumb_mesh
+                .vertices
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        let at_min = thumb_min_y(&tree);
+        if let Err(err) = set_scrollbar_value(&mut tree, scrollbar, 100.0) {
+            unreachable!("{err:?}");
+        }
+        let at_max = thumb_min_y(&tree);
+        assert!(
+            at_max > at_min,
+            "a vertical scrollbar's thumb must move down as the value increases: \
+             {at_min} -> {at_max}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_scrollbar_applies_the_theme_disabled_opacity_to_both_shapes() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let scrollbar = match insert_scrollbar(
+            &mut tree,
+            root,
+            &scales,
+            Orientation::Horizontal,
+            None,
+            0.0,
+            scrollbar_range(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_scrollbar_disabled(&mut tree, scrollbar, true) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let paints = match paint_widget(&tree, scrollbar, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(paints.len(), 2);
+        for (_, color) in &paints {
+            assert_eq!(color[3], theme.state.disabled_opacity);
+        }
+    }
+
+    /// A mesh's own axis-aligned bounding box, `(min_x, min_y, max_x,
+    /// max_y)` — every scrollbar geometry assertion below is about
+    /// where a thumb actually landed, not just that something
+    /// tessellated.
+    type Bbox = (f32, f32, f32, f32);
+
+    /// One case for `a_scrollbar_with_non_finite_state_still_paints_
+    /// finite_geometry`: a name for the failure message, and the edit
+    /// that puts a `ScrollbarState` into that shape.
+    type ScrollbarCase = (&'static str, Box<dyn FnOnce(&mut ScrollbarState)>);
+
+    fn bbox(mesh: &aurora_vector::Mesh) -> Bbox {
+        let mut bounds = (
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        );
+        for point in &mesh.vertices {
+            bounds.0 = bounds.0.min(point.x);
+            bounds.1 = bounds.1.min(point.y);
+            bounds.2 = bounds.2.max(point.x);
+            bounds.3 = bounds.3.max(point.y);
+        }
+        bounds
+    }
+
+    /// Builds a laid-out scrollbar of exactly `bounds` and paints it,
+    /// returning `(track_bbox, thumb_bbox)`. `state` is applied through
+    /// `payload_mut` *after* insertion deliberately: several cases below
+    /// are ranges `insert_scrollbar` now refuses outright, and the point
+    /// is that `paint_scrollbar` survives them anyway — `payload_mut` is
+    /// public, so "unreachable through the constructor" is not the same
+    /// as "unreachable."
+    fn scrollbar_geometry(
+        bounds: Rect,
+        orientation: Orientation,
+        edit: impl FnOnce(&mut ScrollbarState),
+    ) -> (Bbox, Bbox) {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let id = match insert_scrollbar(
+            &mut tree,
+            root,
+            &scales,
+            orientation,
+            None,
+            0.0,
+            scrollbar_range(),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match tree.payload_mut(id) {
+            Some(WidgetKind::Scrollbar(state)) => edit(state),
+            other => unreachable!("expected Scrollbar, got {other:?}"),
+        }
+        if let Err(err) = tree.set_bounds(id, bounds) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+        let mut paints = match paint_widget(&tree, id, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(paints.len(), 2, "a scrollbar paints a track and a thumb");
+        let (thumb_mesh, _) = paints.remove(1);
+        let (track_mesh, _) = paints.remove(0);
+        (bbox(&track_mesh), bbox(&thumb_mesh))
+    }
+
+    /// A 13x300 vertical bar — the shape the geometry tests below use,
+    /// matching `insert_scrollbar`'s own 13px type-scale thickness.
+    const TALL_BAR: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 13,
+        height: 300,
+    };
+
+    /// `TALL_BAR` transposed — every geometry test above exercises only
+    /// `Orientation::Vertical`; this is the one case pinning that the
+    /// horizontal branch (thumb offset along `x`, thickness on `y`)
+    /// resolves correctly too, independent of the GPU-gated gallery
+    /// (which self-skips on a CPU-only runner).
+    const WIDE_BAR: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 300,
+        height: 13,
+    };
+
+    /// The horizontal counterpart of the geometry this module's doc
+    /// comment traces by hand for the vertical case: a 20-of-120 page
+    /// (`(max - min) + page_size`) over a 300px track is a 50px thumb,
+    /// and a value of 50 out of a 0..100 range centers it at the
+    /// `x = [125, 175]` offset the same arithmetic gives vertically.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_horizontal_scrollbars_thumb_sits_on_the_x_axis_not_the_y_axis() {
+        let (track, thumb) = scrollbar_geometry(WIDE_BAR, Orientation::Horizontal, |state| {
+            state.min = 0.0;
+            state.max = 100.0;
+            state.value = 50.0;
+            state.page_size = 20.0;
+        });
+        assert_eq!(track, (0.0, 0.0, 300.0, 13.0));
+        assert_eq!(
+            thumb,
+            (125.0, 0.0, 175.0, 13.0),
+            "the thumb travels along x and keeps the bar's own y extent, \
+             not the vertical branch's x/y swapped"
+        );
+    }
+
+    /// `min == max` with no page at all: nothing is scrollable, so
+    /// there is no proportional information to draw a short thumb from
+    /// and the thumb covers the whole track. Kills the `span > 0.0`
+    /// guard's removal (`0.0 / 0.0` is `NaN`, which `f32::max` silently
+    /// launders into the 13px thickness floor — a 13px thumb, not a
+    /// 300px one) and the `range > 0.0` guard's removal (`NaN` offset,
+    /// which reaches `lyon` and fails the paint outright).
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_scrollbar_with_nothing_to_scroll_paints_a_full_length_thumb() {
+        let (track, thumb) = scrollbar_geometry(TALL_BAR, Orientation::Vertical, |state| {
+            state.min = 50.0;
+            state.max = 50.0;
+            state.value = 50.0;
+            state.page_size = 0.0;
+        });
+        assert_eq!(track, (0.0, 0.0, 13.0, 300.0));
+        assert_eq!(
+            thumb,
+            (0.0, 0.0, 13.0, 300.0),
+            "with nothing to scroll the thumb fills its own track"
+        );
+    }
+
+    /// A zero page is "no proportional information" (`ScrollbarRange::
+    /// page_size`'s own doc comment), which must still leave something
+    /// grabbable rather than a zero-length thumb. Kills the
+    /// `.max(thickness)` floor's removal.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_scrollbar_with_a_zero_page_size_still_paints_a_grabbable_thumb() {
+        let (_, thumb) = scrollbar_geometry(TALL_BAR, Orientation::Vertical, |state| {
+            state.page_size = 0.0;
+            state.value = 0.0;
+        });
+        assert_eq!(
+            thumb,
+            (0.0, 0.0, 13.0, 13.0),
+            "the thumb is floored at the bar's own cross-axis thickness, not zero"
+        );
+    }
+
+    /// A page larger than the travel it sits in is a caller saying the
+    /// viewport shows more than the content — the thumb grows towards
+    /// the whole track but must never exceed it.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_page_larger_than_the_travel_paints_a_longer_thumb_but_never_a_longer_track() {
+        let (_, small_page) = scrollbar_geometry(TALL_BAR, Orientation::Vertical, |state| {
+            state.min = 0.0;
+            state.max = 100.0;
+            state.value = 0.0;
+            state.page_size = 20.0;
+        });
+        let (track, big_page) = scrollbar_geometry(TALL_BAR, Orientation::Vertical, |state| {
+            state.min = 0.0;
+            state.max = 100.0;
+            state.value = 0.0;
+            state.page_size = 1000.0;
+        });
+        assert!(
+            big_page.3 - big_page.1 > small_page.3 - small_page.1,
+            "a bigger page must give a longer thumb: {small_page:?} -> {big_page:?}"
+        );
+        assert!(
+            big_page.3 <= track.3 && big_page.1 >= track.1,
+            "the thumb must stay inside its own track: {big_page:?} in {track:?}"
+        );
+    }
+
+    /// A bar thicker than it is long — a real possibility for a
+    /// horizontal bar in a narrow column, and the case where the
+    /// thumb's own `.max(thickness)` floor fights its own track. Kills
+    /// the `.min(track_len)` cap's removal, which would paint a 40px
+    /// thumb overhanging a 20px track by its own length again.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_bar_thicker_than_it_is_long_keeps_its_thumb_inside_its_track() {
+        let squat = Rect {
+            x: 5,
+            y: 7,
+            width: 40,
+            height: 20,
+        };
+        let (track, thumb) = scrollbar_geometry(squat, Orientation::Vertical, |state| {
+            state.value = 100.0;
+        });
+        assert_eq!(track, (5.0, 7.0, 45.0, 27.0));
+        assert_eq!(
+            thumb, track,
+            "a thumb floored at a thickness bigger than its own track is capped at the track"
+        );
+    }
+
+    /// An inverted range (`min > max`, reachable only through
+    /// `payload_mut` now that `insert_scrollbar` refuses it) makes the
+    /// scrollable span itself *negative*, which is the one case the
+    /// `span > 0.0` guard decides differently from the non-finite
+    /// fallback that follows it: without the guard, `page_size /
+    /// negative_span` is a perfectly finite negative number that clamps
+    /// to `0.0` and paints a 13px stub. The documented convention for
+    /// every degenerate input is one full-length thumb parked at the
+    /// start, so that is what is pinned here.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_inverted_range_paints_a_full_length_thumb_parked_at_the_start() {
+        let (track, thumb) = scrollbar_geometry(TALL_BAR, Orientation::Vertical, |state| {
+            state.min = 100.0;
+            state.max = 0.0;
+            state.value = 50.0;
+        });
+        assert_eq!(track, (0.0, 0.0, 13.0, 300.0));
+        assert_eq!(thumb, track);
+    }
+
+    /// The `range > 0.0` guard is deliberately kept but is, as of this
+    /// round, *provably unobservable*, and saying so is more useful than
+    /// pretending a test covers it. Whenever `range == 0.0`, `span`
+    /// reduces to `page_size`, so `thumb_fraction` is `page_size /
+    /// page_size == 1.0` (or the zero-span fallback, also `1.0`) — a
+    /// full-length thumb, whose remaining travel `(track_len -
+    /// thumb_len).max(0.0)` is exactly zero. `offset` is then
+    /// `anything * 0.0`, so no `position_fraction` the guard could
+    /// return is distinguishable from any other. Deleting the guard is
+    /// therefore an equivalent mutant, not an uncovered branch: it
+    /// survives this suite because it *cannot* change the output, and it
+    /// stays in the source because `range` becoming observable again
+    /// (any future change to how `thumb_len` is derived) would make it
+    /// load-bearing without warning. This test pins the observable half.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_zero_range_leaves_the_thumb_no_travel_whatever_its_value() {
+        let (track, at_start) = scrollbar_geometry(TALL_BAR, Orientation::Vertical, |state| {
+            state.min = 50.0;
+            state.max = 50.0;
+            state.value = 50.0;
+        });
+        let (_, past_the_end) = scrollbar_geometry(TALL_BAR, Orientation::Vertical, |state| {
+            state.min = 50.0;
+            state.max = 50.0;
+            state.value = 1000.0;
+        });
+        assert_eq!(at_start, track);
+        assert_eq!(past_the_end, track);
+    }
+
+    /// The build-profile-dependent panic this function's own doc
+    /// comment describes: a `NaN` value, and infinite-but-ordered
+    /// bounds, both produced `NaN` geometry that tripped `lyon`'s own
+    /// `assert!(p.y.is_finite())` in a debug build (this one) and
+    /// returned `Err(Paint)` in a release build. Neither is reachable
+    /// through `insert_scrollbar` any more, but `payload_mut` is
+    /// public, so `paint_scrollbar` is made total rather than merely
+    /// unreached. Asserting on real finite geometry, not just `Ok`.
+    #[test]
+    fn a_scrollbar_with_non_finite_state_still_paints_finite_geometry() {
+        let cases: Vec<ScrollbarCase> = vec![
+            (
+                "NaN value",
+                Box::new(|state: &mut ScrollbarState| state.value = f64::NAN),
+            ),
+            (
+                "infinite bounds",
+                Box::new(|state: &mut ScrollbarState| {
+                    state.min = f64::NEG_INFINITY;
+                    state.max = f64::INFINITY;
+                }),
+            ),
+            (
+                "NaN page size",
+                Box::new(|state: &mut ScrollbarState| state.page_size = f64::NAN),
+            ),
+            (
+                "inverted bounds",
+                Box::new(|state: &mut ScrollbarState| {
+                    state.min = 100.0;
+                    state.max = 0.0;
+                }),
+            ),
+        ];
+        for (name, edit) in cases {
+            let (track, thumb) = scrollbar_geometry(TALL_BAR, Orientation::Vertical, edit);
+            for value in [
+                track.0, track.1, track.2, track.3, thumb.0, thumb.1, thumb.2, thumb.3,
+            ] {
+                assert!(value.is_finite(), "{name} produced non-finite geometry");
+            }
+            assert!(
+                thumb.1 >= track.1 && thumb.3 <= track.3,
+                "{name} put the thumb outside its own track: {thumb:?} in {track:?}"
+            );
         }
     }
 

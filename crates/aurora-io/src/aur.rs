@@ -17,23 +17,95 @@
 //!   finally gives the crash-recovery journal (deferred since M1.4/M1.8)
 //!   a real, permanent home, not just the temp-dir autosave file
 //!   `aurora-app` writes today.
-//! - One entry per non-blank pixel-layer tile, named by `tile_entry_name`
-//!   from its own `(SurfaceId, TileId)` pair, holding
+//! - `skipped-tiles` (**optional**, since 0.74.0): the tiles a
+//!   [`write_best_effort`] writer could not read and therefore left
+//!   out, `postcard`-encoded as a versioned `SkippedTilesWire` —
+//!   a schema `version`, the **true** `total` number dropped, and up to
+//!   `MAX_SKIPPED_TILE_RECORDS` individual `SkippedTileRecord`s.
+//!   Written only when that list is non-empty, so an ordinary
+//!   [`write()`] of a document that has lost nothing — every ordinary
+//!   user-facing save — still produces byte-identical output to what it
+//!   produced before this entry existed. Absent means "nothing was
+//!   dropped", which is exactly what every file written before 0.74.0
+//!   means too.
+//!
+//!   It was a bare `Vec<SkippedTileRecord>` in 0.74.0, for one day and
+//!   in no user's hands, and 0.74.1 changed it before it could ship
+//!   further. Two defects, both real: the count a user is shown was
+//!   silently the *capped* count rather than the true one, and the entry
+//!   had no room to grow — reproducing at the entry level exactly the
+//!   `postcard`-is-positional problem the manifest section below spends
+//!   thirty lines on. A wrapper whose first two fields are frozen
+//!   answers both.
+//! - One entry per non-blank persisted tile — a pixel layer's own
+//!   content **and, since 0.71.0, a layer mask's coverage** — named by
+//!   `tile_entry_name` from its own `(SurfaceId, TileId)` pair, holding
 //!   `aurora_tile::codec::encode`'s own output **verbatim** — stored,
 //!   not deflated, since that output is already `lz4_flex`-compressed
 //!   and compressing compressed bytes again wastes CPU for no size
 //!   benefit.
 //!
-//! **Scope, stated honestly.** Only a pixel layer's own `bounds` extent
-//! is persisted — the same "no document-extent clamp" limitation
-//! `aurora_brush::stamp_dab`'s own doc comment already names (nothing
-//! in this pipeline clips painting to a layer's own bounds, so pixels
-//! painted past them were never on documented, reliable ground to begin
-//! with). A fully blank (all-zero) tile is skipped when writing — most
-//! of a freshly created layer's own tile range is never actually
-//! painted, and writing every one of those out would be real, avoidable
-//! file bloat; a missing tile entry on read simply leaves that tile at
-//! the store's own default (blank), not an error.
+//! **Scope, stated honestly.** Two kinds of surface are persisted, and
+//! `persisted_surfaces` is the single place that decides so: a pixel
+//! layer's own content over its `bounds` extent, and a layer's mask
+//! coverage over the *mask's* own `aurora_doc::LayerMask::bounds`
+//! extent — a different rectangle, at a possibly different origin, on a
+//! different `aurora_tile::SurfaceId`
+//! (`aurora_doc::LayerTree::mask_surface_id`). A masked layer's tile
+//! range is therefore walked **twice**, once per surface; that is the
+//! real cost of the extension, and both the whole-document tile budget
+//! (`MAX_TOTAL_TILES_PER_DOCUMENT`) and the wall clock pay it. Group
+//! masks are included too: a group has no content surface but certainly
+//! can carry a mask.
+//!
+//! Neither kind is clamped to the document's own extent — the same "no
+//! document-extent clamp" limitation `aurora_brush::stamp_dab`'s own
+//! doc comment already names (nothing in this pipeline clips painting
+//! to a layer's own bounds, so pixels painted past them were never on
+//! documented, reliable ground to begin with). A fully blank (all-zero)
+//! tile is skipped when writing, as is any tile the store has never
+//! held at all — most of a freshly created layer's own tile range is
+//! never actually painted, and *no* mask surface is painted by anything
+//! in the app today, so writing every one of those out would be real,
+//! avoidable file bloat; a missing tile entry on read simply leaves
+//! that tile at the store's own default, which for a mask means
+//! coverage `1.0`/fully visible (`aurora_doc::mask`'s
+//! alpha-as-presence-flag convention) rather than a hidden layer. That
+//! is also what makes every `.aur` file written before 0.71.0 keep
+//! opening unchanged: no mask entries, so every mask reads back fully
+//! visible, exactly as it composited then.
+//!
+//! **The accepted cost of not bumping `MANIFEST_VERSION`, stated
+//! plainly.** Compatibility runs backward but not forward. A build
+//! older than 0.71.0 opens a 0.71.0-saved file happily — it simply
+//! never probes for mask entries — and if the user then re-saves from
+//! that build, **every painted mask pixel in the document is silently
+//! gone**, because that build's own surface walk yields only pixel
+//! layers. Nothing in the file makes that loud: the manifest carries no
+//! signal an older reader could notice, which is precisely what makes
+//! the no-bump choice work in the first place. The alternative was a
+//! `MANIFEST_VERSION` bump, which this reader answers with a hard
+//! refusal ("unsupported manifest version"), so it would make every
+//! `.aur` file and every autosave that already exists unopenable — a
+//! certain, universal loss traded against a conditional one that
+//! requires a user to run two different builds against one file.
+//! Deliberate, and recorded in PLAN.md beside the same decision. The
+//! honest mitigation, if downgrade ever becomes a real scenario, is a
+//! *capability* signal an old reader can be taught to warn on, not a
+//! version bump; nothing needs one today, because 0.71.0 is unreleased
+//! and no build in a user's hands has ever written a mask entry.
+//!
+//! **Nothing in the app paints mask coverage yet** — the mask brush/tool
+//! UI is still a named follow-on in `aurora_doc::mask` — so this half of
+//! the format is exercised by tests only, not end to end through the
+//! running editor. It is persisted anyway rather than deferred, because
+//! the alternative is a format that silently drops content the moment
+//! that tool lands.
+//!
+//! Persistence is **not** gated on `aurora_doc::LayerMask::enabled`:
+//! that flag is a UI toggle, and skipping disabled masks would mean
+//! switching one off and saving destroys the painted pixels
+//! irrecoverably.
 //!
 //! **Reading is hardened against a hostile or corrupt container**
 //! (2026-08-24). [`read`] runs on `aurora-app`'s own pre-window startup
@@ -58,14 +130,26 @@
 //! origin stays legal; a layer may sit off the canvas edge.
 //!
 //! **A layer's `bounds` is not the only `Rect` a manifest carries**
-//! (0.57.13). A `LayerMask` has one of its own, and `tile_grid` cannot
-//! see it — it is only ever called on a `LayerKind::Pixel` arm's own
-//! `bounds`, so a mask's rectangle went unchecked, and a *group*, which
-//! can carry a mask but has no `bounds`, never reached `tile_grid` at
-//! all. `validate_mask_origins` closes both, from [`read`] and from the
-//! shared body behind [`write()`] and [`write_best_effort`]. It is the
-//! same failure class and reuses [`IoError::LayerOriginOutOfRange`]
+//! (0.57.13). A `LayerMask` has one of its own, and `tile_grid` could
+//! not see it then — it was only ever called on a `LayerKind::Pixel`
+//! arm's own `bounds`, so a mask's rectangle went unchecked, and a
+//! *group*, which can carry a mask but has no `bounds`, never reached
+//! `tile_grid` at all. `validate_persisted_rects` closes both, from [`read`]
+//! and from the shared body behind [`write()`] and
+//! [`write_best_effort`], reusing [`IoError::LayerOriginOutOfRange`]
 //! rather than adding a variant.
+//!
+//! That walk checked only a mask's *origin* until 0.71.0, and said so:
+//! no loop here was derived from a mask's extent, so an oversized one
+//! had nothing to make unfinishable. Persisting mask coverage changed
+//! exactly that — a mask rectangle now drives a real tile grid in both
+//! directions, and `aurora_doc::LayerTree::add_mask` bounds a mask's
+//! origin but never its extent — so `validate_persisted_rects` now runs the
+//! whole of `tile_grid` over every mask, extent
+//! ([`IoError::LayerBoundsTooLarge`]) included. Without it a crafted
+//! manifest declaring a `u32::MAX`-wide mask would hang
+//! `aurora-app`'s own pre-window startup path, which is the same defect
+//! the layer-bounds check already closed.
 //!
 //! **A second hardening pass** (also 2026-08-24) closed three more holes
 //! an independent review found in that same untrusted path: the
@@ -81,6 +165,63 @@
 //! is fixed at its root in `aurora_doc::LayerTree`'s own `Deserialize`
 //! (a tree from bytes is now checked for cycles and depth before any
 //! caller walks it) with this module's own walk made iterative as well.
+//!
+//! **The way *out* was checked less than the way in, until 0.71.1.**
+//! Every check above was reached from [`read`]; the writer shared only
+//! the mask half. Two consequences, both reachable through ordinary
+//! `aurora-doc` API calls rather than a crafted file, and both closed
+//! by hoisting the whole pre-flight into `validate_persisted_rects`:
+//! the writer had **no whole-document tile budget at all**, so two
+//! ordinary layers each carrying an ordinary full-canvas mask wrote a
+//! valid container that this module's own [`read`] then refused with
+//! [`IoError::TooManyTiles`] — a file a user saved and can never
+//! reopen; and an oversized *layer* extent (`aurora-doc` bounds a
+//! layer's origin, not its extent) failed from inside the tile loop,
+//! after the mimetype, manifest and history entries were already
+//! written, leaving a well-formed 3-entry partial container at the
+//! destination. Both now refuse before the first byte.
+//!
+//! **Why `skipped-tiles` is a separate ZIP entry and not a manifest
+//! field** (0.74.0). It looks like a manifest field — it is per-file
+//! metadata, and the manifest is where per-file metadata lives — but it
+//! cannot be one without breaking every `.aur` file and every autosave
+//! that already exists. Two independent reasons, both verified against
+//! this workspace's own pinned `postcard` rather than recalled:
+//!
+//! 1. **`postcard`'s wire format is positional.** Field names and tags
+//!    are not on the wire at all, so a struct's fields are decoded
+//!    strictly in declaration order from a bare byte stream. Adding a
+//!    trailing field to `ManifestRead` means the decoder runs off the
+//!    end of an old container's manifest bytes and fails with
+//!    `DeserializeUnexpectedEnd` — measured directly, with an old-shaped
+//!    two-field struct encoded and a new-shaped three-field struct
+//!    decoded from those same bytes. `#[serde(default)]` does **not**
+//!    rescue it: `default` applies when a self-describing format omits a
+//!    *named* field, and `postcard` has no names to omit, so the hard
+//!    decode error arrives before serde ever consults the attribute.
+//! 2. **A `MANIFEST_VERSION` bump is not the escape hatch either.**
+//!    [`read`] answers any version it does not recognise with a hard
+//!    refusal, so bumping it would make every existing `.aur` file and
+//!    every existing crash-recovery autosave permanently unopenable —
+//!    the exact "certain, universal loss" the mask-persistence decision
+//!    above already rejected for the same reason.
+//!
+//! That `postcard` finding is the foundation the whole design rests on,
+//! so it is pinned by a permanent test rather than left as prose:
+//! `postcard_really_is_positional_so_a_trailing_field_breaks_old_bytes`
+//! in this module's own test module encodes an old-shaped two-field
+//! struct and proves a new-shaped three-field one — `#[serde(default)]`
+//! and all — genuinely fails to decode those bytes. It was a throwaway
+//! gate test until 0.74.1; a `postcard` version bump that quietly
+//! invalidated the premise would otherwise have had nothing to fail.
+//!
+//! A separate, optional, top-level entry has neither problem, and it is
+//! how this format already evolves additively: tile entries are probed
+//! by name and a `ZipError::FileNotFound` simply means "not present"
+//! (see `read_persisted_tiles`). A reader that predates the entry never
+//! looks it up; a reader that knows about it treats absence as an empty
+//! list. Recorded here so nobody has to re-derive the `postcard`
+//! investigation.
 //!
 //! **Colour space, real as of 2026-08-06**: [`write()`]/[`read`] carry a
 //! real `Option<&aurora_color::IccProfile>`/`Option<IccProfile>` now,
@@ -117,6 +258,93 @@ const MIME_ENTRY: &str = "mimetype";
 const MANIFEST_ENTRY: &str = "manifest";
 const HISTORY_ENTRY: &str = "history";
 
+/// The optional entry naming the tiles a [`write_best_effort`] writer
+/// left out — see this module's own doc comment for why it is an entry
+/// of its own rather than a manifest field.
+const SKIPPED_TILES_ENTRY: &str = "skipped-tiles";
+
+/// The most [`SkippedTileRecord`]s either side of this format will put
+/// in, or take out of, the [`SKIPPED_TILES_ENTRY`] entry.
+///
+/// Real skips are rare and correlated (a broken scratch file loses the
+/// handful of tiles that lived in it), so this is far above anything a
+/// genuine best-effort write produces. It exists because the read side
+/// parses a file that may be crafted or corrupt: millions of
+/// `postcard`-encoded records are millions of heap-allocated `String`s,
+/// and the whole point of this list is to be summarized in one dialog
+/// line.
+///
+/// **Truncating the list does not truncate the count.** The entry
+/// carries [`SkippedTiles::total`] — the writer's own true, untruncated
+/// number — beside the capped list, precisely so that capping the
+/// *detail* never quietly shrinks the *disclosure*. A reader past this
+/// cap knows it is past it, and says "at least N".
+const MAX_SKIPPED_TILE_RECORDS: usize = 4096;
+
+/// The most characters of one skip's own `reason` this format stores.
+/// The reason is an [`aurora_tile::TileError`]'s own message, which is
+/// well under this in practice; the bound is here so a pathological
+/// error string cannot make the entry itself large.
+///
+/// **128, matching `aurora_doc::sanitize_display_name`'s own cap**
+/// (0.74.1). It was 512 until then, which was a bound nobody could
+/// honour: the one thing that ever renders a reason puts it through
+/// that sanitizer first, and the sanitizer caps at 128 characters — so
+/// the extra 384 were storage nothing could ever show. Matching the two
+/// makes the stored string exactly what a user can be told, and shrinks
+/// [`MAX_SKIPPED_TILES_ENTRY_BYTES`] by a factor of four for free. The
+/// cost, stated plainly: a `TileError` embedding a long `PathBuf` or a
+/// platform `std::io::Error` string is now cut in storage as well as on
+/// screen. It was already cut on screen.
+///
+/// **Characters, not bytes, deliberately.** Truncating a `String` by
+/// byte offset splits UTF-8 sequences (and would need slicing, which
+/// this workspace denies), so the cut is made with `chars().take(..)`
+/// and this bound counts what that counts. It still bounds the byte
+/// length — at four bytes per `char`, 512 bytes — which is all the
+/// storage bound needs.
+const MAX_SKIPPED_REASON_CHARS: usize = 128;
+
+/// The most bytes one [`SkippedTileRecord`] can occupy once
+/// `postcard`-encoded, worst case, field by field: `surface` is a `u64`
+/// varint (10), `tile_x`/`tile_y` are `u32` varints (5 each), and
+/// `reason` is a length varint (5) plus at most
+/// [`MAX_SKIPPED_REASON_CHARS`] characters at 4 UTF-8 bytes each.
+///
+/// This is the reason [`SkippedTileRecord`] holds nothing but raw
+/// scalars it owns: a field whose serde shape belongs to another crate
+/// would make this number that crate's to change.
+const MAX_SKIPPED_RECORD_BYTES: u64 = 10 + 5 + 5 + 5 + (MAX_SKIPPED_REASON_CHARS as u64) * 4;
+
+/// The largest size [`read`] will accept for the [`SKIPPED_TILES_ENTRY`]
+/// entry — checked by [`read_capped`] **before** a byte is deserialized,
+/// which is the whole point.
+///
+/// Until 0.74.1 this entry shared the manifest's 64 MiB
+/// [`MAX_METADATA_ENTRY_BYTES`], and the [`MAX_SKIPPED_TILE_RECORDS`]
+/// cap was applied by truncating the `Vec` *after* `postcard` had
+/// already decoded all of it. That bounded what was retained, not what
+/// was allocated: a minimal record encodes in about four bytes, so
+/// 64 MiB of (highly DEFLATE-compressible) entry data decoded to
+/// millions of records — measured at ~790 MiB of peak RSS from a 64 KiB
+/// file, on `aurora-app`'s own pre-window crash-recovery startup path.
+/// The cap now matches what [`MAX_SKIPPED_TILE_RECORDS`] records could
+/// legitimately need — about 2.1 MiB — plus a little slack for the
+/// wrapper's own `version`/`total`/length varints, so an oversized entry
+/// is refused by size rather than decoded and then discarded.
+///
+/// Unlike the manifest, this entry has a small, principled bound: it is
+/// a summary, and both sides of the format agree on how large a summary
+/// gets.
+const MAX_SKIPPED_TILES_ENTRY_BYTES: u64 =
+    (MAX_SKIPPED_TILE_RECORDS as u64) * MAX_SKIPPED_RECORD_BYTES + 64;
+
+/// The [`SKIPPED_TILES_ENTRY`] payload's own schema version, independent
+/// of [`MANIFEST_VERSION`] — see [`SkippedTilesWire`] for why this entry
+/// carries one of its own and what a reader that does not recognise it
+/// still manages to report.
+const SKIPPED_TILES_VERSION: u32 = 1;
+
 /// The manifest's own current schema version (`ManifestWrite`/
 /// `ManifestRead`) — bump this whenever their shape changes, and keep
 /// every past version [`read`] has ever shipped readable (ADR 0009's
@@ -146,8 +374,21 @@ const MAX_METADATA_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 /// legitimate can exceed it.
 const MAX_TILE_ENTRY_BYTES: u64 = (aurora_tile::SAMPLES as u64) * 2 + 64 * 1024;
 
-/// The most tiles [`read`]'s own tile scan will visit across *all* of a
-/// manifest's pixel layers put together.
+/// The most tiles a tile scan will visit across *all* of a document's
+/// persisted surfaces put together — every pixel layer's own grid *and*
+/// every mask's, since 0.71.0 charges both against this one budget
+/// ([`persisted_surfaces`]).
+///
+/// **Charged on the way out as well as on the way in** (0.71.1).
+/// Until then only [`read`] carried this budget, and the consequence
+/// was reachable without a crafted file at all: two ordinary layers,
+/// each given an ordinary full-canvas mask through
+/// `aurora_doc::LayerTree::add_mask`, wrote a perfectly valid container
+/// that then failed its own reader with [`IoError::TooManyTiles`] — an
+/// unopenable file produced by entirely ordinary API use, which is the
+/// "silently degrading a professional's file" failure CLAUDE.md names
+/// as the worst this project can have. [`validate_persisted_rects`] now
+/// runs the same sum before the first byte is written.
 ///
 /// `tile_grid` already refuses any single layer larger than the document
 /// ceiling, but nothing bounds how many layers a manifest may declare —
@@ -160,15 +401,44 @@ const MAX_TILE_ENTRY_BYTES: u64 = (aurora_tile::SAMPLES as u64) * 2 + 64 * 1024;
 /// kilobyte-scale file able to spin for hours on `aurora-app`'s own
 /// pre-window startup path.
 ///
-/// The budget is exactly *one* layer at the documented ceiling: the
-/// largest single document PRD §7.3.1 says can exist still loads
-/// untouched, while a manifest that only reaches a bigger number by
-/// stacking many large layers is refused. It is expressed in terms of
-/// the ceiling and the tile size rather than a bare literal, so it
-/// follows either if they ever change.
+/// **What this is, stated plainly.** It is a *flat, document-wide
+/// total*, sized so that the largest single document PRD §7.3.1 says
+/// can exist — one ceiling-sized layer carrying a full-canvas mask —
+/// still loads untouched. It is expressed in terms of the ceiling and
+/// the tile size rather than a bare literal, so it follows either if
+/// they ever change.
+///
+/// The `2 *` arrived with mask persistence (0.71.0), because a mask's
+/// grid is now walked alongside its layer's and a single *legal*
+/// ceiling-sized masked layer would otherwise be refused by a check
+/// meant for crafted files. **It is not mask-scoped, and does not
+/// pretend to be** (corrected 0.71.1, which found the previous wording
+/// here claiming exactly that): the check is `total > MAX` over the sum
+/// of every persisted grid, so any combination reaching the same total
+/// is admitted equally — two ceiling-sized layers carrying *no* masks
+/// at all, one ceiling-sized layer plus a second layer's full-canvas
+/// mask, and so on. That is an accepted, document-wide loosening: the
+/// budget exists to make an unfinishable scan impossible, not to
+/// enforce a layer count, and no arrangement under it can cost more
+/// than the legal one-masked-ceiling-layer case it is sized for.
+///
+/// **The real cost is not uniform across that total, and this budget
+/// does not distinguish.** A grid position with no matching ZIP entry
+/// costs a `format!` and a central-directory miss; one with an entry
+/// costs a capped read, an `lz4` decode, and a tile made resident —
+/// measured at roughly two orders of magnitude more, with an
+/// archive-to-scratch-disk amplification on top. A capped *second*
+/// budget on materialized tiles was considered in 0.71.1 and
+/// deliberately not added: it would bound the worst case tighter, but
+/// it also caps how much real content a legitimate document may hold,
+/// which is a product decision (PRD §6 promises unlimited layers) and
+/// not one to make silently inside a hardening pass. Disclosed here so
+/// the tradeoff is visible rather than assumed away — a file that fills
+/// the whole budget with real tiles is a large, slow read, not a
+/// refused one.
 const MAX_TOTAL_TILES_PER_DOCUMENT: u64 = {
     let side = (aurora_core::MAX_DOCUMENT_EXTENT as u64).div_ceil(TILE as u64);
-    side * side
+    2 * side * side
 };
 
 /// One entry's whole contents, refusing anything past `cap` — see
@@ -238,11 +508,16 @@ fn read_capped(mut file: zip::read::ZipFile<'_>, name: &str, cap: u64) -> Result
 /// through this one function, so one check covers every path in and
 /// out of the format.
 ///
-/// What this function cannot cover, and so does not claim to: a
-/// *mask*'s own rectangle. `bounds` here is always a
-/// `LayerKind::Pixel` arm's, so a mask never arrives, and a group
-/// never calls this at all. [`validate_mask_origins`] is the walk that
-/// covers those, from the same two entry points.
+/// **`bounds` is no longer always a layer's own** (0.71.0). Now that
+/// mask coverage is persisted, [`persisted_surfaces`] yields a *mask*'s
+/// own `aurora_doc::LayerMask` rectangle here too — including a
+/// group's, which has no `bounds` of its own — so this function has
+/// become the single check for every rectangle that drives a tile loop
+/// in this module. Since 0.71.1 every one of those rectangles reaches
+/// this function from [`validate_persisted_rects`] *up front* — before
+/// a single byte is written or a single grid position is probed — and
+/// then again, per surface, purely for the grid dimensions the loops
+/// need.
 ///
 /// Clamping to the ceilings the format already documents bounds the
 /// worst case without newly restricting any legitimate document.
@@ -310,7 +585,9 @@ enum ColorSpaceTag {
 
 /// Writes a complete `.aur` document to `writer`: `layers`/`history`'s
 /// own current state, tagged with `canvas_size`, plus every non-blank
-/// pixel-layer tile currently in `store`. `writer` is generic over
+/// tile currently in `store` on a surface this format persists — every
+/// pixel layer's own content *and* every layer mask's coverage, enabled
+/// or not (`persisted_surfaces`). `writer` is generic over
 /// `Write + Seek` (a real `std::fs::File`, or an in-memory
 /// `std::io::Cursor<Vec<u8>>` for round-trip testing) rather than a
 /// path, so the caller decides how (and whether) to stage/verify the
@@ -331,11 +608,21 @@ enum ColorSpaceTag {
 /// not expected in practice), [`IoError::Doc`] if `history.save_journal`
 /// fails, [`IoError::Color`] if `profile.to_bytes()` fails,
 /// [`IoError::LayerBoundsTooLarge`]/[`IoError::LayerOriginOutOfRange`]
-/// if some layer's own bounds are past the document ceiling in extent
-/// or origin, or some layer's *mask* origin is (`tile_grid` and
-/// `validate_mask_origins` are both shared with [`read`], so the same
-/// checks apply on the way out as on the way in), or [`IoError::Tile`]
-/// if paging a touched tile in from the scratch disk fails.
+/// if some layer's own bounds — **or some layer's mask rectangle** —
+/// are past the document ceiling in extent or origin,
+/// [`IoError::TooManyTiles`] if its layers and their masks together add
+/// up to more tiles than any real document has
+/// (`MAX_TOTAL_TILES_PER_DOCUMENT`), or [`IoError::Tile`] if paging a
+/// touched tile in from the scratch disk fails.
+///
+/// All three rectangle/budget refusals come from the one hoisted
+/// `validate_persisted_rects` pre-flight shared with [`read`], so the
+/// same checks apply on the way out as on the way in and **a refusal
+/// for any of them leaves zero bytes at `writer`** rather than a
+/// partial container. The budget half is what stops this function from
+/// producing a file its own reader would refuse (0.71.1); the extent
+/// half is what stops an oversized mask or layer from turning the tile
+/// loop into an unfinishable one.
 ///
 /// That last one aborts the whole write, deliberately: an explicit save
 /// must refuse rather than quietly produce a document with content
@@ -343,12 +630,20 @@ enum ColorSpaceTag {
 /// file — crash-recovery autosave, and only that — wants
 /// [`write_best_effort`] instead, which skips the unreadable tiles and
 /// names them.
+///
+/// `known_missing` is what this document already knew it had lost
+/// before this write — see [`SkippedTiles`] for why an explicit save has
+/// to carry it forward rather than rediscover it, and
+/// [`SkippedTiles::new`] for the "nothing was ever lost" value that
+/// keeps this function's output byte-identical to what it produced
+/// before the `skipped-tiles` entry existed.
 pub fn write<W: Write + Seek>(
     writer: W,
     layers: &LayerTree,
     history: &History,
     canvas_size: (u32, u32),
     profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
     store: &mut TileStore,
 ) -> Result<(), IoError> {
     // The returned list is empty by construction, not by assumption:
@@ -365,9 +660,12 @@ pub fn write<W: Write + Seek>(
         layers,
         history,
         canvas_size,
-        profile,
+        WritePolicy {
+            profile,
+            known_missing,
+            unreadable: UnreadableTile::Refuse,
+        },
         store,
-        UnreadableTile::Refuse,
     )?;
     Ok(())
 }
@@ -384,11 +682,264 @@ pub struct SkippedTile {
     pub reason: String,
 }
 
+/// One [`SkippedTile`] as it is **stored in the container**, so that a
+/// tile dropped by [`write_best_effort`] is still distinguishable from
+/// a genuinely blank one after a restart.
+///
+/// Until 0.74.0 a skip was visible only within the session that made it
+/// (a `tracing::warn!` line, and `aurora-app`'s own `.partial` autosave
+/// filename). The container itself said nothing: a dropped tile and a
+/// never-painted one both come back as "no entry for this tile", which
+/// is the same silence. This record is what closes that gap — see
+/// the `skipped-tiles` entry, and this module's own doc comment.
+///
+/// **Every field is a raw scalar this module owns, on purpose.** This is
+/// a persisted format that has to keep decoding forever, and encoding a
+/// field as another crate's type would mean inheriting that type's
+/// serde shape as part of this format's wire contract — a change there
+/// would silently become a change here. `SurfaceId::to_raw` /
+/// `SurfaceId::from_raw` is the conversion for `surface`, and it is this
+/// module's own to make; `tile_x`/`tile_y` are `TileId`'s own two
+/// coordinates, spelled out here for exactly the same reason.
+///
+/// `tile` was a bare `aurora_tile::TileId` until 0.74.1 — which did
+/// inherit another crate's derived `Serialize`/`Deserialize`, one line
+/// below a doc comment saying this format does not do that. The
+/// principle was the right one; the code now follows it. Splitting it
+/// also makes `MAX_SKIPPED_RECORD_BYTES` a number this module can
+/// actually derive.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkippedTileRecord {
+    /// The skipped tile's own surface, as `SurfaceId::to_raw`.
+    pub surface: u64,
+    /// The skipped tile's own `TileId::x`.
+    pub tile_x: u32,
+    /// The skipped tile's own `TileId::y`.
+    pub tile_y: u32,
+    /// The underlying `aurora_tile::TileError`'s own message, truncated
+    /// to `MAX_SKIPPED_REASON_CHARS` (128) characters — **on the way in
+    /// and on the way back out**, so the bound is a real invariant of
+    /// this format rather than a convention only the writer keeps.
+    ///
+    /// **Untrusted on the way back in.** On read this is bytes out of a
+    /// file, so anything that renders it — `aurora-app`'s own
+    /// "missing content" dialog is the one caller today — must put it
+    /// through `aurora_doc::sanitize_display_name` first, exactly as
+    /// the layer names out of the same file already are.
+    pub reason: String,
+}
+
+impl SkippedTileRecord {
+    /// This record's own tile, back as the type it came from.
+    #[must_use]
+    pub fn tile(&self) -> TileId {
+        TileId {
+            x: self.tile_x,
+            y: self.tile_y,
+        }
+    }
+
+    /// Whether this skip lost *mask coverage* rather than a pixel
+    /// layer's own content — the same `aurora_doc::MASK_SURFACE_BIT`
+    /// test `write_with_policy`'s own warning line already makes, kept
+    /// here so a reader can make it too. They are different losses to a
+    /// user, and until 0.74.1 the distinction was computed by the writer
+    /// and then thrown away by everything that read the record back.
+    #[must_use]
+    pub fn is_mask(&self) -> bool {
+        self.surface & aurora_doc::MASK_SURFACE_BIT != 0
+    }
+
+    /// `reason`, cut to [`MAX_SKIPPED_REASON_CHARS`].
+    ///
+    /// `chars().take(..)`, never a byte slice: a byte cut can land
+    /// mid-sequence, and `indexing_slicing` is denied workspace-wide
+    /// anyway. Shared by the write side (which truncates what it
+    /// records) and the read side (which truncates what a file claims),
+    /// so both halves enforce one bound.
+    fn bounded_reason(reason: &str) -> String {
+        reason.chars().take(MAX_SKIPPED_REASON_CHARS).collect()
+    }
+}
+
+impl From<&SkippedTile> for SkippedTileRecord {
+    fn from(skipped: &SkippedTile) -> Self {
+        Self {
+            surface: skipped.surface.to_raw(),
+            tile_x: skipped.tile.x,
+            tile_y: skipped.tile.y,
+            reason: Self::bounded_reason(&skipped.reason),
+        }
+    }
+}
+
+/// Everything one container records about tiles a [`write_best_effort`]
+/// writer could not read: the **true, untruncated count**, and up to
+/// `MAX_SKIPPED_TILE_RECORDS` individual [`SkippedTileRecord`]s
+/// describing them.
+///
+/// **Why a count beside the list** (0.74.1). Until then the entry was a
+/// bare `Vec<SkippedTileRecord>` capped at 4096 on both sides, and the
+/// cap was silently lossy in the one message whose entire job is honest
+/// disclosure: a 17,920 × 15,872 px layer — well inside the documented
+/// ceiling — with its scratch tiles gone produces 4339 skips, of which
+/// 4096 survived a save/reload and 243 simply vanished, after which
+/// `aurora-app` told the user "4096 tiles could not be read" as a bare
+/// fact. Carrying `total` makes the capped case say *at least* 4096,
+/// which is true.
+///
+/// **Why it is also carried across saves.** The list a document opens
+/// with is state, not a one-shot notification. The tiles a previous
+/// writer dropped are not in the tile store at all, so a later write
+/// rediscovers nothing about them (`write_with_policy` cannot tell
+/// "never painted" from "lost before this process started"), and until
+/// 0.74.1 the very next save of an opened lossy file produced a
+/// container with no `skipped-tiles` entry — erasing the record this
+/// entry exists to keep. [`Self::record`] is how a live session folds
+/// fresh skips into what it already knew, and every writer takes the
+/// carried value so it lands in the file again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkippedTiles {
+    total: u64,
+    records: Vec<SkippedTileRecord>,
+}
+
+impl SkippedTiles {
+    /// Nothing was dropped — what an ordinary [`write()`] carries, what a
+    /// container with no `skipped-tiles` entry reads back as, and what a
+    /// freshly created document starts with.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// From an explicit count and list — the read side's own
+    /// constructor, and the one tests use to build a truncated case.
+    ///
+    /// `total` is raised to the number of records if a file claims fewer
+    /// than it carries: `total` is documented as a floor on the real
+    /// loss, and a floor below the evidence in the same entry is not one.
+    #[must_use]
+    pub fn from_parts(total: u64, mut records: Vec<SkippedTileRecord>) -> Self {
+        records.truncate(MAX_SKIPPED_TILE_RECORDS);
+        for record in &mut records {
+            record.reason = SkippedTileRecord::bounded_reason(&record.reason);
+        }
+        let total = total.max(records.len() as u64);
+        Self { total, records }
+    }
+
+    /// The true number of tiles dropped, which may exceed
+    /// `records().len()` when the list hit `MAX_SKIPPED_TILE_RECORDS`.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// The individual records, at most `MAX_SKIPPED_TILE_RECORDS` of
+    /// them.
+    #[must_use]
+    pub fn records(&self) -> &[SkippedTileRecord] {
+        &self.records
+    }
+
+    /// The first record, if this carries any detail at all.
+    #[must_use]
+    pub fn first(&self) -> Option<&SkippedTileRecord> {
+        self.records.first()
+    }
+
+    /// Whether anything was dropped. False for every ordinary save and
+    /// every file written before this entry existed — deliberately
+    /// indistinguishable, since neither lost anything.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Whether [`Self::records`] is a *partial* view of
+    /// [`Self::total`] — the condition a message must say "at least" for.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.total > self.records.len() as u64
+    }
+
+    /// Folds a best-effort write's own fresh skips into what was already
+    /// known, in place.
+    ///
+    /// A skip already present — same surface, same tile — is not counted
+    /// twice, so re-saving a document whose losses are unchanged leaves
+    /// the count unchanged. Anything genuinely new raises `total` even
+    /// once `records` has hit its cap.
+    ///
+    /// One honest imprecision, since this is the number a user is shown:
+    /// when `total` already exceeds `records`, a fresh skip cannot be
+    /// checked against the records that were dropped by the cap, so in
+    /// principle it could be counted twice. It cannot happen in
+    /// practice — a carried-forward loss is a tile the store does not
+    /// hold at all, and a fresh skip is a tile it holds but cannot
+    /// read, so the two sets are disjoint — and the number is presented
+    /// as a floor either way.
+    pub fn record(&mut self, fresh: &[SkippedTile]) {
+        for skipped in fresh {
+            let record = SkippedTileRecord::from(skipped);
+            if self
+                .records
+                .iter()
+                .any(|known| known.surface == record.surface && known.tile() == record.tile())
+            {
+                continue;
+            }
+            self.total = self.total.saturating_add(1);
+            if self.records.len() < MAX_SKIPPED_TILE_RECORDS {
+                self.records.push(record);
+            }
+        }
+    }
+}
+
+/// [`SkippedTiles`] as it is written into [`SKIPPED_TILES_ENTRY`].
+///
+/// **Version-first, and the first two fields are frozen forever.**
+/// `postcard` is positional, so a future shape cannot simply grow a
+/// field and expect old bytes to decode (this module's own doc comment
+/// spends thirty lines on exactly that, about the manifest). What it
+/// *can* do is decode a fixed prefix: [`SkippedTilesPrefix`] is
+/// `version` and `total`, and any future version of this payload must
+/// keep starting with those two. That way a build that does not
+/// recognise a newer `version` still reports the honest headline — "at
+/// least N tiles of this document's content are missing" — instead of
+/// either refusing the whole file or, far worse, reading a newer file
+/// as though nothing had been lost.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SkippedTilesWire {
+    version: u32,
+    total: u64,
+    records: Vec<SkippedTileRecord>,
+}
+
+/// The frozen prefix of [`SkippedTilesWire`] — see its doc comment.
+#[derive(serde::Deserialize)]
+struct SkippedTilesPrefix {
+    version: u32,
+    total: u64,
+}
+
 /// [`write()`], except that a tile which cannot be read out of `store` is
 /// **left out** of the container instead of aborting the whole write.
 /// Returns whatever it had to skip, in the order it hit them, so a
-/// caller can say so; an empty vector means the file is complete and
-/// identical to what [`write()`] would have produced.
+/// caller can say so; an empty vector means **this write** read
+/// everything the store still holds.
+///
+/// It does **not** mean the file is complete: `known_missing` is what
+/// the document already knew it had lost (see [`SkippedTiles`]), and
+/// this writer unions it with what it discovers here before writing the
+/// `skipped-tiles` entry. The two are kept apart in the return value on
+/// purpose — `aurora-app` routes an autosave to its `.partial` path on
+/// *fresh* skips only, since a document permanently missing tiles from
+/// a file opened an hour ago must not be barred from ever writing a
+/// primary autosave again. Fold the return value into the carried state
+/// with [`SkippedTiles::record`].
 ///
 /// **This exists for autosave, and deliberately not for Save/Export.**
 /// An explicit save is a professional's deliberate action on their own
@@ -406,13 +957,24 @@ pub struct SkippedTile {
 /// canvas (degrades and repaints) and `composite_document` (refuses).
 ///
 /// Only a tile read is tolerated. A container/I/O failure, a bad
-/// manifest, or a layer whose own bounds — or whose mask's bounds —
-/// exceed the document ceiling in extent or origin still fail the write
-/// outright: those say the *tree* is broken, not that one piece of
-/// input is unreadable. Disclosed rather than silently assumed, since
-/// it means this writer can refuse a whole autosave over a rectangle;
-/// no producer can build such a tree any more, so it is unreachable in
-/// practice, and PLAN.md records it.
+/// manifest, a layer whose own bounds — or whose mask's bounds —
+/// exceed the document ceiling in extent or origin, or a tree whose
+/// grids together exceed `MAX_TOTAL_TILES_PER_DOCUMENT` still fail
+/// the write outright: those say the *tree* is broken, not that one
+/// piece of input is unreadable. Disclosed rather than silently
+/// assumed, since it means this writer can refuse a whole autosave over
+/// a rectangle, and **that is reachable through ordinary
+/// `aurora-doc` API calls, not only from a crafted file** — an earlier
+/// version of this paragraph claimed otherwise. `add_mask` bounds a
+/// mask's extent as of 0.71.3, precisely so one oversized mask can no
+/// longer disable a session's autosave; `add_pixel_layer` still bounds
+/// a layer's origin but not its extent, and nothing bounds the
+/// whole-document total at all, so an oversized *layer* or two
+/// full-canvas-masked ceiling layers still reach this refusal from a
+/// live session. Refusing is still the right answer (the
+/// alternative is an unfinishable loop, or a file that cannot be
+/// reopened) but it means one such layer disables autosave for the rest
+/// of the session, which is a real cost. PLAN.md records it.
 ///
 /// # Errors
 ///
@@ -424,6 +986,7 @@ pub fn write_best_effort<W: Write + Seek>(
     history: &History,
     canvas_size: (u32, u32),
     profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
     store: &mut TileStore,
 ) -> Result<Vec<SkippedTile>, IoError> {
     write_with_policy(
@@ -431,9 +994,12 @@ pub fn write_best_effort<W: Write + Seek>(
         layers,
         history,
         canvas_size,
-        profile,
+        WritePolicy {
+            profile,
+            known_missing,
+            unreadable: UnreadableTile::Skip,
+        },
         store,
-        UnreadableTile::Skip,
     )
 }
 
@@ -448,20 +1014,45 @@ enum UnreadableTile {
     Skip,
 }
 
+/// Everything [`write_with_policy`] needs beyond the document itself:
+/// the colour profile to embed, what the document already knows it has
+/// lost, and what to do about a tile that will not read.
+///
+/// Grouped into a struct rather than passed as three more parameters
+/// only because the workspace's own `too_many_arguments` lint is a real
+/// bound and this function is at it; the three genuinely travel
+/// together, since each is a *policy* decision the two public writers
+/// make differently.
+#[derive(Clone, Copy)]
+struct WritePolicy<'a> {
+    profile: Option<&'a aurora_color::IccProfile>,
+    known_missing: &'a SkippedTiles,
+    unreadable: UnreadableTile,
+}
+
 fn write_with_policy<W: Write + Seek>(
     writer: W,
     layers: &LayerTree,
     history: &History,
     canvas_size: (u32, u32),
-    profile: Option<&aurora_color::IccProfile>,
+    policy: WritePolicy<'_>,
     store: &mut TileStore,
-    unreadable: UnreadableTile,
 ) -> Result<Vec<SkippedTile>, IoError> {
-    // Before a single byte is written: a refusal here leaves no
-    // half-built container behind. `tile_grid`'s own bounds check
-    // cannot be hoisted the same way (it is what derives the grid the
-    // tile loop walks), but a mask check has no such tie.
-    validate_mask_origins(layers)?;
+    let WritePolicy {
+        profile,
+        known_missing,
+        unreadable,
+    } = policy;
+    // Before a single byte is written: every rectangle the tile loop
+    // below will derive a grid from, range-checked, and their grids
+    // summed against the whole-document budget. A refusal here leaves
+    // no half-built container behind -- which, until 0.71.1, an
+    // oversized *layer* extent did (it failed from inside the loop,
+    // after the mimetype/manifest/history entries were already
+    // written), and an over-budget document did not do at all (the
+    // writer had no budget check, so it produced files its own reader
+    // then refused).
+    validate_persisted_rects(layers)?;
 
     let mut skipped: Vec<SkippedTile> = Vec::new();
     let mut zip = ZipWriter::new(writer);
@@ -491,17 +1082,22 @@ fn write_with_policy<W: Write + Seek>(
     zip.start_file(HISTORY_ENTRY, deflated)?;
     zip.write_all(&history_bytes)?;
 
-    for id in pixel_layer_ids(layers) {
-        let Some(LayerKind::Pixel { bounds }) = layers.kind(id) else {
-            continue;
-        };
-        let Some(surface) = layers.surface_id(id) else {
-            continue;
-        };
-        let (tiles_x, tiles_y) = tile_grid(*bounds)?;
+    for (surface, bounds) in persisted_surfaces(layers) {
+        let (tiles_x, tiles_y) = tile_grid(bounds)?;
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let tile_id = TileId { x: tx, y: ty };
+                // A tile the store has never held cannot hold anything
+                // worth writing: `store.get` would materialize it as
+                // `Tile::blank()`, and the all-zero check below would
+                // then drop it again. Identical output, without paying
+                // for the materialization -- and it is a mask surface
+                // that makes this worth doing, since a mask nobody has
+                // painted is the common case for every document written
+                // today.
+                if !store.contains_tile(surface, tile_id) {
+                    continue;
+                }
                 let tile = match store.get(surface, tile_id) {
                     Ok(tile) => tile,
                     Err(err) => match unreadable {
@@ -510,6 +1106,12 @@ fn write_with_policy<W: Write + Seek>(
                             tracing::warn!(
                                 ?surface,
                                 ?tile_id,
+                                // Which half of the surface id space
+                                // this is: a lost mask tile and a lost
+                                // content tile look identical in a log
+                                // otherwise, and they are different
+                                // losses to a user.
+                                mask = surface.to_raw() & aurora_doc::MASK_SURFACE_BIT != 0,
                                 %err,
                                 "leaving an unreadable tile out of a best-effort .aur write"
                             );
@@ -532,19 +1134,69 @@ fn write_with_policy<W: Write + Seek>(
         }
     }
 
+    // The one place the skip list becomes part of the *file* rather
+    // than just the return value, and the one place `known_missing` is
+    // read.
+    //
+    // The union, not just `skipped`: a tile a *previous* writer dropped
+    // is not in the store at all, so the loop above walked straight
+    // past it as "never painted" and rediscovered nothing. Writing only
+    // what this pass found is what made the very next save of an opened
+    // lossy file erase the record entirely (0.74.0's own defect --
+    // open, save, reopen, and the file said nothing).
+    //
+    // The `is_empty` guard is load-bearing and not an optimization: it
+    // is what keeps `write()` -- the `Refuse` policy, and so every
+    // ordinary user-facing save -- byte-identical to what it produced
+    // before this entry existed, since an ordinary save of a document
+    // that never lost anything unions an empty list with an empty list.
+    let mut recorded = known_missing.clone();
+    recorded.record(&skipped);
+    if !recorded.is_empty() {
+        let wire = SkippedTilesWire {
+            version: SKIPPED_TILES_VERSION,
+            total: recorded.total(),
+            records: recorded.records().to_vec(),
+        };
+        let bytes = postcard::to_allocvec(&wire)
+            .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
+        zip.start_file(SKIPPED_TILES_ENTRY, deflated)?;
+        zip.write_all(&bytes)?;
+    }
+
     zip.finish()?;
     Ok(skipped)
 }
 
 /// [`read`]'s own return shape: the reconstructed `LayerTree`/`History`,
-/// the manifest's own `(canvas_width, canvas_height)`, and its own
-/// colour profile (`None`/`Some` — see [`read`]'s own doc comment).
-type AurDocument = (
-    LayerTree,
-    History,
-    (u32, u32),
-    Option<aurora_color::IccProfile>,
-);
+/// the manifest's own `(canvas_width, canvas_height)`, its own colour
+/// profile (`None`/`Some` — see [`read`]'s own doc comment), and
+/// whatever the writer had to leave out.
+///
+/// A named struct rather than the private four-tuple this was until
+/// 0.74.0: a fifth positional element that callers must not ignore is
+/// exactly the thing a tuple makes easy to ignore.
+#[derive(Debug)]
+pub struct AurDocument {
+    pub layers: LayerTree,
+    pub history: History,
+    pub canvas_size: (u32, u32),
+    pub profile: Option<aurora_color::IccProfile>,
+    /// Tiles a [`write_best_effort`] writer could not read and
+    /// therefore left out. Empty for every file [`write()`] produced
+    /// from a document that had lost nothing, and for every file written
+    /// before the `skipped-tiles` entry existed — the two are
+    /// deliberately indistinguishable, since neither lost anything.
+    ///
+    /// Non-empty means this document is **missing content that cannot
+    /// be recovered from this file**. A caller that shows a document to
+    /// a user should say so; `aurora-app`'s own `open_aur_file` does.
+    ///
+    /// It is also the value that caller must **keep** and hand back to
+    /// the next [`write()`]/[`write_best_effort`] of the same document
+    /// — see [`SkippedTiles`] for why nothing rediscovers it.
+    pub skipped_tiles: SkippedTiles,
+}
 
 /// Reads a complete `.aur` document from `reader`, writing every
 /// persisted tile it finds directly into `store` (mirroring
@@ -556,7 +1208,21 @@ type AurDocument = (
 /// that only ever carried the bare `ColorSpaceTag::Srgb` (every `.aur`
 /// file written before [`write()`]'s own `profile` parameter existed, and
 /// every one written with `profile: None` since), `Some` for one that
-/// embedded a real ICC profile.
+/// embedded a real ICC profile — all as a named [`AurDocument`].
+///
+/// [`AurDocument::skipped_tiles`] is the fifth field and the one a
+/// caller must not ignore: non-empty means the file was written by
+/// [`write_best_effort`] with content it could not read, and the
+/// document just handed back is missing pixels no reread will restore.
+///
+/// **A failed read commits nothing** (0.71.2). Tiles go into `store` as
+/// they are decoded, so a container whose *later* entries are corrupt
+/// has already written its earlier ones by the time it fails; every one
+/// of those is dropped again before this returns `Err`
+/// (`roll_back_committed_tiles`), so a rejected file cannot leave
+/// pixels resident under surface ids the caller's next document is
+/// about to claim. See `read_persisted_tiles` for what that fixed and
+/// the one case it cannot.
 ///
 /// # Errors
 ///
@@ -564,18 +1230,20 @@ type AurDocument = (
 /// failure, [`IoError::MissingEntry`] if the manifest or history entry
 /// is absent (not a valid `.aur` file, or one truncated past recovery),
 /// [`IoError::ManifestDeserialization`]/[`IoError::Doc`] if either
-/// fails to decode, [`IoError::Color`] if an embedded ICC profile's own
+/// fails to decode — or if the optional `skipped-tiles` entry is
+/// present but not decodable (its *absence* is never an error; see
+/// `read_skipped_tiles`) —, [`IoError::Color`] if an embedded ICC profile's own
 /// bytes fail to parse, [`IoError::Tile`] if a tile entry fails to
 /// decode or doesn't decode to the expected sample count,
-/// [`IoError::LayerBoundsTooLarge`] if the manifest declares a layer
-/// whose extent is past the document ceiling,
+/// [`IoError::LayerBoundsTooLarge`] if the manifest declares a layer —
+/// or a layer *mask* — whose extent is past the document ceiling,
 /// [`IoError::LayerOriginOutOfRange`] if it declares a layer — or a
 /// layer *mask* — whose *origin* is further from the document origin
 /// than that same ceiling (a negative origin is still legal — see that
 /// variant),
 /// [`IoError::CanvasTooLarge`] if it declares a *canvas* past that same
-/// ceiling, [`IoError::TooManyTiles`] if its
-/// layers together add up to more tiles than any real document has, or
+/// ceiling, [`IoError::TooManyTiles`] if its layers **and their masks**
+/// together add up to more tiles than any real document has, or
 /// [`IoError::EntryTooLarge`] if an entry holds more bytes than it
 /// legitimately could — see
 /// `tile_grid`/`read_capped`/`MAX_TOTAL_TILES_PER_DOCUMENT` for why an
@@ -619,34 +1287,168 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         });
     }
 
-    // Every layer's *mask* origin, before any of them is used. The
-    // layer-bounds twin of this lives in `tile_grid` below, which
-    // cannot cover a mask -- see `validate_mask_origins`.
-    validate_mask_origins(&manifest.layers)?;
+    // Every rectangle this manifest declares -- a layer's own bounds
+    // and every mask's, origin and extent both -- plus the
+    // whole-document tile budget, before any of them is used to derive
+    // a grid below. Hoisted out of the tile loop deliberately: an
+    // oversized extent must be refused before the loop it would
+    // otherwise make unfinishable starts, not part-way through it.
+    validate_persisted_rects(&manifest.layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
 
-    let mut total_tiles: u64 = 0;
-    for id in pixel_layer_ids(&manifest.layers) {
-        let Some(LayerKind::Pixel { bounds }) = manifest.layers.kind(id) else {
-            continue;
-        };
-        let Some(surface) = manifest.layers.surface_id(id) else {
-            continue;
-        };
-        let (tiles_x, tiles_y) = tile_grid(*bounds)?;
-        // Charged against the whole-document budget *before* this
-        // layer's own grid is walked, so an over-budget manifest costs
-        // one addition rather than a scan -- see
-        // `MAX_TOTAL_TILES_PER_DOCUMENT`.
-        total_tiles = total_tiles.saturating_add(u64::from(tiles_x) * u64::from(tiles_y));
-        if total_tiles > MAX_TOTAL_TILES_PER_DOCUMENT {
-            return Err(IoError::TooManyTiles {
-                total: total_tiles,
-                max: MAX_TOTAL_TILES_PER_DOCUMENT,
-            });
-        }
+    let skipped_tiles = read_skipped_tiles(&mut zip)?;
+
+    // Every tile this scan commits is recorded, and undone if the scan
+    // does not finish -- see `read_persisted_tiles` for why a partial
+    // read must not survive.
+    let mut committed: Vec<(SurfaceId, TileId)> = Vec::new();
+    if let Err(err) = read_persisted_tiles(&mut zip, &manifest.layers, store, &mut committed) {
+        roll_back_committed_tiles(store, &committed, &err);
+        return Err(err);
+    }
+
+    Ok(AurDocument {
+        layers: manifest.layers,
+        history,
+        canvas_size: (manifest.canvas_width, manifest.canvas_height),
+        profile,
+        skipped_tiles,
+    })
+}
+
+/// Reads [`SKIPPED_TILES_ENTRY`] if the container has one.
+///
+/// **Absence is not an error, and that is the whole design.** This is a
+/// separate, optional top-level entry precisely so that every `.aur`
+/// file and every crash-recovery autosave written before 0.74.0 keeps
+/// opening unchanged — see this module's own doc comment for why a
+/// manifest field could not do that (`postcard`'s positional wire
+/// format) and why a `MANIFEST_VERSION` bump could not either ([`read`]
+/// hard-refuses an unrecognised version). A missing entry means "the
+/// writer dropped nothing", which is also exactly what an ordinary
+/// [`write()`] means. The `FileNotFound` arm below is that contract,
+/// modelled on the same arm in `read_persisted_tiles`.
+///
+/// **The size cap comes before the decode, and that is the whole
+/// hardening** (0.74.1). This entry has its own tight
+/// [`MAX_SKIPPED_TILES_ENTRY_BYTES`] rather than the manifest's 64 MiB,
+/// and [`read_capped`] rejects an oversized entry from its declared size
+/// before a byte is deserialized. Truncating a decoded `Vec` — what this
+/// did until 0.74.1 — bounds only what is *retained*: a minimal record
+/// encodes in about four `postcard` bytes, so 64 MiB of highly
+/// compressible entry data decoded to millions of `String`-carrying
+/// records first, measured at ~790 MiB of peak RSS from a 64 KiB file on
+/// the pre-window crash-recovery startup path.
+///
+/// What the tight cap leaves is a real, small worst case rather than an
+/// unbounded one: ~2.1 MiB of input at ~4 bytes per minimal record is
+/// on the order of half a million transient records (~20 MiB) before
+/// [`SkippedTiles::from_parts`] cuts the list to
+/// [`MAX_SKIPPED_TILE_RECORDS`]. Bounded, and two orders of magnitude
+/// below what it replaced.
+///
+/// **An unrecognised future `version` degrades once, quietly, on
+/// re-save — matching the mask-persistence format's own accepted
+/// downgrade shape.** The frozen prefix keeps `total` even when the
+/// full payload can't be decoded (see the `version` check below), so a
+/// v1 build reading a hypothetical v2 file still reports the honest
+/// count — but if that same v1 build then saves the document again, it
+/// writes back a v1 entry with that `total` and an *empty* record list.
+/// The count survives; the per-tile detail (which tile, why) does not,
+/// silently, the same way an older build re-saving a file with painted
+/// mask coverage silently drops that coverage. Not disclosed to the
+/// user at either read or write time — only in the `tracing::warn!`
+/// below.
+///
+/// # Errors
+///
+/// [`IoError::EntryTooLarge`] if the entry declares or holds more than
+/// [`MAX_SKIPPED_TILES_ENTRY_BYTES`],
+/// [`IoError::ManifestDeserialization`] if its bytes are not a
+/// `postcard`-encoded [`SkippedTilesWire`] (or do not even carry its
+/// frozen `version`/`total` prefix), or [`IoError::Zip`]/[`IoError::Io`]
+/// for a real container failure.
+fn read_skipped_tiles<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<SkippedTiles, IoError> {
+    let bytes = match zip.by_name(SKIPPED_TILES_ENTRY) {
+        Ok(file) => read_capped(file, SKIPPED_TILES_ENTRY, MAX_SKIPPED_TILES_ENTRY_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(SkippedTiles::new()),
+        Err(err) => return Err(err.into()),
+    };
+    // The frozen prefix first, so a payload written by a future,
+    // unrecognised schema version still yields its honest headline
+    // count instead of being read as "nothing was lost" -- the one
+    // answer this entry must never give by accident. See
+    // `SkippedTilesWire`.
+    let (prefix, _rest) = postcard::take_from_bytes::<SkippedTilesPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != SKIPPED_TILES_VERSION {
+        tracing::warn!(
+            version = prefix.version,
+            understood = SKIPPED_TILES_VERSION,
+            total = prefix.total,
+            "a .aur file records dropped tiles in a newer skipped-tiles schema; keeping the count, \
+             dropping the detail"
+        );
+        return Ok(SkippedTiles::from_parts(prefix.total, Vec::new()));
+    }
+    let wire: SkippedTilesWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    // `from_parts` applies both remaining bounds -- the record cap and
+    // the per-reason character cap -- so the read side enforces what the
+    // write side promises rather than trusting a file to have kept it.
+    Ok(SkippedTiles::from_parts(wire.total, wire.records))
+}
+
+/// [`read`]'s own tile scan: every grid position of every persisted
+/// surface, probed by name, decoded into `store` when an entry exists.
+///
+/// **Split out of [`read`] so that a failure part-way through is
+/// recoverable** (0.71.2). This writes into the *caller's live* store as
+/// it goes — deliberately, mirroring `crate::import::write_into_store`,
+/// since staging a whole document's pixels somewhere else first would
+/// double the memory and the scratch-disk traffic invariant §7.3.1
+/// exists to avoid. The cost of that shape is that a container whose
+/// *later* entries are corrupt has already committed its earlier ones,
+/// and until 0.71.2 nothing undid them: the tiles stayed resident under
+/// exactly the `SurfaceId`s the caller's next document was about to
+/// claim (a fresh `LayerTree` restarts layer ids, and so surface ids,
+/// from the bottom of the space), so a rejected file could show a user
+/// pixels from a document that failed to open — or, on `aurora-app`'s
+/// own "open a `.aur` file a user was sent" path, silently overwrite
+/// tiles of the document they already had open.
+///
+/// So every `(surface, tile)` this commits is pushed onto `committed`
+/// *after* the write succeeds, and [`read`] hands that list to
+/// [`roll_back_committed_tiles`] on any error. The list is bounded by
+/// the number of tile entries the archive actually holds (a grid
+/// position with no entry commits nothing and records nothing), at
+/// twelve bytes each.
+///
+/// 0.71.0 widened the window this closes rather than opening it: a
+/// masked layer now has a *second* surface whose entries can fail
+/// independently, after its content surface has already been committed
+/// in full.
+///
+/// # Errors
+///
+/// The tile-scan half of [`read`]'s own list: [`IoError::Zip`] /
+/// [`IoError::Io`] for a container failure, [`IoError::EntryTooLarge`]
+/// for an entry claiming or holding more bytes than one tile can, and
+/// [`IoError::Tile`] for one that fails to decode or decodes to the
+/// wrong sample count.
+fn read_persisted_tiles<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &LayerTree,
+    store: &mut TileStore,
+    committed: &mut Vec<(SurfaceId, TileId)>,
+) -> Result<(), IoError> {
+    for (surface, bounds) in persisted_surfaces(layers) {
+        // Range-checked and charged against the whole-document budget
+        // already, by `validate_persisted_rects`; this call is only
+        // here for the grid dimensions it returns.
+        let (tiles_x, tiles_y) = tile_grid(bounds)?;
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let tile_id = TileId { x: tx, y: ty };
@@ -655,7 +1457,8 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
                     Ok(file) => read_capped(file, &name, MAX_TILE_ENTRY_BYTES)?,
                     // No entry for this tile -- it was blank when
                     // written (see this module's own doc comment) and
-                    // stays at the store's own default.
+                    // stays at the store's own default. Nothing is
+                    // committed, so nothing is recorded for rollback.
                     Err(zip::result::ZipError::FileNotFound) => continue,
                     Err(err) => return Err(err.into()),
                 };
@@ -686,16 +1489,57 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
                     width: TILE,
                     height: TILE,
                 });
+                // Recorded only now, after the write really landed.
+                // `store.get_mut` materializing a blank tile and then
+                // failing is not a case this can reach -- the `?` above
+                // returns first -- but recording after the fact means
+                // the list can never name a tile this scan did not
+                // actually put content into.
+                committed.push((surface, tile_id));
             }
         }
     }
+    Ok(())
+}
 
-    Ok((
-        manifest.layers,
-        history,
-        (manifest.canvas_width, manifest.canvas_height),
-        profile,
-    ))
+/// Drops every tile [`read_persisted_tiles`] committed before it
+/// failed, so a rejected container leaves the caller's store exactly as
+/// unpopulated (by this read) as it was before.
+///
+/// **This deletes pixels, and that is correct here.** Every key in
+/// `committed` is one this read itself wrote — the content came out of
+/// the container being rejected, not out of the caller's own document.
+/// The one case it is lossy is a caller that had already painted the
+/// *same* `(surface, tile)` before calling [`read`] and whose tile this
+/// read then overwrote: that tile's earlier content was destroyed by the
+/// overwrite itself, not by this rollback, and no amount of eviction
+/// here brings it back. `aurora-app` never does that — both of its
+/// read paths open a document *into* a store, they do not merge one
+/// into a live document — and the alternative (leaving the rejected
+/// file's pixels resident) is the failure this exists to prevent.
+///
+/// Failures are logged, never returned: this runs on an error path that
+/// already has a real error to report, and replacing that error with a
+/// store-eviction one would hide the reason the read failed. `err` is
+/// carried in only so the log line says which failure the rollback
+/// belongs to.
+fn roll_back_committed_tiles(
+    store: &mut TileStore,
+    committed: &[(SurfaceId, TileId)],
+    err: &IoError,
+) {
+    if committed.is_empty() {
+        return;
+    }
+    for &(surface, tile_id) in committed {
+        store.forget_tile(surface, tile_id);
+    }
+    tracing::warn!(
+        tiles = committed.len(),
+        %err,
+        "a .aur read failed part-way through; dropped every tile it had already committed to the \
+         tile store"
+    );
 }
 
 /// Reads one required entry's whole contents, or
@@ -714,12 +1558,85 @@ fn read_entry<R: Read + Seek>(
     read_capped(file, name, MAX_METADATA_ENTRY_BYTES)
 }
 
-/// Every pixel layer in `layers`, at any nesting depth — [`write`]/
-/// [`read`]'s own shared "which layers actually have tiles to
-/// persist" walk. Order doesn't matter here (unlike
-/// `aurora_ui::layers_panel`'s own top-to-bottom paint-order
-/// convention) since this only decides which tiles to touch, not how
-/// to composite them.
+/// Every surface this format persists, paired with the rectangle its
+/// own tile grid is derived from — [`write`]/[`read`]'s **one** shared
+/// answer to "what goes in the archive", so the writer and the reader
+/// cannot disagree about it.
+///
+/// Two kinds of surface, and both are real content a user can lose:
+///
+/// - A pixel layer's own content surface (`LayerTree::surface_id`),
+///   addressed relative to that layer's own `LayerKind::Pixel` bounds.
+/// - A layer's **mask coverage** surface
+///   (`LayerTree::mask_surface_id`), addressed relative to that mask's
+///   own `aurora_doc::LayerMask::bounds` origin — *not* the layer's
+///   (`aurora_doc::mask`'s own "addressing convention" section is the
+///   normative statement of that, and this module is a real caller
+///   bound by it). A *group* has no content surface but can carry a
+///   mask, so it appears here with exactly one entry.
+///
+/// A masked pixel layer therefore contributes two entries and has its
+/// grid walked twice — once per surface, at two different origins.
+/// That is a real, named cost of persisting masks, not a free
+/// extension: both the whole-document tile budget
+/// ([`MAX_TOTAL_TILES_PER_DOCUMENT`], widened to match) and the wall
+/// clock see it.
+///
+/// Mask coverage is persisted **regardless of
+/// `aurora_doc::LayerMask::enabled`**, deliberately. `enabled` is a UI
+/// toggle (shift-click a mask thumbnail); gating persistence on it
+/// would mean switching a mask off and saving silently destroys the
+/// pixels the user painted into it, with no way back — precisely the
+/// "silently degrading a professional's file" failure CLAUDE.md names
+/// as the worst this project can have. `inverted` is a composite-time
+/// interpretation of the same pixels and likewise changes nothing about
+/// what is stored.
+///
+/// Order doesn't matter here (unlike `aurora_ui::layers_panel`'s own
+/// top-to-bottom paint-order convention) since this only decides which
+/// tiles to touch, not how to composite them.
+fn persisted_surfaces(layers: &LayerTree) -> Vec<(SurfaceId, aurora_core::Rect)> {
+    let mut surfaces = Vec::new();
+    for id in layer_ids(layers) {
+        if let Some(LayerKind::Pixel { bounds }) = layers.kind(id)
+            && let Some(surface) = layers.surface_id(id)
+        {
+            surfaces.push((surface, *bounds));
+        }
+        if let Some(mask) = layers.mask(id) {
+            if let Some(surface) = layers.mask_surface_id(id) {
+                surfaces.push((surface, mask.bounds));
+            } else {
+                // Unreachable today and not silently relied on to stay
+                // that way: `mask_surface_id` returns `None` only for a
+                // layer that is not in the tree, and `mask` above just
+                // proved it is. If that ever stops holding, this is a
+                // mask whose painted coverage would be dropped from
+                // every save with no error anywhere -- the exact
+                // silent-degradation failure this format refuses
+                // elsewhere -- so it is logged rather than left to be
+                // rediscovered from a user's lost work.
+                tracing::warn!(
+                    ?id,
+                    "a layer carries a mask but has no mask surface id; its coverage cannot be \
+                     persisted"
+                );
+            }
+        }
+    }
+    surfaces
+}
+
+/// Every layer the tree holds, groups included — the shared walk
+/// [`persisted_surfaces`] goes through (and so, by way of it,
+/// [`validate_persisted_rects`]).
+///
+/// Covering *groups* is the whole reason it walks everything rather
+/// than only `LayerKind::Pixel` entries. A group carries no `bounds`
+/// and has no content surface, but it can carry a mask, and that mask
+/// has both a `Rect` reaching the same downstream arithmetic a pixel
+/// layer's bounds do and (since 0.71.0) coverage tiles of its own to
+/// persist.
 ///
 /// Iterative on an explicit stack, never recursive. `LayerTree`'s own
 /// `Deserialize` already refuses a manifest whose tree isn't really a
@@ -729,23 +1646,6 @@ fn read_entry<R: Read + Seek>(
 /// stack overflow is a process abort rather than an `Err` anything can
 /// report. `budget` bounds the walk at one visit per layer the tree
 /// actually holds, which is all a real tree ever needs.
-fn pixel_layer_ids(layers: &LayerTree) -> Vec<LayerId> {
-    layer_ids(layers)
-        .into_iter()
-        .filter(|id| matches!(layers.kind(*id), Some(LayerKind::Pixel { .. })))
-        .collect()
-}
-
-/// Every layer the tree holds, groups included, in the same order
-/// [`pixel_layer_ids`] yields its own subset — the shared walk, with
-/// the same cycle budget for the same reason (see that function's doc
-/// comment, which this one is the general case of).
-///
-/// Covering *groups* is the whole reason this exists separately.
-/// A group carries no `bounds`, so `pixel_layer_ids` skips it — but it
-/// can carry a mask, and a mask has a `Rect` of its own that reaches
-/// the same downstream arithmetic a pixel layer's bounds do. See
-/// [`validate_mask_origins`].
 ///
 /// Walking from `roots` rather than over the `layers` map reaches every
 /// entry regardless: `aurora_doc`'s own deserialize-time `validate_shape`
@@ -777,43 +1677,74 @@ fn layer_ids(layers: &LayerTree) -> Vec<LayerId> {
     ids
 }
 
-/// Refuses any layer whose *mask* rectangle's origin sits further from
-/// the document origin than [`aurora_core::MAX_DOCUMENT_ORIGIN`] —
-/// [`IoError::LayerOriginOutOfRange`], the same variant `tile_grid`
-/// returns for a layer's own bounds, because it is the same failure
-/// class and a caller has no use for telling them apart.
+/// The whole pre-flight both directions of the format run **before any
+/// tile grid is walked, any byte is written, or any archive entry is
+/// probed**: every rectangle [`persisted_surfaces`] will derive a grid
+/// from — a pixel layer's own `bounds` *and* every mask's — checked for
+/// range, and their grids summed against
+/// [`MAX_TOTAL_TILES_PER_DOCUMENT`].
 ///
-/// **This is a separate walk, and it has to be.** A mask's `Rect` is
-/// not the layer's own `bounds`: `tile_grid` is called only on a
-/// `LayerKind::Pixel` arm's `bounds`, so it never sees a mask at all,
-/// and a *group* — which can carry a mask — never reaches `tile_grid`
-/// in the first place. Until 0.57.13 a crafted manifest could therefore
-/// declare a mask at `i64::MIN` and be read back as `Ok`; it then
-/// survived a write-then-read round trip unchanged and reached
-/// `apply_mask_clip` -> `aurora_core::Rect::contains_point` in
+/// Three refusals, all of them the same variants `tile_grid` and
+/// [`read`] already returned:
+///
+/// - [`IoError::LayerOriginOutOfRange`] — a rectangle whose origin sits
+///   further from the document origin than
+///   [`aurora_core::MAX_DOCUMENT_ORIGIN`].
+/// - [`IoError::LayerBoundsTooLarge`] — one whose extent is past
+///   [`aurora_core::MAX_DOCUMENT_EXTENT`].
+/// - [`IoError::TooManyTiles`] — grids that individually pass and
+///   together do not.
+///
+/// A layer's bad rectangle and its mask's are deliberately not told
+/// apart: they are the same failure classes reaching the same
+/// downstream arithmetic, and a caller has no use for the distinction.
+///
+/// **Why it is one hoisted walk rather than checks inside the loops.**
+/// A grid derived from an unchecked extent is not a big loop but an
+/// unfinishable one (~2.8e14 iterations for a `u32::MAX`-wide
+/// rectangle), reached from `aurora-app`'s own pre-window startup
+/// recovery path; and a refusal discovered *part-way* through a write
+/// leaves a well-formed partial container behind at whatever
+/// destination the caller passed. Both are only closed by checking
+/// everything up front. Until 0.57.13 a crafted manifest could declare
+/// a mask at `i64::MIN`, be read back as `Ok`, survive a round trip and
+/// reach `apply_mask` -> `aurora_core::Rect::contains_point` in
 /// `aurora-app`, which saturates rather than panicking and so renders
-/// the *wrong picture* (the masked layer fully hidden, or fully shown
-/// when `inverted`) rather than failing loudly.
+/// the *wrong picture* rather than failing loudly.
+///
+/// **History of what this walk covered**, because the gaps were found
+/// one at a time and the pattern matters more than any one of them:
+/// mask *origins* only (0.57.13), mask extents as well once mask
+/// coverage became real persisted tiles (0.71.0), and finally — 0.71.1,
+/// this revision — layer bounds and the whole-document tile budget too,
+/// which had been checked only from inside the loops they bound. That
+/// last gap was reachable with no crafted input at all: two ordinary
+/// layers with ordinary full-canvas masks wrote a valid container the
+/// reader then refused ([`MAX_TOTAL_TILES_PER_DOCUMENT`]), and an
+/// oversized layer extent — `aurora_doc` bounds a layer's origin but
+/// not its extent — aborted from inside the tile loop, after the
+/// mimetype, manifest and history entries had already been written.
 ///
 /// Called from [`read`] and from `write_with_policy` — the shared body
 /// behind [`write()`] and [`write_best_effort`] — so one call site each
-/// covers every path in and out of the format, the same property
-/// `tile_grid` gives the bounds check.
+/// covers every path in and out of the format.
 ///
-/// A mask's *extent* is deliberately not checked here. Unlike a layer's
-/// own bounds it drives no loop in this module (no mask pixels are
-/// stored yet — see `aurora_doc::LayerMask`), so there is nothing for
-/// an oversized one to make unfinishable.
-fn validate_mask_origins(layers: &LayerTree) -> Result<(), IoError> {
-    for id in layer_ids(layers) {
-        let Some(mask) = layers.mask(id) else {
-            continue;
-        };
-        if !mask.bounds.origin_in_document_range() {
-            return Err(IoError::LayerOriginOutOfRange {
-                x: mask.bounds.x,
-                y: mask.bounds.y,
-                max: aurora_core::MAX_DOCUMENT_ORIGIN,
+/// `tile_grid` still runs again per surface inside those loops, since
+/// that is what produces the grid dimensions they walk. That is a
+/// repeat of two comparisons per surface, not a second policy: this
+/// function is the one that decides, and it decides first.
+fn validate_persisted_rects(layers: &LayerTree) -> Result<(), IoError> {
+    let mut total_tiles: u64 = 0;
+    for (_surface, bounds) in persisted_surfaces(layers) {
+        let (tiles_x, tiles_y) = tile_grid(bounds)?;
+        // Charged before the next surface is even looked at, so an
+        // over-budget document costs one addition per surface rather
+        // than a scan -- see `MAX_TOTAL_TILES_PER_DOCUMENT`.
+        total_tiles = total_tiles.saturating_add(u64::from(tiles_x) * u64::from(tiles_y));
+        if total_tiles > MAX_TOTAL_TILES_PER_DOCUMENT {
+            return Err(IoError::TooManyTiles {
+                total: total_tiles,
+                max: MAX_TOTAL_TILES_PER_DOCUMENT,
             });
         }
     }
@@ -824,15 +1755,26 @@ fn validate_mask_origins(layers: &LayerTree) -> Result<(), IoError> {
 /// `tiles/<surface>/<x>_<y>.tile`, a real, inspectable path (ADR 0009's
 /// own "open format... a user can inspect a `.aur` file's contents with
 /// a file manager" goal), not an opaque or flat-namespaced one.
+///
+/// `surface` is whatever [`persisted_surfaces`] yielded, so this names
+/// **mask coverage tiles as well as layer content tiles**. The two are
+/// told apart by the surface id itself and nothing else: a mask
+/// surface has `aurora_doc::MASK_SURFACE_BIT` set, which puts it in the
+/// top half of the id space and makes its directory name a very large
+/// decimal number. That is enough for the format (the reader derives
+/// which surface it expects rather than parsing these names), though it
+/// does mean the "inspect it with a file manager" goal is served less
+/// well for masks than for layers — a real, accepted cost of deriving
+/// mask surface ids rather than storing them.
 fn tile_entry_name(surface: SurfaceId, id: TileId) -> String {
     format!("tiles/{}/{}_{}.tile", surface.to_raw(), id.x, id.y)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{read, write, write_best_effort};
+    use super::{SkippedTile, SkippedTiles, read, write, write_best_effort};
     use aurora_doc::{BlendMode, History, LayerKind, LayerTree};
-    use aurora_tile::{TileId, TileStore};
+    use aurora_tile::{SurfaceId, TileId, TileStore};
     use half::f16;
     use std::io::Cursor;
     use std::num::NonZeroUsize;
@@ -882,7 +1824,14 @@ mod tests {
         let Ok(entries) = std::fs::read_dir(dir.path()) else {
             unreachable!("the scratch directory must be readable");
         };
-        let files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        // `.tile` only, never a bare entry list: a scratch directory
+        // also holds `aurora_tile::LOCK_FILE_NAME` (0.67.0), which is
+        // not an evicted tile and must not be counted as one.
+        let files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "tile"))
+            .collect();
         let [victim] = files.as_slice() else {
             unreachable!("exactly one tile should have been evicted: {files:?}");
         };
@@ -940,17 +1889,30 @@ mod tests {
         // 10x10 bounds -- proving canvas size round-trips as its own,
         // independent document-level value, not something derived from
         // whichever layer happens to be on top.
-        if let Err(err) = write(&mut bytes, &layers, &history, (20, 15), None, &mut store) {
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (20, 15),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
         let (_dir2, mut fresh_store) = real_tile_store();
         bytes.set_position(0);
-        let (restored_layers, restored_history, canvas_size, profile) =
-            match read(bytes, &mut fresh_store) {
-                Ok(result) => result,
-                Err(err) => unreachable!("{err:?}"),
-            };
+        let super::AurDocument {
+            layers: restored_layers,
+            history: restored_history,
+            canvas_size,
+            profile,
+            ..
+        } = match read(bytes, &mut fresh_store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
 
         assert_eq!(canvas_size, (20, 15));
         assert!(
@@ -1014,6 +1976,7 @@ mod tests {
             &history,
             (1, 1),
             Some(&profile),
+            &SkippedTiles::new(),
             &mut store,
         ) {
             unreachable!("{err:?}");
@@ -1021,8 +1984,8 @@ mod tests {
 
         let (_dir2, mut fresh_store) = real_tile_store();
         bytes.set_position(0);
-        let (_, _, _, restored_profile) = match read(bytes, &mut fresh_store) {
-            Ok(result) => result,
+        let restored_profile = match read(bytes, &mut fresh_store) {
+            Ok(result) => result.profile,
             Err(err) => unreachable!("{err:?}"),
         };
 
@@ -1055,7 +2018,15 @@ mod tests {
         };
 
         let mut bytes = Cursor::new(Vec::new());
-        if let Err(err) = write(&mut bytes, &layers, &history, (10, 10), None, &mut store) {
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             unreachable!("{err:?}");
         }
 
@@ -1351,8 +2322,29 @@ mod tests {
         }
     }
 
+    /// A mask a crafted fixture should attach, rectangle and all.
+    ///
+    /// The extent is a field rather than the fixed 16x16 it used to be
+    /// because a mask's *extent* is checked as of 0.71.0 — it now
+    /// derives a real tile grid, so an unbounded one is an unfinishable
+    /// loop, and a fixture has to be able to declare one.
+    #[derive(Clone, Copy)]
+    struct CraftedMask {
+        x: i64,
+        y: i64,
+        w: u32,
+        h: u32,
+    }
+
+    impl CraftedMask {
+        /// A 16x16 mask at `(x, y)` — the origin-only cases.
+        fn at(x: i64, y: i64) -> Self {
+            Self { x, y, w: 16, h: 16 }
+        }
+    }
+
     /// The one-layer tree every crafted fixture below is built from.
-    fn crafted_tree(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> mirror::Tree {
+    fn crafted_tree(kind: CraftedKind, mask: Option<CraftedMask>) -> mirror::Tree {
         let mut layers = std::collections::HashMap::new();
         layers.insert(
             0u64,
@@ -1372,11 +2364,11 @@ mod tests {
                     pixels: false,
                     position: false,
                 },
-                mask: mask_origin.map(|(x, y)| mirror::Mask {
-                    x,
-                    y,
-                    w: 16,
-                    h: 16,
+                mask: mask.map(|mask| mirror::Mask {
+                    x: mask.x,
+                    y: mask.y,
+                    w: mask.w,
+                    h: mask.h,
                     enabled: true,
                     inverted: false,
                 }),
@@ -1407,8 +2399,8 @@ mod tests {
     /// independent check, which is what stops a file that never went
     /// through that API.
     ///
-    /// `mask_origin` attaches a 16x16 mask at that origin, or leaves
-    /// the layer maskless when `None`.
+    /// `mask` attaches a mask with that rectangle, or leaves the layer
+    /// maskless when `None`.
     ///
     /// The mirror structs match `LayerTree`'s own derived `Serialize`
     /// field-for-field, the same trick
@@ -1418,13 +2410,13 @@ mod tests {
     /// matching `Rect`'s own types: `postcard` zigzag-varint-encodes
     /// signed integers by width, so an `i32` mirror could not even
     /// represent `i64::MAX`.
-    fn crafted_manifest(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> Vec<u8> {
+    fn crafted_manifest(kind: CraftedKind, mask: Option<CraftedMask>) -> Vec<u8> {
         let manifest = mirror::Manifest {
             version: super::MANIFEST_VERSION,
             canvas_width: 1,
             canvas_height: 1,
             color_space: 0,
-            layers: crafted_tree(kind, mask_origin),
+            layers: crafted_tree(kind, mask),
         };
         match postcard::to_allocvec(&manifest) {
             Ok(bytes) => bytes,
@@ -1438,8 +2430,8 @@ mod tests {
     /// build one carrying an out-of-range origin. Its derived
     /// `Deserialize` does not: origin is a value-range property, and
     /// this crate is where that range is enforced for a file.
-    fn crafted_tree_bytes(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> Vec<u8> {
-        match postcard::to_allocvec(&crafted_tree(kind, mask_origin)) {
+    fn crafted_tree_bytes(kind: CraftedKind, mask: Option<CraftedMask>) -> Vec<u8> {
+        match postcard::to_allocvec(&crafted_tree(kind, mask)) {
             Ok(bytes) => bytes,
             Err(err) => unreachable!("{err:?}"),
         }
@@ -1486,14 +2478,15 @@ mod tests {
 
     #[test]
     fn read_rejects_a_manifest_whose_layer_mask_origin_is_past_the_document_range() {
-        // The gap 0.57.12 left open, and the reason `validate_mask_origins`
+        // The gap 0.57.12 left open, and the reason `validate_persisted_rects`
         // exists as a walk of its own rather than another line inside
         // `tile_grid`: a mask carries a `Rect` that is *not* the layer's
         // own `bounds`, and `tile_grid` never sees it. Measured against
         // the 0.57.12 tree before this fix: this manifest read back as
         // `Ok`, and the origin survived a write-then-read round trip
-        // unchanged, on its way to `apply_mask_clip` ->
-        // `Rect::contains_point` in `aurora-app` -- which saturates
+        // unchanged, on its way to `apply_mask` (then named
+        // `apply_mask_clip`) -> `Rect::contains_point` in `aurora-app`
+        // -- which saturates
         // rather than panicking now, and so renders the wrong picture
         // (the masked layer fully hidden, or fully shown when
         // `inverted`) instead of failing loudly.
@@ -1503,7 +2496,8 @@ mod tests {
             aurora_core::MAX_DOCUMENT_ORIGIN + 1,
             -aurora_core::MAX_DOCUMENT_ORIGIN - 1,
         ] {
-            let manifest_bytes = crafted_manifest(CraftedKind::Pixel(0, 0), Some((bad, 0)));
+            let manifest_bytes =
+                crafted_manifest(CraftedKind::Pixel(0, 0), Some(CraftedMask::at(bad, 0)));
             let (_dir, mut store) = real_tile_store();
             match read(container_with(&manifest_bytes, &[]), &mut store) {
                 Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
@@ -1518,13 +2512,18 @@ mod tests {
 
     #[test]
     fn read_rejects_a_manifest_whose_group_layer_mask_origin_is_past_the_document_range() {
-        // The half a `tile_grid`-placed check could not reach even in
-        // principle. A group has no `LayerKind::Pixel` arm, so
-        // `pixel_layer_ids` skips it and `tile_grid` is never called for
-        // it at all -- yet a group can carry a mask, and that mask's own
+        // The half a `tile_grid`-placed check could not reach in
+        // 0.57.12. A group has no `LayerKind::Pixel` arm, so the walk
+        // of the day skipped it and `tile_grid` was never called for it
+        // at all -- yet a group can carry a mask, and that mask's own
         // rectangle reaches the same compositing arithmetic a pixel
-        // layer's does.
-        let manifest_bytes = crafted_manifest(CraftedKind::Group, Some((0, i64::MIN)));
+        // layer's does. (Since 0.71.0 `persisted_surfaces` does yield a
+        // group's mask surface, so `tile_grid` would eventually see this
+        // rectangle anyway -- but only after the reader had started
+        // walking grids, which is exactly why `validate_persisted_rects`
+        // still runs first.)
+        let manifest_bytes =
+            crafted_manifest(CraftedKind::Group, Some(CraftedMask::at(0, i64::MIN)));
         let (_dir, mut store) = real_tile_store();
         match read(container_with(&manifest_bytes, &[]), &mut store) {
             Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
@@ -1545,7 +2544,7 @@ mod tests {
         for kind in [CraftedKind::Pixel(0, 0), CraftedKind::Group] {
             let manifest_bytes = crafted_manifest(
                 kind,
-                Some((
+                Some(CraftedMask::at(
                     aurora_core::MAX_DOCUMENT_ORIGIN,
                     -aurora_core::MAX_DOCUMENT_ORIGIN,
                 )),
@@ -1561,7 +2560,7 @@ mod tests {
 
     #[test]
     fn write_and_best_effort_write_both_refuse_a_layer_mask_origin_past_the_document_range() {
-        // `validate_mask_origins` is called from `write_with_policy`,
+        // `validate_persisted_rects` is called from `write_with_policy`,
         // the shared body behind both public writers, so this covers
         // the way *out* of the format as well as the way in — the same
         // property `tile_grid` already gives the layer-bounds check.
@@ -1569,7 +2568,8 @@ mod tests {
         // The tree is deserialized rather than built: `add_mask` now
         // refuses this origin, so the derived `Deserialize` is the only
         // way to get one into a `LayerTree` at all.
-        let tree_bytes = crafted_tree_bytes(CraftedKind::Pixel(0, 0), Some((0, i64::MAX)));
+        let tree_bytes =
+            crafted_tree_bytes(CraftedKind::Pixel(0, 0), Some(CraftedMask::at(0, i64::MAX)));
         let layers: LayerTree = match postcard::from_bytes(&tree_bytes) {
             Ok(tree) => tree,
             Err(err) => unreachable!("the crafted tree must still deserialize: {err:?}"),
@@ -1578,7 +2578,15 @@ mod tests {
 
         let (_dir, mut store) = real_tile_store();
         let mut out = Cursor::new(Vec::new());
-        match write(&mut out, &layers, &history, (1, 1), None, &mut store) {
+        match write(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
                 assert_eq!(x, 0);
                 assert_eq!(y, i64::MAX);
@@ -1593,7 +2601,15 @@ mod tests {
         // unreadable *tile*, and a bad rectangle says the tree itself is
         // wrong, not that one piece of input is unreadable.
         let mut out = Cursor::new(Vec::new());
-        match write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store) {
+        match write_best_effort(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::LayerOriginOutOfRange { .. }) => {}
             other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
         }
@@ -1754,8 +2770,8 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         let (_dir, mut store) = real_tile_store();
-        let (_, _, canvas_size, _) = match read(container_with(&manifest_bytes, &[]), &mut store) {
-            Ok(result) => result,
+        let canvas_size = match read(container_with(&manifest_bytes, &[]), &mut store) {
+            Ok(result) => result.canvas_size,
             Err(err) => unreachable!("a canvas at the documented ceiling must still read: {err:?}"),
         };
         assert_eq!(
@@ -1918,7 +2934,15 @@ mod tests {
 
         // The explicit-save contract, unchanged.
         let mut refused = Cursor::new(Vec::new());
-        match write(&mut refused, &layers, &history, (10, 10), None, &mut store) {
+        match write(
+            &mut refused,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
             Err(super::IoError::Tile(_)) => {}
             Ok(()) => unreachable!("an explicit save must not silently drop an unreadable tile"),
             Err(other) => unreachable!("expected IoError::Tile, got {other:?}"),
@@ -1927,11 +2951,18 @@ mod tests {
         // The autosave contract: write what can be written, and say what
         // could not.
         let mut salvaged = Cursor::new(Vec::new());
-        let skipped =
-            match write_best_effort(&mut salvaged, &layers, &history, (10, 10), None, &mut store) {
-                Ok(skipped) => skipped,
-                Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
-            };
+        let skipped = match write_best_effort(
+            &mut salvaged,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(skipped) => skipped,
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        };
         let [only] = skipped.as_slice() else {
             unreachable!("exactly one tile is unreadable, got {skipped:?}");
         };
@@ -1951,11 +2982,14 @@ mod tests {
         // pixels intact.
         let (_fresh_dir, mut fresh_store) = real_tile_store();
         salvaged.set_position(0);
-        let (restored_layers, _history, canvas_size, _profile) =
-            match read(salvaged, &mut fresh_store) {
-                Ok(result) => result,
-                Err(err) => unreachable!("the salvaged autosave must reopen: {err:?}"),
-            };
+        let super::AurDocument {
+            layers: restored_layers,
+            canvas_size,
+            ..
+        } = match read(salvaged, &mut fresh_store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("the salvaged autosave must reopen: {err:?}"),
+        };
         assert_eq!(canvas_size, (10, 10));
         assert_eq!(restored_layers.len(), 2, "no layer was dropped");
         let Some(&(_, intact_surface)) = layer_ids.get(1) else {
@@ -1976,12 +3010,1620 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------
+    // Mask coverage persistence (0.71.0).
+    //
+    // Exercised by these tests and nothing else: no tool in the app
+    // paints mask coverage yet (`aurora_doc::mask`'s own follow-on 1),
+    // so none of this has ever run end to end through the editor. Read
+    // it as evidence about the format, not about the product.
+    // ---------------------------------------------------------------
+
+    /// A mask rectangle deliberately unlike [`bounds`]: a different
+    /// origin, and a different *extent* -- 300x200, which is two tiles
+    /// wide where the 10x10 layer is one.
+    ///
+    /// **The extent is what makes a round trip here discriminating, and
+    /// an earlier version of this comment credited the origin instead**
+    /// (corrected 0.71.4; both reviews of 0.71.0 caught it
+    /// independently). `tile_grid` derives a grid from `width`/`height`
+    /// alone and the loops walk `0..tiles_x`/`0..tiles_y`, so a tile
+    /// *index* is identical whatever the rectangle's origin is -- a
+    /// reader that wrongly addressed mask tiles relative to the layer
+    /// would still produce `0_0` for both frames and pass. What it
+    /// cannot do is invent the second tile column the mask's own 300px
+    /// width has and the layer's 10px width does not: mutating the
+    /// enumerator to yield the layer's rectangle for a mask surface
+    /// makes this test fail there.
+    ///
+    /// The differing origin is still worth keeping. It is what the
+    /// *cross-crate* frame check needs -- `aurora-app`'s `apply_mask`
+    /// windows coverage by `mask.bounds.x/y`, where an origin mix-up
+    /// does show up as a shifted picture (see
+    /// `aurora-app`'s own `.aur`-round-trip mask test) -- but within
+    /// this module's own tile addressing it proves nothing on its own.
+    fn mask_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 500,
+            y: 300,
+            width: 300,
+            height: 200,
+        }
+    }
+
+    /// Exact float equality expressed as bit equality -- these round
+    /// trips really are exact, and this workspace denies
+    /// `clippy::float_cmp`. Same helper `aurora_doc::mask`'s own tests
+    /// use, for the same reason.
+    fn exactly(actual: f32, expected: f32) -> bool {
+        actual.to_bits() == expected.to_bits()
+    }
+
+    /// One texel's mask coverage, read through the same public reader
+    /// (`aurora_doc::read_mask_coverage`) the compositor uses -- not by
+    /// poking at raw channels here, which would let this test agree
+    /// with a broken convention.
+    fn coverage_at(
+        store: &mut TileStore,
+        surface: aurora_tile::SurfaceId,
+        tile: TileId,
+        x: usize,
+        y: usize,
+    ) -> f32 {
+        let entry = match store.get(surface, tile) {
+            Ok(entry) => entry,
+            Err(err) => unreachable!("a real store must serve this tile: {err:?}"),
+        };
+        let base = (y * aurora_tile::TILE as usize + x) * aurora_tile::CHANNELS;
+        let Some(texel) = entry.texels().get(base..base + aurora_tile::CHANNELS) else {
+            unreachable!("(x, y) is constructed in range for a whole tile");
+        };
+        aurora_doc::read_mask_coverage(texel)
+    }
+
+    #[test]
+    fn round_trips_real_mask_coverage_painted_at_the_masks_own_origin() {
+        // The headline case. Coverage `0.0` is what makes it a real
+        // test: a mask entry that was never written, or written and
+        // lost, reads back as `1.0` (the never-painted default), so an
+        // explicit `0.0` is the only value that tells "really
+        // persisted" apart from "silently defaulted".
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut layers, "Masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer that exists has a mask surface");
+        };
+
+        // Two different tiles of the mask's own grid (300px wide is two
+        // 256px tiles), addressed relative to the mask's own origin.
+        let painted = [
+            (TileId { x: 0, y: 0 }, 1_usize, 2_usize, 0.0_f32),
+            (TileId { x: 1, y: 0 }, 3, 4, 0.5),
+        ];
+        for &(tile, x, y, coverage) in &painted {
+            if let Err(err) =
+                aurora_doc::write_mask_coverage(&mut store, mask_surface, tile, x, y, coverage)
+            {
+                unreachable!("{err:?}");
+            }
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+
+        // The entries really are under the *mask* surface, not the
+        // layer's own -- the two are different halves of the id space.
+        let archive = match zip::ZipArchive::new(Cursor::new(bytes.get_ref().clone())) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let prefix = format!("tiles/{}/", mask_surface.to_raw());
+        let mask_entries = archive
+            .file_names()
+            .filter(|name| name.starts_with(&prefix))
+            .count();
+        assert_eq!(
+            mask_entries,
+            2,
+            "both painted mask tiles must be written under the mask surface: {:?}",
+            archive.file_names().collect::<Vec<_>>()
+        );
+
+        let (_dir2, mut fresh_store) = real_tile_store();
+        bytes.set_position(0);
+        let restored_layers = match read(bytes, &mut fresh_store) {
+            Ok(result) => result.layers,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            restored_layers.mask(id).map(|mask| mask.bounds),
+            Some(mask_bounds()),
+            "the mask's own rectangle must survive as well as its pixels"
+        );
+
+        for &(tile, x, y, coverage) in &painted {
+            let restored = coverage_at(&mut fresh_store, mask_surface, tile, x, y);
+            // `f16` cannot hold every `f32`, so the expectation is what
+            // the written value quantizes to -- still exact, not close.
+            assert!(
+                exactly(restored, half::f16::from_f32(coverage).to_f32()),
+                "coverage {coverage} at {tile:?} ({x}, {y}) must survive the round trip, got {restored}"
+            );
+        }
+        assert!(
+            exactly(
+                coverage_at(&mut fresh_store, mask_surface, TileId { x: 0, y: 0 }, 2, 2),
+                1.0
+            ),
+            "an unpainted neighbour must still read as fully visible"
+        );
+    }
+
+    #[test]
+    fn round_trips_mask_coverage_on_a_group_which_has_no_pixel_surface() {
+        // A group has no content surface at all, so its mask is the
+        // only thing it can contribute to the archive -- the case a
+        // walk that only enumerated pixel layers would miss entirely.
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut layers, "Group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(group, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            layers.surface_id(group),
+            None,
+            "a group must have no content surface -- that is the point of this test"
+        );
+        let Some(mask_surface) = layers.mask_surface_id(group) else {
+            unreachable!("a group still gets a mask surface");
+        };
+        let tile = TileId { x: 1, y: 0 };
+        if let Err(err) = aurora_doc::write_mask_coverage(&mut store, mask_surface, tile, 7, 8, 0.0)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh_store) = real_tile_store();
+        bytes.set_position(0);
+        if let Err(err) = read(bytes, &mut fresh_store) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            exactly(coverage_at(&mut fresh_store, mask_surface, tile, 7, 8), 0.0),
+            "a group's own mask coverage must round trip"
+        );
+    }
+
+    #[test]
+    fn round_trips_mask_coverage_of_a_disabled_mask() {
+        // `enabled` is a UI toggle (shift-click a thumbnail), not a
+        // statement about what is stored. Gating persistence on it
+        // would mean switching a mask off and saving silently destroys
+        // the painted pixels -- unrecoverable, and exactly the failure
+        // CLAUDE.md calls the worst this project can have. Locked in
+        // here so a later "optimization" cannot quietly reintroduce it.
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut layers, "Masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_mask_enabled(id, false) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer that exists has a mask surface");
+        };
+        let tile = TileId { x: 0, y: 0 };
+        if let Err(err) = aurora_doc::write_mask_coverage(&mut store, mask_surface, tile, 9, 9, 0.0)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh_store) = real_tile_store();
+        bytes.set_position(0);
+        let restored_layers = match read(bytes, &mut fresh_store) {
+            Ok(result) => result.layers,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            restored_layers.mask(id).map(|mask| mask.enabled),
+            Some(false),
+            "the disabled flag itself must round trip too"
+        );
+        assert!(
+            exactly(coverage_at(&mut fresh_store, mask_surface, tile, 9, 9), 0.0),
+            "a disabled mask's painted coverage must still be persisted"
+        );
+    }
+
+    #[test]
+    fn reads_a_container_written_before_mask_persistence_as_fully_visible_coverage() {
+        // What every `.aur` file and autosave written by 0.70.4 or
+        // earlier looks like: a manifest that declares a mask, and not
+        // one mask tile entry anywhere. It must still open, and the
+        // mask must read back exactly as it composited then -- fully
+        // visible, per `aurora_doc::mask`'s alpha-as-presence-flag
+        // convention. This is why the round of work that added mask
+        // entries did *not* bump `MANIFEST_VERSION`: nothing about the
+        // manifest's shape changed, and a bump would have hard-rejected
+        // every file already on disk.
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("Masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer that exists has a mask surface");
+        };
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1000,
+            canvas_height: 1000,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let (_dir, mut store) = real_tile_store();
+        let restored_layers = match read(container_with(&manifest_bytes, &[]), &mut store) {
+            Ok(result) => result.layers,
+            Err(err) => unreachable!("a pre-0.71.0 container must still open: {err:?}"),
+        };
+        assert!(
+            restored_layers.mask(id).is_some(),
+            "the mask itself must survive"
+        );
+        for tile in [TileId { x: 0, y: 0 }, TileId { x: 1, y: 0 }] {
+            assert!(
+                exactly(coverage_at(&mut store, mask_surface, tile, 0, 0), 1.0),
+                "a mask with no persisted entries must read back fully visible at {tile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_skips_a_never_painted_mask_surface_entirely() {
+        // Every document written today has masks nobody has painted
+        // (nothing in the app can paint one yet), so an unpainted mask
+        // surface must cost zero bytes -- not a grid's worth of
+        // all-zero entries. The layer's *own* painted tile is expected
+        // in the same archive, so this is a statement about masks
+        // specifically and not about an empty writer.
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let history = History::new();
+        let id = match layers.add_pixel_layer("Masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (Some(surface), Some(mask_surface)) =
+            (layers.surface_id(id), layers.mask_surface_id(id))
+        else {
+            unreachable!("a pixel layer has both surfaces");
+        };
+        {
+            let tile = match store.get_mut(surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Some(sample) = tile.texels_mut().first_mut() {
+                *sample = half::f16::from_f32(0.5);
+            }
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let archive = match zip::ZipArchive::new(Cursor::new(bytes.get_ref().clone())) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mask_prefix = format!("tiles/{}/", mask_surface.to_raw());
+        let names: Vec<&str> = archive.file_names().collect();
+        assert!(
+            !names.iter().any(|name| name.starts_with(&mask_prefix)),
+            "an unpainted mask must write no entries at all: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with(&format!("tiles/{}/", surface.to_raw()))),
+            "the layer's own painted tile must still be there: {names:?}"
+        );
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_whose_mask_extent_is_past_the_document_ceiling() {
+        // The gap this round had to close. Before mask surfaces were
+        // persisted, a mask's extent drove no loop here and was
+        // deliberately unchecked; now it derives a real tile grid, and
+        // `aurora_doc::LayerTree::add_mask` bounds a mask's origin but
+        // never its extent -- so an unchecked `u32::MAX` mask is an
+        // unfinishable loop (~2.8e14 iterations) reached from
+        // `aurora-app`'s own pre-window startup path. As with its
+        // layer-bounds twin, the elapsed-time assertion is the point:
+        // the answer must come back immediately, not eventually.
+        for kind in [CraftedKind::Pixel(0, 0), CraftedKind::Group] {
+            let manifest_bytes = crafted_manifest(
+                kind,
+                Some(CraftedMask {
+                    x: 0,
+                    y: 0,
+                    w: u32::MAX,
+                    h: u32::MAX,
+                }),
+            );
+            let (_dir, mut store) = real_tile_store();
+            let started = std::time::Instant::now();
+            match read(container_with(&manifest_bytes, &[]), &mut store) {
+                Err(super::IoError::LayerBoundsTooLarge { width, height, max }) => {
+                    assert_eq!(width, u32::MAX);
+                    assert_eq!(height, u32::MAX);
+                    assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+                }
+                other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "an oversized mask extent must be rejected up front, not looped over"
+            );
+        }
+    }
+
+    #[test]
+    fn write_and_best_effort_write_both_refuse_a_mask_extent_past_the_document_ceiling() {
+        // The way *out* of the format, for the same reason: `add_mask`
+        // does not bound a mask's extent, so a `LayerTree` carrying an
+        // oversized one is reachable in a live session (not only from a
+        // crafted file), and a writer that walked its grid would hang
+        // the app rather than refuse the save.
+        let tree_bytes = crafted_tree_bytes(
+            CraftedKind::Pixel(0, 0),
+            Some(CraftedMask {
+                x: 0,
+                y: 0,
+                w: u32::MAX,
+                h: u32::MAX,
+            }),
+        );
+        let layers: LayerTree = match postcard::from_bytes(&tree_bytes) {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("the crafted tree must still deserialize: {err:?}"),
+        };
+        let history = History::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let started = std::time::Instant::now();
+        let mut out = Cursor::new(Vec::new());
+        match write(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Err(super::IoError::LayerBoundsTooLarge { width, max, .. }) => {
+                assert_eq!(width, u32::MAX);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+            }
+            other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+        }
+        // And nothing was written: `validate_persisted_rects` runs before the
+        // first byte, so a refused save leaves no half-built container.
+        assert!(
+            out.get_ref().is_empty(),
+            "a refused write must not leave a partial container behind"
+        );
+
+        let mut out = Cursor::new(Vec::new());
+        match write_best_effort(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Err(super::IoError::LayerBoundsTooLarge { .. }) => {}
+            other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an oversized mask extent must be refused up front, not looped over"
+        );
+    }
+
+    /// One ceiling-sized layer carrying a full-canvas mask — the
+    /// largest single document PRD §7.3.1 says can exist, and the case
+    /// `MAX_TOTAL_TILES_PER_DOCUMENT`'s `2 *` factor exists for.
+    fn ceiling_layer_with_a_full_canvas_mask() -> LayerTree {
+        let mut layers = LayerTree::new();
+        let ceiling = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        let id = match layers.add_pixel_layer("ceiling", ceiling, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, ceiling) {
+            unreachable!("{err:?}");
+        }
+        layers
+    }
+
+    #[test]
+    fn the_largest_legal_document_still_writes_and_reads_with_its_mask() {
+        // The behavioural replacement (0.71.1) for a test that used to
+        // assert `2 * side * side <= MAX_TOTAL_TILES_PER_DOCUMENT` one
+        // line after asserting `MAX == 2 * side * side` -- an arithmetic
+        // tautology that could not fail whatever the constant actually
+        // permitted, and so covered none of the property its name
+        // claimed. This calls the real `write` and the real `read` on
+        // the real document the widening exists for: one ceiling-sized
+        // layer plus its own full-canvas mask, both grids charged
+        // against the one budget.
+        //
+        // Both directions must say `Ok`. Before 0.71.0's widening the
+        // *reader* refused this (one grid's worth of budget, two grids
+        // declared); before 0.71.1 the *writer* had no budget check at
+        // all, which is the opposite defect -- it would have written
+        // this file whatever the budget said.
+        //
+        // No tiles are painted, so the cost here is the grid walk
+        // itself (~2.75M positions, twice) and nothing else. That is
+        // deliberately the expensive half: it is what proves the
+        // document is *scanned*, not short-circuited.
+        let layers = ceiling_layer_with_a_full_canvas_mask();
+        let history = History::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let started = std::time::Instant::now();
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (
+                aurora_core::MAX_DOCUMENT_EXTENT,
+                aurora_core::MAX_DOCUMENT_EXTENT,
+            ),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("the largest legal document must still save: {err:?}");
+        }
+
+        bytes.set_position(0);
+        let (_dir2, mut fresh_store) = real_tile_store();
+        let super::AurDocument {
+            layers: restored,
+            canvas_size: canvas,
+            ..
+        } = match read(bytes, &mut fresh_store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("the largest legal document must still reopen: {err:?}"),
+        };
+        assert_eq!(
+            canvas,
+            (
+                aurora_core::MAX_DOCUMENT_EXTENT,
+                aurora_core::MAX_DOCUMENT_EXTENT
+            )
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "the ceiling-sized layer must survive the round trip"
+        );
+        // Loose on purpose -- this is a CI-safety bound on an
+        // unoptimized build, not a performance claim. Its job is to
+        // fail if this document ever becomes unfinishable, not to
+        // measure anything.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(100),
+            "the largest legal document must finish both directions, not spin"
+        );
+    }
+
+    #[test]
+    fn write_refuses_two_ordinary_full_canvas_masked_layers_before_writing_a_byte() {
+        // The gap 0.71.1 closed, and it needed no crafted input at all:
+        // two ordinary layers, each given an ordinary full-canvas mask
+        // through the public `add_mask`, used to *write* a perfectly
+        // valid container that this module's own `read` then refused
+        // with `TooManyTiles` -- a file an ordinary user could save and
+        // never reopen, which is exactly the "silently degrading a
+        // professional's file" failure CLAUDE.md names as the worst
+        // this project can have.
+        //
+        // The layers here are individually legal (each is exactly the
+        // documented ceiling, which
+        // `the_largest_legal_document_still_writes_and_reads_with_its_mask`
+        // proves must keep working); it is their sum that is not.
+        let mut layers = LayerTree::new();
+        let ceiling = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        for index in 0..2 {
+            let id = match layers.add_pixel_layer(format!("ceiling {index}"), ceiling, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.add_mask(id, ceiling) {
+                unreachable!("{err:?}");
+            }
+        }
+        let history = History::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let started = std::time::Instant::now();
+        let mut out = Cursor::new(Vec::new());
+        match write(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Err(super::IoError::TooManyTiles { total, max }) => {
+                assert!(total > max, "{total} must exceed the {max}-tile budget");
+                assert_eq!(max, super::MAX_TOTAL_TILES_PER_DOCUMENT);
+            }
+            other => unreachable!("expected TooManyTiles, got {other:?}"),
+        }
+        assert!(
+            out.get_ref().is_empty(),
+            "a refused write must not leave a partial container behind"
+        );
+
+        // The autosave path refuses it too. `write_best_effort` tolerates
+        // an unreadable *tile*, never a tree it cannot finish scanning.
+        let mut out = Cursor::new(Vec::new());
+        match write_best_effort(
+            &mut out,
+            &layers,
+            &history,
+            (1, 1),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Err(super::IoError::TooManyTiles { .. }) => {}
+            other => unreachable!("expected TooManyTiles, got {other:?}"),
+        }
+        assert!(
+            out.get_ref().is_empty(),
+            "a refused best-effort write must not leave a partial container behind"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an over-budget document must be refused on arithmetic, not by scanning it"
+        );
+    }
+
+    #[test]
+    fn write_refuses_an_oversized_layer_extent_before_writing_a_byte() {
+        // The mask half of this was hoisted in 0.71.0 and the layer half
+        // was not, so an oversized *layer* extent still failed from
+        // inside the per-surface loop -- after the mimetype, manifest
+        // and history entries had already been written, leaving a
+        // well-formed 3-entry partial container at the destination. Its
+        // real-world blast radius was bounded (`write_autosave` stages
+        // to a temp path and renames on success), but a caller writing
+        // straight to its destination would have been left with one,
+        // and this module cannot see which kind of caller it has.
+        //
+        // Ordinary API use, again: `add_pixel_layer` bounds a layer's
+        // origin but not its extent, so no crafted manifest is needed.
+        let mut layers = LayerTree::new();
+        let oversized = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        if let Err(err) = layers.add_pixel_layer("oversized", oversized, None) {
+            unreachable!("{err:?}");
+        }
+        let history = History::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let started = std::time::Instant::now();
+        for policy in 0..2 {
+            let mut out = Cursor::new(Vec::new());
+            let result = if policy == 0 {
+                write(
+                    &mut out,
+                    &layers,
+                    &history,
+                    (1, 1),
+                    None,
+                    &SkippedTiles::new(),
+                    &mut store,
+                )
+                .map(|()| Vec::new())
+            } else {
+                write_best_effort(
+                    &mut out,
+                    &layers,
+                    &history,
+                    (1, 1),
+                    None,
+                    &SkippedTiles::new(),
+                    &mut store,
+                )
+            };
+            match result {
+                Err(super::IoError::LayerBoundsTooLarge { width, max, .. }) => {
+                    assert_eq!(width, u32::MAX);
+                    assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+                }
+                other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+            }
+            assert!(
+                out.get_ref().is_empty(),
+                "a refused write must not leave a partial container behind"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an oversized layer extent must be refused up front, not looped over"
+        );
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_whose_layers_and_masks_together_exceed_the_tile_budget() {
+        // Mask grids are charged against the same whole-document budget
+        // layer grids are, from inside the same loop. Without that, a
+        // manifest could stay under the budget on its layers alone and
+        // then blow past it entirely in mask rectangles -- a small file
+        // that spins on `aurora-app`'s pre-window startup path, which
+        // is the exact defect the budget exists to prevent. The layers
+        // here are deliberately tiny; the masks are what overruns it.
+        let mut layers = LayerTree::new();
+        let ceiling = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        for index in 0..2 {
+            let id = match layers.add_pixel_layer(format!("small {index}"), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.add_mask(id, ceiling) {
+                unreachable!("{err:?}");
+            }
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1,
+            canvas_height: 1,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let container = container_with(&manifest_bytes, &[]);
+        assert!(
+            container.get_ref().len() < 16 * 1024,
+            "the crafted container must really be small on disk -- that is the whole attack"
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        match read(container, &mut store) {
+            Err(super::IoError::TooManyTiles { total, max }) => {
+                assert!(total > max, "{total} must exceed the {max}-tile budget");
+                assert_eq!(max, super::MAX_TOTAL_TILES_PER_DOCUMENT);
+            }
+            other => unreachable!("expected TooManyTiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn best_effort_write_skips_an_unreadable_mask_tile_while_write_still_refuses() {
+        // The refuse-vs-degrade split, applied to the surfaces this
+        // round added: an explicit save must refuse rather than quietly
+        // drop painted mask coverage (it is a user's work either way),
+        // while an autosave writes what it can and names what it could
+        // not. Same technique as its pixel-tile twin above: a one-tile
+        // store budget forces the mask tile out to the scratch disk,
+        // `flush` makes that write real, and truncating the file it
+        // landed in leaves an ATIL file `codec::decode` rejects.
+        let (dir, mut store) = one_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let masked = match history.add_pixel_layer(&mut layers, "masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(masked, bounds()) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(masked) else {
+            unreachable!("a layer that exists has a mask surface");
+        };
+        if let Err(err) = aurora_doc::write_mask_coverage(
+            &mut store,
+            mask_surface,
+            TileId { x: 0, y: 0 },
+            2,
+            3,
+            0.0,
+        ) {
+            unreachable!("{err:?}");
+        }
+        // A second layer, whose own tile evicts the mask tile above.
+        let other = match history.add_pixel_layer(&mut layers, "other", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(other_surface) = layers.surface_id(other) else {
+            unreachable!("just created as a pixel layer");
+        };
+        {
+            let tile = match store.get_mut(other_surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Some(sample) = tile.texels_mut().first_mut() {
+                *sample = half::f16::from_f32(0.5);
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_file(&dir);
+
+        let mut refused = Cursor::new(Vec::new());
+        match write(
+            &mut refused,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Err(super::IoError::Tile(_)) => {}
+            Ok(()) => {
+                unreachable!("an explicit save must not silently drop unreadable mask coverage")
+            }
+            Err(other) => unreachable!("expected IoError::Tile, got {other:?}"),
+        }
+
+        let mut salvaged = Cursor::new(Vec::new());
+        let skipped = match write_best_effort(
+            &mut salvaged,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(skipped) => skipped,
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        };
+        let [only] = skipped.as_slice() else {
+            unreachable!("exactly one tile is unreadable, got {skipped:?}");
+        };
+        assert_eq!(only.surface, mask_surface);
+        assert_eq!(only.tile, TileId { x: 0, y: 0 });
+        assert!(
+            only.reason.contains("corrupt tile file"),
+            "the skip must carry the real underlying tile error: {}",
+            only.reason
+        );
+
+        // And the salvaged file is a real document: the other layer's
+        // pixels intact, the lost mask reading back as fully visible
+        // rather than as a hidden layer.
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        salvaged.set_position(0);
+        if let Err(err) = read(salvaged, &mut fresh_store) {
+            unreachable!("the salvaged autosave must reopen: {err:?}");
+        }
+        assert!(
+            exactly(
+                coverage_at(&mut fresh_store, mask_surface, TileId { x: 0, y: 0 }, 2, 3),
+                1.0
+            ),
+            "a dropped mask tile must fail open (fully visible), never hide a layer"
+        );
+    }
+
     /// Field-for-field identical to `super::ManifestRead`, so its own
     /// `postcard` bytes decode identically -- used only to hand-craft a
     /// manifest with an unsupported `version` for
     /// `read_rejects_an_unsupported_manifest_version`, since the real
     /// `ManifestWrite`/`ManifestRead` always write the current,
     /// supported version.
+    /// One tile's worth of real, valid `codec::encode` output, every
+    /// texel set to `value` -- what a container's tile entry actually
+    /// holds, produced through the same encoder the writer uses rather
+    /// than hand-rolled bytes.
+    fn encoded_tile(value: f32) -> Vec<u8> {
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(9_999);
+        let tile = match store.get_mut(surface, TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for sample in tile.texels_mut() {
+            *sample = f16::from_f32(value);
+        }
+        aurora_tile::codec::encode(tile.texels())
+    }
+
+    #[test]
+    fn a_read_that_fails_on_a_mask_tile_leaves_no_content_tile_behind_either() {
+        // The gap 0.71.2 closed, and 0.71.0 is what widened it: `read`
+        // decodes tiles straight into the caller's live store as it
+        // goes, and a masked layer now has *two* surfaces, walked one
+        // after the other. So a container whose mask entry is corrupt
+        // has already committed the layer's own content tile in full by
+        // the time it fails -- and until 0.71.2 that tile stayed
+        // resident, under exactly the `SurfaceId` the caller's next
+        // document was about to claim (a fresh `LayerTree` restarts
+        // layer ids, and so surface ids, from the bottom of the space).
+        //
+        // A real corrupted archive, not a mock: a real manifest, a real
+        // `codec::encode`d content tile, and a mask entry holding bytes
+        // `codec::decode` genuinely rejects.
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (Some(content_surface), Some(mask_surface)) =
+            (layers.surface_id(id), layers.mask_surface_id(id))
+        else {
+            unreachable!("a pixel layer with a mask has both surfaces");
+        };
+        // The two really are different surfaces -- otherwise this test
+        // would prove nothing about ordering.
+        assert_ne!(content_surface.to_raw(), mask_surface.to_raw());
+
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1000,
+            canvas_height: 1000,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let content_entry = super::tile_entry_name(content_surface, TileId { x: 0, y: 0 });
+        let mask_entry = super::tile_entry_name(mask_surface, TileId { x: 0, y: 0 });
+        let container = container_with(
+            &manifest_bytes,
+            &[
+                (content_entry, encoded_tile(0.75)),
+                // Not an ATIL frame at all. `codec::decode` refuses it,
+                // which is the mid-read failure this test needs -- and
+                // it comes *after* the content surface, because
+                // `persisted_surfaces` yields a layer's content before
+                // its mask.
+                (mask_entry, b"this is not an encoded tile".to_vec()),
+            ],
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        match read(container, &mut store) {
+            Err(super::IoError::Tile(_)) => {}
+            other => unreachable!("expected a tile decode failure, got {other:?}"),
+        }
+
+        // The whole point: nothing the failed read committed survives,
+        // on either surface it touched. `contains_tile` is the right
+        // question rather than reading pixels back -- `get` would
+        // materialize a blank tile and answer "clean" whether the
+        // rollback happened or not.
+        assert!(
+            !store.contains_tile(content_surface, TileId { x: 0, y: 0 }),
+            "the content tile committed before the failure must not stay resident"
+        );
+        assert!(
+            !store.contains_tile(mask_surface, TileId { x: 0, y: 0 }),
+            "no mask tile can survive a read that failed on one"
+        );
+        assert_eq!(
+            store.resident_len(),
+            0,
+            "a failed read must leave the store as empty as it found it"
+        );
+    }
+
+    #[test]
+    fn a_successful_read_still_commits_its_tiles() {
+        // The other side of the rollback: it must fire on failure only.
+        // Same container as the test above, with a *valid* mask entry
+        // in place of the corrupt one.
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (Some(content_surface), Some(mask_surface)) =
+            (layers.surface_id(id), layers.mask_surface_id(id))
+        else {
+            unreachable!("a pixel layer with a mask has both surfaces");
+        };
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1000,
+            canvas_height: 1000,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let container = container_with(
+            &manifest_bytes,
+            &[
+                (
+                    super::tile_entry_name(content_surface, TileId { x: 0, y: 0 }),
+                    encoded_tile(0.75),
+                ),
+                (
+                    super::tile_entry_name(mask_surface, TileId { x: 0, y: 0 }),
+                    encoded_tile(0.25),
+                ),
+            ],
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        if let Err(err) = read(container, &mut store) {
+            unreachable!("a valid container must still read: {err:?}");
+        }
+        assert!(
+            store.contains_tile(content_surface, TileId { x: 0, y: 0 }),
+            "a successful read must leave its content tile in the store"
+        );
+        assert!(
+            store.contains_tile(mask_surface, TileId { x: 0, y: 0 }),
+            "a successful read must leave its mask tile in the store"
+        );
+    }
+
+    /// The headline test for 0.74.0: a tile a best-effort write had to
+    /// drop must still be *known to be missing* after the process that
+    /// dropped it is gone.
+    ///
+    /// Before this, the only two signals were session-local — a
+    /// `tracing::warn!` line and `aurora-app`'s own `.partial` autosave
+    /// filename — and the container itself was silent, because a
+    /// dropped tile and a never-painted one are both "no entry for this
+    /// tile". So this reads back into a *completely fresh* store, which
+    /// is what a new process has, and asserts the file itself carries
+    /// the loss.
+    /// A two-layer document written best-effort with the first layer's
+    /// only tile unreadable, plus what the writer said it dropped.
+    ///
+    /// Shared by the tests below so each can assert one thing: building
+    /// the broken-scratch-disk scenario is a dozen lines of setup, and
+    /// inlining it twice is what pushed the round-trip test past this
+    /// workspace's own function-length lint.
+    struct LossyContainer {
+        _dir: tempfile::TempDir,
+        container: Cursor<Vec<u8>>,
+        broken_surface: SurfaceId,
+        in_memory: Vec<SkippedTile>,
+    }
+
+    fn lossy_container_with_one_unreadable_tile() -> LossyContainer {
+        let (dir, mut store) = one_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let mut surfaces = Vec::new();
+        for name in ["broken", "intact"] {
+            let id = match history.add_pixel_layer(&mut layers, name, bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            let tile = match store.get_mut(surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Some(sample) = tile.texels_mut().first_mut() {
+                *sample = f16::from_f32(0.5);
+            }
+            surfaces.push(surface);
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_file(&dir);
+
+        let mut container = Cursor::new(Vec::new());
+        let skipped = match write_best_effort(
+            &mut container,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            Ok(skipped) => skipped,
+            Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+        };
+        assert_eq!(skipped.len(), 1, "exactly one tile is unreadable");
+        let Some(&broken_surface) = surfaces.first() else {
+            unreachable!("two layers were just created");
+        };
+        container.set_position(0);
+        LossyContainer {
+            _dir: dir,
+            container,
+            broken_surface,
+            in_memory: skipped,
+        }
+    }
+
+    #[test]
+    fn a_skipped_tile_survives_as_skipped_across_a_fresh_read() {
+        let lossy = lossy_container_with_one_unreadable_tile();
+        let [in_memory] = lossy.in_memory.as_slice() else {
+            unreachable!("exactly one tile is unreadable");
+        };
+
+        // A fresh store, standing in for a fresh process: nothing here
+        // knows what the writer knew.
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let document = match read(lossy.container, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("the salvaged autosave must reopen: {err:?}"),
+        };
+        let [persisted] = document.skipped_tiles.records() else {
+            unreachable!(
+                "the reopened document must name the dropped tile, got {:?}",
+                document.skipped_tiles
+            );
+        };
+        assert_eq!(
+            document.skipped_tiles.total(),
+            1,
+            "one loss, counted once: {:?}",
+            document.skipped_tiles
+        );
+        assert!(
+            !document.skipped_tiles.is_truncated(),
+            "one record is not a truncated view of one loss"
+        );
+        // The persisted record and the in-memory one describe the same
+        // loss -- surface, tile, and reason all round-trip.
+        assert_eq!(persisted.surface, in_memory.surface.to_raw());
+        assert_eq!(persisted.tile(), in_memory.tile);
+        assert_eq!(persisted.reason, in_memory.reason);
+        assert!(
+            persisted.reason.contains("corrupt tile file"),
+            "the persisted skip must carry the real underlying tile error: {}",
+            persisted.reason
+        );
+        assert_eq!(persisted.surface, lossy.broken_surface.to_raw());
+    }
+
+    /// **The defect 0.74.1 closed, in the exact sequence that found it**:
+    /// reopen a lossy file, then save it normally, then reopen *that*.
+    ///
+    /// The tiles the first writer dropped are not in the reading store
+    /// at all, so the second write rediscovers nothing about them —
+    /// `write_with_policy` cannot tell "never painted" from "lost before
+    /// this process started". Carrying `AurDocument::skipped_tiles` back
+    /// in as `known_missing` is the only reason the record survives.
+    /// Without it the second file has no `skipped-tiles` entry at all,
+    /// and one ordinary Save makes a professional's data loss invisible.
+    #[test]
+    fn an_ordinary_save_of_an_opened_lossy_document_keeps_its_skip_record() {
+        let lossy = lossy_container_with_one_unreadable_tile();
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let document = match read(lossy.container, &mut fresh_store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("the salvaged autosave must reopen: {err:?}"),
+        };
+        let Some(persisted) = document.skipped_tiles.first() else {
+            unreachable!("the reopened file must name its loss");
+        };
+        let first_reason = persisted.reason.clone();
+
+        let mut resaved = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut resaved,
+            &document.layers,
+            &document.history,
+            document.canvas_size,
+            None,
+            &document.skipped_tiles,
+            &mut fresh_store,
+        ) {
+            unreachable!("resaving an opened lossy document must succeed: {err:?}");
+        }
+        let (_third_dir, mut third_store) = real_tile_store();
+        resaved.set_position(0);
+        let reopened = match read(resaved, &mut third_store) {
+            Ok(reopened) => reopened,
+            Err(err) => unreachable!("the resaved container must reopen: {err:?}"),
+        };
+        let [still_named] = reopened.skipped_tiles.records() else {
+            unreachable!(
+                "an ordinary save of an opened lossy document must not erase what it lost, got \
+                 {:?}",
+                reopened.skipped_tiles
+            );
+        };
+        assert_eq!(still_named.surface, lossy.broken_surface.to_raw());
+        assert_eq!(still_named.reason, first_reason);
+        assert_eq!(
+            reopened.skipped_tiles.total(),
+            1,
+            "re-saving must carry the count forward, not double it"
+        );
+    }
+
+    /// The backward-compatibility proof, and the reason the skip list is
+    /// a separate ZIP entry rather than a manifest field (see this
+    /// module's own doc comment): `container_with` writes only
+    /// `manifest` and `history`, which is exactly the shape of every
+    /// `.aur` file and every crash-recovery autosave written before
+    /// 0.74.0. Absence must read as "nothing was dropped", not as an
+    /// error and not as an unknown.
+    #[test]
+    fn a_container_without_the_skipped_tiles_entry_reads_as_none_skipped() {
+        let mut layers = LayerTree::new();
+        if let Err(err) = layers.add_pixel_layer("old", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 10,
+            canvas_height: 10,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        let document = match read(container_with(&manifest_bytes, &[]), &mut store) {
+            Ok(document) => document,
+            Err(err) => unreachable!("a pre-0.74.0 container must still open: {err:?}"),
+        };
+        assert!(
+            document.skipped_tiles.is_empty(),
+            "a container with no skipped-tiles entry lost nothing, got {:?}",
+            document.skipped_tiles
+        );
+    }
+
+    /// The other half of the same contract, pinned from the *write*
+    /// side: an ordinary `write()` -- the `Refuse` policy, and so every
+    /// user-facing save -- must produce exactly the bytes it produced
+    /// before this entry existed. The `is_empty()` guard in
+    /// `write_with_policy` is what makes that true, and this is the test
+    /// that would fail if someone removed it as a micro-optimization.
+    #[test]
+    fn an_ordinary_write_carries_no_skipped_tiles_entry() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut layers, "Background", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        {
+            let tile = match store.get_mut(surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Some(sample) = tile.texels_mut().first_mut() {
+                *sample = f16::from_f32(0.5);
+            }
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (10, 10),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("a healthy document must save: {err:?}");
+        }
+        bytes.set_position(0);
+        let mut archive = match zip::ZipArchive::new(bytes) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match archive.by_name(super::SKIPPED_TILES_ENTRY) {
+            Err(zip::result::ZipError::FileNotFound) => {}
+            Ok(_) => unreachable!("an ordinary save must not add a skipped-tiles entry"),
+            Err(other) => unreachable!("expected FileNotFound, got {other:?}"),
+        }
+    }
+
+    /// A manifest for a small one-layer document — what
+    /// [`container_with`] needs to build a container whose *other*
+    /// entries are the thing under test.
+    fn small_manifest_bytes() -> Vec<u8> {
+        let mut layers = LayerTree::new();
+        if let Err(err) = layers.add_pixel_layer("small", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 10,
+            canvas_height: 10,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn crafted_record(index: usize) -> super::SkippedTileRecord {
+        super::SkippedTileRecord {
+            surface: index as u64,
+            tile_x: 0,
+            tile_y: 0,
+            reason: "crafted".to_owned(),
+        }
+    }
+
+    /// `skipped-tiles` is read out of a file that may be crafted or
+    /// corrupt, so both of its failure shapes get a real answer rather
+    /// than a panic or an unbounded allocation: too many records is
+    /// truncated to `MAX_SKIPPED_TILE_RECORDS` (**while the entry's own
+    /// `total` keeps the true count, so the truncation is disclosed
+    /// rather than hidden**), and bytes that are not a skip payload at
+    /// all become `IoError::ManifestDeserialization`.
+    #[test]
+    fn a_hostile_skipped_tiles_entry_is_bounded() {
+        let manifest_bytes = small_manifest_bytes();
+
+        let overlong = super::SkippedTilesWire {
+            version: super::SKIPPED_TILES_VERSION,
+            total: (super::MAX_SKIPPED_TILE_RECORDS + 500) as u64,
+            records: (0..super::MAX_SKIPPED_TILE_RECORDS + 500)
+                .map(crafted_record)
+                .collect(),
+        };
+        let overlong_bytes = match postcard::to_allocvec(&overlong) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        let document = match read(
+            container_with(
+                &manifest_bytes,
+                &[(super::SKIPPED_TILES_ENTRY.to_owned(), overlong_bytes)],
+            ),
+            &mut store,
+        ) {
+            Ok(document) => document,
+            Err(err) => {
+                unreachable!("an over-long skip list must be bounded, not refused: {err:?}")
+            }
+        };
+        assert_eq!(
+            document.skipped_tiles.records().len(),
+            super::MAX_SKIPPED_TILE_RECORDS,
+            "the skip list must be truncated to its own bound"
+        );
+        assert_eq!(
+            document.skipped_tiles.total(),
+            (super::MAX_SKIPPED_TILE_RECORDS + 500) as u64,
+            "truncating the detail must not truncate the count"
+        );
+        assert!(
+            document.skipped_tiles.is_truncated(),
+            "a capped list over a larger total is exactly the 'at least N' case"
+        );
+
+        let (_garbage_dir, mut garbage_store) = real_tile_store();
+        match read(
+            container_with(
+                &manifest_bytes,
+                &[(super::SKIPPED_TILES_ENTRY.to_owned(), vec![0xff_u8; 64])],
+            ),
+            &mut garbage_store,
+        ) {
+            Err(super::IoError::ManifestDeserialization(_)) => {}
+            other => unreachable!("expected ManifestDeserialization, got {other:?}"),
+        }
+    }
+
+    /// The memory-amplification defect 0.74.1 closed, in its own repro
+    /// shape: a `skipped-tiles` entry far larger than
+    /// `MAX_SKIPPED_TILE_RECORDS` records could ever need, made of
+    /// highly compressible bytes so the container on disk stays tiny.
+    ///
+    /// It must be refused **by size**, before `postcard` allocates
+    /// anything — which is why the assertion is on
+    /// `IoError::EntryTooLarge` and not merely on "the list came back
+    /// bounded". Decoding first and truncating afterwards, as 0.74.0
+    /// did, bounds what is retained and not what is allocated: the same
+    /// shape measured at ~790 MiB of peak RSS from a 64 KiB file.
+    #[test]
+    fn a_skipped_tiles_entry_past_its_own_byte_cap_is_refused_before_it_is_decoded() {
+        let manifest_bytes = small_manifest_bytes();
+        // One byte past the cap is the boundary; this is comfortably
+        // past it, and DEFLATE takes a repeated byte down to almost
+        // nothing on disk.
+        let oversized = vec![0x01_u8; (super::MAX_SKIPPED_TILES_ENTRY_BYTES as usize) + 1024];
+        let container = container_with(
+            &manifest_bytes,
+            &[(super::SKIPPED_TILES_ENTRY.to_owned(), oversized)],
+        );
+        let on_disk = container.get_ref().len();
+        assert!(
+            (on_disk as u64) < super::MAX_SKIPPED_TILES_ENTRY_BYTES,
+            "the crafted container must be far smaller on disk than the entry it declares, or \
+             this test is not exercising the amplification it exists for ({on_disk} bytes)"
+        );
+        let (_dir, mut store) = real_tile_store();
+        match read(container, &mut store) {
+            Err(super::IoError::EntryTooLarge { name, cap, .. }) => {
+                assert_eq!(name, super::SKIPPED_TILES_ENTRY);
+                assert_eq!(cap, super::MAX_SKIPPED_TILES_ENTRY_BYTES);
+            }
+            other => unreachable!("expected EntryTooLarge, got {other:?}"),
+        }
+    }
+
+    /// The frozen `version`/`total` prefix, doing the one job it exists
+    /// for: a payload written by a schema version this build does not
+    /// understand must still report **how much was lost**, never "you
+    /// lost nothing".
+    #[test]
+    fn an_unrecognised_skipped_tiles_version_still_reports_the_count() {
+        let manifest_bytes = small_manifest_bytes();
+        let future = super::SkippedTilesWire {
+            version: super::SKIPPED_TILES_VERSION + 7,
+            total: 12,
+            records: vec![crafted_record(0)],
+        };
+        let bytes = match postcard::to_allocvec(&future) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        let document = match read(
+            container_with(
+                &manifest_bytes,
+                &[(super::SKIPPED_TILES_ENTRY.to_owned(), bytes)],
+            ),
+            &mut store,
+        ) {
+            Ok(document) => document,
+            Err(err) => unreachable!("an unreadable *detail* must not fail the file: {err:?}"),
+        };
+        assert_eq!(
+            document.skipped_tiles.total(),
+            12,
+            "the frozen prefix must survive a version this build cannot decode"
+        );
+        assert!(
+            document.skipped_tiles.records().is_empty(),
+            "detail from an unknown schema must not be guessed at"
+        );
+        assert!(
+            !document.skipped_tiles.is_empty(),
+            "twelve lost tiles is not 'nothing was lost'"
+        );
+    }
+
+    /// The `reason` bound is a format invariant, not a write-side
+    /// convention: a crafted file whose reason runs past
+    /// `MAX_SKIPPED_REASON_CHARS` is cut on the way back in too, and cut
+    /// on a **character** boundary — the multi-byte case, which a byte
+    /// slice would have split mid-sequence.
+    #[test]
+    fn an_overlong_multibyte_reason_is_cut_on_a_char_boundary_on_read() {
+        let manifest_bytes = small_manifest_bytes();
+        // Four bytes per character, so a byte-offset cut anywhere but a
+        // multiple of four lands inside a sequence.
+        let long_reason: String =
+            std::iter::repeat_n('\u{1F600}', super::MAX_SKIPPED_REASON_CHARS * 3).collect();
+        let crafted = super::SkippedTilesWire {
+            version: super::SKIPPED_TILES_VERSION,
+            total: 1,
+            records: vec![super::SkippedTileRecord {
+                surface: 0,
+                tile_x: 0,
+                tile_y: 0,
+                reason: long_reason,
+            }],
+        };
+        let bytes = match postcard::to_allocvec(&crafted) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (_dir, mut store) = real_tile_store();
+        let document = match read(
+            container_with(
+                &manifest_bytes,
+                &[(super::SKIPPED_TILES_ENTRY.to_owned(), bytes)],
+            ),
+            &mut store,
+        ) {
+            Ok(document) => document,
+            Err(err) => unreachable!("an over-long reason must be cut, not refused: {err:?}"),
+        };
+        let [record] = document.skipped_tiles.records() else {
+            unreachable!("exactly one record, got {:?}", document.skipped_tiles);
+        };
+        assert_eq!(
+            record.reason.chars().count(),
+            super::MAX_SKIPPED_REASON_CHARS,
+            "the read side must apply the same character bound the writer does"
+        );
+        assert!(
+            record.reason.chars().all(|c| c == '\u{1F600}'),
+            "the cut must land on a character boundary, not inside a UTF-8 sequence"
+        );
+        assert_eq!(
+            record.reason.len(),
+            super::MAX_SKIPPED_REASON_CHARS * 4,
+            "every kept character is a real four-byte one"
+        );
+    }
+
+    /// **The premise the whole `skipped-tiles`-is-a-separate-entry
+    /// design rests on**, pinned permanently rather than measured once
+    /// and thrown away.
+    ///
+    /// `postcard`'s wire format is positional: no field names, no tags.
+    /// So growing a struct by a trailing field makes the decoder run off
+    /// the end of old bytes, and `#[serde(default)]` does not rescue it
+    /// — `default` fills a field a *self-describing* format omitted by
+    /// name, and there are no names here, so the hard decode error
+    /// arrives before serde consults the attribute. If a future
+    /// `postcard` ever changed that, this module's doc comment would
+    /// become wrong and this test is what says so.
+    #[test]
+    fn postcard_really_is_positional_so_a_trailing_field_breaks_old_bytes() {
+        #[derive(serde::Serialize)]
+        struct OldShape {
+            version: u32,
+            canvas_width: u32,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct NewShape {
+            #[allow(dead_code)]
+            version: u32,
+            #[allow(dead_code)]
+            canvas_width: u32,
+            #[serde(default)]
+            #[allow(dead_code)]
+            added_later: u32,
+        }
+
+        let old_bytes = match postcard::to_allocvec(&OldShape {
+            version: 1,
+            canvas_width: 10,
+        }) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match postcard::from_bytes::<NewShape>(&old_bytes) {
+            Err(_) => {}
+            Ok(_) => unreachable!(
+                "postcard decoded a three-field struct from two-field bytes -- the premise behind \
+                 `skipped-tiles` being a separate entry no longer holds, and this module's doc \
+                 comment needs rewriting, not this test deleting"
+            ),
+        }
+    }
+
     #[derive(serde::Serialize)]
     struct ManifestReadForTest {
         version: u32,

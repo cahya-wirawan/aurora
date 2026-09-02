@@ -191,68 +191,58 @@ pub struct TileStore {
 }
 
 /// Creates `dir` (and any missing parent) owner-only on Unix, and
-/// returns having re-read the directory's own metadata to confirm that
-/// no group or other permission bit is set.
+/// returns having re-read the directory's own metadata — off an open,
+/// `O_NOFOLLOW`-opened descriptor, not the path again — to confirm that
+/// it is owned by this process and that no group or other permission bit
+/// is set.
 ///
 /// # What this checks, exactly
 ///
-/// - **A symlink at `dir` is refused, not followed.**
-///   `std::fs::set_permissions` follows symlinks, so a symlink planted
-///   at this path would silently chmod its *target* — an unrelated
-///   directory elsewhere — to `0o700` while leaving the scratch files
-///   themselves in whatever directory the link points at. A path whose
-///   `symlink_metadata` says "symlink" is an error instead.
+/// - **A symlink at `dir` is refused, not followed**, at two independent
+///   points. First, a quick `symlink_metadata` check up front gives a
+///   friendly, specific error before anything else runs. Second — the
+///   part that actually holds the line — `dir` is opened with
+///   `O_NOFOLLOW | O_DIRECTORY`: if a symlink (or anything not a
+///   directory) has been swapped in between that first check and this
+///   open, the open itself fails instead of silently following it. Every
+///   check after that point runs against the resulting descriptor, never
+///   the path again, so nothing later in this function can be raced onto
+///   a different inode.
 /// - **A non-directory at `dir` is refused** as
 ///   [`std::io::ErrorKind::NotADirectory`], rather than surfacing
 ///   `mkdir`'s own less specific `EEXIST`.
-/// - **The final mode is verified**, by reading `symlink_metadata` back
-///   off the path. That is what lets this function's contract say
-///   "owner-only" as a fact rather than as an intention. It also
-///   *detects* a symlink swapped in after the first check — detects,
-///   not prevents: if a chmod had already run against it, the target's
-///   mode has already been changed by then.
-/// - **The chmod is skipped when it is not needed.** The permissions
-///   are read before they are written, so a directory this call just
-///   created at `0o700` — which is every caller in Aurora — never
-///   reaches `set_permissions` at all, and `set_permissions` is exactly
-///   the call that follows symlinks. Only adopting a pre-existing,
-///   wider directory reaches it.
+/// - **Ownership is verified.** The opened descriptor's `fstat` (`uid()`
+///   on its `Metadata`) is compared against `geteuid()`; a pre-existing
+///   directory owned by a different user is refused rather than adopted.
+/// - **The final mode is verified and corrected on the descriptor, not
+///   the path.** A directory this call just created at `0o700` — every
+///   caller in Aurora today — is already owner-only, so no `fchmod` call
+///   happens at all. Only adopting a pre-existing, wider directory reaches
+///   it, and because `fchmod` takes a file descriptor rather than a path,
+///   there is no window in which a second syscall could be pointed
+///   somewhere else — unlike `std::fs::set_permissions`, which resolves
+///   the path again and therefore follows a symlink swapped in right
+///   before it runs.
 ///
-/// The `mkdir` sets mode `0o700` directly so a freshly created
-/// directory is never group- or world-readable for even an instant. The
-/// following `set_permissions` is *not* about the umask: a umask can
-/// only clear permission bits, never add them, so `mkdir(0o700)` cannot
-/// produce anything wider than `0o700` on its own. It is there for the
-/// one case `mkdir` does not cover — `recursive(true)` silently accepts
-/// a directory that *already exists*, at whatever mode it already has,
-/// and that is the mode `set_permissions` tightens.
+/// The `mkdir` sets mode `0o700` directly so a freshly created directory
+/// is never group- or world-readable for even an instant. The `fchmod`
+/// that can follow it is *not* about the umask: a umask can only clear
+/// permission bits, never add them, so `mkdir(0o700)` cannot produce
+/// anything wider than `0o700` on its own. It is there for the one case
+/// `mkdir` does not cover — `recursive(true)` silently accepts a
+/// directory that *already exists*, at whatever mode it already has, and
+/// that is the mode this function tightens.
 ///
 /// # What this does *not* check
 ///
-/// - **Ownership.** A pre-existing directory is tightened and adopted
-///   without confirming the current user owns it; `std::` exposes no
-///   stable `geteuid`, and reaching for `libc` would mean this
-///   workspace's first `unsafe_code` override. So would the fully
-///   race-free shape of this function (`open(O_DIRECTORY|O_NOFOLLOW)`
-///   plus `fchmod` on the resulting descriptor), which is why the
-///   check-then-chmod sequence above is what is implemented.
-/// - **Intermediate parents.** Only the final component is checked for
-///   being a symlink; a symlinked parent is not.
-/// - **The window before the chmod.** For a directory that already
-///   existed at a wider mode, it stays at that wider mode until
-///   `set_permissions` runs. Nothing of the user's has been written
-///   into it yet at that point, but an attacker who could already write
-///   there could have planted files or symlinks the chmod does not
-///   remove.
-///
-/// None of the three is reachable from Aurora today: every caller in
-/// the app passes a freshly created, randomly named directory from
-/// `tempfile::Builder` (`aurora_app::create_tile_store_scratch_dir`) or
-/// a child of one, so there is never a pre-existing directory to adopt.
-/// They become reachable the moment a *caller-supplied* scratch path is
-/// possible — FR-026's still-open, user-facing scratch-disk-location
-/// preference — which is when this wants the `O_NOFOLLOW` treatment and
-/// a real ownership check. Recorded as a follow-up in PLAN.md.
+/// - **Intermediate parents.** Only the final component is opened
+///   `O_NOFOLLOW`; a symlinked parent is not checked.
+/// - **A mismatched-owner path is not covered by this crate's own test
+///   suite.** Exercising it needs a directory owned by a *different*
+///   user, which a single-user sandbox or CI runner cannot construct.
+///   The check is a direct, one-line comparison against `geteuid()`
+///   (nothing to get subtly wrong in the comparison itself), but the
+///   caveat is recorded here rather than implied.
 ///
 /// A failure to make the directory private is returned, not logged and
 /// ignored: refusing to page a document's pixels into a directory this
@@ -269,7 +259,8 @@ pub struct TileStore {
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::io::AsRawFd as _;
 
     if let Ok(existing) = std::fs::symlink_metadata(dir) {
         if existing.file_type().is_symlink() {
@@ -304,24 +295,19 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         .mode(0o700)
         .create(dir)?;
 
-    // Read before writing, so the ordinary case never chmods at all.
-    // Every caller in Aurora reaches here having just *created* the
-    // directory at mode `0o700`, which is already owner-only, so the
-    // check below returns without calling `set_permissions` — and
-    // `set_permissions` is precisely the call that follows symlinks.
-    // Only the adopt-an-existing-wider-directory case reaches the chmod.
-    //
-    // `symlink_metadata` (not `metadata`) deliberately: it reports the
-    // path itself rather than a link's target, so a symlink swapped in
-    // after the check above is caught here instead of being silently
-    // reported as its target's mode.
-    let mut settled = std::fs::symlink_metadata(dir)?;
-    if settled.permissions().mode() & 0o077 != 0 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        settled = std::fs::symlink_metadata(dir)?;
-    }
+    // From here on the security boundary is a held descriptor, not the
+    // path: `O_NOFOLLOW | O_DIRECTORY` refuses outright if a symlink or
+    // non-directory has been swapped in since the checks above, and
+    // every remaining check runs against this one `File` -- never `dir`
+    // again -- so nothing later in this function can be raced onto a
+    // different inode the way a second path-based syscall could be.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)?;
+    let metadata = file.metadata()?;
 
-    if settled.file_type().is_symlink() || !settled.is_dir() {
+    if !metadata.is_dir() {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
@@ -331,13 +317,45 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
             ),
         ));
     }
-    let mode = settled.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
+
+    // SAFETY: `geteuid` takes no arguments, has no preconditions, and
+    // cannot fail -- it is inherently safe to call, `std` just does not
+    // expose it.
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             format!(
-                "scratch directory {} is still group- or world-accessible (mode {mode:o}) after \
-                 being made owner-only",
+                "refusing to adopt {} as a scratch directory: it is owned by uid {} but this \
+                 process is uid {euid}",
+                dir.display(),
+                metadata.uid()
+            ),
+        ));
+    }
+
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        // SAFETY: `file`'s descriptor is open and held for this whole
+        // call, so `fchmod` cannot be raced onto a different inode the
+        // way `std::fs::set_permissions` (path-based, follows symlinks)
+        // could be by a symlink swapped in right before it runs.
+        let result = unsafe { libc::fchmod(file.as_raw_fd(), 0o700) };
+        if result != 0 {
+            return Err(Error::last_os_error());
+        }
+    }
+
+    // Re-read rather than trust the `fchmod` call's success alone: this
+    // is what lets the function's contract say "owner-only" as a fact
+    // about the directory's settled state, not merely "we asked for it."
+    let settled_mode = file.metadata()?.mode() & 0o777;
+    if settled_mode & 0o077 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "scratch directory {} is still group- or world-accessible (mode {settled_mode:o}) \
+                 after being made owner-only",
                 dir.display()
             ),
         ));
@@ -503,6 +521,106 @@ impl TileStore {
         self.resident
             .get_mut(&(surface, id))
             .and_then(Tile::take_dirty)
+    }
+
+    /// Whether `(surface, id)` is resident and currently dirty, **without
+    /// clearing it** — [`Self::take_dirty`]'s non-consuming counterpart,
+    /// for a caller that must decide whether it can act on the dirtiness
+    /// before consuming it (see [`Tile::is_dirty`]).
+    ///
+    /// Peeks rather than gets, so asking does not bump LRU recency: a
+    /// query is not an access, and a tile the caller then declines to
+    /// upload should not have been promoted for having been asked about.
+    #[must_use]
+    pub fn is_dirty(&self, surface: SurfaceId, id: TileId) -> bool {
+        self.resident
+            .peek(&(surface, id))
+            .is_some_and(Tile::is_dirty)
+    }
+
+    /// Whether this store holds *any* content for `(surface, id)` —
+    /// resident, evicted-but-not-yet-confirmed-written, or paged out to
+    /// the scratch disk — **without materializing it**.
+    ///
+    /// This is precisely the negation of this type's own (private)
+    /// `ensure_resident` branch (d): `false` means [`Self::get`] would
+    /// hand back a
+    /// brand-new `Tile::blank()`, and `true` means it would hand back
+    /// something somebody actually wrote.
+    ///
+    /// # Why this exists rather than "just call `get`"
+    ///
+    /// Because for a caller that treats a blank tile as a no-op,
+    /// `get` is the expensive way to learn nothing. Materializing a
+    /// never-touched tile allocates a whole `SAMPLES`-long buffer,
+    /// makes it resident, and — since residency is capped by the
+    /// store's own budget — can evict a *real* tile to make room for
+    /// it, paying a synchronous encode and scratch-disk write for a
+    /// tile that holds only zeros. `aurora-app`'s mask compositing hit
+    /// exactly that: every enabled mask read its coverage surface once
+    /// per composited tile, and today no mask surface has ever been
+    /// painted, so the entire cost bought a buffer of zeros it already
+    /// had. Measured at ~2.9× the per-tile cost of not reading at all,
+    /// on a frame path CLAUDE.md already documents as over its 60 FPS
+    /// budget.
+    ///
+    /// Three `HashMap`/`LruCache` lookups, no I/O, no allocation.
+    /// Peeks rather than gets, for [`Self::is_dirty`]'s reason: asking
+    /// whether a tile exists is not an access, and must not bump LRU
+    /// recency.
+    ///
+    /// `failed_writes` is deliberately not consulted: every key in it
+    /// is also in `pending` (that is what makes those bytes the tile's
+    /// only surviving copy), so it would add nothing.
+    #[must_use]
+    pub fn contains_tile(&self, surface: SurfaceId, id: TileId) -> bool {
+        let key = (surface, id);
+        self.resident.contains(&key)
+            || self.pending.contains_key(&key)
+            || self.paged_out.contains_key(&key)
+    }
+
+    /// Drops everything this store holds for `(surface, id)` — resident,
+    /// pending, or paged out — and deletes its scratch file, so a
+    /// subsequent [`Self::contains_tile`] is `false` and a subsequent
+    /// [`Self::get`] hands back a brand-new `Tile::blank()`. Returns
+    /// whether anything was actually held.
+    ///
+    /// **This destroys pixels, and that is its whole purpose.** It
+    /// exists for one caller shape: something that wrote tiles into a
+    /// live store, then failed part-way and must not leave what it
+    /// wrote behind. `aurora_io::read_aur` is that caller — it decodes
+    /// a `.aur` archive's tiles straight into the caller's store as it
+    /// goes, so a container whose *last* tile entry is corrupt used to
+    /// leave every earlier tile resident under surface ids the next
+    /// document is about to claim, which is one rejected file away from
+    /// showing a user fragments of a document that failed to open.
+    ///
+    /// Do not reach for it as a cache-eviction knob. Eviction is
+    /// `make_room`'s job and keeps the tile's content
+    /// recoverable; this is the opposite operation, and there is no way
+    /// back from it.
+    ///
+    /// Nothing is flushed and nothing is awaited. A background write
+    /// already in flight for this key is left to complete and land on a
+    /// file this call has just deleted (or is about to be deleted by
+    /// it); its result then drains into `reconcile_pending`/[`Self::flush`]
+    /// against a `pending` entry that is gone, which those already
+    /// handle as an ordinary "no longer in pending" outcome. The
+    /// scratch file it recreates is orphaned rather than aliased — the
+    /// key is in neither map any more, so no read can reach it, and the
+    /// scratch directory is deleted with the session.
+    pub fn forget_tile(&mut self, surface: SurfaceId, id: TileId) -> bool {
+        let key = (surface, id);
+        let held = self.contains_tile(surface, id);
+        // Deletes the scratch file *before* the mapping that names it
+        // is dropped -- `discard_stale_scratch_file` reads the path out
+        // of `paged_out`, so the other order would leak the file.
+        self.discard_stale_scratch_file(key);
+        self.paged_out.remove(&key);
+        self.forget_pending(key);
+        self.resident.pop(&key);
+        held
     }
 
     /// Blocks until every write submitted so far has actually reached
@@ -1143,6 +1261,164 @@ mod tests {
              occupies -- not for its magic, version or header, which `CorruptFile` also covers: \
              {message}"
         );
+    }
+
+    #[test]
+    // The property `contains_tile` is bought for: asking must be free.
+    // A `true` answer would mean `get` had materialized the tile --
+    // which is exactly the cost the caller is trying to avoid, and
+    // would also have consumed a slot of the residency budget.
+    fn contains_tile_is_false_for_a_never_touched_tile_and_does_not_create_it() {
+        let (_dir, mut store) = store(4);
+        let id = TileId { x: 3, y: 7 };
+        assert!(!store.contains_tile(surface(), id));
+        assert_eq!(store.stats().tiles_created, 0);
+        assert_eq!(store.resident_len(), 0);
+        // And it still reads as blank afterwards, so skipping the read
+        // on a `false` answer really is equivalent to doing it.
+        let Ok(tile) = store.get(surface(), id) else {
+            unreachable!("no prior state exists to fail on");
+        };
+        assert!(tile.texels().iter().all(|s| s.to_f32() == 0.0));
+    }
+
+    #[test]
+    // The three places content can live -- resident, evicted with the
+    // write still in flight (`pending`), and confirmed on the scratch
+    // disk (`paged_out`) -- all have to answer `true`, or a caller that
+    // skips on `false` silently drops real pixels.
+    fn contains_tile_is_true_whether_the_tile_is_resident_pending_or_paged_out() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        if store.get_mut(s, a).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.contains_tile(s, a), "resident");
+
+        // Budget of 1, so touching `b` evicts `a`; its bytes are in
+        // `pending` and its path in `paged_out` from the same instant.
+        if store.get_mut(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.contains_tile(s, a), "evicted, write in flight");
+        assert!(store.contains_tile(s, b), "resident");
+
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        assert!(store.contains_tile(s, a), "confirmed on the scratch disk");
+    }
+
+    #[test]
+    // The three places content can live are also the three places
+    // `forget_tile` has to reach, or a caller rolling back a partial
+    // read would drop the resident copy and leave a scratch file the
+    // next `get` pages straight back in.
+    fn forget_tile_drops_a_tile_from_every_place_it_can_live() {
+        for evict_and_flush in [false, true] {
+            let (_dir, mut store) = store(1);
+            let s = surface();
+            let target = TileId { x: 0, y: 0 };
+            let Ok(tile) = store.get_mut(s, target) else {
+                unreachable!("a fresh store must serve this tile");
+            };
+            for sample in tile.texels_mut() {
+                *sample = half::f16::from_f32(0.9);
+            }
+            let path = store.tile_path(s, target);
+            if evict_and_flush {
+                // Budget of 1: touching a second tile evicts `target`,
+                // and the flush confirms its write, so it is in
+                // `paged_out` with a real file on disk.
+                if store.get_mut(s, TileId { x: 1, y: 0 }).is_err() {
+                    unreachable!("a fresh store must serve this tile");
+                }
+                if let Err(err) = store.flush() {
+                    unreachable!("test-local scratch disk must accept the write: {err:?}");
+                }
+                assert!(path.exists(), "the evicted tile really is on disk");
+            }
+            assert!(store.contains_tile(s, target));
+
+            assert!(store.forget_tile(s, target), "it was held");
+            assert!(
+                !store.contains_tile(s, target),
+                "nothing may still hold the forgotten tile"
+            );
+            assert!(
+                !path.exists(),
+                "the forgotten tile's scratch file must be deleted, not orphaned"
+            );
+            // And the pixels really are gone rather than merely
+            // unreachable by one route: a fresh `get` is blank.
+            let Ok(tile) = store.get(s, target) else {
+                unreachable!("a forgotten tile must be servable again as a blank one");
+            };
+            assert!(
+                tile.texels().iter().all(|sample| sample.to_f32() == 0.0),
+                "a forgotten tile must come back blank, not carrying its old pixels"
+            );
+
+            // Idempotent, and honest about having found nothing: the
+            // `get` above made it resident again, so forget it once more
+            // and then ask a third time.
+            assert!(store.forget_tile(s, target));
+            assert!(
+                !store.forget_tile(s, target),
+                "forgetting a tile nothing holds must report that it held nothing"
+            );
+        }
+    }
+
+    #[test]
+    // Asking is not an access: `contains_tile` must not promote the
+    // tile it is asked about, or a query would change which tile the
+    // next eviction picks.
+    fn contains_tile_does_not_bump_lru_recency() {
+        let (_dir, mut store) = store(2);
+        let s = surface();
+        let old = TileId { x: 0, y: 0 };
+        let new = TileId { x: 1, y: 0 };
+        for id in [old, new] {
+            if store.get_mut(s, id).is_err() {
+                unreachable!("a fresh store must serve this tile");
+            }
+        }
+        // If this promoted `old`, the eviction below would take `new`.
+        assert!(store.contains_tile(s, old));
+        if store.get_mut(s, TileId { x: 2, y: 0 }).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert_eq!(
+            store.stats().evictions,
+            1,
+            "exactly one tile should have been evicted"
+        );
+        assert!(
+            store.contains_tile(s, new),
+            "`new` was the most recently used and must have survived -- if it did not, \
+             `contains_tile` promoted `old` and changed the eviction order"
+        );
+    }
+
+    #[test]
+    // Tiles are keyed by `(surface, id)`, so the same `TileId` on
+    // another surface must not answer for this one -- the exact
+    // confusion the mask-surface partition would otherwise invite,
+    // since a mask surface and its layer's own surface share tile
+    // coordinates.
+    fn contains_tile_is_per_surface_not_per_tile_id() {
+        let (_dir, mut store) = store(4);
+        let id = TileId { x: 2, y: 2 };
+        let other = SurfaceId::from_raw(1 << 63);
+        if store.get_mut(surface(), id).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.contains_tile(surface(), id));
+        assert!(!store.contains_tile(other, id));
     }
 
     #[test]
@@ -2899,8 +3175,14 @@ mod tests {
         // Two *real* files, not one that the second store overwrote.
         assert!(first.tile_path(surface(), a).is_file());
         assert!(second.tile_path(surface(), a).is_file());
+        // `.tile` only: a scratch directory may also hold
+        // `crate::LOCK_FILE_NAME` (0.67.0), which is not a paged-out
+        // tile and must not be counted as one.
         let entries = match std::fs::read_dir(dir.path()) {
-            Ok(entries) => entries.filter_map(Result::ok).count(),
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tile"))
+                .count(),
             Err(err) => unreachable!("the scratch directory is readable: {err}"),
         };
         assert_eq!(

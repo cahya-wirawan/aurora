@@ -137,11 +137,34 @@ impl LayerLock {
 /// A layer mask: grayscale, and optional on *any* layer regardless of kind
 /// (Photoshop allows one on both pixel layers and groups, clipping the
 /// whole group in the latter case) — so this lives on `LayerEntry`
-/// itself rather than inside [`LayerKind`]. Deliberately no real pixel
-/// storage yet, the same open resource-management question
-/// `LayerKind::Pixel`'s own `bounds` field already flagged (one store per
-/// layer vs. shared) — this carries only what's needed to create, toggle,
-/// and invert a mask before real mask pixels exist to store. **Narrower
+/// itself rather than inside [`LayerKind`].
+///
+/// **Real per-pixel grayscale coverage exists**, and it is deliberately
+/// *not* stored in this struct. Mask pixels live in the document's
+/// shared `aurora_tile::TileStore` on their own surface — the same
+/// "one shared store, addressed by surface" answer
+/// [ADR 0010](../../../docs/adr/0010-layer-pixel-storage.md) already
+/// gave for a pixel layer's own content, which is what closed the
+/// resource-management question `LayerKind::Pixel`'s own `bounds` field
+/// flagged (one store per layer vs. shared). So this struct stays
+/// small: `bounds` is the mask's own rectangle in document space and
+/// the origin its coverage tiles are addressed relative to; `enabled`
+/// and `inverted` are the two toggles the modern UI exposes. The
+/// surface is [`crate::LayerTree::mask_surface_id`]; the coverage
+/// convention (`(v, v, v, 1.0)`, alpha as the "painted" flag, so
+/// never-painted reads back as fully visible) is the [`crate::mask`]
+/// module's, and [`crate::write_mask_coverage`] /
+/// [`crate::read_mask_coverage`] are its two halves.
+///
+/// **Two follow-ons are deliberately not built yet**, named here
+/// rather than silently dropped (the [`crate::mask`] module's own doc
+/// comment says more about each, plus a third about mask-surface
+/// lifecycle): a brush/tool UI for painting a mask, and mask-pixel
+/// undo/history support. Coverage can be written, is composited
+/// correctly, and survives a `.aur` save/load round trip as of
+/// 0.71.0 — it cannot yet be painted by hand or undone.
+///
+/// **Narrower
 /// than PSD's own `lspf`/mask-data format**: real Photoshop files also
 /// carry a "position relative to layer" flag and density/feather
 /// parameters, both legacy fields not exposed in the modern UI — left out
