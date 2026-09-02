@@ -9437,10 +9437,17 @@ struct App {
     /// at construction time ([`topmost_pixel_layer`]), real-time-
     /// changeable now by clicking a row in the Layers panel
     /// ([`Self::layer_rows`], [`Self::handle_pointer_pressed`]). `None`
-    /// for a document with no pixel layer at all, or once one is
-    /// clicked that turns out to be a group (groups are never inserted
-    /// into `layer_rows` at all, so this can't actually happen via a
-    /// click — only via never having a pixel layer to begin with).
+    /// for a document with no pixel layer at all.
+    ///
+    /// **This can hold a group's `LayerId`, not just a pixel layer's.**
+    /// `layer_rows` maps every row `populate_layers_panel` inserts,
+    /// group rows included ([`aurora_ui::layers_panel::insert_layer_row`]
+    /// inserts unconditionally), and [`select_layer`] sets `*active_layer`
+    /// from whichever row was clicked with no `LayerKind` check. A caller
+    /// reading this field for anything pixel-specific (paint/erase
+    /// targets, the Move tool) must itself confirm the kind rather than
+    /// assume it, the same way [`topmost_pixel_layer`] already does at
+    /// construction time.
     ///
     /// **The canvas pan boundary is a function of this field, of this
     /// layer's own `bounds`, and of the canvas area's own size.** The
