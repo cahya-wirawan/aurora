@@ -23,7 +23,8 @@
 use accesskit::{Action, Node, Role};
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
-use taffy::{Display, Style};
+use taffy::style_helpers::{TaffyAuto, TaffyZero};
+use taffy::{Dimension, Display, Overflow, Style};
 
 /// One inserted panel's own widget ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +69,7 @@ pub fn insert_panel(
     root_node.add_action(Action::Collapse);
     root_node.set_expanded(true);
     let root = tree.insert(parent, root_style(false), root_node, WidgetKind::Panel)?;
-    let body = widgets::insert_container(tree, root, Style::default())?;
+    let body = widgets::insert_container(tree, root, body_style(false))?;
     Ok(PanelHandle { root, body })
 }
 
@@ -80,10 +81,77 @@ pub fn insert_panel(
 /// all and its siblings' own `flex_grow: 1.0` absorbs the space it
 /// gives up — the ordinary flexbox behaviour every sibling already
 /// has, not a special case.
+///
+/// **A panel's share of the rail is its siblings' business, never its
+/// own content's** — `flex_basis: 0` plus `min_size.height: 0` are what
+/// make that true, and both are load-bearing (0.77.1). Real bug, with
+/// real numbers: with the default `flex_basis: auto`, a panel's base
+/// size is its *content* height, and flexbox's automatic minimum size
+/// then refuses to shrink a flex item below that content — so a Layers
+/// panel over a 43-layer document (rows are ~21 px each, and nothing
+/// caps how many there are) claimed the whole 900 px rail and left
+/// Properties and History at literally zero height, off the bottom of
+/// the window and not even hit-testable. `flex_basis: 0` gives all
+/// three panels the same base size regardless of what is inside them,
+/// so the rail is always divided by `flex_grow` alone; `min_size.
+/// height: 0` is what stops the automatic minimum size from putting the
+/// content height back. Content taller than the resulting share
+/// overflows the panel (see [`body_style`]) rather than growing it.
 fn root_style(collapsed: bool) -> Style {
     Style {
         flex_direction: taffy::FlexDirection::Column,
         flex_grow: if collapsed { 0.0 } else { 1.0 },
+        flex_basis: Dimension::ZERO,
+        min_size: taffy::Size {
+            width: Dimension::AUTO,
+            height: Dimension::ZERO,
+        },
+        ..Default::default()
+    }
+}
+
+/// A panel body's own style — `flex_grow: 1.0` with the same
+/// `flex_basis: 0` / `min_size.height: 0` pair [`root_style`] explains,
+/// so the body is exactly as tall as the share its root was given and
+/// never a pixel taller, whatever it holds. Without that the clamp on
+/// the root alone would not be enough: the body would still size to its
+/// content and spill its rows down across the panels below it, where
+/// `WidgetTree::hit_test` would happily hand a click meant for
+/// Properties to a Layers row.
+///
+/// `Overflow::Hidden` states the consequence rather than causing it:
+/// `WidgetTree::hit_test` already refuses to descend into a parent whose
+/// own bounds don't contain the point, so a row past the bottom of the
+/// panel is unreachable by pointer, and the panels painted after it
+/// cover it. **What does not exist yet is any way to *reach* that
+/// content** — there is no scrolling container in `aurora-widgets` (see
+/// `aurora_widgets::widgets::tree_view`'s own module doc comment), so
+/// rows past the bottom of a crowded Layers panel are currently not
+/// reachable at all. That is a real, disclosed gap and the next piece of
+/// work here; it is strictly better than the alternative it replaced,
+/// which was losing the Properties and History panels entirely.
+///
+/// `Display::None` while collapsed is what actually hides the content
+/// ([`set_panel_collapsed`]); the rest of the style is kept identical
+/// across both states so expanding restores exactly the layout the body
+/// had before.
+fn body_style(collapsed: bool) -> Style {
+    Style {
+        display: if collapsed {
+            Display::None
+        } else {
+            Display::Flex
+        },
+        flex_grow: 1.0,
+        flex_basis: Dimension::ZERO,
+        min_size: taffy::Size {
+            width: Dimension::AUTO,
+            height: Dimension::ZERO,
+        },
+        overflow: taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        },
         ..Default::default()
     }
 }
@@ -166,15 +234,7 @@ pub fn set_panel_collapsed(
 ) -> Result<(), WidgetError> {
     tree.set_style(panel.root, root_style(collapsed))?;
 
-    let body_style = if collapsed {
-        Style {
-            display: Display::None,
-            ..Default::default()
-        }
-    } else {
-        Style::default()
-    };
-    tree.set_style(panel.body, body_style)?;
+    tree.set_style(panel.body, body_style(collapsed))?;
 
     let node = tree
         .accessibility(panel.root)

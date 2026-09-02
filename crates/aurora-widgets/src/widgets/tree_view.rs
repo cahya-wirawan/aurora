@@ -1826,7 +1826,7 @@ mod tests {
     /// destroyed by populating a group's own children, before the caller
     /// had even finished building the panel.
     #[test]
-    fn a_description_survives_selection_expansion_and_a_new_child_row() {
+    fn a_description_survives_selection_collapsing_and_a_new_child_row() {
         let (mut tree, root) = new_tree(Style::default());
         let scales = test_scales();
         let group = match insert_tree_item(&mut tree, root, &scales, "Effects", true) {

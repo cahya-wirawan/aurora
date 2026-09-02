@@ -13523,6 +13523,22 @@ mod tests {
 
     #[test]
     fn replace_document_clears_the_old_rows_and_populates_exactly_the_new_layer() {
+        // Everything under the body, at every depth -- not just the
+        // tree container's own direct children. Counting only the
+        // direct ones would pass even if a *nested* row (a row inside a
+        // group row) survived the clear, which is exactly the leftover
+        // this test exists to rule out.
+        fn total_descendants(
+            tree: &aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+            id: aurora_widgets::WidgetId,
+        ) -> usize {
+            tree.children(id)
+                .unwrap_or_default()
+                .iter()
+                .map(|&child| 1 + total_descendants(tree, child))
+                .sum()
+        }
+
         let mut workspace = aurora_ui::build_workspace();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -13563,6 +13579,11 @@ mod tests {
                 > 1,
             "the demo document must have seeded more than one row"
         );
+        let seeded = total_descendants(&workspace.tree, workspace.layers.body);
+        assert!(
+            seeded > 2,
+            "the demo document must have seeded a tree container plus several rows, got {seeded}"
+        );
 
         let image = fake_image(8, 8);
         let (new_layers, new_history, new_layer_id) = document_from_image("photo", &image);
@@ -13584,6 +13605,12 @@ mod tests {
                 .map(<[_]>::len),
             Some(1),
             "old demo rows must be gone, replaced by exactly the new layer's own row"
+        );
+        assert_eq!(
+            total_descendants(&workspace.tree, workspace.layers.body),
+            2,
+            "and nothing at all survives below that: exactly the tree container and one row, \
+             counted at every depth rather than only the tree's own direct children"
         );
         assert_eq!(
             workspace

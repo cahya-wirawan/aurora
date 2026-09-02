@@ -4991,6 +4991,111 @@ structural design work.
   display server in this sandbox, so whether a real `Role::Tree` helps
   that is untested either way and still needs a human on real macOS
   hardware.
+
+  **Review round on 0.77.0, 2026-09-02 (0.77.1)** — an independent
+  critic and red-team pass over the commit above found one real
+  regression it had introduced, plus six smaller gaps. All fixed in
+  `crates/aurora-ui/src/panel.rs`, `crates/aurora-ui/src/layers_panel.rs`,
+  `crates/aurora-widgets/src/widgets/tree_view.rs` and
+  `crates/aurora-app/src/lib.rs`:
+
+  1. **The Layers panel grew without bound and pushed its siblings off
+     the window** — the regression, and the reason for the patch bump.
+     Reproduced with real numbers through `build_workspace()` +
+     `populate_layers_panel` + `compute_layout(1600, 900)`: the panel's
+     own box grew ~21 px per layer, so at **43 layers** — an ordinary
+     count for a real document — Properties and History were both at
+     **zero height, below the bottom of the window**, and `hit_test`
+     returned `None` for both. Cause: a docked panel's `flex_basis` was
+     `auto`, making its base size its own *content* height, and
+     flexbox's automatic minimum size then refuses to shrink a flex item
+     below that. Fixed in `panel.rs`, where the rail's layout model
+     actually lives, not by special-casing the Layers panel:
+     `root_style`/`body_style` now give every panel `flex_basis: 0` and
+     `min_size.height: 0`, so the rail is always divided by `flex_grow`
+     alone and a panel's share is independent of what is inside it.
+     `body_style` (new, shared with `set_panel_collapsed` so an
+     expand can't reset it away) clamps the body to that share too —
+     without it the body would still size to content and spill its rows
+     across the panels below, where `hit_test` would hand a click meant
+     for Properties to a Layers row. Pinned by
+     `a_crowded_layers_panel_never_starves_its_sibling_panels`, which
+     builds the **real workspace** at 1, 40, 100 and 400 layers and
+     asserts both siblings keep a non-zero, on-screen, hit-testable
+     share — the test class that was missing entirely (every existing
+     `layers_panel` test built an isolated panel via bare `insert_panel`
+     and so could never observe a sibling).
+
+     **Disclosed, not fixed**: rows past the bottom of the bounded panel
+     are clipped, and with no scrolling container anywhere in
+     `aurora-widgets` yet (`tree_view`'s own gap, still open) clipped
+     means *unreachable* — about 14 of them fit a 300 px share at the
+     default rail height. `rows_past_the_bottom_of_a_bounded_panel_are_
+     clipped_and_not_yet_reachable` pins exactly that, asserting some
+     rows are reachable and some are not, rather than implying the panel
+     is finished. A real scrolling/virtualized list is the next piece of
+     work here.
+  2. **`populate_layers_panel` now clears the body itself** before
+     inserting, so a second call replaces the rows instead of silently
+     stacking a second `Role::Tree` container beside the first with the
+     old, meaningless `WidgetId`s still live and hit-testable. Latent
+     (every caller already cleared first) but unguarded.
+  3. **A blank layer name no longer produces a blank accessible label.**
+     The `"Untitled Layer"` fallback covered only a *missing* name; a
+     layer named `""` reached a screen reader with a zero-length label
+     and one named `"     "` with five spaces. The fallback is now
+     applied to the *sanitized* result when it is empty or entirely
+     whitespace, which also catches a name that sanitizes away to
+     nothing.
+  4. **The `MAX_LAYER_TREE_DEPTH` / `MAX_TREE_DEPTH` exact fit is a
+     compiled assertion now**, not prose: `const _: () = assert!(
+     aurora_doc::MAX_LAYER_TREE_DEPTH == aurora_widgets::widgets::
+     MAX_TREE_DEPTH + 1)` in `layers_panel.rs`. Either constant moving
+     by one now fails the build instead of making a legal document
+     un-openable with `TreeTooDeep`. The maximum-depth case is also a
+     real test now (255 nested groups + a pixel layer, built through the
+     plain public API) — the old doc comment's claim that constructing
+     it would need `aurora-doc`'s `test-support` escape hatch was wrong.
+  5. **The tree container is no longer labelled "Layers"** — the panel
+     root already is, so a screen reader announced the name twice on
+     entry. Same fix `history_panel.rs` already had by relabelling the
+     body rather than nesting a second named container.
+  6. **Two overstated claims corrected in the module doc.** "No pixel
+     rendering" was false as of 0.77.0 for a *selected* row (selection
+     reaches the payload, so `paint_widget` really draws a highlight);
+     it now says what is actually still unpainted (thumbnail, visibility
+     checkbox, disclosure triangle, all text). And the `has_children:
+     !children.is_empty()` fix was overstated: mutation testing showed
+     hardcoding it to `false` survives the whole `aurora-ui` +
+     `aurora-app` suite, because `insert_tree_item` sets an ancestor's
+     `has_children`/`expanded` the moment a child arrives and this
+     module always populates children immediately. The expression stays
+     (it is the correct thing to declare, and a lazily-populated group
+     would need it) but the comment now says it changes no node this
+     code currently produces — only the opposite mutation is a real,
+     test-caught bug.
+  7. **One `Tab` stop per layer row is now disclosed at the call site**
+     and pinned by `tab_order_currently_stops_on_every_layer_row`.
+     `tree_view` already disclosed this as a crate-wide focus-model
+     question; 0.77.0 made it a live user-visible cost in the shipping
+     app (`Tab` through a 200-layer document is 200 stops before
+     Properties) without saying so. The redesign — one stop per tree
+     plus arrow keys — is still `tree_view`'s own open question.
+
+  Also: `aurora-app`'s `replace_document` test now counts *every*
+  descendant of the panel body rather than only the tree's direct
+  children (a nested leftover row would have escaped the narrower
+  count), and `tree_view`'s `a_description_survives_selection_
+  expansion_and_a_new_child_row` is renamed `..._collapsing_...`, which
+  is what its middle step actually does.
+
+  6 new tests, all in `aurora-ui` (79 there, was 73), 1,505 passing
+  across the workspace. Verified: `cargo fmt --all --check`, `python3
+  scripts/check_layering.py`, `python3 scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace`,
+  `cargo test --workspace --doc`, and `cargo doc --workspace --no-deps
+  --all-features` all clean.
 - [~] **Command palette, keyboard shortcuts** — first slice done
   2026-08-04. Two new generic mechanisms in `aurora-widgets`, following
   the same "abstract steps, not `winit` types — translating real
