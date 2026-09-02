@@ -4762,24 +4762,61 @@ fn perform_undo_redo(
         active_layer,
         canvas_size,
     );
-    // **The safety guard for the whole narrowed-invalidation scheme.**
-    // Read the composite grid's anchor immediately before the command
-    // and again immediately after. `run_command` reports what changed
-    // *inside* the document, in absolute document coordinates -- it has
-    // no way to know that the frame those coordinates get converted into
-    // `TileId`s through has itself moved. Undoing or redoing a Move is
-    // exactly that case: `LayerOp::SetBounds` on the active layer
-    // shifts `composite_reference_origin`, which re-points every cached
-    // `TileId` at a different document window at once. Narrowing there
-    // would recompute only the tiles the (correct, `old ∪ new`) rect
-    // touches and leave every other cached tile showing content
-    // composited under the old anchor -- comprehensively wrong, and
-    // invisible to any test that only compares the tiles the rect
-    // covers. `active_layer` itself cannot change across `run_command`
-    // (it is a `Copy` argument, not a `&mut`), so the layer's own
-    // `bounds` moving under it is the only way this fires -- which is
-    // precisely the Move case.
+    // **The two safety guards for the whole narrowed-invalidation
+    // scheme.** Both have the same shape -- read a document-wide fact
+    // immediately before the command and again immediately after, and
+    // force `Everything` if it moved -- because both describe something
+    // `run_command` structurally cannot report. It reports what changed
+    // *inside* the document, as absolute document coordinates; neither
+    // the frame those coordinates are converted into `TileId`s through
+    // nor the code path that composites them is expressible as a `Rect`
+    // at all.
+    //
+    // **Guard 1, the grid anchor.** `composite_reference_origin` is the
+    // frame every cached composite `TileId` is measured in. Undoing or
+    // redoing a Move shifts it: `LayerOp::SetBounds` on the active layer
+    // moves that layer's own `bounds.x`/`bounds.y`, which re-points
+    // *every* cached `TileId` at a different document window at once.
+    // Narrowing there would recompute only the tiles the (correct,
+    // `old ∪ new`) rect touches and leave every other cached tile
+    // showing content composited under the old anchor -- comprehensively
+    // wrong, and invisible to any test that only compares the tiles the
+    // rect covers.
+    //
+    // `active_layer` itself cannot change across `run_command` (it is a
+    // `Copy` argument, not a `&mut`), so the anchor can only move for
+    // two reasons, and the guard is correct for both because it
+    // *compares* the value rather than assuming which one happened: the
+    // active layer's own `bounds` moving under it (the Move case), and
+    // the undone/redone step removing the active layer outright, which
+    // collapses `composite_reference_origin` to its `(0, 0)` no-active-
+    // pixel-layer default.
+    //
+    // **Guard 2, the compositing path** (0.73.2).
+    // `document_qualifies_for_gpu_compositing` inspects every root-level
+    // layer's visibility, kind and blend mode to choose the GPU fast
+    // path or the CPU fallback **for the whole document**, and several
+    // undoable structural steps flip it: `SetBlendMode` on a root-level
+    // pixel layer across the `Normal` boundary, and `SetVisible`,
+    // `Reparent`, `RemoveById` or `Restore` of a root-level non-`Normal`
+    // layer. When it flips, every visible tile's compositing *path*
+    // changes while a per-layer `Rect` names only one layer's own
+    // region -- a quantity no `Rect` can express.
+    //
+    // **And the flip really does change pixels -- measured, not
+    // assumed.** It would be tempting to call this guard optional on the
+    // grounds that the two paths agree anyway; they do not.
+    // `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_
+    // opacity_document` runs one fixture through both paths on a real
+    // NVIDIA GeForce RTX 3090 and they differ by one `f16` ULP on three
+    // of four channels. The two older sibling tests that *do* show
+    // bit-identical output only ever use exact power-of-two binary
+    // fractions (1.0, 0.5, 0.25, 0.75), where no rounding latitude is in
+    // play at all -- so they never tested the question. Switching a
+    // document between the paths therefore dirties every visible tile
+    // for real, and this guard is load-bearing.
     let anchor_before = composite_reference_origin(layers, active_layer);
+    let gpu_path_before = document_qualifies_for_gpu_compositing(layers);
     let reported = run_command(
         workspace,
         focus,
@@ -4792,7 +4829,9 @@ fn perform_undo_redo(
         undo_order,
         command,
     );
-    let invalidation = if composite_reference_origin(layers, active_layer) == anchor_before {
+    let anchor_held = composite_reference_origin(layers, active_layer) == anchor_before;
+    let gpu_path_held = document_qualifies_for_gpu_compositing(layers) == gpu_path_before;
+    let invalidation = if anchor_held && gpu_path_held {
         reported
     } else {
         CompositeInvalidation::Everything
@@ -13771,6 +13810,117 @@ mod tests {
             invalidation,
             CompositeInvalidation::Everything,
             "redo has the same exposure as undo and must fall back the same way"
+        );
+    }
+
+    /// **The regression test for 0.73.2's compositing-path guard.**
+    ///
+    /// `document_qualifies_for_gpu_compositing` is a *document-wide*
+    /// predicate: it chooses the GPU fast path or the CPU fallback for
+    /// every visible tile at once. Undoing a `SetBlendMode` on a
+    /// root-level pixel layer across the `Normal` boundary flips it, so
+    /// the whole document's compositing path changes while the step's own
+    /// reported rect names one layer's region. This pins both halves:
+    /// that the flip is real, and that [`perform_undo_redo`] answers
+    /// [`CompositeInvalidation::Everything`].
+    ///
+    /// The two paths are **not** bit-identical on real hardware — see
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_
+    /// opacity_document` for the measured one-ULP divergence — so this
+    /// is a real staleness source, not a theoretical one.
+    ///
+    /// Two independent mechanisms force `Everything` here today: this
+    /// guard, and [`structural_invalidation`]'s own blanket fallback
+    /// (0.73.1). That is deliberate belt-and-braces, and the assertion
+    /// is on the observable outcome, so the test keeps its meaning if
+    /// either mechanism is later narrowed. The `assert_ne!` on the
+    /// predicate is what keeps it from passing vacuously.
+    #[test]
+    fn undoing_a_blend_mode_change_that_flips_the_compositing_path_invalidates_everything() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 256,
+        };
+
+        // Two root-level pixel layers, both `Normal`, so the document
+        // starts out GPU-tractable. The *active* one is left alone, so
+        // the anchor guard cannot be what fires.
+        let active = match history.add_pixel_layer(&mut layers, "active", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let other = match history.add_pixel_layer(&mut layers, "other", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "setup: two Normal-blend root pixel layers must qualify for the GPU path"
+        );
+
+        if let Err(err) =
+            history.set_blend_mode(&mut layers, other, aurora_doc::BlendMode::Multiply)
+        {
+            unreachable!("{err:?}");
+        }
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+        let before = document_qualifies_for_gpu_compositing(&layers);
+        assert!(
+            !before,
+            "setup: a root-level Multiply layer must route the whole document to the CPU path"
+        );
+
+        let invalidation = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            Some(active),
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(
+            layers.blend_mode(other),
+            Some(aurora_doc::BlendMode::Normal),
+            "setup: the undo must really revert the blend mode"
+        );
+        assert_ne!(
+            document_qualifies_for_gpu_compositing(&layers),
+            before,
+            "the whole document's compositing path really does flip across this one undo -- \
+             if it stopped doing so this test would be proving nothing"
+        );
+        assert_eq!(
+            composite_reference_origin(&layers, Some(active)),
+            (bounds.x, bounds.y),
+            "the anchor did not move, so the anchor guard is not what forces Everything here"
+        );
+        assert_eq!(
+            invalidation,
+            CompositeInvalidation::Everything,
+            "a step that changes every visible tile's compositing path must invalidate \
+             everything, not one layer's own region"
         );
     }
 
@@ -22993,6 +23143,145 @@ mod tests {
                 result,
                 (0.75, 0.0, 0.0, 0.75),
                 "{path} path: the premultiplied value both paths produced before 0.52.0"
+            );
+        }
+    }
+
+    /// **The measurement that makes `perform_undo_redo`'s
+    /// compositing-path guard load-bearing rather than optional**
+    /// (0.73.2). Read this before assuming the GPU and CPU composite
+    /// paths are interchangeable.
+    ///
+    /// Its two sibling tests above both prove GPU/CPU agreement on
+    /// values chosen to make agreement *easy*: every input and
+    /// intermediate (1.0, 0.5, 0.25, 0.75) is an exact power-of-two
+    /// binary fraction, so no rounding latitude is even in play. That is
+    /// the right choice for what those tests are for, and it means
+    /// neither of them probes whether the two paths agree at values a
+    /// real document would produce.
+    ///
+    /// This one does: three root-level `Normal`-blend pixel layers at
+    /// opacities 0.3, 0.7 and 0.35, filled with colours (0.1, 0.37,
+    /// 0.82) and friends that are *not* exactly representable in binary
+    /// at any precision, so the `f16` storage round trip, the `f32`
+    /// fold, and the straight-alpha division all carry real rounding.
+    ///
+    /// # Measured: they do not agree bit-for-bit
+    ///
+    /// On a real NVIDIA `GeForce` RTX 3090 (Vulkan, `DiscreteGpu`,
+    /// 2026-09-02) this fixture composites to
+    ///
+    /// ```text
+    /// GPU: (0.34179688, 0.50146484, 0.31762695, 0.62011720)
+    /// CPU: (0.34155273, 0.50097656, 0.31762695, 0.62060547)
+    /// ```
+    ///
+    /// — differing on three of four channels by exactly one `f16` ULP at
+    /// that magnitude (2^-11, ≈4.88e-4). Vulkan permits an `f32`
+    /// multiply-add about 2.5 ULP of latitude and the two paths fold in
+    /// different orders and precisions, so this is expected behaviour,
+    /// not a defect in either path. It is asserted as a **tolerance**
+    /// for that reason, and the tolerance is deliberately tight (2 `f16`
+    /// ULP) so a real divergence still fails.
+    ///
+    /// The consequence is the point: **switching a document between the
+    /// two paths changes pixels.** So an undoable step that flips
+    /// `document_qualifies_for_gpu_compositing` really does dirty every
+    /// visible tile, a fact no per-layer `Rect` can express — which is
+    /// why `perform_undo_redo` forces `CompositeInvalidation::Everything`
+    /// on such a flip instead of narrowing. The earlier reading, that a
+    /// flip was harmless because the paths happened to agree, is
+    /// contradicted by the numbers above.
+    ///
+    /// No hand-computed expected value here: the two sibling tests
+    /// already pin absolute correctness against arithmetic worked out by
+    /// hand, and this one exists for the *differential* question.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_opacity_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        for (name, opacity, rgba) in [
+            ("bottom", 0.3_f32, [0.1_f32, 0.37, 0.82, 0.9]),
+            ("middle", 0.7, [0.63, 0.11, 0.29, 0.44]),
+            ("top", 0.35, [0.21, 0.94, 0.06, 0.71]),
+        ] {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(&mut store, surface, tile_id, rgba);
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "three Normal-blend, non-grouped pixel layers must qualify for the GPU path -- \
+             otherwise this test would compare the CPU path against itself"
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut gpu_cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cpu_cache,
+            None,
+            None,
+        );
+        let cpu_result = read_first_texel(&mut store, composite_surface_id(), tile_id);
+
+        assert_ne!(
+            gpu_result,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: the fixture must really composite to something"
+        );
+        // Two `f16` ULP at this magnitude. Tight enough that a real
+        // divergence (a wrong blend, a wrong layer order, a premultiply
+        // that never got undone) still fails, loose enough to accept the
+        // one-ULP rounding difference measured on real hardware -- see
+        // this test's own doc comment for the numbers.
+        let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the GPU and CPU paths diverged by more than {tolerance} \
+                 at arbitrary opacities ({gpu} vs {cpu}) -- that is a real finding to report, \
+                 not a reason to loosen this assertion. Full texels: {gpu_result:?} vs \
+                 {cpu_result:?}"
             );
         }
     }
