@@ -2878,6 +2878,94 @@ enum UndoDirection {
     Redo,
 }
 
+/// What a **structural** (`aurora_doc::History`) undo/redo invalidates in
+/// the composite cache: [`CompositeInvalidation::Everything`], always,
+/// whatever rect `History::undo`/`redo` reported.
+///
+/// `dirtied` is taken and dropped on purpose, so the discard is a named,
+/// documented decision at both call sites rather than an omission
+/// somebody has to notice.
+///
+/// # Why the reported rect cannot be narrowed on (0.73.1)
+///
+/// 0.73.0 shipped this arm as `Regions(vec![rect])`, resting on the
+/// claim that every rect `aurora_doc::History::apply` returns is a
+/// superset of that step's true visual effect. For the pixel path that
+/// claim holds; for the structural path **it does not**, and the
+/// difference is not a rounding detail.
+///
+/// Every `Set*`/`Reparent`/mask arm of `apply` derives its rect from
+/// `layer_dirty_rect`, which returns the layer's own **declared**
+/// `aurora_doc::LayerKind::Pixel::bounds`. Nothing in this workspace
+/// makes `bounds` an authoritative extent of that layer's real content:
+///
+/// - `aurora_doc::LayerKind::Pixel`'s own doc comment says the content is
+///   "positioned at `bounds`" — a position, not a clip — and
+///   `aurora_doc::LayerLock`'s names `bounds` outright as having the
+///   "data now, enforcement once a concrete consumer exists" shape.
+/// - The paint path never clips to it. [`layer_local_point`] is a bare
+///   subtraction with no clamp, [`App::paint_dab`]/[`App::erase_dab`]
+///   pass no extent to `aurora_brush::stamp_dab`/`erase_dab`, and those
+///   clip only at surface-local `(0, 0)` (where `aurora_tile::TileId`'s
+///   unsigned fields run out), never at `bounds.width`/`bounds.height`.
+/// - [`pan_bounds`]' far edge is the active layer's origin plus the
+///   *document* ceiling, explicitly "not the layer's own width/height"
+///   — so a user can pan well past a layer's declared extent and paint
+///   there, with no path refusing it.
+/// - The composite reads that content straight back: [`resolve_tile`]'s
+///   same-origin fast path calls `store.get(surface, tile_id)` and its
+///   other branch calls [`read_layer_window`], and neither intersects
+///   anything against `bounds`' extent.
+///
+/// So out-of-`bounds` painted content is real, is composited, and is
+/// *outside* the rect a structural step reports. Narrowing on that rect
+/// leaves the composite tiles covering that content marked current with
+/// pre-operation pixels — and [`CompositeCache`] never re-checks a tile
+/// once it is current, so nothing later repairs it for the rest of the
+/// session.
+///
+/// `SetBounds` is not an exception. Its `old ∪ new` is a union of two
+/// *declared* rects, so it misses out-of-bounds content at both the old
+/// and the new position in exactly the same way. (Undoing a Move of the
+/// *active* layer is separately forced to `Everything` by
+/// [`perform_undo_redo`]'s anchor guard, but a Move of any other layer
+/// is not.)
+///
+/// # What this does not give up
+///
+/// The overwhelmingly common undo — reverting a brush stroke — is a
+/// *pixel* step, and keeps its narrowing. [`stroke_invalidation`] builds
+/// its rects from the tiles the stroke actually captured plus the
+/// layer's origin, and never reads `bounds.width`/`bounds.height` at
+/// all, so it is a genuine superset however far outside its declared
+/// bounds a layer has been painted.
+///
+/// # The follow-on work, named rather than assumed
+///
+/// Two real options, neither a bug fix:
+///
+/// 1. **Make `bounds` authoritative** — clip both the paint path and the
+///    composite read path to it. That is a design decision, not a
+///    correction: it changes what a user who already painted outside a
+///    layer's declared bounds sees (their pixels stop being composited),
+///    and it has to land in the paint path and the read path together or
+///    the two disagree.
+/// 2. **Widen the reported rect to the layer's real stored extent.**
+///    Cheap in principle — one pass over a surface's stored tile ids —
+///    but it needs two things that do not exist today:
+///    `aurora_doc::History::undo`/`redo` reporting *which* layer(s) a
+///    step touched rather than only a rect, and an
+///    `aurora_tile::TileStore` accessor for a surface's stored tile
+///    extent (`contains_tile` answers only about one id at a time).
+///
+/// Until one of those lands, a full recomposite per structural undo is
+/// the honest answer: wasteful, never wrong.
+#[must_use]
+fn structural_invalidation(dirtied: Option<aurora_core::Rect>) -> CompositeInvalidation {
+    let _ = dirtied;
+    CompositeInvalidation::Everything
+}
+
 /// Runs a global shortcut's own command — [`handle_key`]'s dispatch
 /// target once a [`KeyChord`] resolves via [`ShortcutRegistry::resolve`].
 ///
@@ -2939,23 +3027,15 @@ fn run_command(
             CompositeInvalidation::None
         }
         AppCommand::Undo => match undo_order.undo.last().copied() {
-            // The `Rect` `History::undo` returns is the region the
-            // reverted step dirtied, and `aurora-doc`'s own `apply`
-            // guarantees it is a superset of what that step really
-            // changed (a reverted `SetBounds` reports `old ∪ new`, so
-            // the vacated territory is repainted too). `None` conflates
-            // "nothing to undo" with "a group-level change whose extent
-            // isn't knowable" -- both are safe to treat as `Everything`,
-            // the first being a full recomposite of a document nothing
-            // changed in, which is wasteful but never wrong.
+            // The rect `History::undo` reports is deliberately thrown
+            // away here -- see [`structural_invalidation`] for the whole
+            // reason, which is not a small one.
             Some(UndoKind::Structural) => match history.undo(layers) {
                 Ok(dirty) => {
                     undo_order.undo.pop();
                     undo_order.redo.push(UndoKind::Structural);
                     refresh_history_panel(workspace, history);
-                    dirty.map_or(CompositeInvalidation::Everything, |rect| {
-                        CompositeInvalidation::Regions(vec![rect])
-                    })
+                    structural_invalidation(dirty)
                 }
                 Err(err) => {
                     tracing::warn!(?err, "undo failed");
@@ -2980,14 +3060,13 @@ fn run_command(
             None => CompositeInvalidation::None,
         },
         AppCommand::Redo => match undo_order.redo.last().copied() {
+            // Same deliberate discard as the `Undo` arm above.
             Some(UndoKind::Structural) => match history.redo(layers) {
                 Ok(dirty) => {
                     undo_order.redo.pop();
                     undo_order.undo.push(UndoKind::Structural);
                     refresh_history_panel(workspace, history);
-                    dirty.map_or(CompositeInvalidation::Everything, |rect| {
-                        CompositeInvalidation::Regions(vec![rect])
-                    })
+                    structural_invalidation(dirty)
                 }
                 Err(err) => {
                     tracing::warn!(?err, "redo failed");
@@ -4571,17 +4650,26 @@ fn clamp_pan_to_active_layer(
 /// nothing moved (a pan already within its bound is left untouched), and
 /// it is unrelated to what the command changed *inside* the document.
 ///
-/// **The cache half is no longer unconditional, and one thing is what
-/// makes that safe** (0.73.0): [`perform_undo_redo`] re-reads
-/// [`composite_reference_origin`] after `run_command` and forces
-/// [`CompositeInvalidation::Everything`] if it moved. Without that, an
-/// undone Move would arrive here as a narrow `Regions` — and a Move
-/// shifts the grid anchor itself, so *every* cached `TileId` would then
-/// name a different document window, with only the handful of tiles the
-/// narrow rect happened to touch getting recomputed and the rest left
-/// showing content from the old anchor. That is why `Regions` may be
-/// resolved against the post-command anchor here: on that branch the
-/// caller has already established that before == after.
+/// **The cache half is no longer unconditional** (0.73.0), and since
+/// 0.73.1 exactly one kind of step reaches here narrowed: a *pixel*
+/// undo/redo, whose rects [`stroke_invalidation`] builds from the tiles
+/// the stroke really captured. A *structural* one is always
+/// [`CompositeInvalidation::Everything`] — see
+/// [`structural_invalidation`] for why the rect `aurora_doc::History`
+/// reports cannot be narrowed on.
+///
+/// **What makes resolving `Regions` against the post-command anchor
+/// safe**: [`perform_undo_redo`] re-reads [`composite_reference_origin`]
+/// after `run_command` and forces `Everything` if it moved. A `TileId`
+/// means nothing without the anchor it was composited under, so a step
+/// that shifts the anchor re-points *every* cached tile at a different
+/// document window at once — recomputing only the tiles a narrow rect
+/// touches would leave the rest showing content from the old anchor. On
+/// the `Regions` branch the caller has already established before ==
+/// after. Since 0.73.1 no *structural* step can reach that branch at
+/// all, so the guard is defence in depth rather than the only thing
+/// standing between an undone Move and a wrong composite; it is kept
+/// (and tested) precisely so a future narrowing cannot reopen the hole.
 ///
 /// Kept a free function so the pairing is testable with no `App` — and
 /// therefore no GPU adapter — to build.
@@ -6889,9 +6977,11 @@ impl CompositeCache {
     /// overlaps, against a grid anchored at `reference_origin`. The
     /// region-shaped counterpart to [`Self::invalidate`], for a caller
     /// that knows what changed as a rectangle rather than as a tile list
-    /// (an undo/redo: `aurora_doc::History::undo` returns the rect it
-    /// dirtied, and `aurora_brush::PixelHistory::peek_undo` names the
-    /// tiles the next undo will rewrite).
+    /// (a *pixel* undo/redo: `aurora_brush::PixelHistory::peek_undo`
+    /// names the tiles the next undo will rewrite, and
+    /// [`stroke_invalidation`] places them in document space). A
+    /// *structural* undo/redo deliberately does not reach here at all —
+    /// see [`structural_invalidation`].
     ///
     /// **`reference_origin` must be the anchor the cached tiles were
     /// composited under** — [`composite_reference_origin`] for the
@@ -6988,6 +7078,13 @@ enum CompositeInvalidation {
     /// frame `aurora_doc::LayerKind::Pixel`'s own `bounds` use. Every
     /// composite tile overlapping any of them needs recomputing; every
     /// other cached tile is still valid.
+    ///
+    /// **Only [`stroke_invalidation`] produces this** (0.73.1). Its
+    /// rects come from the tiles a stroke actually captured plus the
+    /// layer's origin, which is a genuine superset of that step's visual
+    /// effect. A *structural* step's rect is not — see
+    /// [`structural_invalidation`] — so that path reports
+    /// [`Self::Everything`] instead.
     Regions(Vec<aurora_core::Rect>),
     /// The changed region isn't knowable (a group-level change, whose
     /// on-canvas extent needs subtree-bounds aggregation `aurora-doc`
@@ -11357,9 +11454,10 @@ mod tests {
         previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
         replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
         run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds, splitmix64,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        tile_overlaps_doc_rect, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -13518,6 +13616,162 @@ mod tests {
             AppCommand::Redo,
         );
         assert_eq!(layers.bounds(id), Some(moved), "redo must reapply the move");
+    }
+
+    /// **The regression test for 0.73.1.** A pixel layer's declared
+    /// `bounds` is not an enforced extent of its real content anywhere
+    /// in this workspace, so a structural undo must not narrow on the
+    /// rect derived from it — see [`structural_invalidation`] for the
+    /// whole argument. This proves the three links of that argument on
+    /// real data rather than by reading:
+    ///
+    /// 1. A document point far outside the layer's declared 64x64 extent
+    ///    maps, unclamped, to a positive layer-local point
+    ///    ([`layer_local_point`]) — and [`pan_bounds`] really does let
+    ///    the view reach it, since its far edge is the document ceiling
+    ///    and not the layer's own width/height.
+    /// 2. Painting there writes a real tile
+    ///    (`aurora_brush::stamp_dab` clips only at local `(0, 0)`), and
+    ///    that tile lies **outside** the rect
+    ///    `aurora_doc::History` reports for a structural step on this
+    ///    layer — checked with [`tile_overlaps_doc_rect`], the very
+    ///    predicate [`CompositeCache::invalidate_doc_rect`] narrows by.
+    ///    So a narrowed invalidation would have left that tile stale.
+    /// 3. The structural undo therefore reports
+    ///    [`CompositeInvalidation::Everything`], not `Regions`.
+    ///
+    /// Headless on purpose: none of this needs a GPU adapter, so it runs
+    /// in CI rather than self-skipping the way the differential test
+    /// does.
+    // Three numbered steps of one argument, each meaningless without
+    // the others: splitting them into separate tests would duplicate the
+    // whole fixture three times and let a later edit break the chain
+    // without any single test failing.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn structural_undo_falls_back_to_everything_because_paint_escapes_declared_bounds() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let (_dir, mut store) = real_tile_store();
+
+        // Deliberately smaller than one tile, so "outside the declared
+        // bounds" and "outside the tile the declared bounds covers" are
+        // the same thing and the check below cannot pass by accident.
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        let id = match history.add_pixel_layer(&mut layers, "a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+
+        // (1) Reachability: nothing clamps the document -> layer-local
+        // conversion, and the pan bound extends to the document ceiling.
+        let far_doc = (800.0_f32, 800.0_f32);
+        assert_eq!(
+            layer_local_point(bounds, far_doc),
+            far_doc,
+            "layer_local_point is a bare subtraction -- a point 800 px into a 64 px layer is \
+             not clamped back onto it"
+        );
+        let reachable = pan_bounds(&layers, Some(id), Some((256.0, 256.0)));
+        assert!(
+            reachable.max_doc.0 > far_doc.0 && reachable.max_doc.1 > far_doc.1,
+            "the pan bound's far edge is the document ceiling, not the layer's own extent, so \
+             the user can pan out to {far_doc:?} and paint there: {reachable:?}"
+        );
+
+        // (2) Painting there writes a real tile the declared-bounds rect
+        // does not cover.
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            far_doc,
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert!(
+            !outcome.painted().is_empty(),
+            "the dab must really paint outside the declared bounds: {outcome:?}"
+        );
+        for &tile in outcome.painted() {
+            assert!(
+                store.contains_tile(surface, tile),
+                "{tile:?} must really exist on the layer's surface"
+            );
+            assert!(
+                !tile_overlaps_doc_rect(tile, bounds, (bounds.x, bounds.y)),
+                "{tile:?} holds real, composited content that the declared-bounds rect \
+                 {bounds:?} does not cover -- narrowing on that rect would leave it stale"
+            );
+        }
+
+        // (3) A structural step on that layer, undone, must report
+        // `Everything`.
+        match history.set_visible(&mut layers, id, false) {
+            Ok(Some(reported)) => assert_eq!(
+                reported, bounds,
+                "History still reports the declared bounds -- which is exactly why this arm \
+                 cannot narrow on it"
+            ),
+            other => unreachable!("a pixel layer has a knowable rect, got {other:?}"),
+        }
+        let mut undo_order = UndoOrder::default();
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+
+        let invalidation = run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            AppCommand::Undo,
+        );
+        assert_eq!(layers.visible(id), Some(true), "setup: the undo must apply");
+        assert_eq!(
+            invalidation,
+            CompositeInvalidation::Everything,
+            "a structural undo must not narrow on a rect that misses real painted content"
+        );
+
+        let invalidation = run_command(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            AppCommand::Redo,
+        );
+        assert_eq!(
+            layers.visible(id),
+            Some(false),
+            "setup: the redo must apply"
+        );
+        assert_eq!(
+            invalidation,
+            CompositeInvalidation::Everything,
+            "redo has the same exposure as undo and must fall back the same way"
+        );
     }
 
     #[test]
