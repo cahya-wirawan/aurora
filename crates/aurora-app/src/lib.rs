@@ -4938,10 +4938,12 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
 /// # Deliberately still open
 ///
 /// Coverage can be *written* ([`aurora_doc::write_mask_coverage`]) and
-/// is composited here, but three follow-ons are named, not built: a
+/// is composited here, but four follow-ons are named, not built: a
 /// brush/tool UI for painting a mask, `.aur` persistence of mask
-/// pixels, and mask-pixel undo/history. See the `aurora_doc::mask`
-/// module's own doc comment.
+/// pixels, mask-pixel undo/history, and mask-surface lifecycle
+/// (nothing clears a mask's tiles when the mask or its layer is
+/// removed, so a re-added mask inherits the old one's coverage). See
+/// the `aurora_doc::mask` module's own doc comment for all four.
 fn apply_mask(
     texels: &[half::f16],
     mask: &aurora_doc::LayerMask,
@@ -19212,8 +19214,12 @@ mod tests {
     // full coverage, no mask. Expected: left half shows `top`'s own
     // blue (inside the mask), right half shows `bottom`'s red through
     // (outside the mask, `top` contributes nothing there) -- a hard
-    // edge at x = 5, not a blend, since this is a rectangular clip, not
-    // real grayscale masking.
+    // edge at x = 5, not a blend -- not because masks are rectangular
+    // (since 0.70.0 they are not: `apply_mask` reads real per-pixel
+    // grayscale coverage) but because *this fixture's* mask surface is
+    // never painted, so `mask.bounds` is the only thing deciding
+    // anything. `composite_document_shows_and_hides_a_pixel_layer_by_real_mask_coverage`
+    // is the counterpart that paints one.
     fn composite_document_clips_a_masked_pixel_layer_to_its_mask_bounds() {
         let (_dir, mut store) = real_tile_store();
         let mut layers = aurora_doc::LayerTree::new();

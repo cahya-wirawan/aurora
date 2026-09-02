@@ -37,7 +37,7 @@
 //!
 //! # Deliberately not built this round
 //!
-//! Three follow-ons are named rather than silently dropped, because
+//! Four follow-ons are named rather than silently dropped, because
 //! each is a task-sized piece of work in a different part of the stack:
 //!
 //! 1. **A brush/tool UI for painting a mask.** Nothing in the app
@@ -53,6 +53,28 @@
 //!    reversible operations plus dirtied tiles (§7.3.3); mask writes go
 //!    through no history operation at all yet, so painting a mask would
 //!    not be undoable.
+//! 4. **Mask-surface lifecycle: nothing clears mask tiles.** A mask
+//!    surface id is *derived* from its layer's id, not allocated, and
+//!    that has a consequence nothing currently handles. Two shapes,
+//!    both harmless today (no mask coverage is ever painted yet) and
+//!    both real the moment item 1 lands:
+//!
+//!    - **Remove a mask, add a new one to the same layer, and the old
+//!      one's painted coverage comes back.** The new mask resolves to
+//!      the same [`crate::LayerTree::mask_surface_id`], and
+//!      [`crate::LayerTree::remove_mask`] drops only the `LayerMask`
+//!      struct — the tiles under that surface are untouched. A fresh
+//!      mask would therefore start out wearing the deleted mask's
+//!      pixels. Fixing this means clearing (or otherwise invalidating)
+//!      that surface's tiles on `remove_mask`, which is a store
+//!      operation `aurora-doc` does not have a handle to at that call
+//!      site.
+//!    - **Deleting a layer leaves its mask tiles in the store.** This
+//!      is not new and not specific to masks — a deleted layer's *own*
+//!      pixel tiles leak exactly the same way today, because nothing
+//!      reclaims a surface — but masks double the number of surfaces
+//!      that can be orphaned, so it is worth naming here rather than
+//!      leaving it to be rediscovered.
 
 /// The bit that separates mask surfaces from layer-pixel surfaces in
 /// the shared `aurora_tile::TileStore`'s single `SurfaceId` space.

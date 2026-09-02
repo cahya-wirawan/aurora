@@ -117,8 +117,11 @@ pub(crate) struct RemovedSubtree {
 /// visibility, and locking (see [`Self::set_opacity`] and neighbours) —
 /// stored state only, since nothing yet composites or paints to actually
 /// interpret them. Any layer, pixel or group, may also carry one
-/// [`LayerMask`] (see [`Self::add_mask`] and neighbours) — likewise
-/// stored state only, no real mask pixels yet.
+/// [`LayerMask`] (see [`Self::add_mask`] and neighbours). The mask's
+/// own grayscale *pixels* do not live in the tree either: they live in
+/// the document's shared `aurora_tile::TileStore`, under
+/// [`Self::mask_surface_id`] — see [`crate::mask`] for the storage
+/// convention and for what is deliberately still missing around it.
 ///
 /// `Serialize`/`Deserialize`: a `.aur` file's own manifest entry (ADR
 /// 0009) is the whole tree, `postcard`-encoded — every field here
@@ -2022,12 +2025,14 @@ impl LayerTree {
     /// level up — the only semantic `aurora_doc::BlendMode` can express,
     /// since it has no "Pass Through" variant to model Photoshop's own
     /// isolated-vs-pass-through distinction with — and, on both a plain
-    /// layer and a group's own isolated composite alike, clipping to the
-    /// layer's own [`LayerMask::bounds`] when it has one and
-    /// [`LayerMask::enabled`] is true; that clip is a hard rectangular
-    /// inside/outside test only — `LayerMask` still carries no per-pixel
-    /// mask data, so there is no feathering or soft edge, real grayscale
-    /// masking either), not a feature of this method. Callers that need
+    /// layer and a group's own isolated composite alike, masking by the
+    /// layer's own [`LayerMask`] when it has one and
+    /// [`LayerMask::enabled`] is true — real per-pixel grayscale
+    /// coverage since 0.70.0, read from the mask's own surface
+    /// ([`Self::mask_surface_id`], [`crate::mask`]) and multiplied with
+    /// the [`LayerMask::bounds`] rectangle, so feathering and soft
+    /// edges are expressible; it was a hard rectangular inside/outside
+    /// test only before that), not a feature of this method. Callers that need
     /// real per-group compositing should walk the tree shape directly
     /// rather than call `paint_order`, which remains what it always was:
     /// a flat, group-blind paint list for callers (a Layers-panel row

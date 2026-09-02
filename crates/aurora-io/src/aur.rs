@@ -790,20 +790,25 @@ fn layer_ids(layers: &LayerTree) -> Vec<LayerId> {
 /// in the first place. Until 0.57.13 a crafted manifest could therefore
 /// declare a mask at `i64::MIN` and be read back as `Ok`; it then
 /// survived a write-then-read round trip unchanged and reached
-/// `apply_mask_clip` -> `aurora_core::Rect::contains_point` in
-/// `aurora-app`, which saturates rather than panicking and so renders
-/// the *wrong picture* (the masked layer fully hidden, or fully shown
-/// when `inverted`) rather than failing loudly.
+/// `apply_mask` -> `aurora_core::Rect::contains_point` in `aurora-app`
+/// (named `apply_mask_clip` at the time), which saturates rather than
+/// panicking and so renders the *wrong picture* (the masked layer
+/// fully hidden, or fully shown when `inverted`) rather than failing
+/// loudly.
 ///
 /// Called from [`read`] and from `write_with_policy` — the shared body
 /// behind [`write()`] and [`write_best_effort`] — so one call site each
 /// covers every path in and out of the format, the same property
 /// `tile_grid` gives the bounds check.
 ///
-/// A mask's *extent* is deliberately not checked here. Unlike a layer's
-/// own bounds it drives no loop in this module (no mask pixels are
-/// stored yet — see `aurora_doc::LayerMask`), so there is nothing for
-/// an oversized one to make unfinishable.
+/// A mask's *extent* is deliberately not checked here. Real mask
+/// coverage pixels do exist as of 0.70.0 (see `aurora_doc::mask` for
+/// the storage convention), but this module does not yet enumerate
+/// mask surfaces — that is one of the named follow-ons in
+/// `aurora_doc::mask`'s own doc comment — so a mask's extent still
+/// drives no loop here, and there is nothing for an oversized one to
+/// make unfinishable. Revisit this the moment mask surfaces are
+/// written into the archive.
 fn validate_mask_origins(layers: &LayerTree) -> Result<(), IoError> {
     for id in layer_ids(layers) {
         let Some(mask) = layers.mask(id) else {
@@ -1499,8 +1504,9 @@ mod tests {
         // own `bounds`, and `tile_grid` never sees it. Measured against
         // the 0.57.12 tree before this fix: this manifest read back as
         // `Ok`, and the origin survived a write-then-read round trip
-        // unchanged, on its way to `apply_mask_clip` ->
-        // `Rect::contains_point` in `aurora-app` -- which saturates
+        // unchanged, on its way to `apply_mask` (then named
+        // `apply_mask_clip`) -> `Rect::contains_point` in `aurora-app`
+        // -- which saturates
         // rather than panicking now, and so renders the wrong picture
         // (the masked layer fully hidden, or fully shown when
         // `inverted`) instead of failing loudly.

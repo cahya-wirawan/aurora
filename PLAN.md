@@ -72,7 +72,9 @@ paragraph is a pointer, not a substitute for them.
 This session specifically (six landed rounds, 0.37.0–0.40.1) grew
 M1.9's own compositing engine substantially: all 27
 `aurora_doc::BlendMode` variants real on flat layers and groups, real
-mask aggregation (rectangular clip), GPU-accelerated compositing with
+mask aggregation (a rectangular clip at the time — superseded by
+0.70.0, which gave layer masks real per-pixel grayscale coverage),
+GPU-accelerated compositing with
 its readback batched to one synchronization point per frame, a real
 data-integrity race in `aurora-tile` found and fixed, and the
 project's first real, live-app-level end-to-end frame-timing
@@ -14122,11 +14124,39 @@ Backward compatibility is automatic at texel granularity: alpha is the
 visible and reproduces the old clip byte-for-byte (asserted by
 `apply_mask_with_an_unpainted_mask_surface_matches_the_bounds_only_clip`).
 `aurora-render` and `composite.wgsl` needed and got zero changes.
-**Three follow-ons are deliberately not done and are named in four doc
+**Four follow-ons are deliberately not done and are named in doc
 comments plus the commit message rather than dropped**: a brush/tool UI
-for painting a mask, `.aur` persistence of mask pixels, and mask-pixel
-undo/history. See M1.9's own "Real per-pixel grayscale mask coverage"
-bullet for the full record.
+for painting a mask, `.aur` persistence of mask pixels, mask-pixel
+undo/history, and mask-surface lifecycle — nothing clears a mask's
+tiles when the mask or its layer is removed, so a mask removed and
+re-added to the same layer would inherit the old one's painted
+coverage (the surface id is derived from the layer id, not allocated
+fresh), and a deleted layer's mask tiles stay in the store the same way
+its own pixel tiles already do. The fourth was added in 0.70.4 after
+review; the first three were named in 0.70.0 itself. See M1.9's own
+"Real per-pixel grayscale mask coverage" bullet for the full record.
+
+**Addendum 2026-09-02 (0.70.1–0.70.4) — four fixes on top of 0.70.0,
+from an independent review of it.** In order: (`0.70.1`) a crafted
+`.aur` manifest could carry a `LayerId` with bit 63 set, whose *pixel*
+surface then aliased another layer's *mask* surface — one tile-store
+slot with two owners, no error anywhere — because nothing validated
+that ids stay in the bottom half of the id space; both whole-tree gates
+now refuse such an id and such an id counter, and `surface_id` carries
+the guard itself. (`0.70.2`) `apply_mask`'s promised fail-open on an
+unreadable mask tile was fail-*closed* whenever `mask.inverted` was
+set, because the substituted `1.0` went through the inversion like a
+real value; the "could not be read" signal now survives past inversion.
+Same commit: an `f16` alpha underflow could emit the `(r, g, b, 0)`
+texel the output convention forbids, and a mask read's warning was
+attributed to a layer's own pixels. (`0.70.3`) every enabled mask read
+its coverage window unconditionally, materializing never-painted tiles
+— measured at 2.9× the per-tile cost of not reading at all (453.5 →
+1312.6 µs/tile), now 1.01× (364.6 → 369.3 µs/tile) via a new
+`TileStore::contains_tile`. Dev-box CPU numbers; per this file's own
+standard they say nothing about real GPU frame timing, and the 60 FPS
+gap above is unchanged. (`0.70.4`) doc-comment corrections left stale
+by 0.70.0, plus the fourth follow-on above.
 
 **Addendum 2026-09-02 (0.69.1) — the `Ctrl+Z`/`Ctrl+Shift+Z` routing gap
 0.57.7/0.57.8 disclosed and deliberately left open is closed.** Both
