@@ -732,6 +732,18 @@ fn paint_list_row(
 /// overhangs by 8 px, exactly as an unclamped `ListRow` would; that
 /// class of overflow belongs to [`clip_to_clipping_ancestors`], which
 /// runs before this function and hands it already-clipped `bounds`.
+///
+/// **A latent interaction, not yet reachable**: `clip_to_clipping_ancestors`
+/// can move `bounds.y` down when a row is clipped at its *top* (a
+/// scrolled-past-the-start row, once a scrolling container exists — see
+/// `history_panel.rs`'s own disclosed damage-rect gap for the sibling case
+/// clipping already guards). This function always paints `row_height`
+/// starting from whatever `bounds.y` it receives, so a group row clipped
+/// at the top would have its one-row highlight anchored over its first
+/// visible *descendants* rather than its own (now-scrolled-off) row. No
+/// caller can produce a top-clipped row today — nothing in this crate
+/// scrolls, and every panel body only ever clips at the *bottom* — so this
+/// is recorded rather than fixed.
 fn paint_tree_item(
     state: &TreeItemState,
     bounds: Rect,
