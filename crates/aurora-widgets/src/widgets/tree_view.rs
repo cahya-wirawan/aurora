@@ -57,8 +57,9 @@
 //! be converted to explicit stacks together. What this module does
 //! instead is refuse to *build* a tree deep enough to reach it:
 //! [`insert_tree_item`] returns [`WidgetError::TreeTooDeep`] beyond
-//! [`MAX_TREE_DEPTH`], an order of magnitude below the measured abort
-//! and two orders above any real document's group nesting.
+//! [`MAX_TREE_DEPTH`] — a margin of about 4× below the shallowest
+//! measured abort (debug), an order of magnitude below the release
+//! figure, and two orders above any real document's group nesting.
 //!
 //! # The accessibility vocabulary, and which platforms actually read it
 //!
@@ -169,11 +170,16 @@ use crate::tree::{WidgetId, WidgetTree};
 /// measured thresholds (1100–1200 debug, 3000–4000 release) and for why
 /// the underlying recursion is not what this cap fixes.
 ///
-/// `255` is chosen to be uninteresting from both directions: an order of
-/// magnitude below the shallowest measured abort, and two orders above
-/// any real document's group nesting (Photoshop's own PSD group nesting
-/// does not approach it, and a human cannot navigate 255 levels of
-/// indent in a panel anyway).
+/// `255` is chosen to be uninteresting from both directions: about 4×
+/// below the shallowest measured abort (debug; an order of magnitude
+/// below the release figure), and two orders above any real document's
+/// group nesting (Photoshop's own PSD group nesting does not approach
+/// it, and a human cannot navigate 255 levels of indent in a panel
+/// anyway). That margin is a checked fact, not just a remembered
+/// measurement: `a_tree_at_the_maximum_depth_survives_every_traversal`
+/// builds a real chain at exactly this depth and drives every traversal
+/// this module's doc comment names — `compute_layout`, `paint_order`,
+/// `hit_test`, `accessibility_update` — over it.
 pub const MAX_TREE_DEPTH: usize = 255;
 
 /// One row of a tree. `Eq`, unlike most state types here — every field
@@ -1825,7 +1831,8 @@ mod tests {
     /// aborts the process during layout (measured: between depth 1100
     /// and 1200 in a debug build). `MAX_TREE_DEPTH` is what keeps a
     /// caller from building one through this module's own public API —
-    /// a real error, an order of magnitude short of the abort.
+    /// a real error, about 4x short of the debug abort (an order of
+    /// magnitude short of the release one).
     #[test]
     fn insert_tree_item_refuses_to_nest_past_the_maximum_depth() {
         let (mut tree, root) = new_tree(Style::default());
@@ -1857,5 +1864,74 @@ mod tests {
             !state_of(&tree, parent).has_children,
             "and must not mark its would-be parent as a group either"
         );
+    }
+
+    /// `MAX_TREE_DEPTH`'s whole justification is a *measured* margin
+    /// below a real abort, not merely an assumption that the cap is
+    /// small enough to be safe. This drives every traversal the module
+    /// doc names (`compute_layout`, `paint_order`, `hit_test`,
+    /// `accessibility_update`) over a tree at exactly that depth, so the
+    /// margin is a checked fact rather than a remembered number.
+    #[test]
+    fn a_tree_at_the_maximum_depth_survives_every_traversal() {
+        let (mut tree, root) = new_tree(Style {
+            size: Size {
+                width: percent(1.0_f32),
+                height: percent(1.0_f32),
+            },
+            ..Default::default()
+        });
+        let scales = test_scales();
+        let mut parent = root;
+        for depth in 0..=MAX_TREE_DEPTH {
+            parent = match insert_tree_item(&mut tree, parent, &scales, "Row", false) {
+                Ok(id) => id,
+                Err(err) => unreachable!("depth {depth} must still be legal: {err:?}"),
+            };
+        }
+        let deepest = parent;
+
+        // A generous height: MAX_TREE_DEPTH + 1 rows, each one
+        // `tree_row_height` tall, is what a real layout of this chain
+        // needs — this is the traversal `compute_layout` itself walks
+        // recursively (`build_taffy_node`/`apply_taffy_layout`).
+        let height = tree_row_height(&scales) * (MAX_TREE_DEPTH as f32 + 1.0);
+        tree.compute_layout(2_000.0, height);
+
+        // `paint_order` (`collect_paint_order`) is its own recursion,
+        // separate from layout.
+        assert_eq!(
+            tree.paint_order().len(),
+            MAX_TREE_DEPTH + 2,
+            "the tree's own root, plus one entry per row in the chain"
+        );
+
+        // `hit_test_from` recurses root-to-leaf; a point inside the
+        // shallowest row's own strip is unaffected by how far the chain
+        // eventually indents, so this exercises the recursion without
+        // depending on the panel being wide enough for the deepest row
+        // (that width floor is `a_row_indented_past_its_panel_still_has_a_floored_size`'s
+        // own, separate concern).
+        let Some(top_bounds) = tree.bounds(root) else {
+            unreachable!("root must be laid out")
+        };
+        // `hit_test` prefers the deepest node containing a point (as
+        // `a_childs_row_sits_below_its_parents_own_row_not_on_top_of_it`
+        // already pins), so this lands on the first row, not the root
+        // itself — what matters here is only that the 256-deep descent
+        // returns at all rather than overflowing the stack.
+        let shallow_point = ((top_bounds.x + 1) as f32, (top_bounds.y + 1) as f32);
+        assert!(
+            tree.hit_test(shallow_point).is_some(),
+            "hit-testing must still terminate at this depth, not just at the root"
+        );
+
+        // `accessibility_update`/`accessibility_update`'s own descent
+        // (`WidgetTree::accessibility_update`'s doc comment names the
+        // real crash this guards against) must produce a tree
+        // `accesskit_consumer` accepts as structurally valid, focused on
+        // the deepest row specifically.
+        let update = tree.accessibility_update(deepest);
+        let _consumer_tree = accesskit_consumer::Tree::new(update, true);
     }
 }
