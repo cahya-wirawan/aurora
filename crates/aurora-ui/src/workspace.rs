@@ -92,8 +92,9 @@ pub struct Workspace {
 /// The pins on the panel styles changed nothing either way.
 ///
 /// The mechanism, read off `taffy`'s own flexbox source
-/// (`compute/flexbox.rs`, `determine_flex_base_size`, ~line 794 in
-/// `taffy 0.9.2`) rather than assumed:
+/// (`compute/flexbox.rs`, `determine_flex_base_size`, lines 817–820 in
+/// `taffy 0.12.2` — the version this workspace actually pins, per
+/// `Cargo.lock`) rather than assumed:
 ///
 /// ```text
 /// let style_min_main_size = child.min_size.or(...).main(dir);
