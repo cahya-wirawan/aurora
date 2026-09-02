@@ -4528,22 +4528,37 @@ fn perform_undo_redo(
 
 /// The reserved `aurora_tile::SurfaceId` this crate uses for its own
 /// live, composited multi-layer preview — never a real layer's own
-/// surface. Every real one reuses a `LayerId`'s own raw value
-/// (`LayerTree::surface_id`), sequentially allocated from near zero by
-/// `aurora_core::IdGenerator`; `u64::MAX` is guaranteed never to
-/// collide with one in any document this process could ever build.
+/// surface. Every real pixel layer's own surface reuses a `LayerId`'s
+/// own raw value (`LayerTree::surface_id`), sequentially allocated from
+/// near zero by `aurora_core::IdGenerator`; since 0.70.0 a mask's own
+/// surface (`LayerTree::mask_surface_id`) also lives in this same
+/// `SurfaceId` space, in its top half (`id.to_raw() |
+/// aurora_doc::MASK_SURFACE_BIT`) — `u64::MAX` is in that same top half,
+/// so it collides with exactly one derived mask surface
+/// (`MASK_SURFACE_BIT - 1`'s own), which is why both `surface_id` and
+/// `mask_surface_id` refuse to hand back a `SurfaceId` for that one id.
+/// `u64::MAX` is therefore guaranteed never to collide with a real
+/// layer's pixel surface OR a real layer's mask surface, in any
+/// document this process could ever build.
 #[must_use]
 fn composite_surface_id() -> aurora_tile::SurfaceId {
     aurora_tile::SurfaceId::from_raw(u64::MAX)
 }
 
-/// `id`'s own `SurfaceId`, computed directly rather than through
-/// `LayerTree::surface_id` — a pure conversion of `id`'s own raw value
-/// (`aurora_tile::SurfaceId::from_raw(id.to_raw())`, exactly what that
-/// method does for a pixel layer), usable from a context like
-/// [`begin_drag`] that already knows `id` names a real pixel layer
-/// (`active_pixel_layer`'s own contract) without needing a `&LayerTree`
-/// reference just to re-derive what the id itself already encodes.
+/// `id`'s own **pixel** `SurfaceId`, computed directly rather than
+/// through `LayerTree::surface_id` — a pure conversion of `id`'s own
+/// raw value (`aurora_tile::SurfaceId::from_raw(id.to_raw())`), usable
+/// from a context like [`begin_drag`] that already knows `id` names a
+/// real pixel layer (`active_pixel_layer`'s own contract) without
+/// needing a `&LayerTree` reference just to re-derive what the id
+/// itself already encodes. **No longer "exactly what `surface_id`
+/// does"** since 0.70.1: that method also refuses an id with
+/// [`aurora_doc::MASK_SURFACE_BIT`] set (`LayerTree::surface_id`'s own
+/// doc comment). This free function has no such guard — every caller
+/// already holds an id `active_pixel_layer` vouched for, which the live
+/// `IdGenerator` can never set that bit on, so the two agree in
+/// practice; they would disagree only for an id this crate should never
+/// have been handed in the first place.
 #[must_use]
 fn surface_id_for(id: aurora_doc::LayerId) -> aurora_tile::SurfaceId {
     aurora_tile::SurfaceId::from_raw(id.to_raw())

@@ -31,9 +31,45 @@
 //! or per surface, and it needs no new `TileStore` API, no new
 //! [`crate::LayerMask`] field, and no `.aur` format change.
 //!
+//! **Accepted trade-off, named rather than left implicit**: one grayscale
+//! coverage value costs a full RGBA `f16` texel — 4x the bytes the data
+//! itself needs — against a PRD that budgets 8 bytes/px and calls tile
+//! compression mandatory. Reusing the existing store's own sparse
+//! allocation and per-tile compression (rather than a dedicated
+//! single-channel surface kind, which would need new `TileStore`/`.aur`
+//! machinery) is the trade this round made, and it is why the
+//! consequences list above can say "no new `TileStore` API." Revisit if
+//! mask memory ever shows up as a real, measured cost.
+//!
 //! The writer ([`write_mask_coverage`]) and the reader
 //! ([`read_mask_coverage`]) both live here, in one module, so the two
 //! halves of that convention cannot drift apart.
+//!
+//! # The addressing convention — the other half, not just the value
+//!
+//! Everything above is the *value* half of the convention (what a texel
+//! means once you have it). There is a second, equally load-bearing
+//! half this module does not enforce and could not: a mask surface's
+//! `aurora_tile::TileId` space is addressed **relative to the mask's
+//! own [`crate::LayerMask::bounds`] origin**, not the document's origin
+//! and not the layer's own `bounds` origin — the three coincide only
+//! when a mask happens to sit at the same place as its layer, which is
+//! not guaranteed. `write_mask_coverage` takes a bare `TileId` plus a
+//! tile-local `(column, row)` and has no way to check which frame the
+//! caller meant; the current, sole caller
+//! (`aurora-app`'s `apply_mask`) gets this right by construction,
+//! reading through the same window it built from `mask.bounds`'s own
+//! `(x, y)`. **A future caller — the brush/tool UI in follow-on 1 below
+//! — must convert a document-space paint stroke into `mask.bounds`-
+//! relative tile coordinates before calling [`write_mask_coverage`], or
+//! painted coverage will be shifted by exactly the offset between the
+//! mask's origin and whatever frame the tool assumed.** This is exactly
+//! the kind of drift this module's single-writer/single-reader design
+//! prevents for the *value* convention — it cannot prevent it here,
+//! because the origin lives on [`crate::LayerMask`], not in this
+//! module, so the tool implementing follow-on 1 is responsible for
+//! getting this right and should re-read this paragraph before wiring
+//! coordinates through.
 //!
 //! # Deliberately not built this round
 //!
@@ -146,6 +182,11 @@ pub const MASK_SURFACE_BIT: u64 = 1 << 63;
 /// this function does not check that, because `aurora_tile` deals only
 /// in opaque surface ids and has no way to tell one apart from a
 /// layer's own.
+///
+/// **`tile`/`(column, row)` must already be in the mask's own frame**
+/// — relative to [`crate::LayerMask::bounds`]'s own origin, not the
+/// document's and not the layer's own `bounds`. See this module's own
+/// "The addressing convention" section; this function cannot check it.
 ///
 /// # Errors
 ///

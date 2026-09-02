@@ -13727,7 +13727,7 @@ severity choice.
   offset). The four pre-existing `apply_mask_clip_*` tests were renamed
   to `apply_mask_*` and kept asserting exactly what they asserted
   before, via a bounds-only test helper; not one assertion was retuned.
-  1,347 workspace tests, up from 1,324.
+  1,347 workspace tests at 0.70.0, up from 1,324.
 
   **Deliberately out of scope, named rather than dropped**: (1) a
   brush/tool UI for painting a mask — `write_mask_coverage` is the API
@@ -13736,20 +13736,51 @@ severity choice.
   surfaces, so painted coverage does not survive save/load (the format
   itself needs no change; the code that walks surfaces does); (3)
   mask-pixel undo/history — mask writes go through no `History`
-  operation, so painting a mask would not be undoable. All three are
-  named in `aurora_doc::mask`'s own module doc comment, `LayerMask`'s,
-  `apply_mask`'s, and `resolve_tile`'s.
+  operation, so painting a mask would not be undoable; (4) **mask-
+  surface lifecycle cleanup, named in review and added 0.70.4** —
+  because the surface id is *derived*, not allocated fresh, removing a
+  mask and adding a new one to the same layer resurrects the old
+  painted coverage, *shifted* by the delta between the old and new
+  `bounds` origins (there is no `set_mask_bounds`, so this is worse
+  than merely stale); a deleted layer's mask tiles leak the same way
+  its pixel tiles already do. All four are named in `aurora_doc::mask`'s
+  own module doc comment, `LayerMask`'s, `apply_mask`'s, and
+  `resolve_tile`'s.
 
-  **Verified**: `cargo fmt --all --check`, `check_layering.py`,
+  **Review found three real defects, all fixed by 0.70.4**: a
+  cross-layer `SurfaceId` collision reachable through a crafted/
+  untrusted `.aur` manifest (a `LayerId` with bit 63 already set
+  aliased another layer's mask surface — `surface_id` had no guard
+  against it; fixed with `validate_layer_id_range` at both the
+  manifest-deserialize and journal-replay validation gates, plus a
+  mirrored guard directly on `surface_id` itself, since `restore`
+  during undo/redo merges a subtree without a closing `validate()`);
+  the fail-open safety guarantee inverting to fail-*closed* exactly
+  when `mask.inverted` was `true` and a read genuinely failed (the
+  "unread" signal now survives past the inversion step; only the
+  *final* combined coverage defaults to `1.0`); and a measured ~2.9x
+  per-tile cost from unconditionally reading an unpainted mask
+  surface's coverage window on every composite (fixed with a new,
+  non-materializing `TileStore::contains_tile` check that skips the
+  read entirely when a surface has nothing stored — remeasured at
+  ~1.01x). See the 0.70.1–0.70.4 addenda under "Next action" for the
+  full account, including the deliberate decision that a mask read
+  failure still refuses an export (fail-open protects the canvas; an
+  export that silently wrote a wrongly un-masked layer would be the
+  exact silent-degradation failure CLAUDE.md names as this project's
+  worst). 1,359 workspace tests as of 0.70.4.
+
+  **Verified (0.70.0; re-verified after each 0.70.1–0.70.4 fix)**:
+  `cargo fmt --all --check`, `check_layering.py`,
   `check_no_hardcoded_style.py`, `cargo check --workspace --locked`,
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-  `cargo test --workspace` (1,347 passing), `cargo test --workspace
-  --doc`, and `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps
-  --all-features` all clean locally. `cargo nextest` is not installed on
-  this box; `cargo test --workspace` stood in, per CLAUDE.md. **No GPU
-  or interactive verification** — this is a CPU/data-model change, but
-  CLAUDE.md's own rule applies: a green test run is not evidence about
-  how a mask looks on real hardware.
+  `cargo test --workspace` (1,359 passing at 0.70.4), `cargo test
+  --workspace --doc`, and `RUSTDOCFLAGS=-D warnings cargo doc
+  --workspace --no-deps --all-features` all clean locally. `cargo
+  nextest` is not installed on this box; `cargo test --workspace` stood
+  in, per CLAUDE.md. **No GPU or interactive verification** — this is a
+  CPU/data-model change, but CLAUDE.md's own rule applies: a green test
+  run is not evidence about how a mask looks on real hardware.
 
 ### M1.10 — Phase 1 gate
 
@@ -15393,9 +15424,13 @@ tooling-gated, fall into one of four buckets:
    pixel storage. **The mask half is now partly done (0.70.0)**: ADR
    0010's pattern was applied — coverage lives on its own surface in
    the shared `TileStore`, and `resolve_tile` composites it for real,
-   feathering and all. Three slices of it are still open and named as
+   feathering and all. Four slices of it are still open and named as
    such: a brush/tool UI for painting a mask, `.aur` persistence of
-   mask pixels, and mask-pixel undo/history. Asked Cahya which of these two to
+   mask pixels, mask-pixel undo/history, and mask-surface lifecycle
+   cleanup (a removed-then-re-added mask resurrects its old, now
+   spatially-shifted coverage; a deleted layer's mask tiles leak the
+   same way its pixel tiles already do) — the fourth named in 0.70.4
+   after review found it undisclosed. Asked Cahya which of these two to
    pick up next (2026-08-12); answer was to pause rather than commit to
    either without more review first — see the session's own record for
    the exact framing offered.
