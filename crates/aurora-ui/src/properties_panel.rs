@@ -28,25 +28,56 @@
 //! **One-shot, not reactive** — see [`crate::layers_panel`]'s own doc
 //! comment for why (the same reasoning applies here: nothing can edit
 //! a live document in `aurora-app` yet either). A caller re-populates on
-//! every tool change by clearing the body first
-//! (`crate::clear_panel_body`) — see `aurora-app`'s own
+//! every tool change and [`populate_properties_panel`] empties the body
+//! for itself first, the same contract its two sibling `populate_*`
+//! functions already had — see `aurora-app`'s own
 //! `refresh_properties_panel`.
+//!
+//! **Its rows are still degenerate, and that is a real, open bug** —
+//! disclosed here and pinned by
+//! `properties_rows_are_still_degenerate_zero_height_boxes`, deliberately
+//! not fixed in the round that wrote this. A row is a
+//! `WidgetKind::Container` carrying `Style::default()`, which under the
+//! shared `Column` body direction resolves to full body width and **zero
+//! height** — the same class of bug `crate::history_panel` had on the
+//! width axis before `0.77.2`, with the axis swapped by the same
+//! `Row` → `Column` change that fixed History. Nothing hit-tests or
+//! paints a Properties row today, so it is currently invisible rather
+//! than wrong on screen; the fix is the same one History got (real
+//! `WidgetKind::ListRow`s with a token-derived `min_size`), and it needs
+//! the `&Scales` this function does not yet take.
 
 use accesskit::{Node, Role};
 use aurora_widgets::widgets::WidgetKind;
 use aurora_widgets::{WidgetError, WidgetTree};
 use taffy::Style;
 
-use crate::panel::PanelHandle;
+use crate::panel::{PanelHandle, clear_panel_body};
 use crate::tool::Tool;
 
-/// Replaces `panel`'s body accessibility with a real `Role::List`
-/// labeled with `tool`'s own [`Tool::label`], then inserts one
-/// `Role::ListItem` row per `(label, value)` pair in `options`, in the
-/// order given. `options` is deliberately just label/value text — no
+/// Empties `panel`'s body, replaces its accessibility with a real
+/// `Role::List` labeled with `tool`'s own [`Tool::label`], then inserts
+/// one `Role::ListItem` row per `(label, value)` pair in `options`, in
+/// the order given. `options` is deliberately just label/value text — no
 /// tool-specific knowledge lives in this crate; see this module's own
 /// doc comment for why. An empty `options` slice is a legitimate,
 /// honest "no real options for this tool yet" state, not an error.
+///
+/// **Repopulating is safe**: `panel.body`'s existing children are
+/// removed first ([`clear_panel_body`]), so switching from a tool with
+/// real options to one without really empties the panel instead of
+/// leaving the previous tool's stale rows in it. This landed in
+/// `0.77.3` purely to give the three `populate_*` functions one
+/// contract; every caller in `aurora-app` already cleared first
+/// (`replace_document`, `refresh_properties_panel`, and `App::new`'s own
+/// freshly built workspace), so it changed no behaviour — it moved the
+/// guarantee from "every caller remembers" to "the function provides."
+///
+/// **Unlike its two siblings, this one is labelled, and deliberately.**
+/// A body label is only right when it says something the panel's own
+/// `Role::Region` does not; "Properties: Brush" names the active tool,
+/// where "History" on a region already labelled "History" was just a
+/// duplicate announcement (see [`crate::populate_history_panel`]).
 ///
 /// # Errors
 ///
@@ -57,6 +88,7 @@ pub fn populate_properties_panel(
     tool: Tool,
     options: &[(&str, String)],
 ) -> Result<(), WidgetError> {
+    clear_panel_body(tree, panel.body)?;
     let mut list_node = Node::new(Role::List);
     list_node.set_label(format!("Properties: {}", tool.label()));
     tree.set_accessibility(panel.body, list_node)?;
@@ -136,6 +168,95 @@ mod tests {
             0,
             "a tool with no real options yet must render zero rows, not a placeholder"
         );
+    }
+
+    /// Repopulating replaces the rows rather than appending a second set
+    /// beside the first — the [`clear_panel_body`] call this function
+    /// makes for itself, the same guarantee `populate_layers_panel`
+    /// gained in `0.77.1` and `populate_history_panel` in `0.77.2`.
+    #[test]
+    fn populating_the_same_panel_twice_replaces_the_rows_instead_of_stacking_them() {
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "Properties") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let options = [("Radius", "24px".to_owned())];
+        for _ in 0..2 {
+            if let Err(err) = populate_properties_panel(&mut tree, panel, Tool::Brush, &options) {
+                unreachable!("{err:?}");
+            }
+        }
+        assert_eq!(
+            tree.children(panel.body).map(<[_]>::len),
+            Some(1),
+            "a second call must replace the row, not stack a second one beside it"
+        );
+
+        if let Err(err) = populate_properties_panel(&mut tree, panel, Tool::Move, &[]) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.children(panel.body),
+            Some([].as_slice()),
+            "and switching to a tool with no options must really empty the panel"
+        );
+    }
+
+    /// **An honest before-picture of a known, disclosed bug, not a
+    /// guarantee.** A Properties row is a `WidgetKind::Container`
+    /// carrying `Style::default()`, which under `crate::panel`'s shared
+    /// `Column` body direction resolves to full body width and **zero
+    /// height** — laid out, but degenerate, unhittable, and unpaintable,
+    /// exactly the shape a History row had on the *width* axis before
+    /// `0.77.2`. This test asserts the broken geometry on purpose, so
+    /// that the disclosure in this module's own doc comment is something
+    /// CI notices changing rather than prose that can quietly go stale.
+    /// The same discipline `layers_panel`'s own
+    /// `tab_order_currently_stops_on_every_layer_row` uses for a
+    /// different disclosed gap.
+    ///
+    /// **Whoever fixes the bug should delete this test**, not weaken it:
+    /// its failure is the intended signal that the gap closed.
+    #[test]
+    fn properties_rows_are_still_degenerate_zero_height_boxes() {
+        let mut ws = crate::workspace::build_workspace();
+        let options = [
+            ("Radius", "24px".to_owned()),
+            ("Hardness", "80%".to_owned()),
+        ];
+        if let Err(err) =
+            populate_properties_panel(&mut ws.tree, ws.properties, Tool::Brush, &options)
+        {
+            unreachable!("{err:?}");
+        }
+        ws.tree.compute_layout(1600.0, 900.0);
+
+        let Some(rows) = ws.tree.children(ws.properties.body) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(rows.len(), 2, "one row per option");
+        for &row in rows {
+            let Some(row_bounds) = ws.tree.bounds(row) else {
+                unreachable!("just laid out");
+            };
+            assert_eq!(
+                row_bounds.height, 0,
+                "the disclosed bug: a Style::default() row in a Column body has no height \
+                 at all -- {row_bounds:?}"
+            );
+            #[allow(clippy::cast_precision_loss)]
+            let point = (
+                (row_bounds.x + i64::from(row_bounds.width) / 2) as f32,
+                row_bounds.y as f32,
+            );
+            assert_ne!(
+                ws.tree.hit_test(point),
+                Some(row),
+                "and a zero-height row cannot be hit, the same way a zero-width History row \
+                 could not be before 0.77.2"
+            );
+        }
     }
 
     #[test]

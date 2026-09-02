@@ -42,6 +42,14 @@
 //! [`WidgetKind`] (`Container` on its own) returns `Ok(vec![])` too — a
 //! real, deliberate "nothing to paint," not an error.
 //!
+//! Every kind's own geometry is built from bounds that
+//! [`clip_to_clipping_ancestors`] has already intersected with any
+//! ancestor declaring a clipping `taffy::Overflow`, so no widget paints
+//! outside the panel that holds it and one entirely past its panel's
+//! edge paints nothing at all — see that function for the measured case
+//! (a 21 px row in a 13 px panel body) and for why no per-widget height
+//! clamp can stand in for it.
+//!
 //! [`paint_widget`] returns a `Vec<Paint>`, not a single `Paint` —
 //! `Button`/`Checkbox` only ever needed one shape, but `Slider` is the
 //! first widget that genuinely needs more than one (a track *and* a
@@ -78,6 +86,8 @@ use accesskit::{Orientation, Toggled};
 use aurora_core::Rect;
 use aurora_theme::{Scales, Theme};
 use aurora_vector::{Mesh, Path, fill, rounded_rect, stroke, tolerance_for_scale_factor};
+
+use taffy::Overflow;
 
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
@@ -158,6 +168,9 @@ pub fn paint_widget(
 ) -> Result<Vec<Paint>, WidgetError> {
     let bounds = tree.bounds(id).ok_or(WidgetError::UnknownWidget(id))?;
     let kind = tree.payload(id).ok_or(WidgetError::UnknownWidget(id))?;
+    let Some(bounds) = clip_to_clipping_ancestors(tree, id, bounds) else {
+        return Ok(vec![]);
+    };
     match kind {
         WidgetKind::Button(state) => paint_button(state, bounds, theme, scales, scale_factor),
         WidgetKind::Checkbox(state) => paint_checkbox(state, bounds, theme, scales, scale_factor),
@@ -179,6 +192,88 @@ pub fn paint_widget(
         WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
+}
+
+/// `bounds`, intersected with the box of every ancestor that clips its
+/// own content — `taffy::Overflow` anything but `Visible`, tested per
+/// axis, since `taffy` carries `overflow.x` and `overflow.y`
+/// independently. `None` when nothing of the widget survives the
+/// intersection, which [`paint_widget`] turns into the same real,
+/// deliberate `Ok(vec![])` an unselected row already returns.
+///
+/// **This is what keeps a widget from painting outside the panel that
+/// contains it, and it is a real, measured gap, not a hypothetical.**
+/// A panel body (`aurora_ui::panel`'s own `body_style`, the only
+/// `Overflow::Hidden` in the workspace today) gets a content-independent
+/// share of the dock rail, while the rows inside it each carry a hard
+/// one-line `min_size.height` floor. Measured in a real
+/// `aurora_ui::build_workspace` at an 800×40 window: the History body
+/// resolves to 13 px tall and its first row to 21 px, so the row's own
+/// box extends 8 px past the body — and the Layers panel's tree rows do
+/// exactly the same thing, at exactly the same numbers. Painting a
+/// selected row's `accent.primary` fill from its own unclipped bounds
+/// would lay that overhang across whatever is docked below.
+///
+/// `paint_tree_item`'s own `row_height(scales).min(bounds.height)` does
+/// **not** cover this and never did: for a 21 px row it computes
+/// `min(21, 21) = 21`. That clamp exists for a different problem — a
+/// selected *group*'s box spanning its whole subtree — and this one is
+/// about the ancestor, which no per-widget height clamp can see.
+///
+/// The clip is applied to the *rect*, before tessellation, rather than
+/// as a real scissor: a partly-clipped rounded rect therefore keeps its
+/// `scales.radius.sm` corners at the cut instead of being sliced flat.
+/// That is a visible approximation only in the already-degenerate case
+/// this exists to contain, and a genuine scissor belongs to
+/// `crate::render`/the caller's own render pass, not here. Clipping to
+/// nothing also makes paint agree with `WidgetTree::hit_test`, which
+/// already refuses to descend into a parent whose bounds exclude the
+/// point: a row fully past the bottom of its panel is now both
+/// unreachable *and* invisible, rather than unreachable but drawn.
+fn clip_to_clipping_ancestors(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    bounds: Rect,
+) -> Option<Rect> {
+    let mut left = bounds.x;
+    let mut top = bounds.y;
+    let mut right = bounds.x.saturating_add(i64::from(bounds.width));
+    let mut bottom = bounds.y.saturating_add(i64::from(bounds.height));
+    let mut clipped = false;
+    let mut current = tree.parent(id);
+    while let Some(ancestor) = current {
+        if let (Some(style), Some(clip)) = (tree.style(ancestor), tree.bounds(ancestor)) {
+            if style.overflow.x != Overflow::Visible {
+                clipped = true;
+                left = left.max(clip.x);
+                right = right.min(clip.x.saturating_add(i64::from(clip.width)));
+            }
+            if style.overflow.y != Overflow::Visible {
+                clipped = true;
+                top = top.max(clip.y);
+                bottom = bottom.min(clip.y.saturating_add(i64::from(clip.height)));
+            }
+        }
+        current = tree.parent(ancestor);
+    }
+    // Returned untouched, not merely unchanged, when no ancestor clips
+    // at all: a widget whose bounds are still the default zero rect
+    // (every test in this module that paints without a
+    // `compute_layout`/`set_bounds` first) must keep painting the
+    // degenerate shape it always did, rather than being turned into an
+    // `Ok(vec![])` by an empty intersection with itself.
+    if !clipped {
+        return Some(bounds);
+    }
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(Rect {
+        x: left,
+        y: top,
+        width: u32::try_from(right - left).ok()?,
+        height: u32::try_from(bottom - top).ok()?,
+    })
 }
 
 fn paint_button(
@@ -569,6 +664,21 @@ fn paint_color_swatch(
 /// "primary buttons, active tool," so this isn't a new use invented
 /// here. `scales.radius.sm`, the same small-control radius every other
 /// non-panel shape in this module uses.
+///
+/// **The fill really is the row's whole box, and deliberately so** —
+/// unlike [`paint_tree_item`], which clamps to one row's height because
+/// a tree row's box grows to contain its children. A list row has no
+/// children to contain, and a command-palette row's box is *meant* to be
+/// its whole share of a sparse palette (`widgets::command_palette`'s own
+/// `row_style` sets `flex_grow: 1.0`), so clamping here would leave a
+/// palette row highlighted over only part of its own click target.
+/// Measured rather than argued: applying `row_height(scales).min(bounds.
+/// height)` here fails ten existing `tests/gallery.rs` cases, five of
+/// them golden-image comparisons.
+///
+/// Staying inside the *panel* is a different question, and it is
+/// [`clip_to_clipping_ancestors`]' job for every widget kind at once —
+/// including `TreeItem`, whose own height clamp never addressed it.
 fn paint_list_row(
     state: ListRowState,
     bounds: Rect,
@@ -616,6 +726,12 @@ fn paint_list_row(
 /// `.min(bounds.height)` guard keeps a row that is somehow *shorter*
 /// than one line (a caller-supplied `set_bounds`, a squeezed layout)
 /// from painting outside its own bounds.
+///
+/// **What it does not do is keep the row inside its own *panel*.** For a
+/// 21 px row in a 13 px panel body it computes `min(21, 21) = 21` and
+/// overhangs by 8 px, exactly as an unclamped `ListRow` would; that
+/// class of overflow belongs to [`clip_to_clipping_ancestors`], which
+/// runs before this function and hands it already-clipped `bounds`.
 fn paint_tree_item(
     state: &TreeItemState,
     bounds: Rect,
@@ -724,11 +840,11 @@ mod tests {
     use crate::widgets::{
         CommandEntry, ListRowState, ScrollbarRange, ScrollbarState, WidgetKind,
         command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
-        insert_command_palette, insert_scrollbar, insert_slider, insert_text_field,
-        insert_tree_item, insert_tree_view, new_tree, set_button_disabled, set_button_pressed,
-        set_checkbox_disabled, set_color_swatch_disabled, set_scrollbar_disabled,
-        set_scrollbar_value, set_slider_disabled, set_slider_value, set_text_field_disabled,
-        set_tree_item_disabled, set_tree_item_selected, toggle_checkbox,
+        insert_command_palette, insert_container, insert_scrollbar, insert_slider,
+        insert_text_field, insert_tree_item, insert_tree_view, new_tree, row_height,
+        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
+        set_scrollbar_disabled, set_scrollbar_value, set_slider_disabled, set_slider_value,
+        set_text_field_disabled, set_tree_item_disabled, set_tree_item_selected, toggle_checkbox,
     };
     use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
@@ -2024,6 +2140,174 @@ mod tests {
             (bottom - top - 21.0).abs() < 0.5,
             "the highlight must be one row tall (21px), not the whole 63px box: \
              {top} -> {bottom}"
+        );
+    }
+
+    /// A panel body that hides its overflow, sized the way a real dock
+    /// rail sizes one: a content-independent share, here deliberately
+    /// shorter than the one-line `min_size.height` floor its rows carry.
+    /// `overflow: Hidden` needs `Overflow::Scroll`'s sibling semantics
+    /// only for clipping, not scrolling, which is all this exercises.
+    fn clipping_body(height: f32) -> taffy::Style {
+        taffy::Style {
+            flex_direction: taffy::FlexDirection::Column,
+            size: taffy::Size {
+                width: taffy::style_helpers::length(200.0_f32),
+                height: taffy::style_helpers::length(height),
+            },
+            overflow: taffy::Point {
+                x: taffy::Overflow::Hidden,
+                y: taffy::Overflow::Hidden,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// One row's own style, the same shape `aurora_ui::history_panel`'s
+    /// `row_style` builds: an `auto` height with a hard one-line floor,
+    /// which is exactly what lets a row out-grow an undersized body.
+    fn floored_row_style(scales: &Scales) -> taffy::Style {
+        taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::percent(1.0_f32),
+                height: taffy::style_helpers::auto(),
+            },
+            min_size: taffy::Size {
+                width: taffy::style_helpers::length(row_height(scales)),
+                height: taffy::style_helpers::length(row_height(scales)),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A selected `ListRow` whose own one-line floor makes it taller
+    /// than the panel body holding it must still paint inside that body.
+    /// Measured, not hypothetical: a real `aurora_ui::build_workspace`
+    /// at an 800×40 window gives the History body 13 px and its rows
+    /// 21 px each. Before `0.77.3` the fill was built straight from the
+    /// row's own unclipped bounds and hung 8 px over whatever was docked
+    /// below.
+    #[test]
+    fn a_selected_list_rows_highlight_stays_inside_a_body_that_clips_its_overflow() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(13.0)) else {
+            unreachable!("the root was just built");
+        };
+        let row = match tree.insert(
+            body,
+            floored_row_style(&scales),
+            accesskit::Node::new(accesskit::Role::ListItem),
+            WidgetKind::ListRow(ListRowState {
+                selected: true,
+                disabled: false,
+            }),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(200.0, 200.0);
+
+        let Some(row_bounds) = tree.bounds(row) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            row_bounds.height, 21,
+            "the row really does out-grow its 13px body -- that is the precondition: \
+             {row_bounds:?}"
+        );
+        let theme = dark_theme();
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top >= 0.0 && bottom <= 13.0,
+            "a 21px row in a 13px clipping body must paint only inside it: {top} -> {bottom}"
+        );
+    }
+
+    /// The same clip, taken to its end: a row laid out entirely past the
+    /// bottom of its clipping body paints nothing at all. That makes
+    /// paint agree with `WidgetTree::hit_test`, which already refuses to
+    /// descend into a parent whose own bounds exclude the point.
+    #[test]
+    fn a_selected_list_row_past_the_bottom_of_its_body_paints_nothing() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(13.0)) else {
+            unreachable!("the root was just built");
+        };
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            match tree.insert(
+                body,
+                floored_row_style(&scales),
+                accesskit::Node::new(accesskit::Role::ListItem),
+                WidgetKind::ListRow(ListRowState {
+                    selected: true,
+                    disabled: false,
+                }),
+            ) {
+                Ok(id) => rows.push(id),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        tree.compute_layout(200.0, 200.0);
+
+        let Some(&last) = rows.last() else {
+            unreachable!("three rows were just inserted");
+        };
+        let Some(last_bounds) = tree.bounds(last) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            last_bounds.y >= 13,
+            "the third row must start past the 13px body -- the precondition: {last_bounds:?}"
+        );
+        let theme = dark_theme();
+        let paints = match paint_widget(&tree, last, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            paints.is_empty(),
+            "a row wholly outside its clipping body must paint nothing, the same \
+             Ok(vec![]) an unselected row returns"
+        );
+    }
+
+    /// The same guard for `TreeItem`, whose own
+    /// `row_height(scales).min(bounds.height)` clamp never covered this:
+    /// for a 21px row in a 13px body it computes `min(21, 21) = 21` and
+    /// overhangs exactly as an unclamped `ListRow` would.
+    #[test]
+    fn a_selected_tree_rows_highlight_stays_inside_a_body_that_clips_its_overflow() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let Ok(body) = insert_container(&mut tree, root, clipping_body(13.0)) else {
+            unreachable!("the root was just built");
+        };
+        let row = match insert_tree_item(&mut tree, body, &scales, "Squeezed", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(200.0, 200.0);
+
+        let Some(row_bounds) = tree.bounds(row) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            row_bounds.height, 21,
+            "the tree row out-grows its 13px body too: {row_bounds:?}"
+        );
+        let theme = dark_theme();
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top >= 0.0 && bottom <= 13.0,
+            "a tree row must be clipped to its own body as well: {top} -> {bottom}"
         );
     }
 

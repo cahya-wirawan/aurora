@@ -179,8 +179,15 @@ const _: () = assert!(
 /// **The tree container is deliberately unlabelled.** `panel.root` is
 /// already a `Role::Region` labelled "Layers"; naming the container
 /// inside it "Layers" too made a screen reader announce the name twice
-/// on entry. The History panel next door avoids the same double-naming
-/// by relabelling the body rather than nesting a second named container.
+/// on entry. The History panel next door does the same thing, and
+/// `0.77.2` claimed here that it "avoided the same double-naming by
+/// relabelling the body" — it did not: relabelling the body to the
+/// identical string is the same duplicate one level shallower, and
+/// `0.77.3` dropped that label too. The rule both panels now follow is
+/// that the region names the panel and nothing nested inside it repeats
+/// that name. [`crate::populate_properties_panel`] is the exception that
+/// proves it: its body really is labelled, because "Properties: Brush"
+/// says something the region's bare "Properties" does not.
 ///
 /// **Repopulating is safe**: `panel.body`'s existing children are
 /// removed first ([`crate::panel::clear_panel_body`]), so calling this

@@ -2341,7 +2341,7 @@ check licenses` clean with the new `toml` dependency.
   `0.0` (`command_palette::row_style`'s `1.0` would divide the view's
   height evenly across rows instead of one line each — the same class of
   bug `scrollbar::style` records), and each row carries
-  `padding.top = tree_row_height`, without which a parent's first child
+  `padding.top = row_height`, without which a parent's first child
   occupies exactly the parent's own band: `hit_test` prefers the deeper
   node, so a click on a group's own row selected its first child, and
   that child's highlight painted where the parent's row is. Asserted
@@ -2349,9 +2349,11 @@ check licenses` clean with the new `toml` dependency.
   Indentation is `padding.left` accumulated by `taffy`, never a
   `depth * indent` computed at paint time, so the indent is in each
   row's real `bounds` and hit-testing agrees with it for free.
-  `paint_tree_item` clamps its fill to `tree_row_height(scales).min(
+  `paint_tree_item` clamps its fill to `row_height(scales).min(
   bounds.height)` — a group's own layout box spans its whole subtree, so
-  an unclamped fill would paint over every descendant's highlight.
+  an unclamped fill would paint over every descendant's highlight. (That
+  clamp is about the row's own subtree only; staying inside the *panel*
+  is `paint_widget`'s own ancestor clip, added in `0.77.3`.)
   Gallery: `tree_view_gallery_tree` — two cells (the same three-row tree
   expanded and collapsed, since collapse removing real widgets is not
   something one cell can show), a real rendered-pixel test in all five
@@ -5130,12 +5132,21 @@ structural design work.
      `spacing.xxs` 4 × 2) a Layers row beside them uses. That helper was
      `pub(crate) tree_row_height`; it is now `pub row_height`, since
      History rows are a third consumer and are not a tree.
-     `flex_grow` stays `0.0`: borrowing `command_palette::row_style`'s
-     `flex_grow: 1.0` would divide the panel's ~300 px share among
-     however many entries exist (200 entries → 1.5 px each, 1000 →
-     0.3 px, below `Rect`'s integer resolution), reintroducing the same
-     bug in a form no small row count makes visible. `tree_view::style`
-     already records that borrowed-idiom mistake for the same reason.
+     `flex_grow` stays `0.0`, but **not for the reason `0.77.2`'s own
+     commit message gave** — corrected in `0.77.3` after the mutation was
+     actually applied and measured. `min_size.height` is the hard
+     flexbox floor that makes a row exactly 21 px at *any* entry count
+     (rows stay 21 px at 200 and at 1000 entries even with
+     `flex_grow: 1.0`; the "200 → 1.5 px, 1000 → 0.3 px" collapse the old
+     wording described does not occur, because an `auto` main size gives
+     a flex base size of `0` and therefore a scaled flex-shrink factor of
+     `0` too). What `flex_grow: 0.0` prevents is the opposite case: a
+     *sparse* panel, which has free space to divide — the mutation
+     inflates five rows to 60 px each, which is what
+     `history_rows_are_real_list_row_widgets_with_a_hittable_size`
+     catches. Both guards are load-bearing, for opposite reasons;
+     neither is redundant. `tree_view::style` records the same
+     borrowed-idiom mistake for the sparse case.
 
   Rows stay **direct children of `panel.body`** rather than gaining a
   container of their own the way Layers has: nothing needs the extra
@@ -5157,10 +5168,15 @@ structural design work.
   - **Rows past the panel's visible height are laid out but unreachable**
     — the identical disclosed gap Layers has, for the identical reason
     (no scrolling container exists anywhere in `aurora-widgets`). With
-    the rail's ~300 px History share and 21 px rows, roughly **14** of
-    an up-to-1000-entry journal are reachable; `rows_past_the_bottom_of_
-    a_bounded_history_panel_are_clipped_and_not_yet_reachable` pins that
-    honestly at 200 entries rather than implying the panel is finished.
+    the rail's ~300 px History share and 21 px rows, exactly **14** of
+    an up-to-**1001**-row journal are reachable; `rows_past_the_bottom_
+    of_a_bounded_history_panel_are_clipped_and_not_yet_reachable` pins
+    that honestly at 200 entries rather than implying the panel is
+    finished, and since `0.77.3` asserts the exact count so a silent
+    change in visible rows fails rather than passes. 1001, not 1000:
+    `journal_descriptions` caps real steps at 1000 and prepends a
+    synthetic "N earlier steps omitted" notice at index 0 when anything
+    was dropped, so row index is not journal index.
   - **The `Role::List`/`Role::ListItem` choice is unverified against any
     real screen reader.** There is no display server in this sandbox. It
     is a specification-level choice (`Role::ListBoxOption` was rejected
@@ -5168,7 +5184,7 @@ structural design work.
     would over-promise a selection interaction nothing implements), not
     a tested one, and still needs a human on real hardware.
   - **No `Action::Focus`/`Action::Click` on rows**, deliberately: that
-    would add up to 1000 `Tab` stops inside one panel, the same
+    would add up to 1001 `Tab` stops inside one panel, the same
     crate-wide focus-model question `tree_view` already discloses and
     Layers already pays, for rows that route nowhere.
   - **The Properties panel has the identical zero-size-row bug and is
@@ -5187,6 +5203,79 @@ structural design work.
   --doc`, and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
   --no-deps --all-features` all clean. (`cargo nextest` is not installed
   in this sandbox; `cargo test --workspace` stood in, per CLAUDE.md.)
+
+  **Review round (`0.77.3`).** Independent review of `0.77.2` passed the
+  fix itself — the rows really are 21 px, hittable and non-degenerate —
+  and found a cluster of doc claims that were wrong and one real paint
+  gap. What changed:
+
+  - **`paint_widget` now clips every widget's geometry to any ancestor
+    declaring a clipping `taffy::Overflow`**, so nothing paints outside
+    the panel holding it and a row wholly past its panel's edge paints
+    nothing at all (matching `hit_test`, which already refused it).
+    Measured, not hypothetical: in a real `build_workspace` at an 800×40
+    window the History body resolves to 13 px and its rows to 21 px, so a
+    selected row's fill overhung by 8 px. The review had prescribed
+    mirroring `paint_tree_item`'s `row_height(scales).min(bounds.height)`
+    onto `paint_list_row` instead; that was rejected with measurements —
+    it computes `min(21, 21) = 21` and so fixes nothing here (the Layers
+    tree rows overhang identically *with* that clamp), and applying it
+    fails ten existing `tests/gallery.rs` cases, five of them golden
+    images, because a sparse command palette's rows are meant to inflate.
+    The clamp guards a different thing (a group's box spanning its
+    subtree) and both doc comments now say so.
+  - **The `flex_grow` rationale above was measured wrong and is
+    corrected** — `min_size.height` is the guard that holds at high entry
+    counts; `flex_grow: 0.0` is the guard against a sparse panel
+    inflating rows. See that bullet.
+  - **The History `Role::List` body is no longer labelled "History"** —
+    `panel.root` is already a `Role::Region` with that name, so the body
+    label was the same duplicate-announcement bug the Layers round fixed,
+    one level shallower. `layers_panel`'s doc comment, which claimed
+    History had avoided it, is corrected. Properties keeps its body label
+    because "Properties: Brush" says something the region does not.
+  - **`close_panel` resets the emptied body's accessibility node** to the
+    neutral `Role::GenericContainer` it was created with, so a
+    closed-then-reopened panel no longer announces an empty list.
+  - **`populate_properties_panel` self-clears**, giving all three
+    `populate_*` functions one contract; `clear_panel_body`'s own doc
+    comment (which named exactly the two that had already stopped needing
+    an external clear) is rewritten, and the five now-redundant external
+    clears in `aurora-app` are gone. Behaviour-preserving: every caller
+    already cleared first.
+  - **`panel::root_style`/`body_style` pin `min_size` to zero on both
+    axes**, not just the height `0.77.1` fixed — under `Column`, width is
+    the cross axis, so a row's `min_size.width` propagated up as a floor
+    on the rail's width. Unreachable behind `set_rail_width`'s
+    `[150, 600]` clamp, and closed anyway, since that is the shape the
+    height bug had before a 43-layer document made it reachable.
+  - **Properties' zero-height rows are now pinned by a test**
+    (`properties_rows_are_still_degenerate_zero_height_boxes`) that
+    asserts the *broken* geometry on purpose, converting a prose-only
+    disclosure into something CI notices. The bug itself is still open.
+  - Doc corrections: `refresh_history_panel`'s real cost is an O(n)
+    rebuild of up to 1001 row widgets on every structural undo/redo (and
+    undo/redo are themselves journaled, so each successive one is
+    larger) — not the ~20 µs scales re-parse it used to name;
+    `journal_descriptions` returns up to **1001** rows, not 1000, with a
+    synthetic omission notice at index 0, so row index is not journal
+    index; the reachability test asserts the exact count (14) rather than
+    a range whose failure message described something it did not test.
+  - **Deferred, disclosed:** the damage rect a full journal produces
+    unions to roughly 1600 × 21000, ~24× a 900 px window. Harmless while
+    nothing in `aurora-app`'s redraw path consumes `take_damage`, but
+    whoever wires it to a scissor must intersect with the real surface
+    size first — an oversized scissor is a `wgpu` validation error in
+    crates that deny `panic`/`unwrap`. Noted in `history_panel`'s own doc
+    comment.
+
+  8 new tests (5 in `aurora-ui`, 90 there; 3 in `aurora-widgets`, 253
+  there), 1,519 passing across the workspace (was 1,511). Same gate,
+  same result: `cargo fmt --all --check`, both `scripts/` checkers,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test
+  --workspace`, `cargo test --workspace --doc`, and `cargo doc
+  --workspace --no-deps --all-features` all clean.
 - [~] **Command palette, keyboard shortcuts** — first slice done
   2026-08-04. Two new generic mechanisms in `aurora-widgets`, following
   the same "abstract steps, not `winit` types — translating real

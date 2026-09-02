@@ -1059,8 +1059,8 @@ fn verify_aur(path: &Path) -> bool {
 ///
 /// # Errors
 ///
-/// Propagates [`aurora_widgets::WidgetError`] if clearing or
-/// repopulating any panel fails — structurally unreachable in practice
+/// Propagates [`aurora_widgets::WidgetError`] if repopulating any panel
+/// fails — structurally unreachable in practice
 /// (`workspace` is always a real `aurora_ui::build_workspace` with real
 /// panel bodies), but this function doesn't itself know that, so it
 /// reports rather than assumes.
@@ -1077,12 +1077,17 @@ fn replace_document(
     ),
     aurora_widgets::WidgetError,
 > {
-    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.layers.body)?;
+    // No `clear_panel_body` calls: all three `populate_*` functions
+    // empty their own panel body as their first step (`0.77.1` for
+    // Layers, `0.77.2` for History, `0.77.3` for Properties), so the
+    // explicit clears that used to stand here removed the same children
+    // the very next line removed again. Dropping them changes nothing a
+    // caller can observe, including the error: a missing panel body is
+    // still reported as the same `WidgetError::UnknownWidget`, just
+    // raised by the populate call instead of the clear before it.
     let layer_rows =
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
-    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body)?;
     aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, scales, history)?;
-    aurora_ui::clear_panel_body(&mut workspace.tree, workspace.properties.body)?;
     let options = tool_options(tool);
     aurora_ui::populate_properties_panel(
         &mut workspace.tree,
@@ -3354,6 +3359,26 @@ fn run_command(
 /// professional's unsaved work). The consequence of that arm is an
 /// out-of-date History panel, not a lost edit: the undo/redo it follows
 /// has already been applied to the real document.
+///
+/// **This is an O(n) rebuild of the whole panel on every structural
+/// undo/redo, and re-reading the design file is the cheap part of it.**
+/// The scales parse was measured at roughly 20 µs — negligible. What
+/// costs is [`aurora_ui::populate_history_panel`] itself: it tears down
+/// every existing row widget and inserts one per journal entry, up to
+/// the 1001 `History::journal_descriptions` can return. And because
+/// undo and redo are themselves journaled steps, the journal grows with
+/// each one, so repeated `Ctrl+Z` makes every successive rebuild
+/// strictly larger — on the UI thread, which invariant §7.3.4 says must
+/// never block. It is tolerable today only because a real session's
+/// journal is short. The fix is the same one both panels already carry
+/// as an open item: an incremental refresh that touches only the rows
+/// that changed, or a virtualized list that only ever builds the
+/// visible ones (roughly 14 of them, `aurora_ui::history_panel`'s own
+/// doc comment).
+///
+/// No `clear_panel_body` call of its own: `populate_history_panel`
+/// empties the body itself as its first step (`0.77.2`), so an external
+/// clear here was doing the same work twice.
 fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_doc::History) {
     let scales = match load_scales() {
         Ok(scales) => scales,
@@ -3365,13 +3390,6 @@ fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_
             return;
         }
     };
-    if let Err(err) = aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body) {
-        tracing::warn!(
-            ?err,
-            "failed to clear the History panel before refreshing it"
-        );
-        return;
-    }
     if let Err(err) =
         aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &scales, history)
     {
@@ -3403,22 +3421,20 @@ fn tool_options(tool: aurora_ui::Tool) -> Vec<(&'static str, String)> {
     }
 }
 
-/// Clears and repopulates the Properties panel for `tool` — the same
-/// `clear_panel_body` + `populate_*` pattern [`refresh_history_panel`]
-/// already uses, just for the Properties panel and [`tool_options`]
-/// instead of a `History` journal. [`AppCommand::SelectTool`]'s own
-/// refresh step: clearing first matters here specifically, since without
-/// it switching from a tool with real options (Brush) to one without
-/// (Move) would leave the previous tool's stale rows sitting in the
-/// panel instead of a real empty state.
+/// Repopulates the Properties panel for `tool` — the same shape
+/// [`refresh_history_panel`] has, just for the Properties panel and
+/// [`tool_options`] instead of a `History` journal.
+/// [`AppCommand::SelectTool`]'s own refresh step.
+///
+/// Emptying the body first matters here specifically, since without it
+/// switching from a tool with real options (Brush) to one without (Move)
+/// would leave the previous tool's stale rows sitting in the panel
+/// instead of a real empty state. `aurora_ui::
+/// populate_properties_panel` does that for itself as of `0.77.3`, the
+/// same contract its two sibling `populate_*` functions already had, so
+/// the explicit `clear_panel_body` that used to stand here was doing the
+/// work twice.
 fn refresh_properties_panel(workspace: &mut aurora_ui::Workspace, tool: aurora_ui::Tool) {
-    if let Err(err) = aurora_ui::clear_panel_body(&mut workspace.tree, workspace.properties.body) {
-        tracing::warn!(
-            ?err,
-            "failed to clear the Properties panel before refreshing it"
-        );
-        return;
-    }
     let options = tool_options(tool);
     if let Err(err) = aurora_ui::populate_properties_panel(
         &mut workspace.tree,

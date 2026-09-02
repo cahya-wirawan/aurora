@@ -23,7 +23,7 @@
 use accesskit::{Action, Node, Role};
 use aurora_widgets::widgets::{self, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
-use taffy::style_helpers::{TaffyAuto, TaffyZero};
+use taffy::style_helpers::TaffyZero;
 use taffy::{Dimension, Display, Overflow, Style};
 
 /// One inserted panel's own widget ids.
@@ -97,13 +97,27 @@ pub fn insert_panel(
 /// height: 0` is what stops the automatic minimum size from putting the
 /// content height back. Content taller than the resulting share
 /// overflows the panel (see [`body_style`]) rather than growing it.
+///
+/// **`min_size.width` is pinned to `0` too, for the same reason on the
+/// other axis (0.77.3).** It was left `AUTO` when the height was pinned,
+/// because only the height axis had a demonstrated bug at the time. That
+/// asymmetry became a latent one the moment [`body_style`] became a
+/// `Column`: width is now the *cross* axis, and a row's own
+/// `min_size.width` (one row height, `crate::history_panel`'s
+/// `row_style`) propagates up through body → panel root → dock rail as a
+/// floor on the rail's whole width. It is currently unreachable —
+/// `crate::workspace::set_rail_width` clamps to `[150, 600]` and the
+/// propagated floor is 21 px — but "unreachable because something else
+/// happens to clamp harder" is exactly the shape the height bug had
+/// before a 43-layer document made it reachable. Pinning both axes
+/// closes the class rather than the one instance.
 fn root_style(collapsed: bool) -> Style {
     Style {
         flex_direction: taffy::FlexDirection::Column,
         flex_grow: if collapsed { 0.0 } else { 1.0 },
         flex_basis: Dimension::ZERO,
         min_size: taffy::Size {
-            width: Dimension::AUTO,
+            width: Dimension::ZERO,
             height: Dimension::ZERO,
         },
         ..Default::default()
@@ -119,11 +133,16 @@ fn root_style(collapsed: bool) -> Style {
 /// `WidgetTree::hit_test` would happily hand a click meant for
 /// Properties to a Layers row.
 ///
-/// `Overflow::Hidden` states the consequence rather than causing it:
-/// `WidgetTree::hit_test` already refuses to descend into a parent whose
-/// own bounds don't contain the point, so a row past the bottom of the
-/// panel is unreachable by pointer, and the panels painted after it
-/// cover it. **What does not exist yet is any way to *reach* that
+/// `Overflow::Hidden` is what actually clips: `WidgetTree::hit_test`
+/// already refuses to descend into a parent whose own bounds don't
+/// contain the point, so a row past the bottom of the panel is
+/// unreachable by pointer, and since `0.77.3`
+/// `aurora_widgets::paint::paint_widget` intersects every widget's own
+/// paint geometry with any ancestor declaring a clipping overflow, so it
+/// is invisible as well — rather than merely covered by whatever the
+/// paint order happens to draw next. This declaration is what that
+/// intersection reads; it is the only clipping overflow in the
+/// workspace. **What does not exist yet is any way to *reach* that
 /// content** — there is no scrolling container in `aurora-widgets` (see
 /// `aurora_widgets::widgets::tree_view`'s own module doc comment), so
 /// rows past the bottom of a crowded Layers panel are currently not
@@ -149,6 +168,16 @@ fn root_style(collapsed: bool) -> Style {
 ///   insert_tree_view` gives its own container an explicit
 ///   `size: { width: percent(1.0), height: percent(1.0) }` on *both*
 ///   axes, so its resolved box is identical under `Row` or `Column`.
+///   **The height being a *definite* `percent(1.0)`, not merely
+///   present, is what carries that** — and it is worth spelling out,
+///   because once height became the main axis the flex-item automatic
+///   minimum size became able to clamp the container *upward* to its
+///   content, and a Layers tree over a long document is easily 900 px of
+///   content inside a 300 px body. A definite main size caps the
+///   automatic minimum, so the container stays the body's height and its
+///   overflow is clipped rather than pushing the panel open. Changing
+///   that height to `auto()` would silently reintroduce exactly the
+///   rail-starvation bug `0.77.1` fixed on [`root_style`].
 ///   That container is now redundant for Layers and is deliberately
 ///   kept: removing it would mean rewriting every Layers test's
 ///   tree-root traversal for no behavioural gain.
@@ -181,8 +210,11 @@ fn body_style(collapsed: bool) -> Style {
         flex_direction: taffy::FlexDirection::Column,
         flex_grow: 1.0,
         flex_basis: Dimension::ZERO,
+        // Both axes, not just the height -- see `root_style`'s own doc
+        // comment for why the width pin is preventive rather than a fix
+        // for a reachable bug.
         min_size: taffy::Size {
-            width: Dimension::AUTO,
+            width: Dimension::ZERO,
             height: Dimension::ZERO,
         },
         overflow: taffy::Point {
@@ -193,13 +225,23 @@ fn body_style(collapsed: bool) -> Style {
     }
 }
 
-/// Removes every one of `body`'s current children — the "empty it
-/// first" half [`crate::populate_layers_panel`]/
-/// [`crate::populate_history_panel`] both need before a caller can call
-/// either again for a freshly opened document. Both modules' own doc
-/// comments call themselves "one-shot, not reactive": calling either
-/// twice without this in between would just append a second set of
-/// rows alongside the first, not replace them.
+/// Removes every one of `body`'s current children, leaving the body
+/// itself in the tree.
+///
+/// **No `populate_*` function needs an external call to this any more,
+/// and that is the current contract** — a correction, since through
+/// `0.77.2` this comment named exactly the two that had already stopped
+/// needing it. [`crate::populate_layers_panel`] (`0.77.1`),
+/// [`crate::populate_history_panel`] (`0.77.2`) and
+/// [`crate::populate_properties_panel`] (`0.77.3`) each call this
+/// themselves as their first step, so repopulating any panel replaces
+/// its rows rather than stacking a second set beside the first. Calling
+/// it beforehand is therefore redundant, not wrong.
+///
+/// What it is still for: emptying a panel with no repopulation to
+/// follow — [`close_panel`]'s own second half, and any future caller
+/// that wants a body genuinely empty rather than filled with something
+/// else.
 ///
 /// # Errors
 ///
@@ -305,6 +347,16 @@ pub fn set_panel_collapsed(
 /// already document. This module knows nothing about layers or history
 /// to repopulate anything itself.
 ///
+/// **The body's own accessibility node is reset too (0.77.3)**, back to
+/// the neutral `Role::GenericContainer` [`insert_panel`] created it
+/// with. Every `populate_*` function replaces that node with a real
+/// `Role::List` for the content it is about to insert, so without the
+/// reset a closed-then-reopened panel would announce an empty list —
+/// a role promising rows that were just freed. Emptying the children
+/// while leaving the role claiming them is precisely the mismatch this
+/// function exists to avoid; a plain [`set_panel_collapsed`]
+/// deliberately keeps both, because it keeps the content too.
+///
 /// # Errors
 ///
 /// Returns [`WidgetError::UnknownWidget`] if `panel.root` or
@@ -314,7 +366,8 @@ pub fn close_panel(
     panel: PanelHandle,
 ) -> Result<(), WidgetError> {
     set_panel_collapsed(tree, panel, true)?;
-    clear_panel_body(tree, panel.body)
+    clear_panel_body(tree, panel.body)?;
+    tree.set_accessibility(panel.body, Node::new(Role::GenericContainer))
 }
 
 #[cfg(test)]
@@ -325,6 +378,7 @@ mod tests {
     use aurora_widgets::WidgetError;
     use aurora_widgets::widgets::{self, WidgetKind};
     use taffy::Style;
+    use taffy::style_helpers::TaffyZero;
 
     #[test]
     fn insert_panel_adds_a_labeled_region_with_an_empty_body() {
@@ -644,6 +698,81 @@ mod tests {
             "reopening doesn't repopulate on its own -- this module knows nothing about \
              layers/history content, see close_panel's own doc comment"
         );
+    }
+
+    /// Closing frees the content, so it must free the *role* that
+    /// described it too. Otherwise a closed-then-reopened History panel
+    /// still announces a `Role::List` — an empty list, promising rows
+    /// that were just removed.
+    #[test]
+    fn closing_a_panel_resets_its_bodys_accessibility_to_a_neutral_container() {
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "History") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut list = accesskit::Node::new(accesskit::Role::List);
+        list.set_label("Something a populate_* call left behind");
+        if let Err(err) = tree.set_accessibility(panel.body, list) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = widgets::insert_container(&mut tree, panel.body, Style::default()) {
+            unreachable!("{err:?}");
+        }
+
+        if let Err(err) = close_panel(&mut tree, panel) {
+            unreachable!("{err:?}");
+        }
+
+        let Some(accessibility) = tree.accessibility(panel.body) else {
+            unreachable!("the body itself survives close_panel");
+        };
+        assert_eq!(
+            accessibility.role(),
+            accesskit::Role::GenericContainer,
+            "an emptied body must not keep claiming to be a list"
+        );
+        assert_eq!(
+            accessibility.label(),
+            None,
+            "nor keep the name the last populate_* call gave it"
+        );
+    }
+
+    /// `min_size` is pinned to zero on *both* axes, not just the height
+    /// `0.77.1` fixed. Under the `Column` body direction width is the
+    /// cross axis, so a row's own `min_size.width` would otherwise
+    /// propagate up as a floor on the whole dock rail's width — the same
+    /// shape as the height bug, one axis over. Read off the styles
+    /// themselves: the propagated floor is currently unreachable behind
+    /// `workspace::set_rail_width`'s own `[150, 600]` clamp, so no
+    /// layout assertion could catch a regression here.
+    #[test]
+    fn a_panels_own_styles_never_impose_a_minimum_size_on_either_axis() {
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "History") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for collapsed in [false, true] {
+            if let Err(err) = set_panel_collapsed(&mut tree, panel, collapsed) {
+                unreachable!("{err:?}");
+            }
+            for (name, id) in [("root", panel.root), ("body", panel.body)] {
+                let Some(style) = tree.style(id) else {
+                    unreachable!("just inserted");
+                };
+                assert_eq!(
+                    style.min_size,
+                    taffy::Size {
+                        width: taffy::Dimension::ZERO,
+                        height: taffy::Dimension::ZERO,
+                    },
+                    "a panel's {name} must never impose its content's size on the rail \
+                     (collapsed: {collapsed})"
+                );
+            }
+        }
     }
 
     #[test]

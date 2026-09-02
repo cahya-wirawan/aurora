@@ -38,14 +38,33 @@
 //! reason: `crate::panel`'s own `body_style` gives the panel a
 //! content-independent share of the rail, and there is no scrolling
 //! container anywhere in `aurora-widgets` yet. With the rail's ~300 px
-//! History share and 21 px rows, roughly **14** of an up-to-1000-entry
-//! journal (`History::journal_descriptions`' own cap) are reachable;
-//! the rest are refused by `hit_test`, which will not descend into a
-//! parent whose own bounds exclude the point. A real scrolling or
-//! virtualized list is what closes this, and it is still open.
+//! History share and 21 px rows, exactly **14** of an up-to-**1001**-row
+//! journal are reachable; the rest are refused by `hit_test`, which will
+//! not descend into a parent whose own bounds exclude the point. A real
+//! scrolling or virtualized list is what closes this, and it is still
+//! open.
+//!
+//! **1001, not 1000** — `History::journal_descriptions` caps the *real*
+//! journal steps it returns at `MAX_DESCRIPTIONS` (1000, matching
+//! Photoshop's own History-states maximum) and prepends a synthetic
+//! "N earlier steps omitted" notice at index 0 whenever anything was
+//! dropped, so its own `journal_descriptions_caps_entry_count_with_an_
+//! omission_notice` test asserts `len() == 1001`. That matters to
+//! whoever eventually wires row clicks up to a real "revert to this
+//! step" action: **row index is not journal index**, and on a truncated
+//! journal row 0 is not a step at all.
+//!
+//! **The damage rect a full journal produces is not yet safe to scissor
+//! with.** `WidgetTree` accumulates one union rect, so 1000 stacked rows
+//! union to roughly `Rect { 0, 0, 1600, 21000 }` — ~24× a 900 px-tall
+//! window. Harmless today: nothing in `aurora-app`'s redraw path
+//! consumes `WidgetTree::take_damage` yet (only tests and `input.rs`
+//! do). Whoever wires it to a partial-repaint path must intersect it
+//! with the real surface size first — an oversized scissor rect is a
+//! `wgpu` validation error, in crates that deny `panic`/`unwrap`.
 //!
 //! **No `Action::Focus`/`Action::Click` on a row, deliberately.**
-//! Adding them would make every journal entry a `Tab` stop — up to 1000
+//! Adding them would make every journal entry a `Tab` stop — up to 1001
 //! of them inside one panel — which is the same crate-wide focus-model
 //! question `aurora_widgets::widgets::tree_view` already discloses and
 //! the Layers panel already pays. Making History pay it too, for rows
@@ -68,25 +87,37 @@ use crate::panel::{PanelHandle, clear_panel_body};
 /// One history row's own layout: full body width, one row height tall,
 /// and never smaller than that on either axis.
 ///
-/// **`flex_grow` stays at its `0.0` default, and that is the whole
-/// point.** `aurora_widgets::widgets::command_palette::row_style` uses
-/// `flex_grow: 1.0` because its handful of result rows are *meant* to
-/// divide their container's height evenly; a history row is one line
-/// tall regardless of how many siblings it has. Borrowing that idiom
-/// here would divide the panel's ~300 px share among however many
-/// entries exist: 200 entries would be 1.5 px each and 1000 entries
-/// 0.3 px — below the integer resolution of `aurora_core::Rect`, so
-/// they would round to zero and the bug this style exists to fix would
-/// come straight back, in a form no row count short of the cap makes
-/// obvious. `tree_view::style` records the same borrowed-idiom mistake
-/// for the same reason.
+/// **Two separate guards, load-bearing for two different reasons.**
+/// The `0.77.2` commit message credited `flex_grow: 0.0` with preventing
+/// sub-pixel rows in a long journal; that was wrong, and the correction
+/// is measured rather than reasoned (0.77.3 review round).
 ///
-/// `size.height: auto()` with `min_size.height: length(row)` rather
-/// than a fixed `length(row)`: an `auto` main size gives the item a
-/// flex base size of `0`, so its scaled flex-shrink factor is `0` too
-/// and a crowded panel cannot squeeze rows below the floor — the
-/// minimum is a real floor, not a starting point flexbox is free to
-/// shrink past.
+/// - **`min_size.height: length(row)` is what makes a row exactly one
+///   line tall at *any* entry count.** It is a hard flexbox floor that
+///   neither `flex_grow` nor `flex_shrink` can cross. `size.height:
+///   auto()` is what makes it a real floor rather than a starting point:
+///   an `auto` main size gives the item a flex base size of `0`, so its
+///   *scaled* flex-shrink factor (`flex_shrink × flex_base_size`) is `0`
+///   too and a crowded panel has nothing to shrink. Setting
+///   `flex_grow: 1.0` here was applied as a mutation and measured: rows
+///   still came back a correct 21 px at 200 entries and at 1000. The
+///   "200 entries would be 1.5 px each, 1000 would be 0.3 px" scenario
+///   the previous wording described **does not occur**, and nothing here
+///   depends on `flex_grow` to prevent it.
+/// - **`flex_grow: 0.0` (the default, spelled by omission) is what stops
+///   a *sparse* panel from inflating its rows.** Free space is what
+///   `flex_grow` divides, and a panel with a handful of entries has
+///   plenty: the same mutation inflates five rows to 60 px each, which
+///   is what `history_rows_are_real_list_row_widgets_with_a_hittable_size`
+///   actually catches. `aurora_widgets::widgets::command_palette::
+///   row_style` uses `flex_grow: 1.0` deliberately, because its handful
+///   of result rows really are meant to divide their container evenly; a
+///   history row is one line tall no matter how much room it is offered.
+///   `tree_view::style` records the same borrowed-idiom mistake.
+///
+/// Neither is redundant, and deleting `min_size.height` in particular
+/// would bring the zero-height bug straight back — it is the guard that
+/// holds, not the one the old wording credited.
 ///
 /// `min_size.width` is one row height as well, the same square floor
 /// and the same reasoning `tree_view::style` documents: no "minimum row
@@ -112,6 +143,17 @@ fn row_style(scales: &Scales) -> Style {
 /// `Role::List`, then inserts one `Role::ListItem` row per journal entry
 /// in `history`, in chronological order (oldest first, matching
 /// `History::journal_descriptions`'s own order).
+///
+/// **The `Role::List` is deliberately unlabelled.** `panel.root` is
+/// already a `Role::Region` labelled "History" ([`crate::panel::
+/// insert_panel`]), so naming the list inside it "History" too was the
+/// same nested-duplicate-name shape [`crate::layers_panel`] had to fix
+/// in `0.77.1` — a screen reader announcing the name twice on entry —
+/// just one level shallower. Relabelling the body rather than nesting a
+/// second container did not avoid it; dropping the label does. A body
+/// label would only be right if it said something the region does not,
+/// the way [`crate::populate_properties_panel`]'s "Properties: Brush"
+/// names the active tool.
 ///
 /// **The rows are `panel.body`'s own direct children**, unlike
 /// [`crate::populate_layers_panel`], which nests its rows inside a
@@ -148,9 +190,7 @@ pub fn populate_history_panel(
     history: &History,
 ) -> Result<(), WidgetError> {
     clear_panel_body(tree, panel.body)?;
-    let mut list_node = Node::new(Role::List);
-    list_node.set_label("History");
-    tree.set_accessibility(panel.body, list_node)?;
+    tree.set_accessibility(panel.body, Node::new(Role::List))?;
 
     let style = row_style(scales);
     for description in history.journal_descriptions() {
@@ -438,14 +478,57 @@ mod tests {
                 ws.tree.hit_test(point) == Some(row)
             })
             .count();
-        assert!(
-            reachable > 0,
-            "the rows that fit in the panel must still be clickable"
+        // The exact count, not just `> 0 && < len`. The loose form read
+        // as "a scrolling container would close this gap," which it
+        // would not make fail -- a scrolled-out row is exactly as
+        // unreachable to `hit_test` as a clipped-out one. What is really
+        // being pinned is the arithmetic: a 300px panel share divided by
+        // 21px rows, with no scrolling of any kind. Pinning the number
+        // is what makes a silent change in the visible row count a test
+        // failure rather than a shrug.
+        assert_eq!(
+            reachable, 14,
+            "300px of History share divided by 21px rows -- the rows that fit really work, \
+             and the other 186 are clipped and unreachable"
         );
-        assert!(
-            reachable < rows.len(),
-            "and the rest are clipped -- the disclosed gap a real scrolling container would \
-             close, not a claim that all 200 rows are usable"
+    }
+
+    /// The `Role::List` body must carry no accessible name of its own:
+    /// `panel.root` is already a `Role::Region` labelled "History", and
+    /// a nested node repeating that name is the same double-announcement
+    /// `layers_panel` fixed in `0.77.1` by leaving its tree container
+    /// unlabelled. Mirrors that module's own
+    /// `tree.accessibility(tree_root).label() == None` assertion.
+    #[test]
+    fn the_history_list_body_carries_no_name_of_its_own() {
+        let history = history_with(3);
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = match insert_panel(&mut tree, root, "History") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let scales = test_scales();
+        if let Err(err) = populate_history_panel(&mut tree, panel, &scales, &history) {
+            unreachable!("{err:?}");
+        }
+
+        let (Some(region), Some(list)) = (
+            tree.accessibility(panel.root),
+            tree.accessibility(panel.body),
+        ) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(
+            region.label(),
+            Some("History"),
+            "the panel's own region is what names it"
+        );
+        assert_eq!(list.role(), accesskit::Role::List);
+        assert_eq!(
+            list.label(),
+            None,
+            "a nested node repeating the region's name makes a screen reader announce \
+             'History' twice on entry"
         );
     }
 
