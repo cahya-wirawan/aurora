@@ -538,6 +538,48 @@ impl TileStore {
             .is_some_and(Tile::is_dirty)
     }
 
+    /// Whether this store holds *any* content for `(surface, id)` —
+    /// resident, evicted-but-not-yet-confirmed-written, or paged out to
+    /// the scratch disk — **without materializing it**.
+    ///
+    /// This is precisely the negation of this type's own (private)
+    /// `ensure_resident` branch (d): `false` means [`Self::get`] would
+    /// hand back a
+    /// brand-new `Tile::blank()`, and `true` means it would hand back
+    /// something somebody actually wrote.
+    ///
+    /// # Why this exists rather than "just call `get`"
+    ///
+    /// Because for a caller that treats a blank tile as a no-op,
+    /// `get` is the expensive way to learn nothing. Materializing a
+    /// never-touched tile allocates a whole `SAMPLES`-long buffer,
+    /// makes it resident, and — since residency is capped by the
+    /// store's own budget — can evict a *real* tile to make room for
+    /// it, paying a synchronous encode and scratch-disk write for a
+    /// tile that holds only zeros. `aurora-app`'s mask compositing hit
+    /// exactly that: every enabled mask read its coverage surface once
+    /// per composited tile, and today no mask surface has ever been
+    /// painted, so the entire cost bought a buffer of zeros it already
+    /// had. Measured at ~2.9× the per-tile cost of not reading at all,
+    /// on a frame path CLAUDE.md already documents as over its 60 FPS
+    /// budget.
+    ///
+    /// Three `HashMap`/`LruCache` lookups, no I/O, no allocation.
+    /// Peeks rather than gets, for [`Self::is_dirty`]'s reason: asking
+    /// whether a tile exists is not an access, and must not bump LRU
+    /// recency.
+    ///
+    /// `failed_writes` is deliberately not consulted: every key in it
+    /// is also in `pending` (that is what makes those bytes the tile's
+    /// only surviving copy), so it would add nothing.
+    #[must_use]
+    pub fn contains_tile(&self, surface: SurfaceId, id: TileId) -> bool {
+        let key = (surface, id);
+        self.resident.contains(&key)
+            || self.pending.contains_key(&key)
+            || self.paged_out.contains_key(&key)
+    }
+
     /// Blocks until every write submitted so far has actually reached
     /// disk (e.g. before a document save) and surfaces the first
     /// failure encountered, if any. Every failure is logged via
@@ -1176,6 +1218,103 @@ mod tests {
              occupies -- not for its magic, version or header, which `CorruptFile` also covers: \
              {message}"
         );
+    }
+
+    #[test]
+    // The property `contains_tile` is bought for: asking must be free.
+    // A `true` answer would mean `get` had materialized the tile --
+    // which is exactly the cost the caller is trying to avoid, and
+    // would also have consumed a slot of the residency budget.
+    fn contains_tile_is_false_for_a_never_touched_tile_and_does_not_create_it() {
+        let (_dir, mut store) = store(4);
+        let id = TileId { x: 3, y: 7 };
+        assert!(!store.contains_tile(surface(), id));
+        assert_eq!(store.stats().tiles_created, 0);
+        assert_eq!(store.resident_len(), 0);
+        // And it still reads as blank afterwards, so skipping the read
+        // on a `false` answer really is equivalent to doing it.
+        let Ok(tile) = store.get(surface(), id) else {
+            unreachable!("no prior state exists to fail on");
+        };
+        assert!(tile.texels().iter().all(|s| s.to_f32() == 0.0));
+    }
+
+    #[test]
+    // The three places content can live -- resident, evicted with the
+    // write still in flight (`pending`), and confirmed on the scratch
+    // disk (`paged_out`) -- all have to answer `true`, or a caller that
+    // skips on `false` silently drops real pixels.
+    fn contains_tile_is_true_whether_the_tile_is_resident_pending_or_paged_out() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        if store.get_mut(s, a).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.contains_tile(s, a), "resident");
+
+        // Budget of 1, so touching `b` evicts `a`; its bytes are in
+        // `pending` and its path in `paged_out` from the same instant.
+        if store.get_mut(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.contains_tile(s, a), "evicted, write in flight");
+        assert!(store.contains_tile(s, b), "resident");
+
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        assert!(store.contains_tile(s, a), "confirmed on the scratch disk");
+    }
+
+    #[test]
+    // Asking is not an access: `contains_tile` must not promote the
+    // tile it is asked about, or a query would change which tile the
+    // next eviction picks.
+    fn contains_tile_does_not_bump_lru_recency() {
+        let (_dir, mut store) = store(2);
+        let s = surface();
+        let old = TileId { x: 0, y: 0 };
+        let new = TileId { x: 1, y: 0 };
+        for id in [old, new] {
+            if store.get_mut(s, id).is_err() {
+                unreachable!("a fresh store must serve this tile");
+            }
+        }
+        // If this promoted `old`, the eviction below would take `new`.
+        assert!(store.contains_tile(s, old));
+        if store.get_mut(s, TileId { x: 2, y: 0 }).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert_eq!(
+            store.stats().evictions,
+            1,
+            "exactly one tile should have been evicted"
+        );
+        assert!(
+            store.contains_tile(s, new),
+            "`new` was the most recently used and must have survived -- if it did not, \
+             `contains_tile` promoted `old` and changed the eviction order"
+        );
+    }
+
+    #[test]
+    // Tiles are keyed by `(surface, id)`, so the same `TileId` on
+    // another surface must not answer for this one -- the exact
+    // confusion the mask-surface partition would otherwise invite,
+    // since a mask surface and its layer's own surface share tile
+    // coordinates.
+    fn contains_tile_is_per_surface_not_per_tile_id() {
+        let (_dir, mut store) = store(4);
+        let id = TileId { x: 2, y: 2 };
+        let other = SurfaceId::from_raw(1 << 63);
+        if store.get_mut(surface(), id).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.contains_tile(surface(), id));
+        assert!(!store.contains_tile(other, id));
     }
 
     #[test]

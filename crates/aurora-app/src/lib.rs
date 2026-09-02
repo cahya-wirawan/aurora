@@ -4963,6 +4963,14 @@ fn apply_mask(
             WindowKind::MaskCoverage,
         )
     });
+    // A coverage window that is blank *and known to be* says exactly
+    // what no window at all says -- coverage `1.0` inside the bounds --
+    // so it is dropped here rather than consulted 65,536 times to be
+    // told the same thing. This is the common case today and probably
+    // for a long time: nothing paints mask coverage yet, and once
+    // something does, most masks still will not be painted on most
+    // tiles.
+    let coverage_window = coverage_window.filter(|window| !window.is_blank());
     let mut masked = vec![half::f16::from_f32(0.0); texels.len()];
     for (index, (src, dst)) in texels
         .chunks_exact(aurora_tile::CHANNELS)
@@ -4994,18 +5002,28 @@ fn apply_mask(
                     else {
                         continue;
                     };
-                    let base = index * aurora_tile::CHANNELS;
-                    match window.texels.get(base..base + aurora_tile::CHANNELS) {
+                    if window.was_read(window_col, window_row) {
+                        let base = index * aurora_tile::CHANNELS;
+                        match window.texels.as_ref() {
+                            // `map` on the `get`: a window that cannot
+                            // be indexed says the same thing a failed
+                            // read does -- no coverage determined --
+                            // and so stays `None`.
+                            Some(texels) => texels
+                                .get(base..base + aurora_tile::CHANNELS)
+                                .map(aurora_doc::read_mask_coverage),
+                            // Read cleanly, nothing ever stored under
+                            // this part of the surface: the
+                            // never-painted default.
+                            None => Some(1.0),
+                        }
+                    } else {
                         // A texel whose own source tile failed to read
                         // is all-zeros for that reason, not because
                         // nobody painted it -- so it carries no
                         // coverage, rather than the zeros' usual
                         // meaning of `1.0`.
-                        Some(_) if !window.was_read(window_col, window_row) => None,
-                        Some(texel) => Some(aurora_doc::read_mask_coverage(texel)),
-                        // A window that cannot be indexed at all is the
-                        // same statement: no coverage was determined.
-                        None => None,
+                        None
                     }
                 }
                 // No mask surface: `mask.bounds` alone decides, and
@@ -5555,7 +5573,7 @@ fn resolve_tile(
                     budget,
                     WindowKind::LayerPixels,
                 )
-                .texels
+                .into_texels()
             };
             // Masking runs first, ahead of `Dissolve` below: it
             // restricts which pixels are even in play, and by how much,
@@ -6733,7 +6751,11 @@ struct UnreadRegion {
 /// [`read_layer_window`]'s own doc comment.
 #[derive(Debug)]
 struct LayerWindow {
-    texels: Vec<half::f16>,
+    /// `None` when no source tile overlapping this window was ever
+    /// stored on the surface — every texel is the blank default, and
+    /// nothing was allocated, paged in, or materialized to establish
+    /// that. See [`read_layer_window`]'s own doc comment.
+    texels: Option<Vec<half::f16>>,
     /// At most four entries: one window overlaps at most four source
     /// tiles. Empty in the overwhelmingly common case, which is what
     /// makes [`Self::was_read`] a no-op scan rather than a per-texel
@@ -6742,6 +6764,30 @@ struct LayerWindow {
 }
 
 impl LayerWindow {
+    /// Whether this window is blank *and known to be* — nothing stored
+    /// and nothing that failed to read, so every texel really is the
+    /// surface's own default.
+    ///
+    /// [`apply_mask`] uses this to drop straight onto its
+    /// `mask_surface: None` path, which is bit-identical for a blank
+    /// coverage window and skips the per-texel window lookups
+    /// entirely.
+    fn is_blank(&self) -> bool {
+        self.texels.is_none() && self.unread.is_empty()
+    }
+
+    /// The window as a plain buffer, materializing the all-zero default
+    /// if nothing was stored — for a caller that needs texels either
+    /// way and gives blank its ordinary meaning (fully transparent).
+    fn into_texels(self) -> Vec<half::f16> {
+        self.texels.unwrap_or_else(|| {
+            vec![
+                half::f16::from_f32(0.0);
+                aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
+            ]
+        })
+    }
+
     /// Whether the texel at window-local `(col, row)` reflects an
     /// actual read of the surface.
     ///
@@ -6779,6 +6825,25 @@ impl LayerWindow {
 /// transparent, the same as any pixel `surface` has genuinely never
 /// been painted at.
 ///
+/// # A surface with nothing stored under it costs nothing
+///
+/// Neither the up-to-four `aurora_tile::TileStore::get` calls nor the
+/// destination buffer happen for a source tile that was never written.
+/// `TileStore::get` *materializes* an untouched tile — allocates it,
+/// makes it resident, and can evict a real tile to make room, paying a
+/// synchronous encode and scratch-disk write — all to hand back zeros
+/// this window already holds; `contains_tile` answers the same question
+/// in three hash lookups. The buffer is likewise allocated on the first
+/// tile that really exists, so a wholly-unstored surface returns
+/// `texels: None` having touched nothing at all.
+///
+/// That case is not hypothetical: today it is *every* mask surface,
+/// because nothing in the app paints one yet, and it stays the common
+/// case afterwards (most masks will never be painted on most tiles).
+/// Measured at ~2.9× the per-tile cost of the bounds-only path before
+/// this, on the frame path CLAUDE.md already records as over its 60 FPS
+/// budget — see [`apply_mask`].
+///
 /// # Why the result is a [`LayerWindow`] and not a bare `Vec`
 ///
 /// Because "this texel is blank" and "this texel could not be read"
@@ -6808,11 +6873,13 @@ fn read_layer_window(
     let tile_size = i64::from(aurora_tile::TILE);
     let window_x = doc_origin.0 - layer_origin.0;
     let window_y = doc_origin.1 - layer_origin.1;
-    let mut out =
-        vec![
-            half::f16::from_f32(0.0);
-            aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
-        ];
+    // Allocated on the first source tile that actually exists, not up
+    // front: a window over a surface with nothing stored under it at
+    // all -- today, *every* mask surface, since nothing paints one yet
+    // -- would otherwise pay a half-megabyte zero-fill to learn that
+    // it is blank. `None` is the caller's signal for exactly that. See
+    // this function's own doc comment.
+    let mut out: Option<Vec<half::f16>> = None;
     // At most four source tiles overlap one window, so at most four
     // regions can fail; the `Vec` never grows past that.
     let mut unread: Vec<UnreadRegion> = Vec::new();
@@ -6841,13 +6908,23 @@ fn read_layer_window(
             if col_lo >= col_hi {
                 continue;
             }
-            let src = match store.get(
-                surface,
-                aurora_tile::TileId {
-                    x: tile_col,
-                    y: tile_row,
-                },
-            ) {
+            let tile_id = aurora_tile::TileId {
+                x: tile_col,
+                y: tile_row,
+            };
+            // Nothing was ever stored here, so `TileStore::get` would
+            // materialize a blank tile -- allocate it, make it
+            // resident, and (residency being capped) very possibly
+            // evict a *real* tile to make room, paying a synchronous
+            // encode and scratch-disk write -- purely to copy zeros
+            // over the zeros `out` already holds. Skipping is
+            // bit-identical output at a fraction of the cost, and
+            // leaves the LRU cache alone. See
+            // `aurora_tile::TileStore::contains_tile`.
+            if !store.contains_tile(surface, tile_id) {
+                continue;
+            }
+            let src = match store.get(surface, tile_id) {
                 Ok(src) => src,
                 Err(err) => {
                     // Same reason as `resolve_tile`'s own direct
@@ -6886,6 +6963,14 @@ fn read_layer_window(
                 }
             };
             let texels = src.texels().to_vec();
+            // First real source tile for this window: now, and only
+            // now, is a destination buffer worth having.
+            let out = out.get_or_insert_with(|| {
+                vec![
+                    half::f16::from_f32(0.0);
+                    aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
+                ]
+            });
             for src_row in row_lo..row_hi {
                 let dst_row = (src_row - window_y) as usize;
                 let in_tile_row = (src_row - tile_y * tile_size) as usize;
@@ -17024,6 +17109,108 @@ mod tests {
         }
 
         (dir, store, mask_surface)
+    }
+
+    #[test]
+    // The measured regression this round fixes, pinned as a property
+    // rather than as a timing threshold. Before this, `apply_mask`
+    // read the mask coverage window unconditionally for every enabled
+    // mask with a surface -- and since nothing in the app paints mask
+    // coverage yet, every one of those reads materialized up to four
+    // never-touched tiles: a full `SAMPLES` allocation each, made
+    // resident, capable of evicting a real layer tile and paying a
+    // synchronous encode plus scratch-disk write for the privilege.
+    //
+    // Timed with a loop over 200 tiles on this machine, before and
+    // after: 453.5us/tile bounds-only vs 1312.6us/tile with an
+    // unpainted mask surface (2.9x), against 364.6us vs 369.3us after
+    // (1.01x) -- recorded in the commit and in PLAN.md rather than
+    // asserted here, because a wall-clock assertion in CI measures the
+    // runner's mood. What *is* asserted is the mechanism the speedup
+    // comes from, which does not vary: nothing is materialized, so the
+    // store is untouched and the residency budget is undisturbed.
+    fn apply_mask_does_not_materialize_tiles_of_an_unpainted_mask_surface() {
+        let texels = solid_tile_buffer([0.25, 0.5, 0.75, 1.0]);
+        let mask = rect_mask(0, 0, 10_000, 10_000);
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let surface = aurora_tile::SurfaceId::from_raw(0x2b | aurora_doc::MASK_SURFACE_BIT);
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let masked = apply_mask(
+            &texels,
+            &mask,
+            Some(surface),
+            &mut store,
+            (0, 0),
+            &mut budget,
+        );
+
+        assert_eq!(
+            store.stats().tiles_created,
+            0,
+            "an unpainted mask surface must not be materialized to discover it is unpainted"
+        );
+        assert_eq!(store.resident_len(), 0, "and must not occupy the LRU cache");
+        assert!(budget.store_error().is_none());
+        // And the output is still exactly the bounds-only clip -- the
+        // skip is an optimization, not a behaviour change. (The
+        // byte-identity of those two is
+        // `apply_mask_with_an_unpainted_mask_surface_matches_the_bounds_only_clip`;
+        // this checks the same buffer arrives.)
+        assert_eq!(masked, apply_mask_bounds_only(&texels, &mask, (0, 0)));
+    }
+
+    #[test]
+    // The other half: skipping must apply per *tile*, not per surface,
+    // so a mask surface that is painted on one tile and untouched on
+    // the next still reads the painted one. A too-eager skip would
+    // silently ignore real mask pixels.
+    fn apply_mask_still_reads_a_mask_surface_that_is_painted_on_only_some_tiles() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        let side = i64::from(aurora_tile::TILE);
+        let mask = rect_mask(0, 0, 10_000, 10_000);
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let surface = aurora_tile::SurfaceId::from_raw(0x2c | aurora_doc::MASK_SURFACE_BIT);
+
+        // Tile (0, 0) painted fully hidden; tile (1, 0) never touched.
+        let painted = aurora_tile::TileId { x: 0, y: 0 };
+        let extent = aurora_tile::TILE as usize;
+        for y in 0..extent {
+            for x in 0..extent {
+                if let Err(err) =
+                    aurora_doc::write_mask_coverage(&mut store, surface, painted, x, y, 0.0)
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+
+        for (origin, expected, why) in [
+            ((0, 0), (0.0, 0.0, 0.0, 0.0), "painted to coverage 0.0"),
+            ((side, 0), (1.0, 1.0, 1.0, 1.0), "never painted"),
+        ] {
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let masked = apply_mask(
+                &texels,
+                &mask,
+                Some(surface),
+                &mut store,
+                origin,
+                &mut budget,
+            );
+            for chunk in masked.chunks_exact(aurora_tile::CHANNELS) {
+                let [r, g, b, a] = chunk else {
+                    unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+                };
+                assert_eq!(
+                    (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                    expected,
+                    "tile at {origin:?} is {why}"
+                );
+            }
+        }
     }
 
     #[test]
