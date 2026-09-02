@@ -45,6 +45,21 @@ pub enum WidgetError {
     /// prevent.
     #[error("invalid numeric range: min={min}, max={max} (both must be finite, with min <= max)")]
     InvalidRange { min: f64, max: f64 },
+    /// [`widgets::insert_tree_item`](crate::widgets::insert_tree_item)
+    /// was asked to nest a tree row deeper than
+    /// [`widgets::MAX_TREE_DEPTH`](crate::widgets::MAX_TREE_DEPTH).
+    /// Returned rather than built, because the failure on the other side
+    /// of that cap is not an error a caller can handle: `WidgetTree`'s
+    /// layout, paint, and hit-test traversals are recursive, and a deep
+    /// enough tree overflows the stack and **aborts the process** — no
+    /// `Result`, and nothing the workspace's own `panic = "deny"` lint
+    /// can see.
+    #[error("cannot nest a tree row under {parent:?} at depth {depth}: the maximum is {max}")]
+    TreeTooDeep {
+        parent: WidgetId,
+        depth: usize,
+        max: usize,
+    },
     /// [`crate::paint_widget`] failed to tessellate a widget's own paint
     /// geometry into a `Mesh`. In practice unreachable from this crate's
     /// own callers today: `rounded_rect`'s own cubic-Bézier output never

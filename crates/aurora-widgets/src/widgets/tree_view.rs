@@ -3,7 +3,7 @@
 //! and — for a row that declares children — an expanded/collapsed
 //! state that is kept in lockstep with the tree's actual structure.
 //!
-//! **Scope, stated honestly.** Three things a finished tree widget has
+//! **Scope, stated honestly.** Five things a finished tree widget has
 //! and this one does not:
 //!
 //! - **No scrolling container.** A tree taller than its parent
@@ -19,16 +19,46 @@
 //! - **No text.** A row's `label` reaches the accessibility node and
 //!   nothing else, the same "no real text shaping in this crate" gap
 //!   `TextField` already has.
+//! - **No in-row content.** A row has no content container of its own:
+//!   its `padding.top` band is where its *own* line would be drawn, and
+//!   anything inserted under a row becomes a child *row*, one level
+//!   deeper, not something sitting beside the row's label. So the
+//!   motivating Layers-panel shape — thumbnail, visibility checkbox,
+//!   and name on one line — cannot be built here yet. Closing that
+//!   needs a real per-row content box (the row becoming a `Row` of
+//!   [content | children] rather than a `Column` of [own band |
+//!   children]), which is a redesign of [`style`], [`insert_tree_item`]
+//!   and `paint::paint_tree_item` together, not a local fix. What *is*
+//!   fixed is the silent data loss it used to cause:
+//!   [`set_tree_item_expanded`]`(id, false)` removes only the tree rows
+//!   beneath `id`, never a widget of some other kind a caller put there.
+//! - **One tab stop per row, not per tree.** Every enabled row declares
+//!   `Action::Focus`, so `FocusManager` treats a 500-row tree as 500 tab
+//!   stops, where the conventional pattern is one stop on the tree plus
+//!   arrow-key navigation between rows (`accesskit`'s own
+//!   active-descendant shape). Choosing between those two is an
+//!   architectural decision about this crate's whole focus model, not a
+//!   tree-local one, so it is named here rather than quietly settled —
+//!   the same way `Scrollbar` disclosed that only the Windows adapter
+//!   consumes its expanded state.
 //!
 //! **`WidgetTree`'s own traversals are unbounded recursion**
 //! (`paint_order`/`collect_paint_order`, `build_taffy_node`,
 //! `hit_test_from`, `remove_subtree`, `apply_taffy_layout`), and this
 //! is the first widget in the crate that *invites* deep nesting — a
 //! layers panel over a deeply grouped document is exactly the shape
-//! that would find it. Pre-existing and not fixed here (it is a
-//! property of `tree.rs`, not of this module, and every one of those
-//! five sites would need converting together), but named rather than
-//! left for someone to discover with a stack overflow.
+//! that would find it. Measured: `compute_layout` overflows the stack
+//! and **aborts the process** (`SIGABRT`, which no `Result` and no
+//! `panic = "deny"` lint can catch) somewhere between depth 1100 and
+//! 1200 in a debug build, and between 3000 and 4000 in release.
+//!
+//! Fixing that properly is still out of scope — it is a property of
+//! `tree.rs`, shared by every widget, and all five sites would have to
+//! be converted to explicit stacks together. What this module does
+//! instead is refuse to *build* a tree deep enough to reach it:
+//! [`insert_tree_item`] returns [`WidgetError::TreeTooDeep`] beyond
+//! [`MAX_TREE_DEPTH`], an order of magnitude below the measured abort
+//! and two orders above any real document's group nesting.
 //!
 //! # The accessibility vocabulary, and which platforms actually read it
 //!
@@ -75,23 +105,39 @@
 //!
 //! # Collapse removes children; it does not hide them
 //!
-//! [`set_tree_item_expanded`]`(id, false)` removes `id`'s child widgets
-//! from the [`WidgetTree`] outright (cascading through each whole
-//! subtree, via `WidgetTree::remove`), and the caller re-inserts them
-//! on expand — the same "real tree nodes, not a hidden flag" shape
+//! [`set_tree_item_expanded`]`(id, false)` removes the **tree rows**
+//! beneath `id` from the [`WidgetTree`] outright (cascading through each
+//! whole subtree, via `WidgetTree::remove`), and the caller re-inserts
+//! them on expand — the same "real tree nodes, not a hidden flag" shape
 //! `command_palette`'s own open/close already uses. Two consequences a
-//! caller must know: a collapsed row's descendants no longer exist, so
-//! their [`WidgetId`]s are dead; and expanding a row does **not**
-//! repopulate it — [`set_tree_item_expanded`]`(id, true)` on a row with
-//! no children is a deliberate, legal no-op that only updates the
-//! accessibility node, which is exactly what a lazily-populated tree
+//! caller must know: a collapsed row's descendant *rows* no longer
+//! exist, so their [`WidgetId`]s are dead; and expanding a row does
+//! **not** repopulate it — [`set_tree_item_expanded`]`(id, true)` on a
+//! row with no children is a deliberate, legal no-op that only updates
+//! the accessibility node, which is exactly what a lazily-populated tree
 //! needs.
 //!
-//! `has_children` is therefore **caller-declared** at insert time, not
-//! derived from `tree.children(id).is_empty()`: a collapsed group has
-//! no children in the tree and must still announce itself as collapsed
-//! rather than as a leaf. [`insert_tree_item`] does maintain it in the
-//! one direction it can — inserting a row under a row makes that parent
+//! **Rows, not "everything underneath".** A child of some other kind (a
+//! `Checkbox`, a `ColorSwatch`, a plain container) is left exactly where
+//! it is: collapse is a statement about a group's *rows*, and silently
+//! deleting a widget a caller deliberately parented to a row would be
+//! data loss reachable straight through this module's own validated
+//! public API. Rows nested *inside* such a container are still removed,
+//! since they really are descendant rows of the collapsed group — the
+//! same "look through plain containers, stop at a `Role::Tree`"
+//! traversal [`insert_tree_item`] uses to derive depth.
+//!
+//! `has_children` is **caller-declared** at insert time, not derived
+//! from `tree.children(id).is_empty()`: a collapsed group has no rows in
+//! the tree and must still announce itself as a group rather than as a
+//! leaf. The *expanded* half is the opposite, and deliberately so —
+//! [`node`] announces `expanded` only when the row both claims to be
+//! expanded and really has rows under it right now. A group whose rows
+//! were destroyed by a collapse and never repopulated would otherwise
+//! announce "expanded" over nothing, and offer a `Collapse` action that
+//! could never change anything. [`insert_tree_item`] maintains the
+//! stored flags in the one direction it can — inserting a row under a
+//! row (however many plain containers deep) makes that ancestor
 //! `has_children = true` and `expanded = true`, since the child is now
 //! really there and really visible.
 //!
@@ -115,22 +161,41 @@ use super::{WidgetKind, spacing, tree_row_height};
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 
+/// The deepest a row may be nested: the largest legal
+/// [`TreeItemState::depth`], so at most `MAX_TREE_DEPTH + 1` rows in one
+/// chain. Beyond it [`insert_tree_item`] returns
+/// [`WidgetError::TreeTooDeep`] rather than building a tree that aborts
+/// the process during layout — see this module's own doc comment for the
+/// measured thresholds (1100–1200 debug, 3000–4000 release) and for why
+/// the underlying recursion is not what this cap fixes.
+///
+/// `255` is chosen to be uninteresting from both directions: an order of
+/// magnitude below the shallowest measured abort, and two orders above
+/// any real document's group nesting (Photoshop's own PSD group nesting
+/// does not approach it, and a human cannot navigate 255 levels of
+/// indent in a panel anyway).
+pub const MAX_TREE_DEPTH: usize = 255;
+
 /// One row of a tree. `Eq`, unlike most state types here — every field
 /// is a `String`, `usize`, or `bool`, no floats involved.
 // Four bools, and the lint is worth answering rather than waving
 // through. Three of them (`selected`, `disabled`, `has_children`) are
-// genuinely independent, simultaneously-settable facts about a row, the
-// same shape `shortcut::Modifiers` already carries this allow for.
-// `expanded` is the honest exception: it means nothing unless
-// `has_children`, and `Option<bool>` -- exactly `accesskit`'s own
-// `is_expanded()` shape -- would make that unrepresentable rather than
-// merely documented. It is kept as a plain `bool` because these two are
-// the caller-facing fields the widget's whole API is specified in terms
-// of (`insert_tree_item`'s `has_children` argument,
-// `set_tree_item_expanded`), and the coupling is enforced in the one
-// place that consumes it: `node()` never emits `expanded` for a leaf,
-// asserted by `a_leaf_row_declares_no_expanded_state_and_no_expand_
-// collapse_action` and `collapsing_a_leaf_leaves_its_node_leaf_shaped`.
+// genuinely independent, simultaneously-settable facts about a row.
+// (`shortcut::Modifiers` carries the same allow, but it is *not* the
+// precedent for this one: all four of its bools are fully independent,
+// which is exactly what isn't true here.) `expanded` is the honest
+// exception: it means nothing unless `has_children`, and
+// `Option<bool>` -- exactly `accesskit`'s own `is_expanded()` shape --
+// would make that unrepresentable rather than merely documented. It is
+// kept as a plain `bool` because these two are the caller-facing fields
+// the widget's whole API is specified in terms of (`insert_tree_item`'s
+// `has_children` argument, `set_tree_item_expanded`), and the coupling
+// is enforced at both ends rather than only documented: `insert_tree_
+// item` never stores `expanded: true` on a row that isn't a group, and
+// `node()` never emits `expanded` for a leaf -- asserted by
+// `a_leaf_row_declares_no_expanded_state_and_no_expand_collapse_action`,
+// `collapsing_a_leaf_leaves_its_node_leaf_shaped`, and
+// `a_fresh_leaf_stores_expanded_false_rather_than_a_meaningless_true`.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeItemState {
@@ -145,7 +210,10 @@ pub struct TreeItemState {
     pub depth: usize,
     /// Whether this row's children are currently shown. Meaningless
     /// (and never announced) when `has_children` is `false` — see this
-    /// module's own doc comment.
+    /// module's own doc comment. This is the row's *intent*; what gets
+    /// announced is this **and** whether the row really has rows under
+    /// it right now, so a group emptied by a collapse announces
+    /// "collapsed" until something repopulates it.
     pub expanded: bool,
     pub selected: bool,
     pub disabled: bool,
@@ -156,7 +224,18 @@ pub struct TreeItemState {
     pub has_children: bool,
 }
 
-fn node(state: &TreeItemState) -> Node {
+/// This row's accessibility node. `showing_children` is whether the row
+/// really has tree rows beneath it *right now* (`child_tree_rows`), and
+/// is not the same question as `state.expanded`: a group that was
+/// collapsed — which destroys its rows — and then re-expanded without
+/// anything repopulating it intends to be expanded and has nothing to
+/// show. Announcing `expanded` there would tell a screen reader to read
+/// out an open container with no contents, and would offer a `Collapse`
+/// that removes nothing and cannot be undone by the matching `Expand`.
+/// So the announced state is the conjunction, and the caller's stored
+/// intent is kept intact in [`TreeItemState`] for when real rows arrive.
+fn node(state: &TreeItemState, showing_children: bool) -> Node {
+    let expanded = state.expanded && showing_children;
     let mut node = Node::new(Role::TreeItem);
     node.set_label(state.label.clone());
     node.set_level(state.depth);
@@ -165,7 +244,7 @@ fn node(state: &TreeItemState) -> Node {
     // `false` here would be announced as "collapsed". See this module's
     // own doc comment.
     if state.has_children {
-        node.set_expanded(state.expanded);
+        node.set_expanded(expanded);
     }
     if state.disabled {
         node.set_disabled();
@@ -176,7 +255,7 @@ fn node(state: &TreeItemState) -> Node {
         // Windows adapter refuses the one that wouldn't change
         // anything.
         if state.has_children {
-            if state.expanded {
+            if expanded {
                 node.add_action(Action::Collapse);
             } else {
                 node.add_action(Action::Expand);
@@ -184,6 +263,95 @@ fn node(state: &TreeItemState) -> Node {
         }
     }
     node
+}
+
+/// The nearest tree rows beneath `id`: its own [`WidgetKind::TreeItem`]
+/// children, plus any found by looking *through* a child of some other
+/// kind (a plain container a caller wrapped rows in). Never descends
+/// into a row it has already found — those are that row's own children,
+/// not `id`'s — and never past a nested `Role::Tree`, which begins a
+/// tree of its own.
+///
+/// Iterative rather than recursive on purpose: this module's own doc
+/// comment records that `tree.rs`'s five existing recursive traversals
+/// abort the process on a deep enough tree, and adding a sixth would be
+/// making that worse while claiming to fix it.
+///
+/// One function for two callers, deliberately — [`node`] asks "is this
+/// group really showing anything?" and [`set_tree_item_expanded`] asks
+/// "what does collapsing remove?", and those two answers disagreeing is
+/// exactly how a row ends up announcing a state its structure doesn't
+/// have.
+fn child_tree_rows(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Vec<WidgetId> {
+    let mut found = Vec::new();
+    let mut pending: Vec<WidgetId> = match tree.children(id) {
+        Some(children) => children.to_vec(),
+        None => return found,
+    };
+    while let Some(candidate) = pending.pop() {
+        if matches!(tree.payload(candidate), Some(WidgetKind::TreeItem(_))) {
+            found.push(candidate);
+            continue;
+        }
+        if is_tree_root(tree, candidate) {
+            continue;
+        }
+        if let Some(children) = tree.children(candidate) {
+            pending.extend_from_slice(children);
+        }
+    }
+    found
+}
+
+/// The nearest enclosing tree row at or above `id`, looking *through*
+/// plain containers — a caller may legally wrap rows in one, and before
+/// this walk existed a single `WidgetKind::Container` between two rows
+/// silently reset the deeper one's depth to `0` and left the outer row
+/// claiming to be a childless leaf while a child row was visibly
+/// indented beneath it. Stops at a nested `Role::Tree`, whose rows
+/// belong to that tree rather than to anything above it.
+fn enclosing_tree_item(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<WidgetId> {
+    let mut current = id;
+    loop {
+        match tree.payload(current) {
+            Some(WidgetKind::TreeItem(_)) => return Some(current),
+            Some(_) => {}
+            None => return None,
+        }
+        if is_tree_root(tree, current) {
+            return None;
+        }
+        current = tree.parent(current)?;
+    }
+}
+
+/// Whether `id` is a tree's own root container ([`insert_tree_view`]).
+/// Asked of the `accesskit` role rather than the payload because
+/// `insert_tree_view` deliberately stores a plain
+/// [`WidgetKind::Container`] — the `Role::Tree` node *is* the only thing
+/// that distinguishes it from any other container.
+fn is_tree_root(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
+    tree.accessibility(id).map(Node::role) == Some(Role::Tree)
+}
+
+/// Rebuilds `id`'s accessibility node from its current state and its
+/// current real structure, and marks it dirty — the one place that
+/// knows [`node`] needs both.
+fn refresh_node(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) -> Result<(), WidgetError> {
+    let showing_children = !child_tree_rows(tree, id).is_empty();
+    let Some(WidgetKind::TreeItem(state)) = tree.payload(id) else {
+        return Err(WidgetError::WrongWidgetKind(id));
+    };
+    let accessibility = node(state, showing_children);
+    // Two calls, not one, and deliberately so -- the same gap
+    // `with_scrollbar_mut` records: `set_accessibility` sets only the
+    // per-widget `dirty` flag, while `mark_dirty` is what unions this
+    // widget's own bounds into the tree-wide damage region
+    // `take_damage` hands a renderer. A row whose selection changed has
+    // *new pixels*, so it needs both.
+    tree.set_accessibility(id, accessibility)?;
+    tree.mark_dirty(id)?;
+    Ok(())
 }
 
 /// One row's own layout: a `Column` (its children are the rows nested
@@ -194,10 +362,40 @@ fn node(state: &TreeItemState) -> Node {
 /// time.** Each row inherits its ancestors' padding through `taffy`'s
 /// own absolute-position accumulation (`WidgetTree::apply_taffy_layout`
 /// adds each parent's origin into its children's), so a row at depth
-/// `n` lands `n + 1` padding steps in without this module ever
-/// computing `depth * indent` itself. That matters beyond tidiness:
-/// the indent is then in the row's real `bounds`, so hit-testing and
-/// painting agree with it automatically.
+/// `n` lands `n` padding steps in without this module ever computing
+/// `depth * indent` itself. (`n`, not `n + 1`: a row's own box starts
+/// where its parent's *padding* ends, and its own padding indents its
+/// children rather than itself. The extra step would only ever apply to
+/// content drawn inside a row's own content box, and this module draws
+/// none — see "No in-row content" in the module doc comment.) That
+/// matters beyond tidiness: the indent is then in the row's real
+/// `bounds`, so hit-testing and painting agree with it automatically.
+///
+/// **`min_size.width` is the floor under that same indent.** The width
+/// is `percent(1.0)` of the parent's *content* box, so every level costs
+/// one `spacing.md` step: a row at depth `n` in a `W`-wide panel
+/// resolves to `W - n * spacing.md`, which reaches **zero** at about
+/// `W / 16` — twelve or thirteen rows deep in a 200 px panel, a depth a
+/// deeply grouped document really reaches. A zero-width row is not a
+/// small row, it is a degenerate layout box: it paints nothing at all,
+/// can never be hit, and still consumes a full row of vertical space —
+/// a phantom the user can see the effect of and not the row. The floor
+/// keeps the box well-formed. One row height is the value: no new token
+/// is invented for it (a "minimum row width" would be a design
+/// decision, not an engineering default — CLAUDE.md), and a square of
+/// the row's own height is the smallest thing that is still a real,
+/// grabbable target.
+///
+/// Stated honestly, because the floor is a floor and not a cure: a row
+/// indented that far starts at or past its panel's own right edge
+/// (`x = n * spacing.md`, and every row runs flush to the panel's right
+/// edge), so it lies outside the panel whether it is 0 or 21 px wide,
+/// and `WidgetTree::hit_test` will not reach the part of a row that
+/// overhangs its own parent. Making a deep row genuinely usable needs
+/// horizontal scrolling and a clipping container — the same missing
+/// piece this module's own doc comment already names for vertical
+/// overflow — or an indent model that doesn't spend width. What the
+/// floor buys today is that nothing in the tree is ever a zero-size box.
 ///
 /// **`padding.top` is one row height, and is load-bearing.** A row's
 /// children are laid out inside its own box; with no top padding the
@@ -228,7 +426,7 @@ fn style(scales: &Scales) -> Style {
         // independently, which is what `paint::paint_tree_item` clamps
         // a selected parent's own highlight to.
         min_size: Size {
-            width: auto(),
+            width: length(row),
             height: length(row),
         },
         // Spelled out rather than `..Default::default()`-ed: a
@@ -284,21 +482,27 @@ pub fn insert_tree_view(
 /// which may be a tree's own root container ([`insert_tree_view`]) for
 /// a top-level row, or another row for a nested one.
 ///
-/// `depth` is derived, never passed: a row under a
-/// [`WidgetKind::TreeItem`] is one deeper than it, and a row under
-/// anything else is depth `0`. `has_children` is the caller's
-/// declaration that this row is a group — see [`TreeItemState::
-/// has_children`] for why it can't be derived. A new group starts
-/// `expanded: true`, matching the fact that it has no children hidden
-/// away yet.
+/// `depth` is derived, never passed: a row is one deeper than the
+/// nearest enclosing row, looking *through* any plain containers between
+/// them (`enclosing_tree_item`), and a row with no enclosing row at
+/// all is depth `0`. `has_children` is the caller's declaration that
+/// this row is a group — see [`TreeItemState::has_children`] for why it
+/// can't be derived. A new **group** starts `expanded: true` (it is not
+/// hiding anything yet); a new **leaf** starts `expanded: false`, since
+/// storing `true` there would be a flag that contradicts
+/// `has_children: false` and means nothing either way.
 ///
-/// When `parent` is itself a row, this marks *it* `has_children = true`
+/// When there is an enclosing row, this marks *it* `has_children = true`
 /// and `expanded = true` (a child was just added, and it is really
 /// visible), rebuilds its accessibility node, and marks it dirty.
 ///
 /// # Errors
 ///
-/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
+/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist, or
+/// [`WidgetError::TreeTooDeep`] if the new row would sit deeper than
+/// [`MAX_TREE_DEPTH`] — see this module's own doc comment for the
+/// measured process abort that cap exists to stay away from. Nothing is
+/// added when either happens.
 pub fn insert_tree_item(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
@@ -306,18 +510,31 @@ pub fn insert_tree_item(
     label: &str,
     has_children: bool,
 ) -> Result<WidgetId, WidgetError> {
+    if !tree.contains(parent) {
+        return Err(WidgetError::UnknownWidget(parent));
+    }
+    let ancestor = enclosing_tree_item(tree, parent);
     // `saturating_add`, not `+`: an overflowing add is a panic in a
-    // debug build, and this crate denies panics. A tree 2^64 deep is
-    // unreachable in practice, but "unreachable in practice" is not the
+    // debug build, and this crate denies panics. `MAX_TREE_DEPTH` makes
+    // the overflow unreachable anyway, and "unreachable" is not the
     // standard this workspace holds itself to.
-    let depth = match tree.payload(parent) {
+    let depth = match ancestor.and_then(|id| tree.payload(id)) {
         Some(WidgetKind::TreeItem(parent_state)) => parent_state.depth.saturating_add(1),
         _ => 0,
     };
+    if depth > MAX_TREE_DEPTH {
+        return Err(WidgetError::TreeTooDeep {
+            parent,
+            depth,
+            max: MAX_TREE_DEPTH,
+        });
+    }
     let state = TreeItemState {
         label: label.to_owned(),
         depth,
-        expanded: true,
+        // Not unconditionally `true`: see this function's own doc
+        // comment, and `TreeItemState`'s.
+        expanded: has_children,
         selected: false,
         disabled: false,
         has_children,
@@ -325,51 +542,64 @@ pub fn insert_tree_item(
     let id = tree.insert(
         parent,
         style(scales),
-        node(&state),
+        // A freshly inserted row has no children of its own yet, so it
+        // is showing none -- a group inserted here announces itself
+        // collapsed until something is really put under it.
+        node(&state, false),
         WidgetKind::TreeItem(state),
     )?;
 
-    // The parent now really does have a child, and it is really shown.
-    if let Some(WidgetKind::TreeItem(parent_state)) = tree.payload_mut(parent) {
-        parent_state.has_children = true;
-        parent_state.expanded = true;
-        let accessibility = match tree.payload(parent) {
-            Some(WidgetKind::TreeItem(parent_state)) => node(parent_state),
-            _ => unreachable!("parent was just confirmed to be a TreeItem above"),
-        };
-        tree.set_accessibility(parent, accessibility)?;
-        tree.mark_dirty(parent)?;
+    // The enclosing row now really does have a descendant row, and it is
+    // really shown.
+    if let Some(ancestor) = ancestor {
+        if let Some(WidgetKind::TreeItem(ancestor_state)) = tree.payload_mut(ancestor) {
+            ancestor_state.has_children = true;
+            ancestor_state.expanded = true;
+        }
+        refresh_node(tree, ancestor)?;
     }
     Ok(id)
 }
 
 /// Expands or collapses `id` (a tree row) — **structurally**, not
-/// visually: collapsing removes every child widget beneath `id` from
-/// the tree (each cascading through its own whole subtree), so their
+/// visually: collapsing removes the tree rows beneath `id` from the tree
+/// (each cascading through its own whole subtree), so their
 /// [`WidgetId`]s are dead afterwards and a caller that wants them back
 /// re-inserts them.
+///
+/// **Only rows.** A child of some other kind stays exactly where it is;
+/// see this module's own doc comment for why silently deleting one would
+/// be data loss reachable through this function's own validated API.
 ///
 /// Expanding is only ever a state/accessibility change: this function
 /// has nothing to re-insert (it never kept the removed rows), so
 /// `set_tree_item_expanded(id, true)` on a row with no children is a
 /// deliberate, legal no-op beyond updating the node — which is exactly
-/// what a lazily-populated tree wants. See this module's own doc
-/// comment.
+/// what a lazily-populated tree wants. It does **not** make the row
+/// announce itself as expanded: with nothing under it, that would be an
+/// open container with no contents. See this module's own doc comment.
 ///
 /// # Errors
 ///
-/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
-/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a tree row.
-/// A removal that fails part-way through returns that error too, having
-/// removed whatever it already had — `WidgetTree::remove` only fails
-/// for an unknown id or the root, neither of which a child of `id` can
-/// be.
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist,
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a tree row,
+/// or [`WidgetError::WidgetDisabled`] if the row is disabled — the same
+/// "a disabled widget refuses the interaction, not merely the paint"
+/// rule `set_scrollbar_value` and `toggle_checkbox` already follow. A
+/// caller driving state rather than replaying a gesture re-enables the
+/// row first. A removal that fails part-way through returns that error
+/// too, having removed whatever it already had — `WidgetTree::remove`
+/// only fails for an unknown id or the root, neither of which a
+/// descendant of `id` can be.
 pub fn set_tree_item_expanded(
     tree: &mut WidgetTree<WidgetKind>,
     id: WidgetId,
     expanded: bool,
 ) -> Result<(), WidgetError> {
     with_tree_item_mut(tree, id, |state| {
+        if state.disabled {
+            return Err(WidgetError::WidgetDisabled(id));
+        }
         state.expanded = expanded;
         Ok(())
     })?;
@@ -378,16 +608,48 @@ pub fn set_tree_item_expanded(
         // immutably for as long as the slice lives, so removing while
         // iterating it doesn't compile -- the same `.to_vec()` shape
         // `command_palette::rebuild_rows` already uses for its own row
-        // teardown.
-        let children = match tree.children(id) {
-            Some(children) => children.to_vec(),
-            None => Vec::new(),
-        };
-        for child in children {
-            tree.remove(child)?;
+        // teardown. `child_tree_rows` is already an owned `Vec`, and is
+        // what keeps a non-row child out of this loop.
+        for row in child_tree_rows(tree, id) {
+            tree.remove(row)?;
         }
+        // Recomputed now that the rows are really gone: `node` reads
+        // real structure, and the node built inside `with_tree_item_mut`
+        // above saw the pre-removal tree. Cheap, and it means this
+        // function never leaves a node describing a structure that no
+        // longer exists.
+        refresh_node(tree, id)?;
     }
     Ok(())
+}
+
+/// Renames `id` (a tree row). Routed through the same path every other
+/// mutator here uses rather than left to [`WidgetTree::payload_mut`]:
+/// a label edited directly reaches neither the accessibility node nor
+/// the damage region, so a screen reader would keep announcing the old
+/// name and the row would keep its old pixels. A layers panel renames
+/// rows more often than it changes any other field, which is exactly why
+/// the unsanctioned path was worth closing.
+///
+/// Unlike [`set_tree_item_selected`] and [`set_tree_item_expanded`] this
+/// is allowed on a **disabled** row: a rename is an owner-driven change
+/// to what the row *is*, not a user gesture the disabled state exists to
+/// refuse — a locked layer still gets renamed when the document renames
+/// it.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a tree row.
+pub fn set_tree_item_label(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    label: &str,
+) -> Result<(), WidgetError> {
+    with_tree_item_mut(tree, id, |state| {
+        label.clone_into(&mut state.label);
+        Ok(())
+    })
 }
 
 /// Sets whether `id` (a tree row) is selected. Selection is per-row
@@ -397,14 +659,22 @@ pub fn set_tree_item_expanded(
 ///
 /// # Errors
 ///
-/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
-/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a tree row.
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist,
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a tree row,
+/// or [`WidgetError::WidgetDisabled`] if the row is disabled — see
+/// [`set_tree_item_expanded`] for the precedent that policy follows, and
+/// [`set_tree_item_label`] for the one mutation it deliberately does not
+/// cover. Select a row *before* disabling it (which is what an owner
+/// building a disabled-but-selected row does anyway), not after.
 pub fn set_tree_item_selected(
     tree: &mut WidgetTree<WidgetKind>,
     id: WidgetId,
     selected: bool,
 ) -> Result<(), WidgetError> {
     with_tree_item_mut(tree, id, |state| {
+        if state.disabled {
+            return Err(WidgetError::WidgetDisabled(id));
+        }
         state.selected = selected;
         Ok(())
     })
@@ -441,29 +711,20 @@ fn with_tree_item_mut(
         };
         f(state)?;
     }
-    let Some(WidgetKind::TreeItem(state)) = tree.payload(id) else {
-        unreachable!("id was just confirmed to be a TreeItem above");
-    };
-    let accessibility = node(state);
-    // Two calls, not one, and deliberately so -- the same gap
-    // `with_scrollbar_mut` records: `set_accessibility` sets only the
-    // per-widget `dirty` flag, while `mark_dirty` is what unions this
-    // widget's own bounds into the tree-wide damage region
-    // `take_damage` hands a renderer. A row whose selection changed has
-    // *new pixels*, so it needs both.
-    tree.set_accessibility(id, accessibility)?;
-    tree.mark_dirty(id)?;
-    Ok(())
+    refresh_node(tree, id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_disabled,
-        set_tree_item_expanded, set_tree_item_selected,
+        MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_disabled,
+        set_tree_item_expanded, set_tree_item_label, set_tree_item_selected,
     };
     use crate::WidgetError;
-    use crate::widgets::{WidgetKind, new_tree, test_scales, tree_row_height};
+    use crate::widgets::{
+        WidgetKind, insert_checkbox, insert_color_swatch, insert_container, new_tree, test_scales,
+        tree_row_height,
+    };
     use accesskit::{Action, Role};
     use aurora_core::Rect;
     use taffy::style_helpers::{length, percent};
@@ -584,6 +845,12 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
+        // A real child, because "expanded" is announced only over real
+        // rows -- see `an_empty_group_announces_collapsed_however_its_
+        // own_flag_reads`.
+        if let Err(err) = insert_tree_item(&mut tree, group, &scales, "Child", false) {
+            unreachable!("{err:?}");
+        }
         let Some(accessibility) = tree.accessibility(group) else {
             unreachable!("just inserted");
         };
@@ -742,22 +1009,32 @@ mod tests {
 
     /// Expanding never repopulates — this module never kept the removed
     /// rows. A legal no-op, and the behaviour a lazily-populated tree
-    /// depends on.
+    /// depends on. What it must *not* do is announce the row as
+    /// expanded: a screen reader would read out an open container with
+    /// nothing in it, and the `Collapse` action it would then offer
+    /// removes nothing, so Collapse-then-Expand would loop forever
+    /// changing nothing.
     #[test]
-    fn expanding_a_childless_group_updates_only_its_own_state() {
+    fn re_expanding_an_emptied_group_announces_collapsed_until_rows_come_back() {
         let (mut tree, root) = new_tree(Style::default());
         let scales = test_scales();
         let group = match insert_tree_item(&mut tree, root, &scales, "Group", true) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
+        if let Err(err) = insert_tree_item(&mut tree, group, &scales, "Child", false) {
+            unreachable!("{err:?}");
+        }
         if let Err(err) = set_tree_item_expanded(&mut tree, group, false) {
             unreachable!("{err:?}");
         }
         if let Err(err) = set_tree_item_expanded(&mut tree, group, true) {
             unreachable!("{err:?}");
         }
-        assert!(state_of(&tree, group).expanded);
+        assert!(
+            state_of(&tree, group).expanded,
+            "the caller's own intent is kept -- it is the announcement that is derived"
+        );
         assert_eq!(
             tree.children(group),
             Some([].as_slice()),
@@ -766,7 +1043,68 @@ mod tests {
         let Some(accessibility) = tree.accessibility(group) else {
             unreachable!("still exists");
         };
+        assert_eq!(
+            accessibility.is_expanded(),
+            Some(false),
+            "a group with nothing under it must not announce itself expanded"
+        );
+        assert!(accessibility.supports_action(Action::Expand));
+        assert!(
+            !accessibility.supports_action(Action::Collapse),
+            "there is nothing left to collapse"
+        );
+
+        // ... and it flips back the moment real rows exist again.
+        if let Err(err) = insert_tree_item(&mut tree, group, &scales, "Child again", false) {
+            unreachable!("{err:?}");
+        }
+        let Some(accessibility) = tree.accessibility(group) else {
+            unreachable!("still exists");
+        };
         assert_eq!(accessibility.is_expanded(), Some(true));
+        assert!(accessibility.supports_action(Action::Collapse));
+    }
+
+    /// The same rule seen from the other end: a group declared at insert
+    /// time, before its rows are added, is a group with nothing in it.
+    #[test]
+    fn an_empty_group_announces_collapsed_however_its_own_flag_reads() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let group = match insert_tree_item(&mut tree, root, &scales, "Group", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            state_of(&tree, group).expanded,
+            "a fresh group intends to be expanded"
+        );
+        let Some(accessibility) = tree.accessibility(group) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(accessibility.is_expanded(), Some(false));
+        assert!(accessibility.supports_action(Action::Expand));
+    }
+
+    /// A leaf's stored `expanded` is `false`, not a meaningless `true`.
+    /// The announced shape was already right (`node` never emits the
+    /// property for a leaf); this is about the payload a caller reading
+    /// [`TreeItemState`] directly actually sees, and about `Eq` over it
+    /// not distinguishing two leaves by a field neither of them has.
+    #[test]
+    fn a_fresh_leaf_stores_expanded_false_rather_than_a_meaningless_true() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let leaf = match insert_tree_item(&mut tree, root, &scales, "Leaf", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let state = state_of(&tree, leaf);
+        assert!(!state.has_children);
+        assert!(
+            !state.expanded,
+            "a leaf has nothing to expand, so it must not store that it is expanded"
+        );
     }
 
     #[test]
@@ -777,6 +1115,9 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
+        if let Err(err) = insert_tree_item(&mut tree, group, &scales, "Child", false) {
+            unreachable!("{err:?}");
+        }
         if let Err(err) = set_tree_item_disabled(&mut tree, group, true) {
             unreachable!("{err:?}");
         }
@@ -1051,5 +1392,470 @@ mod tests {
 
         let update = tree.accessibility_update(group);
         let _consumer_tree = accesskit_consumer::Tree::new(update, true);
+    }
+
+    /// The live crash this round exists for, reproduced end to end:
+    /// focus a descendant row, collapse its ancestor (which really
+    /// removes the focused widget), and build the update an adapter
+    /// would receive. `accesskit_consumer::State::validate_global`
+    /// panics with "Focused ID #N is not in the node list" on a focus id
+    /// the update doesn't carry, so before
+    /// `WidgetTree::accessibility_update`'s fallback existed this test
+    /// aborted rather than failed. Nothing here calls
+    /// `FocusManager::validate` on purpose — the whole point is that a
+    /// caller who forgets to (as `aurora-app`'s own `push_accessibility`
+    /// does on this path) still cannot crash a screen reader.
+    #[test]
+    fn collapsing_the_focused_rows_ancestor_still_produces_a_valid_update() {
+        let (mut tree, root) = new_tree(Style {
+            size: Size {
+                width: percent(1.0_f32),
+                height: percent(1.0_f32),
+            },
+            ..Default::default()
+        });
+        let scales = test_scales();
+        let view = match insert_tree_view(&mut tree, root, Some("Layers")) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match insert_tree_item(&mut tree, view, &scales, "Group", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match insert_tree_item(&mut tree, group, &scales, "Child", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut focus = crate::FocusManager::new();
+        if let Err(err) = focus.focus(&mut tree, child) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(focus.focused(), Some(child));
+
+        if let Err(err) = set_tree_item_expanded(&mut tree, group, false) {
+            unreachable!("{err:?}");
+        }
+        assert!(!tree.contains(child), "the focused row is really gone");
+
+        let Some(stale) = focus.focused() else {
+            unreachable!("the focus manager still points at the removed row");
+        };
+        let update = tree.accessibility_update(stale);
+        assert_eq!(
+            update.focus, root,
+            "a focus into the removed subtree must fall back to a live node"
+        );
+        let _consumer_tree = accesskit_consumer::Tree::new(update, true);
+    }
+
+    /// A *multi-child* group, deliberately — the chain in
+    /// `collapsing_removes_the_whole_subtree_from_the_widget_tree`
+    /// cannot tell a full removal apart from one that stops after the
+    /// first child, and the only tests that could were GPU-gated (so
+    /// they self-skip on a machine with no adapter, which is this
+    /// workspace's ordinary CI state).
+    #[test]
+    fn collapsing_removes_every_child_subtree_not_only_the_first() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let insert = |tree: &mut crate::WidgetTree<WidgetKind>, parent, label, group| {
+            match insert_tree_item(tree, parent, &scales, label, group) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        };
+        let group = insert(&mut tree, root, "Group", true);
+        let first = insert(&mut tree, group, "First", true);
+        let first_child = insert(&mut tree, first, "First child", false);
+        let second = insert(&mut tree, group, "Second", true);
+        let second_child = insert(&mut tree, second, "Second child", false);
+        let third = insert(&mut tree, group, "Third", false);
+        assert_eq!(tree.len(), 7, "root + group + three subtrees");
+
+        if let Err(err) = set_tree_item_expanded(&mut tree, group, false) {
+            unreachable!("{err:?}");
+        }
+        for gone in [first, first_child, second, second_child, third] {
+            assert!(
+                !tree.contains(gone),
+                "every child subtree must go, not just the first"
+            );
+        }
+        assert_eq!(tree.children(group), Some([].as_slice()));
+        assert_eq!(
+            tree.len(),
+            2,
+            "only the root and the collapsed row are left"
+        );
+    }
+
+    /// Collapse is a statement about a group's *rows*. A widget of some
+    /// other kind that a caller deliberately parented to a row is not a
+    /// row, and deleting it was silent data loss reachable straight
+    /// through this module's own validated public API.
+    #[test]
+    fn collapsing_removes_rows_and_leaves_every_other_widget_alone() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let group = match insert_tree_item(&mut tree, root, &scales, "Layer group", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // The Layers-panel shape: a row that also carries its own
+        // visibility toggle and colour chip, inserted as ordinary
+        // widgets rather than through `insert_tree_item`, so the row's
+        // own `has_children` never claimed them.
+        let visible = match insert_checkbox(&mut tree, group, &scales, "Visible") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let swatch = match insert_color_swatch(
+            &mut tree,
+            group,
+            &scales,
+            aurora_theme::Color { r: 1, g: 2, b: 3 },
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let row = match insert_tree_item(&mut tree, group, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        if let Err(err) = set_tree_item_expanded(&mut tree, group, false) {
+            unreachable!("{err:?}");
+        }
+        assert!(!tree.contains(row), "the child row really is removed");
+        assert!(
+            tree.contains(visible),
+            "a checkbox a caller put on the row must survive its collapse"
+        );
+        assert!(tree.contains(swatch));
+        assert!(
+            tree.payload(visible).is_some() && tree.payload(swatch).is_some(),
+            "and survive intact, not as empty shells"
+        );
+        assert_eq!(tree.len(), 4, "root + group + checkbox + swatch");
+    }
+
+    /// ... but a plain container is looked *through*: rows nested inside
+    /// one really are descendant rows of the collapsed group, so they
+    /// go, while the container a caller built stays.
+    #[test]
+    fn collapsing_looks_through_a_plain_container_to_the_rows_inside_it() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let group = match insert_tree_item(&mut tree, root, &scales, "Group", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let wrapper = match insert_container(&mut tree, group, Style::default()) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let nested = match insert_tree_item(&mut tree, wrapper, &scales, "Nested", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        if let Err(err) = set_tree_item_expanded(&mut tree, group, false) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.contains(wrapper), "the caller's own container stays");
+        assert!(
+            !tree.contains(nested),
+            "a row is a row however it was wrapped"
+        );
+    }
+
+    /// An ordinary `WidgetKind::Container` between two rows is a legal,
+    /// unremarkable thing to insert, and it used to silently reset the
+    /// deeper row's depth to `0` while leaving the outer row announcing
+    /// itself as a childless leaf — with the child row visibly indented
+    /// one step beneath it on screen.
+    #[test]
+    fn depth_and_group_state_resolve_through_an_intervening_container() {
+        let (mut tree, root) = new_tree(sized_root());
+        let scales = test_scales();
+        let view = match insert_tree_view(&mut tree, root, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let top = match insert_tree_item(&mut tree, view, &scales, "Top", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let wrapper = match insert_container(&mut tree, top, Style::default()) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let nested = match insert_tree_item(&mut tree, wrapper, &scales, "Nested", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        assert_eq!(
+            state_of(&tree, nested).depth,
+            1,
+            "a container between two rows is not a new tree"
+        );
+        let top_state = state_of(&tree, top);
+        assert!(
+            top_state.has_children,
+            "the outer row really does have a row under it"
+        );
+        assert!(top_state.expanded);
+        let Some(accessibility) = tree.accessibility(top) else {
+            unreachable!("still exists");
+        };
+        assert_eq!(accessibility.is_expanded(), Some(true));
+        assert!(accessibility.supports_action(Action::Collapse));
+        let Some(accessibility) = tree.accessibility(nested) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(
+            accessibility.level(),
+            Some(1),
+            "the announced level must match the indent the layout really produces"
+        );
+
+        // ... and the indent it announces is the indent it gets.
+        tree.compute_layout(300.0, 200.0);
+        let (Some(top_bounds), Some(nested_bounds)) = (tree.bounds(top), tree.bounds(nested))
+        else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(nested_bounds.x - top_bounds.x, 16);
+    }
+
+    /// A nested tree is a tree of its own: its rows belong to it, not to
+    /// whatever row the tree happens to sit inside.
+    #[test]
+    fn a_nested_tree_view_starts_its_own_depth_and_claims_no_outer_parent() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let outer = match insert_tree_item(&mut tree, root, &scales, "Outer", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let inner_view = match insert_tree_view(&mut tree, outer, Some("Inner")) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let inner_row = match insert_tree_item(&mut tree, inner_view, &scales, "Inner row", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state_of(&tree, inner_row).depth, 0);
+        assert!(
+            !state_of(&tree, outer).has_children,
+            "a whole tree inside a row is not that row's own child row"
+        );
+    }
+
+    /// The sanctioned rename. A `payload_mut` label edit updates neither
+    /// the accessibility node nor the damage region, so a screen reader
+    /// keeps reading the old name and the row keeps its old pixels —
+    /// which is exactly what the other setters' own dirty/damage test
+    /// asserts, applied to the field a layers panel changes most.
+    #[test]
+    fn set_tree_item_label_renames_the_node_and_widens_the_damage_region() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bounds = Rect {
+            x: 4,
+            y: 8,
+            width: 200,
+            height: 21,
+        };
+        if let Err(err) = tree.set_bounds(row, bounds) {
+            unreachable!("{err:?}");
+        }
+        tree.take_damage();
+
+        if let Err(err) = set_tree_item_label(&mut tree, row, "Background") {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(state_of(&tree, row).label, "Background");
+        let Some(accessibility) = tree.accessibility(row) else {
+            unreachable!("still exists");
+        };
+        assert_eq!(accessibility.label(), Some("Background"));
+        assert_eq!(tree.is_dirty(row), Some(true));
+        assert_eq!(tree.take_damage(), Some(bounds));
+    }
+
+    /// A rename is owner-driven, not a user gesture, so it is the one
+    /// mutator a disabled row still accepts.
+    #[test]
+    fn set_tree_item_label_is_allowed_on_a_disabled_row() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Locked", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_disabled(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_tree_item_label(&mut tree, row, "Locked, renamed") {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(state_of(&tree, row).label, "Locked, renamed");
+    }
+
+    /// The two gesture-shaped mutators refuse a disabled row, matching
+    /// `set_scrollbar_value` and `toggle_checkbox` rather than leaving
+    /// this widget's own policy unstated.
+    #[test]
+    fn selecting_or_collapsing_a_disabled_row_is_refused() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let group = match insert_tree_item(&mut tree, root, &scales, "Group", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match insert_tree_item(&mut tree, group, &scales, "Child", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_disabled(&mut tree, group, true) {
+            unreachable!("{err:?}");
+        }
+        for result in [
+            set_tree_item_selected(&mut tree, group, true),
+            set_tree_item_expanded(&mut tree, group, false),
+        ] {
+            match result {
+                Err(WidgetError::WidgetDisabled(id)) => assert_eq!(id, group),
+                other => unreachable!("expected WidgetDisabled, got {other:?}"),
+            }
+        }
+        assert!(
+            tree.contains(child),
+            "a refused collapse must not have removed anything"
+        );
+        assert!(!state_of(&tree, group).selected);
+    }
+
+    /// Indentation eats into a `percent(1.0)` width one `spacing.md`
+    /// step per level, so in a narrow panel a deep enough row used to
+    /// resolve to *zero* width — a degenerate box that paints nothing,
+    /// can never be hit, and still consumes a row of vertical space.
+    /// `min_size.width` is the floor under it. (What the floor does not
+    /// do is bring an over-indented row back inside its panel; see
+    /// `style`'s own doc comment.)
+    #[test]
+    fn a_deeply_nested_row_in_a_narrow_panel_never_resolves_to_zero_width() {
+        let (mut tree, root) = new_tree(Style {
+            size: Size {
+                width: length(64.0_f32),
+                height: length(400.0_f32),
+            },
+            ..Default::default()
+        });
+        let scales = test_scales();
+        let view = match insert_tree_view(&mut tree, root, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // 64px of panel and 16px of indent per level: without a floor,
+        // the fifth row down is already 0 wide.
+        let mut parent = view;
+        let mut rows = Vec::new();
+        for depth in 0..8 {
+            parent = match insert_tree_item(&mut tree, parent, &scales, "Row", true) {
+                Ok(id) => id,
+                Err(err) => unreachable!("depth {depth}: {err:?}"),
+            };
+            rows.push(parent);
+        }
+        tree.compute_layout(64.0, 400.0);
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let floor = tree_row_height(&scales) as u32;
+        for (depth, &row) in rows.iter().enumerate() {
+            let Some(bounds) = tree.bounds(row) else {
+                unreachable!("just laid out");
+            };
+            assert!(
+                bounds.width >= floor,
+                "a row at depth {depth} resolved to {} px wide, below the {floor} px floor",
+                bounds.width
+            );
+        }
+        // Without the floor these would be the arithmetic: 64, 48, 32,
+        // 16, and then 0 for every level below. The fifth row down is
+        // the one that used to vanish.
+        let Some(&fifth) = rows.get(4) else {
+            unreachable!("eight rows were just inserted");
+        };
+        let Some(bounds) = tree.bounds(fifth) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(bounds.width, floor);
+        // And the limitation the floor does *not* remove, pinned rather
+        // than implied: this row's indent has already carried it to the
+        // panel's own right edge, so it is off-panel and `hit_test`
+        // cannot reach it -- that needs clipping and horizontal
+        // scrolling, the gap this module's own doc comment names.
+        assert_eq!(
+            bounds.x, 64,
+            "one spacing.md step per level, four levels in"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let point = (
+            (bounds.x + 1) as f32,
+            (bounds.y + i64::from(bounds.height) / 2) as f32,
+        );
+        assert_eq!(
+            tree.hit_test(point),
+            None,
+            "a row indented past its panel is outside it, floored width or not"
+        );
+    }
+
+    /// `WidgetTree`'s traversals are recursive, and a deep enough tree
+    /// aborts the process during layout (measured: between depth 1100
+    /// and 1200 in a debug build). `MAX_TREE_DEPTH` is what keeps a
+    /// caller from building one through this module's own public API —
+    /// a real error, an order of magnitude short of the abort.
+    #[test]
+    fn insert_tree_item_refuses_to_nest_past_the_maximum_depth() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let mut parent = root;
+        for depth in 0..=MAX_TREE_DEPTH {
+            parent = match insert_tree_item(&mut tree, parent, &scales, "Row", false) {
+                Ok(id) => id,
+                Err(err) => unreachable!("depth {depth} must still be legal: {err:?}"),
+            };
+        }
+        assert_eq!(state_of(&tree, parent).depth, MAX_TREE_DEPTH);
+        let before = tree.len();
+
+        match insert_tree_item(&mut tree, parent, &scales, "One too deep", false) {
+            Err(WidgetError::TreeTooDeep {
+                parent: at,
+                depth,
+                max,
+            }) => {
+                assert_eq!(at, parent);
+                assert_eq!(depth, MAX_TREE_DEPTH + 1);
+                assert_eq!(max, MAX_TREE_DEPTH);
+            }
+            other => unreachable!("expected TreeTooDeep, got {other:?}"),
+        }
+        assert_eq!(tree.len(), before, "a refused insert must add nothing");
+        assert!(
+            !state_of(&tree, parent).has_children,
+            "and must not mark its would-be parent as a group either"
+        );
     }
 }

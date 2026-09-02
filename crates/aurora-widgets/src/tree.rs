@@ -542,6 +542,21 @@ impl<W> WidgetTree<W> {
     /// disconnected tree (confirmed via a real crash on real macOS
     /// hardware: "N nodes which are neither in the current tree nor a
     /// child of another node from the update").
+    ///
+    /// **A `focus` that no longer exists falls back to this tree's own
+    /// root**, and that guard is load-bearing rather than defensive
+    /// tidiness. `accesskit_consumer::State::validate_global` (pinned
+    /// 0.38, `tree.rs`) *panics* with "Focused ID #N is not in the node
+    /// list" on a focus id the update doesn't carry — the same
+    /// disconnected-tree validation class as the crash above, reproduced
+    /// live. Any caller that removes widgets can orphan the focus
+    /// between the removal and the next
+    /// [`crate::FocusManager::validate`], and `widgets::tree_view`'s own
+    /// collapse is exactly such a caller; putting the check here defends
+    /// every removal site at once rather than each one separately.
+    /// Callers that track focus should still call `FocusManager::
+    /// validate` — this only guarantees the update is *valid*, not that
+    /// the caller's own idea of focus was repaired.
     #[must_use]
     pub fn accessibility_update(&self, focus: WidgetId) -> TreeUpdate {
         let nodes = self
@@ -553,6 +568,11 @@ impl<W> WidgetTree<W> {
                 (id, accessibility)
             })
             .collect();
+        let focus = if self.nodes.contains_key(&focus) {
+            focus
+        } else {
+            self.root
+        };
         TreeUpdate {
             nodes,
             tree: Some(Tree::new(self.root)),
@@ -844,6 +864,51 @@ mod tests {
 
         let update = tree.accessibility_update(root);
         let _consumer_tree = accesskit_consumer::Tree::new(update, true);
+    }
+
+    /// The second half of the same crash class, and a real one: a
+    /// removal orphans whatever focus pointed into the removed subtree,
+    /// and `accesskit_consumer::State::validate_global` panics with
+    /// "Focused ID #N is not in the node list" when that stale id
+    /// reaches it. Reproduced live before this guard existed, by
+    /// collapsing a tree row whose descendant held focus. The fallback
+    /// has to be a node the update really carries — the root always is.
+    #[test]
+    fn a_focus_on_a_removed_widget_falls_back_to_the_root() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let group = match tree.insert(root, Style::default(), label("group"), "group") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let leaf = match tree.insert(group, Style::default(), label("leaf"), "leaf") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.remove(group) {
+            unreachable!("{err:?}");
+        }
+        assert!(!tree.contains(leaf), "the removal cascaded, as it must");
+
+        let update = tree.accessibility_update(leaf);
+        assert_eq!(
+            update.focus, root,
+            "a stale focus must fall back to a node the update really carries"
+        );
+        // ... and the guard is what keeps this from aborting the test
+        // process: `accesskit_consumer` panics on a focus it can't find.
+        let _consumer_tree = accesskit_consumer::Tree::new(update, true);
+    }
+
+    /// The fallback is a *fallback*, not a rewrite: a focus that is
+    /// still in the tree is passed through untouched.
+    #[test]
+    fn a_live_focus_is_never_rewritten_by_the_fallback() {
+        let (mut tree, root) = WidgetTree::new(label("root"), Style::default(), "root");
+        let a = match tree.insert(root, Style::default(), label("a"), "a") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.accessibility_update(a).focus, a);
     }
 
     #[test]

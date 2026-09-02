@@ -1189,9 +1189,18 @@ fn tree_view_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId
 /// it would only make five places to get it wrong.
 ///
 /// Every sample coordinate below was confirmed against an actual debug
-/// scan of this exact render (Dark theme, real adapter), not computed
-/// from the layout arithmetic and assumed — the same discipline the two
-/// `border.control_opacity` outline proofs in this file already follow.
+/// scan of this exact render, not computed from the layout arithmetic
+/// and assumed — the same discipline the two `border.control_opacity`
+/// outline proofs in this file already follow. The adapter, named rather
+/// than left as "real" for a reader to take on trust: **`NVIDIA GeForce
+/// RTX 3090`, Vulkan, `DeviceType::DiscreteGpu`**, as printed by
+/// `aurora_gpu::test_support::real_context_or_skip` on every run of
+/// these five tests, and re-confirmed under `AURORA_REQUIRE_GPU=1`
+/// (which fails outright on a CPU adapter). Nothing here is
+/// adapter-dependent anyway — a tree row is a solid rounded rect at
+/// integer bounds, no DPI scaling involved — but "real adapter" is a
+/// claim, and CLAUDE.md is explicit that claims of that shape have to
+/// name what was actually tested.
 fn assert_tree_view_states_are_distinct(image: &aurora_testkit::Image, theme_name: &str) {
     assert_eq!(image.width, TREE_VIEW_GALLERY_SIZE.0);
     assert_eq!(image.height, TREE_VIEW_GALLERY_SIZE.1);
@@ -3174,7 +3183,7 @@ scrollbar_golden_test!(
 #[test]
 fn tree_view_gallery_rows_are_one_row_tall() {
     let scales = scales();
-    let (tree, [expanded, _collapsed]) = tree_view_gallery_tree(&scales);
+    let (tree, [expanded, collapsed]) = tree_view_gallery_tree(&scales);
     let Some(&group) = tree.children(expanded).and_then(<[_]>::first) else {
         unreachable!("the expanded cell holds its own group row");
     };
@@ -3208,6 +3217,44 @@ fn tree_view_gallery_rows_are_one_row_tall() {
         );
         expected_y += i64::from(TREE_VIEW_ROW_HEIGHT);
     }
+
+    // The collapsed cell's own geometry, which two of the pixel claims
+    // above depend on and none of them pinned: its group's box has to
+    // shrink back to a single row once the children are really gone, or
+    // `TREE_VIEW_CHILD_SAMPLE_Y` would still be inside the group's box
+    // and "backdrop below a collapsed parent" would be sampling the
+    // wrong band for the wrong reason.
+    let Some(&collapsed_group) = tree.children(collapsed).and_then(<[_]>::first) else {
+        unreachable!("the collapsed cell holds its own group row");
+    };
+    assert_eq!(
+        tree.children(collapsed_group),
+        Some([].as_slice()),
+        "collapsing really removed the rows"
+    );
+    let Some(collapsed_bounds) = tree.bounds(collapsed_group) else {
+        unreachable!("just laid out");
+    };
+    assert_eq!(
+        collapsed_bounds.height, TREE_VIEW_ROW_HEIGHT,
+        "a collapsed group's box is one row, not the three its children used to need"
+    );
+    assert_eq!(
+        collapsed_bounds.x,
+        i64::from(TREE_VIEW_CELL.0),
+        "the collapsed cell starts one cell to the right"
+    );
+    assert!(
+        collapsed_bounds.y + i64::from(collapsed_bounds.height)
+            <= i64::from(TREE_VIEW_CHILD_SAMPLE_Y),
+        "the child sample row must fall below the collapsed group's whole box"
+    );
+    assert!(
+        i64::from(TREE_VIEW_PARENT_SAMPLE_Y) >= collapsed_bounds.y
+            && i64::from(TREE_VIEW_PARENT_SAMPLE_Y)
+                < collapsed_bounds.y + i64::from(collapsed_bounds.height),
+        "... and the parent sample row inside it"
+    );
 }
 
 /// `TreeView`'s own gallery, one test per built-in theme, each a

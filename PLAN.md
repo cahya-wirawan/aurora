@@ -2370,7 +2370,9 @@ check licenses` clean with the new `toml` dependency.
   and **no human has blessed any of the five tree goldens** — none of
   the five PNGs exists. `WidgetTree`'s traversals remain unbounded
   recursion, pre-existing but newly relevant now that a widget invites
-  deep nesting; named in the module doc, not fixed. 32 new tests
+  deep nesting; named in the module doc, not fixed (0.76.1 caps how deep
+  a *tree* can be built, which is not the same as fixing the recursion).
+  32 new tests
   (`aurora-widgets` lib 204 → 230, gallery 75 → 81 plus 5 more ignored
   goldens; workspace 1,475 passing, measured — the 1,442 recorded above
   for 0.75.1 implies a 1,443 baseline for this round, a one-test
@@ -2381,6 +2383,96 @@ check licenses` clean with the new `toml` dependency.
   --workspace --all-targets --all-features -- -D warnings`, `cargo test
   --workspace`, `cargo test --workspace --doc`, and `cargo doc
   --workspace --no-deps --all-features` all clean.
+  **Review round, 2026-09-02 (0.76.1).** An independent critic and a
+  red team reviewed `0.76.0`; the red team reproduced the top two
+  findings live, one as an actual process abort. Nine real bugs closed,
+  one reported finding rejected on evidence:
+  1. **A collapse could crash the app through the screen reader.**
+     `set_tree_item_expanded(id, false)` removes widgets without knowing
+     whether `FocusManager`'s current focus is one of them, and
+     `WidgetTree::accessibility_update` took the focus id on trust.
+     `accesskit_consumer::State::validate_global` (pinned 0.38)
+     *panics* — "Focused ID #N is not in the node list" — on a focus the
+     update doesn't carry: the same disconnected-tree validation class
+     that caused a real macOS crash once already, reproduced live here.
+     `aurora-app`'s `push_accessibility` does not call
+     `FocusManager::validate` on this path, unlike its two other removal
+     sites. Fixed in `tree.rs` rather than in the tree widget, so it
+     defends every present and future removal site: an unknown `focus`
+     falls back to the tree's own root. Two tests in `tree.rs`, one end
+     to end in `tree_view.rs` (focus a row, collapse its ancestor, hand
+     the update to `accesskit_consumer`).
+  2. **Collapsing silently destroyed non-row content.** The removal loop
+     took *every* child regardless of kind, so a `Checkbox` or
+     `ColorSwatch` a caller parented to a row — the Layers-panel shape —
+     was deleted with no error and no signal, reachable straight through
+     the validated public API. Collapse now removes only tree rows,
+     looking *through* a plain container to the rows inside it (the
+     container itself survives).
+  3. **Depth and group state broke through an intervening container.** A
+     plain `WidgetKind::Container` between two rows is legal and
+     ordinary, and it reset the deeper row's `depth` to 0 and left the
+     outer row announcing itself a childless leaf while its child was
+     visibly indented on screen. `insert_tree_item` now walks up to the
+     nearest real row, stopping at a nested `Role::Tree`.
+  4. **A group with nothing under it announced "expanded".** The
+     announced state is now `expanded && has real rows`, so a group
+     emptied by a collapse (or declared before its rows are inserted)
+     announces collapsed and offers `Expand`, not a `Collapse` that
+     could never change anything. The caller's stored intent is kept.
+  5. **A fresh leaf stored `expanded: true`**, contradicting
+     `has_children: false` under an `Eq` derive; it now stores `false`.
+  6. **No sanctioned rename.** `set_tree_item_label` joins the other
+     setters (so a rename reaches both the accessibility node and the
+     damage region); a direct `payload_mut` edit reached neither, and a
+     layers panel renames rows more than it changes anything else. It is
+     deliberately the one mutator allowed on a *disabled* row.
+  7. **Disabled semantics were unstated.** `set_tree_item_selected` and
+     `set_tree_item_expanded` now return `WidgetError::WidgetDisabled`,
+     matching `set_scrollbar_value`/`toggle_checkbox` instead of
+     silently accepting a gesture on a row that declares no actions.
+  8. **Unbounded nesting aborted the process.** Measured: `compute_
+     layout` overflows the stack and `SIGABRT`s between depth 1100–1200
+     debug, 3000–4000 release — uncatchable by any `Result` or by the
+     workspace's `panic = "deny"` lint. `insert_tree_item` now refuses
+     past `MAX_TREE_DEPTH` (255) with a new `WidgetError::TreeTooDeep`.
+     This does **not** fix the recursion, which is `tree.rs`-wide and
+     shared by every widget; it keeps this widget's own public API from
+     reaching it.
+  9. **A deep row could resolve to zero width** — a degenerate box that
+     paints nothing, can never be hit, and still eats a row of vertical
+     space. `min_size.width` is now one row height (no new token
+     invented). Stated honestly in the module: a row indented that far
+     is *outside* its panel either way, so the floor buys a well-formed
+     box, not a usable one — that needs clipping and horizontal
+     scrolling, already a disclosed gap.
+  Test coverage gaps the reviewers found, also closed: collapse was only
+  ever proven on a linear chain (a mutation removing just the first child
+  survived the whole CPU suite; only GPU-gated tests caught it), and the
+  headless gallery-geometry test pinned the expanded cell but not the
+  collapsed one whose height two pixel claims depend on.
+  **Rejected, with evidence**: the report that this sandbox has only
+  Mesa llvmpipe, so the tree gallery's "real adapter" claim was
+  overstated. It is a real adapter — `NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)`, printed by `real_context_or_skip` on every run and
+  re-confirmed with `AURORA_REQUIRE_GPU=1` (which fails on a CPU
+  adapter). The comment now names the adapter instead of asserting
+  "real", which is the substance of what was asked for.
+  Also disclosed rather than fixed, both too large for a patch round and
+  both now named in the module doc: rows **cannot hold in-row content**
+  (a row's band houses no content container, so thumbnail + checkbox +
+  name on one line is not buildable), and every enabled row declares
+  `Action::Focus`, making a large tree one tab stop *per row* instead of
+  the conventional single stop plus arrow-key navigation.
+  15 new tests (`aurora-widgets` lib 230 → 245, one renamed; workspace
+  1,475 → 1,490 passing, 10 ignored — the same ten unblessed goldens).
+  Full gate re-run clean: `cargo fmt --all --check`, `python3
+  scripts/check_layering.py`, `python3 scripts/check_no_hardcoded_
+  style.py`, `python3 design/check_contrast.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace`, `cargo test
+  --workspace --doc`, and `cargo doc --workspace --no-deps
+  --all-features`.
 - [~] **Vector-first rendering via `aurora-vector` (resolution-independent)**
   — first real slice done 2026-08-06, picked up as a direct prerequisite
   the "Component gallery + golden-image tests" bullet below was found to

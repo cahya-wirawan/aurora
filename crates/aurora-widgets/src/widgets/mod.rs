@@ -34,9 +34,13 @@
 //! nested `Role::TreeItem` rows), real expand/collapse that actually
 //! adds and removes child widgets, per-level indentation from `taffy`'s
 //! own padding accumulation, and a real gallery entry — but still **no
-//! scrolling container** (a tree taller than its parent overflows) and
-//! **no disclosure-triangle glyph** (this crate draws no glyphs at
-//! all). The rest still need infrastructure that doesn't exist yet
+//! scrolling container** (a tree taller than its parent overflows), **no
+//! disclosure-triangle glyph** (this crate draws no glyphs at all), and
+//! **no in-row content** (a row's own band holds nothing but the row, so
+//! the Layers-panel "thumbnail + checkbox + name on one line" shape
+//! isn't buildable yet — `tree_view.rs`'s own doc comment has the full
+//! list of what it does and doesn't promise). The rest still need
+//! infrastructure that doesn't exist yet
 //! (real text shaping for dropdowns, popover layering for
 //! menus/tooltips, `aurora-vector` path rendering for the curve editor)
 //! and are deliberately left open rather than stubbed out half-built.
@@ -87,8 +91,8 @@ pub use text_field::{
     set_text_field_disabled, text_field_state, with_text_field_mut,
 };
 pub use tree_view::{
-    TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_disabled,
-    set_tree_item_expanded, set_tree_item_selected,
+    MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_disabled,
+    set_tree_item_expanded, set_tree_item_label, set_tree_item_selected,
 };
 
 use accesskit::{Node, Role};
