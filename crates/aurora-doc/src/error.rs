@@ -315,4 +315,50 @@ pub enum DocError {
         "layer origin ({x}, {y}) is further than {max}px from the document origin on at least one axis"
     )]
     LayerOriginOutOfRange { x: i64, y: i64, max: i64 },
+    /// A [`LayerId`] read back from an untrusted manifest (or journal)
+    /// has [`crate::MASK_SURFACE_BIT`] set, which would put its own
+    /// *pixel* surface into the half of the `aurora_tile::SurfaceId`
+    /// space reserved for **mask** surfaces.
+    ///
+    /// # The collision this refuses
+    ///
+    /// [`crate::LayerTree::surface_id`] is `id.to_raw()` and
+    /// [`crate::LayerTree::mask_surface_id`] is
+    /// `id.to_raw() | MASK_SURFACE_BIT`. Those two ranges are disjoint
+    /// only while every live id keeps that bit clear. A crafted `.aur`
+    /// manifest holding both layer `5` (with a mask) and layer
+    /// `5 | MASK_SURFACE_BIT` (an ordinary pixel layer) makes the
+    /// second layer's own pixel surface and the first layer's mask
+    /// surface the *same* `SurfaceId` — one tile-store slot with two
+    /// owners, so painting one silently rewrites the other's coverage,
+    /// with no error anywhere.
+    ///
+    /// Nothing built through this crate's own API can reach it:
+    /// `aurora_core::IdGenerator` starts at `0` and hands ids out one
+    /// at a time, so a real session would need `2^63` layer creations.
+    /// But `IdGenerator` and `LayerId` are both `Deserialize`, and
+    /// [`Self::StaleLayerIdGenerator`]'s counter check compares ids
+    /// only against `peek_next()` — which a crafted manifest is free to
+    /// set to `u64::MAX`. That is why this is a validation rule and not
+    /// merely a comment.
+    #[error(
+        "layer id {id:?} has the reserved mask-surface bit set: layer ids must stay below {limit}"
+    )]
+    ReservedLayerIdBit { id: LayerId, limit: u64 },
+    /// The layer tree's own id *counter* is at or past
+    /// [`crate::MASK_SURFACE_BIT`], so the next ordinary
+    /// `add_pixel_layer`/`add_group` would hand out an id
+    /// [`Self::ReservedLayerIdBit`] refuses.
+    ///
+    /// [`Self::ReservedLayerIdBit`] is to this what
+    /// [`Self::LayerIdCollision`] is to
+    /// [`Self::StaleLayerIdGenerator`]: that one refuses ids the file
+    /// already carries, this one refuses a counter positioned to
+    /// *create* one on the very next insert. Both halves are needed
+    /// for the same reason the stale-counter pair is — a manifest can
+    /// be shape-perfect and still be unsafe to add to.
+    #[error(
+        "the layer tree's id counter is at {next}, at or past the reserved mask-surface bit {limit}"
+    )]
+    ReservedLayerIdCounter { next: u64, limit: u64 },
 }

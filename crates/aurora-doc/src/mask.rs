@@ -61,10 +61,7 @@
 ///
 /// - **Layer pixel surfaces** occupy the bottom half. They are
 ///   `SurfaceId::from_raw(layer_id.to_raw())`
-///   ([`crate::LayerTree::surface_id`]), and `aurora_core::IdGenerator`
-///   hands out ids from `0` upward, one at a time — so a real layer id
-///   would have to survive `2^63` allocations before this bit could
-///   ever be set in one.
+///   ([`crate::LayerTree::surface_id`]).
 /// - **Mask surfaces** occupy the top half:
 ///   `layer_id.to_raw() | MASK_SURFACE_BIT`
 ///   ([`crate::LayerTree::mask_surface_id`]).
@@ -73,9 +70,46 @@
 ///   is why [`crate::LayerTree::mask_surface_id`] refuses the single
 ///   layer id (`MASK_SURFACE_BIT - 1`) that would map onto it.
 ///
-/// A mask surface therefore collides with neither a layer's own pixel
+/// # What the partition actually rests on
+///
+/// **Every `LayerId` in a live tree has this bit clear.** That is the
+/// whole load-bearing statement, and it is not self-evident — it is
+/// enforced, in two places, because two different kinds of tree exist:
+///
+/// 1. **Trees this process builds.** `aurora_core::IdGenerator` starts
+///    at `0` and hands ids out one at a time, monotonically, so a real
+///    id would have to survive `2^63` allocations before the bit could
+///    be set in one.
+/// 2. **Trees deserialized from an untrusted `.aur` file** (a corrupted
+///    one, or a crafted one). `LayerId` and `IdGenerator` are both
+///    `Deserialize`, so point 1 says nothing at all here: the file
+///    supplies the ids *and* the counter. `aurora_doc`'s own
+///    `validate_layer_id_range` — run by both whole-tree gates,
+///    `#[serde(try_from = "LayerTreeRepr")]` and
+///    `LayerTree::validate` (the journal-replay path) — refuses any id
+///    with this bit set, and any id counter positioned to hand one out
+///    ([`crate::DocError::ReservedLayerIdBit`],
+///    [`crate::DocError::ReservedLayerIdCounter`]).
+///
+/// **Half of that was missing until 0.70.1, and this comment used to
+/// claim otherwise.** It said a mask surface collides with nothing "for
+/// every id any document this process could build" — true of point 1,
+/// false of point 2, and the gap was real and reachable: a manifest
+/// holding layer `5` (with a mask) alongside layer
+/// `5 | MASK_SURFACE_BIT` (a plain pixel layer) gave both the same
+/// `SurfaceId`, so painting the second layer's pixels rewrote the
+/// first layer's mask coverage and vice versa, through one tile-store
+/// slot with two owners and no error anywhere. Nothing but
+/// `validate_id_allocator`'s "counter is ahead of every id present"
+/// check stood in the way, and a crafted counter of `u64::MAX`
+/// satisfies that. [`crate::LayerTree::surface_id`] now carries the
+/// mirror of [`crate::LayerTree::mask_surface_id`]'s own guard as well,
+/// so the invariant holds at the type's boundary and not only at the
+/// validation call site.
+///
+/// Given that, a mask surface collides with neither a layer's own pixel
 /// surface (different half) nor the composite surface (explicitly
-/// excluded), for every id any document this process could build.
+/// excluded), for every id any `LayerTree` this crate will hand out.
 pub const MASK_SURFACE_BIT: u64 = 1 << 63;
 
 /// Writes one texel of mask coverage at tile-local `(x, y)`.

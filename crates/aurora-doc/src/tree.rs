@@ -220,6 +220,11 @@ impl TryFrom<LayerTreeRepr> for LayerTree {
         // out-of-range opacity renders wrongly, which is worth refusing
         // but strictly less urgent than a traversal that never returns.
         validate_id_allocator(&ids, &layers)?;
+        // Same family as the allocator check, and for the same reason
+        // it sits next to it rather than inside `validate_shape`: an id
+        // with `MASK_SURFACE_BIT` set makes a perfectly well-formed
+        // tree that aliases another layer's mask storage.
+        validate_layer_id_range(&ids, &layers)?;
         validate_opacities(&layers)?;
         Ok(Self { ids, layers, roots })
     }
@@ -411,6 +416,61 @@ fn validate_id_allocator(
         return Err(DocError::StaleLayerIdGenerator {
             next,
             existing: highest,
+        });
+    }
+    Ok(())
+}
+
+/// Rejects any [`LayerId`] — present in `layers`, or about to be handed
+/// out by `ids` — that has [`crate::MASK_SURFACE_BIT`] set.
+///
+/// [`validate_id_allocator`]'s neighbour, and a *different* defect
+/// again. That one holds the counter ahead of the ids present; this one
+/// holds both to the half of the `aurora_tile::SurfaceId` space that
+/// belongs to layer pixels. [`LayerTree::surface_id`] is
+/// `id.to_raw()` unchanged and [`LayerTree::mask_surface_id`] is
+/// `id.to_raw() | MASK_SURFACE_BIT`, so the two ranges are disjoint
+/// only while no live id sets that bit — and a crafted manifest can set
+/// it, since both [`LayerId`] and `IdGenerator` are `Deserialize` and
+/// [`validate_id_allocator`] compares ids only against a `peek_next()`
+/// the same file supplies. A document holding layer `5` (masked) and
+/// layer `5 | MASK_SURFACE_BIT` (a plain pixel layer) then addresses
+/// the second layer's pixels and the first layer's mask coverage
+/// through one and the same tile-store slot.
+///
+/// Both halves are checked because either alone leaves a door open: the
+/// map check refuses the ids the file already carries, the counter
+/// check refuses a counter positioned to create one on the next
+/// ordinary insert. See [`DocError::ReservedLayerIdBit`] and
+/// [`DocError::ReservedLayerIdCounter`].
+///
+/// Deterministic despite `HashMap`'s arbitrary iteration order: the
+/// *lowest* offending id is reported, which is unique.
+///
+/// Only `layers.keys()` is walked, for the same reason
+/// [`validate_id_allocator`] can get away with it — [`validate_shape`]
+/// refuses a name with no entry behind it, so "every id present" and
+/// "every id named" are the same set.
+fn validate_layer_id_range(
+    ids: &IdGenerator<Layer>,
+    layers: &HashMap<LayerId, LayerEntry>,
+) -> Result<(), DocError> {
+    if let Some(id) = layers
+        .keys()
+        .copied()
+        .filter(|id| id.to_raw() >= crate::MASK_SURFACE_BIT)
+        .min_by_key(|id| id.to_raw())
+    {
+        return Err(DocError::ReservedLayerIdBit {
+            id,
+            limit: crate::MASK_SURFACE_BIT,
+        });
+    }
+    let next = ids.peek_next();
+    if next >= crate::MASK_SURFACE_BIT {
+        return Err(DocError::ReservedLayerIdCounter {
+            next,
+            limit: crate::MASK_SURFACE_BIT,
         });
     }
     Ok(())
@@ -1447,8 +1507,9 @@ impl LayerTree {
 
     /// Holds this whole tree to exactly the bar
     /// `#[serde(try_from = "LayerTreeRepr")]` holds a deserialized one
-    /// to — literally the same [`validate_shape`], [`validate_opacities`]
-    /// and [`validate_id_allocator`] calls, rooted at [`Self::roots`]
+    /// to — literally the same [`validate_shape`], [`validate_opacities`],
+    /// [`validate_id_allocator`] and [`validate_layer_id_range`] calls,
+    /// rooted at [`Self::roots`]
     /// with no parent above them, plus [`validate_origins`] for the
     /// stored `Rect` origins the per-call guards cover on the live edit
     /// paths.
@@ -1468,6 +1529,9 @@ impl LayerTree {
     /// the four rules — plus [`DocError::StaleLayerIdGenerator`] from
     /// [`validate_id_allocator`], the same pairing
     /// `#[serde(try_from = "LayerTreeRepr")]` runs; plus
+    /// [`DocError::ReservedLayerIdBit`] and
+    /// [`DocError::ReservedLayerIdCounter`] from
+    /// [`validate_layer_id_range`]; plus
     /// [`DocError::OpacityOutOfRange`] from [`validate_opacities`] and
     /// [`DocError::LayerOriginOutOfRange`] from [`validate_origins`].
     ///
@@ -1489,10 +1553,11 @@ impl LayerTree {
     /// [`Self::restore`]'s own `validate_opacities` — were guarded
     /// before this.)
     pub(crate) fn validate(&self) -> Result<(), DocError> {
-        // Shape, allocator, opacity, origin -- `try_from`'s own
-        // ordering, one step further.
+        // Shape, allocator, id range, opacity, origin -- `try_from`'s
+        // own ordering, one step further.
         validate_shape(&self.layers, &self.roots, None, 1)?;
         validate_id_allocator(&self.ids, &self.layers)?;
+        validate_layer_id_range(&self.ids, &self.layers)?;
         validate_opacities(&self.layers)?;
         validate_origins(&self.layers)
     }
@@ -1562,8 +1627,33 @@ impl LayerTree {
     /// Returns `None` for an unknown `id`, or one that names a
     /// [`LayerKind::Group`] — a group has no pixels of its own to store,
     /// so it never needs a surface.
+    ///
+    /// # And for an id with [`crate::MASK_SURFACE_BIT`] set
+    ///
+    /// Also `None`, and this branch is the mirror image of the one
+    /// [`Self::mask_surface_id`] already carries. A layer's pixel
+    /// surface is the *bottom* half of the id space by construction;
+    /// an id with the top bit set would put it in the half reserved for
+    /// mask surfaces, where it aliases the mask storage of the layer
+    /// whose id is this one with that bit cleared — one tile-store slot
+    /// with two owners.
+    ///
+    /// [`validate_layer_id_range`] refuses such an id at the
+    /// deserialization boundary, so this guard should be unreachable.
+    /// It is here anyway, deliberately, so the invariant is enforced at
+    /// the type's own boundary rather than only at the one call site
+    /// that validates: `LayerEntry`/`LayerId` are both `Deserialize`
+    /// and a `LayerTree` can also be assembled by `restore`, and this
+    /// crate would rather return "no surface" than hand a caller an id
+    /// that addresses somebody else's pixels. Before 0.70.1 the
+    /// validation half was missing entirely, and a crafted `.aur`
+    /// manifest could reach exactly that collision — see
+    /// [`DocError::ReservedLayerIdBit`].
     #[must_use]
     pub fn surface_id(&self, id: LayerId) -> Option<aurora_tile::SurfaceId> {
+        if id.to_raw() >= crate::MASK_SURFACE_BIT {
+            return None;
+        }
         match self.kind(id)? {
             LayerKind::Pixel { .. } => Some(aurora_tile::SurfaceId::from_raw(id.to_raw())),
             LayerKind::Group { .. } => None,
@@ -1600,8 +1690,10 @@ impl LayerTree {
     /// id at or above `MASK_SURFACE_BIT - 1`.
     /// `aurora_core::IdGenerator` starts at `0` and hands ids out one
     /// at a time, monotonically, so reaching `2^63 - 1` would take
-    /// `2^63` layer creations in a single session. No tree this
-    /// process can build gets there. The branch exists because this
+    /// `2^63` layer creations in a single session; and an id
+    /// deserialized from an untrusted file cannot get there either,
+    /// because [`validate_layer_id_range`] refuses anything at or above
+    /// `MASK_SURFACE_BIT` outright. The branch exists because this
     /// crate refuses to `panic` (see CLAUDE.md's "Lints worth
     /// knowing": a panic costs a professional their unsaved work), so
     /// an unreachable case still has to return something honest rather
@@ -2212,10 +2304,57 @@ mod tests {
             assert_ne!(tree.mask_surface_id(id), Some(composite));
             assert_ne!(tree.surface_id(id), Some(composite));
         }
-        // The single id whose masked form *would* be `u64::MAX`, forced
-        // in directly rather than generated -- refused, not aliased.
-        let colliding: super::LayerId = Id::from_raw(crate::MASK_SURFACE_BIT - 1);
-        assert_eq!(tree.mask_surface_id(colliding), None);
+        // The single id whose masked form *would* be `u64::MAX`, and
+        // the two above it -- each **actually present in the tree**, so
+        // the arithmetic guard is what refuses them rather than
+        // `contains`. (This test asserted the same thing against a tree
+        // that did *not* contain those ids until 0.70.1, which made it
+        // vacuous: `mask_surface_id` short-circuits on `!contains`
+        // before it ever reaches the guard, so it would have stayed
+        // green with the guard deleted outright.)
+        //
+        // Built by struct literal because no other path can produce
+        // them: `IdGenerator` would need `2^63` allocations, and
+        // `validate_layer_id_range` refuses exactly these ids on the
+        // deserialization path. That is the point -- the guard is the
+        // last line behind a validator, so the test has to reach past
+        // the validator to exercise it.
+        for raw in [
+            crate::MASK_SURFACE_BIT - 1,
+            crate::MASK_SURFACE_BIT,
+            u64::MAX,
+        ] {
+            let colliding: super::LayerId = Id::from_raw(raw);
+            let mut layers = HashMap::new();
+            layers.insert(colliding, pixel_entry("boundary", None));
+            let forced = LayerTree {
+                ids: ids_for(&layers),
+                layers,
+                roots: vec![colliding],
+            };
+            assert!(forced.contains(colliding), "the guard, not `contains`");
+            assert_eq!(
+                forced.mask_surface_id(colliding),
+                None,
+                "layer id {raw} must not get a mask surface"
+            );
+        }
+
+        // ... while an ordinary id one step below the boundary block
+        // still gets one, so the guard is a boundary and not a blanket
+        // refusal.
+        let below: super::LayerId = Id::from_raw(crate::MASK_SURFACE_BIT - 2);
+        let mut layers = HashMap::new();
+        layers.insert(below, pixel_entry("below", None));
+        let forced = LayerTree {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![below],
+        };
+        assert_eq!(
+            forced.mask_surface_id(below),
+            Some(aurora_tile::SurfaceId::from_raw(u64::MAX - 1)),
+        );
     }
 
     #[test]
@@ -4547,6 +4686,135 @@ mod tests {
         if let Err(err) = postcard::from_bytes::<LayerTree>(&bytes) {
             unreachable!("a tree written by this very build must decode: {err}");
         }
+    }
+
+    #[test]
+    fn a_manifest_holding_a_layer_id_with_the_mask_surface_bit_set_is_rejected() {
+        // The cross-layer surface collision, as the crafted file that
+        // reaches it. Shape-wise flawless again -- two root pixel
+        // layers, no cycle, no orphan, no dangling reference, and a
+        // counter comfortably ahead of both ids, so every other
+        // validator passes. What is wrong is only which *numbers* the
+        // ids are: `victim` is an ordinary layer that carries a mask,
+        // and `attacker` is `victim`'s id with `MASK_SURFACE_BIT` set.
+        //
+        // `LayerTree::surface_id(attacker)` is `attacker.to_raw()` and
+        // `LayerTree::mask_surface_id(victim)` is
+        // `victim.to_raw() | MASK_SURFACE_BIT` -- the same number. One
+        // `aurora_tile` slot, two owners: painting the attacker layer's
+        // pixels rewrites what the victim layer's mask reads back as
+        // coverage, and vice versa, with no error raised anywhere.
+        let victim = super::LayerId::from_raw(5);
+        let attacker = super::LayerId::from_raw(5 | crate::MASK_SURFACE_BIT);
+        assert_eq!(
+            attacker.to_raw(),
+            victim.to_raw() | crate::MASK_SURFACE_BIT,
+            "the two ids really do alias one surface -- that is the bug"
+        );
+
+        let mut layers = HashMap::new();
+        layers.insert(victim, pixel_entry("victim", None));
+        layers.insert(attacker, pixel_entry("attacker", None));
+        let roots = vec![victim, attacker];
+
+        // Neither of the pre-0.70.1 whole-tree checks has a complaint,
+        // which is exactly why this shipped.
+        if let Err(err) = super::validate_shape(&layers, &roots, None, 1) {
+            unreachable!("the shape is valid; only the id numbering is: {err:?}");
+        }
+        let ids = ids_for(&layers);
+        if let Err(err) = super::validate_id_allocator(&ids, &layers) {
+            unreachable!("the counter is ahead of both ids: {err:?}");
+        }
+
+        match super::validate_layer_id_range(&ids, &layers) {
+            Err(DocError::ReservedLayerIdBit { id, limit }) => {
+                assert_eq!(id, attacker);
+                assert_eq!(limit, crate::MASK_SURFACE_BIT);
+            }
+            other => unreachable!("expected ReservedLayerIdBit, got {other:?}"),
+        }
+
+        // And refused at the door, through real bytes -- the reason
+        // pinned against the validator above rather than the message,
+        // for the same reason every neighbouring test does it that way.
+        let repr = TreeReprForTest { ids, layers, roots };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a manifest whose layer id aliases another layer's mask surface must be refused"
+        );
+    }
+
+    #[test]
+    fn a_manifest_whose_id_counter_is_already_in_the_mask_surface_half_is_rejected() {
+        // The other half of the same door. This file carries no
+        // offending id at all -- just one ordinary layer 0 -- but its
+        // counter is parked so that the *next* ordinary
+        // `add_pixel_layer` hands out an id with `MASK_SURFACE_BIT`
+        // set, which is the same collision one user action later.
+        let held = super::LayerId::from_raw(0);
+        let mut layers = HashMap::new();
+        layers.insert(held, pixel_entry("held", None));
+        let roots = vec![held];
+
+        let mut ids: IdGenerator<Layer> = IdGenerator::new();
+        ids.advance_past(crate::MASK_SURFACE_BIT - 1);
+        assert_eq!(ids.peek_next(), crate::MASK_SURFACE_BIT);
+        if let Err(err) = super::validate_id_allocator(&ids, &layers) {
+            unreachable!("the counter is far ahead of layer 0: {err:?}");
+        }
+
+        match super::validate_layer_id_range(&ids, &layers) {
+            Err(DocError::ReservedLayerIdCounter { next, limit }) => {
+                assert_eq!(next, crate::MASK_SURFACE_BIT);
+                assert_eq!(limit, crate::MASK_SURFACE_BIT);
+            }
+            other => unreachable!("expected ReservedLayerIdCounter, got {other:?}"),
+        }
+
+        let repr = TreeReprForTest { ids, layers, roots };
+        assert!(
+            decode_tree(&repr).is_err(),
+            "a manifest whose id counter is about to hand out a mask-surface id must be refused"
+        );
+    }
+
+    #[test]
+    fn surface_id_refuses_an_id_in_the_mask_surface_half_even_past_validation() {
+        // The belt-and-braces half of the fix: the guard lives on the
+        // accessor too, not only in the validator, so a tree assembled
+        // some third way still cannot hand out an aliasing surface.
+        // Struct literal, because `validate_layer_id_range` is exactly
+        // what stops every ordinary path from producing this.
+        let victim = super::LayerId::from_raw(5);
+        let attacker = super::LayerId::from_raw(5 | crate::MASK_SURFACE_BIT);
+        let mut layers = HashMap::new();
+        layers.insert(victim, pixel_entry("victim", None));
+        layers.insert(attacker, pixel_entry("attacker", None));
+        let forced = LayerTree {
+            ids: ids_for(&layers),
+            layers,
+            roots: vec![victim, attacker],
+        };
+
+        assert!(forced.contains(attacker));
+        assert_eq!(
+            forced.surface_id(attacker),
+            None,
+            "a pixel surface must never be addressed in the mask half"
+        );
+        // The victim's own mask surface is unaffected, and so is its
+        // own pixel surface -- the guard is one-sided.
+        assert_eq!(
+            forced.mask_surface_id(victim),
+            Some(aurora_tile::SurfaceId::from_raw(
+                5 | crate::MASK_SURFACE_BIT
+            ))
+        );
+        assert_eq!(
+            forced.surface_id(victim),
+            Some(aurora_tile::SurfaceId::from_raw(5))
+        );
     }
 
     #[test]
