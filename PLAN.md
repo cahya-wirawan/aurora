@@ -14274,6 +14274,49 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-02 (0.71.1) — the `.aur` writer now runs the
+reader's whole pre-flight, and the widened tile budget says what it
+actually does.** Two independent reviews of 0.71.0 converged on the
+same defect and it needed no crafted input at all: the *reader* carried
+a whole-document tile budget and the *writer* carried none, so two
+ordinary layers, each given an ordinary full-canvas mask through the
+public `add_mask`, wrote a valid container that this project's own
+reader then refused with `TooManyTiles` — a file a user saves and can
+never reopen, which is the "silently degrading a professional's file"
+failure CLAUDE.md names as the worst this project can have. A second,
+narrower shape of the same gap: 0.71.0 hoisted the *mask*-extent check
+above `ZipWriter::new` but not the *layer*-bounds one, so an oversized
+layer extent (reachable through `add_pixel_layer`, which bounds a
+layer's origin but not its extent) failed from inside the tile loop,
+after the mimetype/manifest/history entries were already written,
+leaving a well-formed 3-entry partial container behind — bounded in
+practice only because `write_autosave` stages to a temp path. Both are
+closed by one change: `validate_mask_rects` becomes
+`validate_persisted_rects`, walks `persisted_surfaces` (so layer bounds
+and mask rectangles alike), and sums their grids against
+`MAX_TOTAL_TILES_PER_DOCUMENT` — one hoisted pre-flight shared by
+`read` and `write_with_policy`, before the first byte or the first
+archive probe. Also corrected: that constant's own doc comment claimed
+the `2 *` widening admitted "one layer at the documented ceiling, plus
+its own mask" and refused anything bigger. It does not — the check is a
+flat `total > MAX` over every persisted grid, so two *maskless*
+ceiling-sized layers reach exactly the same total and are admitted too.
+The widening is document-wide and now says so, together with the real
+cost asymmetry it does not distinguish (a found tile costs ~2 orders of
+magnitude more than an empty grid position) and the deliberate decision
+*not* to add a second cap on materialized tiles this round, since that
+would bound how much real content a legitimate document may hold — a
+product decision (PRD §6 promises unlimited layers), not one to make
+inside a hardening pass. The single test guarding the constant was an
+arithmetic tautology (`assert!(2*side*side <= MAX)` one line after
+`assert_eq!(MAX, 2*side*side)`); it is replaced by
+`the_largest_legal_document_still_writes_and_reads_with_its_mask`,
+which calls the real `write` and the real `read` on a real
+ceiling-sized layer carrying a full-canvas mask (~2.75M grid positions
+per direction, 0.43 s locally at the workspace's `opt-level = 1` dev
+profile). Two more tests cover the refusals, each asserting zero bytes
+at the destination.
+
 **Addendum 2026-09-02 (0.71.0) — painted mask coverage now survives a
 `.aur` save/load round trip.** Follow-on (2) of the four 0.70.0 named
 is closed. `aurora-io`'s writer and reader each walked only a layer's

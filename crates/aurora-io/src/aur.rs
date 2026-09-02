@@ -94,7 +94,7 @@
 //! not see it then — it was only ever called on a `LayerKind::Pixel`
 //! arm's own `bounds`, so a mask's rectangle went unchecked, and a
 //! *group*, which can carry a mask but has no `bounds`, never reached
-//! `tile_grid` at all. `validate_mask_rects` closes both, from [`read`]
+//! `tile_grid` at all. `validate_persisted_rects` closes both, from [`read`]
 //! and from the shared body behind [`write()`] and
 //! [`write_best_effort`], reusing [`IoError::LayerOriginOutOfRange`]
 //! rather than adding a variant.
@@ -104,7 +104,7 @@
 //! had nothing to make unfinishable. Persisting mask coverage changed
 //! exactly that — a mask rectangle now drives a real tile grid in both
 //! directions, and `aurora_doc::LayerTree::add_mask` bounds a mask's
-//! origin but never its extent — so `validate_mask_rects` now runs the
+//! origin but never its extent — so `validate_persisted_rects` now runs the
 //! whole of `tile_grid` over every mask, extent
 //! ([`IoError::LayerBoundsTooLarge`]) included. Without it a crafted
 //! manifest declaring a `u32::MAX`-wide mask would hang
@@ -125,6 +125,21 @@
 //! is fixed at its root in `aurora_doc::LayerTree`'s own `Deserialize`
 //! (a tree from bytes is now checked for cycles and depth before any
 //! caller walks it) with this module's own walk made iterative as well.
+//!
+//! **The way *out* was checked less than the way in, until 0.71.1.**
+//! Every check above was reached from [`read`]; the writer shared only
+//! the mask half. Two consequences, both reachable through ordinary
+//! `aurora-doc` API calls rather than a crafted file, and both closed
+//! by hoisting the whole pre-flight into `validate_persisted_rects`:
+//! the writer had **no whole-document tile budget at all**, so two
+//! ordinary layers each carrying an ordinary full-canvas mask wrote a
+//! valid container that this module's own [`read`] then refused with
+//! [`IoError::TooManyTiles`] — a file a user saved and can never
+//! reopen; and an oversized *layer* extent (`aurora-doc` bounds a
+//! layer's origin, not its extent) failed from inside the tile loop,
+//! after the mimetype, manifest and history entries were already
+//! written, leaving a well-formed 3-entry partial container at the
+//! destination. Both now refuse before the first byte.
 //!
 //! **Colour space, real as of 2026-08-06**: [`write()`]/[`read`] carry a
 //! real `Option<&aurora_color::IccProfile>`/`Option<IccProfile>` now,
@@ -190,10 +205,21 @@ const MAX_METADATA_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 /// legitimate can exceed it.
 const MAX_TILE_ENTRY_BYTES: u64 = (aurora_tile::SAMPLES as u64) * 2 + 64 * 1024;
 
-/// The most tiles [`read`]'s own tile scan will visit across *all* of a
-/// manifest's persisted surfaces put together — every pixel layer's own
-/// grid *and* every mask's, since 0.71.0 charges both against this one
-/// budget ([`persisted_surfaces`]).
+/// The most tiles a tile scan will visit across *all* of a document's
+/// persisted surfaces put together — every pixel layer's own grid *and*
+/// every mask's, since 0.71.0 charges both against this one budget
+/// ([`persisted_surfaces`]).
+///
+/// **Charged on the way out as well as on the way in** (0.71.1).
+/// Until then only [`read`] carried this budget, and the consequence
+/// was reachable without a crafted file at all: two ordinary layers,
+/// each given an ordinary full-canvas mask through
+/// `aurora_doc::LayerTree::add_mask`, wrote a perfectly valid container
+/// that then failed its own reader with [`IoError::TooManyTiles`] — an
+/// unopenable file produced by entirely ordinary API use, which is the
+/// "silently degrading a professional's file" failure CLAUDE.md names
+/// as the worst this project can have. [`validate_persisted_rects`] now
+/// runs the same sum before the first byte is written.
 ///
 /// `tile_grid` already refuses any single layer larger than the document
 /// ceiling, but nothing bounds how many layers a manifest may declare —
@@ -206,19 +232,41 @@ const MAX_TILE_ENTRY_BYTES: u64 = (aurora_tile::SAMPLES as u64) * 2 + 64 * 1024;
 /// kilobyte-scale file able to spin for hours on `aurora-app`'s own
 /// pre-window startup path.
 ///
-/// The budget is exactly *one layer at the documented ceiling, plus its
-/// own mask*: the largest single document PRD §7.3.1 says can exist
-/// still loads untouched — mask included — while a manifest that only
-/// reaches a bigger number by stacking many large layers is refused. It
-/// is expressed in terms of the ceiling and the tile size rather than a
-/// bare literal, so it follows either if they ever change.
+/// **What this is, stated plainly.** It is a *flat, document-wide
+/// total*, sized so that the largest single document PRD §7.3.1 says
+/// can exist — one ceiling-sized layer carrying a full-canvas mask —
+/// still loads untouched. It is expressed in terms of the ceiling and
+/// the tile size rather than a bare literal, so it follows either if
+/// they ever change.
 ///
-/// The `2 *` arrived with mask persistence (0.71.0) and is a widening,
-/// not slack: a mask's grid is now walked alongside its layer's, so a
-/// single *legal* ceiling-sized layer carrying a full-canvas mask would
-/// otherwise be refused as over budget — a real document rejected by a
-/// check meant for crafted ones. Two is the exact factor, because a
-/// layer can carry at most one mask.
+/// The `2 *` arrived with mask persistence (0.71.0), because a mask's
+/// grid is now walked alongside its layer's and a single *legal*
+/// ceiling-sized masked layer would otherwise be refused by a check
+/// meant for crafted files. **It is not mask-scoped, and does not
+/// pretend to be** (corrected 0.71.1, which found the previous wording
+/// here claiming exactly that): the check is `total > MAX` over the sum
+/// of every persisted grid, so any combination reaching the same total
+/// is admitted equally — two ceiling-sized layers carrying *no* masks
+/// at all, one ceiling-sized layer plus a second layer's full-canvas
+/// mask, and so on. That is an accepted, document-wide loosening: the
+/// budget exists to make an unfinishable scan impossible, not to
+/// enforce a layer count, and no arrangement under it can cost more
+/// than the legal one-masked-ceiling-layer case it is sized for.
+///
+/// **The real cost is not uniform across that total, and this budget
+/// does not distinguish.** A grid position with no matching ZIP entry
+/// costs a `format!` and a central-directory miss; one with an entry
+/// costs a capped read, an `lz4` decode, and a tile made resident —
+/// measured at roughly two orders of magnitude more, with an
+/// archive-to-scratch-disk amplification on top. A capped *second*
+/// budget on materialized tiles was considered in 0.71.1 and
+/// deliberately not added: it would bound the worst case tighter, but
+/// it also caps how much real content a legitimate document may hold,
+/// which is a product decision (PRD §6 promises unlimited layers) and
+/// not one to make silently inside a hardening pass. Disclosed here so
+/// the tradeoff is visible rather than assumed away — a file that fills
+/// the whole budget with real tiles is a large, slow read, not a
+/// refused one.
 const MAX_TOTAL_TILES_PER_DOCUMENT: u64 = {
     let side = (aurora_core::MAX_DOCUMENT_EXTENT as u64).div_ceil(TILE as u64);
     2 * side * side
@@ -296,9 +344,11 @@ fn read_capped(mut file: zip::read::ZipFile<'_>, name: &str, cap: u64) -> Result
 /// own `aurora_doc::LayerMask` rectangle here too — including a
 /// group's, which has no `bounds` of its own — so this function has
 /// become the single check for every rectangle that drives a tile loop
-/// in this module. [`validate_mask_rects`] still exists and still runs
-/// the mask half *up front*, before a single byte is written or a
-/// single grid position is probed.
+/// in this module. Since 0.71.1 every one of those rectangles reaches
+/// this function from [`validate_persisted_rects`] *up front* — before
+/// a single byte is written or a single grid position is probed — and
+/// then again, per surface, purely for the grid dimensions the loops
+/// need.
 ///
 /// Clamping to the ceilings the format already documents bounds the
 /// worst case without newly restricting any legitimate document.
@@ -390,13 +440,20 @@ enum ColorSpaceTag {
 /// fails, [`IoError::Color`] if `profile.to_bytes()` fails,
 /// [`IoError::LayerBoundsTooLarge`]/[`IoError::LayerOriginOutOfRange`]
 /// if some layer's own bounds — **or some layer's mask rectangle** —
-/// are past the document ceiling in extent or origin (`tile_grid` and
-/// `validate_mask_rects` are both shared with [`read`], so the same
-/// checks apply on the way out as on the way in; a mask's *extent* is
-/// checked here too as of 0.71.0, since `add_mask` itself does not
-/// bound one and a mask now drives a real tile grid), or
-/// [`IoError::Tile`] if paging a touched tile in from the scratch disk
-/// fails.
+/// are past the document ceiling in extent or origin,
+/// [`IoError::TooManyTiles`] if its layers and their masks together add
+/// up to more tiles than any real document has
+/// ([`MAX_TOTAL_TILES_PER_DOCUMENT`]), or [`IoError::Tile`] if paging a
+/// touched tile in from the scratch disk fails.
+///
+/// All three rectangle/budget refusals come from the one hoisted
+/// `validate_persisted_rects` pre-flight shared with [`read`], so the
+/// same checks apply on the way out as on the way in and **a refusal
+/// for any of them leaves zero bytes at `writer`** rather than a
+/// partial container. The budget half is what stops this function from
+/// producing a file its own reader would refuse (0.71.1); the extent
+/// half is what stops an oversized mask or layer from turning the tile
+/// loop into an unfinishable one.
 ///
 /// That last one aborts the whole write, deliberately: an explicit save
 /// must refuse rather than quietly produce a document with content
@@ -467,13 +524,22 @@ pub struct SkippedTile {
 /// canvas (degrades and repaints) and `composite_document` (refuses).
 ///
 /// Only a tile read is tolerated. A container/I/O failure, a bad
-/// manifest, or a layer whose own bounds — or whose mask's bounds —
-/// exceed the document ceiling in extent or origin still fail the write
-/// outright: those say the *tree* is broken, not that one piece of
-/// input is unreadable. Disclosed rather than silently assumed, since
-/// it means this writer can refuse a whole autosave over a rectangle;
-/// no producer can build such a tree any more, so it is unreachable in
-/// practice, and PLAN.md records it.
+/// manifest, a layer whose own bounds — or whose mask's bounds —
+/// exceed the document ceiling in extent or origin, or a tree whose
+/// grids together exceed [`MAX_TOTAL_TILES_PER_DOCUMENT`] still fail
+/// the write outright: those say the *tree* is broken, not that one
+/// piece of input is unreadable. Disclosed rather than silently
+/// assumed, since it means this writer can refuse a whole autosave over
+/// a rectangle, and **that is reachable through ordinary
+/// `aurora-doc` API calls, not only from a crafted file** — an earlier
+/// version of this paragraph claimed otherwise. `add_pixel_layer` and
+/// `add_mask` bound a rectangle's *origin* but not its *extent*, and
+/// nothing bounds the whole-document total at all, so an oversized
+/// layer or two full-canvas-masked ceiling layers reach this refusal
+/// from a live session. Refusing is still the right answer (the
+/// alternative is an unfinishable loop, or a file that cannot be
+/// reopened) but it means one such layer disables autosave for the rest
+/// of the session, which is a real cost. PLAN.md records it.
 ///
 /// # Errors
 ///
@@ -518,11 +584,16 @@ fn write_with_policy<W: Write + Seek>(
     store: &mut TileStore,
     unreadable: UnreadableTile,
 ) -> Result<Vec<SkippedTile>, IoError> {
-    // Before a single byte is written: a refusal here leaves no
-    // half-built container behind. `tile_grid`'s own bounds check
-    // cannot be hoisted the same way (it is what derives the grid the
-    // tile loop walks), but a mask check has no such tie.
-    validate_mask_rects(layers)?;
+    // Before a single byte is written: every rectangle the tile loop
+    // below will derive a grid from, range-checked, and their grids
+    // summed against the whole-document budget. A refusal here leaves
+    // no half-built container behind -- which, until 0.71.1, an
+    // oversized *layer* extent did (it failed from inside the loop,
+    // after the mimetype/manifest/history entries were already
+    // written), and an over-budget document did not do at all (the
+    // writer had no budget check, so it produced files its own reader
+    // then refused).
+    validate_persisted_rects(layers)?;
 
     let mut skipped: Vec<SkippedTile> = Vec::new();
     let mut zip = ZipWriter::new(writer);
@@ -691,33 +762,22 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         });
     }
 
-    // Every layer's *mask* rectangle -- origin and extent both --
-    // before any of them is used to derive a grid below. Hoisted out
-    // of the tile loop deliberately: an oversized mask extent must be
-    // refused before the loop it would otherwise make unfinishable
-    // starts, not part-way through it.
-    validate_mask_rects(&manifest.layers)?;
+    // Every rectangle this manifest declares -- a layer's own bounds
+    // and every mask's, origin and extent both -- plus the
+    // whole-document tile budget, before any of them is used to derive
+    // a grid below. Hoisted out of the tile loop deliberately: an
+    // oversized extent must be refused before the loop it would
+    // otherwise make unfinishable starts, not part-way through it.
+    validate_persisted_rects(&manifest.layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
 
-    let mut total_tiles: u64 = 0;
     for (surface, bounds) in persisted_surfaces(&manifest.layers) {
+        // Range-checked and charged against the whole-document budget
+        // already, by `validate_persisted_rects` above; this call is
+        // only here for the grid dimensions it returns.
         let (tiles_x, tiles_y) = tile_grid(bounds)?;
-        // Charged against the whole-document budget *before* this
-        // surface's own grid is walked, so an over-budget manifest costs
-        // one addition rather than a scan -- see
-        // `MAX_TOTAL_TILES_PER_DOCUMENT`. A mask grid is charged here
-        // exactly like a layer's, from inside the one unified loop:
-        // charging only layers would leave a manifest able to blow past
-        // the budget entirely in mask rectangles.
-        total_tiles = total_tiles.saturating_add(u64::from(tiles_x) * u64::from(tiles_y));
-        if total_tiles > MAX_TOTAL_TILES_PER_DOCUMENT {
-            return Err(IoError::TooManyTiles {
-                total: total_tiles,
-                max: MAX_TOTAL_TILES_PER_DOCUMENT,
-            });
-        }
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let tile_id = TileId { x: tx, y: ty };
@@ -840,7 +900,8 @@ fn persisted_surfaces(layers: &LayerTree) -> Vec<(SurfaceId, aurora_core::Rect)>
 }
 
 /// Every layer the tree holds, groups included — the shared walk
-/// [`persisted_surfaces`] and [`validate_mask_rects`] both go through.
+/// [`persisted_surfaces`] goes through (and so, by way of it,
+/// [`validate_persisted_rects`]).
 ///
 /// Covering *groups* is the whole reason it walks everything rather
 /// than only `LayerKind::Pixel` entries. A group carries no `bounds`
@@ -888,58 +949,76 @@ fn layer_ids(layers: &LayerTree) -> Vec<LayerId> {
     ids
 }
 
-/// Refuses any layer whose *mask* rectangle is out of range — its
-/// origin further from the document origin than
-/// [`aurora_core::MAX_DOCUMENT_ORIGIN`]
-/// ([`IoError::LayerOriginOutOfRange`]), or its extent past
-/// [`aurora_core::MAX_DOCUMENT_EXTENT`]
-/// ([`IoError::LayerBoundsTooLarge`]). Both are the same variants
-/// `tile_grid` returns for a layer's own bounds, because they are the
-/// same failure classes and a caller has no use for telling a layer's
-/// bad rectangle from its mask's; this function is literally
-/// `tile_grid` run over every mask in the tree, with the grid it
-/// computes discarded.
+/// The whole pre-flight both directions of the format run **before any
+/// tile grid is walked, any byte is written, or any archive entry is
+/// probed**: every rectangle [`persisted_surfaces`] will derive a grid
+/// from — a pixel layer's own `bounds` *and* every mask's — checked for
+/// range, and their grids summed against
+/// [`MAX_TOTAL_TILES_PER_DOCUMENT`].
 ///
-/// **The extent half is new in 0.71.0, and it is now load-bearing.**
-/// Until then this checked only the origin, and said so: a mask's
-/// extent drove no loop here, because mask surfaces were not written
-/// into the archive at all, so there was nothing an oversized one could
-/// make unfinishable. That comment ended by saying to revisit it "the
-/// moment mask surfaces are written into the archive" — this is that
-/// moment. [`persisted_surfaces`] now derives a real tile grid from
-/// `aurora_doc::LayerMask::bounds`, and `aurora_doc::LayerTree::add_mask`
-/// bounds only a mask's origin, never its extent — so a crafted
-/// manifest declaring a `u32::MAX`-wide mask would be an unfinishable
-/// loop (~2.8e14 iterations) on `aurora-app`'s own pre-window startup
-/// path, exactly the defect `tile_grid`'s extent check already closed
-/// for layer bounds.
+/// Three refusals, all of them the same variants `tile_grid` and
+/// [`read`] already returned:
 ///
-/// **This stays a separate walk, and it has to.** `tile_grid` runs
-/// per grid, interleaved with writing entries; this runs *before* the
-/// first byte of a container is written and before the reader's first
-/// probe, so a bad rectangle anywhere in the tree fails up front rather
-/// than half-way through a file. Until 0.57.13 a crafted manifest could
-/// declare a mask at `i64::MIN` and be read back as `Ok`; it then
-/// survived a write-then-read round trip unchanged and reached
-/// `apply_mask` -> `aurora_core::Rect::contains_point` in `aurora-app`
-/// (named `apply_mask_clip` at the time), which saturates rather than
-/// panicking and so renders the *wrong picture* (the masked layer
-/// fully hidden, or fully shown when `inverted`) rather than failing
-/// loudly.
+/// - [`IoError::LayerOriginOutOfRange`] — a rectangle whose origin sits
+///   further from the document origin than
+///   [`aurora_core::MAX_DOCUMENT_ORIGIN`].
+/// - [`IoError::LayerBoundsTooLarge`] — one whose extent is past
+///   [`aurora_core::MAX_DOCUMENT_EXTENT`].
+/// - [`IoError::TooManyTiles`] — grids that individually pass and
+///   together do not.
+///
+/// A layer's bad rectangle and its mask's are deliberately not told
+/// apart: they are the same failure classes reaching the same
+/// downstream arithmetic, and a caller has no use for the distinction.
+///
+/// **Why it is one hoisted walk rather than checks inside the loops.**
+/// A grid derived from an unchecked extent is not a big loop but an
+/// unfinishable one (~2.8e14 iterations for a `u32::MAX`-wide
+/// rectangle), reached from `aurora-app`'s own pre-window startup
+/// recovery path; and a refusal discovered *part-way* through a write
+/// leaves a well-formed partial container behind at whatever
+/// destination the caller passed. Both are only closed by checking
+/// everything up front. Until 0.57.13 a crafted manifest could declare
+/// a mask at `i64::MIN`, be read back as `Ok`, survive a round trip and
+/// reach `apply_mask` -> `aurora_core::Rect::contains_point` in
+/// `aurora-app`, which saturates rather than panicking and so renders
+/// the *wrong picture* rather than failing loudly.
+///
+/// **History of what this walk covered**, because the gaps were found
+/// one at a time and the pattern matters more than any one of them:
+/// mask *origins* only (0.57.13), mask extents as well once mask
+/// coverage became real persisted tiles (0.71.0), and finally — 0.71.1,
+/// this revision — layer bounds and the whole-document tile budget too,
+/// which had been checked only from inside the loops they bound. That
+/// last gap was reachable with no crafted input at all: two ordinary
+/// layers with ordinary full-canvas masks wrote a valid container the
+/// reader then refused ([`MAX_TOTAL_TILES_PER_DOCUMENT`]), and an
+/// oversized layer extent — `aurora_doc` bounds a layer's origin but
+/// not its extent — aborted from inside the tile loop, after the
+/// mimetype, manifest and history entries had already been written.
 ///
 /// Called from [`read`] and from `write_with_policy` — the shared body
 /// behind [`write()`] and [`write_best_effort`] — so one call site each
-/// covers every path in and out of the format, the same property
-/// `tile_grid` gives the bounds check.
-fn validate_mask_rects(layers: &LayerTree) -> Result<(), IoError> {
-    for id in layer_ids(layers) {
-        let Some(mask) = layers.mask(id) else {
-            continue;
-        };
-        // The grid itself is not wanted here, only the two range checks
-        // it performs -- see this function's own doc comment for why
-        // they have to happen before any loop, not inside one.
-        tile_grid(mask.bounds)?;
+/// covers every path in and out of the format.
+///
+/// `tile_grid` still runs again per surface inside those loops, since
+/// that is what produces the grid dimensions they walk. That is a
+/// repeat of two comparisons per surface, not a second policy: this
+/// function is the one that decides, and it decides first.
+fn validate_persisted_rects(layers: &LayerTree) -> Result<(), IoError> {
+    let mut total_tiles: u64 = 0;
+    for (_surface, bounds) in persisted_surfaces(layers) {
+        let (tiles_x, tiles_y) = tile_grid(bounds)?;
+        // Charged before the next surface is even looked at, so an
+        // over-budget document costs one addition per surface rather
+        // than a scan -- see `MAX_TOTAL_TILES_PER_DOCUMENT`.
+        total_tiles = total_tiles.saturating_add(u64::from(tiles_x) * u64::from(tiles_y));
+        if total_tiles > MAX_TOTAL_TILES_PER_DOCUMENT {
+            return Err(IoError::TooManyTiles {
+                total: total_tiles,
+                max: MAX_TOTAL_TILES_PER_DOCUMENT,
+            });
+        }
     }
     Ok(())
 }
@@ -1649,7 +1728,7 @@ mod tests {
 
     #[test]
     fn read_rejects_a_manifest_whose_layer_mask_origin_is_past_the_document_range() {
-        // The gap 0.57.12 left open, and the reason `validate_mask_rects`
+        // The gap 0.57.12 left open, and the reason `validate_persisted_rects`
         // exists as a walk of its own rather than another line inside
         // `tile_grid`: a mask carries a `Rect` that is *not* the layer's
         // own `bounds`, and `tile_grid` never sees it. Measured against
@@ -1691,7 +1770,7 @@ mod tests {
         // layer's does. (Since 0.71.0 `persisted_surfaces` does yield a
         // group's mask surface, so `tile_grid` would eventually see this
         // rectangle anyway -- but only after the reader had started
-        // walking grids, which is exactly why `validate_mask_rects`
+        // walking grids, which is exactly why `validate_persisted_rects`
         // still runs first.)
         let manifest_bytes =
             crafted_manifest(CraftedKind::Group, Some(CraftedMask::at(0, i64::MIN)));
@@ -1731,7 +1810,7 @@ mod tests {
 
     #[test]
     fn write_and_best_effort_write_both_refuse_a_layer_mask_origin_past_the_document_range() {
-        // `validate_mask_rects` is called from `write_with_policy`,
+        // `validate_persisted_rects` is called from `write_with_policy`,
         // the shared body behind both public writers, so this covers
         // the way *out* of the format as well as the way in — the same
         // property `tile_grid` already gives the layer-bounds check.
@@ -2588,7 +2667,7 @@ mod tests {
             }
             other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
         }
-        // And nothing was written: `validate_mask_rects` runs before the
+        // And nothing was written: `validate_persisted_rects` runs before the
         // first byte, so a refused save leaves no half-built container.
         assert!(
             out.get_ref().is_empty(),
@@ -2606,24 +2685,212 @@ mod tests {
         );
     }
 
+    /// One ceiling-sized layer carrying a full-canvas mask — the
+    /// largest single document PRD §7.3.1 says can exist, and the case
+    /// `MAX_TOTAL_TILES_PER_DOCUMENT`'s `2 *` factor exists for.
+    fn ceiling_layer_with_a_full_canvas_mask() -> LayerTree {
+        let mut layers = LayerTree::new();
+        let ceiling = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        let id = match layers.add_pixel_layer("ceiling", ceiling, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, ceiling) {
+            unreachable!("{err:?}");
+        }
+        layers
+    }
+
     #[test]
-    fn the_whole_document_tile_budget_is_one_ceiling_layer_plus_its_own_mask() {
-        // Why the budget had to be widened rather than left alone: a
-        // masked layer now contributes two grids, so the largest
-        // *legal* document PRD §7.3.1 allows -- one ceiling-sized layer
-        // carrying a full-canvas mask -- would have been refused by a
-        // budget sized for one grid. Two is the exact factor: a layer
-        // can carry at most one mask.
-        let side =
-            u64::from(aurora_core::MAX_DOCUMENT_EXTENT).div_ceil(u64::from(aurora_tile::TILE));
-        assert_eq!(super::MAX_TOTAL_TILES_PER_DOCUMENT, 2 * side * side);
+    fn the_largest_legal_document_still_writes_and_reads_with_its_mask() {
+        // The behavioural replacement (0.71.1) for a test that used to
+        // assert `2 * side * side <= MAX_TOTAL_TILES_PER_DOCUMENT` one
+        // line after asserting `MAX == 2 * side * side` -- an arithmetic
+        // tautology that could not fail whatever the constant actually
+        // permitted, and so covered none of the property its name
+        // claimed. This calls the real `write` and the real `read` on
+        // the real document the widening exists for: one ceiling-sized
+        // layer plus its own full-canvas mask, both grids charged
+        // against the one budget.
+        //
+        // Both directions must say `Ok`. Before 0.71.0's widening the
+        // *reader* refused this (one grid's worth of budget, two grids
+        // declared); before 0.71.1 the *writer* had no budget check at
+        // all, which is the opposite defect -- it would have written
+        // this file whatever the budget said.
+        //
+        // No tiles are painted, so the cost here is the grid walk
+        // itself (~2.75M positions, twice) and nothing else. That is
+        // deliberately the expensive half: it is what proves the
+        // document is *scanned*, not short-circuited.
+        let layers = ceiling_layer_with_a_full_canvas_mask();
+        let history = History::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let started = std::time::Instant::now();
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (
+                aurora_core::MAX_DOCUMENT_EXTENT,
+                aurora_core::MAX_DOCUMENT_EXTENT,
+            ),
+            None,
+            &mut store,
+        ) {
+            unreachable!("the largest legal document must still save: {err:?}");
+        }
+
+        bytes.set_position(0);
+        let (_dir2, mut fresh_store) = real_tile_store();
+        let (restored, _, canvas, _) = match read(bytes, &mut fresh_store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("the largest legal document must still reopen: {err:?}"),
+        };
+        assert_eq!(
+            canvas,
+            (
+                aurora_core::MAX_DOCUMENT_EXTENT,
+                aurora_core::MAX_DOCUMENT_EXTENT
+            )
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "the ceiling-sized layer must survive the round trip"
+        );
+        // Loose on purpose -- this is a CI-safety bound on an
+        // unoptimized build, not a performance claim. Its job is to
+        // fail if this document ever becomes unfinishable, not to
+        // measure anything.
         assert!(
-            2 * side * side <= super::MAX_TOTAL_TILES_PER_DOCUMENT,
-            "a ceiling-sized layer plus its own mask must fit"
+            started.elapsed() < std::time::Duration::from_secs(100),
+            "the largest legal document must finish both directions, not spin"
+        );
+    }
+
+    #[test]
+    fn write_refuses_two_ordinary_full_canvas_masked_layers_before_writing_a_byte() {
+        // The gap 0.71.1 closed, and it needed no crafted input at all:
+        // two ordinary layers, each given an ordinary full-canvas mask
+        // through the public `add_mask`, used to *write* a perfectly
+        // valid container that this module's own `read` then refused
+        // with `TooManyTiles` -- a file an ordinary user could save and
+        // never reopen, which is exactly the "silently degrading a
+        // professional's file" failure CLAUDE.md names as the worst
+        // this project can have.
+        //
+        // The layers here are individually legal (each is exactly the
+        // documented ceiling, which
+        // `the_largest_legal_document_still_writes_and_reads_with_its_mask`
+        // proves must keep working); it is their sum that is not.
+        let mut layers = LayerTree::new();
+        let ceiling = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        for index in 0..2 {
+            let id = match layers.add_pixel_layer(format!("ceiling {index}"), ceiling, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.add_mask(id, ceiling) {
+                unreachable!("{err:?}");
+            }
+        }
+        let history = History::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let started = std::time::Instant::now();
+        let mut out = Cursor::new(Vec::new());
+        match write(&mut out, &layers, &history, (1, 1), None, &mut store) {
+            Err(super::IoError::TooManyTiles { total, max }) => {
+                assert!(total > max, "{total} must exceed the {max}-tile budget");
+                assert_eq!(max, super::MAX_TOTAL_TILES_PER_DOCUMENT);
+            }
+            other => unreachable!("expected TooManyTiles, got {other:?}"),
+        }
+        assert!(
+            out.get_ref().is_empty(),
+            "a refused write must not leave a partial container behind"
+        );
+
+        // The autosave path refuses it too. `write_best_effort` tolerates
+        // an unreadable *tile*, never a tree it cannot finish scanning.
+        let mut out = Cursor::new(Vec::new());
+        match write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store) {
+            Err(super::IoError::TooManyTiles { .. }) => {}
+            other => unreachable!("expected TooManyTiles, got {other:?}"),
+        }
+        assert!(
+            out.get_ref().is_empty(),
+            "a refused best-effort write must not leave a partial container behind"
         );
         assert!(
-            4 * side * side > super::MAX_TOTAL_TILES_PER_DOCUMENT,
-            "two ceiling-sized masked layers must not"
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an over-budget document must be refused on arithmetic, not by scanning it"
+        );
+    }
+
+    #[test]
+    fn write_refuses_an_oversized_layer_extent_before_writing_a_byte() {
+        // The mask half of this was hoisted in 0.71.0 and the layer half
+        // was not, so an oversized *layer* extent still failed from
+        // inside the per-surface loop -- after the mimetype, manifest
+        // and history entries had already been written, leaving a
+        // well-formed 3-entry partial container at the destination. Its
+        // real-world blast radius was bounded (`write_autosave` stages
+        // to a temp path and renames on success), but a caller writing
+        // straight to its destination would have been left with one,
+        // and this module cannot see which kind of caller it has.
+        //
+        // Ordinary API use, again: `add_pixel_layer` bounds a layer's
+        // origin but not its extent, so no crafted manifest is needed.
+        let mut layers = LayerTree::new();
+        let oversized = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        if let Err(err) = layers.add_pixel_layer("oversized", oversized, None) {
+            unreachable!("{err:?}");
+        }
+        let history = History::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let started = std::time::Instant::now();
+        for policy in 0..2 {
+            let mut out = Cursor::new(Vec::new());
+            let result = if policy == 0 {
+                write(&mut out, &layers, &history, (1, 1), None, &mut store).map(|()| Vec::new())
+            } else {
+                write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store)
+            };
+            match result {
+                Err(super::IoError::LayerBoundsTooLarge { width, max, .. }) => {
+                    assert_eq!(width, u32::MAX);
+                    assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+                }
+                other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+            }
+            assert!(
+                out.get_ref().is_empty(),
+                "a refused write must not leave a partial container behind"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an oversized layer extent must be refused up front, not looped over"
         );
     }
 
