@@ -58,9 +58,21 @@
 //! journal row 0 is not a step at all.
 //!
 //! **The damage rect a full journal produces is not yet safe to scissor
-//! with.** `WidgetTree` accumulates one union rect, so 1000 stacked rows
-//! union to roughly `Rect { 0, 0, 1600, 21000 }` — ~24× a 900 px-tall
-//! window. Harmless today: nothing in `aurora-app`'s redraw path
+//! with, and the rect is the whole tree's, not this panel's.**
+//! `WidgetTree` accumulates one union rect across every dirty node, so
+//! all three panels feed it — [`crate::properties_panel`]
+//! cross-references this paragraph rather than restating it. Measured in
+//! a real 1600×900 `build_workspace` with a
+//! capped 1001-row journal, 200 layers and ten tool options populated at
+//! once: `Rect { 0, 0, 1600, 21621 }`, ~24× a 900 px-tall window. The
+//! same measurement with *only* History populated gives the identical
+//! number, because a full journal dominates the union outright (1001
+//! rows of 21 px, from a body 600 px down the rail, against Layers'
+//! 4500). Treat the figure as an order of magnitude rather than a
+//! constant — it moves with row counts and with the rail's own share.
+//! (Through `0.77.4` this comment quoted "roughly
+//! `Rect { 0, 0, 1600, 21000 }`", which was neither measured nor
+//! current.) Harmless today: nothing in `aurora-app`'s redraw path
 //! consumes `WidgetTree::take_damage` yet (only tests and `input.rs`
 //! do). Whoever wires it to a partial-repaint path must intersect it
 //! with the real surface size first — an oversized scissor rect is a
@@ -302,6 +314,16 @@ mod tests {
     /// The other half of the same fix: rows must stack, not overlap.
     /// Before `0.77.2` every row shared one identical rect, so a
     /// per-row `width > 0` check alone would not have caught it.
+    ///
+    /// The `before.height > 0` guard is the same one the Properties twin
+    /// carries (0.77.5), added here for symmetry rather than because the
+    /// class was uncovered: the equality below is trivially satisfied by
+    /// zero-height rows all piled at one `y`, and since `0.77.4` both
+    /// panels share one `crate::panel::row_style`, so one regression in
+    /// that single function has to be visible from either panel's own
+    /// tests. (`history_rows_are_real_list_row_widgets_with_a_hittable_
+    /// size` above already asserts the exact height, so the class was
+    /// caught — just not by this test.)
     #[test]
     fn history_rows_stack_top_to_bottom_without_overlapping() {
         let history = history_with(6);
@@ -325,6 +347,11 @@ mod tests {
                 assert_eq!(
                     row_bounds.x, before.x,
                     "sibling rows must share a left edge, not sit beside each other"
+                );
+                assert!(
+                    before.height > 0,
+                    "a degenerate zero-height row would satisfy the stacking check below \
+                     vacuously: {before:?}"
                 );
                 assert_eq!(
                     row_bounds.y,

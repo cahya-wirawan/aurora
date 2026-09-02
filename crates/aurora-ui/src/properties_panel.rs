@@ -53,15 +53,43 @@
 //! (it reaches the accessibility node and nothing else — there is no
 //! glyph rendering here yet) and any editable control.
 //!
-//! **Rows past the bottom of the panel would be clipped and unreachable**
+//! **Rows past the bottom of the panel are clipped and unreachable**
 //! — the same structural gap [`crate::history_panel`] and
 //! [`crate::layers_panel`] both disclose, since `crate::panel`'s own
 //! `body_style` gives each panel a content-independent share of the rail
-//! and `aurora-widgets` has no scrolling container. Here it is a
-//! class-guard disclosure rather than a live limit: `aurora-app`'s own
-//! `tool_options` returns at most one row today (a Brush or Eraser
-//! radius) and the panel's rail share fits roughly fourteen, so no real
-//! user path reaches the clip.
+//! and `aurora-widgets` has no scrolling container. At a typical window
+//! height the ~300 px rail share fits roughly fourteen rows, and
+//! `aurora-app`'s own `tool_options` returns at most one today (a Brush
+//! or Eraser radius), so the single row it produces is never clipped in
+//! practice. **The clip is still genuinely reachable, not hypothetical**,
+//! and this file said otherwise through `0.77.4`: nothing enforces a
+//! minimum window size anywhere (no `min_inner_size` call exists in the
+//! workspace), and at a window short enough to squeeze the body below one
+//! row height — measured at 800×40 in `aurora_widgets::paint`'s own
+//! `a_selected_list_rows_highlight_stays_inside_a_body_that_clips_its_
+//! overflow` — even one row overflows. `aurora_widgets::paint`'s
+//! `clip_to_clipping_ancestors` is what handles that case.
+//!
+//! **Rows here join the same shared damage rect the History panel
+//! discloses** — see [`crate::history_panel`]'s own module doc comment
+//! for the full account. `WidgetTree` accumulates one union rect across
+//! the whole tree, so Properties' rows widen it alongside Layers' and
+//! History's; the disclosure and the "intersect with the real surface
+//! size before scissoring" warning are the same, and are recorded once
+//! there rather than three times.
+//!
+//! **Open, and not an engineering call: the body's own label repeats its
+//! region's name.** `populate_properties_panel` labels the body
+//! `"Properties: {tool}"` inside a `Role::Region` already labelled
+//! "Properties", so a screen reader entering the panel may announce
+//! "Properties" twice in a row. It is deliberately *not* the exact
+//! duplicate [`crate::populate_history_panel`] had to remove in `0.77.4`
+//! — the tool name is real information the region does not carry — but it
+//! is the same shape one level milder, it has never been checked against
+//! a real screen reader (no display server in this workspace's sandbox),
+//! and what a body label should say is a design-owner question
+//! (CLAUDE.md, FR-027 *Ownership*) rather than something to change here.
+//! Raised, not decided.
 //!
 //! **No `Action::Focus`/`Action::Click` on a row, deliberately** — the
 //! same reasoning [`crate::history_panel`] records: routing rows to a
@@ -70,6 +98,7 @@
 //! `aurora_widgets::widgets::tree_view` already discloses.
 
 use accesskit::{Node, Role};
+use aurora_doc::sanitize_display_name;
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{ListRowState, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetTree};
@@ -84,6 +113,22 @@ use crate::tool::Tool;
 /// tool-specific knowledge lives in this crate; see this module's own
 /// doc comment for why. An empty `options` slice is a legitimate,
 /// honest "no real options for this tool yet" state, not an error.
+///
+/// **Both halves of every row's label go through
+/// [`aurora_doc::sanitize_display_name`] (0.77.5)** — the same bound
+/// [`crate::populate_layers_panel`] applies to a layer name and
+/// `aurora_doc::History::describe` applies upstream of
+/// [`crate::populate_history_panel`]. This was the one panel of the three
+/// with no bound on the path at all, and `options` is fully
+/// caller-supplied: a NUL byte, a BEL, a `U+202E` bidi override and a
+/// 100 KB string all reached the `accesskit` node verbatim, confirmed
+/// against a real `crate::workspace::build_workspace`. `aurora-app`'s own
+/// `tool_options` cannot produce any of those today (every value it
+/// builds is `format!("{RADIUS}px")`-shaped), so this is a guard on a
+/// `pub` API rather than a fix for a live path — but the first caller
+/// that puts a layer name, a file path or a font family in a tool option
+/// would have opened it silently. Display-only, like its siblings: the
+/// caller's own `options` are untouched.
 ///
 /// `scales` is what gives each row its real, token-derived height
 /// (`crate::panel`'s own `row_style`, shared with
@@ -125,7 +170,16 @@ pub fn populate_properties_panel(
     let style = row_style(scales);
     for (label, value) in options {
         let mut node = Node::new(Role::ListItem);
-        node.set_label(format!("{label}: {value}"));
+        // Both halves separately, not the joined string: sanitizing
+        // after the join would let a 200-character label spend the whole
+        // 128-character budget and truncate the value away entirely, and
+        // would let a bidi override in the label reorder the ": "
+        // separator itself.
+        node.set_label(format!(
+            "{}: {}",
+            sanitize_display_name(label),
+            sanitize_display_name(value)
+        ));
         tree.insert(
             panel.body,
             style.clone(),
@@ -355,7 +409,11 @@ mod tests {
         let Some(rows) = ws.tree.children(ws.properties.body) else {
             unreachable!("just populated");
         };
-        assert!(rows.len() >= 3, "at least three rows, got {}", rows.len());
+        // Exact, not `>= 3`: this function inserts exactly one row per
+        // option, so the count is fully determined by the input here --
+        // unlike History's twin, whose journal-description count has its
+        // own reasons to stay loose.
+        assert_eq!(rows.len(), 4, "one row per option");
         let mut previous: Option<Rect> = None;
         for &row in rows {
             let Some(row_bounds) = ws.tree.bounds(row) else {
@@ -449,6 +507,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The Properties twin of `layers_panel`'s own
+    /// `a_hostile_layer_name_reaches_the_label_bounded_and_sanitized`.
+    /// Through `0.77.4` this panel was the only one of the three with no
+    /// bound anywhere on its label path — `options` is fully
+    /// caller-supplied and went straight into `set_label` — so a NUL, a
+    /// BEL, a bidi override and a 100 KB string all reached the
+    /// `accesskit` node verbatim.
+    #[test]
+    fn a_hostile_tool_option_reaches_the_label_bounded_and_sanitized() {
+        let hostile_label = format!("Rad{}ius{}", '\u{202E}', '\u{0000}');
+        let hostile_value = format!(
+            "24{}px{}{}{}",
+            '\u{0007}',
+            '\u{2028}',
+            char::from_u32(0xE_0041).unwrap_or('\u{FFFD}'),
+            "9".repeat(100_000),
+        );
+        let options = [
+            (hostile_label.as_str(), hostile_value.clone()),
+            ("<script>alert(1)</script>", "<b>bold</b>".to_owned()),
+        ];
+
+        let mut ws = crate::workspace::build_workspace();
+        let scales = test_scales();
+        if let Err(err) =
+            populate_properties_panel(&mut ws.tree, ws.properties, &scales, Tool::Brush, &options)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let Some(rows) = ws.tree.children(ws.properties.body) else {
+            unreachable!("just populated");
+        };
+        assert_eq!(rows.len(), 2, "one row per option, hostile or not");
+        let Some(&row) = rows.first() else {
+            unreachable!("just asserted len() == 2");
+        };
+        let Some(accessibility) = ws.tree.accessibility(row) else {
+            unreachable!("just inserted");
+        };
+        let Some(label) = accessibility.label() else {
+            unreachable!("every row carries a label");
+        };
+
+        // Two 128-character caps plus the ellipsis each, plus the ": "
+        // separator: the bound is per half, which is what keeps a long
+        // label from truncating the value away entirely.
+        assert!(
+            label.chars().count() <= 260,
+            "{} chars: {label:?}",
+            label.chars().count()
+        );
+        for hostile_char in ['\u{202E}', '\u{0000}', '\u{0007}', '\u{2028}', '\u{E0041}'] {
+            assert!(!label.contains(hostile_char), "{hostile_char:?} survived");
+        }
+        assert!(label.starts_with("Radius: 24px"), "{label:?}");
+
+        // Markup is *not* stripped, and that is correct: this is an
+        // accessibility label, never an HTML document, and mangling a
+        // legitimate value that happens to contain angle brackets would
+        // be the real bug. The bound above is what matters.
+        let Some(&second) = rows.get(1) else {
+            unreachable!("just asserted len() == 2");
+        };
+        let Some(second_accessibility) = ws.tree.accessibility(second) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(
+            second_accessibility.label(),
+            Some("<script>alert(1)</script>: <b>bold</b>"),
+            "printable text passes through unchanged, however it looks"
+        );
+
+        // Display-only: the caller's own slice is untouched.
+        assert_eq!(
+            options.first().map(|(_, value)| value),
+            Some(&hostile_value)
+        );
     }
 
     #[test]

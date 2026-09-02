@@ -99,19 +99,32 @@ pub fn insert_panel(
 /// content height back. Content taller than the resulting share
 /// overflows the panel (see [`body_style`]) rather than growing it.
 ///
-/// **`min_size.width` is pinned to `0` too, for the same reason on the
-/// other axis (0.77.3).** It was left `AUTO` when the height was pinned,
-/// because only the height axis had a demonstrated bug at the time. That
-/// asymmetry became a latent one the moment [`body_style`] became a
-/// `Column`: width is now the *cross* axis, and a row's own
-/// `min_size.width` (one row height, this module's own [`row_style`])
-/// propagates up through body → panel root → dock rail as a
-/// floor on the rail's whole width. It is currently unreachable —
-/// `crate::workspace::set_rail_width` clamps to `[150, 600]` and the
-/// propagated floor is 21 px — but "unreachable because something else
-/// happens to clamp harder" is exactly the shape the height bug had
-/// before a 43-layer document made it reachable. Pinning both axes
-/// closes the class rather than the one instance.
+/// **`min_size.width` is pinned to `0` here too, and — unlike the height
+/// — it does nothing. That is a correction (0.77.5) to what `0.77.3`
+/// claimed.** That round pinned the width believing it would stop a row's
+/// own `min_size.width` (one row height, this module's own [`row_style`])
+/// from propagating up through body → panel root → dock rail as a floor
+/// on the rail's whole width. It does not. Measured on a real
+/// `crate::workspace::build_workspace` at `compute_layout(1.0, 200.0)`,
+/// *with these pins in place*: the rail still came back 21 px wide
+/// against a 1 px window whenever any one of the three panels held rows.
+///
+/// The reason is that `taffy` only consults a flex item's own `min_size`
+/// on its **main** axis when deciding whether to fall back to a
+/// content-based minimum (`compute/flexbox.rs`,
+/// `determine_flex_base_size`), and a panel root and a panel body are
+/// both items of `Column` containers — width is their *cross* axis, so
+/// this pin is never read by that branch at all. The one box in the chain
+/// where width really is the main axis is the rail itself, and that is
+/// where the fix went: `crate::workspace`'s own `rail_style`, whose doc
+/// comment carries the full mechanism and the numbers.
+///
+/// These two lines are kept rather than deleted because `min_size: 0` on
+/// both axes is the honest statement of "a panel never imposes its
+/// content's size on the rail", and the width half would become
+/// load-bearing the moment a panel root were ever docked into a `Row`
+/// container (drag-to-redock, this module's own doc comment). What is
+/// removed is the claim that it closes anything today.
 fn root_style(collapsed: bool) -> Style {
     Style {
         flex_direction: taffy::FlexDirection::Column,
@@ -217,9 +230,10 @@ fn body_style(collapsed: bool) -> Style {
         flex_direction: taffy::FlexDirection::Column,
         flex_grow: 1.0,
         flex_basis: Dimension::ZERO,
-        // Both axes, not just the height -- see `root_style`'s own doc
-        // comment for why the width pin is preventive rather than a fix
-        // for a reachable bug.
+        // Both axes, not just the height -- but see `root_style`'s own
+        // doc comment: the width half is inert on a `Column` item and
+        // does *not* close the rail-width propagation `0.77.3` said it
+        // did. `crate::workspace::rail_style` is where that is fixed.
         min_size: taffy::Size {
             width: Dimension::ZERO,
             height: Dimension::ZERO,
@@ -287,6 +301,21 @@ fn body_style(collapsed: bool) -> Style {
 /// width" token exists, inventing one is a design decision rather than
 /// an engineering default (CLAUDE.md), and a square of the row's own
 /// height is the smallest thing that is still a real target.
+///
+/// **That width floor is visible from outside this row, and containing it
+/// is `crate::workspace`'s own `rail_style`'s job, not this function's
+/// (0.77.5).** `taffy` resolves a flex item with an `auto` main-axis
+/// minimum by *measuring* its min-content size, and that measurement
+/// descends the whole subtree taking each descendant's `min_size` as a
+/// floor — so before `0.77.5` this one line made a 1 px-wide window's
+/// dock rail 21 px wide. It is fixed where the measurement is actually
+/// triggered rather than by deleting the floor here, because
+/// `aurora_widgets::widgets::tree_view::style` gives Layers' rows the
+/// same floor for a separate and genuinely load-bearing reason and
+/// propagated identically; see `rail_style` for the source citation and
+/// `crate::workspace`'s own
+/// `a_populated_panel_never_floors_the_rails_own_width_to_a_row_height`
+/// for the layout-level regression test.
 pub(crate) fn row_style(scales: &Scales) -> Style {
     let row = row_height(scales);
     Style {
@@ -817,13 +846,24 @@ mod tests {
     }
 
     /// `min_size` is pinned to zero on *both* axes, not just the height
-    /// `0.77.1` fixed. Under the `Column` body direction width is the
-    /// cross axis, so a row's own `min_size.width` would otherwise
-    /// propagate up as a floor on the whole dock rail's width — the same
-    /// shape as the height bug, one axis over. Read off the styles
-    /// themselves: the propagated floor is currently unreachable behind
-    /// `workspace::set_rail_width`'s own `[150, 600]` clamp, so no
-    /// layout assertion could catch a regression here.
+    /// `0.77.1` fixed, and this test reads that off the two styles
+    /// directly.
+    ///
+    /// **It is a style test and nothing more, which is a correction to
+    /// what it claimed through `0.77.4`.** It used to say it protected
+    /// the dock rail's width from a row's own `min_size.width`. It never
+    /// did: reading a `Style` back says nothing about what `taffy` does
+    /// with it, and the propagation it named was live the whole time it
+    /// was green — see [`super::root_style`] for the measurement and
+    /// `crate::workspace`'s own `rail_style` for the real mechanism and
+    /// fix. The layout-level assertion that actually covers that
+    /// behaviour is `crate::workspace`'s own
+    /// `a_populated_panel_never_floors_the_rails_own_width_to_a_row_height`.
+    ///
+    /// What this one is still worth: the *height* pin is genuinely
+    /// load-bearing (`0.77.1`'s rail-starvation bug), it must survive a
+    /// collapse/expand round trip, and pinning it is cheap to assert
+    /// here directly.
     #[test]
     fn a_panels_own_styles_never_impose_a_minimum_size_on_either_axis() {
         let (mut tree, root) = widgets::new_tree(Style::default());

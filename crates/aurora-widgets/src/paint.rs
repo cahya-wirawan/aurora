@@ -2175,9 +2175,23 @@ mod tests {
         }
     }
 
-    /// One row's own style, the same shape `aurora_ui::history_panel`'s
+    /// One row's own style, the same shape `aurora_ui::panel`'s shared
     /// `row_style` builds: an `auto` height with a hard one-line floor,
     /// which is exactly what lets a row out-grow an undersized body.
+    /// (It was `aurora_ui::history_panel`'s until `0.77.4` moved it up to
+    /// `panel` and gave it a second caller, the Properties panel.)
+    ///
+    /// **This is a deliberate replica, and it cannot be shared.**
+    /// `aurora-widgets` sits *below* `aurora-ui` in the layering rule
+    /// (`scripts/layering.json`, PRD §7.2), so importing the real
+    /// function here is not merely awkward, it is forbidden — which also
+    /// means nothing mechanical will notice if the two drift apart. The
+    /// tests below are then testing a shape production may no longer
+    /// have. Whoever changes `aurora_ui::panel::row_style` has to change
+    /// this by hand; that manual step is the cost of the layering rule,
+    /// not an oversight. What actually needs to match is the pair that
+    /// makes the clip observable — an `auto` main size with a
+    /// `length(row_height)` minimum under it — not the whole style.
     fn floored_row_style(scales: &Scales) -> taffy::Style {
         taffy::Style {
             size: taffy::Size {

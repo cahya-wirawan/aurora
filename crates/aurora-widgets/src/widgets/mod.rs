@@ -216,10 +216,14 @@ fn type_size(value: u32) -> f32 {
 ///    layout box grows to contain its children, so its *highlight* has
 ///    to be clamped back to one row's height or a selected parent would
 ///    paint over every descendant beneath it (`paint::paint_tree_item`).
-/// 3. `aurora_ui::history_panel`'s own rows, which are plain
+/// 3. `aurora_ui::panel`'s own shared `row_style`, which both the
+///    History and the Properties panel build their rows from — plain
 ///    [`WidgetKind::ListRow`]s under a panel body rather than a tree,
-///    and take their `min_size` from here so a History row is exactly
-///    as tall as a Layers row beside it and never a degenerate box.
+///    taking their `min_size` from here so a row in either panel is
+///    exactly as tall as a Layers row beside it and never a degenerate
+///    box. (It lived in `aurora_ui::history_panel` when this list was
+///    written, and served one panel; it moved and gained its second
+///    caller in `0.77.4`.)
 #[must_use]
 pub fn row_height(scales: &Scales) -> f32 {
     type_size(scales.typography.size.md) + spacing(scales.spacing.xxs) * 2.0

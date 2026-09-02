@@ -5352,6 +5352,94 @@ structural design work.
   warnings" cargo doc --workspace --no-deps --all-features` all clean.
   (`cargo nextest` is not installed in this sandbox; `cargo test
   --workspace` stood in, per CLAUDE.md.)
+
+  **Review round on `0.77.4`, 2026-09-02 (`0.77.5`).** Independent
+  review found one real bug, and it is not in `0.77.4`'s own new code:
+  **the width-floor fix the `0.77.3` entry above claims does not work,
+  and never did.** That entry (its "`panel::root_style`/`body_style` pin
+  `min_size` to zero on both axes" bullet) says pinning the two panel
+  styles closed a row's `min_size.width` from propagating up as a floor
+  on the dock rail's width. Measured on a real `build_workspace` at
+  `compute_layout(1.0, 200.0)` *with those pins in place*, the rail still
+  came back **21 px** — one `row_height` — against a 1 px window, for
+  every one of the three panels. Read that bullet as describing an
+  intention, not an effect.
+
+  - **Why the pins were inert, from `taffy`'s own source rather than
+    reasoning.** `compute/flexbox.rs`'s `determine_flex_base_size`
+    (~line 794, `taffy 0.9.2`) does
+    `child.min_size...main(dir).unwrap_or(<measure min-content>)`. It
+    reads a flex item's `min_size` **on its main axis only**, and a panel
+    root and a panel body are both items of `Column` containers — width
+    is their *cross* axis there, so the pinned value is never consulted.
+    And `unwrap_or` is a short circuit, not a clamp: an `auto` minimum
+    falls through to a real min-content *measurement* that descends the
+    whole subtree taking every descendant's own `min_size` as a floor,
+    which is exactly how a row reached the rail. A minimum of zero
+    further down cannot cap a measurement — a floor never does.
+  - **The fix is one line, at the only box where width is the main
+    axis**: `workspace::rail_style` now pins its own `min_size`, which
+    short-circuits the measurement before it starts. That closes the
+    class for all three panels rather than one row style — Layers' rows
+    carry the same width floor from
+    `aurora_widgets::widgets::tree_view::style`, for its own separate
+    and genuinely load-bearing reason (a deeply indented row would
+    otherwise reach zero width), and propagated identically. The shared
+    `panel::row_style` is unchanged; the two inert pins are kept as an
+    honest statement of intent with the false claim removed from their
+    doc comments.
+  - **The `0.77.3` test that was supposed to protect this asserted
+    nothing about it.** `a_panels_own_styles_never_impose_a_minimum_
+    size_on_either_axis` reads `min_size` back off two `Style`s, which is
+    equally true of the broken and the fixed code; mutating the shared
+    row style's `min_size.width` survived the entire `aurora-ui` suite.
+    It is kept (the *height* pin is real and must survive a
+    collapse/expand round trip) with its claim corrected, and the
+    behaviour is now covered by a layout-level test,
+    `a_populated_panel_never_floors_the_rails_own_width_to_a_row_height`
+    — mutation-checked: reverting `rail_style` fails it, and it fails
+    first on the **Layers** case, which a fix aimed only at the panel row
+    style would have missed.
+  - **Properties row labels are sanitized** with
+    `aurora_doc::sanitize_display_name`, matching `layers_panel`'s
+    pattern. It was the one panel of the three with no bound anywhere on
+    its label path — `options` is fully caller-supplied and went straight
+    into `set_label` — so a NUL, a BEL, a `U+202E` bidi override and a
+    100 KB string all reached the `accesskit` node verbatim. Not
+    reachable through today's `tool_options` (every value it builds is
+    `format!("{RADIUS}px")`-shaped), so this guards a `pub` API rather
+    than fixing a live path. Both halves are sanitized separately, so a
+    long label cannot truncate the value away. New twin test of
+    `layers_panel`'s own hostile-input test.
+  - **First committed test of all three panels crowded at once**
+    (`all_three_panels_crowded_at_once_still_share_the_rail_and_stay_
+    hittable`): equal rail shares, no cross-panel overlap, all three
+    hit-testable, at 5/60/200 rows each. Each panel's own crowding test
+    populates one panel and leaves the other two empty, so the combined
+    load had only ever been checked ad hoc.
+  - **Doc corrections, none of which anything mechanical would catch:**
+    `properties_panel`'s "no real user path reaches the clip" was false —
+    nothing enforces a minimum window size anywhere (no `min_inner_size`
+    call exists), and `aurora_widgets::paint`'s own tests measure the
+    overflow at an 800×40 window; `history_panel`'s damage-rect figure
+    was an unmeasured "roughly 1600 × 21000" and is now the measured
+    `Rect { 0, 0, 1600, 21621 }`, with the honest note that a full
+    journal dominates the union outright so the all-three-panels number
+    is identical, and `properties_panel` now cross-references it;
+    `row_height`'s consumer list in `aurora-widgets` named the wrong
+    module and one panel where there are now two; `paint.rs`'s
+    `floored_row_style` cited the moved function and is now marked as
+    the deliberate, un-shareable replica it is (`aurora-widgets` sits
+    below `aurora-ui`, so nothing can catch drift between them).
+  - **Raised, not decided:** Properties' body label `"Properties: {tool}"`
+    partially repeats its own `Role::Region`'s name — one level milder
+    than the exact duplicate History fixed in `0.77.4`, unverified
+    against a real screen reader, and a design-owner question (FR-027
+    *Ownership*) rather than an engineering one. Noted in the module doc
+    comment, wording unchanged.
+
+  3 new tests in `aurora-ui` (95, was 92), 1,524 passing across the
+  workspace (was 1,521). Same gate, same result.
 - [~] **Command palette, keyboard shortcuts** — first slice done
   2026-08-04. Two new generic mechanisms in `aurora-widgets`, following
   the same "abstract steps, not `winit` types — translating real
