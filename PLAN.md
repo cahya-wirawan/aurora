@@ -13830,7 +13830,9 @@ severity choice.
 
   **A load-bearing hardening gap this round had to close, found in
   planning rather than by a test.** `validate_mask_origins` (now
-  `validate_mask_rects`) checked a mask's *origin* only, and its own doc
+  `validate_persisted_rects` — renamed twice since, once in this round
+  and again during its own 0.71.1-0.71.4 revision; see the addenda
+  below for the full name history) checked a mask's *origin* only, and its own doc
   comment said the extent check was deliberately deferred and to
   "revisit the moment mask surfaces are written into the archive" —
   this was that moment. `LayerTree::add_mask` bounds a mask's origin but
@@ -13886,7 +13888,10 @@ severity choice.
   (pixel layer and group, both in bounded time),
   `write_and_best_effort_write_both_refuse_a_mask_extent_past_the_document_ceiling`
   (and leave no partial container),
-  `the_whole_document_tile_budget_is_one_ceiling_layer_plus_its_own_mask`,
+  `the_whole_document_tile_budget_is_one_ceiling_layer_plus_its_own_mask`
+  (deleted in 0.71.4 for being a pure arithmetic tautology — see that
+  addendum — and replaced by the real, behavioral
+  `the_largest_legal_document_still_writes_and_reads_with_its_mask`),
   `read_rejects_a_manifest_whose_layers_and_masks_together_exceed_the_tile_budget`
   (tiny layers, ceiling-sized masks — the masks are what overruns it),
   and
@@ -13897,6 +13902,23 @@ severity choice.
   layer). The five round-trip/budget assertions were checked to be
   non-vacuous by removing the enumerator's mask arm: exactly those five
   fail, the rest stay green.
+
+  **Reviewed and revised 0.71.1-0.71.4** (see those addenda below for
+  the full account) — three real defects found by independent review
+  and fixed: the writer had no whole-document tile budget at all, only
+  the reader did, so an ordinary document built through the public API
+  could save successfully and then become permanently unopenable
+  (0.71.1); a failed read left partially-decoded tiles resident in the
+  live store with no rollback, reachable more widely once a masked
+  layer has two surfaces that can independently fail mid-read (0.71.2,
+  new `aurora_tile::TileStore::forget_tile`); and `LayerTree::add_mask`
+  itself gained the extent check named above, closing the gap where the
+  `aurora-io`-boundary guard still had to fail production *after* a
+  live session had already reached a broken state (0.71.3). 0.71.4 also
+  added the cross-crate frame-agreement test the design's addressing
+  convention depends on but which nothing had actually tested until
+  then. Independently re-verified by a Judge pass scoring 0.938/1.00
+  (PASS).
 
   **Exercised by tests only, and that is not a hedge.** Nothing in the
   app paints mask coverage yet — follow-on (1), the brush/tool UI, is

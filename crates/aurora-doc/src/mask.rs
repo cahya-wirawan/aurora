@@ -127,7 +127,15 @@
 //!      pixels. Fixing this means clearing (or otherwise invalidating)
 //!      that surface's tiles on `remove_mask`, which is a store
 //!      operation `aurora-doc` does not have a handle to at that call
-//!      site.
+//!      site. **Widened in scope by `.aur` persistence (0.71.0):** this
+//!      was previously session-scoped — the stale tiles died with the
+//!      process, since nothing wrote them anywhere durable. A mask
+//!      surface's tiles now survive a save/load round trip like any
+//!      other, so the same stale coverage can persist *across*
+//!      sessions and travel inside a shared `.aur` file. Still
+//!      unreachable today (nothing paints mask coverage yet), but the
+//!      fix, whenever it lands, now has to account for on-disk state
+//!      too, not just the live store.
 //!    - **Coverage written outside the mask's own grid is dropped on
 //!      save.** [`write_mask_coverage`] does not check the `TileId` it
 //!      is given against the grid `crate::LayerMask::bounds` spans, and
