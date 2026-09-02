@@ -1081,7 +1081,7 @@ fn replace_document(
     let layer_rows =
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
     aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body)?;
-    aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, history)?;
+    aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, scales, history)?;
     aurora_ui::clear_panel_body(&mut workspace.tree, workspace.properties.body)?;
     let options = tool_options(tool);
     aurora_ui::populate_properties_panel(
@@ -3341,7 +3341,30 @@ fn run_command(
 /// shared refresh step, the same `clear_panel_body` + `populate_*`
 /// pattern [`replace_document`] already uses for a freshly opened
 /// document, just for one panel instead of two.
+///
+/// **The scales are resolved here rather than threaded in** (0.77.2,
+/// when History rows gained a real token-derived height). The only
+/// caller is [`run_command`], which already carries ten parameters and
+/// an `#[allow(clippy::too_many_arguments)]`; adding an eleventh purely
+/// to pass a value [`load_scales`] can read from a `const`-embedded
+/// design file is a worse trade than reading it here. A parse failure
+/// is logged and the refresh abandoned — the same arm the
+/// `clear_panel_body` failure below already takes, and never an
+/// `unwrap`/`expect` (workspace-denied lints; this crate holds a
+/// professional's unsaved work). The consequence of that arm is an
+/// out-of-date History panel, not a lost edit: the undo/redo it follows
+/// has already been applied to the real document.
 fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_doc::History) {
+    let scales = match load_scales() {
+        Ok(scales) => scales,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to load the design scales; leaving the History panel as it is"
+            );
+            return;
+        }
+    };
     if let Err(err) = aurora_ui::clear_panel_body(&mut workspace.tree, workspace.history.body) {
         tracing::warn!(
             ?err,
@@ -3350,7 +3373,7 @@ fn refresh_history_panel(workspace: &mut aurora_ui::Workspace, history: &aurora_
         return;
     }
     if let Err(err) =
-        aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, history)
+        aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &scales, history)
     {
         tracing::warn!(?err, "failed to repopulate the History panel");
     }
@@ -9691,9 +9714,12 @@ impl App {
                 unreachable!("workspace.layers was just built by build_workspace above: {err:?}")
             }
         };
-        if let Err(err) =
-            aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &history)
-        {
+        if let Err(err) = aurora_ui::populate_history_panel(
+            &mut workspace.tree,
+            workspace.history,
+            &scales,
+            &history,
+        ) {
             unreachable!("workspace.history was just built by build_workspace above: {err:?}");
         }
         // Seeded from the tool this session actually starts with
@@ -13562,8 +13588,13 @@ mod tests {
         {
             unreachable!("a freshly built workspace's own panel body must accept this");
         }
-        if aurora_ui::populate_history_panel(&mut workspace.tree, workspace.history, &old_history)
-            .is_err()
+        if aurora_ui::populate_history_panel(
+            &mut workspace.tree,
+            workspace.history,
+            &scales,
+            &old_history,
+        )
+        .is_err()
         {
             unreachable!("a freshly built workspace's own panel body must accept this");
         }

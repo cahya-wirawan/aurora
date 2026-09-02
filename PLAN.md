@@ -5096,6 +5096,97 @@ structural design work.
   --all-targets --all-features -- -D warnings`, `cargo test --workspace`,
   `cargo test --workspace --doc`, and `cargo doc --workspace --no-deps
   --all-features` all clean.
+
+  **History panel rows have a real, hittable size, 2026-09-02 (0.77.2)**
+  — a latent bug in already-landed code, hence the patch bump. A History
+  row was a `WidgetKind::Container` carrying `Style::default()`,
+  inserted straight into `panel.body`. The body inherited
+  `Style::default()`'s `FlexDirection::Row`, and with `taffy`'s default
+  `align_items: Stretch` that resolved every row to **zero width and the
+  body's full height**. Measured before the fix, not argued: five rows
+  in a real `build_workspace()` at `compute_layout(1600, 900)` all came
+  back as `Rect { x: 1350, y: 600, width: 0, height: 300 }` — the same
+  rect five times, stacked on one point — and `WidgetTree::hit_test`
+  returned `None` for every one of them. A row was not a small target;
+  it was a degenerate box that could never be hit and could never paint.
+
+  Two halves to the fix, in the two places the two halves belong:
+
+  1. **`crate::panel::body_style` now declares `FlexDirection::Column`.**
+     This is the shared style *every* panel body gets, and
+     `set_panel_collapsed` resets to that same shared style on every
+     collapse and expand — which is exactly why a per-panel override
+     would not have worked, and why a change to the shared default
+     cannot be reset away. That corrects the reasoning recorded in item
+     1 of the 0.77.0 entry above: the objection there was to a
+     *per-panel* override, and it was right about that, but it was
+     generalized into "the body cannot be `Column`," which was wrong.
+     Pinned by `a_panel_body_stacks_its_children_vertically`.
+     `panel.root` had always declared `Column` for the same "content
+     stacks downward" reason; the body was simply left out.
+  2. **Rows are real `WidgetKind::ListRow(ListRowState)` widgets with a
+     token-derived `min_size`** of one `aurora_widgets::widgets::
+     row_height` square — the same 21 px (`type.size.md` 13 +
+     `spacing.xxs` 4 × 2) a Layers row beside them uses. That helper was
+     `pub(crate) tree_row_height`; it is now `pub row_height`, since
+     History rows are a third consumer and are not a tree.
+     `flex_grow` stays `0.0`: borrowing `command_palette::row_style`'s
+     `flex_grow: 1.0` would divide the panel's ~300 px share among
+     however many entries exist (200 entries → 1.5 px each, 1000 →
+     0.3 px, below `Rect`'s integer resolution), reintroducing the same
+     bug in a form no small row count makes visible. `tree_view::style`
+     already records that borrowed-idiom mistake for the same reason.
+
+  Rows stay **direct children of `panel.body`** rather than gaining a
+  container of their own the way Layers has: nothing needs the extra
+  level once the body stacks, `Role::List` + `Role::ListItem` is already
+  well-formed, and `aurora-app`'s tests count rows at `children(history.
+  body)` directly. Layers' own `insert_tree_view` container is now
+  redundant and kept anyway — removing it would mean rewriting every
+  Layers test's tree-root traversal for no behavioural gain.
+
+  **What this does not do, stated plainly:**
+
+  - **Zero pixel difference.** `paint_list_row` returns `Ok(vec![])` for
+    an unselected row, and nothing in the workspace selects a History
+    row — no click routing, no "current step" marker of the kind the
+    mockup's `.history-row.current` shows. This change buys geometry (a
+    real, non-degenerate, hit-testable rect), not paint. The highlight
+    becomes real the moment something sets `selected`; that is separate,
+    open work.
+  - **Rows past the panel's visible height are laid out but unreachable**
+    — the identical disclosed gap Layers has, for the identical reason
+    (no scrolling container exists anywhere in `aurora-widgets`). With
+    the rail's ~300 px History share and 21 px rows, roughly **14** of
+    an up-to-1000-entry journal are reachable; `rows_past_the_bottom_of_
+    a_bounded_history_panel_are_clipped_and_not_yet_reachable` pins that
+    honestly at 200 entries rather than implying the panel is finished.
+  - **The `Role::List`/`Role::ListItem` choice is unverified against any
+    real screen reader.** There is no display server in this sandbox. It
+    is a specification-level choice (`Role::ListBoxOption` was rejected
+    because it is only well-formed under a `Role::ListBox` parent and
+    would over-promise a selection interaction nothing implements), not
+    a tested one, and still needs a human on real hardware.
+  - **No `Action::Focus`/`Action::Click` on rows**, deliberately: that
+    would add up to 1000 `Tab` stops inside one panel, the same
+    crate-wide focus-model question `tree_view` already discloses and
+    Layers already pays, for rows that route nowhere.
+  - **The Properties panel has the identical zero-size-row bug and is
+    NOT fixed here.** Its rows are `Style::default()` under `Row` *and*
+    under `Column`, so the shared-`body_style` change neither fixes nor
+    breaks them — it moves the degenerate axis from width to height.
+    Real, separate, still-open work, named here rather than left to be
+    rediscovered.
+
+  6 new tests, all in `aurora-ui` (85 there, was 79), 1,511 passing
+  across the workspace (was 1,505). Verified: `cargo fmt --all --check`,
+  `python3 scripts/check_layering.py`, `python3
+  scripts/check_no_hardcoded_style.py`, `cargo check --workspace
+  --locked`, `cargo clippy --workspace --all-targets --all-features --
+  -D warnings`, `cargo test --workspace`, `cargo test --workspace
+  --doc`, and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
+  --no-deps --all-features` all clean. (`cargo nextest` is not installed
+  in this sandbox; `cargo test --workspace` stood in, per CLAUDE.md.)
 - [~] **Command palette, keyboard shortcuts** — first slice done
   2026-08-04. Two new generic mechanisms in `aurora-widgets`, following
   the same "abstract steps, not `winit` types — translating real

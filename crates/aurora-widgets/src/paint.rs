@@ -83,7 +83,7 @@ use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorSwatchState, ListRowState, ScrollbarState, SliderState,
-    TextFieldState, TreeItemState, WidgetKind, tree_row_height,
+    TextFieldState, TreeItemState, WidgetKind, row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -612,7 +612,7 @@ fn paint_list_row(
 /// rectangle over that whole subtree — every descendant's own highlight
 /// included, since `WidgetTree::paint_order` draws a parent before its
 /// children only for the fill order, and this fill is opaque. Clamping
-/// to `tree_row_height(scales)` paints exactly the row itself. The
+/// to `row_height(scales)` paints exactly the row itself. The
 /// `.min(bounds.height)` guard keeps a row that is somehow *shorter*
 /// than one line (a caller-supplied `set_bounds`, a squeezed layout)
 /// from painting outside its own bounds.
@@ -626,7 +626,7 @@ fn paint_tree_item(
     if !state.selected {
         return Ok(vec![]);
     }
-    let height = tree_row_height(scales).min(bounds.height as f32);
+    let height = row_height(scales).min(bounds.height as f32);
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,

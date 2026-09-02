@@ -374,7 +374,7 @@ const SCROLLBAR_HORIZONTAL_SAMPLE_Y: u32 = 16;
 const TREE_VIEW_CELL: (u32, u32) = (128, 128);
 const TREE_VIEW_GALLERY_SIZE: (u32, u32) = (TREE_VIEW_CELL.0 * 2, TREE_VIEW_CELL.1);
 /// One tree row's own height, `aurora_theme::Scales`-derived in the
-/// widget itself (`widgets::tree_row_height` — `type.size.md` 13 plus
+/// widget itself (`widgets::row_height` — `type.size.md` 13 plus
 /// `spacing.xxs` 4 above and below) and restated here as the plain
 /// number this gallery's own sample coordinates are built from. Not a
 /// second source of truth: `tree_view_gallery_rows_are_one_row_tall`
@@ -3177,7 +3177,7 @@ scrollbar_golden_test!(
 /// A headless (no GPU) proof that the number every `TreeView` sample
 /// coordinate above is built from is the number the real layout
 /// actually produces — `TREE_VIEW_ROW_HEIGHT` restates
-/// `aurora_widgets::widgets`' own `Scales`-derived `tree_row_height`,
+/// `aurora_widgets::widgets`' own `Scales`-derived `row_height`,
 /// and a scale change that moved the rows would otherwise leave every
 /// pixel assertion in this file quietly sampling the wrong band.
 #[test]

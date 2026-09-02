@@ -110,8 +110,8 @@ fn root_style(collapsed: bool) -> Style {
     }
 }
 
-/// A panel body's own style — `flex_grow: 1.0` with the same
-/// `flex_basis: 0` / `min_size.height: 0` pair [`root_style`] explains,
+/// A panel body's own style — `Column`, and `flex_grow: 1.0` with the
+/// same `flex_basis: 0` / `min_size.height: 0` pair [`root_style`] explains,
 /// so the body is exactly as tall as the share its root was given and
 /// never a pixel taller, whatever it holds. Without that the clamp on
 /// the root alone would not be enough: the body would still size to its
@@ -131,6 +131,42 @@ fn root_style(collapsed: bool) -> Style {
 /// work here; it is strictly better than the alternative it replaced,
 /// which was losing the Properties and History panels entirely.
 ///
+/// **`FlexDirection::Column` is new in `0.77.2`, and it is a bug fix,
+/// not a preference.** The body previously inherited `Style::default()`'s
+/// `FlexDirection::Row`; combined with `taffy`'s default
+/// `align_items: Stretch` on the cross axis, that resolved every *direct*
+/// child of a body to **zero width and full body height** — measured, not
+/// argued: five History rows in a real 1600×900 `build_workspace` all
+/// came back as `Rect { x: 1350, y: 600, width: 0, height: 300 }`,
+/// stacked exactly on top of one another, and `WidgetTree::hit_test`
+/// (which needs a point genuinely inside a rect) returned `None` for
+/// every one of them. [`root_style`] has always declared `Column` for
+/// the "content stacks downward" reason; the body was simply left out.
+///
+/// What this does and does not change:
+///
+/// - **Layers** is unaffected. `aurora_widgets::widgets::
+///   insert_tree_view` gives its own container an explicit
+///   `size: { width: percent(1.0), height: percent(1.0) }` on *both*
+///   axes, so its resolved box is identical under `Row` or `Column`.
+///   That container is now redundant for Layers and is deliberately
+///   kept: removing it would mean rewriting every Layers test's
+///   tree-root traversal for no behavioural gain.
+/// - **History** is what this fixes, together with its own rows'
+///   real `min_size` (`crate::history_panel`).
+/// - **Properties is neither fixed nor broken by this.** Its rows are
+///   `Style::default()` under `Row` *and* under `Column`, so they were
+///   degenerate before and are degenerate now — the axis simply moves
+///   from width to height. That is a real, separate, still-open bug,
+///   named here rather than left to be rediscovered.
+///
+/// Setting `Column` here rather than as a per-panel override is what
+/// makes it survive: [`set_panel_collapsed`] resets the body to this
+/// same shared `body_style` on every collapse *and* every expand, so a
+/// per-panel override would be silently discarded on the first
+/// collapse/expand round trip. A change to the shared default cannot be
+/// discarded by a reset to that same default.
+///
 /// `Display::None` while collapsed is what actually hides the content
 /// ([`set_panel_collapsed`]); the rest of the style is kept identical
 /// across both states so expanding restores exactly the layout the body
@@ -142,6 +178,7 @@ fn body_style(collapsed: bool) -> Style {
         } else {
             Display::Flex
         },
+        flex_direction: taffy::FlexDirection::Column,
         flex_grow: 1.0,
         flex_basis: Dimension::ZERO,
         min_size: taffy::Size {
@@ -458,6 +495,59 @@ mod tests {
             after.height, 200,
             "the collapsed panel's own share must go to its still-expanded sibling, ordinary \
              flex_grow sharing, not a special case"
+        );
+    }
+
+    /// The regression test for the `0.77.2` zero-width-row bug. A body
+    /// left at `Style::default()`'s `FlexDirection::Row` laid its direct
+    /// children out *side by side*, and with `taffy`'s default
+    /// `align_items: Stretch` each one resolved to zero width and the
+    /// body's full height — invisible and unhittable. Two sized
+    /// containers must stack, sharing a left edge.
+    #[test]
+    fn a_panel_body_stacks_its_children_vertically() {
+        let (mut tree, root) = widgets::new_tree(Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(200.0_f32),
+                height: taffy::style_helpers::length(200.0_f32),
+            },
+            ..Default::default()
+        });
+        let panel = match insert_panel(&mut tree, root, "History") {
+            Ok(panel) => panel,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child_style = || Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::percent(1.0_f32),
+                height: taffy::style_helpers::length(20.0_f32),
+            },
+            ..Default::default()
+        };
+        let (Ok(first), Ok(second)) = (
+            widgets::insert_container(&mut tree, panel.body, child_style()),
+            widgets::insert_container(&mut tree, panel.body, child_style()),
+        ) else {
+            unreachable!("the body was just inserted");
+        };
+        tree.compute_layout(200.0, 200.0);
+
+        let (Some(first_bounds), Some(second_bounds)) = (tree.bounds(first), tree.bounds(second))
+        else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            first_bounds.width > 0,
+            "a body's own child must not resolve to a degenerate zero-width box: {first_bounds:?}"
+        );
+        assert_eq!(
+            second_bounds.x, first_bounds.x,
+            "sibling children must share a left edge, not sit beside each other"
+        );
+        assert_eq!(
+            second_bounds.y,
+            first_bounds.y + i64::from(first_bounds.height),
+            "the second child must stack directly under the first"
         );
     }
 

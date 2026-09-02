@@ -153,17 +153,28 @@ const _: () = assert!(
 /// represents, so a caller can turn a real pointer hit or accessibility
 /// action back into "which layer".
 ///
-/// **The tree is its own container under `panel.body`, deliberately —
-/// the rows are not `panel.body`'s own children.** `crate::panel::
-/// insert_panel` builds the body Row-direction (`crate::panel`'s own
-/// `body_style`); tree rows are `width: percent(1.0)` and as
-/// `Row`-direction siblings would lay out *side by side* rather than
-/// stacked. Setting the body's own style to `Column` instead would not
-/// hold either: `crate::panel::set_panel_collapsed` resets it to that
-/// same shared `body_style` on every expand, so the first collapse/
-/// expand round trip would silently scramble the panel.
-/// `insert_tree_view` brings its own `FlexDirection::Column` container,
-/// which that reset path cannot reach.
+/// **The tree is its own container under `panel.body` — the rows are
+/// not `panel.body`'s own children.** Originally that container was
+/// load-bearing: `crate::panel`'s own `body_style` left the body at
+/// `Style::default()`'s `FlexDirection::Row`, so tree rows (which are
+/// `width: percent(1.0)`) would have laid out side by side rather than
+/// stacked, and `insert_tree_view` brought its own
+/// `FlexDirection::Column` container to escape that.
+///
+/// **As of `0.77.2` it is no longer load-bearing, and it stays anyway.**
+/// The `Row` default was a real bug for every panel body, not just this
+/// one — it resolved each direct child of a body to a zero-width,
+/// full-height box that nothing could hit — and it was fixed where it
+/// actually lived, in the shared `body_style` itself. That is a fix a
+/// per-panel override could not have made: `crate::panel::
+/// set_panel_collapsed` resets the body to that same shared
+/// `body_style` on every collapse and expand, so an override set here
+/// would be silently discarded on the first round trip, while a change
+/// to the shared default is exactly what the reset restores. This
+/// container is therefore now redundant — kept because removing it
+/// would mean rewriting every test in this module's own tree-root
+/// traversal (`tree_root`) for no behavioural gain, and because
+/// `insert_tree_view` is also what carries the `Role::Tree` node.
 ///
 /// **The tree container is deliberately unlabelled.** `panel.root` is
 /// already a `Role::Region` labelled "Layers"; naming the container
@@ -879,11 +890,13 @@ mod tests {
         assert!(!accessibility.supports_action(accesskit::Action::Collapse));
     }
 
-    /// The regression test for the layout bug the tree container exists
-    /// to avoid. `insert_panel` builds `panel.body` with
-    /// `Style::default()` -- `FlexDirection::Row` -- so rows parented
-    /// straight to it would lay out *side by side*. They must stack, and
-    /// each level must indent further than the one above it.
+    /// The regression test for the layout bug the tree container was
+    /// originally introduced to avoid, and which `0.77.2` fixed at its
+    /// real source instead (`crate::panel`'s own `body_style` left every
+    /// panel body at `Style::default()`'s `FlexDirection::Row`, so any
+    /// direct child laid out side by side and stretched to zero width).
+    /// Both the container and the body now say `Column`; rows must
+    /// stack, and each level must indent further than the one above it.
     #[test]
     fn populate_layers_panel_stacks_rows_vertically_and_indents_each_level() {
         let mut layers = LayerTree::new();

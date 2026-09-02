@@ -161,7 +161,7 @@ use aurora_theme::Scales;
 use taffy::style_helpers::{auto, length, percent, zero};
 use taffy::{FlexDirection, Size, Style};
 
-use super::{WidgetKind, spacing, tree_row_height};
+use super::{WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 
@@ -452,7 +452,7 @@ fn refresh_node(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) -> Result<(), W
 /// count. (`scrollbar::style`'s own doc comment records the same class
 /// of mistake, found the hard way.)
 fn style(scales: &Scales) -> Style {
-    let row = tree_row_height(scales);
+    let row = row_height(scales);
     Style {
         flex_direction: FlexDirection::Column,
         size: Size {
@@ -797,8 +797,8 @@ mod tests {
     };
     use crate::WidgetError;
     use crate::widgets::{
-        WidgetKind, insert_checkbox, insert_color_swatch, insert_container, new_tree, test_scales,
-        tree_row_height,
+        WidgetKind, insert_checkbox, insert_color_swatch, insert_container, new_tree, row_height,
+        test_scales,
     };
     use accesskit::{Action, Role};
     use aurora_core::Rect;
@@ -1330,15 +1330,15 @@ mod tests {
         };
         assert_eq!(view_bounds.width, 300, "the tree fills its parent");
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let row_height = tree_row_height(&scales) as u32;
-        assert_eq!(row_height, 21, "13px of type plus 4px above and below");
+        let one_row = row_height(&scales) as u32;
+        assert_eq!(one_row, 21, "13px of type plus 4px above and below");
         assert_eq!(
-            child_bounds.height, row_height,
+            child_bounds.height, one_row,
             "a childless row is exactly one line tall"
         );
         assert_eq!(
             top_bounds.height,
-            row_height * 2,
+            one_row * 2,
             "a group's own box is its own row plus its one child"
         );
         assert_eq!(
@@ -1379,10 +1379,10 @@ mod tests {
             unreachable!("just laid out");
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let row_height = i64::from(tree_row_height(&scales) as u32);
+        let one_row = i64::from(row_height(&scales) as u32);
         assert_eq!(
             child_bounds.y,
-            top_bounds.y + row_height,
+            top_bounds.y + one_row,
             "the child starts exactly one row below its parent's own row"
         );
         // The parent's own strip really is the parent's: a point in it
@@ -1390,13 +1390,13 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let parent_strip = (
             (top_bounds.x + i64::from(top_bounds.width) / 2) as f32,
-            (top_bounds.y + row_height / 2) as f32,
+            (top_bounds.y + one_row / 2) as f32,
         );
         assert_eq!(tree.hit_test(parent_strip), Some(top));
         #[allow(clippy::cast_precision_loss)]
         let child_strip = (
             (child_bounds.x + i64::from(child_bounds.width) / 2) as f32,
-            (child_bounds.y + row_height / 2) as f32,
+            (child_bounds.y + one_row / 2) as f32,
         );
         assert_eq!(tree.hit_test(child_strip), Some(child));
     }
@@ -1999,7 +1999,7 @@ mod tests {
         tree.compute_layout(64.0, 400.0);
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let floor = tree_row_height(&scales) as u32;
+        let floor = row_height(&scales) as u32;
         for (depth, &row) in rows.iter().enumerate() {
             let Some(bounds) = tree.bounds(row) else {
                 unreachable!("just laid out");
@@ -2106,10 +2106,10 @@ mod tests {
         let deepest = parent;
 
         // A generous height: MAX_TREE_DEPTH + 1 rows, each one
-        // `tree_row_height` tall, is what a real layout of this chain
+        // `row_height` tall, is what a real layout of this chain
         // needs — this is the traversal `compute_layout` itself walks
         // recursively (`build_taffy_node`/`apply_taffy_layout`).
-        let height = tree_row_height(&scales) * (MAX_TREE_DEPTH as f32 + 1.0);
+        let height = row_height(&scales) * (MAX_TREE_DEPTH as f32 + 1.0);
         tree.compute_layout(2_000.0, height);
 
         // `paint_order` (`collect_paint_order`) is its own recursion,

@@ -198,19 +198,30 @@ fn type_size(value: u32) -> f32 {
     value as f32
 }
 
-/// One tree row's own height: a line of default UI text plus the
-/// smallest real spacing step above and below it. Both halves come from
-/// the token scales (invariant §7.3.10 — never a literal), through the
-/// same two helpers every other widget's own intrinsic size already
+/// One list-or-tree row's own height: a line of default UI text plus
+/// the smallest real spacing step above and below it. Both halves come
+/// from the token scales (invariant §7.3.10 — never a literal), through
+/// the same two helpers every other widget's own intrinsic size already
 /// goes through, so the `cast_precision_loss` allow lives in one place
 /// rather than at every call site.
 ///
-/// Shared rather than private to `tree_view` because
-/// [`crate::paint_widget`] needs the same number: a tree row's own
-/// layout box grows to contain its children, so its *highlight* has to
-/// be clamped back to one row's height or a selected parent would paint
-/// over every descendant beneath it (`paint::paint_tree_item`).
-pub(crate) fn tree_row_height(scales: &Scales) -> f32 {
+/// Three consumers, which is why this is shared rather than private to
+/// `tree_view` (and why it is named for a *row* rather than a tree row
+/// — it was `tree_row_height` through `0.77.1`, when `tree_view` was
+/// the only widget that laid rows out):
+///
+/// 1. [`insert_tree_item`]'s own row layout — one row height tall, and
+///    the floor under a deeply indented row's width.
+/// 2. [`crate::paint_widget`] needs the same number: a tree row's own
+///    layout box grows to contain its children, so its *highlight* has
+///    to be clamped back to one row's height or a selected parent would
+///    paint over every descendant beneath it (`paint::paint_tree_item`).
+/// 3. `aurora_ui::history_panel`'s own rows, which are plain
+///    [`WidgetKind::ListRow`]s under a panel body rather than a tree,
+///    and take their `min_size` from here so a History row is exactly
+///    as tall as a Layers row beside it and never a degenerate box.
+#[must_use]
+pub fn row_height(scales: &Scales) -> f32 {
     type_size(scales.typography.size.md) + spacing(scales.spacing.xxs) * 2.0
 }
 
