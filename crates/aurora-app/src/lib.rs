@@ -6989,20 +6989,46 @@ fn recomposite_visible_tiles(
 /// back over already-composited, unedited territory is a real cache
 /// hit, not just an idle redraw with nothing to do.
 ///
-/// [`Self::bump`] is the coarse invalidation primitive, called by every
-/// `aurora-app` operation whose effect on "what a given `TileId` now
-/// composites to" isn't confined to a known, small set of tiles: a live
-/// Move, Undo/Redo, opening or replacing the active document, and
-/// selecting a different active layer (which changes the reference
-/// origin every `TileId` is measured from, shifting every tile's own
-/// meaning at once). [`Self::invalidate`] is the precise counterpart: a
-/// brush/eraser dab (`App::paint_dab`/`App::erase_dab`) knows exactly
-/// which tiles it really wrote (`aurora_brush::DabOutcome::painted`, in
-/// the same document-space-relative-to-the-active-layer's-own-origin
-/// frame `reference_origin` already uses — see those functions' own
-/// call sites) and invalidates only those, since a full bump on every dab of
+/// # The three invalidation primitives, and who reaches for each
+///
+/// Rewritten for what 0.72.0 and 0.73.0–0.73.2 actually left in place;
+/// before that there was only `bump`, and the account below said so.
+///
+/// [`Self::bump`] is the coarse one — every cached tile at once — for an
+/// operation whose effect on "what a given `TileId` now composites to"
+/// isn't confined to a known, small set of tiles. What still reaches for
+/// it *unconditionally* is now a short list, and it is the whole list:
+/// a live Move ([`App::apply_move`], which shifts the grid anchor on
+/// every pointer-move event of the drag), and opening a document —
+/// [`App::open_file`] and [`App::open_aur_file`]. Two callers that used to be on that list no longer are:
+///
+/// - **Selecting a different active layer** ([`press_layer_row`], 0.72.0)
+///   bumps only when the switch really moves
+///   [`composite_reference_origin`]. Two layers sharing an origin
+///   composite every `TileId` identically, and that is every layer this
+///   app's own UI creates.
+/// - **Undo/Redo** ([`perform_undo_redo`], 0.73.0) dispatches on the
+///   [`CompositeInvalidation`] the command reports, and reaches `bump`
+///   only for [`CompositeInvalidation::Everything`] — which is still
+///   every *structural* step ([`structural_invalidation`]), plus any
+///   step that moved the grid anchor or flipped
+///   [`document_qualifies_for_gpu_compositing`], but no longer a
+///   stroke's own undo.
+///
+/// [`Self::invalidate`] is the single-tile counterpart: a brush/eraser
+/// dab (`App::paint_dab`/`App::erase_dab`) knows exactly which tiles it
+/// really wrote (`aurora_brush::DabOutcome::painted`, in the same
+/// document-space-relative-to-the-active-layer's-own-origin frame
+/// `reference_origin` already uses — see those functions' own call
+/// sites) and invalidates only those, since a full bump on every dab of
 /// a stroke would mean recompositing the *entire* visible grid on every
 /// dab rather than just the tile(s) the dab actually changed.
+///
+/// [`Self::invalidate_doc_rects`] is the region-shaped one, for a caller
+/// that knows what changed as document-space rectangles rather than as a
+/// tile list — today exactly one: a *pixel* undo/redo, via
+/// [`stroke_invalidation`]. It is the reason `bump` no longer fires on
+/// every Ctrl+Z.
 ///
 /// **Bump itself stays coarse, stated honestly**: it invalidates every
 /// currently cached tile at once, not just the one(s) the triggering
@@ -7852,7 +7878,7 @@ fn composite_document(
 /// gestures.
 ///
 /// **The composite-cache invalidation is this function's job too, and
-/// it is guarded rather than unconditional** (0.71.0). A layer switch
+/// it is guarded rather than unconditional** (0.72.0). A layer switch
 /// can only change what an already-cached composite `TileId` means by
 /// moving the grid anchor itself — [`composite_reference_origin`], the
 /// single value through which `active_layer` reaches
@@ -9587,15 +9613,22 @@ impl App {
     /// function, which needs no `App` (and therefore no GPU adapter) to
     /// test, the same split [`Self::commit_drag`] already uses.
     ///
-    /// What the command palette's and (macOS) native menu's own
-    /// Undo/Redo entries fall back to once `activate_command` hands the
-    /// bare command back up (deliberately kept free of `layers`/
-    /// `history`/`pixel_history`/the tile store — see
-    /// [`ActivatedCommand`]'s own doc comment for why). **Not** the
-    /// `Ctrl+Z`/`Ctrl+Shift+Z` path, which [`handle_key`] resolves and
-    /// runs through [`run_command`] itself without ever returning an
-    /// `ActivatedCommand` — see PLAN.md's own residual disclosure for
-    /// what that costs and why closing it is its own change.
+    /// **All three entry points converge here**, which is the reason
+    /// this method exists: the command palette, the macOS native menu,
+    /// and the `Ctrl+Z`/`Ctrl+Shift+Z` keyboard shortcut. All three
+    /// arrive the same way — `activate_command`/[`handle_key`] hand the
+    /// bare command back up as an [`ActivatedCommand`], deliberately
+    /// kept free of `layers`/`history`/`pixel_history`/the tile store
+    /// (see its own doc comment for why), and
+    /// `App::handle_key_event` dispatches it here.
+    ///
+    /// The keyboard leg has been one of the three since 0.69.1. Before
+    /// that, [`handle_key`] ran `Ctrl+Z` through [`run_command`] inline
+    /// and never returned an `ActivatedCommand`, so that path skipped
+    /// both the live-drag commit and the pan re-clamp
+    /// [`perform_undo_redo`] exists to order correctly. The paragraph
+    /// this replaces still described that split, and had been false
+    /// since.
     fn run_undo_redo(&mut self, command: AppCommand) {
         // Annotated rather than discarded bare, for the reason
         // `CompositeInvalidation`'s own `#[must_use]` exists: the report
