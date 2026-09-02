@@ -6275,14 +6275,80 @@ structural design work.
   `aurora-app` the two pointer tests that used hand-set
   `WidgetTree::set_bounds` (which proved dispatch logic and nothing about
   real geometry) were rewritten against real `compute_layout`, and 3 more
-  added, including one covering all three real dialogs (crash recovery,
-  export refused, Move refused). **Deliberately not ticked to `[x]`**:
+  added. **Deliberately not ticked to `[x]`**:
   this is layout and click-routing correctness, proven headlessly. A
   dialog's root and message are still `WidgetKind::Container` and this
   crate paints no glyphs, so on screen a dialog is still only its action
   buttons' rounded rects over the canvas — no surface, no visible title
   or message text, and no real-hardware pass. Painting a dialog remains
   open.
+
+  **Review round 2026-09-03 (0.77.7): three real gaps in the fix above.**
+  Independent review of `0.77.6` passed the core layout fix but found
+  three things wrong with what was claimed around it, all corrected here.
+
+  - *The two rewritten pointer tests were vacuous with respect to the bug
+    they were credited with.* Both derived their click coordinate from
+    the button's own computed bounds, so they passed identically whether
+    the button was centred or stranded in the old `x: 968` sliver —
+    proven by mutation (reverting `root_style` to `Style::default()` left
+    both green). The same self-referential shape sat in the all-dialogs
+    test's `hit_test` probe. Fixed by anchoring assertions to the
+    **window and the rail** rather than to the widget under test: the
+    button's own centre must fall in the middle third of a 1000 px-wide
+    window and left of the rail's own x-range, and the outside-click
+    probe must be a point that exists inside the window at all (under the
+    old full-height dialog it was `y: 801`). Re-run of the same mutation
+    now turns both tests red. Their doc comments say plainly what they do
+    verify (real dispatch against real geometry) and what they do not
+    (they are not by themselves centring-regression tests — that is the
+    three geometry tests' job).
+  - *"All three real dialogs" was four.* `App::open_skipped_tiles_dialog`
+    ("This Document Is Missing Content") was left out — and it is the one
+    dialog whose message is **file-controlled**, embedding a
+    `SkippedTileRecord::reason` from the `.aur` container being opened.
+    It is already sanitised through `aurora_doc::sanitize_display_name`
+    and produces no layout pathology, so this was a coverage-accuracy
+    defect, not a live security bug. The fourth case is now in the test.
+  - *A dialog's action went mouse-unreachable again below ~72 px of
+    window height* — the same failure class this whole entry exists to
+    remove, surviving at a boundary. `Position::Absolute` takes the
+    dialog out of flow but nothing clamped it to the window, so the fixed
+    ~89 px content height plus the 15 %-of-height top inset pushed the
+    button past `workspace.root`'s bottom edge; `hit_test_from` refuses
+    to descend into a parent that doesn't contain the point, so the
+    button became unclickable while `handle_dialog_pointer` went on
+    swallowing every click — the app fully mouse-dead, Escape/Enter
+    unaffected. No `min_inner_size` exists on the real window, so a user
+    can reach this. Fixed by **centring the dialog vertically too**
+    (`align_self: Center` with both vertical insets `auto()`, plus auto
+    vertical margins as the `Column`-parent fallback) in place of the
+    15 % top inset: overflow is now symmetric, so the buttons stay on
+    screen far longer. Measured at 800 px wide with the default scales:
+    the action's own centre is hit-testable down to a ~34 px-tall window,
+    against ~73 px before. Regression tests at 40/58/72/90 px in
+    `aurora-widgets` and 58/72/90 px in `aurora-app`; both go red under
+    `0.77.6`'s own style. *Not* claimed fixed: nothing clamps the dialog
+    to the window, so below ~34 px it fails again — real clamping needs
+    either a scrollable dialog body or a measured text stack, neither of
+    which exists. Documented in `root_style` rather than papered over.
+
+  Also in the same round, from the same review: `root_style`'s doc
+  comment claimed that a definite vertical-inset pair "collapses the
+  horizontal auto margins" — measured false (only the height stretches;
+  horizontal centring is untouched), and corrected; `insert_dialog`'s
+  public doc now states its **definitely-sized-parent precondition** and
+  what silently goes wrong without it; `message_style`'s meaningless
+  `min_size.width` floor (a text line *height* reused as a width) is
+  gone; the root's inert `min_size.height` is documented as dominated by
+  its own padding; the centring assertions use a ±1 px tolerance with the
+  `apply_taffy_layout` truncation named, so they survive an odd-sized
+  window instead of relying on 800/1000 being even; and the module doc
+  now notes that `command_palette` was followed as a precedent for
+  *layout* but not for paint. One informational finding is deliberately
+  **not** acted on: non-finite or negative window sizes produce saturated
+  coordinates rather than a panic, which is pre-existing in
+  `WidgetTree`'s own cast and unreachable from `winit`.
 
 ### M1.9 — Basic tools and I/O
 

@@ -25810,6 +25810,26 @@ mod tests {
     /// laid out as a 32 px-wide, full-height sliver at `x: 968` on a
     /// 1000x800 window. `0.77.6` fixed the layout; these two now run
     /// against what `compute_layout` really produces.
+    ///
+    /// **What that does and does not buy, stated exactly** (0.77.7,
+    /// after review found the first version of this comment overclaimed).
+    /// What it verifies is real: `handle_dialog_pointer` dispatches
+    /// correctly against geometry a real `compute_layout` produced,
+    /// rather than against a `Rect` the test invented. What it is *not*
+    /// is a regression test for the centring bug itself -- the click
+    /// point below is derived from the button's own computed bounds, so
+    /// on its own this test passes identically whether the button is
+    /// centred or stranded in the old `x: 968` sliver. Proven by
+    /// mutation: reverting `root_style` to `Style::default()` leaves
+    /// this test and its sibling green while
+    /// `an_open_dialog_does_not_take_any_width_from_the_canvas`,
+    /// `the_open_dialog_is_centered_over_the_workspace_under_real_layout`
+    /// and `each_real_dialogs_own_message_and_actions_lay_out_as_a_centered_overlay`
+    /// all go red. Those three own the centring; this one owns dispatch.
+    ///
+    /// The one exception is the window-relative assertion below, which
+    /// is anchored to the window and the rail rather than to the button,
+    /// and which the old sliver does violate.
     #[test]
     fn clicking_the_dialogs_action_button_closes_it_under_real_layout() {
         let mut workspace = aurora_ui::build_workspace();
@@ -25837,6 +25857,31 @@ mod tests {
             bounds.y as f32 + bounds.height as f32 / 2.0,
         );
 
+        // The one assertion here that is anchored to the *window*
+        // rather than to the widget under test, and therefore the one
+        // that is bug-specific rather than dispatch-specific: the point
+        // we are about to click must lie in the middle third of a
+        // 1000 px-wide window, and must not lie inside the rail. The
+        // pre-0.77.6 layout put this button at `x: 968, width: 32`,
+        // over the rail and hard against the window's right edge, which
+        // fails both halves.
+        let Some(rail) = workspace.tree.bounds(workspace.rail) else {
+            unreachable!("just laid out");
+        };
+        assert!(
+            center.0 > 1000.0 / 3.0 && center.0 < 2.0 * 1000.0 / 3.0,
+            "the action a user has to click must sit in the middle third \
+             of the window, not stranded at one edge: {center:?} in a \
+             1000x800 window"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let rail_left = rail.x as f32;
+        assert!(
+            center.0 < rail_left,
+            "the action must not sit inside the rail's own column \
+             (x >= {rail_left}): {center:?}"
+        );
+
         let opened = handle_dialog_pointer(
             &mut workspace,
             &mut focus,
@@ -25850,6 +25895,20 @@ mod tests {
         assert!(!workspace.tree.contains(handle.root));
     }
 
+    /// The outside-click half of the pair above, and it carries the same
+    /// caveat: the probe point is derived from the dialog's own computed
+    /// bounds, so what it proves is that `handle_dialog_pointer`
+    /// swallows a click that misses every action button -- not that the
+    /// dialog is anywhere in particular. The centring is the geometry
+    /// tests' job (named in the sibling's own doc comment).
+    ///
+    /// The exception, again, is one window-relative assertion: the
+    /// "outside" point has to be a point that exists *in the window*.
+    /// Under the pre-0.77.6 layout the dialog was full height
+    /// (`y: 0, height: 800` in an 800 px-tall window), so one pixel past
+    /// its bottom edge was `y: 801` -- off the window entirely, i.e. a
+    /// click no user could make. That assertion does fail on the old
+    /// layout.
     #[test]
     fn clicking_outside_the_dialog_under_real_layout_is_swallowed_without_closing_it() {
         let mut workspace = aurora_ui::build_workspace();
@@ -25876,6 +25935,14 @@ mod tests {
             bounds.x as f32 + bounds.width as f32 / 2.0,
             (bounds.y + i64::from(bounds.height)) as f32 + 1.0,
         );
+        assert!(
+            outside.1 >= 0.0 && outside.1 < 800.0,
+            "the point just past the dialog's bottom edge must still be \
+             inside the 1000x800 window -- a dialog that reaches the \
+             window's own bottom edge (which the pre-0.77.6 full-height \
+             layout did) leaves no reachable outside at all: {outside:?} \
+             from {bounds:?}"
+        );
 
         let opened = handle_dialog_pointer(
             &mut workspace,
@@ -25893,7 +25960,7 @@ mod tests {
         );
     }
 
-    /// All three dialogs this crate can actually open, under real
+    /// All **four** dialogs this crate can actually open, under real
     /// layout -- driven through the shared free `open_dialog` with each
     /// one's own real title/message/actions, the same split
     /// `the_export_refused_dialog_opens_through_the_shared_helper` and
@@ -25901,14 +25968,52 @@ mod tests {
     /// already use, because the `&mut self` `App` methods that wrap
     /// them need a live window, a GPU device and an event-loop proxy,
     /// none of which exist headlessly.
+    ///
+    /// **Four, not three** (corrected in `0.77.7`). The first version of
+    /// this test and its own comment both said "all three" and left out
+    /// `App::open_skipped_tiles_dialog` ("This Document Is Missing
+    /// Content"), which is a real opening path like the other three. It
+    /// is also the only one whose message is **file-controlled** -- it
+    /// embeds a `SkippedTileRecord::reason` read straight out of the
+    /// `.aur` container being opened -- so it is the case where a
+    /// hostile file gets the closest to this layout. That text is
+    /// sanitised on the way in (`skipped_tiles_message` runs it through
+    /// `aurora_doc::sanitize_display_name`) and nothing here measures
+    /// text anyway, so it produces no layout pathology; the case is
+    /// present because the claim of full coverage has to be true, not
+    /// because a live hole was found.
+    ///
+    /// The four cases are the ones this crate constructs. What this test
+    /// therefore cannot see is any field that only a *multi*-action
+    /// dialog exercises -- every real dialog here has exactly one action
+    /// -- which is why `root_style`'s `FlexDirection::Column` is held by
+    /// an `aurora-widgets` test instead. That crate's own `root_style`
+    /// doc comment names the gap.
     #[test]
+    // A table-driven scenario: four real dialogs' own content, then one
+    // shared block of assertions applied to each. Splitting it would
+    // either duplicate the assertions per dialog or split the table from
+    // what it is checked against, and both are worse than the length.
+    #[allow(clippy::too_many_lines)]
     fn each_real_dialogs_own_message_and_actions_lay_out_as_a_centered_overlay() {
         let scales = match load_scales() {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err}"),
         };
         let export_message = incomplete_composite_message(1, "boom");
-        let cases: [(&str, &str, Vec<super::DialogAction>); 3] = [
+        // The real read-side constructor, with a real record: this is
+        // the shape `open_aur_file` hands `open_skipped_tiles_dialog`.
+        let skipped = aurora_io::SkippedTiles::from_parts(
+            3,
+            vec![aurora_io::SkippedTileRecord {
+                surface: 1,
+                tile_x: 0,
+                tile_y: 0,
+                reason: "the scratch file could not be read".to_owned(),
+            }],
+        );
+        let skipped_message = skipped_tiles_message(&skipped);
+        let cases: [(&str, &str, Vec<super::DialogAction>); 4] = [
             (
                 "Aurora Didn't Close Properly",
                 crash_recovery_dialog_message(true),
@@ -25923,6 +26028,11 @@ mod tests {
                 "Can't Move This Layer Further",
                 move_refused_message(),
                 move_refused_dialog_actions(),
+            ),
+            (
+                "This Document Is Missing Content",
+                &skipped_message,
+                skipped_tiles_dialog_actions(),
             ),
         ];
 
@@ -25950,9 +26060,15 @@ mod tests {
             let Some(bounds) = workspace.tree.bounds(handle.root) else {
                 unreachable!("just laid out");
             };
+            // `<= 1`, not exact equality: `apply_taffy_layout` truncates
+            // an `f32` origin to an `i64`, so a window whose free space
+            // on an axis is odd centres to two gaps that differ by one
+            // pixel. That is correct, and the exact-equality form this
+            // replaced only held because 1000 and 800 both happen to
+            // leave even free space here.
             let right_gap = 1000 - (bounds.x + i64::from(bounds.width));
-            assert_eq!(
-                bounds.x, right_gap,
+            assert!(
+                (bounds.x - right_gap).abs() <= 1,
                 "{title} must be horizontally centred: {bounds:?}"
             );
             assert!(
@@ -25968,6 +26084,9 @@ mod tests {
                 "{title}'s message must be a real box: {message_bounds:?}"
             );
 
+            let Some(rail) = workspace.tree.bounds(workspace.rail) else {
+                unreachable!("just laid out");
+            };
             for (action, button) in &handle.actions {
                 let Some(button_bounds) = workspace.tree.bounds(*button) else {
                     unreachable!("just laid out");
@@ -25981,6 +26100,30 @@ mod tests {
                     button_bounds.x as f32 + button_bounds.width as f32 / 2.0,
                     button_bounds.y as f32 + button_bounds.height as f32 / 2.0,
                 );
+                // Window-anchored, deliberately. The `hit_test` check
+                // below derives its probe from the button's own bounds,
+                // so on its own it passes wherever the button ends up --
+                // including the pre-0.77.6 `x: 968, width: 32` sliver
+                // over the rail. These two are the ones that pin the
+                // button to somewhere a user would actually look and
+                // that the sliver fails.
+                assert!(
+                    center.0 > 1000.0 / 3.0 && center.0 < 2.0 * 1000.0 / 3.0,
+                    "{title}'s {action} button must sit in the middle third of \
+                     the 1000x800 window: {center:?} from {button_bounds:?}"
+                );
+                #[allow(clippy::cast_precision_loss)]
+                let rail_left = rail.x as f32;
+                assert!(
+                    center.0 < rail_left,
+                    "{title}'s {action} button must be over the document, not \
+                     inside the rail's own column (x >= {rail_left}): {center:?}"
+                );
+                assert!(
+                    center.1 >= 0.0 && center.1 < 800.0,
+                    "{title}'s {action} button's centre must be a point inside \
+                     the window at all: {center:?}"
+                );
                 assert_eq!(
                     workspace.tree.hit_test(center),
                     Some(*button),
@@ -25988,6 +26131,71 @@ mod tests {
                      actually reach it"
                 );
             }
+        }
+    }
+
+    /// The app-level half of `0.77.7`'s small-window fix, against the
+    /// real workspace tree rather than `aurora-widgets`'s own test root.
+    ///
+    /// Red-team's finding: below roughly 72 logical pixels of window
+    /// height the dialog's action button fell past `workspace.root`'s own
+    /// bottom edge, `WidgetTree::hit_test_from` refused to descend into a
+    /// parent that doesn't contain the point, and `handle_dialog_pointer`
+    /// went on swallowing every click in the window -- so the app became
+    /// entirely mouse-dead while a dialog was open, with only Escape and
+    /// Enter left. `winit` sets no `min_inner_size` on Aurora's window,
+    /// so this is reachable on most platforms.
+    ///
+    /// This drives the whole real path: `open_crash_recovery_dialog`,
+    /// a real `compute_layout` at the small size, then a real
+    /// `handle_dialog_pointer` press at the button's own centre, which
+    /// must actually close the dialog.
+    #[test]
+    fn a_dialogs_action_is_still_clickable_in_a_very_short_window() {
+        for height in [58.0_f32, 72.0, 90.0] {
+            let mut workspace = aurora_ui::build_workspace();
+            let mut focus = FocusManager::default();
+            let mut dialog = None;
+            let scales = match load_scales() {
+                Ok(scales) => scales,
+                Err(err) => unreachable!("{err}"),
+            };
+            open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+            let Some(handle) = dialog.clone() else {
+                unreachable!("just opened");
+            };
+            let Some(button) = handle.first_action() else {
+                unreachable!("the crash recovery dialog always has one action");
+            };
+            workspace.tree.compute_layout(1000.0, height);
+
+            let Some(bounds) = workspace.tree.bounds(button) else {
+                unreachable!("just laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let center = (
+                bounds.x as f32 + bounds.width as f32 / 2.0,
+                bounds.y as f32 + bounds.height as f32 / 2.0,
+            );
+            assert!(
+                center.1 >= 0.0 && center.1 < height,
+                "in a 1000x{height} window the action's own centre must be a \
+                 point the mouse can reach: {center:?} from {bounds:?}"
+            );
+
+            let opened = handle_dialog_pointer(
+                &mut workspace,
+                &mut focus,
+                &mut dialog,
+                PointerButton::Primary,
+                center,
+            );
+            assert!(opened, "a dialog was open to route the click to");
+            assert_eq!(
+                dialog, None,
+                "in a 1000x{height} window the action must still be clickable, \
+                 or the app is mouse-dead for as long as the dialog is open"
+            );
         }
     }
 
@@ -26059,10 +26267,21 @@ mod tests {
             bounds.width > 0 && bounds.height > 0,
             "the dialog must have a real box: {bounds:?}"
         );
+        // `<= 1`, not exact equality: `apply_taffy_layout` truncates an
+        // `f32` origin to an `i64`, so a window whose free space on an
+        // axis is odd centres to two gaps a pixel apart. Correct, and
+        // the exact form this replaced held only because 1000 and 800
+        // happen to leave even free space on both axes here.
         let right_gap = 1000 - (bounds.x + i64::from(bounds.width));
-        assert_eq!(
-            bounds.x, right_gap,
+        assert!(
+            (bounds.x - right_gap).abs() <= 1,
             "the dialog must be horizontally centred over the window: {bounds:?}"
+        );
+        let bottom_gap = 800 - (bounds.y + i64::from(bounds.height));
+        assert!(
+            (bounds.y - bottom_gap).abs() <= 1,
+            "and vertically centred too, which is what keeps its buttons on \
+             screen in a short window: {bounds:?}"
         );
         assert!(
             bounds.y > 0,
