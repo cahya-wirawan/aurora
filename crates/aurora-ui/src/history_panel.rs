@@ -17,7 +17,10 @@
 //! `min_size` of one [`aurora_widgets::widgets::row_height`] square —
 //! the same token-derived number a Layers row beside them uses — and
 //! the panel body itself stacks its children ([`crate::panel`]'s own
-//! `body_style`).
+//! `body_style`). That `min_size` comes from `crate::panel`'s own
+//! `row_style`, shared with the Properties panel since `0.77.4` rather
+//! than copied into each; see it for why both guards there are
+//! load-bearing.
 //!
 //! **Zero pixel difference, deliberately.** `aurora_widgets::paint`'s
 //! own `paint_list_row` returns `Ok(vec![])` for an *unselected* row,
@@ -77,67 +80,10 @@
 use accesskit::{Node, Role};
 use aurora_doc::History;
 use aurora_theme::Scales;
-use aurora_widgets::widgets::{ListRowState, WidgetKind, row_height};
+use aurora_widgets::widgets::{ListRowState, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetTree};
-use taffy::style_helpers::{auto, length, percent};
-use taffy::{Size, Style};
 
-use crate::panel::{PanelHandle, clear_panel_body};
-
-/// One history row's own layout: full body width, one row height tall,
-/// and never smaller than that on either axis.
-///
-/// **Two separate guards, load-bearing for two different reasons.**
-/// The `0.77.2` commit message credited `flex_grow: 0.0` with preventing
-/// sub-pixel rows in a long journal; that was wrong, and the correction
-/// is measured rather than reasoned (0.77.3 review round).
-///
-/// - **`min_size.height: length(row)` is what makes a row exactly one
-///   line tall at *any* entry count.** It is a hard flexbox floor that
-///   neither `flex_grow` nor `flex_shrink` can cross. `size.height:
-///   auto()` is what makes it a real floor rather than a starting point:
-///   an `auto` main size gives the item a flex base size of `0`, so its
-///   *scaled* flex-shrink factor (`flex_shrink × flex_base_size`) is `0`
-///   too and a crowded panel has nothing to shrink. Setting
-///   `flex_grow: 1.0` here was applied as a mutation and measured: rows
-///   still came back a correct 21 px at 200 entries and at 1000. The
-///   "200 entries would be 1.5 px each, 1000 would be 0.3 px" scenario
-///   the previous wording described **does not occur**, and nothing here
-///   depends on `flex_grow` to prevent it.
-/// - **`flex_grow: 0.0` (the default, spelled by omission) is what stops
-///   a *sparse* panel from inflating its rows.** Free space is what
-///   `flex_grow` divides, and a panel with a handful of entries has
-///   plenty: the same mutation inflates five rows to 60 px each, which
-///   is what `history_rows_are_real_list_row_widgets_with_a_hittable_size`
-///   actually catches. `aurora_widgets::widgets::command_palette::
-///   row_style` uses `flex_grow: 1.0` deliberately, because its handful
-///   of result rows really are meant to divide their container evenly; a
-///   history row is one line tall no matter how much room it is offered.
-///   `tree_view::style` records the same borrowed-idiom mistake.
-///
-/// Neither is redundant, and deleting `min_size.height` in particular
-/// would bring the zero-height bug straight back — it is the guard that
-/// holds, not the one the old wording credited.
-///
-/// `min_size.width` is one row height as well, the same square floor
-/// and the same reasoning `tree_view::style` documents: no "minimum row
-/// width" token exists, inventing one is a design decision rather than
-/// an engineering default (CLAUDE.md), and a square of the row's own
-/// height is the smallest thing that is still a real target.
-fn row_style(scales: &Scales) -> Style {
-    let row = row_height(scales);
-    Style {
-        size: Size {
-            width: percent(1.0_f32),
-            height: auto(),
-        },
-        min_size: Size {
-            width: length(row),
-            height: length(row),
-        },
-        ..Default::default()
-    }
-}
+use crate::panel::{PanelHandle, clear_panel_body, row_style};
 
 /// Empties `panel`'s body, replaces its accessibility with a real
 /// `Role::List`, then inserts one `Role::ListItem` row per journal entry

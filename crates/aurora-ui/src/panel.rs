@@ -21,10 +21,11 @@
 //! machinery this crate doesn't build yet.
 
 use accesskit::{Action, Node, Role};
-use aurora_widgets::widgets::{self, WidgetKind};
+use aurora_theme::Scales;
+use aurora_widgets::widgets::{self, WidgetKind, row_height};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
-use taffy::style_helpers::TaffyZero;
-use taffy::{Dimension, Display, Overflow, Style};
+use taffy::style_helpers::{TaffyZero, auto, length, percent};
+use taffy::{Dimension, Display, Overflow, Size, Style};
 
 /// One inserted panel's own widget ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +104,8 @@ pub fn insert_panel(
 /// because only the height axis had a demonstrated bug at the time. That
 /// asymmetry became a latent one the moment [`body_style`] became a
 /// `Column`: width is now the *cross* axis, and a row's own
-/// `min_size.width` (one row height, `crate::history_panel`'s
-/// `row_style`) propagates up through body → panel root → dock rail as a
+/// `min_size.width` (one row height, this module's own [`row_style`])
+/// propagates up through body → panel root → dock rail as a
 /// floor on the rail's whole width. It is currently unreachable —
 /// `crate::workspace::set_rail_width` clamps to `[150, 600]` and the
 /// propagated floor is 21 px — but "unreachable because something else
@@ -182,12 +183,18 @@ fn root_style(collapsed: bool) -> Style {
 ///   kept: removing it would mean rewriting every Layers test's
 ///   tree-root traversal for no behavioural gain.
 /// - **History** is what this fixes, together with its own rows'
-///   real `min_size` (`crate::history_panel`).
-/// - **Properties is neither fixed nor broken by this.** Its rows are
-///   `Style::default()` under `Row` *and* under `Column`, so they were
-///   degenerate before and are degenerate now — the axis simply moves
-///   from width to height. That is a real, separate, still-open bug,
-///   named here rather than left to be rediscovered.
+///   real `min_size` ([`row_style`], which lived in
+///   `crate::history_panel` when this was written).
+/// - **Properties needed one more step, and got it in `0.77.4`.** The
+///   `Column` change alone neither fixed nor broke it: its rows were
+///   `Style::default()` under `Row` *and* under `Column`, so they stayed
+///   degenerate with only the axis moving from width to height (full
+///   body width, zero height). They are now real
+///   `aurora_widgets::widgets::WidgetKind::ListRow`s sharing the same
+///   [`row_style`] History uses, so all three panels' rows are
+///   non-degenerate and hit-testable. What remains open there is what
+///   remains open for History: no scrolling, no selection, no focus
+///   stops (`crate::properties_panel`'s own module doc comment).
 ///
 /// Setting `Column` here rather than as a per-panel override is what
 /// makes it survive: [`set_panel_collapsed`] resets the body to this
@@ -220,6 +227,76 @@ fn body_style(collapsed: bool) -> Style {
         overflow: taffy::Point {
             x: Overflow::Hidden,
             y: Overflow::Hidden,
+        },
+        ..Default::default()
+    }
+}
+
+/// One panel-body list row's own layout: full body width, one row height
+/// tall, and never smaller than that on either axis. Shared by
+/// [`crate::populate_history_panel`] and
+/// [`crate::populate_properties_panel`] — the two panels whose rows are
+/// `panel.body`'s own direct children. (Layers is not a caller: its rows
+/// live inside `aurora_widgets::widgets::insert_tree_view`'s own
+/// container and use `tree_view::style` instead.)
+///
+/// **It lives here rather than in either caller** because the two copies
+/// would otherwise be byte-identical, and a copy carries its own prose:
+/// the first draft of the Properties fix duplicated History's version
+/// verbatim, doc comment included, which would have shipped a rationale
+/// citing a test name that does not exist in the module quoting it.
+///
+/// **Two separate guards, load-bearing for two different reasons.**
+/// The `0.77.2` commit message credited `flex_grow: 0.0` with preventing
+/// sub-pixel rows in a long journal; that was wrong, and the correction
+/// is measured rather than reasoned (0.77.3 review round).
+///
+/// - **`min_size.height: length(row)` is what makes a row exactly one
+///   line tall at *any* row count.** It is a hard flexbox floor that
+///   neither `flex_grow` nor `flex_shrink` can cross. `size.height:
+///   auto()` is what makes it a real floor rather than a starting point:
+///   an `auto` main size gives the item a flex base size of `0`, so its
+///   *scaled* flex-shrink factor (`flex_shrink × flex_base_size`) is `0`
+///   too and a crowded panel has nothing to shrink. Setting
+///   `flex_grow: 1.0` here was applied as a mutation and measured: rows
+///   still came back a correct 21 px at 200 entries and at 1000. The
+///   "200 entries would be 1.5 px each, 1000 would be 0.3 px" scenario
+///   the previous wording described **does not occur**, and nothing here
+///   depends on `flex_grow` to prevent it.
+/// - **`flex_grow: 0.0` (the default, spelled by omission) is what stops
+///   a *sparse* panel from inflating its rows.** Free space is what
+///   `flex_grow` divides, and a panel with a handful of rows has plenty:
+///   the same mutation inflates five rows to 60 px each, which is what
+///   `history_rows_are_real_list_row_widgets_with_a_hittable_size` and
+///   its Properties twin actually catch — both assert the *exact* row
+///   height, not merely a positive one, which is the assertion shape
+///   that makes that regression visible. `aurora_widgets::widgets::
+///   command_palette::row_style` uses `flex_grow: 1.0` deliberately,
+///   because its handful of result rows really are meant to divide their
+///   container evenly; a list row here is one line tall no matter how
+///   much room it is offered. `aurora_widgets::widgets::tree_view::
+///   style` records the same borrowed-idiom mistake, and additionally
+///   adds a `padding.top` this does not.
+///
+/// Neither is redundant, and deleting `min_size.height` in particular
+/// would bring the zero-height bug straight back — it is the guard that
+/// holds, not the one the old wording credited.
+///
+/// `min_size.width` is one row height as well, the same square floor
+/// and the same reasoning `tree_view::style` documents: no "minimum row
+/// width" token exists, inventing one is a design decision rather than
+/// an engineering default (CLAUDE.md), and a square of the row's own
+/// height is the smallest thing that is still a real target.
+pub(crate) fn row_style(scales: &Scales) -> Style {
+    let row = row_height(scales);
+    Style {
+        size: Size {
+            width: percent(1.0_f32),
+            height: auto(),
+        },
+        min_size: Size {
+            width: length(row),
+            height: length(row),
         },
         ..Default::default()
     }

@@ -5276,6 +5276,82 @@ structural design work.
   --all-targets --all-features -- -D warnings`, `cargo test
   --workspace`, `cargo test --workspace --doc`, and `cargo doc
   --workspace --no-deps --all-features` all clean.
+
+  **Properties panel rows have a real, hittable size, 2026-09-02
+  (`0.77.4`).** The last of the three panels to carry the same
+  degeneracy, and the bug `0.77.3` deliberately pinned rather than
+  fixed. A Properties row was a `WidgetKind::Container` carrying
+  `Style::default()`; under the shared `Column` body direction that
+  resolved to full body width and **zero height** — laid out, but
+  unhittable and unpaintable, the same class of bug History had on the
+  *width* axis before `0.77.2`. Rows are now real
+  `WidgetKind::ListRow`s with a token-derived `min_size` of one
+  `row_height` square, so all three panels' rows are non-degenerate.
+
+  - **`row_style` moved from `history_panel.rs` to `panel.rs`** as a
+    `pub(crate)` shared helper (not `pub` — nothing outside `aurora-ui`
+    needs it, and the crate's re-export list did not grow). The logic is
+    byte-identical to History's; the reason it moved rather than being
+    copied is that its doc comment is where the two load-bearing guards
+    are explained, and a second copy would have shipped a rationale
+    citing `history_rows_are_real_list_row_widgets_with_a_hittable_size`
+    from a module that does not contain that test. `history_panel.rs`
+    now calls the shared one; its call site was unchanged.
+  - **`populate_properties_panel` takes `&Scales` as its third
+    parameter**, matching `populate_layers_panel`/
+    `populate_history_panel`'s established argument order. Three
+    production call sites in `aurora-app`: `replace_document` and
+    `App::new` already had a `Scales` in scope;
+    `refresh_properties_panel` did not, and now resolves it with the
+    same `load_scales()`-warn-and-return prologue
+    `refresh_history_panel` already used — a stale panel on failure,
+    never a lost edit, in a crate that denies `unwrap`/`panic`.
+    `run_command`'s signature is unchanged.
+  - **This buys geometry, not pixels.** `paint_list_row` returns
+    `Ok(vec![])` for an *unselected* row and nothing in the workspace
+    selects a Properties row, so the panel draws exactly what it drew
+    before: nothing. What changed is that a row is now a real,
+    non-degenerate, hit-testable rect. No screen-reader or on-hardware
+    verification exists for any of it.
+  - **Still not done, disclosed rather than implied:** no row selection
+    or click routing, no `Action::Focus`/`Action::Click` (the same
+    crate-wide focus-model question History declined to pay for rows
+    that route nowhere), no scrolling container, and no drawn label text
+    — a row's label reaches the accessibility node and nothing else.
+  - **Deliberately no Properties twin of History's exact
+    reachable-row-count test.** `tool_options` returns at most one row
+    (a Brush or Eraser radius) against a rail share that fits ~14, so
+    pinning that arithmetic here would pin something no real user path
+    can exercise. The clipping is disclosed in `properties_panel`'s own
+    module doc comment instead, and the omission is stated in the
+    crowding test rather than left silent.
+  - **Doc corrections in `panel.rs`, which nothing mechanical would have
+    caught:** `body_style`'s "Properties is neither fixed nor broken by
+    this... degenerate before and degenerate now" bullet became false
+    with this commit and is rewritten; `root_style`'s cross-reference to
+    `crate::history_panel`'s `row_style` now points at this module's
+    own.
+
+  Net +2 tests: the pinning test
+  `properties_rows_are_still_degenerate_zero_height_boxes` was
+  **deleted**, as its own doc comment instructed ("whoever fixes this
+  should delete this test, not weaken it"), and three replaced it —
+  `aurora-ui` is at 92 (was 90), 1,521 passing across the workspace (was
+  1,519). Both new geometry tests were mutation-checked, not assumed:
+  reverting the row insertion to `Style::default()`/`WidgetKind::
+  Container` fails them, and setting `flex_grow: 1.0` in the shared
+  `row_style` fails the exact-height assertion in *both* the History and
+  Properties versions. The first draft of the stacking test passed
+  vacuously under the revert (zero-height rows all pile at one `y` and
+  satisfy `y == previous.y + 0`); it now asserts a strict `y` increase
+  and a positive previous height, which is what makes it real. Same
+  gate, same result: `cargo fmt --all --check`, both `scripts/`
+  checkers, `cargo check --workspace --locked`, `cargo clippy
+  --workspace --all-targets --all-features -- -D warnings`, `cargo test
+  --workspace`, `cargo test --workspace --doc`, and `RUSTDOCFLAGS="-D
+  warnings" cargo doc --workspace --no-deps --all-features` all clean.
+  (`cargo nextest` is not installed in this sandbox; `cargo test
+  --workspace` stood in, per CLAUDE.md.)
 - [~] **Command palette, keyboard shortcuts** — first slice done
   2026-08-04. Two new generic mechanisms in `aurora-widgets`, following
   the same "abstract steps, not `winit` types — translating real

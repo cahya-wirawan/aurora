@@ -33,26 +33,48 @@
 //! functions already had — see `aurora-app`'s own
 //! `refresh_properties_panel`.
 //!
-//! **Its rows are still degenerate, and that is a real, open bug** —
-//! disclosed here and pinned by
-//! `properties_rows_are_still_degenerate_zero_height_boxes`, deliberately
-//! not fixed in the round that wrote this. A row is a
-//! `WidgetKind::Container` carrying `Style::default()`, which under the
-//! shared `Column` body direction resolves to full body width and **zero
-//! height** — the same class of bug `crate::history_panel` had on the
-//! width axis before `0.77.2`, with the axis swapped by the same
-//! `Row` → `Column` change that fixed History. Nothing hit-tests or
-//! paints a Properties row today, so it is currently invisible rather
-//! than wrong on screen; the fix is the same one History got (real
-//! `WidgetKind::ListRow`s with a token-derived `min_size`), and it needs
-//! the `&Scales` this function does not yet take.
+//! **Real rows with a real, hittable size** (0.77.4). Until then a row
+//! was a `WidgetKind::Container` carrying `Style::default()`, which under
+//! the shared `Column` body direction resolved to full body width and
+//! **zero height** — laid out, but degenerate, unhittable and
+//! unpaintable, the same class of bug [`crate::history_panel`] had on the
+//! *width* axis before `0.77.2`. Rows are now real
+//! [`aurora_widgets::widgets::WidgetKind::ListRow`]s carrying
+//! `crate::panel`'s own `row_style`, the same shared style a History row
+//! beside them uses (it moved there from `history_panel` in this same
+//! round, rather than being copied a second time).
+//!
+//! **Zero pixel difference, deliberately.** `aurora_widgets::paint`'s own
+//! `paint_list_row` returns `Ok(vec![])` for an *unselected* row, and
+//! nothing in the workspace selects a Properties row — no `set_*_selected`
+//! call site, no click routing. So this draws exactly what the old code
+//! drew (nothing) and changes only the geometry: a real, non-degenerate,
+//! hit-testable rect. Still not drawn at all: the row's own label text
+//! (it reaches the accessibility node and nothing else — there is no
+//! glyph rendering here yet) and any editable control.
+//!
+//! **Rows past the bottom of the panel would be clipped and unreachable**
+//! — the same structural gap [`crate::history_panel`] and
+//! [`crate::layers_panel`] both disclose, since `crate::panel`'s own
+//! `body_style` gives each panel a content-independent share of the rail
+//! and `aurora-widgets` has no scrolling container. Here it is a
+//! class-guard disclosure rather than a live limit: `aurora-app`'s own
+//! `tool_options` returns at most one row today (a Brush or Eraser
+//! radius) and the panel's rail share fits roughly fourteen, so no real
+//! user path reaches the clip.
+//!
+//! **No `Action::Focus`/`Action::Click` on a row, deliberately** — the
+//! same reasoning [`crate::history_panel`] records: routing rows to a
+//! real interaction is separate work, and making them `Tab` stops that
+//! go nowhere is the crate-wide focus-model question
+//! `aurora_widgets::widgets::tree_view` already discloses.
 
 use accesskit::{Node, Role};
-use aurora_widgets::widgets::WidgetKind;
+use aurora_theme::Scales;
+use aurora_widgets::widgets::{ListRowState, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetTree};
-use taffy::Style;
 
-use crate::panel::{PanelHandle, clear_panel_body};
+use crate::panel::{PanelHandle, clear_panel_body, row_style};
 use crate::tool::Tool;
 
 /// Empties `panel`'s body, replaces its accessibility with a real
@@ -62,6 +84,12 @@ use crate::tool::Tool;
 /// tool-specific knowledge lives in this crate; see this module's own
 /// doc comment for why. An empty `options` slice is a legitimate,
 /// honest "no real options for this tool yet" state, not an error.
+///
+/// `scales` is what gives each row its real, token-derived height
+/// (`crate::panel`'s own `row_style`, shared with
+/// [`crate::populate_history_panel`]); before `0.77.4` the rows carried
+/// `Style::default()` and resolved to zero height — see this module's own
+/// doc comment.
 ///
 /// **Repopulating is safe**: `panel.body`'s existing children are
 /// removed first ([`clear_panel_body`]), so switching from a tool with
@@ -85,6 +113,7 @@ use crate::tool::Tool;
 pub fn populate_properties_panel(
     tree: &mut WidgetTree<WidgetKind>,
     panel: PanelHandle,
+    scales: &Scales,
     tool: Tool,
     options: &[(&str, String)],
 ) -> Result<(), WidgetError> {
@@ -93,10 +122,16 @@ pub fn populate_properties_panel(
     list_node.set_label(format!("Properties: {}", tool.label()));
     tree.set_accessibility(panel.body, list_node)?;
 
+    let style = row_style(scales);
     for (label, value) in options {
         let mut node = Node::new(Role::ListItem);
         node.set_label(format!("{label}: {value}"));
-        tree.insert(panel.body, Style::default(), node, WidgetKind::Container)?;
+        tree.insert(
+            panel.body,
+            style.clone(),
+            node,
+            WidgetKind::ListRow(ListRowState::default()),
+        )?;
     }
     Ok(())
 }
@@ -106,8 +141,29 @@ mod tests {
     use super::populate_properties_panel;
     use crate::panel::insert_panel;
     use crate::tool::Tool;
-    use aurora_widgets::widgets;
+    use aurora_core::Rect;
+    use aurora_theme::Scales;
+    use aurora_widgets::widgets::{self, ListRowState, WidgetKind};
     use taffy::Style;
+
+    // The real, committed, owner-approved scales -- the same file
+    // `aurora-theme`'s own tests parse, so this exercises real token
+    // values, not a synthetic fixture.
+    fn test_scales() -> Scales {
+        const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
+        match Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// `count` synthetic label/value pairs. Deliberately far more than
+    /// `aurora-app`'s own `tool_options` ever produces (one row, a Brush
+    /// or Eraser radius) -- the crowding test needs content the real
+    /// caller cannot currently supply.
+    fn options_with(count: usize) -> Vec<(&'static str, String)> {
+        (0..count).map(|i| ("Radius", format!("{i}px"))).collect()
+    }
 
     #[test]
     fn populate_properties_panel_adds_one_row_per_option_in_order() {
@@ -117,7 +173,10 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         let options = [("Radius", "24px".to_owned())];
-        if let Err(err) = populate_properties_panel(&mut tree, panel, Tool::Brush, &options) {
+        let scales = test_scales();
+        if let Err(err) =
+            populate_properties_panel(&mut tree, panel, &scales, Tool::Brush, &options)
+        {
             unreachable!("{err:?}");
         }
 
@@ -150,7 +209,8 @@ mod tests {
             Ok(panel) => panel,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = populate_properties_panel(&mut tree, panel, Tool::Move, &[]) {
+        let scales = test_scales();
+        if let Err(err) = populate_properties_panel(&mut tree, panel, &scales, Tool::Move, &[]) {
             unreachable!("{err:?}");
         }
 
@@ -182,8 +242,11 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         let options = [("Radius", "24px".to_owned())];
+        let scales = test_scales();
         for _ in 0..2 {
-            if let Err(err) = populate_properties_panel(&mut tree, panel, Tool::Brush, &options) {
+            if let Err(err) =
+                populate_properties_panel(&mut tree, panel, &scales, Tool::Brush, &options)
+            {
                 unreachable!("{err:?}");
             }
         }
@@ -193,7 +256,7 @@ mod tests {
             "a second call must replace the row, not stack a second one beside it"
         );
 
-        if let Err(err) = populate_properties_panel(&mut tree, panel, Tool::Move, &[]) {
+        if let Err(err) = populate_properties_panel(&mut tree, panel, &scales, Tool::Move, &[]) {
             unreachable!("{err:?}");
         }
         assert_eq!(
@@ -203,30 +266,24 @@ mod tests {
         );
     }
 
-    /// **An honest before-picture of a known, disclosed bug, not a
-    /// guarantee.** A Properties row is a `WidgetKind::Container`
-    /// carrying `Style::default()`, which under `crate::panel`'s shared
-    /// `Column` body direction resolves to full body width and **zero
-    /// height** — laid out, but degenerate, unhittable, and unpaintable,
-    /// exactly the shape a History row had on the *width* axis before
-    /// `0.77.2`. This test asserts the broken geometry on purpose, so
-    /// that the disclosure in this module's own doc comment is something
-    /// CI notices changing rather than prose that can quietly go stale.
-    /// The same discipline `layers_panel`'s own
-    /// `tab_order_currently_stops_on_every_layer_row` uses for a
-    /// different disclosed gap.
-    ///
-    /// **Whoever fixes the bug should delete this test**, not weaken it:
-    /// its failure is the intended signal that the gap closed.
+    /// The regression test for the `0.77.4` bug. Before the fix, a
+    /// Properties row was a `WidgetKind::Container` carrying
+    /// `Style::default()`, which under `crate::panel`'s shared `Column`
+    /// body direction resolved to full body width and **zero height** --
+    /// laid out, but degenerate, unhittable and unpaintable. Built
+    /// through the real `build_workspace` rather than a bare
+    /// `insert_panel`, because the degeneracy only appears once the body
+    /// has a real resolved size to lay a row out against.
     #[test]
-    fn properties_rows_are_still_degenerate_zero_height_boxes() {
+    fn properties_rows_are_real_list_row_widgets_with_a_hittable_size() {
         let mut ws = crate::workspace::build_workspace();
+        let scales = test_scales();
         let options = [
             ("Radius", "24px".to_owned()),
             ("Hardness", "80%".to_owned()),
         ];
         if let Err(err) =
-            populate_properties_panel(&mut ws.tree, ws.properties, Tool::Brush, &options)
+            populate_properties_panel(&mut ws.tree, ws.properties, &scales, Tool::Brush, &options)
         {
             unreachable!("{err:?}");
         }
@@ -236,26 +293,161 @@ mod tests {
             unreachable!("just populated");
         };
         assert_eq!(rows.len(), 2, "one row per option");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let one_row = widgets::row_height(&scales) as u32;
+        assert_eq!(one_row, 21, "13px of type plus 4px above and below");
+
         for &row in rows {
+            assert_eq!(
+                ws.tree.payload(row),
+                Some(&WidgetKind::ListRow(ListRowState::default())),
+                "a row must be a real ListRow, not an unpainted Container"
+            );
             let Some(row_bounds) = ws.tree.bounds(row) else {
                 unreachable!("just laid out");
             };
+            assert!(
+                row_bounds.width > 0,
+                "a row must not be a degenerate zero-width box either: {row_bounds:?}"
+            );
+            // The exact height, not `> 0`. A sparse panel is exactly
+            // where `flex_grow: 1.0` would inflate two rows to ~150px
+            // each and still pass a positive-height check -- see
+            // `crate::panel`'s own `row_style` for why that guard is
+            // load-bearing.
             assert_eq!(
-                row_bounds.height, 0,
-                "the disclosed bug: a Style::default() row in a Column body has no height \
-                 at all -- {row_bounds:?}"
+                row_bounds.height, one_row,
+                "a row is exactly one line tall, not a share of the body: {row_bounds:?}"
             );
             #[allow(clippy::cast_precision_loss)]
             let point = (
                 (row_bounds.x + i64::from(row_bounds.width) / 2) as f32,
-                row_bounds.y as f32,
+                (row_bounds.y + i64::from(row_bounds.height) / 2) as f32,
             );
-            assert_ne!(
+            assert_eq!(
                 ws.tree.hit_test(point),
                 Some(row),
-                "and a zero-height row cannot be hit, the same way a zero-width History row \
-                 could not be before 0.77.2"
+                "and a pointer must actually land on it: {row_bounds:?}"
             );
+        }
+    }
+
+    /// The other half of the same fix: rows must stack, not overlap.
+    ///
+    /// The strict `y` *increase* is what makes this non-vacuous, and it
+    /// was added after the assertion was mutation-tested: the equality
+    /// alone (`y == previous.y + previous.height`) is trivially true of
+    /// the very bug being fixed, since zero-height rows all pile up at
+    /// one `y` and satisfy `y == previous.y + 0`. Reverting the fix now
+    /// fails this test rather than passing it by accident.
+    #[test]
+    fn properties_rows_stack_top_to_bottom_without_overlapping() {
+        let mut ws = crate::workspace::build_workspace();
+        let scales = test_scales();
+        let options = options_with(4);
+        if let Err(err) =
+            populate_properties_panel(&mut ws.tree, ws.properties, &scales, Tool::Brush, &options)
+        {
+            unreachable!("{err:?}");
+        }
+        ws.tree.compute_layout(1600.0, 900.0);
+
+        let Some(rows) = ws.tree.children(ws.properties.body) else {
+            unreachable!("just populated");
+        };
+        assert!(rows.len() >= 3, "at least three rows, got {}", rows.len());
+        let mut previous: Option<Rect> = None;
+        for &row in rows {
+            let Some(row_bounds) = ws.tree.bounds(row) else {
+                unreachable!("just laid out");
+            };
+            if let Some(before) = previous {
+                assert_eq!(
+                    row_bounds.x, before.x,
+                    "sibling rows must share a left edge, not sit beside each other"
+                );
+                assert!(
+                    before.height > 0,
+                    "a degenerate zero-height row would satisfy the stacking check below \
+                     vacuously: {before:?}"
+                );
+                assert_eq!(
+                    row_bounds.y,
+                    before.y + i64::from(before.height),
+                    "each row must start exactly where the one above it ended"
+                );
+                assert!(
+                    row_bounds.y > before.y,
+                    "and must really be below it, not piled on the same point: \
+                     {before:?}, {row_bounds:?}"
+                );
+            }
+            previous = Some(row_bounds);
+        }
+    }
+
+    /// The Properties twin of `history_panel`'s own crowding test: rows
+    /// with a real intrinsic height are exactly the content that would
+    /// otherwise push a panel past its share of the rail and starve its
+    /// siblings, the way a 43-layer Layers panel did before `0.77.1`.
+    ///
+    /// **There is deliberately no Properties twin of History's
+    /// `rows_past_the_bottom_..._are_clipped_and_not_yet_reachable`.**
+    /// That test pins an exact reachable-row count, which is worth doing
+    /// for a journal that really reaches 1001 entries; `aurora-app`'s own
+    /// `tool_options` returns at most one row, so the same assertion here
+    /// would pin arithmetic no real user path can exercise. The clipping
+    /// itself is disclosed in this module's own doc comment instead.
+    #[test]
+    fn a_crowded_properties_panel_never_starves_its_sibling_panels() {
+        for count in [1_usize, 40, 200, 400] {
+            let mut ws = crate::workspace::build_workspace();
+            let scales = test_scales();
+            let options = options_with(count);
+            if let Err(err) = populate_properties_panel(
+                &mut ws.tree,
+                ws.properties,
+                &scales,
+                Tool::Brush,
+                &options,
+            ) {
+                unreachable!("{err:?}");
+            }
+            ws.tree.compute_layout(1600.0, 900.0);
+
+            let (Some(layers_bounds), Some(properties_bounds), Some(history_bounds)) = (
+                ws.tree.bounds(ws.layers.root),
+                ws.tree.bounds(ws.properties.root),
+                ws.tree.bounds(ws.history.root),
+            ) else {
+                unreachable!("just laid out");
+            };
+
+            assert!(
+                layers_bounds.height > 0 && history_bounds.height > 0,
+                "{count} property rows must not collapse the sibling panels: \
+                 {layers_bounds:?}, {history_bounds:?}"
+            );
+            assert_eq!(
+                properties_bounds.height, layers_bounds.height,
+                "the three panels must keep sharing the rail equally at {count} rows"
+            );
+            assert!(
+                history_bounds.y + i64::from(history_bounds.height) <= 900,
+                "no panel may be pushed off the bottom of the window: {history_bounds:?}"
+            );
+
+            for (name, panel_bounds) in [("layers", layers_bounds), ("history", history_bounds)] {
+                #[allow(clippy::cast_precision_loss)]
+                let point = (
+                    (panel_bounds.x + i64::from(panel_bounds.width) / 2) as f32,
+                    (panel_bounds.y + i64::from(panel_bounds.height) / 2) as f32,
+                );
+                assert!(
+                    ws.tree.hit_test(point).is_some(),
+                    "{name} must stay hit-testable at {count} rows"
+                );
+            }
         }
     }
 
@@ -269,7 +461,8 @@ mod tests {
         if let Err(err) = tree.remove(panel.body) {
             unreachable!("{err:?}");
         }
-        match populate_properties_panel(&mut tree, panel, Tool::Brush, &[]) {
+        let scales = test_scales();
+        match populate_properties_panel(&mut tree, panel, &scales, Tool::Brush, &[]) {
             Err(aurora_widgets::WidgetError::UnknownWidget(id)) => assert_eq!(id, panel.body),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }

@@ -1092,6 +1092,7 @@ fn replace_document(
     aurora_ui::populate_properties_panel(
         &mut workspace.tree,
         workspace.properties,
+        scales,
         tool,
         &options,
     )?;
@@ -3434,11 +3435,31 @@ fn tool_options(tool: aurora_ui::Tool) -> Vec<(&'static str, String)> {
 /// same contract its two sibling `populate_*` functions already had, so
 /// the explicit `clear_panel_body` that used to stand here was doing the
 /// work twice.
+///
+/// The design scales are resolved here rather than threaded through
+/// [`run_command`], the same way [`refresh_history_panel`] already does
+/// it: `aurora_ui::Workspace` carries no `Scales` of its own. A failure
+/// to load them warns and returns, leaving the panel showing the previous
+/// tool's options rather than losing anything — it is a stale panel, not
+/// a lost edit, and this crate denies `unwrap`/`panic` besides. Unlike
+/// [`refresh_history_panel`], the rebuild cost of doing this per call is
+/// not worth a caveat: [`tool_options`] yields at most one row.
 fn refresh_properties_panel(workspace: &mut aurora_ui::Workspace, tool: aurora_ui::Tool) {
+    let scales = match load_scales() {
+        Ok(scales) => scales,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to load the design scales; leaving the Properties panel as it is"
+            );
+            return;
+        }
+    };
     let options = tool_options(tool);
     if let Err(err) = aurora_ui::populate_properties_panel(
         &mut workspace.tree,
         workspace.properties,
+        &scales,
         tool,
         &options,
     ) {
@@ -9746,6 +9767,7 @@ impl App {
         if let Err(err) = aurora_ui::populate_properties_panel(
             &mut workspace.tree,
             workspace.properties,
+            &scales,
             aurora_ui::Tool::default(),
             &tool_options(aurora_ui::Tool::default()),
         ) {
