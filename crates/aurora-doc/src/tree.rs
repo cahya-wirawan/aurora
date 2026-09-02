@@ -1638,8 +1638,9 @@ impl LayerTree {
     /// whose id is this one with that bit cleared — one tile-store slot
     /// with two owners.
     ///
-    /// [`validate_layer_id_range`] refuses such an id at the
-    /// deserialization boundary, so this guard should be unreachable.
+    /// `validate_layer_id_range` (this module's own, crate-private)
+    /// refuses such an id at the deserialization boundary, so this
+    /// guard should be unreachable.
     /// It is here anyway, deliberately, so the invariant is enforced at
     /// the type's own boundary rather than only at the one call site
     /// that validates: `LayerEntry`/`LayerId` are both `Deserialize`
@@ -1692,7 +1693,8 @@ impl LayerTree {
     /// at a time, monotonically, so reaching `2^63 - 1` would take
     /// `2^63` layer creations in a single session; and an id
     /// deserialized from an untrusted file cannot get there either,
-    /// because [`validate_layer_id_range`] refuses anything at or above
+    /// because this module's own crate-private
+    /// `validate_layer_id_range` refuses anything at or above
     /// `MASK_SURFACE_BIT` outright. The branch exists because this
     /// crate refuses to `panic` (see CLAUDE.md's "Lints worth
     /// knowing": a panic costs a professional their unsaved work), so

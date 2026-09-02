@@ -4875,11 +4875,29 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
 ///    and not to `doc_origin`. `read_layer_window` already handles the
 ///    up-to-four-tile overlap of a non-tile-aligned origin, and its own
 ///    store-error handling (`CompositeBudget::note_store_error`) is
-///    reused as-is: an unreadable mask tile leaves that part of the
-///    window at all-zeros, which
-///    [`aurora_doc::read_mask_coverage`] reads as coverage `1.0` — the
-///    fail-open direction, so a broken scratch file cannot silently
-///    erase a layer.
+///    reused as-is — see [`WindowKind::MaskCoverage`] for what a mask
+///    read failure does and does not do to an export.
+///
+/// # Failing open, in both directions
+///
+/// Every degenerate case — a short slice, a `NaN`, an unreadable tile
+/// — resolves to **final** coverage `1.0`: the layer stays visible. A
+/// mask that cannot be read must never silently erase a layer's
+/// content.
+///
+/// The word doing the work there is *final*. Until 0.70.2 the
+/// substitution happened one step too early — an unreadable texel was
+/// given a raw coverage of `1.0` and then went through the
+/// `mask.inverted` step like any other value, so with `inverted` set,
+/// `1.0 - 1.0` was `0.0` and the failure erased the layer exactly where
+/// the read had failed. That is fail-*closed*, and it contradicted the
+/// promise in the paragraph above rather than fulfilling it. The
+/// "could not be read" signal is therefore carried as a `None` all the
+/// way past inversion (via [`LayerWindow::was_read`], which is why a
+/// window read is not merely a `Vec`), and only then resolved to `1.0`.
+/// A never-*painted* texel is a different thing and still inverts
+/// normally: it was read successfully, and `1.0` is genuinely what it
+/// says.
 ///
 /// The two multiply — inside the bounds, coverage is whatever the mask
 /// surface says; outside, it is zero. **A never-painted mask surface
@@ -4942,6 +4960,7 @@ fn apply_mask(
             (mask.bounds.x, mask.bounds.y),
             doc_origin,
             budget,
+            WindowKind::MaskCoverage,
         )
     });
     let mut masked = vec![half::f16::from_f32(0.0); texels.len()];
@@ -4962,30 +4981,76 @@ fn apply_mask(
         let abs_x = doc_origin.0 + col;
         let abs_y = doc_origin.1 + row;
 
-        let raw = if mask.bounds.contains_point(abs_x, abs_y) {
+        // `None` means "this texel's coverage could not be determined",
+        // which is deliberately *not* a coverage value: it has to
+        // survive past the `inverted` step below, or inverting turns
+        // the fail-open default into a fail-*closed* one. See this
+        // function's own "Failing open, in both directions" note.
+        let raw: Option<f32> = if mask.bounds.contains_point(abs_x, abs_y) {
             match coverage_window.as_ref() {
                 Some(window) => {
+                    let (Ok(window_col), Ok(window_row)) =
+                        (usize::try_from(col), usize::try_from(row))
+                    else {
+                        continue;
+                    };
                     let base = index * aurora_tile::CHANNELS;
-                    match window.get(base..base + aurora_tile::CHANNELS) {
-                        Some(texel) => aurora_doc::read_mask_coverage(texel),
-                        // Same fail-open direction as a store error: a
-                        // window that cannot be indexed must not erase
-                        // the layer.
-                        None => 1.0,
+                    match window.texels.get(base..base + aurora_tile::CHANNELS) {
+                        // A texel whose own source tile failed to read
+                        // is all-zeros for that reason, not because
+                        // nobody painted it -- so it carries no
+                        // coverage, rather than the zeros' usual
+                        // meaning of `1.0`.
+                        Some(_) if !window.was_read(window_col, window_row) => None,
+                        Some(texel) => Some(aurora_doc::read_mask_coverage(texel)),
+                        // A window that cannot be indexed at all is the
+                        // same statement: no coverage was determined.
+                        None => None,
                     }
                 }
-                None => 1.0,
+                // No mask surface: `mask.bounds` alone decides, and
+                // inside it the layer is fully covered.
+                None => Some(1.0),
             }
         } else {
-            0.0
+            // Outside the rectangle a mask shows nothing, and this is a
+            // real determination -- `inverted` is meant to flip it.
+            Some(0.0)
         };
-        let coverage = if mask.inverted { 1.0 - raw } else { raw };
+        let coverage = match raw {
+            Some(raw) => {
+                if mask.inverted {
+                    1.0 - raw
+                } else {
+                    raw
+                }
+            }
+            // Fail open *after* `inverted`, never before. Substituting
+            // `1.0` into `raw` instead (as this did until 0.70.2) is
+            // fail-open only while `inverted` is false: with it true,
+            // `1.0 - 1.0` is `0.0` and an unreadable mask erased the
+            // layer on screen -- the exact opposite of what the
+            // surrounding contract promises.
+            None => 1.0,
+        };
 
         if coverage > 0.0 {
-            *dst_r = *r;
-            *dst_g = *g;
-            *dst_b = *b;
-            *dst_a = half::f16::from_f32(a.to_f32() * coverage);
+            let scaled = half::f16::from_f32(a.to_f32() * coverage);
+            // The `(0, 0, 0, 0)`-at-zero rule has to be checked on the
+            // *scaled* alpha, not on `coverage` alone: at a tiny but
+            // nonzero coverage the product can underflow to `f16` zero
+            // while `r`/`g`/`b` were about to be copied through intact,
+            // producing exactly the `(r, g, b, 0)` shape this function
+            // promises never to emit. `abs() > 0.0` rather than
+            // `!= 0.0` both dodges this workspace's `clippy::float_cmp`
+            // and treats `-0.0` (and a `NaN` alpha, which compares
+            // false) as zero.
+            if scaled.to_f32().abs() > 0.0 {
+                *dst_r = *r;
+                *dst_g = *g;
+                *dst_b = *b;
+                *dst_a = scaled;
+            }
         }
         // else: leave fully transparent -- `masked` is already
         // zero-initialized above, and that is exactly `(0, 0, 0, 0)`.
@@ -5482,7 +5547,15 @@ fn resolve_tile(
                     }
                 }
             } else {
-                read_layer_window(store, surface, origin, doc_origin, budget)
+                read_layer_window(
+                    store,
+                    surface,
+                    origin,
+                    doc_origin,
+                    budget,
+                    WindowKind::LayerPixels,
+                )
+                .texels
             };
             // Masking runs first, ahead of `Dissolve` below: it
             // restricts which pixels are even in play, and by how much,
@@ -6580,6 +6653,111 @@ impl CompositeCache {
     }
 }
 
+/// What a [`read_layer_window`] call is reading, which decides how a
+/// failed `aurora_tile::TileStore::get` inside it is described.
+///
+/// Purely a reporting distinction: both variants charge
+/// [`CompositeBudget::note_store_error`] identically. The variant
+/// exists because the log line used to say "skipping a moved layer's
+/// source tile" for a *mask* read too, which sends whoever reads it
+/// looking at the wrong surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowKind {
+    /// A [`aurora_doc::LayerKind::Pixel`] layer's own pixels, re-tiled
+    /// because that layer's origin isn't a whole number of tiles away
+    /// from the composite tile's.
+    LayerPixels,
+    /// A [`aurora_doc::LayerMask`]'s grayscale coverage, on the layer's
+    /// own `aurora_doc::LayerTree::mask_surface_id`.
+    ///
+    /// # Why an unreadable mask tile still refuses an export
+    ///
+    /// Masking fails *open* on the canvas — an unreadable mask shows
+    /// the layer rather than erasing it, so a user never watches their
+    /// work vanish because a scratch file went bad. That is
+    /// deliberately **not** the same as saying the failure is harmless,
+    /// and the two paths get different answers on purpose:
+    ///
+    /// - **Canvas** (`recomposite_visible_tiles`): show the layer.
+    ///   Being briefly un-masked on screen is recoverable; the pixels
+    ///   are all still there.
+    /// - **Export** (`composite_document`): refuse. The image that
+    ///   would be written is not the document — a layer that should
+    ///   have been masked isn't — and CLAUDE.md is explicit that
+    ///   silently degrading a professional's file is the worst failure
+    ///   this project can have. A refusal is loud and retryable; a
+    ///   wrongly un-masked export is silent and permanent.
+    ///
+    /// So this variant charges `note_store_error` exactly like
+    /// [`Self::LayerPixels`] does. It is a real behaviour change from
+    /// before mask pixels existed (a mask could not fail to read at
+    /// all then), stated here rather than left to be discovered.
+    MaskCoverage,
+}
+
+impl WindowKind {
+    /// The `surface_kind` field on this kind's own warning.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LayerPixels => "layer-pixels",
+            Self::MaskCoverage => "mask-coverage",
+        }
+    }
+
+    /// What was skipped, said in terms of the surface actually read.
+    const fn skip_message(self) -> &'static str {
+        match self {
+            Self::LayerPixels => "skipping a moved layer's source tile for this composite tile",
+            Self::MaskCoverage => "skipping a layer mask's coverage tile for this composite tile",
+        }
+    }
+}
+
+/// A rectangle of a [`LayerWindow`] that a failed
+/// `aurora_tile::TileStore::get` left at the blank default, in
+/// window-local texel coordinates (`col_start..col_end` by
+/// `row_start..row_end`, both half-open).
+#[derive(Clone, Copy, Debug)]
+struct UnreadRegion {
+    col_start: usize,
+    col_end: usize,
+    row_start: usize,
+    row_end: usize,
+}
+
+/// One [`read_layer_window`] result: the window's texels, plus which
+/// parts of it (if any) are blank *because a read failed* rather than
+/// because nothing was ever painted there.
+///
+/// Keeping those apart is the whole reason this type exists — see
+/// [`read_layer_window`]'s own doc comment.
+#[derive(Debug)]
+struct LayerWindow {
+    texels: Vec<half::f16>,
+    /// At most four entries: one window overlaps at most four source
+    /// tiles. Empty in the overwhelmingly common case, which is what
+    /// makes [`Self::was_read`] a no-op scan rather than a per-texel
+    /// cost.
+    unread: Vec<UnreadRegion>,
+}
+
+impl LayerWindow {
+    /// Whether the texel at window-local `(col, row)` reflects an
+    /// actual read of the surface.
+    ///
+    /// `false` means a `aurora_tile::TileStore::get` covering it
+    /// failed, so the zeros sitting there say nothing about what the
+    /// surface holds. A caller that gives zeros a *meaning* — as
+    /// [`apply_mask`] does, where they mean "never painted, fully
+    /// visible" — must consult this before believing them.
+    fn was_read(&self, col: usize, row: usize) -> bool {
+        !self.unread.iter().any(|region| {
+            (region.col_start..region.col_end).contains(&col)
+                && (region.row_start..region.row_end).contains(&row)
+        })
+    }
+}
+
 /// Assembles one `aurora_tile::TILE`-sized window of `surface`'s own
 /// texels, positioned at document-space `doc_origin`, given that
 /// `surface`'s own pixels are addressed from `layer_origin` (that
@@ -6600,6 +6778,24 @@ impl CompositeCache {
 /// own unsigned fields mean there is no tile to read — is left fully
 /// transparent, the same as any pixel `surface` has genuinely never
 /// been painted at.
+///
+/// # Why the result is a [`LayerWindow`] and not a bare `Vec`
+///
+/// Because "this texel is blank" and "this texel could not be read"
+/// are *different facts* that both come out as all-zeros in the buffer,
+/// and one caller has to tell them apart. [`apply_mask`] reads a mask's
+/// coverage through here, where a zero texel means "never painted, so
+/// fully visible" — the fail-open default — and if a failed
+/// `aurora_tile::TileStore::get` is indistinguishable from that, then
+/// `mask.inverted` flips the *default* along with everything else and
+/// the failure fails **closed** instead, erasing the layer. See
+/// [`LayerWindow::was_read`] and [`apply_mask`]'s own doc comment.
+///
+/// `kind` decides only how a failed read is *described* in the log
+/// line; both kinds still charge `CompositeBudget::note_store_error`,
+/// which is what an export refusal is built on. See
+/// [`WindowKind::MaskCoverage`] for why a mask read counts too, even
+/// though masking otherwise fails open.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn read_layer_window(
     store: &mut aurora_tile::TileStore,
@@ -6607,7 +6803,8 @@ fn read_layer_window(
     layer_origin: (i64, i64),
     doc_origin: (i64, i64),
     budget: &mut CompositeBudget,
-) -> Vec<half::f16> {
+    kind: WindowKind,
+) -> LayerWindow {
     let tile_size = i64::from(aurora_tile::TILE);
     let window_x = doc_origin.0 - layer_origin.0;
     let window_y = doc_origin.1 - layer_origin.1;
@@ -6616,6 +6813,9 @@ fn read_layer_window(
             half::f16::from_f32(0.0);
             aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
         ];
+    // At most four source tiles overlap one window, so at most four
+    // regions can fail; the `Vec` never grows past that.
+    let mut unread: Vec<UnreadRegion> = Vec::new();
 
     for tile_y in [
         window_y.div_euclid(tile_size),
@@ -6656,17 +6856,30 @@ fn read_layer_window(
                     // unless somebody upstream is told. See
                     // `CompositeBudget::note_store_error`.
                     budget.note_store_error(&err);
+                    // Recorded per *region*, not merely per window, so
+                    // `apply_mask` can force the fail-open default on
+                    // exactly the texels this failed read covers and
+                    // leave the rest of the window alone. Charged
+                    // whatever `kind` is; only `apply_mask` reads it.
+                    unread.push(UnreadRegion {
+                        col_start: (col_lo - window_x) as usize,
+                        col_end: (col_hi - window_x) as usize,
+                        row_start: (row_lo - window_y) as usize,
+                        row_end: (row_hi - window_y) as usize,
+                    });
                     // Gated for the same reason as `resolve_tile`'s own
-                    // sibling warning, and doubly so here: a moved
-                    // layer's window reads up to four source tiles per
-                    // composite tile, so one broken file is up to four
-                    // log lines per tile per frame.
+                    // sibling warning, and doubly so here: a window
+                    // reads up to four source tiles per composite tile,
+                    // so one broken file is up to four log lines per
+                    // tile per frame.
                     if budget.should_report() {
                         tracing::warn!(
                             ?err,
                             tile_x = tile_col,
                             tile_y = tile_row,
-                            "skipping a moved layer's source tile for this composite tile"
+                            surface_kind = kind.as_str(),
+                            "{}",
+                            kind.skip_message()
                         );
                     }
                     continue;
@@ -6695,7 +6908,10 @@ fn read_layer_window(
             }
         }
     }
-    out
+    LayerWindow {
+        texels: out,
+        unread,
+    }
 }
 
 /// Composites every visible pixel layer in `layers` across the whole
@@ -16720,6 +16936,245 @@ mod tests {
                     "coverage 0.0 must zero all four channels, not just alpha"
                 );
             }
+        }
+    }
+
+    /// Builds a store whose one mask-coverage tile is genuinely
+    /// unreadable, and returns it alongside the surface that tile is on.
+    ///
+    /// The corruption is real, not mocked, and follows
+    /// `composite_document_refuses_to_export_when_a_layer_tile_cannot_be_read`'s
+    /// own recipe: a budget-of-1 store, a mask tile painted and then
+    /// evicted to the scratch directory by the next surface touched,
+    /// `flush` to make that write real, and the file truncated the way a
+    /// crash mid-write or a full disk leaves it. Since 0.52.2 a failed
+    /// page-in does not heal into a blank tile, so every later read of
+    /// that tile fails too — which is what lets one fixture serve both
+    /// halves of the test below.
+    ///
+    /// The mask is painted to coverage `0.0` everywhere on purpose: if
+    /// the read ever *did* succeed, the layer would be fully hidden, so
+    /// a "layer is visible" assertion cannot pass by accidentally
+    /// reading real data.
+    fn store_with_an_unreadable_mask_tile() -> (
+        tempfile::TempDir,
+        aurora_tile::TileStore,
+        aurora_tile::SurfaceId,
+    ) {
+        let Ok(dir) = tempfile::tempdir() else {
+            unreachable!("a scratch directory is always creatable in a real test environment");
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(1) else {
+            unreachable!("1 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("a freshly created tempdir must be usable: {err:?}"),
+        };
+
+        let mask_surface = aurora_tile::SurfaceId::from_raw(0x11 | aurora_doc::MASK_SURFACE_BIT);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let side = aurora_tile::TILE as usize;
+        for y in 0..side {
+            for x in 0..side {
+                if let Err(err) =
+                    aurora_doc::write_mask_coverage(&mut store, mask_surface, tile, x, y, 0.0)
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+        // One resident tile at a time, so touching any other surface
+        // evicts the mask tile to disk.
+        fill_solid(
+            &mut store,
+            aurora_tile::SurfaceId::from_raw(0x11),
+            tile,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        let mut scratch_files: Vec<std::path::PathBuf> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            unreachable!("the scratch directory must be readable");
+        };
+        for entry in entries.flatten() {
+            if is_tile_file(&entry.path()) {
+                scratch_files.push(entry.path());
+            }
+        }
+        assert_eq!(
+            scratch_files.len(),
+            1,
+            "exactly the mask tile should have been evicted: {scratch_files:?}"
+        );
+        let Some(victim) = scratch_files.first() else {
+            unreachable!("just asserted there is exactly one");
+        };
+        let Ok(bytes) = std::fs::read(victim) else {
+            unreachable!("the evicted tile file must be readable");
+        };
+        let Some(truncated) = bytes.get(..bytes.len() / 2) else {
+            unreachable!("half of a slice's own length is always in range");
+        };
+        if let Err(err) = std::fs::write(victim, truncated) {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+
+        (dir, store, mask_surface)
+    }
+
+    #[test]
+    // The regression this whole `LayerWindow`/`was_read` machinery
+    // exists for. `apply_mask`'s contract says every degenerate case
+    // fails *open* -- a mask that cannot be read must never silently
+    // erase a layer -- and until 0.70.2 that held only while
+    // `mask.inverted` was false. The fail-open `1.0` was substituted
+    // into the *raw* coverage and then inverted like any real value, so
+    // `1.0 - 1.0 = 0.0` erased the layer exactly where the read had
+    // failed: fail-closed, on the one path the doc comment singled out
+    // as impossible.
+    //
+    // Both directions are asserted from one genuinely corrupt tile, so
+    // neither half can pass by mocking an error that the real store
+    // would not produce. The non-inverted half is the case the original
+    // suite already covered; it is kept here so a future change cannot
+    // fix one direction by breaking the other.
+    fn apply_mask_fails_open_on_an_unreadable_mask_tile_whether_or_not_inverted() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        let layers = aurora_doc::LayerTree::new();
+
+        for inverted in [false, true] {
+            let (_dir, mut store, mask_surface) = store_with_an_unreadable_mask_tile();
+            let mut mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+            mask.inverted = inverted;
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let masked = apply_mask(
+                &texels,
+                &mask,
+                Some(mask_surface),
+                &mut store,
+                (0, 0),
+                &mut budget,
+            );
+
+            assert!(
+                budget.store_error().is_some(),
+                "inverted={inverted}: the fixture's tile must really have failed to read, \
+                 or this test proves nothing"
+            );
+            for chunk in masked.chunks_exact(aurora_tile::CHANNELS) {
+                let [r, g, b, a] = chunk else {
+                    unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+                };
+                assert_eq!(
+                    (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                    (1.0, 1.0, 1.0, 1.0),
+                    "inverted={inverted}: an unreadable mask tile must leave the layer \
+                     fully visible, not erase it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    // The counterpart that keeps the fix from being a blanket "inverted
+    // masks always show everything": a mask surface that was read
+    // successfully and has simply never been painted still inverts
+    // normally, hiding the layer. The difference between this and the
+    // test above is entirely whether the read succeeded -- the buffer
+    // contents are identical zeros either way, which is exactly why the
+    // "could not be read" signal has to travel beside them.
+    fn apply_mask_inverted_over_a_readable_unpainted_mask_surface_still_hides_the_layer() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1.0]);
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let mut mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+        mask.inverted = true;
+        let surface = aurora_tile::SurfaceId::from_raw(0x12 | aurora_doc::MASK_SURFACE_BIT);
+
+        let masked = apply_mask(
+            &texels,
+            &mask,
+            Some(surface),
+            &mut store,
+            (0, 0),
+            &mut budget,
+        );
+
+        assert!(
+            budget.store_error().is_none(),
+            "an untouched surface reads cleanly -- nothing failed here"
+        );
+        for chunk in masked.chunks_exact(aurora_tile::CHANNELS) {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            assert_eq!(
+                (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                (0.0, 0.0, 0.0, 0.0),
+                "an inverted mask over never-painted coverage hides the layer"
+            );
+        }
+    }
+
+    #[test]
+    // The `(r, g, b, 0)` shape `apply_mask`'s own output convention
+    // forbids, at the one input that used to produce it: coverage and
+    // source alpha both small enough that their product underflows to
+    // `f16` zero, while the colour channels are large and were copied
+    // through before anything checked the alpha. `f16`'s smallest
+    // subnormal is about 6e-8, so 1e-4 * 1e-4 = 1e-8 rounds to zero.
+    fn apply_mask_zeroes_the_whole_texel_when_the_scaled_alpha_underflows_to_f16_zero() {
+        let texels = solid_tile_buffer([1.0, 1.0, 1.0, 1e-4]);
+        let mask = rect_mask(0, 0, aurora_tile::TILE, aurora_tile::TILE);
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(0x13 | aurora_doc::MASK_SURFACE_BIT);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let side = aurora_tile::TILE as usize;
+        for y in 0..side {
+            for x in 0..side {
+                if let Err(err) =
+                    aurora_doc::write_mask_coverage(&mut store, surface, tile, x, y, 1e-4)
+                {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+        // The premise, asserted rather than assumed: coverage really is
+        // above zero (so the texel takes the "shown" branch) and the
+        // product really does underflow.
+        let coverage = half::f16::from_f32(1e-4).to_f32();
+        assert!(coverage > 0.0);
+        let alpha = half::f16::from_f32(1e-4).to_f32();
+        assert!(
+            half::f16::from_f32(alpha * coverage).to_f32().abs() <= 0.0,
+            "this test's premise is that the scaled alpha underflows"
+        );
+
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let masked = apply_mask(
+            &texels,
+            &mask,
+            Some(surface),
+            &mut store,
+            (0, 0),
+            &mut budget,
+        );
+
+        for chunk in masked.chunks_exact(aurora_tile::CHANNELS) {
+            let [r, g, b, a] = chunk else {
+                unreachable!("CHANNELS-sized chunks always destructure to 4 elements");
+            };
+            assert_eq!(
+                (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()),
+                (0.0, 0.0, 0.0, 0.0),
+                "an alpha that underflows to f16 zero must not keep its colour"
+            );
         }
     }
 
