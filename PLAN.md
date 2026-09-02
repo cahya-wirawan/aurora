@@ -13732,9 +13732,12 @@ severity choice.
   **Deliberately out of scope, named rather than dropped**: (1) a
   brush/tool UI for painting a mask — `write_mask_coverage` is the API
   such a tool would call, and today only tests call it; (2) `.aur`
-  persistence of mask pixels — `aurora-io` does not yet enumerate mask
-  surfaces, so painted coverage does not survive save/load (the format
-  itself needs no change; the code that walks surfaces does); (3)
+  persistence of mask pixels — **closed 2026-09-02 (0.71.0), see the
+  next bullet**; it was named here as "`aurora-io` does not yet
+  enumerate mask surfaces, so painted coverage does not survive
+  save/load (the format itself needs no change; the code that walks
+  surfaces does)", and that prediction held exactly: no manifest field
+  and no `MANIFEST_VERSION` bump were needed; (3)
   mask-pixel undo/history — mask writes go through no `History`
   operation, so painting a mask would not be undoable; (4) **mask-
   surface lifecycle cleanup, named in review and added 0.70.4** —
@@ -13743,9 +13746,10 @@ severity choice.
   painted coverage, *shifted* by the delta between the old and new
   `bounds` origins (there is no `set_mask_bounds`, so this is worse
   than merely stale); a deleted layer's mask tiles leak the same way
-  its pixel tiles already do. All four are named in `aurora_doc::mask`'s
-  own module doc comment, `LayerMask`'s, `apply_mask`'s, and
-  `resolve_tile`'s.
+  its pixel tiles already do. All four were named in
+  `aurora_doc::mask`'s own module doc comment, `LayerMask`'s,
+  `apply_mask`'s, and `resolve_tile`'s; now that 0.71.0 has closed (2),
+  those doc comments name the remaining three.
 
   **Review found three real defects, all fixed by 0.70.4**: a
   cross-layer `SurfaceId` collision reachable through a crafted/
@@ -13781,6 +13785,134 @@ severity choice.
   in, per CLAUDE.md. **No GPU or interactive verification** — this is a
   CPU/data-model change, but CLAUDE.md's own rule applies: a green test
   run is not evidence about how a mask looks on real hardware.
+
+- [x] **`.aur` persistence of real mask coverage — done 2026-09-02
+  (0.71.0), closing follow-on (2) of the four the 0.70.0 mask round
+  named.** Painted mask coverage now survives a save/load round trip.
+  Before this, `aurora-io`'s writer and reader each walked only a
+  layer's own pixel surface (`layers.surface_id(id)`), never its mask
+  surface, so every mask tile a user could paint was silently dropped
+  on save — the exact shape of failure FR-001 calls the worst this
+  project can have, just aimed at mask pixels rather than at a PSD.
+
+  **One enumerator, so the two halves cannot disagree.** The change is
+  confined to `crates/aurora-io/src/aur.rs` (plus doc-only edits in
+  `aurora-doc`). A new `persisted_surfaces(&LayerTree) -> Vec<(SurfaceId,
+  Rect)>` is now the single place that decides what the format holds:
+  for every layer the existing iterative, cycle-budgeted `layer_ids`
+  walk yields, it emits that layer's content surface paired with its
+  own `bounds`, *and* — when the layer has a mask — its
+  `mask_surface_id` paired with the **mask's** `bounds`. The writer and
+  the reader both iterate it, so neither can grow a surface the other
+  does not know about. The old pixel-only `pixel_layer_ids` helper is
+  gone; nothing else used it.
+
+  **No format change, and deliberately no `MANIFEST_VERSION` bump.**
+  The manifest never stored tile ownership: entries are named
+  `tiles/<surface>/<x>_<y>.tile`, and the reader *derives* the surface
+  it expects per layer and probes by name, treating `FileNotFound` as
+  "blank". Masks slot into exactly that mechanism. A version bump would
+  have hard-rejected every existing `.aur` file and every autosave on
+  disk (`read` refuses any version mismatch outright) in exchange for
+  nothing. An old file simply carries no mask entries, so every mask in
+  it reads back as coverage `1.0` — fully visible, exactly how it
+  composited before — which is `aurora_doc::mask`'s alpha-as-presence
+  convention doing the work it was designed for, asserted by
+  `reads_a_container_written_before_mask_persistence_as_fully_visible_coverage`.
+
+  **Persistence is not gated on `mask.enabled`.** `enabled` is a UI
+  toggle (shift-click a thumbnail); skipping disabled masks would mean
+  toggling one off and saving destroys the painted pixels
+  irrecoverably. `inverted` is composite-time-only and irrelevant to
+  storage. Group masks persist too — `mask_surface_id` returns `Some`
+  for a group, and a group's mask is the only thing it can contribute
+  to the archive at all.
+
+  **A load-bearing hardening gap this round had to close, found in
+  planning rather than by a test.** `validate_mask_origins` (now
+  `validate_mask_rects`) checked a mask's *origin* only, and its own doc
+  comment said the extent check was deliberately deferred and to
+  "revisit the moment mask surfaces are written into the archive" —
+  this was that moment. `LayerTree::add_mask` bounds a mask's origin but
+  never its extent, so once a mask rectangle drives a real tile grid, a
+  crafted manifest declaring a `u32::MAX`-wide mask is an unfinishable
+  loop (~2.8e14 iterations) on `aurora-app`'s own pre-window startup
+  path — the same defect `tile_grid` already closed for layer bounds,
+  reopened through a different rectangle. The validator now runs the
+  whole of `tile_grid` over every mask, extent included, still hoisted
+  ahead of the first written byte and the first probe so a refusal
+  leaves no half-built container. It is reachable from a live session
+  too, not only from a file, because `add_mask` does not bound one —
+  hence the write-side test as well as the read-side one.
+
+  **The whole-document tile budget widened to `2 * side * side`** ("one
+  layer at the documented ceiling, plus its own mask"). Not slack: a
+  masked layer now contributes two grids, so a single *legal*
+  ceiling-sized layer carrying a full-canvas mask would have been
+  refused by a budget sized for one grid — a real document rejected by
+  a check meant for crafted ones. Two is the exact factor, since a
+  layer carries at most one mask. Mask grids are charged against that
+  budget from inside the same unified loop layer grids are, so a
+  manifest cannot stay under it on layers alone and then overrun it in
+  mask rectangles.
+
+  **The real cost, named rather than glossed**: a masked layer's tile
+  range is walked **twice** now, once per surface, at two possibly
+  different origins. The writer offsets part of that with a
+  `TileStore::contains_tile` check before each `store.get` — behaviour
+  is identical (a never-touched tile was already skipped once
+  materialized and found all-zero), it just stops paying to materialize
+  a blank tile in order to throw it away, which matters most for
+  masks, since *every* mask surface in every document today is
+  unpainted. `tracing::warn!` on a skipped tile now also records
+  whether the surface is a mask surface (`MASK_SURFACE_BIT`), so the
+  two losses are distinguishable in a log.
+
+  **Tests**: 10 new in `aur.rs`, all in its existing fixture idioms —
+  `round_trips_real_mask_coverage_painted_at_the_masks_own_origin` (the
+  headline: mask origin `(500, 300)` against a layer at `(0, 0)`,
+  spanning two tiles, with one texel painted to coverage **exactly
+  `0.0`** — the only value that tells "really persisted" apart from
+  "silently defaulted to `1.0`" — plus an unpainted neighbour still
+  reading `1.0` and the entries provably written under the mask
+  surface, not the layer's),
+  `round_trips_mask_coverage_on_a_group_which_has_no_pixel_surface`,
+  `round_trips_mask_coverage_of_a_disabled_mask`,
+  `reads_a_container_written_before_mask_persistence_as_fully_visible_coverage`,
+  `write_skips_a_never_painted_mask_surface_entirely` (zero bytes for
+  masks nobody painted, while the layer's own painted tile is still
+  written),
+  `read_rejects_a_manifest_whose_mask_extent_is_past_the_document_ceiling`
+  (pixel layer and group, both in bounded time),
+  `write_and_best_effort_write_both_refuse_a_mask_extent_past_the_document_ceiling`
+  (and leave no partial container),
+  `the_whole_document_tile_budget_is_one_ceiling_layer_plus_its_own_mask`,
+  `read_rejects_a_manifest_whose_layers_and_masks_together_exceed_the_tile_budget`
+  (tiny layers, ceiling-sized masks — the masks are what overruns it),
+  and
+  `best_effort_write_skips_an_unreadable_mask_tile_while_write_still_refuses`
+  (the refuse-vs-degrade split applied to mask tiles, using the same
+  evict-flush-truncate technique its pixel-tile twin uses; the salvaged
+  file's lost mask reads back fully visible rather than hiding a
+  layer). The five round-trip/budget assertions were checked to be
+  non-vacuous by removing the enumerator's mask arm: exactly those five
+  fail, the rest stay green.
+
+  **Exercised by tests only, and that is not a hedge.** Nothing in the
+  app paints mask coverage yet — follow-on (1), the brush/tool UI, is
+  still open — so this has never run end to end through the editor, and
+  no `aurora-app`, `aurora-ui`, or `aurora-brush` code changed. It was
+  built now rather than deferred because the alternative is a format
+  that silently drops content the moment that tool lands.
+
+  **Verified**: `cargo fmt --all --check`, `check_layering.py`,
+  `check_no_hardcoded_style.py`, `cargo check --workspace --locked`,
+  `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`, `cargo test --workspace`, `cargo test --workspace --doc`,
+  and `cargo doc --workspace --no-deps --all-features` all clean
+  locally. `cargo nextest` is not installed on this box; `cargo test
+  --workspace` stood in, per CLAUDE.md. No GPU or interactive
+  verification, and none is claimed.
 
 ### M1.10 — Phase 1 gate
 
@@ -14141,6 +14273,35 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-02 (0.71.0) — painted mask coverage now survives a
+`.aur` save/load round trip.** Follow-on (2) of the four 0.70.0 named
+is closed. `aurora-io`'s writer and reader each walked only a layer's
+own pixel surface, so mask pixels were silently dropped on save; both
+now iterate one shared `persisted_surfaces` enumerator that yields a
+layer's content surface *and* its mask surface, the latter addressed
+against the **mask's** own `bounds` rather than the layer's. No
+manifest field and **no `MANIFEST_VERSION` bump** — the format never
+stored tile ownership, so masks slot into the existing derive-the-name-
+and-probe mechanism, and every existing `.aur` file and autosave keeps
+opening with its masks reading back fully visible. Persistence is
+**not** gated on `mask.enabled` (that flag is a UI toggle; gating on it
+would make switching a mask off and saving destroy the painted pixels),
+and group masks persist too. Planning also found a real hardening gap
+this round had to close rather than could skip: a mask's *extent* had
+never been validated — deliberately, since nothing looped over it — and
+`add_mask` does not bound one, so the moment a mask rectangle drives a
+tile grid, a crafted `u32::MAX` mask becomes an unfinishable loop on
+the pre-window startup path; `validate_mask_rects` now runs the full
+`tile_grid` check over every mask, and the whole-document tile budget
+widened to `2 * side * side` so a legal ceiling-sized layer carrying a
+full-canvas mask is not refused. 10 new tests, 5 of them verified
+non-vacuous by removing the enumerator's mask arm. **No `aurora-app`,
+`aurora-ui`, or `aurora-brush` changes, and this is exercised by tests
+only** — nothing in the app paints mask coverage yet (follow-on (1),
+the brush/tool UI, is still open), so it has never run end to end
+through the editor. See M1.9's own "`.aur` persistence of real mask
+coverage" bullet for the full record.
 
 **Addendum 2026-09-02 (0.70.0) — layer masks now carry real per-pixel
 grayscale coverage.** The "rectangular clip only" limitation that
@@ -15424,13 +15585,16 @@ tooling-gated, fall into one of four buckets:
    pixel storage. **The mask half is now partly done (0.70.0)**: ADR
    0010's pattern was applied — coverage lives on its own surface in
    the shared `TileStore`, and `resolve_tile` composites it for real,
-   feathering and all. Four slices of it are still open and named as
-   such: a brush/tool UI for painting a mask, `.aur` persistence of
-   mask pixels, mask-pixel undo/history, and mask-surface lifecycle
-   cleanup (a removed-then-re-added mask resurrects its old, now
+   feathering and all, and **`.aur` persistence landed in 0.71.0**, so
+   painted coverage survives save/load. Three slices of it are still
+   open and named as such: a brush/tool UI for painting a mask,
+   mask-pixel undo/history, and mask-surface lifecycle cleanup (a
+   removed-then-re-added mask resurrects its old, now
    spatially-shifted coverage; a deleted layer's mask tiles leak the
-   same way its pixel tiles already do) — the fourth named in 0.70.4
-   after review found it undisclosed. Asked Cahya which of these two to
+   same way its pixel tiles already do) — the last named in 0.70.4
+   after review found it undisclosed. The first is what still keeps
+   every other slice, persistence included, from ever running end to
+   end through the editor. Asked Cahya which of these two to
    pick up next (2026-08-12); answer was to pause rather than commit to
    either without more review first — see the session's own record for
    the exact framing offered.

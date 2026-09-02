@@ -56,10 +56,16 @@
 //! when a mask happens to sit at the same place as its layer, which is
 //! not guaranteed. `write_mask_coverage` takes a bare `TileId` plus a
 //! tile-local `(column, row)` and has no way to check which frame the
-//! caller meant; the current, sole caller
-//! (`aurora-app`'s `apply_mask`) gets this right by construction,
-//! reading through the same window it built from `mask.bounds`'s own
-//! `(x, y)`. **A future caller — the brush/tool UI in follow-on 1 below
+//! caller meant; both real callers today get this right by
+//! construction, and for the same reason — each derives its tile
+//! addressing from `mask.bounds` itself rather than from some other
+//! frame. `aurora-app`'s `apply_mask` reads through the window it built
+//! from `mask.bounds`'s own `(x, y)`; `aurora-io`'s `.aur`
+//! writer/reader (0.71.0, `persisted_surfaces`) derives a mask
+//! surface's whole persisted tile grid from `mask.bounds`'s own extent
+//! at that same origin, which is what lets a mask sitting somewhere
+//! other than its layer round-trip through a save at all. **A future
+//! caller — the brush/tool UI in follow-on 1 below
 //! — must convert a document-space paint stroke into `mask.bounds`-
 //! relative tile coordinates before calling [`write_mask_coverage`], or
 //! painted coverage will be shifted by exactly the offset between the
@@ -73,23 +79,26 @@
 //!
 //! # Deliberately not built this round
 //!
-//! Four follow-ons are named rather than silently dropped, because
-//! each is a task-sized piece of work in a different part of the stack:
+//! Three follow-ons are named rather than silently dropped, because
+//! each is a task-sized piece of work in a different part of the stack.
+//! (A fourth, `.aur` persistence of mask pixels, is **built** as of
+//! 0.71.0: `aurora-io`'s own `persisted_surfaces` enumerates mask
+//! surfaces alongside layer content surfaces, so painted coverage now
+//! survives save/load — including on a group, and including a mask
+//! whose `enabled` toggle is off. Nothing about the format had to
+//! change, exactly as predicted above; only the code that walks
+//! surfaces did.)
 //!
 //! 1. **A brush/tool UI for painting a mask.** Nothing in the app
 //!    currently *writes* mask coverage — [`write_mask_coverage`] is the
 //!    API a future mask-painting tool calls, and today only tests do.
-//! 2. **`.aur` persistence of mask pixels.** `aurora-io` writes a
-//!    layer's own pixel surfaces into the archive; mask surfaces are
-//!    not yet enumerated there, so painted mask coverage does not
-//!    survive save/load. Nothing about the format has to change to
-//!    support it (a mask surface is an ordinary surface), but the code
-//!    that walks surfaces does.
-//! 3. **Mask-pixel undo/history.** `aurora_doc::History` records
+//!    This is also why the persistence above, though real and tested,
+//!    has never run end to end through the editor.
+//! 2. **Mask-pixel undo/history.** `aurora_doc::History` records
 //!    reversible operations plus dirtied tiles (§7.3.3); mask writes go
 //!    through no history operation at all yet, so painting a mask would
 //!    not be undoable.
-//! 4. **Mask-surface lifecycle: nothing clears mask tiles.** A mask
+//! 3. **Mask-surface lifecycle: nothing clears mask tiles.** A mask
 //!    surface id is *derived* from its layer's id, not allocated, and
 //!    that has a consequence nothing currently handles. Two shapes,
 //!    both harmless today (no mask coverage is ever painted yet) and

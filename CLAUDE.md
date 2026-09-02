@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**A real, running editor — Phase 1 in progress.** As of `0.70.4`: roughly 82,000 lines across 20 crates, 1,359 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
+**A real, running editor — Phase 1 in progress.** As of `0.71.0`: roughly 82,800 lines across 20 crates, 1,369 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
 
 Five crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-text`, `aurora-filters`, `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. Everything else is real code.
 
@@ -12,7 +12,7 @@ Five crates are still skeletons holding only a placeholder `crate_name()` and on
 
 ### What is not done
 
-- **M1.10, the Phase 1 gate, is what is actually open.** Its remaining items are hardware-gated (below), design-owner-gated (which gallery component to build next is Cahya's call, not an engineering one), tooling-gated (the PSD spike needs `psd-tools` as an independent reader), or genuinely large multi-round work (all 26 blend-mode formulas ported to WGSL). Mask *coverage* is real per-pixel grayscale as of 0.70.0; what is still missing there is a brush/tool UI for painting a mask, `.aur` persistence of mask pixels, mask-pixel undo/history, and mask-surface lifecycle cleanup (a removed-then-re-added mask resurrects stale, spatially-shifted coverage; a deleted layer's mask tiles leak like its pixel tiles already do) — see PLAN.md's M1.9 mask entry for the full account.
+- **M1.10, the Phase 1 gate, is what is actually open.** Its remaining items are hardware-gated (below), design-owner-gated (which gallery component to build next is Cahya's call, not an engineering one), tooling-gated (the PSD spike needs `psd-tools` as an independent reader), or genuinely large multi-round work (all 26 blend-mode formulas ported to WGSL). Mask *coverage* is real per-pixel grayscale as of 0.70.0 and survives a `.aur` save/load round trip as of 0.71.0; what is still missing there is a brush/tool UI for painting a mask, mask-pixel undo/history, and mask-surface lifecycle cleanup (a removed-then-re-added mask resurrects stale, spatially-shifted coverage; a deleted layer's mask tiles leak like its pixel tiles already do) — see PLAN.md's M1.9 mask entry for the full account.
 - **Phase 0 has a tail.** Windows/DX12 validation, the Linux and Windows human legs of the accessibility/IME checklist, and macOS/Windows LGPL packaging all need hardware and a human.
 - **[ADR 0001](docs/adr/0001-custom-wgpu-ui.md) is still not de-risked** — the project's most durable open risk. macOS accessibility passes 9/10 ([spike/a11y-ime/FINDINGS.md](spike/a11y-ime/FINDINGS.md)); Linux (AT-SPI) and Windows (UIA) are entirely unverified, and each is a different platform API. Cahya accepted this as a risk rather than a blocker for starting Phase 1 (2026-07-28). It remains the one open item that could overturn the custom-`wgpu`-UI decision.
 - **60 FPS is measured and failing** — see "Measured, not assumed" below.
@@ -130,7 +130,7 @@ The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `
 
 ## Versioning
 
-SemVer, started at `0.0.1`, currently `0.70.4`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
+SemVer, started at `0.0.1`, currently `0.71.0`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
 
 - **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
 - **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.

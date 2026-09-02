@@ -17,23 +17,55 @@
 //!   finally gives the crash-recovery journal (deferred since M1.4/M1.8)
 //!   a real, permanent home, not just the temp-dir autosave file
 //!   `aurora-app` writes today.
-//! - One entry per non-blank pixel-layer tile, named by `tile_entry_name`
-//!   from its own `(SurfaceId, TileId)` pair, holding
+//! - One entry per non-blank persisted tile — a pixel layer's own
+//!   content **and, since 0.71.0, a layer mask's coverage** — named by
+//!   `tile_entry_name` from its own `(SurfaceId, TileId)` pair, holding
 //!   `aurora_tile::codec::encode`'s own output **verbatim** — stored,
 //!   not deflated, since that output is already `lz4_flex`-compressed
 //!   and compressing compressed bytes again wastes CPU for no size
 //!   benefit.
 //!
-//! **Scope, stated honestly.** Only a pixel layer's own `bounds` extent
-//! is persisted — the same "no document-extent clamp" limitation
-//! `aurora_brush::stamp_dab`'s own doc comment already names (nothing
-//! in this pipeline clips painting to a layer's own bounds, so pixels
-//! painted past them were never on documented, reliable ground to begin
-//! with). A fully blank (all-zero) tile is skipped when writing — most
-//! of a freshly created layer's own tile range is never actually
-//! painted, and writing every one of those out would be real, avoidable
-//! file bloat; a missing tile entry on read simply leaves that tile at
-//! the store's own default (blank), not an error.
+//! **Scope, stated honestly.** Two kinds of surface are persisted, and
+//! `persisted_surfaces` is the single place that decides so: a pixel
+//! layer's own content over its `bounds` extent, and a layer's mask
+//! coverage over the *mask's* own `aurora_doc::LayerMask::bounds`
+//! extent — a different rectangle, at a possibly different origin, on a
+//! different `aurora_tile::SurfaceId`
+//! (`aurora_doc::LayerTree::mask_surface_id`). A masked layer's tile
+//! range is therefore walked **twice**, once per surface; that is the
+//! real cost of the extension, and both the whole-document tile budget
+//! (`MAX_TOTAL_TILES_PER_DOCUMENT`) and the wall clock pay it. Group
+//! masks are included too: a group has no content surface but certainly
+//! can carry a mask.
+//!
+//! Neither kind is clamped to the document's own extent — the same "no
+//! document-extent clamp" limitation `aurora_brush::stamp_dab`'s own
+//! doc comment already names (nothing in this pipeline clips painting
+//! to a layer's own bounds, so pixels painted past them were never on
+//! documented, reliable ground to begin with). A fully blank (all-zero)
+//! tile is skipped when writing, as is any tile the store has never
+//! held at all — most of a freshly created layer's own tile range is
+//! never actually painted, and *no* mask surface is painted by anything
+//! in the app today, so writing every one of those out would be real,
+//! avoidable file bloat; a missing tile entry on read simply leaves
+//! that tile at the store's own default, which for a mask means
+//! coverage `1.0`/fully visible (`aurora_doc::mask`'s
+//! alpha-as-presence-flag convention) rather than a hidden layer. That
+//! is also what makes every `.aur` file written before 0.71.0 keep
+//! opening unchanged: no mask entries, so every mask reads back fully
+//! visible, exactly as it composited then.
+//!
+//! **Nothing in the app paints mask coverage yet** — the mask brush/tool
+//! UI is still a named follow-on in `aurora_doc::mask` — so this half of
+//! the format is exercised by tests only, not end to end through the
+//! running editor. It is persisted anyway rather than deferred, because
+//! the alternative is a format that silently drops content the moment
+//! that tool lands.
+//!
+//! Persistence is **not** gated on `aurora_doc::LayerMask::enabled`:
+//! that flag is a UI toggle, and skipping disabled masks would mean
+//! switching one off and saving destroys the painted pixels
+//! irrecoverably.
 //!
 //! **Reading is hardened against a hostile or corrupt container**
 //! (2026-08-24). [`read`] runs on `aurora-app`'s own pre-window startup
@@ -58,14 +90,26 @@
 //! origin stays legal; a layer may sit off the canvas edge.
 //!
 //! **A layer's `bounds` is not the only `Rect` a manifest carries**
-//! (0.57.13). A `LayerMask` has one of its own, and `tile_grid` cannot
-//! see it — it is only ever called on a `LayerKind::Pixel` arm's own
-//! `bounds`, so a mask's rectangle went unchecked, and a *group*, which
-//! can carry a mask but has no `bounds`, never reached `tile_grid` at
-//! all. `validate_mask_origins` closes both, from [`read`] and from the
-//! shared body behind [`write()`] and [`write_best_effort`]. It is the
-//! same failure class and reuses [`IoError::LayerOriginOutOfRange`]
+//! (0.57.13). A `LayerMask` has one of its own, and `tile_grid` could
+//! not see it then — it was only ever called on a `LayerKind::Pixel`
+//! arm's own `bounds`, so a mask's rectangle went unchecked, and a
+//! *group*, which can carry a mask but has no `bounds`, never reached
+//! `tile_grid` at all. `validate_mask_rects` closes both, from [`read`]
+//! and from the shared body behind [`write()`] and
+//! [`write_best_effort`], reusing [`IoError::LayerOriginOutOfRange`]
 //! rather than adding a variant.
+//!
+//! That walk checked only a mask's *origin* until 0.71.0, and said so:
+//! no loop here was derived from a mask's extent, so an oversized one
+//! had nothing to make unfinishable. Persisting mask coverage changed
+//! exactly that — a mask rectangle now drives a real tile grid in both
+//! directions, and `aurora_doc::LayerTree::add_mask` bounds a mask's
+//! origin but never its extent — so `validate_mask_rects` now runs the
+//! whole of `tile_grid` over every mask, extent
+//! ([`IoError::LayerBoundsTooLarge`]) included. Without it a crafted
+//! manifest declaring a `u32::MAX`-wide mask would hang
+//! `aurora-app`'s own pre-window startup path, which is the same defect
+//! the layer-bounds check already closed.
 //!
 //! **A second hardening pass** (also 2026-08-24) closed three more holes
 //! an independent review found in that same untrusted path: the
@@ -147,7 +191,9 @@ const MAX_METADATA_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TILE_ENTRY_BYTES: u64 = (aurora_tile::SAMPLES as u64) * 2 + 64 * 1024;
 
 /// The most tiles [`read`]'s own tile scan will visit across *all* of a
-/// manifest's pixel layers put together.
+/// manifest's persisted surfaces put together — every pixel layer's own
+/// grid *and* every mask's, since 0.71.0 charges both against this one
+/// budget ([`persisted_surfaces`]).
 ///
 /// `tile_grid` already refuses any single layer larger than the document
 /// ceiling, but nothing bounds how many layers a manifest may declare —
@@ -160,15 +206,22 @@ const MAX_TILE_ENTRY_BYTES: u64 = (aurora_tile::SAMPLES as u64) * 2 + 64 * 1024;
 /// kilobyte-scale file able to spin for hours on `aurora-app`'s own
 /// pre-window startup path.
 ///
-/// The budget is exactly *one* layer at the documented ceiling: the
-/// largest single document PRD §7.3.1 says can exist still loads
-/// untouched, while a manifest that only reaches a bigger number by
-/// stacking many large layers is refused. It is expressed in terms of
-/// the ceiling and the tile size rather than a bare literal, so it
-/// follows either if they ever change.
+/// The budget is exactly *one layer at the documented ceiling, plus its
+/// own mask*: the largest single document PRD §7.3.1 says can exist
+/// still loads untouched — mask included — while a manifest that only
+/// reaches a bigger number by stacking many large layers is refused. It
+/// is expressed in terms of the ceiling and the tile size rather than a
+/// bare literal, so it follows either if they ever change.
+///
+/// The `2 *` arrived with mask persistence (0.71.0) and is a widening,
+/// not slack: a mask's grid is now walked alongside its layer's, so a
+/// single *legal* ceiling-sized layer carrying a full-canvas mask would
+/// otherwise be refused as over budget — a real document rejected by a
+/// check meant for crafted ones. Two is the exact factor, because a
+/// layer can carry at most one mask.
 const MAX_TOTAL_TILES_PER_DOCUMENT: u64 = {
     let side = (aurora_core::MAX_DOCUMENT_EXTENT as u64).div_ceil(TILE as u64);
-    side * side
+    2 * side * side
 };
 
 /// One entry's whole contents, refusing anything past `cap` — see
@@ -238,11 +291,14 @@ fn read_capped(mut file: zip::read::ZipFile<'_>, name: &str, cap: u64) -> Result
 /// through this one function, so one check covers every path in and
 /// out of the format.
 ///
-/// What this function cannot cover, and so does not claim to: a
-/// *mask*'s own rectangle. `bounds` here is always a
-/// `LayerKind::Pixel` arm's, so a mask never arrives, and a group
-/// never calls this at all. [`validate_mask_origins`] is the walk that
-/// covers those, from the same two entry points.
+/// **`bounds` is no longer always a layer's own** (0.71.0). Now that
+/// mask coverage is persisted, [`persisted_surfaces`] yields a *mask*'s
+/// own `aurora_doc::LayerMask` rectangle here too — including a
+/// group's, which has no `bounds` of its own — so this function has
+/// become the single check for every rectangle that drives a tile loop
+/// in this module. [`validate_mask_rects`] still exists and still runs
+/// the mask half *up front*, before a single byte is written or a
+/// single grid position is probed.
 ///
 /// Clamping to the ceilings the format already documents bounds the
 /// worst case without newly restricting any legitimate document.
@@ -310,7 +366,9 @@ enum ColorSpaceTag {
 
 /// Writes a complete `.aur` document to `writer`: `layers`/`history`'s
 /// own current state, tagged with `canvas_size`, plus every non-blank
-/// pixel-layer tile currently in `store`. `writer` is generic over
+/// tile currently in `store` on a surface this format persists — every
+/// pixel layer's own content *and* every layer mask's coverage, enabled
+/// or not (`persisted_surfaces`). `writer` is generic over
 /// `Write + Seek` (a real `std::fs::File`, or an in-memory
 /// `std::io::Cursor<Vec<u8>>` for round-trip testing) rather than a
 /// path, so the caller decides how (and whether) to stage/verify the
@@ -331,11 +389,14 @@ enum ColorSpaceTag {
 /// not expected in practice), [`IoError::Doc`] if `history.save_journal`
 /// fails, [`IoError::Color`] if `profile.to_bytes()` fails,
 /// [`IoError::LayerBoundsTooLarge`]/[`IoError::LayerOriginOutOfRange`]
-/// if some layer's own bounds are past the document ceiling in extent
-/// or origin, or some layer's *mask* origin is (`tile_grid` and
-/// `validate_mask_origins` are both shared with [`read`], so the same
-/// checks apply on the way out as on the way in), or [`IoError::Tile`]
-/// if paging a touched tile in from the scratch disk fails.
+/// if some layer's own bounds — **or some layer's mask rectangle** —
+/// are past the document ceiling in extent or origin (`tile_grid` and
+/// `validate_mask_rects` are both shared with [`read`], so the same
+/// checks apply on the way out as on the way in; a mask's *extent* is
+/// checked here too as of 0.71.0, since `add_mask` itself does not
+/// bound one and a mask now drives a real tile grid), or
+/// [`IoError::Tile`] if paging a touched tile in from the scratch disk
+/// fails.
 ///
 /// That last one aborts the whole write, deliberately: an explicit save
 /// must refuse rather than quietly produce a document with content
@@ -461,7 +522,7 @@ fn write_with_policy<W: Write + Seek>(
     // half-built container behind. `tile_grid`'s own bounds check
     // cannot be hoisted the same way (it is what derives the grid the
     // tile loop walks), but a mask check has no such tie.
-    validate_mask_origins(layers)?;
+    validate_mask_rects(layers)?;
 
     let mut skipped: Vec<SkippedTile> = Vec::new();
     let mut zip = ZipWriter::new(writer);
@@ -491,17 +552,22 @@ fn write_with_policy<W: Write + Seek>(
     zip.start_file(HISTORY_ENTRY, deflated)?;
     zip.write_all(&history_bytes)?;
 
-    for id in pixel_layer_ids(layers) {
-        let Some(LayerKind::Pixel { bounds }) = layers.kind(id) else {
-            continue;
-        };
-        let Some(surface) = layers.surface_id(id) else {
-            continue;
-        };
-        let (tiles_x, tiles_y) = tile_grid(*bounds)?;
+    for (surface, bounds) in persisted_surfaces(layers) {
+        let (tiles_x, tiles_y) = tile_grid(bounds)?;
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let tile_id = TileId { x: tx, y: ty };
+                // A tile the store has never held cannot hold anything
+                // worth writing: `store.get` would materialize it as
+                // `Tile::blank()`, and the all-zero check below would
+                // then drop it again. Identical output, without paying
+                // for the materialization -- and it is a mask surface
+                // that makes this worth doing, since a mask nobody has
+                // painted is the common case for every document written
+                // today.
+                if !store.contains_tile(surface, tile_id) {
+                    continue;
+                }
                 let tile = match store.get(surface, tile_id) {
                     Ok(tile) => tile,
                     Err(err) => match unreadable {
@@ -510,6 +576,12 @@ fn write_with_policy<W: Write + Seek>(
                             tracing::warn!(
                                 ?surface,
                                 ?tile_id,
+                                // Which half of the surface id space
+                                // this is: a lost mask tile and a lost
+                                // content tile look identical in a log
+                                // otherwise, and they are different
+                                // losses to a user.
+                                mask = surface.to_raw() & aurora_doc::MASK_SURFACE_BIT != 0,
                                 %err,
                                 "leaving an unreadable tile out of a best-effort .aur write"
                             );
@@ -567,15 +639,15 @@ type AurDocument = (
 /// fails to decode, [`IoError::Color`] if an embedded ICC profile's own
 /// bytes fail to parse, [`IoError::Tile`] if a tile entry fails to
 /// decode or doesn't decode to the expected sample count,
-/// [`IoError::LayerBoundsTooLarge`] if the manifest declares a layer
-/// whose extent is past the document ceiling,
+/// [`IoError::LayerBoundsTooLarge`] if the manifest declares a layer —
+/// or a layer *mask* — whose extent is past the document ceiling,
 /// [`IoError::LayerOriginOutOfRange`] if it declares a layer — or a
 /// layer *mask* — whose *origin* is further from the document origin
 /// than that same ceiling (a negative origin is still legal — see that
 /// variant),
 /// [`IoError::CanvasTooLarge`] if it declares a *canvas* past that same
-/// ceiling, [`IoError::TooManyTiles`] if its
-/// layers together add up to more tiles than any real document has, or
+/// ceiling, [`IoError::TooManyTiles`] if its layers **and their masks**
+/// together add up to more tiles than any real document has, or
 /// [`IoError::EntryTooLarge`] if an entry holds more bytes than it
 /// legitimately could — see
 /// `tile_grid`/`read_capped`/`MAX_TOTAL_TILES_PER_DOCUMENT` for why an
@@ -619,27 +691,26 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         });
     }
 
-    // Every layer's *mask* origin, before any of them is used. The
-    // layer-bounds twin of this lives in `tile_grid` below, which
-    // cannot cover a mask -- see `validate_mask_origins`.
-    validate_mask_origins(&manifest.layers)?;
+    // Every layer's *mask* rectangle -- origin and extent both --
+    // before any of them is used to derive a grid below. Hoisted out
+    // of the tile loop deliberately: an oversized mask extent must be
+    // refused before the loop it would otherwise make unfinishable
+    // starts, not part-way through it.
+    validate_mask_rects(&manifest.layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
 
     let mut total_tiles: u64 = 0;
-    for id in pixel_layer_ids(&manifest.layers) {
-        let Some(LayerKind::Pixel { bounds }) = manifest.layers.kind(id) else {
-            continue;
-        };
-        let Some(surface) = manifest.layers.surface_id(id) else {
-            continue;
-        };
-        let (tiles_x, tiles_y) = tile_grid(*bounds)?;
+    for (surface, bounds) in persisted_surfaces(&manifest.layers) {
+        let (tiles_x, tiles_y) = tile_grid(bounds)?;
         // Charged against the whole-document budget *before* this
-        // layer's own grid is walked, so an over-budget manifest costs
+        // surface's own grid is walked, so an over-budget manifest costs
         // one addition rather than a scan -- see
-        // `MAX_TOTAL_TILES_PER_DOCUMENT`.
+        // `MAX_TOTAL_TILES_PER_DOCUMENT`. A mask grid is charged here
+        // exactly like a layer's, from inside the one unified loop:
+        // charging only layers would leave a manifest able to blow past
+        // the budget entirely in mask rectangles.
         total_tiles = total_tiles.saturating_add(u64::from(tiles_x) * u64::from(tiles_y));
         if total_tiles > MAX_TOTAL_TILES_PER_DOCUMENT {
             return Err(IoError::TooManyTiles {
@@ -714,12 +785,69 @@ fn read_entry<R: Read + Seek>(
     read_capped(file, name, MAX_METADATA_ENTRY_BYTES)
 }
 
-/// Every pixel layer in `layers`, at any nesting depth — [`write`]/
-/// [`read`]'s own shared "which layers actually have tiles to
-/// persist" walk. Order doesn't matter here (unlike
-/// `aurora_ui::layers_panel`'s own top-to-bottom paint-order
-/// convention) since this only decides which tiles to touch, not how
-/// to composite them.
+/// Every surface this format persists, paired with the rectangle its
+/// own tile grid is derived from — [`write`]/[`read`]'s **one** shared
+/// answer to "what goes in the archive", so the writer and the reader
+/// cannot disagree about it.
+///
+/// Two kinds of surface, and both are real content a user can lose:
+///
+/// - A pixel layer's own content surface (`LayerTree::surface_id`),
+///   addressed relative to that layer's own `LayerKind::Pixel` bounds.
+/// - A layer's **mask coverage** surface
+///   (`LayerTree::mask_surface_id`), addressed relative to that mask's
+///   own `aurora_doc::LayerMask::bounds` origin — *not* the layer's
+///   (`aurora_doc::mask`'s own "addressing convention" section is the
+///   normative statement of that, and this module is a real caller
+///   bound by it). A *group* has no content surface but can carry a
+///   mask, so it appears here with exactly one entry.
+///
+/// A masked pixel layer therefore contributes two entries and has its
+/// grid walked twice — once per surface, at two different origins.
+/// That is a real, named cost of persisting masks, not a free
+/// extension: both the whole-document tile budget
+/// ([`MAX_TOTAL_TILES_PER_DOCUMENT`], widened to match) and the wall
+/// clock see it.
+///
+/// Mask coverage is persisted **regardless of
+/// `aurora_doc::LayerMask::enabled`**, deliberately. `enabled` is a UI
+/// toggle (shift-click a mask thumbnail); gating persistence on it
+/// would mean switching a mask off and saving silently destroys the
+/// pixels the user painted into it, with no way back — precisely the
+/// "silently degrading a professional's file" failure CLAUDE.md names
+/// as the worst this project can have. `inverted` is a composite-time
+/// interpretation of the same pixels and likewise changes nothing about
+/// what is stored.
+///
+/// Order doesn't matter here (unlike `aurora_ui::layers_panel`'s own
+/// top-to-bottom paint-order convention) since this only decides which
+/// tiles to touch, not how to composite them.
+fn persisted_surfaces(layers: &LayerTree) -> Vec<(SurfaceId, aurora_core::Rect)> {
+    let mut surfaces = Vec::new();
+    for id in layer_ids(layers) {
+        if let Some(LayerKind::Pixel { bounds }) = layers.kind(id)
+            && let Some(surface) = layers.surface_id(id)
+        {
+            surfaces.push((surface, *bounds));
+        }
+        if let Some(mask) = layers.mask(id)
+            && let Some(surface) = layers.mask_surface_id(id)
+        {
+            surfaces.push((surface, mask.bounds));
+        }
+    }
+    surfaces
+}
+
+/// Every layer the tree holds, groups included — the shared walk
+/// [`persisted_surfaces`] and [`validate_mask_rects`] both go through.
+///
+/// Covering *groups* is the whole reason it walks everything rather
+/// than only `LayerKind::Pixel` entries. A group carries no `bounds`
+/// and has no content surface, but it can carry a mask, and that mask
+/// has both a `Rect` reaching the same downstream arithmetic a pixel
+/// layer's bounds do and (since 0.71.0) coverage tiles of its own to
+/// persist.
 ///
 /// Iterative on an explicit stack, never recursive. `LayerTree`'s own
 /// `Deserialize` already refuses a manifest whose tree isn't really a
@@ -729,23 +857,6 @@ fn read_entry<R: Read + Seek>(
 /// stack overflow is a process abort rather than an `Err` anything can
 /// report. `budget` bounds the walk at one visit per layer the tree
 /// actually holds, which is all a real tree ever needs.
-fn pixel_layer_ids(layers: &LayerTree) -> Vec<LayerId> {
-    layer_ids(layers)
-        .into_iter()
-        .filter(|id| matches!(layers.kind(*id), Some(LayerKind::Pixel { .. })))
-        .collect()
-}
-
-/// Every layer the tree holds, groups included, in the same order
-/// [`pixel_layer_ids`] yields its own subset — the shared walk, with
-/// the same cycle budget for the same reason (see that function's doc
-/// comment, which this one is the general case of).
-///
-/// Covering *groups* is the whole reason this exists separately.
-/// A group carries no `bounds`, so `pixel_layer_ids` skips it — but it
-/// can carry a mask, and a mask has a `Rect` of its own that reaches
-/// the same downstream arithmetic a pixel layer's bounds do. See
-/// [`validate_mask_origins`].
 ///
 /// Walking from `roots` rather than over the `layers` map reaches every
 /// entry regardless: `aurora_doc`'s own deserialize-time `validate_shape`
@@ -777,17 +888,37 @@ fn layer_ids(layers: &LayerTree) -> Vec<LayerId> {
     ids
 }
 
-/// Refuses any layer whose *mask* rectangle's origin sits further from
-/// the document origin than [`aurora_core::MAX_DOCUMENT_ORIGIN`] —
-/// [`IoError::LayerOriginOutOfRange`], the same variant `tile_grid`
-/// returns for a layer's own bounds, because it is the same failure
-/// class and a caller has no use for telling them apart.
+/// Refuses any layer whose *mask* rectangle is out of range — its
+/// origin further from the document origin than
+/// [`aurora_core::MAX_DOCUMENT_ORIGIN`]
+/// ([`IoError::LayerOriginOutOfRange`]), or its extent past
+/// [`aurora_core::MAX_DOCUMENT_EXTENT`]
+/// ([`IoError::LayerBoundsTooLarge`]). Both are the same variants
+/// `tile_grid` returns for a layer's own bounds, because they are the
+/// same failure classes and a caller has no use for telling a layer's
+/// bad rectangle from its mask's; this function is literally
+/// `tile_grid` run over every mask in the tree, with the grid it
+/// computes discarded.
 ///
-/// **This is a separate walk, and it has to be.** A mask's `Rect` is
-/// not the layer's own `bounds`: `tile_grid` is called only on a
-/// `LayerKind::Pixel` arm's `bounds`, so it never sees a mask at all,
-/// and a *group* — which can carry a mask — never reaches `tile_grid`
-/// in the first place. Until 0.57.13 a crafted manifest could therefore
+/// **The extent half is new in 0.71.0, and it is now load-bearing.**
+/// Until then this checked only the origin, and said so: a mask's
+/// extent drove no loop here, because mask surfaces were not written
+/// into the archive at all, so there was nothing an oversized one could
+/// make unfinishable. That comment ended by saying to revisit it "the
+/// moment mask surfaces are written into the archive" — this is that
+/// moment. [`persisted_surfaces`] now derives a real tile grid from
+/// `aurora_doc::LayerMask::bounds`, and `aurora_doc::LayerTree::add_mask`
+/// bounds only a mask's origin, never its extent — so a crafted
+/// manifest declaring a `u32::MAX`-wide mask would be an unfinishable
+/// loop (~2.8e14 iterations) on `aurora-app`'s own pre-window startup
+/// path, exactly the defect `tile_grid`'s extent check already closed
+/// for layer bounds.
+///
+/// **This stays a separate walk, and it has to.** `tile_grid` runs
+/// per grid, interleaved with writing entries; this runs *before* the
+/// first byte of a container is written and before the reader's first
+/// probe, so a bad rectangle anywhere in the tree fails up front rather
+/// than half-way through a file. Until 0.57.13 a crafted manifest could
 /// declare a mask at `i64::MIN` and be read back as `Ok`; it then
 /// survived a write-then-read round trip unchanged and reached
 /// `apply_mask` -> `aurora_core::Rect::contains_point` in `aurora-app`
@@ -800,27 +931,15 @@ fn layer_ids(layers: &LayerTree) -> Vec<LayerId> {
 /// behind [`write()`] and [`write_best_effort`] — so one call site each
 /// covers every path in and out of the format, the same property
 /// `tile_grid` gives the bounds check.
-///
-/// A mask's *extent* is deliberately not checked here. Real mask
-/// coverage pixels do exist as of 0.70.0 (see `aurora_doc::mask` for
-/// the storage convention), but this module does not yet enumerate
-/// mask surfaces — that is one of the named follow-ons in
-/// `aurora_doc::mask`'s own doc comment — so a mask's extent still
-/// drives no loop here, and there is nothing for an oversized one to
-/// make unfinishable. Revisit this the moment mask surfaces are
-/// written into the archive.
-fn validate_mask_origins(layers: &LayerTree) -> Result<(), IoError> {
+fn validate_mask_rects(layers: &LayerTree) -> Result<(), IoError> {
     for id in layer_ids(layers) {
         let Some(mask) = layers.mask(id) else {
             continue;
         };
-        if !mask.bounds.origin_in_document_range() {
-            return Err(IoError::LayerOriginOutOfRange {
-                x: mask.bounds.x,
-                y: mask.bounds.y,
-                max: aurora_core::MAX_DOCUMENT_ORIGIN,
-            });
-        }
+        // The grid itself is not wanted here, only the two range checks
+        // it performs -- see this function's own doc comment for why
+        // they have to happen before any loop, not inside one.
+        tile_grid(mask.bounds)?;
     }
     Ok(())
 }
@@ -829,6 +948,17 @@ fn validate_mask_origins(layers: &LayerTree) -> Result<(), IoError> {
 /// `tiles/<surface>/<x>_<y>.tile`, a real, inspectable path (ADR 0009's
 /// own "open format... a user can inspect a `.aur` file's contents with
 /// a file manager" goal), not an opaque or flat-namespaced one.
+///
+/// `surface` is whatever [`persisted_surfaces`] yielded, so this names
+/// **mask coverage tiles as well as layer content tiles**. The two are
+/// told apart by the surface id itself and nothing else: a mask
+/// surface has `aurora_doc::MASK_SURFACE_BIT` set, which puts it in the
+/// top half of the id space and makes its directory name a very large
+/// decimal number. That is enough for the format (the reader derives
+/// which surface it expects rather than parsing these names), though it
+/// does mean the "inspect it with a file manager" goal is served less
+/// well for masks than for layers — a real, accepted cost of deriving
+/// mask surface ids rather than storing them.
 fn tile_entry_name(surface: SurfaceId, id: TileId) -> String {
     format!("tiles/{}/{}_{}.tile", surface.to_raw(), id.x, id.y)
 }
@@ -1363,8 +1493,29 @@ mod tests {
         }
     }
 
+    /// A mask a crafted fixture should attach, rectangle and all.
+    ///
+    /// The extent is a field rather than the fixed 16x16 it used to be
+    /// because a mask's *extent* is checked as of 0.71.0 — it now
+    /// derives a real tile grid, so an unbounded one is an unfinishable
+    /// loop, and a fixture has to be able to declare one.
+    #[derive(Clone, Copy)]
+    struct CraftedMask {
+        x: i64,
+        y: i64,
+        w: u32,
+        h: u32,
+    }
+
+    impl CraftedMask {
+        /// A 16x16 mask at `(x, y)` — the origin-only cases.
+        fn at(x: i64, y: i64) -> Self {
+            Self { x, y, w: 16, h: 16 }
+        }
+    }
+
     /// The one-layer tree every crafted fixture below is built from.
-    fn crafted_tree(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> mirror::Tree {
+    fn crafted_tree(kind: CraftedKind, mask: Option<CraftedMask>) -> mirror::Tree {
         let mut layers = std::collections::HashMap::new();
         layers.insert(
             0u64,
@@ -1384,11 +1535,11 @@ mod tests {
                     pixels: false,
                     position: false,
                 },
-                mask: mask_origin.map(|(x, y)| mirror::Mask {
-                    x,
-                    y,
-                    w: 16,
-                    h: 16,
+                mask: mask.map(|mask| mirror::Mask {
+                    x: mask.x,
+                    y: mask.y,
+                    w: mask.w,
+                    h: mask.h,
                     enabled: true,
                     inverted: false,
                 }),
@@ -1419,8 +1570,8 @@ mod tests {
     /// independent check, which is what stops a file that never went
     /// through that API.
     ///
-    /// `mask_origin` attaches a 16x16 mask at that origin, or leaves
-    /// the layer maskless when `None`.
+    /// `mask` attaches a mask with that rectangle, or leaves the layer
+    /// maskless when `None`.
     ///
     /// The mirror structs match `LayerTree`'s own derived `Serialize`
     /// field-for-field, the same trick
@@ -1430,13 +1581,13 @@ mod tests {
     /// matching `Rect`'s own types: `postcard` zigzag-varint-encodes
     /// signed integers by width, so an `i32` mirror could not even
     /// represent `i64::MAX`.
-    fn crafted_manifest(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> Vec<u8> {
+    fn crafted_manifest(kind: CraftedKind, mask: Option<CraftedMask>) -> Vec<u8> {
         let manifest = mirror::Manifest {
             version: super::MANIFEST_VERSION,
             canvas_width: 1,
             canvas_height: 1,
             color_space: 0,
-            layers: crafted_tree(kind, mask_origin),
+            layers: crafted_tree(kind, mask),
         };
         match postcard::to_allocvec(&manifest) {
             Ok(bytes) => bytes,
@@ -1450,8 +1601,8 @@ mod tests {
     /// build one carrying an out-of-range origin. Its derived
     /// `Deserialize` does not: origin is a value-range property, and
     /// this crate is where that range is enforced for a file.
-    fn crafted_tree_bytes(kind: CraftedKind, mask_origin: Option<(i64, i64)>) -> Vec<u8> {
-        match postcard::to_allocvec(&crafted_tree(kind, mask_origin)) {
+    fn crafted_tree_bytes(kind: CraftedKind, mask: Option<CraftedMask>) -> Vec<u8> {
+        match postcard::to_allocvec(&crafted_tree(kind, mask)) {
             Ok(bytes) => bytes,
             Err(err) => unreachable!("{err:?}"),
         }
@@ -1498,7 +1649,7 @@ mod tests {
 
     #[test]
     fn read_rejects_a_manifest_whose_layer_mask_origin_is_past_the_document_range() {
-        // The gap 0.57.12 left open, and the reason `validate_mask_origins`
+        // The gap 0.57.12 left open, and the reason `validate_mask_rects`
         // exists as a walk of its own rather than another line inside
         // `tile_grid`: a mask carries a `Rect` that is *not* the layer's
         // own `bounds`, and `tile_grid` never sees it. Measured against
@@ -1516,7 +1667,8 @@ mod tests {
             aurora_core::MAX_DOCUMENT_ORIGIN + 1,
             -aurora_core::MAX_DOCUMENT_ORIGIN - 1,
         ] {
-            let manifest_bytes = crafted_manifest(CraftedKind::Pixel(0, 0), Some((bad, 0)));
+            let manifest_bytes =
+                crafted_manifest(CraftedKind::Pixel(0, 0), Some(CraftedMask::at(bad, 0)));
             let (_dir, mut store) = real_tile_store();
             match read(container_with(&manifest_bytes, &[]), &mut store) {
                 Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
@@ -1531,13 +1683,18 @@ mod tests {
 
     #[test]
     fn read_rejects_a_manifest_whose_group_layer_mask_origin_is_past_the_document_range() {
-        // The half a `tile_grid`-placed check could not reach even in
-        // principle. A group has no `LayerKind::Pixel` arm, so
-        // `pixel_layer_ids` skips it and `tile_grid` is never called for
-        // it at all -- yet a group can carry a mask, and that mask's own
+        // The half a `tile_grid`-placed check could not reach in
+        // 0.57.12. A group has no `LayerKind::Pixel` arm, so the walk
+        // of the day skipped it and `tile_grid` was never called for it
+        // at all -- yet a group can carry a mask, and that mask's own
         // rectangle reaches the same compositing arithmetic a pixel
-        // layer's does.
-        let manifest_bytes = crafted_manifest(CraftedKind::Group, Some((0, i64::MIN)));
+        // layer's does. (Since 0.71.0 `persisted_surfaces` does yield a
+        // group's mask surface, so `tile_grid` would eventually see this
+        // rectangle anyway -- but only after the reader had started
+        // walking grids, which is exactly why `validate_mask_rects`
+        // still runs first.)
+        let manifest_bytes =
+            crafted_manifest(CraftedKind::Group, Some(CraftedMask::at(0, i64::MIN)));
         let (_dir, mut store) = real_tile_store();
         match read(container_with(&manifest_bytes, &[]), &mut store) {
             Err(super::IoError::LayerOriginOutOfRange { x, y, max }) => {
@@ -1558,7 +1715,7 @@ mod tests {
         for kind in [CraftedKind::Pixel(0, 0), CraftedKind::Group] {
             let manifest_bytes = crafted_manifest(
                 kind,
-                Some((
+                Some(CraftedMask::at(
                     aurora_core::MAX_DOCUMENT_ORIGIN,
                     -aurora_core::MAX_DOCUMENT_ORIGIN,
                 )),
@@ -1574,7 +1731,7 @@ mod tests {
 
     #[test]
     fn write_and_best_effort_write_both_refuse_a_layer_mask_origin_past_the_document_range() {
-        // `validate_mask_origins` is called from `write_with_policy`,
+        // `validate_mask_rects` is called from `write_with_policy`,
         // the shared body behind both public writers, so this covers
         // the way *out* of the format as well as the way in — the same
         // property `tile_grid` already gives the layer-bounds check.
@@ -1582,7 +1739,8 @@ mod tests {
         // The tree is deserialized rather than built: `add_mask` now
         // refuses this origin, so the derived `Deserialize` is the only
         // way to get one into a `LayerTree` at all.
-        let tree_bytes = crafted_tree_bytes(CraftedKind::Pixel(0, 0), Some((0, i64::MAX)));
+        let tree_bytes =
+            crafted_tree_bytes(CraftedKind::Pixel(0, 0), Some(CraftedMask::at(0, i64::MAX)));
         let layers: LayerTree = match postcard::from_bytes(&tree_bytes) {
             Ok(tree) => tree,
             Err(err) => unreachable!("the crafted tree must still deserialize: {err:?}"),
@@ -1987,6 +2145,636 @@ mod tests {
                 assert_eq!(first.to_f32(), expected);
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Mask coverage persistence (0.71.0).
+    //
+    // Exercised by these tests and nothing else: no tool in the app
+    // paints mask coverage yet (`aurora_doc::mask`'s own follow-on 1),
+    // so none of this has ever run end to end through the editor. Read
+    // it as evidence about the format, not about the product.
+    // ---------------------------------------------------------------
+
+    /// A mask rectangle at a deliberately *different* origin from
+    /// [`bounds`]'s, and wide enough to span two tiles -- the two
+    /// properties that make a mask round trip prove something. If the
+    /// two origins matched, a reader that wrongly addressed mask tiles
+    /// relative to the *layer* would still pass.
+    fn mask_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 500,
+            y: 300,
+            width: 300,
+            height: 200,
+        }
+    }
+
+    /// Exact float equality expressed as bit equality -- these round
+    /// trips really are exact, and this workspace denies
+    /// `clippy::float_cmp`. Same helper `aurora_doc::mask`'s own tests
+    /// use, for the same reason.
+    fn exactly(actual: f32, expected: f32) -> bool {
+        actual.to_bits() == expected.to_bits()
+    }
+
+    /// One texel's mask coverage, read through the same public reader
+    /// (`aurora_doc::read_mask_coverage`) the compositor uses -- not by
+    /// poking at raw channels here, which would let this test agree
+    /// with a broken convention.
+    fn coverage_at(
+        store: &mut TileStore,
+        surface: aurora_tile::SurfaceId,
+        tile: TileId,
+        x: usize,
+        y: usize,
+    ) -> f32 {
+        let entry = match store.get(surface, tile) {
+            Ok(entry) => entry,
+            Err(err) => unreachable!("a real store must serve this tile: {err:?}"),
+        };
+        let base = (y * aurora_tile::TILE as usize + x) * aurora_tile::CHANNELS;
+        let Some(texel) = entry.texels().get(base..base + aurora_tile::CHANNELS) else {
+            unreachable!("(x, y) is constructed in range for a whole tile");
+        };
+        aurora_doc::read_mask_coverage(texel)
+    }
+
+    #[test]
+    fn round_trips_real_mask_coverage_painted_at_the_masks_own_origin() {
+        // The headline case. Coverage `0.0` is what makes it a real
+        // test: a mask entry that was never written, or written and
+        // lost, reads back as `1.0` (the never-painted default), so an
+        // explicit `0.0` is the only value that tells "really
+        // persisted" apart from "silently defaulted".
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut layers, "Masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer that exists has a mask surface");
+        };
+
+        // Two different tiles of the mask's own grid (300px wide is two
+        // 256px tiles), addressed relative to the mask's own origin.
+        let painted = [
+            (TileId { x: 0, y: 0 }, 1_usize, 2_usize, 0.0_f32),
+            (TileId { x: 1, y: 0 }, 3, 4, 0.5),
+        ];
+        for &(tile, x, y, coverage) in &painted {
+            if let Err(err) =
+                aurora_doc::write_mask_coverage(&mut store, mask_surface, tile, x, y, coverage)
+            {
+                unreachable!("{err:?}");
+            }
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+
+        // The entries really are under the *mask* surface, not the
+        // layer's own -- the two are different halves of the id space.
+        let archive = match zip::ZipArchive::new(Cursor::new(bytes.get_ref().clone())) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let prefix = format!("tiles/{}/", mask_surface.to_raw());
+        let mask_entries = archive
+            .file_names()
+            .filter(|name| name.starts_with(&prefix))
+            .count();
+        assert_eq!(
+            mask_entries,
+            2,
+            "both painted mask tiles must be written under the mask surface: {:?}",
+            archive.file_names().collect::<Vec<_>>()
+        );
+
+        let (_dir2, mut fresh_store) = real_tile_store();
+        bytes.set_position(0);
+        let (restored_layers, _, _, _) = match read(bytes, &mut fresh_store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            restored_layers.mask(id).map(|mask| mask.bounds),
+            Some(mask_bounds()),
+            "the mask's own rectangle must survive as well as its pixels"
+        );
+
+        for &(tile, x, y, coverage) in &painted {
+            let restored = coverage_at(&mut fresh_store, mask_surface, tile, x, y);
+            // `f16` cannot hold every `f32`, so the expectation is what
+            // the written value quantizes to -- still exact, not close.
+            assert!(
+                exactly(restored, half::f16::from_f32(coverage).to_f32()),
+                "coverage {coverage} at {tile:?} ({x}, {y}) must survive the round trip, got {restored}"
+            );
+        }
+        assert!(
+            exactly(
+                coverage_at(&mut fresh_store, mask_surface, TileId { x: 0, y: 0 }, 2, 2),
+                1.0
+            ),
+            "an unpainted neighbour must still read as fully visible"
+        );
+    }
+
+    #[test]
+    fn round_trips_mask_coverage_on_a_group_which_has_no_pixel_surface() {
+        // A group has no content surface at all, so its mask is the
+        // only thing it can contribute to the archive -- the case a
+        // walk that only enumerated pixel layers would miss entirely.
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut layers, "Group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(group, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            layers.surface_id(group),
+            None,
+            "a group must have no content surface -- that is the point of this test"
+        );
+        let Some(mask_surface) = layers.mask_surface_id(group) else {
+            unreachable!("a group still gets a mask surface");
+        };
+        let tile = TileId { x: 1, y: 0 };
+        if let Err(err) = aurora_doc::write_mask_coverage(&mut store, mask_surface, tile, 7, 8, 0.0)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh_store) = real_tile_store();
+        bytes.set_position(0);
+        if let Err(err) = read(bytes, &mut fresh_store) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            exactly(coverage_at(&mut fresh_store, mask_surface, tile, 7, 8), 0.0),
+            "a group's own mask coverage must round trip"
+        );
+    }
+
+    #[test]
+    fn round_trips_mask_coverage_of_a_disabled_mask() {
+        // `enabled` is a UI toggle (shift-click a thumbnail), not a
+        // statement about what is stored. Gating persistence on it
+        // would mean switching a mask off and saving silently destroys
+        // the painted pixels -- unrecoverable, and exactly the failure
+        // CLAUDE.md calls the worst this project can have. Locked in
+        // here so a later "optimization" cannot quietly reintroduce it.
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut layers, "Masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = layers.set_mask_enabled(id, false) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer that exists has a mask surface");
+        };
+        let tile = TileId { x: 0, y: 0 };
+        if let Err(err) = aurora_doc::write_mask_coverage(&mut store, mask_surface, tile, 9, 9, 0.0)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh_store) = real_tile_store();
+        bytes.set_position(0);
+        let (restored_layers, _, _, _) = match read(bytes, &mut fresh_store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            restored_layers.mask(id).map(|mask| mask.enabled),
+            Some(false),
+            "the disabled flag itself must round trip too"
+        );
+        assert!(
+            exactly(coverage_at(&mut fresh_store, mask_surface, tile, 9, 9), 0.0),
+            "a disabled mask's painted coverage must still be persisted"
+        );
+    }
+
+    #[test]
+    fn reads_a_container_written_before_mask_persistence_as_fully_visible_coverage() {
+        // What every `.aur` file and autosave written by 0.70.4 or
+        // earlier looks like: a manifest that declares a mask, and not
+        // one mask tile entry anywhere. It must still open, and the
+        // mask must read back exactly as it composited then -- fully
+        // visible, per `aurora_doc::mask`'s alpha-as-presence-flag
+        // convention. This is why the round of work that added mask
+        // entries did *not* bump `MANIFEST_VERSION`: nothing about the
+        // manifest's shape changed, and a bump would have hard-rejected
+        // every file already on disk.
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("Masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer that exists has a mask surface");
+        };
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1000,
+            canvas_height: 1000,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let (_dir, mut store) = real_tile_store();
+        let (restored_layers, _, _, _) =
+            match read(container_with(&manifest_bytes, &[]), &mut store) {
+                Ok(result) => result,
+                Err(err) => unreachable!("a pre-0.71.0 container must still open: {err:?}"),
+            };
+        assert!(
+            restored_layers.mask(id).is_some(),
+            "the mask itself must survive"
+        );
+        for tile in [TileId { x: 0, y: 0 }, TileId { x: 1, y: 0 }] {
+            assert!(
+                exactly(coverage_at(&mut store, mask_surface, tile, 0, 0), 1.0),
+                "a mask with no persisted entries must read back fully visible at {tile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_skips_a_never_painted_mask_surface_entirely() {
+        // Every document written today has masks nobody has painted
+        // (nothing in the app can paint one yet), so an unpainted mask
+        // surface must cost zero bytes -- not a grid's worth of
+        // all-zero entries. The layer's *own* painted tile is expected
+        // in the same archive, so this is a statement about masks
+        // specifically and not about an empty writer.
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let history = History::new();
+        let id = match layers.add_pixel_layer("Masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (Some(surface), Some(mask_surface)) =
+            (layers.surface_id(id), layers.mask_surface_id(id))
+        else {
+            unreachable!("a pixel layer has both surfaces");
+        };
+        {
+            let tile = match store.get_mut(surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Some(sample) = tile.texels_mut().first_mut() {
+                *sample = half::f16::from_f32(0.5);
+            }
+        }
+
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let archive = match zip::ZipArchive::new(Cursor::new(bytes.get_ref().clone())) {
+            Ok(archive) => archive,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mask_prefix = format!("tiles/{}/", mask_surface.to_raw());
+        let names: Vec<&str> = archive.file_names().collect();
+        assert!(
+            !names.iter().any(|name| name.starts_with(&mask_prefix)),
+            "an unpainted mask must write no entries at all: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with(&format!("tiles/{}/", surface.to_raw()))),
+            "the layer's own painted tile must still be there: {names:?}"
+        );
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_whose_mask_extent_is_past_the_document_ceiling() {
+        // The gap this round had to close. Before mask surfaces were
+        // persisted, a mask's extent drove no loop here and was
+        // deliberately unchecked; now it derives a real tile grid, and
+        // `aurora_doc::LayerTree::add_mask` bounds a mask's origin but
+        // never its extent -- so an unchecked `u32::MAX` mask is an
+        // unfinishable loop (~2.8e14 iterations) reached from
+        // `aurora-app`'s own pre-window startup path. As with its
+        // layer-bounds twin, the elapsed-time assertion is the point:
+        // the answer must come back immediately, not eventually.
+        for kind in [CraftedKind::Pixel(0, 0), CraftedKind::Group] {
+            let manifest_bytes = crafted_manifest(
+                kind,
+                Some(CraftedMask {
+                    x: 0,
+                    y: 0,
+                    w: u32::MAX,
+                    h: u32::MAX,
+                }),
+            );
+            let (_dir, mut store) = real_tile_store();
+            let started = std::time::Instant::now();
+            match read(container_with(&manifest_bytes, &[]), &mut store) {
+                Err(super::IoError::LayerBoundsTooLarge { width, height, max }) => {
+                    assert_eq!(width, u32::MAX);
+                    assert_eq!(height, u32::MAX);
+                    assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+                }
+                other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "an oversized mask extent must be rejected up front, not looped over"
+            );
+        }
+    }
+
+    #[test]
+    fn write_and_best_effort_write_both_refuse_a_mask_extent_past_the_document_ceiling() {
+        // The way *out* of the format, for the same reason: `add_mask`
+        // does not bound a mask's extent, so a `LayerTree` carrying an
+        // oversized one is reachable in a live session (not only from a
+        // crafted file), and a writer that walked its grid would hang
+        // the app rather than refuse the save.
+        let tree_bytes = crafted_tree_bytes(
+            CraftedKind::Pixel(0, 0),
+            Some(CraftedMask {
+                x: 0,
+                y: 0,
+                w: u32::MAX,
+                h: u32::MAX,
+            }),
+        );
+        let layers: LayerTree = match postcard::from_bytes(&tree_bytes) {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("the crafted tree must still deserialize: {err:?}"),
+        };
+        let history = History::new();
+        let (_dir, mut store) = real_tile_store();
+
+        let started = std::time::Instant::now();
+        let mut out = Cursor::new(Vec::new());
+        match write(&mut out, &layers, &history, (1, 1), None, &mut store) {
+            Err(super::IoError::LayerBoundsTooLarge { width, max, .. }) => {
+                assert_eq!(width, u32::MAX);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_EXTENT);
+            }
+            other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+        }
+        // And nothing was written: `validate_mask_rects` runs before the
+        // first byte, so a refused save leaves no half-built container.
+        assert!(
+            out.get_ref().is_empty(),
+            "a refused write must not leave a partial container behind"
+        );
+
+        let mut out = Cursor::new(Vec::new());
+        match write_best_effort(&mut out, &layers, &history, (1, 1), None, &mut store) {
+            Err(super::IoError::LayerBoundsTooLarge { .. }) => {}
+            other => unreachable!("expected LayerBoundsTooLarge, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an oversized mask extent must be refused up front, not looped over"
+        );
+    }
+
+    #[test]
+    fn the_whole_document_tile_budget_is_one_ceiling_layer_plus_its_own_mask() {
+        // Why the budget had to be widened rather than left alone: a
+        // masked layer now contributes two grids, so the largest
+        // *legal* document PRD §7.3.1 allows -- one ceiling-sized layer
+        // carrying a full-canvas mask -- would have been refused by a
+        // budget sized for one grid. Two is the exact factor: a layer
+        // can carry at most one mask.
+        let side =
+            u64::from(aurora_core::MAX_DOCUMENT_EXTENT).div_ceil(u64::from(aurora_tile::TILE));
+        assert_eq!(super::MAX_TOTAL_TILES_PER_DOCUMENT, 2 * side * side);
+        assert!(
+            2 * side * side <= super::MAX_TOTAL_TILES_PER_DOCUMENT,
+            "a ceiling-sized layer plus its own mask must fit"
+        );
+        assert!(
+            4 * side * side > super::MAX_TOTAL_TILES_PER_DOCUMENT,
+            "two ceiling-sized masked layers must not"
+        );
+    }
+
+    #[test]
+    fn read_rejects_a_manifest_whose_layers_and_masks_together_exceed_the_tile_budget() {
+        // Mask grids are charged against the same whole-document budget
+        // layer grids are, from inside the same loop. Without that, a
+        // manifest could stay under the budget on its layers alone and
+        // then blow past it entirely in mask rectangles -- a small file
+        // that spins on `aurora-app`'s pre-window startup path, which
+        // is the exact defect the budget exists to prevent. The layers
+        // here are deliberately tiny; the masks are what overruns it.
+        let mut layers = LayerTree::new();
+        let ceiling = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: aurora_core::MAX_DOCUMENT_EXTENT,
+            height: aurora_core::MAX_DOCUMENT_EXTENT,
+        };
+        for index in 0..2 {
+            let id = match layers.add_pixel_layer(format!("small {index}"), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.add_mask(id, ceiling) {
+                unreachable!("{err:?}");
+            }
+        }
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1,
+            canvas_height: 1,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let container = container_with(&manifest_bytes, &[]);
+        assert!(
+            container.get_ref().len() < 16 * 1024,
+            "the crafted container must really be small on disk -- that is the whole attack"
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        match read(container, &mut store) {
+            Err(super::IoError::TooManyTiles { total, max }) => {
+                assert!(total > max, "{total} must exceed the {max}-tile budget");
+                assert_eq!(max, super::MAX_TOTAL_TILES_PER_DOCUMENT);
+            }
+            other => unreachable!("expected TooManyTiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn best_effort_write_skips_an_unreadable_mask_tile_while_write_still_refuses() {
+        // The refuse-vs-degrade split, applied to the surfaces this
+        // round added: an explicit save must refuse rather than quietly
+        // drop painted mask coverage (it is a user's work either way),
+        // while an autosave writes what it can and names what it could
+        // not. Same technique as its pixel-tile twin above: a one-tile
+        // store budget forces the mask tile out to the scratch disk,
+        // `flush` makes that write real, and truncating the file it
+        // landed in leaves an ATIL file `codec::decode` rejects.
+        let (dir, mut store) = one_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let masked = match history.add_pixel_layer(&mut layers, "masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(masked, bounds()) {
+            unreachable!("{err:?}");
+        }
+        let Some(mask_surface) = layers.mask_surface_id(masked) else {
+            unreachable!("a layer that exists has a mask surface");
+        };
+        if let Err(err) = aurora_doc::write_mask_coverage(
+            &mut store,
+            mask_surface,
+            TileId { x: 0, y: 0 },
+            2,
+            3,
+            0.0,
+        ) {
+            unreachable!("{err:?}");
+        }
+        // A second layer, whose own tile evicts the mask tile above.
+        let other = match history.add_pixel_layer(&mut layers, "other", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(other_surface) = layers.surface_id(other) else {
+            unreachable!("just created as a pixel layer");
+        };
+        {
+            let tile = match store.get_mut(other_surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Some(sample) = tile.texels_mut().first_mut() {
+                *sample = half::f16::from_f32(0.5);
+            }
+        }
+        if let Err(err) = store.flush() {
+            unreachable!("test-local scratch disk must accept the write: {err:?}");
+        }
+        break_the_only_scratch_file(&dir);
+
+        let mut refused = Cursor::new(Vec::new());
+        match write(&mut refused, &layers, &history, (10, 10), None, &mut store) {
+            Err(super::IoError::Tile(_)) => {}
+            Ok(()) => {
+                unreachable!("an explicit save must not silently drop unreadable mask coverage")
+            }
+            Err(other) => unreachable!("expected IoError::Tile, got {other:?}"),
+        }
+
+        let mut salvaged = Cursor::new(Vec::new());
+        let skipped =
+            match write_best_effort(&mut salvaged, &layers, &history, (10, 10), None, &mut store) {
+                Ok(skipped) => skipped,
+                Err(err) => unreachable!("a best-effort write must still produce a file: {err:?}"),
+            };
+        let [only] = skipped.as_slice() else {
+            unreachable!("exactly one tile is unreadable, got {skipped:?}");
+        };
+        assert_eq!(only.surface, mask_surface);
+        assert_eq!(only.tile, TileId { x: 0, y: 0 });
+        assert!(
+            only.reason.contains("corrupt tile file"),
+            "the skip must carry the real underlying tile error: {}",
+            only.reason
+        );
+
+        // And the salvaged file is a real document: the other layer's
+        // pixels intact, the lost mask reading back as fully visible
+        // rather than as a hidden layer.
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        salvaged.set_position(0);
+        if let Err(err) = read(salvaged, &mut fresh_store) {
+            unreachable!("the salvaged autosave must reopen: {err:?}");
+        }
+        assert!(
+            exactly(
+                coverage_at(&mut fresh_store, mask_surface, TileId { x: 0, y: 0 }, 2, 3),
+                1.0
+            ),
+            "a dropped mask tile must fail open (fully visible), never hide a layer"
+        );
     }
 
     /// Field-for-field identical to `super::ManifestRead`, so its own

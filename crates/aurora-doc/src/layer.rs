@@ -156,12 +156,13 @@ impl LayerLock {
 /// module's, and [`crate::write_mask_coverage`] /
 /// [`crate::read_mask_coverage`] are its two halves.
 ///
-/// **Three follow-ons are deliberately not built yet**, named here
+/// **Two follow-ons are deliberately not built yet**, named here
 /// rather than silently dropped (the [`crate::mask`] module's own doc
-/// comment says more about each): a brush/tool UI for painting a mask,
-/// `.aur` persistence of mask pixels, and mask-pixel undo/history
-/// support. Coverage can be written and is composited correctly; it
-/// cannot yet be painted by hand, saved, or undone.
+/// comment says more about each, plus a third about mask-surface
+/// lifecycle): a brush/tool UI for painting a mask, and mask-pixel
+/// undo/history support. Coverage can be written, is composited
+/// correctly, and survives a `.aur` save/load round trip as of
+/// 0.71.0 — it cannot yet be painted by hand or undone.
 ///
 /// **Narrower
 /// than PSD's own `lspf`/mask-data format**: real Photoshop files also
