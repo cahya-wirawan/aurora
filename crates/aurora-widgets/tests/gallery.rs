@@ -241,12 +241,13 @@
 //! as an external consumer would use it" discipline `tests/headless.rs`
 //! already established for this crate's integration tests.
 
+use accesskit::Orientation;
 use aurora_theme::{Color, Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::widgets::{
-    CommandEntry, WidgetKind, insert_button, insert_checkbox, insert_color_swatch,
-    insert_command_palette, insert_slider, insert_text_field, new_tree, set_button_disabled,
-    set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled, set_slider_disabled,
-    set_text_field_disabled, toggle_checkbox,
+    CommandEntry, ScrollbarRange, WidgetKind, insert_button, insert_checkbox, insert_color_swatch,
+    insert_command_palette, insert_scrollbar, insert_slider, insert_text_field, new_tree,
+    set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
+    set_scrollbar_disabled, set_slider_disabled, set_text_field_disabled, toggle_checkbox,
 };
 use aurora_widgets::{GpuMesh, PathPipeline, WidgetId, WidgetTree, paint_widget};
 use std::sync::{Mutex, MutexGuard};
@@ -299,6 +300,45 @@ const SLIDER_GALLERY_SIZE: (u32, u32) = (SLIDER_CELL.0 * 3, SLIDER_CELL.1);
 /// at that cell's own left edge (the minimum-value cell), but past it
 /// once the thumb has moved away (see that test's own doc comment).
 const SLIDER_THUMB_SAMPLE_OFFSET_X: u32 = 16;
+
+/// A scrollbar is the one widget here whose *cell shape* has to differ
+/// by state, not just its contents: a bar only has travel along its own
+/// scrolling axis, so a horizontal bar in a tall square cell degenerates
+/// to a full-length thumb with nowhere to move (`paint_scrollbar`'s own
+/// `.max(thickness)` floor against a short track), showing nothing. The
+/// three vertical cells are therefore tall and narrow and the one
+/// horizontal cell is short and wide; the horizontal cell sits at the
+/// top of the row with backdrop below it, which is honest about a
+/// horizontal bar's own height rather than stretching it to match.
+const SCROLLBAR_VERTICAL_CELL: (u32, u32) = (64, 128);
+const SCROLLBAR_HORIZONTAL_CELL: (u32, u32) = (128, 32);
+/// `64 * 3 + 128 = 320`, and `320 * 4 = 1280 = 5 * 256` — already a
+/// multiple of `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`, the same constraint
+/// every other gallery size here satisfies (see [`BUTTON_GALLERY_SIZE`]).
+const SCROLLBAR_GALLERY_SIZE: (u32, u32) = (
+    SCROLLBAR_VERTICAL_CELL.0 * 3 + SCROLLBAR_HORIZONTAL_CELL.0,
+    SCROLLBAR_VERTICAL_CELL.1,
+);
+/// A 20-of-120 page over a 128px track floors at the bar's own 64px
+/// thickness, so each vertical thumb is 64px long with 64px of travel:
+/// at the minimum it occupies `y` 0..64, at the maximum `y` 64..128.
+/// `y = 16` is inside the thumb in the first case and on bare track in
+/// the second — a direct rendered-pixel proof the thumb moved, the same
+/// shape `SLIDER_THUMB_SAMPLE_OFFSET_X` already uses on the other axis.
+const SCROLLBAR_THUMB_SAMPLE_Y: u32 = 16;
+/// `y = 48` is inside the thumb both at the minimum (0..64) and at the
+/// disabled cell's own mid-travel position (32..96) — so comparing the
+/// two at this row compares one thumb against another, isolating
+/// `disabled_opacity` rather than accidentally comparing a thumb to a
+/// track.
+const SCROLLBAR_DISABLED_SAMPLE_Y: u32 = 48;
+/// The horizontal cell starts at `x = 192` and is 128 wide with a 32px
+/// thickness, so its thumb is 32 long with 96 of travel; mid-travel puts
+/// it at `x` 240..272 within the image. `256` is inside it, `200` is
+/// bare track well to its left.
+const SCROLLBAR_HORIZONTAL_THUMB_SAMPLE_X: u32 = 256;
+const SCROLLBAR_HORIZONTAL_TRACK_SAMPLE_X: u32 = 200;
+const SCROLLBAR_HORIZONTAL_SAMPLE_Y: u32 = 16;
 
 const TEXT_FIELD_CELL: (u32, u32) = (192, 32);
 const TEXT_FIELD_GALLERY_SIZE: (u32, u32) = (TEXT_FIELD_CELL.0 * 2, TEXT_FIELD_CELL.1);
@@ -884,6 +924,119 @@ fn slider_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 3
     #[allow(clippy::cast_precision_loss)]
     tree.compute_layout(SLIDER_GALLERY_SIZE.0 as f32, SLIDER_GALLERY_SIZE.1 as f32);
     (tree, [at_min, at_max, disabled])
+}
+
+/// A real, laid-out tree with one `Scrollbar` per state: a vertical bar
+/// at its own minimum value, the same bar at its own maximum, a
+/// disabled vertical bar mid-travel, and a horizontal bar mid-travel —
+/// four cells covering both orientations, both ends of the travel, a
+/// position neither end would reveal, and the disabled state.
+///
+/// The horizontal cell is the one that proves `widgets::scrollbar`'s own
+/// `style()` branch means something at the pixel level rather than only
+/// in resolved `taffy` numbers: it is short and wide where its three
+/// neighbours are tall and narrow, and its thumb travels along `x`.
+fn scrollbar_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 4]) {
+    let (mut tree, root) = new_tree(Style {
+        flex_direction: FlexDirection::Row,
+        ..Default::default()
+    });
+    let range = ScrollbarRange {
+        min: 0.0,
+        max: 100.0,
+        page_size: 20.0,
+    };
+    let insert =
+        |tree: &mut WidgetTree<WidgetKind>, orientation: Orientation, label: &str, value: f64| {
+            match insert_scrollbar(tree, root, scales, orientation, Some(label), value, range) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        };
+    let at_min = insert(&mut tree, Orientation::Vertical, "Min", 0.0);
+    let at_max = insert(&mut tree, Orientation::Vertical, "Max", 100.0);
+    let disabled = insert(&mut tree, Orientation::Vertical, "Disabled", 50.0);
+    let horizontal = insert(&mut tree, Orientation::Horizontal, "Horizontal", 50.0);
+    if let Err(err) = set_scrollbar_disabled(&mut tree, disabled, true) {
+        unreachable!("{err:?}");
+    }
+
+    for id in [at_min, at_max, disabled] {
+        if let Err(err) = tree.set_style(id, sized_style(SCROLLBAR_VERTICAL_CELL)) {
+            unreachable!("{err:?}");
+        }
+    }
+    if let Err(err) = tree.set_style(horizontal, sized_style(SCROLLBAR_HORIZONTAL_CELL)) {
+        unreachable!("{err:?}");
+    }
+    #[allow(clippy::cast_precision_loss)]
+    tree.compute_layout(
+        SCROLLBAR_GALLERY_SIZE.0 as f32,
+        SCROLLBAR_GALLERY_SIZE.1 as f32,
+    );
+    (tree, [at_min, at_max, disabled, horizontal])
+}
+
+/// The four rendered-pixel claims every theme's own scrollbar gallery
+/// makes, in one place rather than copy-pasted five times over. Unlike
+/// the widgets above — whose per-theme assertions each needed their own
+/// backdrop reasoning, and so were genuinely different tests wearing
+/// similar shapes — a scrollbar resolves exactly the two tokens a
+/// `Slider` already does (`surface.sunken` track, `accent.primary`
+/// thumb), so the claim really is identical in all five and duplicating
+/// it would only make five places to get it wrong. `theme_name` is
+/// threaded through so a failure still says which theme produced it.
+fn assert_scrollbar_states_are_distinct(image: &aurora_testkit::Image, theme_name: &str) {
+    assert_eq!(image.width, SCROLLBAR_GALLERY_SIZE.0);
+    assert_eq!(image.height, SCROLLBAR_GALLERY_SIZE.1);
+
+    let vertical = |cell: u32, y: u32| {
+        sample_at(
+            image,
+            cell * SCROLLBAR_VERTICAL_CELL.0 + SCROLLBAR_VERTICAL_CELL.0 / 2,
+            y,
+        )
+    };
+    assert_ne!(
+        vertical(0, SCROLLBAR_THUMB_SAMPLE_Y),
+        vertical(1, SCROLLBAR_THUMB_SAMPLE_Y),
+        "{theme_name}: the thumb must be at a different y offset for a scrollbar at its own \
+         minimum vs maximum value"
+    );
+    assert_ne!(
+        vertical(0, SCROLLBAR_DISABLED_SAMPLE_Y)[..3],
+        vertical(2, SCROLLBAR_DISABLED_SAMPLE_Y)[..3],
+        "{theme_name}: state.disabled_opacity must render the thumb dimmer than full opacity, \
+         compared thumb-to-thumb at a row both occupy"
+    );
+    assert_ne!(
+        sample_at(
+            image,
+            SCROLLBAR_HORIZONTAL_THUMB_SAMPLE_X,
+            SCROLLBAR_HORIZONTAL_SAMPLE_Y
+        ),
+        sample_at(
+            image,
+            SCROLLBAR_HORIZONTAL_TRACK_SAMPLE_X,
+            SCROLLBAR_HORIZONTAL_SAMPLE_Y
+        ),
+        "{theme_name}: a horizontal scrollbar's thumb must travel along x, leaving bare track \
+         to its left"
+    );
+    assert_ne!(
+        sample_at(
+            image,
+            SCROLLBAR_HORIZONTAL_THUMB_SAMPLE_X,
+            SCROLLBAR_VERTICAL_CELL.1 - 1
+        ),
+        sample_at(
+            image,
+            SCROLLBAR_HORIZONTAL_THUMB_SAMPLE_X,
+            SCROLLBAR_HORIZONTAL_SAMPLE_Y
+        ),
+        "{theme_name}: a horizontal scrollbar must be one type-scale step tall, so the bottom \
+         of its own cell is backdrop, not bar"
+    );
 }
 
 /// A real, laid-out tree with one `TextField` per state: enabled, and
@@ -2620,6 +2773,184 @@ fn color_swatch_gallery_matches_the_golden_image_in_color_critical_theme() {
         unreachable!("{err}");
     }
 }
+
+/// `Scrollbar`'s own gallery, one test per built-in theme, each a
+/// self-contained rendered-pixel proof needing no golden image at all —
+/// see [`assert_scrollbar_states_are_distinct`] for the four claims and
+/// why they are shared rather than restated five times.
+///
+/// **Backdrops are inherited, not re-derived.** A scrollbar paints
+/// exactly the two tokens a `Slider` does — `surface.sunken` for the
+/// track, `accent.primary` for the thumb — so each theme's clear colour
+/// here is the one that theme's own `Slider` gallery already uses, and
+/// the reasoning recorded on `NEUTRAL_CLEAR`, `LIGHT_CLEAR`,
+/// `HIGH_CONTRAST_DARK_CLEAR`, `HIGH_CONTRAST_LIGHT_CLEAR` and
+/// `COLOR_CRITICAL_CLEAR` carries over unchanged. Nothing new was
+/// assumed: the same two tokens against the same five backdrops.
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_scrollbar_state() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (tree, _ids) = scrollbar_gallery_tree(&scales);
+    let image = render_gallery(
+        &context,
+        &tree,
+        &dark_theme(),
+        &scales,
+        SCROLLBAR_GALLERY_SIZE,
+        wgpu::Color::BLACK,
+    );
+    assert_scrollbar_states_are_distinct(&image, "Dark");
+}
+
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_scrollbar_state_in_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (tree, _ids) = scrollbar_gallery_tree(&scales);
+    let image = render_gallery(
+        &context,
+        &tree,
+        &light_theme(),
+        &scales,
+        SCROLLBAR_GALLERY_SIZE,
+        LIGHT_CLEAR,
+    );
+    assert_scrollbar_states_are_distinct(&image, "Light");
+}
+
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_scrollbar_state_in_high_contrast_dark_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (tree, _ids) = scrollbar_gallery_tree(&scales);
+    let image = render_gallery(
+        &context,
+        &tree,
+        &high_contrast_dark_theme(),
+        &scales,
+        SCROLLBAR_GALLERY_SIZE,
+        HIGH_CONTRAST_DARK_CLEAR,
+    );
+    assert_scrollbar_states_are_distinct(&image, "High Contrast Dark");
+}
+
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_scrollbar_state_in_high_contrast_light_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (tree, _ids) = scrollbar_gallery_tree(&scales);
+    let image = render_gallery(
+        &context,
+        &tree,
+        &high_contrast_light_theme(),
+        &scales,
+        SCROLLBAR_GALLERY_SIZE,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+    );
+    assert_scrollbar_states_are_distinct(&image, "High Contrast Light");
+}
+
+#[test]
+fn render_gallery_produces_distinct_pixels_for_each_scrollbar_state_in_color_critical_theme() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let scales = scales();
+    let (tree, _ids) = scrollbar_gallery_tree(&scales);
+    let image = render_gallery(
+        &context,
+        &tree,
+        &color_critical_theme(),
+        &scales,
+        SCROLLBAR_GALLERY_SIZE,
+        COLOR_CRITICAL_CLEAR,
+    );
+    assert_scrollbar_states_are_distinct(&image, "Colour-Critical");
+}
+
+/// `Scrollbar`'s own five golden-diff tests, one per built-in theme,
+/// against goldens that **do not exist yet** — including Dark's.
+///
+/// **All five are `#[ignore]`d, Dark included, and that is the point.**
+/// Every other widget in this file had its Dark golden blessed by a
+/// human on real macOS GPU hardware before the `#[ignore]` came off
+/// (`slider_gallery_matches_the_golden_image`'s own doc comment records
+/// the date), and the other four themes are still waiting for the same
+/// step. A scrollbar is not exempt from that just because the round
+/// that added it happened to run on a machine with a real discrete
+/// adapter: "the distinct-pixels test passes" is not "the golden is
+/// trustworthy", which is exactly the distinction this file's own
+/// header insists on. A human runs `AURORA_BLESS_GOLDEN=1 cargo test -p
+/// aurora-widgets --test gallery -- --ignored`, opens the five written
+/// PNGs, and confirms each shows a thumb at the top, a thumb at the
+/// bottom, a dimmed thumb mid-track, and a short wide bar with its own
+/// thumb mid-travel — before any of these attributes come off.
+macro_rules! scrollbar_golden_test {
+    ($name:ident, $theme:expr, $clear:expr, $golden:expr) => {
+        #[test]
+        #[ignore = "golden not blessed: needs a human on real GPU hardware"]
+        fn $name() {
+            let Some(context) = real_context() else {
+                return;
+            };
+            let scales = scales();
+            let (tree, _ids) = scrollbar_gallery_tree(&scales);
+            let image = render_gallery(
+                &context,
+                &tree,
+                &$theme,
+                &scales,
+                SCROLLBAR_GALLERY_SIZE,
+                $clear,
+            );
+            let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(concat!("tests/golden/", $golden));
+            if let Err(err) = aurora_testkit::compare_to_golden(&golden_path, &image, 1) {
+                unreachable!("{err}");
+            }
+        }
+    };
+}
+
+scrollbar_golden_test!(
+    scrollbar_gallery_matches_the_golden_image,
+    dark_theme(),
+    wgpu::Color::BLACK,
+    "scrollbar_gallery.png"
+);
+scrollbar_golden_test!(
+    scrollbar_gallery_matches_the_golden_image_in_light_theme,
+    light_theme(),
+    LIGHT_CLEAR,
+    "scrollbar_gallery_light.png"
+);
+scrollbar_golden_test!(
+    scrollbar_gallery_matches_the_golden_image_in_high_contrast_dark_theme,
+    high_contrast_dark_theme(),
+    HIGH_CONTRAST_DARK_CLEAR,
+    "scrollbar_gallery_high_contrast_dark.png"
+);
+scrollbar_golden_test!(
+    scrollbar_gallery_matches_the_golden_image_in_high_contrast_light_theme,
+    high_contrast_light_theme(),
+    HIGH_CONTRAST_LIGHT_CLEAR,
+    "scrollbar_gallery_high_contrast_light.png"
+);
+scrollbar_golden_test!(
+    scrollbar_gallery_matches_the_golden_image_in_color_critical_theme,
+    color_critical_theme(),
+    COLOR_CRITICAL_CLEAR,
+    "scrollbar_gallery_color_critical.png"
+);
 
 /// `Slider`'s own "distinct pixels" proof is shaped differently from
 /// the others: instead of comparing each cell's own centre (which

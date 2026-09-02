@@ -493,7 +493,7 @@ workspace, same pattern as `spike/`), commit
 - [x] Type scale, spacing scale, radius, elevation, motion values — [design/tokens/scales.toml](design/tokens/scales.toml), owner-approved; font family still an open placeholder (`[type].family`), not blocking
 - [x] One complete built-in theme (Dark), all pairs passing contrast — [design/themes/dark.toml](design/themes/dark.toml), owner-approved; every gated pair passes WCAG 2.1 AA via [design/check_contrast.py](design/check_contrast.py) (17/17 gated pairs pass; `border.default` and disabled text are informational, not gated — see script comments for the WCAG 1.4.11 rationale)
 - [x] Static mockups: main workspace + 2–3 panels — [design/mockups/workspace.html](design/mockups/workspace.html) (Layers/Properties/History docked), owner-approved; HTML/CSS is a Phase 0 review tool only, not how `aurora-widgets` renders
-- [x] Component gallery skeleton — review surface and golden-image target — [design/gallery/index.html](design/gallery/index.html), owner-approved; covers button/checkbox/slider/field/dropdown/tab bar/tooltip/swatch across forced states; scrollbar/tree/menu/curve editor deliberately left for a later pass
+- [x] Component gallery skeleton — review surface and golden-image target — [design/gallery/index.html](design/gallery/index.html), owner-approved; covers button/checkbox/slider/field/dropdown/tab bar/tooltip/swatch across forced states; tree/menu/curve editor deliberately left for a later pass (scrollbar was in that deferred group too until 2026-09-02, when the design owner approved building it — it now has a real widget, paint, and gallery entry in all five themes; the HTML file's own section for it is still unwritten)
 - [x] Outside critique on the mockups (risk R2f mitigation) — **2026-07-28: a colleague reviewed the scaffold and signed off as fine for a start**, with the explicit understanding it can be revised later if needed. Not a formal design-professional audit, but it satisfies R2f's actual gap (no second opinion at all) — good enough to unblock widget work; deeper critique can still happen opportunistically as the token system gets exercised for real.
 
 ### 0.6 Format feasibility — PSD partially done; RAW/ICC spiked
@@ -2202,6 +2202,89 @@ check licenses` clean with the new `toml` dependency.
   --all-features -- -D warnings`, `cargo test --workspace`, `cargo test
   --workspace --doc`, and `cargo doc --workspace --no-deps
   --all-features` all clean.
+  **An independent review round found five real defects in that commit,
+  all fixed 2026-09-02 (0.75.1).** Recorded in full because four of the
+  five were invisible to the green gate above, which is the point:
+  1. **A build-profile-dependent panic.** `paint_scrollbar` guarded
+     every *divisor* (`span > 0.0`, `range > 0.0`) and no *quotient*. A
+     `NaN` `value`, or `min = f64::NEG_INFINITY` with `max =
+     f64::INFINITY` (which satisfies `min <= max` perfectly), makes
+     `(value - min) / range` an honest `inf / inf = NaN`, which reached
+     `lyon` and tripped its own `assert!(p.y.is_finite())` in a debug
+     build while merely returning `Err(Paint)` in a release one. Both
+     fractions are now forced finite *after* the division.
+  2. **A public `Result`-returning API panicking anyway.** `f64::clamp`
+     asserts `min <= max` internally; that assertion lives in `core`,
+     so the workspace's own `panic = "deny"` lint could not see it, and
+     `insert_scrollbar(min = 100.0, max = 0.0)` (or either bound `NaN`)
+     panicked instead of returning. Both entry points now validate
+     explicitly and return a new `WidgetError::InvalidRange { min, max }`.
+  3. **A layout bug that made the widget invisible.** `style()` used
+     `flex_grow: 1.0` with `auto()` on the scrolling axis, borrowed from
+     `slider::style`. `flex_grow` grows the *parent's* main axis, so a
+     vertical bar in a 300x200 `Row` resolved to **13 x 0** — measured,
+     not deduced. Now `percent(1.0)` on the scrolling axis with
+     `flex_grow: 0.0`/`flex_shrink: 0.0`, which was the only one of
+     three candidate styles to resolve to `13 x 200` in *both* a `Row`
+     and a `Column` parent (`flex_grow` + `align_self: STRETCH` gives
+     `300 x 200` in a `Row`). Two permanent `compute_layout` tests, one
+     per orientation, assert the two differ.
+  4. **Value changes never reached the renderer.** `with_scrollbar_mut`
+     called only `set_accessibility`, which sets the per-widget `dirty`
+     flag but never unions the widget's bounds into the tree-wide damage
+     region `take_damage` hands a renderer — so a moved thumb was never
+     repainted, and the existing test passed because it asserted on
+     `is_dirty` alone. Now calls `mark_dirty` too, asserted against
+     `take_damage`. **The identical gap still exists in
+     `with_slider_mut` and the `text_field` mutators** and is left for
+     its own change rather than fixed as a drive-by here.
+  5. **The definition-of-done gap.** CLAUDE.md requires a widget to
+     appear "in the component gallery in every state" before it counts,
+     and the original commit skipped it. `tests/gallery.rs` now has
+     `scrollbar_gallery_tree` — four cells (vertical at minimum, at
+     maximum, disabled mid-travel, and a horizontal bar mid-travel, the
+     one cell whose shape differs, since a bar only has travel along its
+     own axis) — with a real rendered-pixel test in all five built-in
+     themes and five `#[ignore]`d golden-diff tests. Backdrops are
+     inherited from `Slider`'s own per-theme reasoning rather than
+     re-derived: a scrollbar resolves exactly the same two tokens.
+     Contrast re-checked, not assumed — all five themes pass every gated
+     pair, and the widget's own thumb-against-track pair (not itself
+     gated, the same as `Slider`'s) computes 8.02:1 Dark, 4.23:1 Light,
+     19.56:1 HC Dark, 8.59:1 HC Light, 9.08:1 Colour-Critical.
+  Smaller fixes in the same round: an `Option<String>` label reaching
+  `set_label` (a standalone bar is otherwise announced as an unnamed
+  "scroll bar" — `insert_scrollbar` gained a `label` parameter, 7 total,
+  still inside the `too_many_arguments` bound); `page_size` reaching
+  `set_numeric_value_jump` (the page-jump amount, the one quantity a
+  scrollbar has that a slider does not); a negative or non-finite
+  `page_size` clamped to `0.0`; a non-finite `value` parked at `min`
+  rather than stored verbatim; and `ScrollbarRange`'s previously
+  unstated `max` convention written down (`max` is the maximum scroll
+  *offset*, `content_size - page_size`, **not** the content size).
+  **Guard strength was measured by mutation, not asserted.** Deleting
+  `.min(track_len)`, `.max(thickness)`, the `span > 0.0` guard, or both
+  finite-quotient guards each now fails at least one test — verified by
+  actually applying each deletion and running the suite. The `range >
+  0.0` guard is the honest exception: it survives deletion because it is
+  *provably unobservable* (whenever `range == 0`, `span` reduces to
+  `page_size`, so the thumb is full-length and its remaining travel is
+  exactly zero, making `offset` `anything * 0.0`). It is kept, and
+  documented as an equivalent mutant rather than passed off as covered.
+  **Design-owner note**: Cahya approved keeping `Scrollbar` and
+  finishing it properly this round, retroactively resolving the "needs
+  more structural design work" deferral `design/gallery/index.html` and
+  the three PLAN.md passages below had recorded. **Still open and not
+  claimed**: no human has blessed any of the five scrollbar goldens (the
+  images were generated once on this box's real discrete adapter and
+  looked structurally right, which is not a bless and is not committed);
+  a `Role::ScrollBar` reports read-only through Windows UIA regardless
+  of the `SetValue` action declared, an `accesskit` role-mapping
+  property now noted in the module doc rather than implied away; and
+  this is still a position model with nothing that scrolls. 27 new lib
+  tests (189 → 203 in `aurora-widgets`, plus 5 gallery tests and 5
+  ignored goldens; workspace 1,423 → 1,442 passing). Full gate re-run
+  clean.
 - [~] **Vector-first rendering via `aurora-vector` (resolution-independent)**
   — first real slice done 2026-08-06, picked up as a direct prerequisite
   the "Component gallery + golden-image tests" bullet below was found to
@@ -3092,9 +3175,15 @@ check licenses` clean with the new `toml` dependency.
   highlighting (still Cahya's own architecture decision, not picked
   unilaterally); the remaining named widgets from that file's own list
   (`Dropdown`, `Tab bar`, `Tooltip` — each needs real text shaping,
-  which `aurora-text` doesn't have yet; `Scrollbar`/`Tree`/`Menu`/
-  `Curve editor` are explicitly deferred further by that file's own
-  "needs more structural design work" note).
+  which `aurora-text` doesn't have yet; `Tree`/`Menu`/`Curve editor`
+  are explicitly deferred further by that file's own "needs more
+  structural design work" note). **`Scrollbar` was in that deferred
+  group until 2026-09-02**, when the design owner approved building it
+  anyway; it landed in 0.75.0 and got its gallery entry — all four
+  states, all five built-in themes — plus its review fixes in 0.75.1,
+  see this section's own `Scrollbar` entry above. What is still open for
+  it is a *scrolling container*, not the structural design work this
+  note originally described.
 
   **Per-theme coverage partially unblocked, 2026-08-09**: the Light
   theme now exists (`design/themes/light.toml`) and passes its own
@@ -16096,10 +16185,15 @@ tooling-gated, fall into one of four buckets:
 2. **Needs a real design-owner decision, not an engineering call.**
    M1.10's "component gallery complete" gate item — which of
    `design/gallery/index.html`'s remaining named components (dropdown,
-   tab bar, tooltip, scrollbar, tree, menu, curve editor) to build
+   tab bar, tooltip, tree, menu, curve editor) to build
    next is a real product-scope choice, the same category CLAUDE.md's
    own "don't invent tokens ad hoc... that's a design decision to
    raise" guidance already covers for widget work specifically.
+   **`Scrollbar` came off this list 2026-09-02**: Cahya made exactly
+   that call for it — build it, then finish it properly — so it landed
+   (0.75.0) and was completed with its gallery entry and review fixes
+   (0.75.1). The list is one shorter; the decision it describes is
+   unchanged for the six that remain.
 3. **Blocked by this sandbox's own missing tooling, not a design or
    hardware question.** PSD spike work (0.6: layer masks, vector
    masks, smart objects, layer styles, adjustment layers; compression/
