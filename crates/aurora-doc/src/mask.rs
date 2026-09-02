@@ -77,6 +77,20 @@
 //! getting this right and should re-read this paragraph before wiring
 //! coordinates through.
 //!
+//! **Nor is coverage checked against the mask's own grid.**
+//! [`write_mask_coverage`] accepts any `TileId`, including one outside
+//! the tile grid `mask.bounds` spans. Such a write lands in the store
+//! and is then **silently dropped on every save**, with no error and no
+//! log: `aurora-io`'s writer walks `0..tiles_x`/`0..tiles_y` of the
+//! mask's own rectangle and never looks anywhere else. This is
+//! unreachable today — nothing but tests calls the writer, and a mask's
+//! `bounds` is immutable through the current API once
+//! `LayerTree::add_mask` has accepted it — but it stops being
+//! unreachable the moment a mask can be moved or resized, which is the
+//! same "the origin/extent relationship is not enforced across time"
+//! gap follow-on 3 below already tracks. It belongs to that item, not
+//! to a new one.
+//!
 //! # Deliberately not built this round
 //!
 //! Three follow-ons are named rather than silently dropped, because
@@ -114,6 +128,15 @@
 //!      that surface's tiles on `remove_mask`, which is a store
 //!      operation `aurora-doc` does not have a handle to at that call
 //!      site.
+//!    - **Coverage written outside the mask's own grid is dropped on
+//!      save.** [`write_mask_coverage`] does not check the `TileId` it
+//!      is given against the grid `crate::LayerMask::bounds` spans, and
+//!      `aurora-io`'s writer walks only that grid — so such a texel is
+//!      lost silently, with no error and no log. Same category as the
+//!      two above: the origin/extent relationship is not enforced
+//!      across time. Harmless while `bounds` is immutable after
+//!      `crate::LayerTree::add_mask`; real the moment a mask can be
+//!      moved or resized, which is when this item is done anyway.
 //!    - **Deleting a layer leaves its mask tiles in the store.** This
 //!      is not new and not specific to masks — a deleted layer's *own*
 //!      pixel tiles leak exactly the same way today, because nothing

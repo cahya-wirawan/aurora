@@ -4966,13 +4966,13 @@ fn dissolve_gate(texels: &[half::f16], opacity: f32, doc_origin: (i64, i64)) -> 
 ///
 /// # Deliberately still open
 ///
-/// Coverage can be *written* ([`aurora_doc::write_mask_coverage`]) and
-/// is composited here, but four follow-ons are named, not built: a
-/// brush/tool UI for painting a mask, `.aur` persistence of mask
-/// pixels, mask-pixel undo/history, and mask-surface lifecycle
-/// (nothing clears a mask's tiles when the mask or its layer is
-/// removed, so a re-added mask inherits the old one's coverage). See
-/// the `aurora_doc::mask` module's own doc comment for all four.
+/// Coverage can be *written* ([`aurora_doc::write_mask_coverage`]),
+/// composited here, and — since 0.71.0 — persisted through a `.aur`
+/// round trip. Three follow-ons are named, not built: a brush/tool UI
+/// for painting a mask, mask-pixel undo/history, and mask-surface
+/// lifecycle (nothing clears a mask's tiles when the mask or its layer
+/// is removed, so a re-added mask inherits the old one's coverage). See
+/// the `aurora_doc::mask` module's own doc comment for all three.
 fn apply_mask(
     texels: &[half::f16],
     mask: &aurora_doc::LayerMask,
@@ -17052,6 +17052,177 @@ mod tests {
                     "coverage 0.0 must zero all four channels, not just alpha"
                 );
             }
+        }
+    }
+
+    /// A non-negative `i64` difference as a `usize` -- the one cast the
+    /// cross-crate frame test below needs, kept honest rather than
+    /// `as`-cast, since a *negative* difference would mean the test's
+    /// own arithmetic had drifted and silently wrapping it would hide
+    /// exactly the frame error the test exists to catch.
+    fn offset(from: i64, to: i64) -> usize {
+        match usize::try_from(to - from) {
+            Ok(offset) => offset,
+            Err(err) => unreachable!("{to} must be at or past {from}: {err:?}"),
+        }
+    }
+
+    /// The document this crate and `aurora-io` have to agree about: a
+    /// 1000x1000 pixel layer carrying a mask at a deliberately different
+    /// origin *and* extent (300x200 at (500, 300) -- two tile columns
+    /// where the layer is four, and nowhere near the layer's origin).
+    /// Returns the tree and the layer's own id.
+    fn masked_document_for_the_frame_check() -> (aurora_doc::LayerTree, aurora_doc::LayerId) {
+        let mut layers = aurora_doc::LayerTree::new();
+        let layer_bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 1000,
+        };
+        let id = match layers.add_pixel_layer("masked", layer_bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, frame_check_mask_rect()) {
+            unreachable!("{err:?}");
+        }
+        (layers, id)
+    }
+
+    fn frame_check_mask_rect() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 500,
+            y: 300,
+            width: 300,
+            height: 200,
+        }
+    }
+
+    #[test]
+    fn painted_mask_coverage_survives_a_real_aur_round_trip_at_the_same_absolute_position() {
+        // **The property the whole mask-persistence design hinges on,
+        // and nothing tested it end to end until 0.71.4.** Two crates
+        // independently derive a frame from the *mask's* own
+        // `bounds.x/y`: `aurora-io`'s `persisted_surfaces` decides which
+        // tile indices to write and read, and this crate's `apply_mask`
+        // (via `read_layer_window`) decides which document position a
+        // coverage texel lands at. `aurora-io`'s own round-trip tests
+        // check the format agrees with itself; `apply_mask`'s own tests
+        // check the compositor agrees with itself. Neither can catch the
+        // two disagreeing with *each other* -- a mask persisted in one
+        // frame and composited in another shifts a user's mask by the
+        // offset between the layer's origin and the mask's, silently,
+        // and only after a save/load.
+        //
+        // So: paint coverage at a known document-*absolute* position,
+        // round trip it through the real `write_aur`/`read_aur` into a
+        // fresh store, and check the pixel it hides through the real
+        // `apply_mask` compositing path -- not by reading coverage back
+        // directly, which would only re-test `aurora-io`'s own frame
+        // against itself.
+        let (layers, id) = masked_document_for_the_frame_check();
+        let mask_rect = frame_check_mask_rect();
+        let history = aurora_doc::History::new();
+        let Some(mask_surface) = layers.mask_surface_id(id) else {
+            unreachable!("a layer in the tree has a mask surface");
+        };
+
+        // Hide exactly one document-absolute texel: (510, 320), which is
+        // mask-relative (10, 20) -- tile (0, 0) of the mask's own grid.
+        // Spelled as absolute-minus-origin rather than as a literal, so
+        // the test states the frame it means.
+        let hidden_abs = (510_i64, 320_i64);
+        let (_dir, mut store) = real_tile_store();
+        if let Err(err) = aurora_doc::write_mask_coverage(
+            &mut store,
+            mask_surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            offset(mask_rect.x, hidden_abs.0),
+            offset(mask_rect.y, hidden_abs.1),
+            0.0,
+        ) {
+            unreachable!("{err:?}");
+        }
+
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        if let Err(err) = aurora_io::write_aur(
+            &mut bytes,
+            &layers,
+            &history,
+            (1000, 1000),
+            None,
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        bytes.set_position(0);
+        let (_fresh_dir, mut fresh_store) = real_tile_store();
+        let (reopened, _history, _canvas, _profile) =
+            match aurora_io::read_aur(bytes, &mut fresh_store) {
+                Ok(result) => result,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let (Some(reopened_mask), Some(reopened_surface)) =
+            (reopened.mask(id), reopened.mask_surface_id(id))
+        else {
+            unreachable!("the reopened document still carries the mask");
+        };
+
+        // Composite the 256x256 document tile at (256, 256), which
+        // contains (510, 320) at local (254, 64). Everything below is
+        // derived from `hidden_abs` and `doc_origin` rather than
+        // restated, so a frame error cannot be absorbed by a matching
+        // typo in the expectation.
+        let doc_origin = (256_i64, 256_i64);
+        let local = (
+            offset(doc_origin.0, hidden_abs.0),
+            offset(doc_origin.1, hidden_abs.1),
+        );
+        let side = aurora_tile::TILE as usize;
+        assert!(local.0 < side && local.1 < side, "{local:?} is in the tile");
+
+        let texels = solid_tile_buffer([0.2, 0.4, 0.6, 1.0]);
+        let mut budget = CompositeBudget::for_pass(&reopened);
+        let masked = apply_mask(
+            &texels,
+            reopened_mask,
+            Some(reopened_surface),
+            &mut fresh_store,
+            doc_origin,
+            &mut budget,
+        );
+
+        // Bit equality, not `==`: this workspace denies
+        // `clippy::float_cmp`, and these values really are exact.
+        let alpha_bits_at = |x: usize, y: usize| {
+            let base = (y * side + x) * aurora_tile::CHANNELS;
+            match masked.get(base..base + aurora_tile::CHANNELS) {
+                Some([_, _, _, a]) => a.to_f32().to_bits(),
+                _ => unreachable!("(x, y) is constructed in range for a whole tile"),
+            }
+        };
+        assert_eq!(
+            alpha_bits_at(local.0, local.1),
+            0.0_f32.to_bits(),
+            "the texel painted to zero coverage must still be hidden at the same absolute \
+             document position after a .aur round trip"
+        );
+        // Its immediate neighbours are untouched, which is what makes
+        // this a position check and not merely a "something got hidden"
+        // check: a one-texel frame error would move the hole, and a
+        // whole-tile one would swallow these too.
+        for (nx, ny) in [
+            (local.0 + 1, local.1),
+            (local.0 - 1, local.1),
+            (local.0, local.1 + 1),
+            (local.0, local.1 - 1),
+        ] {
+            assert_eq!(
+                alpha_bits_at(nx, ny),
+                1.0_f32.to_bits(),
+                "only {local:?} was painted; its neighbour at ({nx}, {ny}) must stay fully visible"
+            );
         }
     }
 

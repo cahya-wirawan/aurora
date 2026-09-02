@@ -14274,6 +14274,45 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-02 (0.71.4) — the cross-crate frame agreement mask
+persistence hinges on is finally tested, and three doc-comment claims
+are corrected.** (1) Two crates independently derive a frame from a
+mask's own `bounds.x/y` — `aurora-io`'s `persisted_surfaces` decides
+which tile indices to write and read, `aurora-app`'s
+`apply_mask`/`read_layer_window` decides which document position a
+coverage texel lands at — and nothing tested them agreeing with *each
+other*. Each crate's own tests only prove it is self-consistent, so a
+mask persisted in one frame and composited in another would shift a
+user's mask by the layer-to-mask offset, silently, and only after a
+save/load.
+`painted_mask_coverage_survives_a_real_aur_round_trip_at_the_same_absolute_position`
+paints coverage at a known document-absolute position through
+`write_mask_coverage`, round trips it through the real
+`write_aur`/`read_aur`, and checks the hidden pixel through the real
+`apply_mask` compositing path (not by reading coverage back directly,
+which would only re-test one crate against itself). Verified
+non-vacuous by pointing `apply_mask`'s window at the layer's origin
+instead of the mask's. (2) The headline `.aur` mask round-trip test's
+own comment credited the mask's differing *origin* for making it
+discriminating; `tile_grid` derives a grid from width/height alone and
+the loops walk `0..tiles_x`, so tile indices are origin-independent —
+it is the differing *extent* (two tile columns vs. one) that fails
+under a wrong-frame mutation. Corrected, with the origin's real value
+(the cross-crate check above) named instead. (3) `apply_mask`'s doc
+comment still said "four follow-ons" and listed `.aur` persistence as
+unbuilt, contradicting `mask.rs`'s own corrected "three". Also
+disclosed, not fixed, and deliberately: a build older than 0.71.0 opens
+a 0.71.0-saved file happily and, on re-save, silently drops every
+painted mask pixel — the manifest carries no signal an old reader could
+notice, which is exactly what makes the no-`MANIFEST_VERSION`-bump
+choice work (a bump would instead make every existing `.aur` file and
+autosave unopenable). Recorded in the module doc beside the no-bump
+decision. And `write_mask_coverage` does not check the `TileId` it is
+given against the grid `mask.bounds` spans, so coverage written outside
+it is dropped on save with no error — unreachable while `bounds` is
+immutable after `add_mask`, folded into the existing mask-surface
+lifecycle follow-on rather than tracked as a new one.
+
 **Addendum 2026-09-02 (0.71.3) — an oversized mask is refused where it
 is created, not only where it is saved.** `LayerTree::add_mask` ran
 `validate_origin` and no extent check, so an ordinary in-process caller

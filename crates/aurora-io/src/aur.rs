@@ -55,6 +55,26 @@
 //! opening unchanged: no mask entries, so every mask reads back fully
 //! visible, exactly as it composited then.
 //!
+//! **The accepted cost of not bumping `MANIFEST_VERSION`, stated
+//! plainly.** Compatibility runs backward but not forward. A build
+//! older than 0.71.0 opens a 0.71.0-saved file happily — it simply
+//! never probes for mask entries — and if the user then re-saves from
+//! that build, **every painted mask pixel in the document is silently
+//! gone**, because that build's own surface walk yields only pixel
+//! layers. Nothing in the file makes that loud: the manifest carries no
+//! signal an older reader could notice, which is precisely what makes
+//! the no-bump choice work in the first place. The alternative was a
+//! `MANIFEST_VERSION` bump, which this reader answers with a hard
+//! refusal ("unsupported manifest version"), so it would make every
+//! `.aur` file and every autosave that already exists unopenable — a
+//! certain, universal loss traded against a conditional one that
+//! requires a user to run two different builds against one file.
+//! Deliberate, and recorded in PLAN.md beside the same decision. The
+//! honest mitigation, if downgrade ever becomes a real scenario, is a
+//! *capability* signal an old reader can be taught to warn on, not a
+//! version bump; nothing needs one today, because 0.71.0 is unreleased
+//! and no build in a user's hands has ever written a mask entry.
+//!
 //! **Nothing in the app paints mask coverage yet** — the mask brush/tool
 //! UI is still a named follow-on in `aurora_doc::mask` — so this half of
 //! the format is exercised by tests only, not end to end through the
@@ -2363,11 +2383,29 @@ mod tests {
     // it as evidence about the format, not about the product.
     // ---------------------------------------------------------------
 
-    /// A mask rectangle at a deliberately *different* origin from
-    /// [`bounds`]'s, and wide enough to span two tiles -- the two
-    /// properties that make a mask round trip prove something. If the
-    /// two origins matched, a reader that wrongly addressed mask tiles
-    /// relative to the *layer* would still pass.
+    /// A mask rectangle deliberately unlike [`bounds`]: a different
+    /// origin, and a different *extent* -- 300x200, which is two tiles
+    /// wide where the 10x10 layer is one.
+    ///
+    /// **The extent is what makes a round trip here discriminating, and
+    /// an earlier version of this comment credited the origin instead**
+    /// (corrected 0.71.4; both reviews of 0.71.0 caught it
+    /// independently). `tile_grid` derives a grid from `width`/`height`
+    /// alone and the loops walk `0..tiles_x`/`0..tiles_y`, so a tile
+    /// *index* is identical whatever the rectangle's origin is -- a
+    /// reader that wrongly addressed mask tiles relative to the layer
+    /// would still produce `0_0` for both frames and pass. What it
+    /// cannot do is invent the second tile column the mask's own 300px
+    /// width has and the layer's 10px width does not: mutating the
+    /// enumerator to yield the layer's rectangle for a mask surface
+    /// makes this test fail there.
+    ///
+    /// The differing origin is still worth keeping. It is what the
+    /// *cross-crate* frame check needs -- `aurora-app`'s `apply_mask`
+    /// windows coverage by `mask.bounds.x/y`, where an origin mix-up
+    /// does show up as a shifted picture (see
+    /// `aurora-app`'s own `.aur`-round-trip mask test) -- but within
+    /// this module's own tile addressing it proves nothing on its own.
     fn mask_bounds() -> aurora_core::Rect {
         aurora_core::Rect {
             x: 500,
