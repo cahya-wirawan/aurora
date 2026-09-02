@@ -45,3 +45,14 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
+# Mask coverage is stored as real texels in the shared tile store
+# (`mask.rs`), so this crate now names the same half-float sample type
+# `aurora-tile` itself stores (ADR 0003's ≥16-bit floor, invariant
+# §7.3.1b).
+half = { workspace = true }
+
+[dev-dependencies]
+# `mask.rs`'s round-trip tests go through a *real* `TileStore`, which
+# needs a real scratch directory -- the same helper shape `aurora-app`'s
+# own `real_tile_store` test fixture already uses.
+tempfile = { workspace = true }

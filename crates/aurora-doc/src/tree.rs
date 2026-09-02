@@ -1570,6 +1570,52 @@ impl LayerTree {
         }
     }
 
+    /// The [`aurora_tile::SurfaceId`] `id`'s own **mask** coverage is
+    /// addressed under in the same shared `aurora_tile::TileStore` —
+    /// `id`'s own raw value with [`crate::MASK_SURFACE_BIT`] set. Like
+    /// [`Self::surface_id`], it is derived, not allocated: there is no
+    /// stored field, no second id scheme, and nothing in the `.aur`
+    /// format has to change to carry it.
+    ///
+    /// **Unlike [`Self::surface_id`], this returns `Some` for a
+    /// [`LayerKind::Group`] too.** Photoshop masks groups, and
+    /// `aurora-app`'s own compositor already masks a group's whole
+    /// isolated buffer as one unit — a group has no pixels of its own,
+    /// but it certainly can have a mask.
+    ///
+    /// # Why the bit partition cannot collide
+    ///
+    /// See [`crate::MASK_SURFACE_BIT`] for the full partition. In
+    /// short: layer pixel surfaces are the bottom half, mask surfaces
+    /// the top half, and `aurora-app`'s reserved composite surface is
+    /// `u64::MAX` — which is why the guard below excludes
+    /// `MASK_SURFACE_BIT - 1` as well as everything above it, since
+    /// `(MASK_SURFACE_BIT - 1) | MASK_SURFACE_BIT == u64::MAX` is the
+    /// one layer id that would otherwise land on the composite
+    /// surface.
+    ///
+    /// # When this is `None`
+    ///
+    /// For an unknown `id`, and — structurally unreachably — for a real
+    /// id at or above `MASK_SURFACE_BIT - 1`.
+    /// `aurora_core::IdGenerator` starts at `0` and hands ids out one
+    /// at a time, monotonically, so reaching `2^63 - 1` would take
+    /// `2^63` layer creations in a single session. No tree this
+    /// process can build gets there. The branch exists because this
+    /// crate refuses to `panic` (see CLAUDE.md's "Lints worth
+    /// knowing": a panic costs a professional their unsaved work), so
+    /// an unreachable case still has to return something honest rather
+    /// than assert.
+    #[must_use]
+    pub fn mask_surface_id(&self, id: LayerId) -> Option<aurora_tile::SurfaceId> {
+        if !self.contains(id) || id.to_raw() >= crate::MASK_SURFACE_BIT - 1 {
+            return None;
+        }
+        Some(aurora_tile::SurfaceId::from_raw(
+            id.to_raw() | crate::MASK_SURFACE_BIT,
+        ))
+    }
+
     #[must_use]
     pub fn name(&self, id: LayerId) -> Option<&str> {
         self.layers.get(&id).map(|entry| entry.name.as_str())
@@ -2092,6 +2138,107 @@ mod tests {
         let tree = LayerTree::new();
         let bogus: super::LayerId = Id::from_raw(0);
         assert_eq!(tree.surface_id(bogus), None);
+    }
+
+    #[test]
+    // A layer's mask coverage and its own pixels must never share a
+    // surface -- writing one would clobber the other.
+    fn mask_surface_id_differs_from_the_same_layers_own_pixel_surface() {
+        let mut tree = LayerTree::new();
+        let id = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_ne!(tree.mask_surface_id(id), tree.surface_id(id));
+        assert_eq!(
+            tree.mask_surface_id(id),
+            Some(aurora_tile::SurfaceId::from_raw(
+                id.to_raw() | crate::MASK_SURFACE_BIT
+            ))
+        );
+    }
+
+    #[test]
+    fn mask_surface_id_is_distinct_for_two_different_layers() {
+        let mut tree = LayerTree::new();
+        let a = match tree.add_pixel_layer("a", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let b = match tree.add_pixel_layer("b", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_ne!(a, b);
+        assert_ne!(tree.mask_surface_id(a), tree.mask_surface_id(b));
+    }
+
+    #[test]
+    // The deliberate contrast with `surface_id`, which is `None` for a
+    // group: a group has no pixels of its own, but Photoshop masks
+    // groups and so does this compositor.
+    fn mask_surface_id_is_some_for_a_group_where_surface_id_is_none() {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("group", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(tree.surface_id(group), None);
+        assert!(tree.mask_surface_id(group).is_some());
+    }
+
+    #[test]
+    fn mask_surface_id_is_none_for_an_unknown_id() {
+        let tree = LayerTree::new();
+        let bogus: super::LayerId = Id::from_raw(0);
+        assert_eq!(tree.mask_surface_id(bogus), None);
+    }
+
+    #[test]
+    // `aurora-app`'s reserved composite surface is
+    // `SurfaceId::from_raw(u64::MAX)`; no mask surface may ever land on
+    // it. `IdGenerator` allocates from 0 upward, so a handful of real
+    // ids stands in for "every id a document could hold" -- and the one
+    // id that *would* collide (`MASK_SURFACE_BIT - 1`) is refused
+    // outright.
+    fn mask_surface_id_never_collides_with_the_reserved_composite_surface() {
+        let mut tree = LayerTree::new();
+        let composite = aurora_tile::SurfaceId::from_raw(u64::MAX);
+        for index in 0..64 {
+            let id = match tree.add_pixel_layer(format!("layer {index}"), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_ne!(tree.mask_surface_id(id), Some(composite));
+            assert_ne!(tree.surface_id(id), Some(composite));
+        }
+        // The single id whose masked form *would* be `u64::MAX`, forced
+        // in directly rather than generated -- refused, not aliased.
+        let colliding: super::LayerId = Id::from_raw(crate::MASK_SURFACE_BIT - 1);
+        assert_eq!(tree.mask_surface_id(colliding), None);
+    }
+
+    #[test]
+    // The partition itself: every mask surface is in the top half of
+    // the id space, every pixel surface in the bottom half, so the two
+    // sets cannot overlap for *any* pair of layers, not just the same
+    // layer.
+    fn mask_surfaces_and_pixel_surfaces_occupy_opposite_halves_of_the_id_space() {
+        let mut tree = LayerTree::new();
+        for index in 0..8 {
+            let id = match tree.add_pixel_layer(format!("layer {index}"), bounds(), None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(mask) = tree.mask_surface_id(id) else {
+                unreachable!("a freshly generated id is far below MASK_SURFACE_BIT");
+            };
+            let Some(pixels) = tree.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            assert!(mask.to_raw() >= crate::MASK_SURFACE_BIT);
+            assert!(pixels.to_raw() < crate::MASK_SURFACE_BIT);
+        }
     }
 
     #[test]
