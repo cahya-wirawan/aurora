@@ -1349,6 +1349,19 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
 /// [`MAX_SKIPPED_TILE_RECORDS`]. Bounded, and two orders of magnitude
 /// below what it replaced.
 ///
+/// **An unrecognised future `version` degrades once, quietly, on
+/// re-save — matching the mask-persistence format's own accepted
+/// downgrade shape.** The frozen prefix keeps `total` even when the
+/// full payload can't be decoded (see the `version` check below), so a
+/// v1 build reading a hypothetical v2 file still reports the honest
+/// count — but if that same v1 build then saves the document again, it
+/// writes back a v1 entry with that `total` and an *empty* record list.
+/// The count survives; the per-tile detail (which tile, why) does not,
+/// silently, the same way an older build re-saving a file with painted
+/// mask coverage silently drops that coverage. Not disclosed to the
+/// user at either read or write time — only in the `tracing::warn!`
+/// below.
+///
 /// # Errors
 ///
 /// [`IoError::EntryTooLarge`] if the entry declares or holds more than

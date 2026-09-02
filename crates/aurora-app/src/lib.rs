@@ -2180,9 +2180,9 @@ fn skipped_tiles_message(skipped: &aurora_io::SkippedTiles) -> String {
         format!(" The first one was left out because: {reason}.")
     });
     format!(
-        "{count} tile{plural} of {kind} could not be read when this file was written, so {was} \
-         left out of it. That content is not in this file and cannot be recovered by reopening \
-         it.{first} Everything else in the document opened normally."
+        "{count} tile{plural} of {kind} could not be read when this document was last written \
+         to disk, so {was} left out. That content is not in this file and cannot be recovered \
+         by reopening it.{first} Everything else in the document opened normally."
     )
 }
 
@@ -10018,6 +10018,11 @@ impl App {
             );
         } else {
             tracing::warn!("no live tile store; skipping the opened document's autosave");
+            // `self.skipped_tiles` keeps whatever the *previous* document
+            // carried -- harmlessly stale, not wrong: with no live store,
+            // `save_aur_file` refuses before it would ever read this field
+            // (its own early return), so a record that describes a
+            // different document can never reach a file on disk.
         }
 
         self.layers = layers;
