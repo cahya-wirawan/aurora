@@ -25815,21 +25815,21 @@ mod tests {
     /// after review found the first version of this comment overclaimed).
     /// What it verifies is real: `handle_dialog_pointer` dispatches
     /// correctly against geometry a real `compute_layout` produced,
-    /// rather than against a `Rect` the test invented. What it is *not*
-    /// is a regression test for the centring bug itself -- the click
-    /// point below is derived from the button's own computed bounds, so
-    /// on its own this test passes identically whether the button is
-    /// centred or stranded in the old `x: 968` sliver. Proven by
-    /// mutation: reverting `root_style` to `Style::default()` leaves
-    /// this test and its sibling green while
+    /// rather than against a `Rect` the test invented. On its own, a
+    /// click derived from the button's own computed bounds is *not* a
+    /// regression test for the centring bug -- it passes identically
+    /// whether the button is centred or stranded in the old `x: 968`
+    /// sliver, since the click always lands wherever the button actually
+    /// is. That is why this test also carries the window-relative
+    /// assertion below, anchored to the window and the rail rather than
+    /// to the button: it is what the old sliver actually violates, and
+    /// it is what makes this test catch the regression too, not just
     /// `an_open_dialog_does_not_take_any_width_from_the_canvas`,
     /// `the_open_dialog_is_centered_over_the_workspace_under_real_layout`
-    /// and `each_real_dialogs_own_message_and_actions_lay_out_as_a_centered_overlay`
-    /// all go red. Those three own the centring; this one owns dispatch.
-    ///
-    /// The one exception is the window-relative assertion below, which
-    /// is anchored to the window and the rail rather than to the button,
-    /// and which the old sliver does violate.
+    /// and `each_real_dialogs_own_message_and_actions_lay_out_as_a_centered_overlay`.
+    /// Proven by mutation: reverting `root_style` to `Style::default()`
+    /// now fails this test and its sibling too, on that assertion,
+    /// alongside all three of the above.
     #[test]
     fn clicking_the_dialogs_action_button_closes_it_under_real_layout() {
         let mut workspace = aurora_ui::build_workspace();
