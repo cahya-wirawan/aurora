@@ -3075,18 +3075,27 @@ fn handle_palette_key(
 /// command palette owns it while open ([`handle_palette_key`]);
 /// otherwise a chord that resolves in `shortcuts` runs its command
 /// ([`run_command`], which is also where a tool-switch shortcut updates
-/// `tool` and `Ctrl+Z`/`Ctrl+Shift+Z` undo/redo against `layers`/
-/// `history`/`pixel_history`, in `undo_order`'s own unified sequence).
-/// Anything else (an unbound chord, with nothing modal open) is
-/// silently ignored — there's no text field to fall back to routing
+/// `tool`) — **except** `Ctrl+Z`/`Ctrl+Shift+Z`, which this function
+/// cannot finish itself (see below) and instead reports back the same
+/// way [`handle_palette_key`] already does for the identical two
+/// commands. Anything else (an unbound chord, with nothing modal open)
+/// is silently ignored — there's no text field to fall back to routing
 /// into yet.
 ///
-/// Returns `Some(ActivatedCommand)` only in the one case no pure
-/// `WidgetTree` mutation can finish on its own — see
-/// [`handle_palette_key`]'s own doc comment for exactly which commands
-/// that covers. The caller (`App::handle_key_event`) is what actually
-/// has somewhere to put it (real document state for `Undo`/`Redo`, a
-/// read/decode or encode/write step for an opened/saved file).
+/// Returns `Some(ActivatedCommand)` in two cases, both because no pure
+/// `WidgetTree` mutation can finish them on their own: the palette-key
+/// cases [`handle_palette_key`]'s own doc comment names, and — since
+/// 0.69.1 — `Undo`/`Redo` resolved straight from a global shortcut.
+/// The latter used to run inline, through [`run_command`] alone; that
+/// was PLAN.md's own disclosed 0.57.7/0.57.8 residual (`Ctrl+Z` reaching
+/// neither the mid-stroke commit nor the pan re-clamp every other
+/// undo/redo entry point already gets) rather than a design choice, and
+/// closing it meant deferring to the caller instead of reimplementing
+/// [`perform_undo_redo`]'s three-step order here. The caller
+/// (`App::handle_key_event`) is what actually has somewhere to put
+/// either kind (real document state — `view`, `active_layer`, the live
+/// `drag` — for `Undo`/`Redo`; a read/decode or encode/write step for
+/// an opened/saved file).
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     workspace: &mut aurora_ui::Workspace,
@@ -3099,7 +3108,6 @@ fn handle_key(
     pixel_history: &mut aurora_brush::PixelHistory,
     store: Option<&mut aurora_tile::TileStore>,
     undo_order: &mut UndoOrder,
-    composite_cache: &mut CompositeCache,
     shortcuts: &ShortcutRegistry<AppCommand>,
     modifiers: Modifiers,
     key: Key,
@@ -3124,6 +3132,27 @@ fn handle_key(
         );
     }
     if let Some(&command) = shortcuts.resolve(chord) {
+        // `Undo`/`Redo` need `perform_undo_redo`'s full three-step order
+        // (commit whatever drag is still live, run the command, then
+        // re-clamp the pan and bump the composite cache) -- exactly what
+        // `App::run_undo_redo` already gives the command palette and
+        // (macOS) native menu, through the very `ActivatedCommand` this
+        // function otherwise reserves for cases it cannot finish itself.
+        // Running `run_command` inline here, as before 0.69.1, skipped
+        // both halves: no commit of a live stroke before the undo (so a
+        // mid-stroke `Ctrl+Z` could reach past pixels the stroke hadn't
+        // recorded yet), and no pan re-clamp after an undone Move (so
+        // the next pointer-move event could compute its delta against a
+        // view that had silently moved out from under it). See
+        // `perform_undo_redo`'s own doc comment for why the order itself
+        // is load-bearing, not just the two extra steps.
+        if let AppCommand::Undo | AppCommand::Redo = command {
+            return Some(if command == AppCommand::Undo {
+                ActivatedCommand::Undo
+            } else {
+                ActivatedCommand::Redo
+            });
+        }
         run_command(
             workspace,
             focus,
@@ -3136,20 +3165,6 @@ fn handle_key(
             undo_order,
             command,
         );
-        // Only Undo/Redo can change what a composite tile shows -- see
-        // `App::run_undo_redo`'s own matching bump for the command-
-        // palette/menu path to the same two commands.
-        //
-        // And that split is a disclosed, still-open gap, not a detail:
-        // `Ctrl+Z`/`Ctrl+Shift+Z` runs Undo/Redo *here*, inline, so it
-        // reaches neither half of `perform_undo_redo` -- no commit of a
-        // live stroke before the undo, and no pan re-clamp after an
-        // undone Move. See PLAN.md's own residual disclosure (0.57.7)
-        // before editing this branch; closing it is a change to this
-        // function's contract, not a line here.
-        if matches!(command, AppCommand::Undo | AppCommand::Redo) {
-            composite_cache.bump();
-        }
     }
     None
 }
@@ -8475,7 +8490,6 @@ impl App {
             &mut self.pixel_history,
             self.tile_store.as_mut(),
             &mut self.undo_order,
-            &mut self.composite_cache,
             &self.shortcuts,
             self.modifiers,
             key,
@@ -12904,7 +12918,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -12917,7 +12930,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Tab),
@@ -12939,7 +12951,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         handle_key(
             &mut workspace,
@@ -12952,7 +12963,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('h'),
@@ -12963,8 +12973,17 @@ mod tests {
         assert_eq!(tool, Tool::Pan);
     }
 
+    /// Since 0.69.1, `handle_key` no longer runs `Undo`/`Redo` itself —
+    /// it defers to the caller via `ActivatedCommand`, exactly as
+    /// `handle_palette_key`/`activate_command` already do for the same
+    /// two commands (see `activate_command_resolves_undo_and_redo_
+    /// without_focusing_anything`), so `App::handle_key_event` can route
+    /// either through `perform_undo_redo`'s full commit-drag/re-clamp
+    /// order instead of the bare `run_command` call this function used
+    /// to make on its own. The layer added above must therefore still
+    /// be present after this call — the undo itself never runs here.
     #[test]
-    fn handle_key_routes_ctrl_z_to_undo_when_the_palette_is_closed() {
+    fn handle_key_reports_ctrl_z_as_undo_instead_of_running_it_when_the_palette_is_closed() {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -12992,9 +13011,8 @@ mod tests {
         // called above.
         let mut undo_order = UndoOrder::default();
         undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
-        handle_key(
+        let picked = handle_key(
             &mut workspace,
             &mut focus,
             &mut dialog,
@@ -13005,7 +13023,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers {
                 control: true,
@@ -13016,9 +13033,76 @@ mod tests {
             &mut FakeClipboard::default(),
             &mut FakeFileDialog::default(),
         );
+        assert_eq!(picked, Some(ActivatedCommand::Undo));
+        assert!(
+            layers.contains(id),
+            "handle_key must not run the undo itself -- that is now the caller's job, through \
+             perform_undo_redo"
+        );
+    }
+
+    /// The `Redo` half of the test just above — same contract, the
+    /// other command.
+    #[test]
+    fn handle_key_reports_ctrl_shift_z_as_redo_instead_of_running_it_when_the_palette_is_closed() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let id = match history.add_pixel_layer(
+            &mut layers,
+            "a",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+        // A real undo first, so there is something on the redo stack.
+        if let Err(err) = history.undo(&mut layers) {
+            unreachable!("{err:?}");
+        }
+        undo_order.undo.pop();
+        undo_order.redo.push(UndoKind::Structural);
+        let shortcuts = default_shortcuts();
+        let picked = handle_key(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &shortcuts,
+            Modifiers {
+                control: true,
+                shift: true,
+                ..Modifiers::none()
+            },
+            Key::Character('z'),
+            None,
+            &mut FakeClipboard::default(),
+            &mut FakeFileDialog::default(),
+        );
+        assert_eq!(picked, Some(ActivatedCommand::Redo));
         assert!(
             !layers.contains(id),
-            "Ctrl+Z must undo the just-added layer"
+            "handle_key must not run the redo itself -- that is now the caller's job, through \
+             perform_undo_redo"
         );
     }
 
@@ -13033,7 +13117,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         // 'q' is deliberately not one of `default_shortcuts`' own
         // tool-switch letters (v/m/z/h/i) or anything else bound.
@@ -13048,7 +13131,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('q'),
@@ -13072,7 +13154,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         open_command_palette(&mut workspace, &mut focus, &mut palette);
 
@@ -13090,7 +13171,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Character('p'),
@@ -21917,7 +21997,6 @@ mod tests {
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
-        let mut composite_cache = CompositeCache::default();
         let shortcuts = default_shortcuts();
         let scales = match load_scales() {
             Ok(scales) => scales,
@@ -21937,7 +22016,6 @@ mod tests {
             &mut pixel_history,
             None,
             &mut undo_order,
-            &mut composite_cache,
             &shortcuts,
             Modifiers::none(),
             Key::Named(NamedKey::Escape),

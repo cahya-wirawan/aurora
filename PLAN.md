@@ -7420,7 +7420,9 @@ structural design work.
     (Vulkan, DiscreteGpu)`). All pre-existing GPU-path tests
     (`..._batches_multiple_real_tiles_in_one_call_without_mixing_them_up`
     included, the one that most exercises this function's control flow)
-    still pass unchanged. 311 `aurora-app` tests, up from 310.
+    still pass unchanged. 310 `aurora-app` tests, up from 309.
+    (Corrected 2026-09-02: this originally said 311/310 — off by the
+    one test the very next round, 0.69.1, actually added.)
 - [x] **Every saved file with translucent pixels has premultiplied
     alpha where straight alpha belongs — the un-premultiply step runs
     only inside a group** — found 2026-08-24 by the review of the
@@ -13992,6 +13994,49 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-02 (0.69.1) — the `Ctrl+Z`/`Ctrl+Shift+Z` routing gap
+0.57.7/0.57.8 disclosed and deliberately left open is closed.** Both
+addenda said plainly that the keyboard chord ran `Undo`/`Redo` inline,
+through `run_command` alone, so it reached neither `perform_undo_redo`'s
+mid-stroke commit nor its post-command pan re-clamp — the same class of
+bug fixed at four other sites that round, just not at this one, because
+closing it meant changing `handle_key`'s own contract rather than adding
+a line inside it. Closed the way `ActivatedCommand` already exists for:
+`handle_key`'s global-shortcut branch now returns
+`Some(ActivatedCommand::Undo)`/`::Redo` for those two commands instead of
+running them, exactly as `handle_palette_key` already does for the same
+two entries in the command palette — so `App::handle_key_event`'s
+existing `Some(ActivatedCommand::Undo) => self.run_undo_redo(...)` arm
+(already there, unchanged, previously reachable only from the palette
+and the macOS menu) now catches the keyboard path too, and both go
+through the same, already independently-tested `perform_undo_redo`. No
+new logic was written for the commit/re-clamp step itself — it already
+existed and was already covered by
+`an_undo_during_a_live_stroke_commits_it_instead_of_painting_a_line_the_user_never_drew`
+and its Move-tool sibling; this round's job was only routing `Ctrl+Z`
+into it. `composite_cache` dropped out of `handle_key`'s own parameter
+list entirely (its one remaining use, an inline bump on the two commands
+this fix now defers, moved into `perform_undo_redo`'s own
+`after_undo_redo` step, where it already ran for every other entry
+point). Two existing tests exercising the old inline-run behaviour were
+rewritten to assert the new deferred contract instead (one for `Undo`,
+a new sibling added for `Redo`, since only `Undo` had a test before) —
+each now asserts the *opposite* of what it asserted before: the layer
+under test must still be present/absent after the call, proving
+`handle_key` no longer performs the edit itself. 311 `aurora-app` tests,
+up from 310 (one existing test replaced by two: the same `Undo` case,
+rewritten, plus a new `Redo` sibling that didn't exist before).
+
+**Addendum 2026-09-01 (0.69.0) — `begin_gpu_composite_tile`'s
+collect-all-siblings shape, sized but not scheduled since 0.51.0's CPU-
+side fix because this sandbox had no real GPU to check a change against,
+is closed now that it does.** See that item's own entry (M1.2 section)
+for the full change; the short version is that the destination texture
+now builds lazily on the first root layer that actually resolves at a
+tile, rather than resolving every root into memory before uploading any
+of them, matching the CPU path's existing shape. Verified on this
+sandbox's real NVIDIA RTX 3090 (`AURORA_REQUIRE_GPU=1`), not llvmpipe.
 
 **Addendum 2026-09-01 (0.68.8) — the Judge's independent pass found two
 things the Reviser's own ledger had missed, both fixed here.** (1) The
