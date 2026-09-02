@@ -2960,7 +2960,8 @@ enum UndoDirection {
 ///
 /// Until one of those lands, a full recomposite per structural undo is
 /// the honest answer: wasteful, never wrong.
-#[must_use]
+// No `#[must_use]` on the function: `CompositeInvalidation` itself
+// carries it, and clippy's `double_must_use` rejects both.
 fn structural_invalidation(dirtied: Option<aurora_core::Rect>) -> CompositeInvalidation {
     let _ = dirtied;
     CompositeInvalidation::Everything
@@ -3030,18 +3031,43 @@ fn run_command(
             // The rect `History::undo` reports is deliberately thrown
             // away here -- see [`structural_invalidation`] for the whole
             // reason, which is not a small one.
-            Some(UndoKind::Structural) => match history.undo(layers) {
-                Ok(dirty) => {
-                    undo_order.undo.pop();
-                    undo_order.redo.push(UndoKind::Structural);
-                    refresh_history_panel(workspace, history);
-                    structural_invalidation(dirty)
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "undo failed");
+            //
+            // `can_undo` is checked *first* because `History::undo`'s own
+            // `Ok(None)` conflates "there was nothing to undo" with "a
+            // step was undone whose dirtied region isn't knowable" (its
+            // own doc comment says so, and names this check as the way to
+            // tell them apart). Without it, an empty `History` behind a
+            // `Structural` order entry would pop that entry and push a
+            // matching `Redo` one for a step that does not exist,
+            // desyncing `UndoOrder` from its backing store permanently.
+            // That is not reachable today -- the two stay in sync by
+            // construction, since every `UndoKind::Structural` entry is
+            // pushed alongside a real `History` step -- so this is
+            // closing a latent hole, not a live bug, and it matches the
+            // shape the `Pixel` arm below already uses for its own
+            // missing-precondition case.
+            Some(UndoKind::Structural) => {
+                if history.can_undo() {
+                    match history.undo(layers) {
+                        Ok(dirty) => {
+                            undo_order.undo.pop();
+                            undo_order.redo.push(UndoKind::Structural);
+                            refresh_history_panel(workspace, history);
+                            structural_invalidation(dirty)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "undo failed");
+                            CompositeInvalidation::None
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "the undo order names a structural step the document history does not \
+                         have; leaving both untouched"
+                    );
                     CompositeInvalidation::None
                 }
-            },
+            }
             Some(UndoKind::Pixel) => {
                 if let Some(store) = store {
                     match apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo) {
@@ -3060,19 +3086,31 @@ fn run_command(
             None => CompositeInvalidation::None,
         },
         AppCommand::Redo => match undo_order.redo.last().copied() {
-            // Same deliberate discard as the `Undo` arm above.
-            Some(UndoKind::Structural) => match history.redo(layers) {
-                Ok(dirty) => {
-                    undo_order.redo.pop();
-                    undo_order.undo.push(UndoKind::Structural);
-                    refresh_history_panel(workspace, history);
-                    structural_invalidation(dirty)
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "redo failed");
+            // Same deliberate discard, and the same `can_redo`
+            // precondition, as the `Undo` arm above -- `History::redo`
+            // conflates its own `Ok(None)` exactly the same way.
+            Some(UndoKind::Structural) => {
+                if history.can_redo() {
+                    match history.redo(layers) {
+                        Ok(dirty) => {
+                            undo_order.redo.pop();
+                            undo_order.undo.push(UndoKind::Structural);
+                            refresh_history_panel(workspace, history);
+                            structural_invalidation(dirty)
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "redo failed");
+                            CompositeInvalidation::None
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "the undo order names a structural step the document history cannot \
+                         redo; leaving both untouched"
+                    );
                     CompositeInvalidation::None
                 }
-            },
+            }
             Some(UndoKind::Pixel) => {
                 if let Some(store) = store {
                     match apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo) {
@@ -3343,7 +3381,17 @@ fn handle_key(
                 ActivatedCommand::Redo
             });
         }
-        run_command(
+        // Spelled out rather than discarded bare, and annotated so the
+        // type is visible at the call site: every command that can reach
+        // here is `FocusNext`, `FocusPrevious`, `ToggleCommandPalette` or
+        // `SelectTool` -- `Undo`/`Redo` returned above -- and each of
+        // those arms returns `CompositeInvalidation::None`, because none
+        // of them touches the document model. So there is genuinely
+        // nothing to invalidate. A new `AppCommand` arm that edits
+        // `layers` would land here reporting a real region, and this
+        // binding is where somebody has to decide what to do with it --
+        // see `run_command`'s own doc comment, which names that trap.
+        let _: CompositeInvalidation = run_command(
             workspace,
             focus,
             palette,
@@ -4685,9 +4733,7 @@ fn after_undo_redo(
         CompositeInvalidation::None => {}
         CompositeInvalidation::Regions(rects) => {
             let reference_origin = composite_reference_origin(layers, active_layer);
-            for rect in rects {
-                composite_cache.invalidate_doc_rect(*rect, reference_origin);
-            }
+            composite_cache.invalidate_doc_rects(rects, reference_origin);
         }
         CompositeInvalidation::Everything => composite_cache.bump(),
     }
@@ -7038,9 +7084,51 @@ impl CompositeCache {
     /// cache that only ever holds the tiles a session actually visited.
     /// Retaining costs one overlap test per *cached* tile instead, which
     /// is bounded by what the cache holds.
+    /// **Test-only since 0.73.3.** [`Self::invalidate_doc_rects`] is
+    /// what production code calls, in one pass; this single-rect entry
+    /// point survives because the tests that pin the half-open overlap
+    /// edges read far better one rect at a time, and pinning them
+    /// through a one-element slice would add noise to eight tests to
+    /// save one delegating line.
+    #[cfg(test)]
     fn invalidate_doc_rect(&mut self, rect: aurora_core::Rect, reference_origin: (i64, i64)) {
-        self.current
-            .retain(|&id| !tile_overlaps_doc_rect(id, rect, reference_origin));
+        self.invalidate_doc_rects(std::slice::from_ref(&rect), reference_origin);
+    }
+
+    /// [`Self::invalidate_doc_rect`] for a whole set of regions at once,
+    /// in **one** pass over the cache — every rule that method documents
+    /// applies unchanged, `reference_origin` requirement included.
+    ///
+    /// **One pass, not one per rect** (0.73.3), and the difference is a
+    /// real regression this fixes rather than a micro-optimisation.
+    /// Before narrowing existed, every undo/redo called [`Self::bump`],
+    /// which *cleared* `current` — so the cache was periodically reset
+    /// to empty for the whole session. Narrowing removed those resets
+    /// without removing the growth: `current` only ever grows between
+    /// bumps (this type's own doc comment says so), and dispatching one
+    /// `retain` per rect made the cost
+    /// `O(rects x cached_tiles)` against a second factor that now climbs
+    /// monotonically across a long session. A stroke's undo reports one
+    /// rect per captured tile, so a wide stroke multiplies a growing
+    /// walk.
+    ///
+    /// Folding the rects into the predicate instead costs one walk of
+    /// `current`, with `Iterator::any` short-circuiting on the first
+    /// rect that matches — and no merging pass, no allocation, and no
+    /// dependence on the rects being disjoint or sorted.
+    ///
+    /// An empty slice returns without touching the cache: `any` over
+    /// nothing is `false`, so the `retain` would keep every tile and
+    /// achieve nothing at the cost of a full walk.
+    fn invalidate_doc_rects(&mut self, rects: &[aurora_core::Rect], reference_origin: (i64, i64)) {
+        if rects.is_empty() {
+            return;
+        }
+        self.current.retain(|&id| {
+            !rects
+                .iter()
+                .any(|&rect| tile_overlaps_doc_rect(id, rect, reference_origin))
+        });
     }
 }
 
@@ -7108,6 +7196,16 @@ fn tile_overlaps_doc_rect(
 /// [`CompositeCache::bump`] — correct, but it paid a whole visible
 /// grid's recomposite for every Ctrl+Z, including the overwhelmingly
 /// common case of undoing a stroke that touched one or two tiles.
+///
+/// **`#[must_use]` is the structural half of that** (0.73.3). Dropping
+/// this value is dropping the instruction to invalidate — the composite
+/// keeps showing pre-command pixels, silently, with no test failing and
+/// nothing on screen to suggest a step was skipped. There is exactly one
+/// call site that legitimately discards it ([`handle_key`], whose
+/// reachable arms are all [`Self::None`]), and it says so explicitly;
+/// this attribute is what makes the *next* one a compile error instead
+/// of a stale-tile bug.
+#[must_use]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CompositeInvalidation {
     /// Nothing composited changed — either the command wasn't a document
@@ -7186,7 +7284,8 @@ fn layer_for_surface(
 /// stroke was recorded still has to invalidate *something*, and an empty
 /// [`CompositeInvalidation::Regions`] would silently invalidate nothing
 /// at all.
-#[must_use]
+// `CompositeInvalidation`'s own `#[must_use]` covers this return
+// value; repeating it here trips clippy's `double_must_use`.
 fn stroke_invalidation(
     layers: &aurora_doc::LayerTree,
     surface: aurora_tile::SurfaceId,
@@ -9498,7 +9597,11 @@ impl App {
     /// `ActivatedCommand` — see PLAN.md's own residual disclosure for
     /// what that costs and why closing it is its own change.
     fn run_undo_redo(&mut self, command: AppCommand) {
-        perform_undo_redo(
+        // Annotated rather than discarded bare, for the reason
+        // `CompositeInvalidation`'s own `#[must_use]` exists: the report
+        // has already been acted on *inside* `perform_undo_redo`, which
+        // owns the cache. See the note below.
+        let _: CompositeInvalidation = perform_undo_redo(
             &mut self.workspace,
             &mut self.focus,
             &mut self.command_palette,
@@ -12463,7 +12566,7 @@ mod tests {
         }
         assert!(commit_test_alpha(&mut store, 30, 30) > 0.5, "setup");
 
-        perform_undo_redo(
+        let _ = perform_undo_redo(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13306,7 +13409,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13319,7 +13422,7 @@ mod tests {
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.layers.root));
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13332,7 +13435,7 @@ mod tests {
             AppCommand::FocusNext,
         );
         assert_eq!(focus.focused(), Some(workspace.properties.root));
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13346,7 +13449,7 @@ mod tests {
         );
         assert_eq!(focus.focused(), Some(workspace.history.root));
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13376,7 +13479,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13402,7 +13505,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13440,7 +13543,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13478,7 +13581,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13518,7 +13621,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13539,7 +13642,7 @@ mod tests {
             "Brush must seed its own Radius row first"
         );
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13558,7 +13661,7 @@ mod tests {
              the previous tool's row behind"
         );
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13614,7 +13717,7 @@ mod tests {
         let mut undo_order = UndoOrder::default();
         undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13642,7 +13745,7 @@ mod tests {
             "the History panel must reflect the undo's own journal entry"
         );
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -13935,7 +14038,7 @@ mod tests {
         let mut pixel_history = aurora_brush::PixelHistory::new();
         let mut undo_order = UndoOrder::default();
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -14007,7 +14110,7 @@ mod tests {
 
         // The pixel stroke was the more recent edit -- Ctrl+Z must
         // reach it first, leaving the structural change untouched.
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -14033,7 +14136,7 @@ mod tests {
         );
 
         // A second Ctrl+Z must now reach the structural edit.
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -14053,7 +14156,7 @@ mod tests {
 
         // Redo walks the exact same order back: structural first, then
         // pixel.
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -14071,7 +14174,7 @@ mod tests {
             "the first redo must reapply the structural edit"
         );
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -14118,7 +14221,7 @@ mod tests {
         undo_order.record(UndoKind::Pixel, &mut history, &mut pixel_history);
         assert!(pixel_history.can_undo());
 
-        run_command(
+        let _ = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -21461,6 +21564,73 @@ mod tests {
             (0, 0),
         );
         assert!(cache.is_current(tile), "same for zero height");
+    }
+
+    /// `invalidate_doc_rects` walks the cache **once** and folds every
+    /// rect into the predicate, rather than dispatching one `retain` per
+    /// rect (0.73.3). Getting that fold wrong is easy in a way that
+    /// still looks right on a one-rect input, so this uses three cached
+    /// tiles and two disjoint rects: each rect must claim its own tile,
+    /// and the tile neither touches must survive. An `all` where the
+    /// code needs `any` would clear nothing; a missing negation would
+    /// clear everything.
+    #[test]
+    fn invalidate_doc_rects_removes_the_union_of_every_rect_in_one_pass() {
+        let mut cache = CompositeCache::default();
+        let hit_by_first = aurora_tile::TileId { x: 0, y: 0 };
+        let hit_by_second = aurora_tile::TileId { x: 4, y: 0 };
+        let untouched = aurora_tile::TileId { x: 2, y: 0 };
+        for tile in [hit_by_first, hit_by_second, untouched] {
+            cache.mark_current(tile);
+        }
+
+        // Tile n spans document x in [256n, 256n + 256).
+        cache.invalidate_doc_rects(
+            &[
+                aurora_core::Rect {
+                    x: 10,
+                    y: 10,
+                    width: 20,
+                    height: 20,
+                },
+                aurora_core::Rect {
+                    x: 1030,
+                    y: 10,
+                    width: 20,
+                    height: 20,
+                },
+            ],
+            (0, 0),
+        );
+
+        assert!(
+            !cache.is_current(hit_by_first),
+            "the first rect's own tile must be invalidated"
+        );
+        assert!(
+            !cache.is_current(hit_by_second),
+            "a rect after the first must invalidate its own tile too -- the fold cannot stop \
+             at rect 0"
+        );
+        assert!(
+            cache.is_current(untouched),
+            "a tile no rect touches must survive: this is narrowing, not a bump"
+        );
+    }
+
+    /// An empty region list returns without touching the cache — `any`
+    /// over nothing is `false`, so a `retain` would keep every tile and
+    /// achieve nothing at the cost of a full walk of a cache that grows
+    /// monotonically between bumps.
+    #[test]
+    fn invalidate_doc_rects_with_no_regions_leaves_every_cached_tile_alone() {
+        let mut cache = CompositeCache::default();
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        cache.mark_current(tile);
+
+        cache.invalidate_doc_rects(&[], (0, 0));
+
+        assert!(cache.is_current(tile));
     }
 
     /// **The most important test in this round.** Undoing a Move
