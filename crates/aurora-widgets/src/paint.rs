@@ -6,7 +6,7 @@
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
 //! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
 //! `ColorSwatch`,
-//! `ListRow`, and `Panel` — solid rounded-rect shapes, the simplest of
+//! `ListRow`, `TreeItem`, and `Panel` — solid rounded-rect shapes, the simplest of
 //! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
@@ -30,7 +30,15 @@
 //! thumb on top of it, but that is *all* it is: nothing in this crate
 //! scrolls any content, so the thumb's own position and length are a
 //! pure function of its state's numbers and never of a real viewport
-//! (`widgets::scrollbar`'s own module doc comment). Every other
+//! (`widgets::scrollbar`'s own module doc comment). `TreeItem` paints
+//! the same selection highlight `ListRow` does, from the same token,
+//! with one real difference: a row's own layout box grows to contain
+//! its children, so the fill is clamped to one row's height
+//! ([`paint_tree_item`]) — a selected group would otherwise paint over
+//! every descendant beneath it. It draws no disclosure triangle and no
+//! label (this crate draws no glyphs at all), so a collapsed row and an
+//! expanded one are pixel-identical apart from what their descendants
+//! do; `expanded` reaches the accessibility node only. Every other
 //! [`WidgetKind`] (`Container` on its own) returns `Ok(vec![])` too — a
 //! real, deliberate "nothing to paint," not an error.
 //!
@@ -75,7 +83,7 @@ use crate::error::WidgetError;
 use crate::tree::{WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorSwatchState, ListRowState, ScrollbarState, SliderState,
-    TextFieldState, WidgetKind,
+    TextFieldState, TreeItemState, WidgetKind, tree_row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -163,6 +171,11 @@ pub fn paint_widget(
             paint_color_swatch(*state, bounds, theme, scales, scale_factor)
         }
         WidgetKind::ListRow(state) => paint_list_row(*state, bounds, theme, scales, scale_factor),
+        // By reference, unlike `ListRow`/`ColorSwatch` above:
+        // `TreeItemState` owns a `String` label, so it is deliberately
+        // not `Copy` (see `list_row`'s own doc comment for why the two
+        // row types stayed separate).
+        WidgetKind::TreeItem(state) => paint_tree_item(state, bounds, theme, scales, scale_factor),
         WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
@@ -584,6 +597,54 @@ fn paint_list_row(
     Ok(vec![(mesh, [r, g, b, alpha])])
 }
 
+/// A tree row's own highlight — the same shape [`paint_list_row`]
+/// paints, for the same reason and from the same token: nothing at all
+/// when the row isn't selected (a real, deliberate `Ok(vec![])`),
+/// `accent.primary` at `scales.radius.sm` when it is,
+/// `state.disabled_opacity` folded into the alpha when it's disabled.
+///
+/// **The one real difference, and it is load-bearing: the fill is one
+/// row tall, not the whole box.** A tree row's own layout box grows to
+/// contain its children (`widgets::tree_view::style` — that is what
+/// makes a subtree's rows nest and indent in the first place), so a
+/// selected *group* has bounds spanning every descendant beneath it.
+/// Painting `bounds.height` would lay an opaque `accent.primary`
+/// rectangle over that whole subtree — every descendant's own highlight
+/// included, since `WidgetTree::paint_order` draws a parent before its
+/// children only for the fill order, and this fill is opaque. Clamping
+/// to `tree_row_height(scales)` paints exactly the row itself. The
+/// `.min(bounds.height)` guard keeps a row that is somehow *shorter*
+/// than one line (a caller-supplied `set_bounds`, a squeezed layout)
+/// from painting outside its own bounds.
+fn paint_tree_item(
+    state: &TreeItemState,
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    if !state.selected {
+        return Ok(vec![]);
+    }
+    let height = tree_row_height(scales).min(bounds.height as f32);
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        height,
+        scales.radius.sm as f32,
+    );
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.accent.primary.to_srgb_f32();
+    let alpha = if state.disabled {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    Ok(vec![(mesh, [r, g, b, alpha])])
+}
+
 /// A docked panel's own flat background, plus a real outline —
 /// `surface.panel`/`border.default`, `design/tokens/vocabulary.md`'s
 /// own entries for exactly this ("Default panel background (Layers,
@@ -663,10 +724,11 @@ mod tests {
     use crate::widgets::{
         CommandEntry, ListRowState, ScrollbarRange, ScrollbarState, WidgetKind,
         command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
-        insert_command_palette, insert_scrollbar, insert_slider, insert_text_field, new_tree,
-        set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
-        set_scrollbar_disabled, set_scrollbar_value, set_slider_disabled, set_slider_value,
-        set_text_field_disabled, toggle_checkbox,
+        insert_command_palette, insert_scrollbar, insert_slider, insert_text_field,
+        insert_tree_item, insert_tree_view, new_tree, set_button_disabled, set_button_pressed,
+        set_checkbox_disabled, set_color_swatch_disabled, set_scrollbar_disabled,
+        set_scrollbar_value, set_slider_disabled, set_slider_value, set_text_field_disabled,
+        set_tree_item_disabled, set_tree_item_selected, toggle_checkbox,
     };
     use accesskit::{Orientation, Toggled};
     use aurora_core::Rect;
@@ -1817,6 +1879,185 @@ mod tests {
         assert_eq!(
             color[3], theme.state.disabled_opacity,
             "a disabled, selected row still dims like every other disabled widget's paint"
+        );
+    }
+
+    /// A selected tree row paints the same token a selected list row
+    /// does — `accent.primary`, `design/tokens/vocabulary.md`'s own
+    /// "selection highlight".
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_selected_tree_row_paints_accent_primary() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_bounds(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 21,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (mesh, color) = single_paint(&tree, row, &theme, &scales, 1.0);
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a 200x21 selected tree row must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert_eq!(color, [r, g, b, 1.0]);
+    }
+
+    #[test]
+    fn an_unselected_tree_row_has_no_paint() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let theme = dark_theme();
+        let paints = match paint_widget(&tree, row, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            paints.is_empty(),
+            "an unselected row paints nothing at all, the same as an unselected list row"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_disabled_selected_tree_row_applies_the_theme_disabled_opacity() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Layer 1", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = set_tree_item_disabled(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_bounds(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 21,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (_, color) = single_paint(&tree, row, &theme, &scales, 1.0);
+        assert_eq!(color[3], theme.state.disabled_opacity);
+    }
+
+    /// The one real difference from `paint_list_row`, and the reason
+    /// `paint_tree_item` exists at all: a selected *group*'s own layout
+    /// box spans every descendant beneath it (that is what makes a
+    /// subtree nest), so painting `bounds.height` would lay an opaque
+    /// rectangle over all of them. Measured through a real
+    /// `compute_layout`, not a hand-set `set_bounds`, so the group's
+    /// bounds are the ones the layout engine actually produces.
+    #[test]
+    fn a_selected_groups_highlight_is_one_row_tall_not_its_whole_subtree() {
+        let root_style = taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(300.0_f32),
+                height: taffy::style_helpers::length(200.0_f32),
+            },
+            ..Default::default()
+        };
+        let (mut tree, root) = new_tree(root_style);
+        let scales = scales();
+        // Through a real `Role::Tree` container, not straight off the
+        // root: a `Row`-direction parent's own `align_items: Stretch`
+        // would inflate a row's `auto` height to the whole 200px, which
+        // is a property of the *parent*, not of `tree_view::style`.
+        let view = match insert_tree_view(&mut tree, root, Some("Layers")) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match insert_tree_item(&mut tree, view, &scales, "Group", true) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for label in ["Child A", "Child B"] {
+            if let Err(err) = insert_tree_item(&mut tree, group, &scales, label, false) {
+                unreachable!("{err:?}");
+            }
+        }
+        if let Err(err) = set_tree_item_selected(&mut tree, group, true) {
+            unreachable!("{err:?}");
+        }
+        tree.compute_layout(300.0, 200.0);
+
+        let Some(bounds) = tree.bounds(group) else {
+            unreachable!("just laid out");
+        };
+        assert_eq!(
+            bounds.height, 63,
+            "the group's own box really does span its own row plus both children"
+        );
+        let theme = dark_theme();
+        let (mesh, _) = single_paint(&tree, group, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            (bottom - top - 21.0).abs() < 0.5,
+            "the highlight must be one row tall (21px), not the whole 63px box: \
+             {top} -> {bottom}"
+        );
+    }
+
+    /// A row squeezed shorter than one line must not paint outside its
+    /// own bounds — what `.min(bounds.height)` is for.
+    #[test]
+    fn a_tree_rows_highlight_never_exceeds_its_own_bounds() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = scales();
+        let row = match insert_tree_item(&mut tree, root, &scales, "Squeezed", false) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = set_tree_item_selected(&mut tree, row, true) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = tree.set_bounds(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 8,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let theme = dark_theme();
+
+        let (mesh, _) = single_paint(&tree, row, &theme, &scales, 1.0);
+        let (_, top, _, bottom) = bbox(&mesh);
+        assert!(
+            top >= 0.0 && bottom <= 8.0,
+            "an 8px-tall row's highlight must stay inside it: {top} -> {bottom}"
         );
     }
 
