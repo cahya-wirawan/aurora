@@ -159,11 +159,13 @@ fn node(state: &ScrollbarState) -> Node {
 /// `auto()` on the scrolling axis, borrowed from `slider::style` — which
 /// is wrong for a widget whose axis is its own property rather than its
 /// parent's. `flex_grow` grows the *parent's* main axis, so it inflated
-/// a vertical scrollbar's width in a `Row` and left its height `auto()`
-/// with no content to derive a height from; measured (`a_vertical_
-/// scrollbar_fills_its_parents_height_at_a_fixed_width` below, before
-/// the fix) that resolved to `13 x 0` in a 300x200 `Row` — a bar with
-/// no length at all, invisible. Filling the scrolling axis with
+/// a vertical scrollbar's width to fill the whole `Row`, and the
+/// default `align_items: Stretch` inflated its `auto()` height to
+/// match; measured (`a_vertical_scrollbar_fills_its_parents_height_
+/// at_a_fixed_width` below, before the fix, and reproduced
+/// independently against a standalone `taffy` program with no Aurora
+/// code at all) that resolved to `300 x 200` in a 300x200 `Row` — the
+/// bar swallowed its entire parent. Filling the scrolling axis with
 /// `percent(1.0)` says what is actually meant regardless of which
 /// direction the parent happens to flex, and `flex_shrink: 0.0` keeps a
 /// crowded parent from squeezing the fixed thickness away.
@@ -889,10 +891,10 @@ mod tests {
 
     /// The real resolved-layout proof, run through `compute_layout`
     /// rather than read off `style()`. Before the fix this resolved to
-    /// `13 x 0` — the fixed thickness was right, and the bar had no
-    /// length at all, because `flex_grow: 1.0` inflates the *parent's*
-    /// main axis while `auto()` left the cross axis with no content to
-    /// derive a height from.
+    /// `300 x 200` — the bar swallowed its entire parent, because
+    /// `flex_grow: 1.0` inflates the *parent's* main axis (width, in
+    /// this `Row`) and the default `align_items: Stretch` inflates
+    /// `auto()`'s cross axis (height) to match.
     #[test]
     fn a_vertical_scrollbar_fills_its_parents_height_at_a_fixed_width() {
         let (mut tree, root) = new_tree(sized_row(FlexDirection::Row));

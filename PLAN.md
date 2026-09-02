@@ -2219,11 +2219,18 @@ check licenses` clean with the new `toml` dependency.
      `insert_scrollbar(min = 100.0, max = 0.0)` (or either bound `NaN`)
      panicked instead of returning. Both entry points now validate
      explicitly and return a new `WidgetError::InvalidRange { min, max }`.
-  3. **A layout bug that made the widget invisible.** `style()` used
-     `flex_grow: 1.0` with `auto()` on the scrolling axis, borrowed from
-     `slider::style`. `flex_grow` grows the *parent's* main axis, so a
-     vertical bar in a 300x200 `Row` resolved to **13 x 0** — measured,
-     not deduced. Now `percent(1.0)` on the scrolling axis with
+  3. **A layout bug that made the widget swallow its whole parent.**
+     `style()` used `flex_grow: 1.0` with `auto()` on the scrolling
+     axis, borrowed from `slider::style`. `flex_grow` grows the
+     *parent's* main axis and the default `align_items: Stretch`
+     inflates `auto()`'s cross axis to match, so a vertical bar in a
+     300x200 `Row` resolved to **300 x 200** — measured, not deduced,
+     and independently reproduced against a standalone `taffy` program
+     with no Aurora code at all (a Gauntlet verifier round caught the
+     commit's original claim of `13 x 0` for this same scenario as
+     wrong — the fix and its tests were already correct, only that
+     one quoted figure was not). Now `percent(1.0)` on the scrolling
+     axis with
      `flex_grow: 0.0`/`flex_shrink: 0.0`, which was the only one of
      three candidate styles to resolve to `13 x 200` in *both* a `Row`
      and a `Column` parent (`flex_grow` + `align_self: STRETCH` gives
