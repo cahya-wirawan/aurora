@@ -14274,6 +14274,36 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-02 (0.71.2) — a failed `.aur` read no longer leaves
+its decoded tiles in the caller's live store.** `aurora_io::read_aur`
+decodes tiles straight into the caller's `TileStore` as it goes
+(deliberately — staging a whole document's pixels elsewhere first would
+double the memory and scratch traffic invariant §7.3.1 exists to
+avoid), and nothing undid that on the error path. A container whose
+*later* entries are corrupt therefore committed its earlier ones in
+full and left them resident under exactly the `SurfaceId`s the caller's
+next document was about to claim — a fresh `LayerTree` restarts layer
+ids, and so surface ids, from the bottom of the space. Red-team
+reproduced it live: after a rejected corrupt autosave, surface 1's tile
+`0_0` read back as attacker data rather than blank. 0.71.0 widened the
+window rather than opening it: a masked layer now has a *second*
+surface, walked after its content surface, that can fail independently
+after the first has already been committed. `read` now records every
+`(surface, tile)` it commits and drops all of them
+(`roll_back_committed_tiles`) before returning `Err`; the mechanism is
+a new `aurora_tile::TileStore::forget_tile`, which reaches all three
+places a tile can live (resident, `pending`, `paged_out`) and deletes
+its scratch file. Regression tests use a real corrupted archive — real
+manifest, real `codec::encode`d content tile, a mask entry
+`codec::decode` genuinely rejects — for exactly the new-in-0.71.0
+shape, and are verified non-vacuous by removing the rollback call.
+`aurora-app`'s own store-swap-after-failed-recovery stays as defence in
+depth (it is the only guard there that does not rest on another crate's
+rollback being right) and its doc comments now say so; the crate's
+*other* read path, `open_aur_file`, never had such a swap, which is why
+fixing this at the `read` boundary rather than per caller was the right
+level.
+
 **Addendum 2026-09-02 (0.71.1) — the `.aur` writer now runs the
 reader's whole pre-flight, and the widened tile budget says what it
 actually does.** Two independent reviews of 0.71.0 converged on the

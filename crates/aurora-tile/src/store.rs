@@ -580,6 +580,49 @@ impl TileStore {
             || self.paged_out.contains_key(&key)
     }
 
+    /// Drops everything this store holds for `(surface, id)` — resident,
+    /// pending, or paged out — and deletes its scratch file, so a
+    /// subsequent [`Self::contains_tile`] is `false` and a subsequent
+    /// [`Self::get`] hands back a brand-new `Tile::blank()`. Returns
+    /// whether anything was actually held.
+    ///
+    /// **This destroys pixels, and that is its whole purpose.** It
+    /// exists for one caller shape: something that wrote tiles into a
+    /// live store, then failed part-way and must not leave what it
+    /// wrote behind. `aurora_io::read_aur` is that caller — it decodes
+    /// a `.aur` archive's tiles straight into the caller's store as it
+    /// goes, so a container whose *last* tile entry is corrupt used to
+    /// leave every earlier tile resident under surface ids the next
+    /// document is about to claim, which is one rejected file away from
+    /// showing a user fragments of a document that failed to open.
+    ///
+    /// Do not reach for it as a cache-eviction knob. Eviction is
+    /// `make_room`'s job and keeps the tile's content
+    /// recoverable; this is the opposite operation, and there is no way
+    /// back from it.
+    ///
+    /// Nothing is flushed and nothing is awaited. A background write
+    /// already in flight for this key is left to complete and land on a
+    /// file this call has just deleted (or is about to be deleted by
+    /// it); its result then drains into `reconcile_pending`/[`Self::flush`]
+    /// against a `pending` entry that is gone, which those already
+    /// handle as an ordinary "no longer in pending" outcome. The
+    /// scratch file it recreates is orphaned rather than aliased — the
+    /// key is in neither map any more, so no read can reach it, and the
+    /// scratch directory is deleted with the session.
+    pub fn forget_tile(&mut self, surface: SurfaceId, id: TileId) -> bool {
+        let key = (surface, id);
+        let held = self.contains_tile(surface, id);
+        // Deletes the scratch file *before* the mapping that names it
+        // is dropped -- `discard_stale_scratch_file` reads the path out
+        // of `paged_out`, so the other order would leak the file.
+        self.discard_stale_scratch_file(key);
+        self.paged_out.remove(&key);
+        self.forget_pending(key);
+        self.resident.pop(&key);
+        held
+    }
+
     /// Blocks until every write submitted so far has actually reached
     /// disk (e.g. before a document save) and surfaces the first
     /// failure encountered, if any. Every failure is logged via
@@ -1267,6 +1310,67 @@ mod tests {
             unreachable!("test-local scratch disk must accept the write: {err:?}");
         }
         assert!(store.contains_tile(s, a), "confirmed on the scratch disk");
+    }
+
+    #[test]
+    // The three places content can live are also the three places
+    // `forget_tile` has to reach, or a caller rolling back a partial
+    // read would drop the resident copy and leave a scratch file the
+    // next `get` pages straight back in.
+    fn forget_tile_drops_a_tile_from_every_place_it_can_live() {
+        for evict_and_flush in [false, true] {
+            let (_dir, mut store) = store(1);
+            let s = surface();
+            let target = TileId { x: 0, y: 0 };
+            let Ok(tile) = store.get_mut(s, target) else {
+                unreachable!("a fresh store must serve this tile");
+            };
+            for sample in tile.texels_mut() {
+                *sample = half::f16::from_f32(0.9);
+            }
+            let path = store.tile_path(s, target);
+            if evict_and_flush {
+                // Budget of 1: touching a second tile evicts `target`,
+                // and the flush confirms its write, so it is in
+                // `paged_out` with a real file on disk.
+                if store.get_mut(s, TileId { x: 1, y: 0 }).is_err() {
+                    unreachable!("a fresh store must serve this tile");
+                }
+                if let Err(err) = store.flush() {
+                    unreachable!("test-local scratch disk must accept the write: {err:?}");
+                }
+                assert!(path.exists(), "the evicted tile really is on disk");
+            }
+            assert!(store.contains_tile(s, target));
+
+            assert!(store.forget_tile(s, target), "it was held");
+            assert!(
+                !store.contains_tile(s, target),
+                "nothing may still hold the forgotten tile"
+            );
+            assert!(
+                !path.exists(),
+                "the forgotten tile's scratch file must be deleted, not orphaned"
+            );
+            // And the pixels really are gone rather than merely
+            // unreachable by one route: a fresh `get` is blank.
+            let Ok(tile) = store.get(s, target) else {
+                unreachable!("a forgotten tile must be servable again as a blank one");
+            };
+            assert!(
+                tile.texels().iter().all(|sample| sample.to_f32() == 0.0),
+                "a forgotten tile must come back blank, not carrying its old pixels"
+            );
+
+            // Idempotent, and honest about having found nothing: the
+            // `get` above made it resident again, so forget it once more
+            // and then ask a third time.
+            assert!(store.forget_tile(s, target));
+            assert!(
+                !store.forget_tile(s, target),
+                "forgetting a tile nothing holds must report that it held nothing"
+            );
+        }
     }
 
     #[test]

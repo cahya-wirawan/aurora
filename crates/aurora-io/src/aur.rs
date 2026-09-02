@@ -443,7 +443,7 @@ enum ColorSpaceTag {
 /// are past the document ceiling in extent or origin,
 /// [`IoError::TooManyTiles`] if its layers and their masks together add
 /// up to more tiles than any real document has
-/// ([`MAX_TOTAL_TILES_PER_DOCUMENT`]), or [`IoError::Tile`] if paging a
+/// (`MAX_TOTAL_TILES_PER_DOCUMENT`), or [`IoError::Tile`] if paging a
 /// touched tile in from the scratch disk fails.
 ///
 /// All three rectangle/budget refusals come from the one hoisted
@@ -526,7 +526,7 @@ pub struct SkippedTile {
 /// Only a tile read is tolerated. A container/I/O failure, a bad
 /// manifest, a layer whose own bounds — or whose mask's bounds —
 /// exceed the document ceiling in extent or origin, or a tree whose
-/// grids together exceed [`MAX_TOTAL_TILES_PER_DOCUMENT`] still fail
+/// grids together exceed `MAX_TOTAL_TILES_PER_DOCUMENT` still fail
 /// the write outright: those say the *tree* is broken, not that one
 /// piece of input is unreadable. Disclosed rather than silently
 /// assumed, since it means this writer can refuse a whole autosave over
@@ -701,6 +701,15 @@ type AurDocument = (
 /// every one written with `profile: None` since), `Some` for one that
 /// embedded a real ICC profile.
 ///
+/// **A failed read commits nothing** (0.71.2). Tiles go into `store` as
+/// they are decoded, so a container whose *later* entries are corrupt
+/// has already written its earlier ones by the time it fails; every one
+/// of those is dropped again before this returns `Err`
+/// (`roll_back_committed_tiles`), so a rejected file cannot leave
+/// pixels resident under surface ids the caller's next document is
+/// about to claim. See `read_persisted_tiles` for what that fixed and
+/// the one case it cannot.
+///
 /// # Errors
 ///
 /// Returns [`IoError::Zip`]/[`IoError::Io`] for a real container/I/O
@@ -773,10 +782,70 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
 
-    for (surface, bounds) in persisted_surfaces(&manifest.layers) {
+    // Every tile this scan commits is recorded, and undone if the scan
+    // does not finish -- see `read_persisted_tiles` for why a partial
+    // read must not survive.
+    let mut committed: Vec<(SurfaceId, TileId)> = Vec::new();
+    if let Err(err) = read_persisted_tiles(&mut zip, &manifest.layers, store, &mut committed) {
+        roll_back_committed_tiles(store, &committed, &err);
+        return Err(err);
+    }
+
+    Ok((
+        manifest.layers,
+        history,
+        (manifest.canvas_width, manifest.canvas_height),
+        profile,
+    ))
+}
+
+/// [`read`]'s own tile scan: every grid position of every persisted
+/// surface, probed by name, decoded into `store` when an entry exists.
+///
+/// **Split out of [`read`] so that a failure part-way through is
+/// recoverable** (0.71.2). This writes into the *caller's live* store as
+/// it goes — deliberately, mirroring `crate::import::write_into_store`,
+/// since staging a whole document's pixels somewhere else first would
+/// double the memory and the scratch-disk traffic invariant §7.3.1
+/// exists to avoid. The cost of that shape is that a container whose
+/// *later* entries are corrupt has already committed its earlier ones,
+/// and until 0.71.2 nothing undid them: the tiles stayed resident under
+/// exactly the `SurfaceId`s the caller's next document was about to
+/// claim (a fresh `LayerTree` restarts layer ids, and so surface ids,
+/// from the bottom of the space), so a rejected file could show a user
+/// pixels from a document that failed to open — or, on `aurora-app`'s
+/// own "open a `.aur` file a user was sent" path, silently overwrite
+/// tiles of the document they already had open.
+///
+/// So every `(surface, tile)` this commits is pushed onto `committed`
+/// *after* the write succeeds, and [`read`] hands that list to
+/// [`roll_back_committed_tiles`] on any error. The list is bounded by
+/// the number of tile entries the archive actually holds (a grid
+/// position with no entry commits nothing and records nothing), at
+/// twelve bytes each.
+///
+/// 0.71.0 widened the window this closes rather than opening it: a
+/// masked layer now has a *second* surface whose entries can fail
+/// independently, after its content surface has already been committed
+/// in full.
+///
+/// # Errors
+///
+/// The tile-scan half of [`read`]'s own list: [`IoError::Zip`] /
+/// [`IoError::Io`] for a container failure, [`IoError::EntryTooLarge`]
+/// for an entry claiming or holding more bytes than one tile can, and
+/// [`IoError::Tile`] for one that fails to decode or decodes to the
+/// wrong sample count.
+fn read_persisted_tiles<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &LayerTree,
+    store: &mut TileStore,
+    committed: &mut Vec<(SurfaceId, TileId)>,
+) -> Result<(), IoError> {
+    for (surface, bounds) in persisted_surfaces(layers) {
         // Range-checked and charged against the whole-document budget
-        // already, by `validate_persisted_rects` above; this call is
-        // only here for the grid dimensions it returns.
+        // already, by `validate_persisted_rects`; this call is only
+        // here for the grid dimensions it returns.
         let (tiles_x, tiles_y) = tile_grid(bounds)?;
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
@@ -786,7 +855,8 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
                     Ok(file) => read_capped(file, &name, MAX_TILE_ENTRY_BYTES)?,
                     // No entry for this tile -- it was blank when
                     // written (see this module's own doc comment) and
-                    // stays at the store's own default.
+                    // stays at the store's own default. Nothing is
+                    // committed, so nothing is recorded for rollback.
                     Err(zip::result::ZipError::FileNotFound) => continue,
                     Err(err) => return Err(err.into()),
                 };
@@ -817,16 +887,57 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
                     width: TILE,
                     height: TILE,
                 });
+                // Recorded only now, after the write really landed.
+                // `store.get_mut` materializing a blank tile and then
+                // failing is not a case this can reach -- the `?` above
+                // returns first -- but recording after the fact means
+                // the list can never name a tile this scan did not
+                // actually put content into.
+                committed.push((surface, tile_id));
             }
         }
     }
+    Ok(())
+}
 
-    Ok((
-        manifest.layers,
-        history,
-        (manifest.canvas_width, manifest.canvas_height),
-        profile,
-    ))
+/// Drops every tile [`read_persisted_tiles`] committed before it
+/// failed, so a rejected container leaves the caller's store exactly as
+/// unpopulated (by this read) as it was before.
+///
+/// **This deletes pixels, and that is correct here.** Every key in
+/// `committed` is one this read itself wrote — the content came out of
+/// the container being rejected, not out of the caller's own document.
+/// The one case it is lossy is a caller that had already painted the
+/// *same* `(surface, tile)` before calling [`read`] and whose tile this
+/// read then overwrote: that tile's earlier content was destroyed by the
+/// overwrite itself, not by this rollback, and no amount of eviction
+/// here brings it back. `aurora-app` never does that — both of its
+/// read paths open a document *into* a store, they do not merge one
+/// into a live document — and the alternative (leaving the rejected
+/// file's pixels resident) is the failure this exists to prevent.
+///
+/// Failures are logged, never returned: this runs on an error path that
+/// already has a real error to report, and replacing that error with a
+/// store-eviction one would hide the reason the read failed. `err` is
+/// carried in only so the log line says which failure the rollback
+/// belongs to.
+fn roll_back_committed_tiles(
+    store: &mut TileStore,
+    committed: &[(SurfaceId, TileId)],
+    err: &IoError,
+) {
+    if committed.is_empty() {
+        return;
+    }
+    for &(surface, tile_id) in committed {
+        store.forget_tile(surface, tile_id);
+    }
+    tracing::warn!(
+        tiles = committed.len(),
+        %err,
+        "a .aur read failed part-way through; dropped every tile it had already committed to the \
+         tile store"
+    );
 }
 
 /// Reads one required entry's whole contents, or
@@ -3050,6 +3161,164 @@ mod tests {
     /// `read_rejects_an_unsupported_manifest_version`, since the real
     /// `ManifestWrite`/`ManifestRead` always write the current,
     /// supported version.
+    /// One tile's worth of real, valid `codec::encode` output, every
+    /// texel set to `value` -- what a container's tile entry actually
+    /// holds, produced through the same encoder the writer uses rather
+    /// than hand-rolled bytes.
+    fn encoded_tile(value: f32) -> Vec<u8> {
+        let (_dir, mut store) = real_tile_store();
+        let surface = aurora_tile::SurfaceId::from_raw(9_999);
+        let tile = match store.get_mut(surface, TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for sample in tile.texels_mut() {
+            *sample = f16::from_f32(value);
+        }
+        aurora_tile::codec::encode(tile.texels())
+    }
+
+    #[test]
+    fn a_read_that_fails_on_a_mask_tile_leaves_no_content_tile_behind_either() {
+        // The gap 0.71.2 closed, and 0.71.0 is what widened it: `read`
+        // decodes tiles straight into the caller's live store as it
+        // goes, and a masked layer now has *two* surfaces, walked one
+        // after the other. So a container whose mask entry is corrupt
+        // has already committed the layer's own content tile in full by
+        // the time it fails -- and until 0.71.2 that tile stayed
+        // resident, under exactly the `SurfaceId` the caller's next
+        // document was about to claim (a fresh `LayerTree` restarts
+        // layer ids, and so surface ids, from the bottom of the space).
+        //
+        // A real corrupted archive, not a mock: a real manifest, a real
+        // `codec::encode`d content tile, and a mask entry holding bytes
+        // `codec::decode` genuinely rejects.
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (Some(content_surface), Some(mask_surface)) =
+            (layers.surface_id(id), layers.mask_surface_id(id))
+        else {
+            unreachable!("a pixel layer with a mask has both surfaces");
+        };
+        // The two really are different surfaces -- otherwise this test
+        // would prove nothing about ordering.
+        assert_ne!(content_surface.to_raw(), mask_surface.to_raw());
+
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1000,
+            canvas_height: 1000,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let content_entry = super::tile_entry_name(content_surface, TileId { x: 0, y: 0 });
+        let mask_entry = super::tile_entry_name(mask_surface, TileId { x: 0, y: 0 });
+        let container = container_with(
+            &manifest_bytes,
+            &[
+                (content_entry, encoded_tile(0.75)),
+                // Not an ATIL frame at all. `codec::decode` refuses it,
+                // which is the mid-read failure this test needs -- and
+                // it comes *after* the content surface, because
+                // `persisted_surfaces` yields a layer's content before
+                // its mask.
+                (mask_entry, b"this is not an encoded tile".to_vec()),
+            ],
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        match read(container, &mut store) {
+            Err(super::IoError::Tile(_)) => {}
+            other => unreachable!("expected a tile decode failure, got {other:?}"),
+        }
+
+        // The whole point: nothing the failed read committed survives,
+        // on either surface it touched. `contains_tile` is the right
+        // question rather than reading pixels back -- `get` would
+        // materialize a blank tile and answer "clean" whether the
+        // rollback happened or not.
+        assert!(
+            !store.contains_tile(content_surface, TileId { x: 0, y: 0 }),
+            "the content tile committed before the failure must not stay resident"
+        );
+        assert!(
+            !store.contains_tile(mask_surface, TileId { x: 0, y: 0 }),
+            "no mask tile can survive a read that failed on one"
+        );
+        assert_eq!(
+            store.resident_len(),
+            0,
+            "a failed read must leave the store as empty as it found it"
+        );
+    }
+
+    #[test]
+    fn a_successful_read_still_commits_its_tiles() {
+        // The other side of the rollback: it must fire on failure only.
+        // Same container as the test above, with a *valid* mask entry
+        // in place of the corrupt one.
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (Some(content_surface), Some(mask_surface)) =
+            (layers.surface_id(id), layers.mask_surface_id(id))
+        else {
+            unreachable!("a pixel layer with a mask has both surfaces");
+        };
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1000,
+            canvas_height: 1000,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let container = container_with(
+            &manifest_bytes,
+            &[
+                (
+                    super::tile_entry_name(content_surface, TileId { x: 0, y: 0 }),
+                    encoded_tile(0.75),
+                ),
+                (
+                    super::tile_entry_name(mask_surface, TileId { x: 0, y: 0 }),
+                    encoded_tile(0.25),
+                ),
+            ],
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        if let Err(err) = read(container, &mut store) {
+            unreachable!("a valid container must still read: {err:?}");
+        }
+        assert!(
+            store.contains_tile(content_surface, TileId { x: 0, y: 0 }),
+            "a successful read must leave its content tile in the store"
+        );
+        assert!(
+            store.contains_tile(mask_surface, TileId { x: 0, y: 0 }),
+            "a successful read must leave its mask tile in the store"
+        );
+    }
+
     #[derive(serde::Serialize)]
     struct ManifestReadForTest {
         version: u32,

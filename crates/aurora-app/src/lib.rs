@@ -1541,11 +1541,20 @@ fn recover_document(
 /// **The store is replaced first**, the same reopen (and for the same
 /// reason) [`startup_document`] already performs after a failed
 /// recovery: `aurora_io::read_aur` writes each tile into the store as it
-/// goes, so an attempt that fails partway through leaves real pixels
+/// goes, so an attempt that fails partway through can leave real pixels
 /// behind on surfaces the partial container's own layers are about to
 /// claim. Recovering *into* those leftovers would show fragments of the
 /// container that failed to read, mixed into the document that
-/// succeeded. This takes `&mut Option<_>` for exactly that reason —
+/// succeeded.
+///
+/// Since 0.71.2 `read_aur` also rolls its own committed tiles back
+/// before returning `Err`, which closes that hole at its root and for
+/// *every* caller, this one included. The reopen stays anyway, as
+/// defence in depth on the one path where the cost is a fresh temp
+/// directory and the failure mode is showing a professional someone
+/// else's pixels: it is the only guard that does not depend on
+/// `aurora-io` getting its own rollback right. This takes
+/// `&mut Option<_>` for exactly that reason —
 /// `None` from [`open_tile_store`] means the session simply continues
 /// without painting, which is what `None` already means everywhere else
 /// on this path.
@@ -1692,11 +1701,16 @@ fn startup_document(
         };
     }
     if had_previous_marker {
-        // A recovery attempt that failed can still have committed real
-        // pixels: `aurora_io::read_aur` writes each tile into the store
-        // as it goes, so a container whose central directory is intact
-        // but whose *last* tile entry is corrupt leaves earlier
-        // surfaces already populated before it returns `Err`. Those are
+        // A recovery attempt that failed could still have committed
+        // real pixels: `aurora_io::read_aur` writes each tile into the
+        // store as it goes, so a container whose central directory is
+        // intact but whose *last* tile entry is corrupt left earlier
+        // surfaces already populated before it returned `Err` -- until
+        // 0.71.2, which made that read roll its own committed tiles
+        // back. This reopen is kept as defence in depth: it costs a
+        // fresh temp directory once per failed recovery, and it is the
+        // only guard here that does not rest on another crate's
+        // rollback being right. Those surfaces are
         // the same `SurfaceId`s [`demo_document`]'s own fresh layers are
         // about to claim, so keeping the store would show the user
         // fragments of the document that failed to recover, painted
