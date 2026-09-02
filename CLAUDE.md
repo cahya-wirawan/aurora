@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-**A real, running editor — Phase 1 in progress.** As of `0.71.4`: roughly 83,800 lines across 20 crates, 1,376 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
+**A real, running editor — Phase 1 in progress.** As of `0.73.0`: roughly 83,800 lines across 20 crates, 1,390 tests passing, and the full CI gate green. The app opens PNG/JPEG/TIFF and Aurora's own round-tripping `.aur` format; paints and erases real pixels with undo/redo; pans and zooms; handles multiple layers and groups with opacity, masks with real per-pixel grayscale coverage, and all 27 PSD-compatible blend modes composited for real (a GPU fast path for the common case, a CPU path for groups and every other blend mode); and saves the full composite, not just the active layer. Verified interactively on real macOS hardware, including a screen reader announcing the window.
 
 Five crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-text`, `aurora-filters`, `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. Everything else is real code.
 
@@ -130,7 +130,7 @@ The workspace denies `unwrap`, `expect`, `panic`, and `indexing_slicing` (root `
 
 ## Versioning
 
-SemVer, started at `0.0.1`, currently `0.71.4`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
+SemVer, started at `0.0.1`, currently `0.73.0`. The single source of truth is `[workspace.package].version` in the root `Cargo.toml`; every crate inherits it via `version.workspace = true` — bump it in exactly one place. The commit subject carries the new version in parentheses, e.g. `Clamp canvas pan to the document's own top-left edge (0.47.1)`.
 
 - **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
 - **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.
@@ -224,7 +224,14 @@ tests assert a deliberately loose CI-safety threshold (350 ms / 180 ms) because
 they exist to produce a true number, not to pass at 60 FPS; do not read a green
 run as the budget being met. Later work reduced *how much* gets recomposited per
 edit, not the per-tile cost, and none of it has been re-measured on real GPU
-hardware.
+hardware. As of 0.73.0 the brush/eraser, undo/redo and active-layer-switch paths
+all invalidate the composite cache narrowly; only a live Move still bumps the
+whole thing, because the composite tile grid is anchored to the *active layer's*
+own origin, so dragging that layer re-anchors every tile at once. Re-anchoring
+the grid to the document instead is the named follow-on (PLAN.md, Incremental
+compositing). **None of that is progress against the 60 FPS gate** — it buys
+Ctrl+Z and Layers-panel click latency, on a different path from the one measured
+above.
 
 **PSD/PSB is full layered read *and* write** (PRD FR-001) — Aurora round-trips, so a file edited here must reopen in Photoshop with layers intact. Two rules follow: never overwrite a user's file in place (write to temp, verify by reopening, then swap), and warn with an itemized list before any lossy save. Silently degrading a professional's file is the worst failure this project can have.
 

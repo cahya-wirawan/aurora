@@ -382,6 +382,37 @@ impl PixelHistory {
         self.redo.clear();
     }
 
+    /// The stroke [`Self::undo`] would restore next, without restoring
+    /// it — `None` exactly when [`Self::can_undo`] is `false`.
+    ///
+    /// Purely a read: nothing is popped, nothing is applied, and the
+    /// store is not consulted at all. It exists so a caller can find out
+    /// *which tiles on which surface* the next undo is about to rewrite
+    /// **before** that undo happens, which is the only moment the
+    /// information is still available — `undo` itself reports a bare
+    /// `bool`, and by the time it has returned the snapshot has been
+    /// replaced by its own inverse. `aurora-app` uses this to invalidate
+    /// exactly the composite tiles an undo will change instead of
+    /// throwing its whole composite cache away.
+    ///
+    /// The tiles reported are precisely the set [`StrokeSnapshot::apply`]
+    /// will write ([`StrokeSnapshot::captured`]), on
+    /// [`StrokeSnapshot::surface`] — same snapshot, same call, so the two
+    /// cannot drift apart.
+    #[must_use]
+    pub fn peek_undo(&self) -> Option<&StrokeSnapshot> {
+        self.undo.last()
+    }
+
+    /// The stroke [`Self::redo`] would reapply next, without reapplying
+    /// it — [`Self::peek_undo`]'s counterpart on the other stack, with
+    /// the same guarantees, and `None` exactly when [`Self::can_redo`] is
+    /// `false`.
+    #[must_use]
+    pub fn peek_redo(&self) -> Option<&StrokeSnapshot> {
+        self.redo.last()
+    }
+
     /// Undoes the most recently pushed stroke, if any. `Ok(false)` (not
     /// an error) when there was nothing to undo — check
     /// [`Self::can_undo`] first if the distinction matters.
@@ -679,6 +710,111 @@ mod tests {
         assert!(
             !history.can_redo(),
             "new activity must invalidate the old redo entry"
+        );
+    }
+
+    /// [`PixelHistory::peek_undo`] has one job: report the surface and
+    /// tile set the *following* `undo` will actually rewrite, so a
+    /// caller can invalidate exactly those and nothing else. Asserted
+    /// against the real `undo` rather than against the snapshot the test
+    /// pushed, so the two can't drift apart.
+    #[test]
+    fn peek_undo_reports_the_same_surface_and_tiles_the_following_undo_restores() {
+        let (_dir, mut store) = real_tile_store();
+        let touched = [TileId { x: 0, y: 0 }, TileId { x: 3, y: 2 }];
+        for tile in touched {
+            fill(&mut store, tile, 0.25);
+        }
+
+        let mut stroke = StrokeSnapshot::new(surface());
+        for tile in touched {
+            if let Err(err) = stroke.record_touch(&mut store, tile) {
+                unreachable!("{err:?}");
+            }
+        }
+        for tile in touched {
+            fill(&mut store, tile, 0.75);
+        }
+
+        let mut history = PixelHistory::new();
+        assert!(history.push(stroke));
+
+        let (peeked_surface, mut peeked): (aurora_tile::SurfaceId, Vec<TileId>) =
+            match history.peek_undo() {
+                Some(next) => (next.surface(), next.captured().collect()),
+                None => unreachable!("a stroke was just pushed"),
+            };
+        peeked.sort_by_key(|tile| (tile.x, tile.y));
+        assert_eq!(peeked_surface, surface());
+        assert_eq!(peeked, touched.to_vec());
+
+        // Nothing was consumed by peeking, and the tiles it named are
+        // exactly the ones the real undo rewrites.
+        match history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        for tile in touched {
+            assert!(
+                (first_sample(&mut store, tile) - 0.25).abs() < 1e-3,
+                "{tile:?} must be restored to its pre-stroke content"
+            );
+        }
+    }
+
+    /// The same contract on the redo stack, plus the empty-stack case
+    /// for both — `None` exactly when there is nothing to peek at.
+    #[test]
+    fn peek_redo_reports_the_next_redo_and_both_peeks_are_none_on_an_empty_stack() {
+        let (_dir, mut store) = real_tile_store();
+        let tile = TileId { x: 1, y: 1 };
+        fill(&mut store, tile, 0.25);
+
+        let mut history = PixelHistory::new();
+        assert!(
+            history.peek_undo().is_none(),
+            "nothing pushed yet, so nothing to undo"
+        );
+        assert!(
+            history.peek_redo().is_none(),
+            "nothing undone yet, so nothing to redo"
+        );
+
+        let mut stroke = StrokeSnapshot::new(surface());
+        if let Err(err) = stroke.record_touch(&mut store, tile) {
+            unreachable!("{err:?}");
+        }
+        fill(&mut store, tile, 0.75);
+        assert!(history.push(stroke));
+        assert!(
+            history.peek_redo().is_none(),
+            "a fresh push leaves the redo stack empty"
+        );
+
+        match history.undo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(
+            history.peek_undo().is_none(),
+            "the only stroke moved to the redo stack"
+        );
+        let peeked: Vec<TileId> = match history.peek_redo() {
+            Some(next) => {
+                assert_eq!(next.surface(), surface());
+                next.captured().collect()
+            }
+            None => unreachable!("the undone stroke is now redoable"),
+        };
+        assert_eq!(peeked, vec![tile]);
+
+        match history.redo(&mut store) {
+            Ok(true) => {}
+            other => unreachable!("expected Ok(true), got {other:?}"),
+        }
+        assert!(
+            (first_sample(&mut store, tile) - 0.75).abs() < 1e-3,
+            "the redo must put the stroke's own content back"
         );
     }
 

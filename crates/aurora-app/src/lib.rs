@@ -2817,6 +2817,67 @@ impl UndoOrder {
     }
 }
 
+/// One pixel-history undo *or* redo, whole: peek at the stroke the call
+/// is about to restore, apply it, and report what that changed in
+/// document space.
+///
+/// **The peek has to happen first, and this is the only place it can.**
+/// `aurora_brush::PixelHistory::undo`/`redo` report a bare `bool`, and
+/// by the time either returns, the snapshot naming the touched tiles has
+/// moved to the opposite stack replaced by its own inverse. The tile set
+/// is copied out rather than borrowed so the immutable borrow ends
+/// before the mutable one begins.
+///
+/// `None` means nothing was applied — an empty stack or a failed restore
+/// — so the caller must leave its own undo-order bookkeeping alone.
+/// `Some` carries what to invalidate, which is
+/// [`CompositeInvalidation::Everything`] when the stroke's own layer
+/// can't be placed in document space any more (see
+/// [`stroke_invalidation`]).
+fn apply_pixel_step(
+    layers: &aurora_doc::LayerTree,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    store: &mut aurora_tile::TileStore,
+    direction: UndoDirection,
+) -> Option<CompositeInvalidation> {
+    let peeked = match direction {
+        UndoDirection::Undo => pixel_history.peek_undo(),
+        UndoDirection::Redo => pixel_history.peek_redo(),
+    }
+    .map(|stroke| (stroke.surface(), stroke.captured().collect::<Vec<_>>()));
+    let applied = match direction {
+        UndoDirection::Undo => pixel_history.undo(store),
+        UndoDirection::Redo => pixel_history.redo(store),
+    };
+    match applied {
+        Ok(true) => Some(
+            peeked.map_or(CompositeInvalidation::Everything, |(surface, tiles)| {
+                stroke_invalidation(layers, surface, &tiles)
+            }),
+        ),
+        Ok(false) => {
+            tracing::warn!(
+                ?direction,
+                "pixel history had nothing to apply, unexpectedly"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(?err, ?direction, "pixel undo/redo failed");
+            None
+        }
+    }
+}
+
+/// Which way [`apply_pixel_step`] is stepping — the one difference
+/// between [`run_command`]'s two pixel arms, which are otherwise the
+/// same handful of lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UndoDirection {
+    Undo,
+    Redo,
+}
+
 /// Runs a global shortcut's own command — [`handle_key`]'s dispatch
 /// target once a [`KeyChord`] resolves via [`ShortcutRegistry::resolve`].
 ///
@@ -2835,6 +2896,17 @@ impl UndoOrder {
 /// ([`refresh_history_panel`]) since undoing/redoing is itself a
 /// journaled step; a pixel undo/redo has no such panel to refresh — the
 /// canvas alone shows the result, on the next redraw.
+///
+/// **The return value is what the caller must invalidate in the
+/// composite cache**, and every arm except `Undo`/`Redo` returns
+/// [`CompositeInvalidation::None`] — not because "nothing changed" is a
+/// deep truth about them, but because none of them touches the document
+/// model at all today (focus, the command palette, tool selection).
+/// **This is a trap for whoever adds the next layer-mutating command
+/// here**: a new arm that edits `layers` and leaves the `None` in place
+/// will composite stale tiles, silently, with no test failing — so a new
+/// arm must return its own [`CompositeInvalidation::Regions`], or
+/// [`CompositeInvalidation::Everything`] if it can't name one.
 #[allow(clippy::too_many_arguments)]
 fn run_command(
     workspace: &mut aurora_ui::Workspace,
@@ -2847,72 +2919,97 @@ fn run_command(
     store: Option<&mut aurora_tile::TileStore>,
     undo_order: &mut UndoOrder,
     command: AppCommand,
-) {
+) -> CompositeInvalidation {
     match command {
         AppCommand::FocusNext => {
             focus.focus_next(&mut workspace.tree);
+            CompositeInvalidation::None
         }
         AppCommand::FocusPrevious => {
             focus.focus_previous(&mut workspace.tree);
+            CompositeInvalidation::None
         }
-        AppCommand::ToggleCommandPalette => toggle_command_palette(workspace, focus, palette),
+        AppCommand::ToggleCommandPalette => {
+            toggle_command_palette(workspace, focus, palette);
+            CompositeInvalidation::None
+        }
         AppCommand::SelectTool(selected) => {
             *tool = selected;
             refresh_properties_panel(workspace, selected);
+            CompositeInvalidation::None
         }
         AppCommand::Undo => match undo_order.undo.last().copied() {
+            // The `Rect` `History::undo` returns is the region the
+            // reverted step dirtied, and `aurora-doc`'s own `apply`
+            // guarantees it is a superset of what that step really
+            // changed (a reverted `SetBounds` reports `old ∪ new`, so
+            // the vacated territory is repainted too). `None` conflates
+            // "nothing to undo" with "a group-level change whose extent
+            // isn't knowable" -- both are safe to treat as `Everything`,
+            // the first being a full recomposite of a document nothing
+            // changed in, which is wasteful but never wrong.
             Some(UndoKind::Structural) => match history.undo(layers) {
-                Ok(_) => {
+                Ok(dirty) => {
                     undo_order.undo.pop();
                     undo_order.redo.push(UndoKind::Structural);
                     refresh_history_panel(workspace, history);
+                    dirty.map_or(CompositeInvalidation::Everything, |rect| {
+                        CompositeInvalidation::Regions(vec![rect])
+                    })
                 }
-                Err(err) => tracing::warn!(?err, "undo failed"),
+                Err(err) => {
+                    tracing::warn!(?err, "undo failed");
+                    CompositeInvalidation::None
+                }
             },
             Some(UndoKind::Pixel) => {
                 if let Some(store) = store {
-                    match pixel_history.undo(store) {
-                        Ok(true) => {
+                    match apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo) {
+                        Some(invalidation) => {
                             undo_order.undo.pop();
                             undo_order.redo.push(UndoKind::Pixel);
+                            invalidation
                         }
-                        Ok(false) => {
-                            tracing::warn!("pixel history had nothing to undo, unexpectedly");
-                        }
-                        Err(err) => tracing::warn!(?err, "pixel undo failed"),
+                        None => CompositeInvalidation::None,
                     }
                 } else {
                     tracing::warn!("no live tile store; cannot undo a pixel edit");
+                    CompositeInvalidation::None
                 }
             }
-            None => {}
+            None => CompositeInvalidation::None,
         },
         AppCommand::Redo => match undo_order.redo.last().copied() {
             Some(UndoKind::Structural) => match history.redo(layers) {
-                Ok(_) => {
+                Ok(dirty) => {
                     undo_order.redo.pop();
                     undo_order.undo.push(UndoKind::Structural);
                     refresh_history_panel(workspace, history);
+                    dirty.map_or(CompositeInvalidation::Everything, |rect| {
+                        CompositeInvalidation::Regions(vec![rect])
+                    })
                 }
-                Err(err) => tracing::warn!(?err, "redo failed"),
+                Err(err) => {
+                    tracing::warn!(?err, "redo failed");
+                    CompositeInvalidation::None
+                }
             },
             Some(UndoKind::Pixel) => {
                 if let Some(store) = store {
-                    match pixel_history.redo(store) {
-                        Ok(true) => {
+                    match apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo) {
+                        Some(invalidation) => {
                             undo_order.redo.pop();
                             undo_order.undo.push(UndoKind::Pixel);
+                            invalidation
                         }
-                        Ok(false) => {
-                            tracing::warn!("pixel history had nothing to redo, unexpectedly");
-                        }
-                        Err(err) => tracing::warn!(?err, "pixel redo failed"),
+                        None => CompositeInvalidation::None,
                     }
                 } else {
                     tracing::warn!("no live tile store; cannot redo a pixel edit");
+                    CompositeInvalidation::None
                 }
             }
-            None => {}
+            None => CompositeInvalidation::None,
         },
     }
 }
@@ -4470,10 +4567,22 @@ fn clamp_pan_to_active_layer(
 /// pan half was the missing counterpart, and an undone Move reproduced
 /// the same `canvas_local_origin` divergence a layer *switch* does.
 ///
-/// Unconditional rather than "only when the command really was a
-/// structural one": both are idempotent no-ops when nothing moved (the
-/// clamp leaves a pan already within its bound untouched), and
-/// `run_command` deliberately reports nothing back about what it ran.
+/// The pan clamp stays unconditional — it is an idempotent no-op when
+/// nothing moved (a pan already within its bound is left untouched), and
+/// it is unrelated to what the command changed *inside* the document.
+///
+/// **The cache half is no longer unconditional, and one thing is what
+/// makes that safe** (0.73.0): [`perform_undo_redo`] re-reads
+/// [`composite_reference_origin`] after `run_command` and forces
+/// [`CompositeInvalidation::Everything`] if it moved. Without that, an
+/// undone Move would arrive here as a narrow `Regions` — and a Move
+/// shifts the grid anchor itself, so *every* cached `TileId` would then
+/// name a different document window, with only the handful of tiles the
+/// narrow rect happened to touch getting recomputed and the rest left
+/// showing content from the old anchor. That is why `Regions` may be
+/// resolved against the post-command anchor here: on that branch the
+/// caller has already established that before == after.
+///
 /// Kept a free function so the pairing is testable with no `App` — and
 /// therefore no GPU adapter — to build.
 fn after_undo_redo(
@@ -4482,8 +4591,18 @@ fn after_undo_redo(
     active_layer: Option<aurora_doc::LayerId>,
     composite_cache: &mut CompositeCache,
     canvas_size: Option<(f32, f32)>,
+    invalidation: &CompositeInvalidation,
 ) {
-    composite_cache.bump();
+    match invalidation {
+        CompositeInvalidation::None => {}
+        CompositeInvalidation::Regions(rects) => {
+            let reference_origin = composite_reference_origin(layers, active_layer);
+            for rect in rects {
+                composite_cache.invalidate_doc_rect(*rect, reference_origin);
+            }
+        }
+        CompositeInvalidation::Everything => composite_cache.bump(),
+    }
     clamp_pan_to_active_layer(view, layers, active_layer, canvas_size);
 }
 
@@ -4543,7 +4662,7 @@ fn perform_undo_redo(
     active_layer: Option<aurora_doc::LayerId>,
     drag: &mut Option<Drag>,
     command: AppCommand,
-) {
+) -> CompositeInvalidation {
     let canvas_size = canvas_area_logical_size(workspace);
     commit_ending_drag(
         drag.take(),
@@ -4555,7 +4674,25 @@ fn perform_undo_redo(
         active_layer,
         canvas_size,
     );
-    run_command(
+    // **The safety guard for the whole narrowed-invalidation scheme.**
+    // Read the composite grid's anchor immediately before the command
+    // and again immediately after. `run_command` reports what changed
+    // *inside* the document, in absolute document coordinates -- it has
+    // no way to know that the frame those coordinates get converted into
+    // `TileId`s through has itself moved. Undoing or redoing a Move is
+    // exactly that case: `LayerOp::SetBounds` on the active layer
+    // shifts `composite_reference_origin`, which re-points every cached
+    // `TileId` at a different document window at once. Narrowing there
+    // would recompute only the tiles the (correct, `old ∪ new`) rect
+    // touches and leave every other cached tile showing content
+    // composited under the old anchor -- comprehensively wrong, and
+    // invisible to any test that only compares the tiles the rect
+    // covers. `active_layer` itself cannot change across `run_command`
+    // (it is a `Copy` argument, not a `&mut`), so the layer's own
+    // `bounds` moving under it is the only way this fires -- which is
+    // precisely the Move case.
+    let anchor_before = composite_reference_origin(layers, active_layer);
+    let reported = run_command(
         workspace,
         focus,
         palette,
@@ -4567,7 +4704,20 @@ fn perform_undo_redo(
         undo_order,
         command,
     );
-    after_undo_redo(view, layers, active_layer, composite_cache, canvas_size);
+    let invalidation = if composite_reference_origin(layers, active_layer) == anchor_before {
+        reported
+    } else {
+        CompositeInvalidation::Everything
+    };
+    after_undo_redo(
+        view,
+        layers,
+        active_layer,
+        composite_cache,
+        canvas_size,
+        &invalidation,
+    );
+    invalidation
 }
 
 /// The reserved `aurora_tile::SurfaceId` this crate uses for its own
@@ -6732,6 +6882,202 @@ impl CompositeCache {
     fn mark_current(&mut self, id: aurora_tile::TileId) {
         self.current.insert(id);
     }
+
+    /// Invalidates every cached tile that `rect` — a **document-space**
+    /// region, measured in the same absolute frame
+    /// `aurora_doc::LayerKind::Pixel`'s own `bounds` are — actually
+    /// overlaps, against a grid anchored at `reference_origin`. The
+    /// region-shaped counterpart to [`Self::invalidate`], for a caller
+    /// that knows what changed as a rectangle rather than as a tile list
+    /// (an undo/redo: `aurora_doc::History::undo` returns the rect it
+    /// dirtied, and `aurora_brush::PixelHistory::peek_undo` names the
+    /// tiles the next undo will rewrite).
+    ///
+    /// **`reference_origin` must be the anchor the cached tiles were
+    /// composited under** — [`composite_reference_origin`] for the
+    /// *current* active layer. A `TileId` means nothing without it, so
+    /// calling this across a change that moved the anchor would
+    /// invalidate the wrong tiles and leave stale ones current;
+    /// [`perform_undo_redo`]'s own before/after check is what guarantees
+    /// the anchor did not move on the path that reaches here.
+    ///
+    /// **Retained in place, deliberately not expanded into a tile list.**
+    /// Converting `rect` to the `TileId`s it covers would allocate up to
+    /// one id per tile of the region, and at the 300,000 × 300,000 px
+    /// document ceiling a single layer's bounds is ~1,373,000 tiles —
+    /// an unbounded allocation driven by document size, to invalidate a
+    /// cache that only ever holds the tiles a session actually visited.
+    /// Retaining costs one overlap test per *cached* tile instead, which
+    /// is bounded by what the cache holds.
+    fn invalidate_doc_rect(&mut self, rect: aurora_core::Rect, reference_origin: (i64, i64)) {
+        self.current
+            .retain(|&id| !tile_overlaps_doc_rect(id, rect, reference_origin));
+    }
+}
+
+/// Whether composite tile `id`, on a grid anchored at
+/// `reference_origin`, covers any pixel of the document-space region
+/// `rect`.
+///
+/// **Half-open on both sides**, the same convention
+/// `aurora_core::Rect` itself uses: a tile owns
+/// `[x0, x0 + TILE) × [y0, y0 + TILE)`, and a rect owns
+/// `[x, x + width) × [y, y + height)`. So a rect ending *exactly* at a
+/// tile's first pixel does not touch that tile, and a rect starting
+/// exactly at a tile's last-pixel-plus-one does not either. Getting this
+/// edge wrong in the permissive direction only wastes work; getting it
+/// wrong in the strict direction leaves a one-pixel-wide stale seam in
+/// the composite that no later redraw ever repairs, which is why both
+/// directions have their own test.
+///
+/// **A zero-width or zero-height rect touches nothing**, and returns
+/// `false` before any arithmetic — an empty region is what
+/// `aurora_core::Rect::union` produces as its own identity, so it does
+/// reach here (an undone `SetBounds` between two empty layers, say), and
+/// treating it as "touches the tile at its corner" would invalidate a
+/// tile for a change that could not have altered a single texel.
+///
+/// **All arithmetic in `i64`, never a cast.** `aurora_tile::TileId`'s
+/// own fields are `u32`, so document territory left of or above
+/// `reference_origin` has no `TileId` at all; the comparison has to
+/// happen in a signed type wide enough for both, and `i64::from` is
+/// lossless for every `u32`. `saturating_*` rather than plain operators
+/// so that a crafted id/rect cannot overflow-panic a debug build — with
+/// real values it can never trigger (a `u32` tile index times 256 is at
+/// most ~1.1e12, and `aurora_core::MAX_DOCUMENT_ORIGIN` bounds the
+/// origins), so this is belt-and-braces, not a behaviour a caller should
+/// rely on.
+#[must_use]
+fn tile_overlaps_doc_rect(
+    id: aurora_tile::TileId,
+    rect: aurora_core::Rect,
+    reference_origin: (i64, i64),
+) -> bool {
+    if rect.width == 0 || rect.height == 0 {
+        return false;
+    }
+    let tile_size = i64::from(aurora_tile::TILE);
+    let tile_x0 = reference_origin
+        .0
+        .saturating_add(i64::from(id.x).saturating_mul(tile_size));
+    let tile_y0 = reference_origin
+        .1
+        .saturating_add(i64::from(id.y).saturating_mul(tile_size));
+    let tile_x1 = tile_x0.saturating_add(tile_size);
+    let tile_y1 = tile_y0.saturating_add(tile_size);
+    let rect_x1 = rect.x.saturating_add(i64::from(rect.width));
+    let rect_y1 = rect.y.saturating_add(i64::from(rect.height));
+    rect.x < tile_x1 && rect_x1 > tile_x0 && rect.y < tile_y1 && rect_y1 > tile_y0
+}
+
+/// What an already-applied command changed about the composite, as
+/// reported by [`run_command`] and dispatched by [`after_undo_redo`].
+///
+/// The point of the type is that "I don't know" is a *named* answer
+/// rather than the absence of one. Before it, `run_command` returned
+/// nothing at all and its one caller compensated with an unconditional
+/// [`CompositeCache::bump`] — correct, but it paid a whole visible
+/// grid's recomposite for every Ctrl+Z, including the overwhelmingly
+/// common case of undoing a stroke that touched one or two tiles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompositeInvalidation {
+    /// Nothing composited changed — either the command wasn't a document
+    /// edit at all, or it failed and was not applied.
+    None,
+    /// Exactly these document-space regions changed, in the absolute
+    /// frame `aurora_doc::LayerKind::Pixel`'s own `bounds` use. Every
+    /// composite tile overlapping any of them needs recomputing; every
+    /// other cached tile is still valid.
+    Regions(Vec<aurora_core::Rect>),
+    /// The changed region isn't knowable (a group-level change, whose
+    /// on-canvas extent needs subtree-bounds aggregation `aurora-doc`
+    /// deliberately doesn't have yet), **or** the grid anchor itself
+    /// moved, which re-points every cached `TileId` at a different
+    /// document window at once. Recomposite everything.
+    Everything,
+}
+
+/// The [`aurora_doc::LayerId`] whose own pixel surface is `surface`, by
+/// scanning the tree — `None` if no layer in `layers` owns it (the layer
+/// was deleted since the stroke that captured it was recorded).
+///
+/// **A real scan, not a reversal of `LayerTree::surface_id`'s derived-id
+/// trick.** That method happens to reuse a `LayerId`'s own raw value
+/// today, and inverting it here would be one line — but it would make
+/// this function silently wrong the moment that derivation changes,
+/// with nothing in either crate saying the two are coupled. Documents
+/// hold tens of layers, this runs once per undo/redo of a stroke, and
+/// `layers.len()` bounds the walk.
+#[must_use]
+fn layer_for_surface(
+    layers: &aurora_doc::LayerTree,
+    surface: aurora_tile::SurfaceId,
+) -> Option<aurora_doc::LayerId> {
+    let mut stack: Vec<aurora_doc::LayerId> = layers.roots().to_vec();
+    // One visit per layer the tree actually holds. Only ever exhausted
+    // by a malformed (cyclic) tree, which `LayerTree`'s own
+    // `Deserialize` already rejects -- the same belt-and-braces bound
+    // `LayerTree::paint_order` uses for the same walk, for the same
+    // reason: this is reached from an edit path, and "the tree is
+    // somehow cyclic" must stay a wrong answer rather than a hang.
+    let mut budget = layers.len();
+    while let Some(id) = stack.pop() {
+        if budget == 0 {
+            tracing::warn!(
+                ?surface,
+                "gave up scanning for a stroke's own layer; treating it as unknown"
+            );
+            return None;
+        }
+        budget -= 1;
+        if layers.surface_id(id) == Some(surface) {
+            return Some(id);
+        }
+        if let Some(children) = layers.children(id) {
+            stack.extend_from_slice(children);
+        }
+    }
+    None
+}
+
+/// The document-space regions a pixel undo/redo is about to rewrite:
+/// one whole-tile rect per captured `aurora_tile::TileId`, translated
+/// out of the owning layer's own surface-local tile grid into absolute
+/// document space by that layer's own `bounds` origin.
+///
+/// [`CompositeInvalidation::Everything`] when the owning layer can't be
+/// found or has no bounds — a stroke whose layer was deleted after the
+/// stroke was recorded still has to invalidate *something*, and an empty
+/// [`CompositeInvalidation::Regions`] would silently invalidate nothing
+/// at all.
+#[must_use]
+fn stroke_invalidation(
+    layers: &aurora_doc::LayerTree,
+    surface: aurora_tile::SurfaceId,
+    tiles: &[aurora_tile::TileId],
+) -> CompositeInvalidation {
+    let Some(layer) = layer_for_surface(layers, surface) else {
+        return CompositeInvalidation::Everything;
+    };
+    let Some(bounds) = layers.bounds(layer) else {
+        return CompositeInvalidation::Everything;
+    };
+    let tile_size = i64::from(aurora_tile::TILE);
+    CompositeInvalidation::Regions(
+        tiles
+            .iter()
+            .map(|tile| aurora_core::Rect {
+                x: bounds
+                    .x
+                    .saturating_add(i64::from(tile.x).saturating_mul(tile_size)),
+                y: bounds
+                    .y
+                    .saturating_add(i64::from(tile.y).saturating_mul(tile_size)),
+                width: aurora_tile::TILE,
+                height: aurora_tile::TILE,
+            })
+            .collect(),
+    )
 }
 
 /// What a [`read_layer_window`] call is reading, which decides how a
@@ -9032,6 +9378,12 @@ impl App {
             &mut self.drag,
             command,
         );
+        // `App` itself has nothing further to do with the report -- the
+        // cache it names has already been invalidated inside. It is
+        // returned so a test can assert *which* invalidation a given
+        // undo/redo produced, which is the only way to pin the
+        // anchor-moved guard down directly rather than by inferring it
+        // from pixels that might agree by coincidence.
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -10980,34 +11332,34 @@ mod tests {
         COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
-        ClipboardAccess, CompositeBudget, CompositeCache, Drag, ERASER_RADIUS,
-        EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord, MOVE_REFUSED_DISMISS, Modifiers,
-        NamedKey, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize, ShutdownState,
-        UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
-        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
-        autosave_path, background_color_from_theme, begin_drag, brush_stroke_mut,
-        canvas_area_logical_size, canvas_area_physical_rect, canvas_area_physical_size,
-        canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer, clean_shutdown_cleanup,
-        clear_session_marker, close_command_palette, close_dialog, collect_widget_paints,
-        commit_ending_drag, composite_document, composite_reference_origin, composite_surface_id,
-        continue_drag, crash_recovery_dialog_message, create_dir_owner_only,
+        ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, Drag,
+        ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord,
+        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PanBounds, PointerButton,
+        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, ShutdownState, UndoKind, UndoOrder,
+        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
+        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
+        begin_drag, brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
+        composite_surface_id, continue_drag, crash_recovery_dialog_message, create_dir_owner_only,
         create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
         document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
         effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
         eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
         handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        incomplete_composite_message, is_aur_path, layer_local_point, load_document_view,
-        load_scales, load_theme, logical_point, logical_size, mark_move_refusal_reported,
-        move_refusal_unreported, move_refused_dialog_actions, move_refused_message,
-        open_command_palette, open_crash_recovery_dialog, open_dialog, open_image, open_tile_store,
-        palette_commands, pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
-        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
-        select_layer, shift_bounds, splitmix64, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
+        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
+        run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds, splitmix64,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
+        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     use aurora_doc::SelectionSet;
     use aurora_ui::{CanvasView, Tool};
@@ -11835,7 +12187,11 @@ mod tests {
         );
 
         cache.mark_current(aurora_tile::TileId { x: 0, y: 0 });
-        run_command(
+        // `perform_undo_redo`'s own guard, spelled out: the anchor is
+        // read across `run_command`, and an anchor that moved forces
+        // `Everything` no matter what the command reported.
+        let anchor_before = composite_reference_origin(&layers, active_layer);
+        let reported = run_command(
             &mut workspace,
             &mut focus,
             &mut palette,
@@ -11847,6 +12203,11 @@ mod tests {
             &mut undo_order,
             AppCommand::Undo,
         );
+        let invalidation = if composite_reference_origin(&layers, active_layer) == anchor_before {
+            reported
+        } else {
+            CompositeInvalidation::Everything
+        };
         assert_eq!(
             layers.bounds(moved),
             Some(moved_layer_bounds()),
@@ -11861,7 +12222,14 @@ mod tests {
             "setup: the undo really does reopen the divergence: ({before_x}, {before_y})"
         );
 
-        after_undo_redo(&mut view, &layers, active_layer, &mut cache, None);
+        after_undo_redo(
+            &mut view,
+            &layers,
+            active_layer,
+            &mut cache,
+            None,
+            &invalidation,
+        );
 
         let (local_x, local_y) =
             canvas_local_origin(&view, active_layer_origin(&layers, active_layer));
@@ -20531,6 +20899,519 @@ mod tests {
         );
     }
 
+    // -- `CompositeCache::invalidate_doc_rect` and the narrowed
+    // undo/redo invalidation it backs (0.73.0). These are pure,
+    // headless tests: no GPU adapter, no `App`. The differential
+    // real-GPU test further down is what proves the narrowed path and a
+    // full `bump()` agree texel for texel.
+
+    #[test]
+    fn invalidate_doc_rect_invalidates_a_tile_the_rect_touches_by_one_pixel() {
+        let mut cache = CompositeCache::default();
+        let tile = aurora_tile::TileId { x: 1, y: 1 };
+        cache.mark_current(tile);
+
+        // Tile (1, 1) owns [256, 512) x [256, 512) at a (0, 0) anchor.
+        // This rect ends at 257, so it covers exactly the tile's own
+        // first pixel (256, 256) and nothing else of it.
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 200,
+                y: 200,
+                width: 57,
+                height: 57,
+            },
+            (0, 0),
+        );
+        assert!(
+            !cache.is_current(tile),
+            "one shared pixel is a real overlap; missing it leaves a stale seam"
+        );
+    }
+
+    #[test]
+    fn invalidate_doc_rect_leaves_a_tile_the_rect_only_abuts() {
+        let mut cache = CompositeCache::default();
+        let far = aurora_tile::TileId { x: 1, y: 1 };
+        let near = aurora_tile::TileId { x: 0, y: 0 };
+        cache.mark_current(far);
+        cache.mark_current(near);
+
+        // Direction 1: the rect ends exactly where tile (1, 1) begins.
+        // Half-open, so 256 is not one of its own pixels.
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 200,
+                y: 200,
+                width: 56,
+                height: 56,
+            },
+            (0, 0),
+        );
+        assert!(
+            cache.is_current(far),
+            "a rect ending at a tile's first pixel does not touch that tile"
+        );
+
+        // Direction 2: the rect begins exactly where tile (0, 0) ends.
+        // Re-marked first: direction 1's own rect genuinely overlaps
+        // tile (0, 0) (it lives at (200, 200)), so `near` was correctly
+        // invalidated by that call and has to be current again for this
+        // half to be testing anything.
+        cache.mark_current(near);
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 256,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            (0, 0),
+        );
+        assert!(
+            cache.is_current(near),
+            "a rect starting one past a tile's last pixel does not touch that tile"
+        );
+    }
+
+    #[test]
+    fn invalidate_doc_rect_ignores_a_rect_entirely_left_of_the_grid_origin() {
+        // `aurora_tile::TileId`'s own fields are `u32`, so document
+        // territory left of or above the anchor has no `TileId` at all.
+        // The comparison has to survive that without ever constructing a
+        // negative `u32`.
+        let mut cache = CompositeCache::default();
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        cache.mark_current(tile);
+
+        // Anchor at (500, 500): tile (0, 0) is [500, 756). The rect sits
+        // entirely before it, in territory the grid cannot name.
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            (500, 500),
+        );
+        assert!(cache.is_current(tile), "no overlap, so nothing to redo");
+
+        // And with a negative rect origin against a (0, 0) anchor.
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: -1000,
+                y: -1000,
+                width: 500,
+                height: 500,
+            },
+            (0, 0),
+        );
+        assert!(
+            cache.is_current(tile),
+            "a rect wholly in negative territory touches no tile"
+        );
+
+        // Straddling the origin from the left *does* touch tile (0, 0).
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: -1000,
+                y: -1000,
+                width: 1001,
+                height: 1001,
+            },
+            (0, 0),
+        );
+        assert!(
+            !cache.is_current(tile),
+            "a rect reaching one pixel past the origin really does overlap"
+        );
+    }
+
+    #[test]
+    fn invalidate_doc_rect_ignores_a_zero_width_rect() {
+        let mut cache = CompositeCache::default();
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        cache.mark_current(tile);
+
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 100,
+            },
+            (0, 0),
+        );
+        assert!(
+            cache.is_current(tile),
+            "an empty region cannot have changed a texel"
+        );
+        cache.invalidate_doc_rect(
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 0,
+            },
+            (0, 0),
+        );
+        assert!(cache.is_current(tile), "same for zero height");
+    }
+
+    /// **The most important test in this round.** Undoing a Move
+    /// re-points every cached `TileId` at a different document window,
+    /// because the composite grid is anchored to the active layer's own
+    /// origin. `History::undo` reports a perfectly correct `old ∪ new`
+    /// rect for that step — and narrowing to it would still be
+    /// comprehensively wrong, leaving every tile the rect misses showing
+    /// content composited under the *old* anchor. `perform_undo_redo`'s
+    /// before/after anchor check is what stops that, and this asserts
+    /// the `CompositeInvalidation` it actually produces rather than
+    /// inferring it from pixels that could agree by coincidence.
+    #[test]
+    fn undoing_a_move_of_the_active_layer_still_invalidates_everything() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let moved = match history.add_pixel_layer(&mut layers, "moved", moved_layer_bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let active_layer = Some(moved);
+        // Dragged from (300, 150) to the document origin and let go:
+        // one `LayerOp::SetBounds` step on the *active* layer.
+        if let Err(err) = layers.set_bounds(moved, layer_bounds()) {
+            unreachable!("{err:?}");
+        }
+        commit_ending_drag(
+            Some(Drag::Move {
+                layer_id: moved,
+                start_doc: (0.0, 0.0),
+                start_bounds: moved_layer_bounds(),
+                current_bounds: layer_bounds(),
+                refused: false,
+            }),
+            &layers,
+            &mut history,
+            &mut pixel_history,
+            &mut undo_order,
+            &mut view,
+            active_layer,
+            None,
+        );
+        assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
+
+        // Two tiles the undone Move's own `old ∪ new` rect
+        // ((0, 0)..(310, 160)) does *not* cover -- exactly the tiles a
+        // narrowed invalidation would wrongly leave current.
+        let far = [
+            aurora_tile::TileId { x: 4, y: 4 },
+            aurora_tile::TileId { x: 9, y: 2 },
+        ];
+        for tile in far {
+            cache.mark_current(tile);
+        }
+
+        let reported = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            active_layer,
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(
+            layers.bounds(moved),
+            Some(moved_layer_bounds()),
+            "setup: the undo really did move the layer back, so the anchor really did move"
+        );
+        assert_eq!(
+            reported,
+            CompositeInvalidation::Everything,
+            "an undone Move moves the grid anchor itself; the guard must override whatever \
+             narrow region `run_command` reported"
+        );
+        for tile in far {
+            assert!(
+                !cache.is_current(tile),
+                "{tile:?} names a different document window now and must be recomputed"
+            );
+        }
+    }
+
+    /// `aurora-doc` reports `None` for a step whose dirtied region isn't
+    /// knowable from that crate alone — a group has no `bounds` of its
+    /// own, and the subtree-bounds aggregation that would give it one
+    /// doesn't exist anywhere yet. `None` must mean "recomposite
+    /// everything", never "recomposite nothing".
+    #[test]
+    fn undoing_a_group_level_change_with_no_knowable_rect_invalidates_everything() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let base = match history.add_pixel_layer(&mut layers, "base", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut layers, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match history.set_opacity(&mut layers, group, 0.5) {
+            Ok(None) => {}
+            other => unreachable!("a group has no knowable dirty rect, got {other:?}"),
+        }
+        undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+
+        let tile = aurora_tile::TileId { x: 7, y: 7 };
+        cache.mark_current(tile);
+
+        let reported = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            None,
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            Some(base),
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(reported, CompositeInvalidation::Everything);
+        assert!(!cache.is_current(tile));
+    }
+
+    /// A pixel undo names its tiles in the *layer's* own surface-local
+    /// grid, so translating them into document space needs that layer's
+    /// `bounds`. If the layer is gone, there is no translation — and an
+    /// empty `Regions` would silently invalidate nothing at all, which
+    /// is the one answer that must not come out of here.
+    #[test]
+    fn undoing_a_stroke_whose_layer_was_deleted_invalidates_everything() {
+        let (_dir, mut store) = commit_test_store();
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let layer = match layers.add_pixel_layer("a", layer_bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(layer) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            (50.0, 50.0),
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            Some(&mut snapshot),
+        );
+        assert!(!outcome.painted().is_empty(), "setup: the dab must paint");
+        assert!(pixel_history.push(snapshot), "setup");
+        undo_order.undo.push(UndoKind::Pixel);
+
+        // The layer is deleted afterwards; the stroke's own tiles are
+        // still on its surface in the store, so the undo itself
+        // succeeds -- there is simply no layer left to place them
+        // against in document space.
+        if let Err(err) = layers.remove(layer) {
+            unreachable!("{err:?}");
+        }
+
+        let tile = aurora_tile::TileId { x: 6, y: 6 };
+        cache.mark_current(tile);
+
+        let reported = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            None,
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(reported, CompositeInvalidation::Everything);
+        assert!(!cache.is_current(tile));
+    }
+
+    /// The payoff, stated as a test: undoing an ordinary stroke pays for
+    /// the tiles it touched, not for the whole visible grid. This is the
+    /// Ctrl+Z-after-a-stroke case the round is actually for.
+    #[test]
+    fn undoing_a_stroke_invalidates_only_the_composite_tiles_it_touched() {
+        let (_dir, mut store) = commit_test_store();
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut cache = CompositeCache::default();
+        let mut view = CanvasView::new();
+        let mut drag = None;
+
+        let layer = match layers.add_pixel_layer(
+            "a",
+            aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 512,
+                height: 512,
+            },
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(layer) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+        // Well inside layer-local tile (0, 0).
+        let outcome = aurora_brush::stamp_dab(
+            &mut store,
+            surface,
+            (50.0, 50.0),
+            BRUSH_RADIUS,
+            [1.0, 0.0, 0.0],
+            Some(&mut snapshot),
+        );
+        assert_eq!(
+            outcome.painted(),
+            &[aurora_tile::TileId { x: 0, y: 0 }],
+            "setup: this dab must touch exactly one tile"
+        );
+        assert!(pixel_history.push(snapshot), "setup");
+        undo_order.undo.push(UndoKind::Pixel);
+
+        let untouched = [
+            aurora_tile::TileId { x: 1, y: 0 },
+            aurora_tile::TileId { x: 0, y: 1 },
+            aurora_tile::TileId { x: 1, y: 1 },
+        ];
+        cache.mark_current(aurora_tile::TileId { x: 0, y: 0 });
+        for tile in untouched {
+            cache.mark_current(tile);
+        }
+
+        let reported = perform_undo_redo(
+            &mut workspace,
+            &mut focus,
+            &mut palette,
+            &mut tool,
+            &mut layers,
+            &mut history,
+            &mut pixel_history,
+            Some(&mut store),
+            &mut undo_order,
+            &mut cache,
+            &mut view,
+            Some(layer),
+            &mut drag,
+            AppCommand::Undo,
+        );
+
+        assert_eq!(
+            reported,
+            CompositeInvalidation::Regions(vec![aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: aurora_tile::TILE,
+                height: aurora_tile::TILE,
+            }]),
+            "the stroke's one layer-local tile, in document space"
+        );
+        assert!(
+            !cache.is_current(aurora_tile::TileId { x: 0, y: 0 }),
+            "the tile the stroke really touched must be recomputed"
+        );
+        for tile in untouched {
+            assert!(
+                cache.is_current(tile),
+                "{tile:?} must survive -- a full bump() would fail this, and that is the \
+                 whole point of the narrowing"
+            );
+        }
+    }
+
+    #[test]
+    fn layer_for_surface_finds_a_nested_layer_and_reports_an_unknown_one() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let group = match layers.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let nested = match layers.add_pixel_layer("nested", layer_bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(nested) else {
+            unreachable!("just created as a pixel layer");
+        };
+        assert_eq!(layer_for_surface(&layers, surface), Some(nested));
+        assert_eq!(
+            layer_for_surface(&layers, composite_surface_id()),
+            None,
+            "the reserved composite surface belongs to no layer"
+        );
+    }
+
     // -- `CompositeCache::invalidate`: the per-tile counterpart to `bump`
     // that `App::paint_dab`/`App::erase_dab` now use instead of a full
     // `bump()` on every dab. `App` itself can't be constructed headlessly
@@ -20614,6 +21495,460 @@ mod tests {
         }
 
         Some((context, dir, store, layers, id, surface, residency, cache))
+    }
+
+    /// The one operation a [`narrowed_invalidation_matches_a_full_bump_pixel_for_pixel`]
+    /// case performs after both worlds are fully composited.
+    #[derive(Clone, Copy, Debug)]
+    enum DiffOp {
+        UndoStrokeOnActive,
+        RedoStrokeOnActive,
+        UndoStrokeOnOther,
+        RedoStrokeOnOther,
+        /// The guard case: the undone step moves the *active* layer, so
+        /// the composite grid's own anchor moves with it.
+        UndoMove,
+        UndoSetOpacity,
+        SwitchToSameOrigin,
+        SwitchToDifferentOrigin,
+    }
+
+    /// Everything one side of the differential test needs. Two of these
+    /// are built identically per case; only how the composite cache is
+    /// invalidated afterwards differs.
+    struct DiffWorld {
+        _dir: tempfile::TempDir,
+        store: aurora_tile::TileStore,
+        layers: aurora_doc::LayerTree,
+        history: aurora_doc::History,
+        pixel_history: aurora_brush::PixelHistory,
+        undo_order: UndoOrder,
+        cache: CompositeCache,
+        workspace: aurora_ui::Workspace,
+        focus: FocusManager,
+        palette: Option<WidgetId>,
+        tool: Tool,
+        view: aurora_ui::CanvasView,
+        drag: Option<Drag>,
+        layer_rows: std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        active: Option<aurora_doc::LayerId>,
+        same: aurora_doc::LayerId,
+        other: aurora_doc::LayerId,
+    }
+
+    /// The differential comparison's own viewport, in physical pixels.
+    /// Wide enough that the visible grid extends well past the region
+    /// any single edit here dirties — which is exactly what makes the
+    /// comparison able to fail. At 256 px tiles this is a 5x5 grid, and
+    /// removing `perform_undo_redo`'s anchor guard makes the `UndoMove`
+    /// case fail on the tiles outside the moved layer's own
+    /// `old ∪ new` rect.
+    const DIFF_VIEWPORT: (u32, u32) = (1024, 1024);
+
+    /// A scratch store with room for the whole differential grid
+    /// resident at once — `real_tile_store`'s own 16-tile budget would
+    /// page constantly across a 5x5 visible grid plus three layers, and
+    /// this test is about invalidation, not eviction.
+    fn diff_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(512) else {
+            unreachable!("512 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+        (dir, store)
+    }
+
+    fn diff_layer_bounds(x: i64, y: i64) -> aurora_core::Rect {
+        aurora_core::Rect {
+            x,
+            y,
+            width: 512,
+            height: 512,
+        }
+    }
+
+    /// The 2x2 layer-local tile grid each differential layer's own
+    /// 512x512 px of content occupies. **Not** the visible grid the
+    /// comparison runs over — that is deliberately much larger (see
+    /// `DIFF_VIEWPORT`), because a grid only as big as the edited region
+    /// cannot tell a narrowed invalidation apart from a full bump: every
+    /// visible tile would be invalidated either way.
+    const DIFF_LAYER_TILES: [aurora_tile::TileId; 4] = [
+        aurora_tile::TileId { x: 0, y: 0 },
+        aurora_tile::TileId { x: 1, y: 0 },
+        aurora_tile::TileId { x: 0, y: 1 },
+        aurora_tile::TileId { x: 1, y: 1 },
+    ];
+
+    /// Paints one whole 2x2 layer-local tile grid of `surface` a solid
+    /// colour, so every layer contributes real, distinguishable content
+    /// to the composite rather than transparency.
+    fn fill_diff_layer(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        rgba: [f32; 4],
+    ) {
+        for tile in DIFF_LAYER_TILES {
+            fill_solid(store, surface, tile, rgba);
+        }
+    }
+
+    /// Builds one side of a differential case, up to and including the
+    /// first full recomposite (so every visible tile is cached and
+    /// current) — deliberately one function called twice rather than two
+    /// call sites, so the two worlds cannot drift apart.
+    // The op-specific setup is one `match` with eight short arms next to
+    // a fixed preamble; splitting it would separate each arm from the
+    // shared state it seeds.
+    #[allow(clippy::too_many_lines)]
+    fn diff_world(context: &GpuTestContext, op: DiffOp) -> (DiffWorld, aurora_gpu::TileResidency) {
+        let (dir, mut store) = diff_tile_store();
+        let mut workspace = aurora_ui::build_workspace();
+        let mut layers = aurora_doc::LayerTree::new();
+        let mut history = aurora_doc::History::new();
+        let mut pixel_history = aurora_brush::PixelHistory::new();
+        let mut undo_order = UndoOrder::default();
+        let mut view = CanvasView::new();
+        let mut focus = FocusManager::default();
+        let mut palette = None;
+        let mut tool = Tool::default();
+        let mut drag = None;
+
+        // Bottom to top: an opaque base at the document origin, a
+        // translucent layer sharing that origin, and a translucent one
+        // at a deliberately non-tile-aligned offset (so the composite
+        // really does exercise `read_layer_window`'s re-tiling).
+        let base = match history.add_pixel_layer(&mut layers, "base", diff_layer_bounds(0, 0), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let same = match history.add_pixel_layer(&mut layers, "same", diff_layer_bounds(0, 0), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let other = match history.add_pixel_layer(
+            &mut layers,
+            "other",
+            diff_layer_bounds(300, 150),
+            None,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (Some(base_surface), Some(same_surface), Some(other_surface)) = (
+            layers.surface_id(base),
+            layers.surface_id(same),
+            layers.surface_id(other),
+        ) else {
+            unreachable!("all three were just created as pixel layers");
+        };
+        // Alphas below 1.0 on every layer, deliberately: `stamp_dab`
+        // accumulates alpha by *maximum*, so a dab over an
+        // already-opaque texel writes nothing at all and the two
+        // stroke cases would silently be testing an empty edit.
+        fill_diff_layer(&mut store, base_surface, [0.20, 0.40, 0.80, 0.60]);
+        fill_diff_layer(&mut store, same_surface, [0.90, 0.10, 0.10, 0.35]);
+        fill_diff_layer(&mut store, other_surface, [0.10, 0.80, 0.20, 0.50]);
+
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+
+        let active = Some(base);
+        let mut cache = CompositeCache::default();
+
+        // Op-specific setup: whatever has to already be on the undo/redo
+        // stacks (and already composited) for the measured operation to
+        // be the thing under test.
+        let record_stroke = |store: &mut aurora_tile::TileStore,
+                             pixel_history: &mut aurora_brush::PixelHistory,
+                             undo_order: &mut UndoOrder,
+                             surface: aurora_tile::SurfaceId| {
+            let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+            let outcome = aurora_brush::stamp_dab(
+                store,
+                surface,
+                (50.0, 50.0),
+                BRUSH_RADIUS,
+                [1.0, 0.9, 0.1],
+                Some(&mut snapshot),
+            );
+            assert!(
+                !outcome.painted().is_empty(),
+                "setup: the dab must really paint: {outcome:?}"
+            );
+            assert!(pixel_history.push(snapshot), "setup");
+            undo_order.undo.push(UndoKind::Pixel);
+        };
+
+        match op {
+            DiffOp::UndoStrokeOnActive | DiffOp::RedoStrokeOnActive => {
+                record_stroke(
+                    &mut store,
+                    &mut pixel_history,
+                    &mut undo_order,
+                    base_surface,
+                );
+            }
+            DiffOp::UndoStrokeOnOther | DiffOp::RedoStrokeOnOther => {
+                record_stroke(
+                    &mut store,
+                    &mut pixel_history,
+                    &mut undo_order,
+                    other_surface,
+                );
+            }
+            DiffOp::UndoMove => {
+                // The active layer, dragged to a non-tile-aligned
+                // offset and let go. Undoing this is what moves the
+                // grid anchor.
+                let moved = diff_layer_bounds(128, 64);
+                if let Err(err) = layers.set_bounds(base, moved) {
+                    unreachable!("{err:?}");
+                }
+                commit_ending_drag(
+                    Some(Drag::Move {
+                        layer_id: base,
+                        start_doc: (0.0, 0.0),
+                        start_bounds: diff_layer_bounds(0, 0),
+                        current_bounds: moved,
+                        refused: false,
+                    }),
+                    &layers,
+                    &mut history,
+                    &mut pixel_history,
+                    &mut undo_order,
+                    &mut view,
+                    active,
+                    None,
+                );
+                assert_eq!(undo_order.undo, vec![UndoKind::Structural], "setup");
+            }
+            DiffOp::UndoSetOpacity => {
+                // On `other`, whose bounds cover only part of the
+                // visible grid -- so the narrowed path really does leave
+                // some cached tiles alone here.
+                match history.set_opacity(&mut layers, other, 0.15) {
+                    Ok(Some(_)) => {}
+                    other => unreachable!("a pixel layer has a knowable rect, got {other:?}"),
+                }
+                undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
+            }
+            DiffOp::SwitchToSameOrigin | DiffOp::SwitchToDifferentOrigin => {}
+        }
+
+        // For the two redo cases, the undo they redo happens *here*,
+        // through the same real code path -- so the measured operation
+        // starts from a genuinely undone, genuinely re-composited state.
+        if matches!(op, DiffOp::RedoStrokeOnActive | DiffOp::RedoStrokeOnOther) {
+            let _ = perform_undo_redo(
+                &mut workspace,
+                &mut focus,
+                &mut palette,
+                &mut tool,
+                &mut layers,
+                &mut history,
+                &mut pixel_history,
+                Some(&mut store),
+                &mut undo_order,
+                &mut cache,
+                &mut view,
+                active,
+                &mut drag,
+                AppCommand::Undo,
+            );
+        }
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), DIFF_VIEWPORT);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            active,
+            &mut store,
+            &mut cache,
+            Some(&**context),
+            Some(&mut compositor),
+        );
+        for tile in residency.visible_tiles() {
+            assert!(
+                cache.is_current(tile),
+                "setup: every visible tile must be composited and current before the op"
+            );
+        }
+
+        (
+            DiffWorld {
+                _dir: dir,
+                store,
+                layers,
+                history,
+                pixel_history,
+                undo_order,
+                cache,
+                workspace,
+                focus,
+                palette,
+                tool,
+                view,
+                drag,
+                layer_rows,
+                active,
+                same,
+                other,
+            },
+            residency,
+        )
+    }
+
+    /// Performs `op` on `world` through the real, production code path —
+    /// including that path's own (narrowed) composite invalidation.
+    fn diff_apply(world: &mut DiffWorld, op: DiffOp) {
+        match op {
+            DiffOp::UndoStrokeOnActive
+            | DiffOp::UndoStrokeOnOther
+            | DiffOp::UndoMove
+            | DiffOp::UndoSetOpacity
+            | DiffOp::RedoStrokeOnActive
+            | DiffOp::RedoStrokeOnOther => {
+                let command =
+                    if matches!(op, DiffOp::RedoStrokeOnActive | DiffOp::RedoStrokeOnOther) {
+                        AppCommand::Redo
+                    } else {
+                        AppCommand::Undo
+                    };
+                let _ = perform_undo_redo(
+                    &mut world.workspace,
+                    &mut world.focus,
+                    &mut world.palette,
+                    &mut world.tool,
+                    &mut world.layers,
+                    &mut world.history,
+                    &mut world.pixel_history,
+                    Some(&mut world.store),
+                    &mut world.undo_order,
+                    &mut world.cache,
+                    &mut world.view,
+                    world.active,
+                    &mut world.drag,
+                    command,
+                );
+            }
+            DiffOp::SwitchToSameOrigin | DiffOp::SwitchToDifferentOrigin => {
+                let target = if matches!(op, DiffOp::SwitchToSameOrigin) {
+                    world.same
+                } else {
+                    world.other
+                };
+                press_layer_row(
+                    &mut world.workspace,
+                    &world.layer_rows,
+                    &mut world.active,
+                    &mut world.view,
+                    &world.layers,
+                    &mut world.history,
+                    &mut world.pixel_history,
+                    &mut world.undo_order,
+                    &mut world.cache,
+                    &mut world.drag,
+                    target,
+                );
+                assert_eq!(world.active, Some(target), "the switch must have happened");
+            }
+        }
+    }
+
+    /// **The strong evidence for this round.** For each operation, two
+    /// identical documents are built and fully composited; the same
+    /// operation is applied to both through the real code path; then one
+    /// keeps only the narrowed invalidation that path performed and the
+    /// other additionally gets a full [`CompositeCache::bump`] — the
+    /// old, unconditional behaviour, which by construction recomputes
+    /// everything and so is the reference answer. Both are recomposited
+    /// and every visible tile is compared texel for texel.
+    ///
+    /// A narrowing that misses a tile shows up as that tile keeping its
+    /// pre-operation content in the narrowed world while the bumped
+    /// world recomputes it — which is exactly the "thin stale seam" or
+    /// "everything is stale at the old anchor" failure this is for.
+    /// `DiffOp::UndoMove` is the case that fails without
+    /// `perform_undo_redo`'s anchor guard.
+    #[test]
+    fn narrowed_invalidation_matches_a_full_bump_pixel_for_pixel() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+
+        for op in [
+            DiffOp::UndoStrokeOnActive,
+            DiffOp::RedoStrokeOnActive,
+            DiffOp::UndoStrokeOnOther,
+            DiffOp::RedoStrokeOnOther,
+            DiffOp::UndoMove,
+            DiffOp::UndoSetOpacity,
+            DiffOp::SwitchToSameOrigin,
+            DiffOp::SwitchToDifferentOrigin,
+        ] {
+            let (mut narrowed, narrowed_residency) = diff_world(&context, op);
+            let (mut bumped, bumped_residency) = diff_world(&context, op);
+
+            diff_apply(&mut narrowed, op);
+            diff_apply(&mut bumped, op);
+            // The reference world throws its whole cache away, which is
+            // what `after_undo_redo`/`press_layer_row` used to do
+            // unconditionally.
+            bumped.cache.bump();
+
+            for (world, residency) in [
+                (&mut narrowed, &narrowed_residency),
+                (&mut bumped, &bumped_residency),
+            ] {
+                let mut compositor = aurora_render::TileCompositor::new(context.device());
+                recomposite_visible_tiles(
+                    residency,
+                    &world.layers,
+                    world.active,
+                    &mut world.store,
+                    &mut world.cache,
+                    Some(&*context),
+                    Some(&mut compositor),
+                );
+            }
+
+            for tile in narrowed_residency.visible_tiles() {
+                let (Ok(a), Ok(b)) = (
+                    narrowed.store.get(composite_surface_id(), tile),
+                    bumped.store.get(composite_surface_id(), tile),
+                ) else {
+                    unreachable!("both composites were just written");
+                };
+                assert_eq!(
+                    a.texels(),
+                    b.texels(),
+                    "{op:?}: composite tile {tile:?} differs between the narrowed \
+                     invalidation and a full bump -- the narrowing left stale content"
+                );
+            }
+        }
     }
 
     #[test]
