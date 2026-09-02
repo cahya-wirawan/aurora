@@ -224,14 +224,20 @@ tests assert a deliberately loose CI-safety threshold (350 ms / 180 ms) because
 they exist to produce a true number, not to pass at 60 FPS; do not read a green
 run as the budget being met. Later work reduced *how much* gets recomposited per
 edit, not the per-tile cost, and none of it has been re-measured on real GPU
-hardware. As of 0.73.0 the brush/eraser, undo/redo and active-layer-switch paths
-all invalidate the composite cache narrowly; only a live Move still bumps the
-whole thing, because the composite tile grid is anchored to the *active layer's*
-own origin, so dragging that layer re-anchors every tile at once. Re-anchoring
-the grid to the document instead is the named follow-on (PLAN.md, Incremental
-compositing). **None of that is progress against the 60 FPS gate** — it buys
-Ctrl+Z and Layers-panel click latency, on a different path from the one measured
-above.
+hardware. As of 0.73.4, brush/eraser dabs, pixel-stroke undo/redo, and
+same-origin active-layer switches all invalidate the composite cache narrowly.
+**Structural undo/redo (visibility, opacity, blend mode, and similar toggles)
+does not** — 0.73.0 narrowed it too, but review found the narrowing unsound (a
+layer's declared `bounds` is a position hint, not an enforced clip on its real
+painted content, so the reported rect could miss real pixels), and 0.73.1
+reverted it to a full bump. A live Move still bumps the whole thing either way,
+because the composite tile grid is anchored to the *active layer's* own origin,
+so dragging that layer re-anchors every tile at once. Re-anchoring the grid to
+the document instead is the named follow-on (PLAN.md, Incremental compositing)
+that would also be the prerequisite for structural narrowing to become sound.
+**None of that is progress against the 60 FPS gate** — it buys Ctrl+Z-after-a-
+stroke and Layers-panel click latency, on a different path from the one
+measured above.
 
 **PSD/PSB is full layered read *and* write** (PRD FR-001) — Aurora round-trips, so a file edited here must reopen in Photoshop with layers intact. Two rules follow: never overwrite a user's file in place (write to temp, verify by reopening, then swap), and warn with an itemized list before any lossy save. Silently degrading a professional's file is the worst failure this project can have.
 

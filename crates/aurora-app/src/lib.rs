@@ -4860,7 +4860,19 @@ fn perform_undo_redo(
     // fractions (1.0, 0.5, 0.25, 0.75), where no rounding latitude is in
     // play at all -- so they never tested the question. Switching a
     // document between the paths therefore dirties every visible tile
-    // for real, and this guard is load-bearing.
+    // for real -- that *finding* is load-bearing, and is why this guard
+    // exists. **The guard itself is currently dead-in-effect, not
+    // dead code**: today the only producer of `CompositeInvalidation::
+    // Regions` is the pixel-stroke path (`apply_pixel_step`), which
+    // touches only `pixel_history`/`store` behind an immutable
+    // `&LayerTree` -- it cannot move `anchor_before` or
+    // `gpu_path_before`, so neither guard can fire on that path, and
+    // structural undo/redo (the only other caller) already returns
+    // `Everything` unconditionally (0.73.1) before either guard is
+    // reached. Keeping both is still correct: they re-arm the instant
+    // structural narrowing (or some future narrowed path) returns, and
+    // deleting them now would be removing a check for a condition this
+    // function's own contract says it must keep handling.
     let anchor_before = composite_reference_origin(layers, active_layer);
     let gpu_path_before = document_qualifies_for_gpu_compositing(layers);
     let reported = run_command(
@@ -23380,12 +23392,19 @@ mod tests {
     /// ```
     ///
     /// — differing on three of four channels by exactly one `f16` ULP at
-    /// that magnitude (2^-11, ≈4.88e-4). Vulkan permits an `f32`
-    /// multiply-add about 2.5 ULP of latitude and the two paths fold in
-    /// different orders and precisions, so this is expected behaviour,
-    /// not a defect in either path. It is asserted as a **tolerance**
-    /// for that reason, and the tolerance is deliberately tight (2 `f16`
-    /// ULP) so a real divergence still fails.
+    /// *each channel's own* magnitude, not one shared number: 2^-12
+    /// (≈2.44e-4) for red, which sits in `[0.25, 0.5)`; 2^-11 (≈4.88e-4)
+    /// for green and alpha, in `[0.5, 1)`; blue does not differ at all.
+    /// Vulkan permits an `f32` multiply-add about 2.5 ULP of latitude
+    /// and the two paths fold in different orders and precisions, so
+    /// this is expected behaviour, not a defect in either path. It is
+    /// asserted as a **tolerance** for that reason — `2 * f16::EPSILON`
+    /// (2^-9), which is 4 ULP at green/alpha's own magnitude and 8 ULP
+    /// at red's (`f16::EPSILON` is the ULP at 1.0, not at these smaller
+    /// values, so the tolerance is looser than "2 ULP" in the sense that
+    /// matters here) — still tight enough that a real divergence fails,
+    /// loose enough to accept the measured one-ULP-at-its-own-magnitude
+    /// rounding.
     ///
     /// The consequence is the point: **switching a document between the
     /// two paths changes pixels.** So an undoable step that flips
@@ -23470,11 +23489,14 @@ mod tests {
             (0.0, 0.0, 0.0, 0.0),
             "setup: the fixture must really composite to something"
         );
-        // Two `f16` ULP at this magnitude. Tight enough that a real
-        // divergence (a wrong blend, a wrong layer order, a premultiply
-        // that never got undone) still fails, loose enough to accept the
-        // one-ULP rounding difference measured on real hardware -- see
-        // this test's own doc comment for the numbers.
+        // `2 * f16::EPSILON` -- looser than "2 ULP" sounds, since
+        // `EPSILON` is the ULP at 1.0, not at these channels' own
+        // smaller magnitudes: this is 4 ULP at green/alpha's bracket and
+        // 8 ULP at red's. Still tight enough that a real divergence (a
+        // wrong blend, a wrong layer order, a premultiply that never got
+        // undone) fails, loose enough to accept the one-ULP-at-its-own-
+        // magnitude rounding measured on real hardware -- see this
+        // test's own doc comment for the exact numbers.
         let tolerance = 2.0 * f32::from(half::f16::EPSILON);
         let (gr, gg, gb, ga) = gpu_result;
         let (cr, cg, cb, ca) = cpu_result;
