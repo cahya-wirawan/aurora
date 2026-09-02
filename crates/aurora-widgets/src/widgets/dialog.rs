@@ -5,13 +5,17 @@
 //! exactly the kind of reusable interaction shape this crate already
 //! covers — [`super::command_palette`] is the nearest precedent: a real,
 //! focusable overlay inserted into the tree on demand, not a
-//! hidden-flag widget. **The precedent was followed for layout, not for
-//! paint**: the command palette also earned its own `WidgetKind` and a
-//! `paint_command_palette` surface, while a dialog's root and message
-//! are still `WidgetKind::Container` and draw nothing — see the "what
-//! this does not do" paragraph at the end of this comment. Read "nearest
-//! precedent" as being about how the overlay is *placed and inserted*,
-//! not about how far along it is.
+//! hidden-flag widget. **The precedent is now followed for paint as
+//! well as layout**: as of `0.79.0` a dialog's root carries its own
+//! [`WidgetKind::Dialog`] and `paint::paint_dialog` draws a real
+//! rounded-rect surface for it, exactly the shape
+//! `paint_command_palette` already had — with one deliberate
+//! difference, `surface.overlay` rather than `surface.raised`, because
+//! `design/tokens/vocabulary.md` names the former "Elevation 2: modals,
+//! dialogs" and reserves the latter for "Elevation 1: popovers". The
+//! dialog's *message* node stays a plain `WidgetKind::Container` and
+//! still draws nothing, for the reason the "what this does not do"
+//! paragraph at the end of this comment gives.
 //!
 //! `Role::AlertDialog`, not the plainer `Role::Dialog` — every dialog
 //! this crate can build today is an urgent, blocking prompt (a crash
@@ -48,14 +52,22 @@
 //! scans `aurora-widgets`/`aurora-ui` and nothing above them. See
 //! [`root_style`] for what the styles actually do and why.
 //!
-//! **What this does not do, stated plainly**: a dialog's root and
-//! message are still [`WidgetKind::Container`], and this crate draws no
-//! glyphs anywhere, so a dialog on screen today is *only* its action
-//! buttons' rounded rects floating over the canvas — no surface behind
-//! them, no visible title, no visible message text. The layout work here
-//! fixes where the boxes are and therefore which widget a click actually
-//! lands on; it is provable headlessly and it is proven that way. It
-//! makes no claim about how a dialog looks.
+//! **What this does not do, stated plainly**: the root now paints a
+//! real `surface.overlay` panel behind its buttons, but this crate
+//! draws no glyphs anywhere, so the **title and the message are still
+//! invisible** — the message node is deliberately still a
+//! [`WidgetKind::Container`] (it has nothing to draw but the text
+//! nothing can shape yet), and both strings reach the accessibility
+//! tree only. There is also **no scrim/backdrop**: nothing dims or
+//! covers the rest of the window behind a modal dialog. That is
+//! explicitly out of scope here rather than forgotten — a scrim is a
+//! window-sized surface owned by whoever hosts the dialog, and giving
+//! this module one would mean inventing both a layout it cannot see
+//! (the window) and an overlay-opacity token nobody has designed
+//! (CLAUDE.md: "don't invent tokens ad hoc"). Named future work, not
+//! attempted this round. The layout work here still does what it always
+//! did — it fixes where the boxes are and therefore which widget a
+//! click actually lands on, provable headlessly and proven that way.
 //!
 //! The `taffy` mechanics `root_style`/`message_style` rely on (auto-margin
 //! overflow behavior, `align_self`'s alignment-safety keywords, the
@@ -365,7 +377,7 @@ pub fn insert_dialog(
     let mut root_node = Node::new(Role::AlertDialog);
     root_node.set_label(title.into());
     root_node.set_modal();
-    let root = tree.insert(parent, root_style(scales), root_node, WidgetKind::Container)?;
+    let root = tree.insert(parent, root_style(scales), root_node, WidgetKind::Dialog)?;
 
     let mut message_node = Node::new(Role::Label);
     message_node.set_label(message.into());

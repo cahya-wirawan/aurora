@@ -6380,6 +6380,65 @@ structural design work.
   down to `20.0`, confirmed the test goes red at the documented failure
   mode, restored.
 
+  **A dialog finally paints something, `0.79.0`.** Through `0.78.0` a
+  dialog's root was a `WidgetKind::Container`, which paints nothing, so
+  every one of the rounds above was about *where the boxes are*, not
+  what a user sees: on screen a dialog was its action buttons' rounded
+  rects floating over the canvas with no panel behind them. The root is
+  now a new unit-like `WidgetKind::Dialog` (no state, the same reason
+  `WidgetKind::Panel` has none — the paint is a pure function of bounds
+  and theme), and `paint::paint_dialog` gives it the same
+  rounded-rect-plus-conditional-outline shape `paint_command_palette`
+  already had, from **`surface.overlay`** rather than `surface.raised`:
+  `design/tokens/vocabulary.md` names the former "Elevation 2: modals,
+  dialogs" and reserves the latter for "Elevation 1: dropdowns,
+  popovers, context menus". Neither `WidgetKind::Dialog` nor
+  `WidgetKind::Panel` nor `CommandPalette` is one of
+  `design/gallery/index.html`'s 12 named widgets, so no widget count
+  moves.
+
+  **The token distinction is real but invisible in three of five
+  themes, and the tests say so.** `surface.overlay` and `surface.raised`
+  resolve byte-identically in Light (both `neutral.900`), High Contrast
+  Dark (both `hc.black`) and High Contrast Light (both `hc.white`);
+  only Dark (`neutral.200` vs `neutral.300`) and Colour-Critical
+  (`cc.raised` `#4c4c4c` vs `cc.overlay` `#5a5a5a`) separate them. So
+  `a_dialog_paints_surface_overlay_not_the_command_palettes_surface_raised`
+  runs against exactly those two themes and opens each with an explicit
+  `assert_ne!` on the two tokens, so it fails loudly rather than
+  degrading into a tautology if a theme edit ever collapses them.
+
+  **Evidence**: four `paint.rs` unit tests (surface colour at full
+  opacity, the overlay-vs-raised proof above, the second outline shape
+  when `border.control_opacity > 0`, and the message node still
+  painting nothing — pinning the no-text scope), plus six gallery tests
+  — one headless layout proof that the box is real, centred and holds
+  its button, and five per-theme rendered-pixel proofs on a real
+  **NVIDIA GeForce RTX 3090, Vulkan, `DiscreteGpu`** adapter
+  (re-confirmed under `AURORA_REQUIRE_GPU=1`). The gallery needed two
+  new backdrop constants, computed rather than assumed and the same two
+  collisions `CommandPalette` already hit one elevation down:
+  `DIALOG_LIGHT_CLEAR` (Light's `surface.overlay` is byte-identical to
+  `LIGHT_CLEAR` — verified by temporarily swapping it back and watching
+  the test go red on `[245,245,246]` against `[245,245,246]`) and
+  `DIALOG_COLOR_CRITICAL_CLEAR` (`#5a5a5a` vs `#545454`, ≈1.1:1 —
+  distinguishable to a byte comparison but not to a human, so this one
+  is a legibility choice no assertion can enforce). Every sample point
+  is derived from real `tree.bounds()`, never hardcoded and never the
+  dialog's naive centre, which lands on the action button.
+
+  **Still missing, explicitly**: the title and the message are *not*
+  drawn — this crate draws no glyphs anywhere, so both strings still
+  reach the accessibility tree only, and the message node stays a
+  `WidgetKind::Container` painting nothing. There is also **no
+  scrim/backdrop** dimming the window behind a modal dialog; that is
+  named future work, not an oversight — it needs a window-sized surface
+  owned by whoever hosts the dialog plus an overlay-opacity token
+  nobody has designed. **No golden-image tests or golden PNGs were
+  added**, deliberately: ten unblessed goldens already exist here from
+  the `Scrollbar`/`TreeView` rounds, and a golden nobody can bless is
+  debt, not evidence.
+
 ### M1.9 — Basic tools and I/O
 
 - [x] **Move, marquee select, zoom, pan, eyedropper** — three of five

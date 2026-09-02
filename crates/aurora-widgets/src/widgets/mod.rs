@@ -19,8 +19,9 @@
 //! swatch", so [`ColorSwatchState`] was going uncounted against a list
 //! it does match. `TextField` is deliberately *still* not counted: the
 //! list's own entry is a **number** field, and [`TextFieldState`] has
-//! no numeric value, range, or step semantics at all. `CommandPalette`
-//! and [`WidgetKind::Panel`] are not on the list in any form.)
+//! no numeric value, range, or step semantics at all.
+//! `CommandPalette`, [`WidgetKind::Panel`] and [`WidgetKind::Dialog`]
+//! are not on the list in any form, so none of them moves this count.)
 //! `Scrollbar` is a deliberately narrow landing: a bounded position
 //! *model* with an accessibility node, a layout style, and a paint, but
 //! nothing in this crate scrolls any content yet. It has a real
@@ -144,6 +145,19 @@ pub enum WidgetKind {
     /// index.html`'s own 12 named widgets — it's workspace chrome, not
     /// a component in that gallery's own sense.
     Panel,
+    /// A modal dialog's own root — `widgets::dialog`'s `insert_dialog` is
+    /// the only constructor. No state, for the same reason [`Panel`] has
+    /// none: its paint is a pure function of its own bounds and the
+    /// theme. Its fill is `surface.overlay` ("Elevation 2: modals,
+    /// dialogs", `design/tokens/vocabulary.md`), deliberately *not* the
+    /// `surface.raised` [`CommandPalette`] resolves — see
+    /// `paint::paint_dialog`. Not one of `design/gallery/index.html`'s
+    /// own 12 named widgets either, the same status [`Panel`] and
+    /// [`CommandPalette`] already have.
+    ///
+    /// [`Panel`]: WidgetKind::Panel
+    /// [`CommandPalette`]: WidgetKind::CommandPalette
+    Dialog,
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

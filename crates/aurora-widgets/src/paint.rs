@@ -6,7 +6,7 @@
 //! **Scope, stated honestly.** [`paint_widget`] covers `Button`,
 //! `Checkbox`, `Slider`, `Scrollbar`, `TextField`, `CommandPalette`,
 //! `ColorSwatch`,
-//! `ListRow`, `TreeItem`, and `Panel` — solid rounded-rect shapes, the simplest of
+//! `ListRow`, `TreeItem`, `Panel`, and `Dialog` — solid rounded-rect shapes, the simplest of
 //! the widgets this crate has (`widgets`' own doc comment). `Checkbox`'s
 //! own box has no check/dash
 //! *glyph* drawn inside it yet (this crate draws no glyphs at all —
@@ -38,9 +38,17 @@
 //! every descendant beneath it. It draws no disclosure triangle and no
 //! label (this crate draws no glyphs at all), so a collapsed row and an
 //! expanded one are pixel-identical apart from what their descendants
-//! do; `expanded` reaches the accessibility node only. Every other
-//! [`WidgetKind`] (`Container` on its own) returns `Ok(vec![])` too — a
-//! real, deliberate "nothing to paint," not an error.
+//! do; `expanded` reaches the accessibility node only. `Dialog` paints
+//! a modal's own surface — the same rounded-rect-plus-outline shape
+//! `CommandPalette` gets, from `surface.overlay` rather than
+//! `surface.raised` ([`paint_dialog`] has the vocabulary citation and
+//! the three themes where the two tokens collide) — and **nothing
+//! else**: no title glyph, no message glyph (this crate draws no
+//! glyphs), and no scrim dimming the window behind it (out of scope,
+//! see `widgets::dialog`'s own module doc comment). Every other
+//! [`WidgetKind`] (`Container` on its own, a dialog's own message node
+//! included) returns `Ok(vec![])` too — a real, deliberate "nothing to
+//! paint," not an error.
 //!
 //! Every kind's own geometry is built from bounds that
 //! [`clip_to_clipping_ancestors`] has already intersected with any
@@ -190,6 +198,7 @@ pub fn paint_widget(
         // row types stayed separate).
         WidgetKind::TreeItem(state) => paint_tree_item(state, bounds, theme, scales, scale_factor),
         WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
+        WidgetKind::Dialog => paint_dialog(bounds, theme, scales, scale_factor),
         WidgetKind::Container => Ok(vec![]),
     }
 }
@@ -615,6 +624,64 @@ fn paint_command_palette(
     Ok(paints)
 }
 
+/// A modal dialog's own surface, and nothing else — structurally the
+/// same shape as [`paint_command_palette`] above (one `scales.radius.md`
+/// rounded rect, filled at full opacity, plus the conditional
+/// [`control_outline`]), with exactly one deliberate difference: the
+/// token.
+///
+/// **`surface.overlay`, not `surface.raised`.**
+/// `design/tokens/vocabulary.md` defines `surface.overlay` as
+/// "Elevation 2: modals, dialogs" and `surface.raised` as "Elevation 1:
+/// dropdowns, popovers, context menus" — a modal alert
+/// (`widgets::dialog` builds nothing else: `Role::AlertDialog` plus
+/// `Node::set_modal`) is the former, a command palette the latter. That
+/// is the whole reason these are two functions rather than one shared
+/// helper taking a token.
+///
+/// **Do not "simplify" the two into one on the strength of a quick
+/// look at the themes**: the two tokens resolve *byte-identically* in
+/// three of the five built-in themes — Light (both `neutral.900`), High
+/// Contrast Dark (both `hc.black`) and High Contrast Light (both
+/// `hc.white`) — so in those three a dialog and a command palette really
+/// do paint the same colour, and no rendered-pixel test can tell this
+/// function's choice from the other's there. Only Dark (`neutral.200`
+/// vs `neutral.300`) and Colour-Critical (`cc.raised` `#4c4c4c` vs
+/// `cc.overlay` `#5a5a5a`) distinguish them today, and this module's own
+/// `a_dialog_paints_surface_overlay_not_the_command_palettes_surface_
+/// raised` is deliberately scoped to exactly those two, with an explicit
+/// `assert_ne!` on the tokens first so it cannot quietly become a
+/// tautology if a theme's values ever change. The collision is a
+/// *theme's* choice about elevation, not evidence that the distinction
+/// is cosmetic.
+///
+/// Still a real, honest gap, the same one [`paint_command_palette`]
+/// has: neither the dialog's title nor its message is drawn (no text
+/// shaping in this crate at all), and nothing here paints a scrim
+/// behind the dialog — see `widgets::dialog`'s own module doc comment.
+fn paint_dialog(
+    bounds: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    let path = rounded_rect(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scales.radius.md as f32,
+    );
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let [r, g, b] = theme.surface.overlay.to_srgb_f32();
+    let mut paints = vec![(mesh, [r, g, b, 1.0])];
+    if let Some(outline) = control_outline(&path, theme, 1.0, scale_factor)? {
+        paints.push(outline);
+    }
+    Ok(paints)
+}
+
 /// A colour swatch's own fill: `state.color` itself — the one widget in
 /// this module whose fill colour is *not* a `Theme` token (see this
 /// module's own doc comment and `widgets::color_swatch`'s for why: the
@@ -850,9 +917,9 @@ mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{
-        CommandEntry, ListRowState, ScrollbarRange, ScrollbarState, WidgetKind,
-        command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
-        insert_command_palette, insert_container, insert_scrollbar, insert_slider,
+        CommandEntry, DialogAction, DialogHandle, ListRowState, ScrollbarRange, ScrollbarState,
+        WidgetKind, command_palette_state, insert_button, insert_checkbox, insert_color_swatch,
+        insert_command_palette, insert_container, insert_dialog, insert_scrollbar, insert_slider,
         insert_text_field, insert_tree_item, insert_tree_view, new_tree, row_height,
         set_button_disabled, set_button_pressed, set_checkbox_disabled, set_color_swatch_disabled,
         set_scrollbar_disabled, set_scrollbar_value, set_slider_disabled, set_slider_value,
@@ -864,6 +931,8 @@ mod tests {
 
     const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
     const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
+    const COLOR_CRITICAL_THEME_TOML: &str =
+        include_str!("../../../design/themes/color-critical.toml");
     const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 
     fn dark_theme() -> Theme {
@@ -920,6 +989,31 @@ mod tests {
         match themes.resolve("TestHighContrast", &palette) {
             Ok(theme) => theme,
             Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// The real, committed Colour-Critical theme -- the *second* of the
+    /// only two built-in themes that resolve `surface.overlay` and
+    /// `surface.raised` to different values (Dark is the first), which
+    /// is the only reason this module needs a third real theme fixture
+    /// at all. `extends = "Dark"`, so the parent has to be registered
+    /// first, and the name is the exact, case-sensitive
+    /// `"Color-Critical"` that file's own `name` field holds.
+    fn color_critical_theme() -> Theme {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(palette) => palette,
+            Err(err) => unreachable!("the committed palette must parse: {err:?}"),
+        };
+        let mut themes = ThemeSet::new();
+        if let Err(err) = themes.register(DARK_THEME_TOML) {
+            unreachable!("the committed Dark theme must register: {err:?}");
+        }
+        if let Err(err) = themes.register(COLOR_CRITICAL_THEME_TOML) {
+            unreachable!("the committed Color-Critical theme must register: {err:?}");
+        }
+        match themes.resolve("Color-Critical", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("the committed Color-Critical theme must resolve: {err:?}"),
         }
     }
 
@@ -2492,6 +2586,163 @@ mod tests {
             border_color,
             [r, g, b, 1.0],
             "a panel's own border must use border.default at full opacity"
+        );
+    }
+
+    /// The window a dialog test lays out against. Any definite size
+    /// works; this one matches `widgets::dialog`'s own layout tests so
+    /// the two read as the same fixture.
+    const DIALOG_WINDOW: (f32, f32) = (800.0, 600.0);
+
+    /// A real, laid-out one-action dialog in a **definitely sized**
+    /// root. The size is load-bearing, not incidental: `insert_dialog`'s
+    /// own root style is `Position::Absolute` with a `percent(0.5)`
+    /// width, so against `new_tree(Style::default())`'s auto-sized root
+    /// the percentage has nothing to resolve against and the dialog
+    /// silently collapses to its `min_size` floor -- a degenerate box
+    /// that still paints, and would make every assertion below a
+    /// statement about the wrong rectangle. Same idiom (and same
+    /// reason) as `widgets::dialog`'s own `sized_tree`.
+    fn laid_out_dialog(scales: &Scales) -> (WidgetTree<WidgetKind>, DialogHandle) {
+        let (mut tree, root) = new_tree(taffy::Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(DIALOG_WINDOW.0),
+                height: taffy::style_helpers::length(DIALOG_WINDOW.1),
+            },
+            ..Default::default()
+        });
+        let handle = match insert_dialog(
+            &mut tree,
+            root,
+            scales,
+            "Aurora Didn't Close Properly",
+            "The previous session didn't shut down cleanly.",
+            vec![DialogAction::new("ok", "OK")],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(DIALOG_WINDOW.0, DIALOG_WINDOW.1);
+        (tree, handle)
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_laid_out_dialog_paints_surface_overlay_at_full_opacity() {
+        let scales = scales();
+        let (tree, handle) = laid_out_dialog(&scales);
+        let theme = dark_theme();
+
+        let (mesh, color) = single_paint(&tree, handle.root, &theme, &scales, 1.0);
+        assert!(
+            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            "a real, centred dialog box must tessellate to real geometry"
+        );
+        let [r, g, b] = theme.surface.overlay.to_srgb_f32();
+        assert_eq!(
+            color,
+            [r, g, b, 1.0],
+            "a dialog's own surface must use surface.overlay at full opacity"
+        );
+    }
+
+    /// The one assertion that actually distinguishes this function's
+    /// token choice from `paint_command_palette`'s -- and it can only be
+    /// made in **two** of the five built-in themes.
+    ///
+    /// Light, High Contrast Dark and High Contrast Light each resolve
+    /// `surface.overlay` and `surface.raised` to the *same* value
+    /// (`neutral.900`, `hc.black`, `hc.white` respectively -- deliberate
+    /// elevation choices in those files, not oversights), so the same
+    /// assertion there would pass no matter which token `paint_dialog`
+    /// read, i.e. it would be vacuous. Only Dark (`neutral.200` vs
+    /// `neutral.300`) and Colour-Critical (`cc.raised` vs `cc.overlay`)
+    /// separate them, so only those two are checked here -- and each is
+    /// checked *starting* with an explicit `assert_ne!` on the two
+    /// tokens, so if a future theme edit ever collapsed them this test
+    /// fails loudly instead of quietly degrading into a tautology.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_dialog_paints_surface_overlay_not_the_command_palettes_surface_raised() {
+        let scales = scales();
+        for (name, theme) in [
+            ("Dark", dark_theme()),
+            ("Colour-Critical", color_critical_theme()),
+        ] {
+            let overlay = theme.surface.overlay.to_srgb_f32();
+            let raised = theme.surface.raised.to_srgb_f32();
+            assert_ne!(
+                overlay, raised,
+                "{name} is only worth testing because these two tokens differ in it -- \
+                 if they ever collide here, this test has stopped proving anything and \
+                 needs a theme that still separates them"
+            );
+
+            let (tree, handle) = laid_out_dialog(&scales);
+            let (_, color) = single_paint(&tree, handle.root, &theme, &scales, 1.0);
+            let [r, g, b] = overlay;
+            assert_eq!(
+                color,
+                [r, g, b, 1.0],
+                "{name}: a dialog paints surface.overlay (Elevation 2: modals, dialogs)"
+            );
+            let [r, g, b] = raised;
+            assert_ne!(
+                color,
+                [r, g, b, 1.0],
+                "{name}: ... and specifically not surface.raised, which is what \
+                 paint_command_palette reads (Elevation 1: popovers)"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_dialog_gains_a_second_outline_shape_when_border_control_opacity_is_above_zero() {
+        let scales = scales();
+        let (tree, handle) = laid_out_dialog(&scales);
+        let theme = high_contrast_theme();
+
+        let paints = match paint_widget(&tree, handle.root, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            paints.len(),
+            2,
+            "a dialog paints its own surface plus the mandatory control outline: {paints:?}"
+        );
+        let Some((_, outline_color)) = paints.get(1) else {
+            unreachable!("just asserted len() == 2");
+        };
+        let [r, g, b] = theme.border.control.to_srgb_f32();
+        assert_eq!(
+            *outline_color,
+            [r, g, b, theme.border.control_opacity],
+            "the outline must use border.control at border.control_opacity"
+        );
+    }
+
+    /// Pins the "no text rendering" half of a dialog's scope: the
+    /// message node holds the real message string for the
+    /// accessibility tree and draws nothing at all. If this ever starts
+    /// painting, either real text shaping landed (in which case this
+    /// test should be rewritten around it) or a `WidgetKind` was
+    /// changed by accident.
+    #[test]
+    fn a_dialogs_message_node_still_paints_nothing() {
+        let scales = scales();
+        let (tree, handle) = laid_out_dialog(&scales);
+        let theme = dark_theme();
+
+        let paints = match paint_widget(&tree, handle.message, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            paints.is_empty(),
+            "a dialog's message is a plain Container -- this crate draws no glyphs, so \
+             there is nothing to paint: {paints:?}"
         );
     }
 
