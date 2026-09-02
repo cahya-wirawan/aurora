@@ -56,6 +56,14 @@
 //! fixes where the boxes are and therefore which widget a click actually
 //! lands on; it is provable headlessly and it is proven that way. It
 //! makes no claim about how a dialog looks.
+//!
+//! The `taffy` mechanics `root_style`/`message_style` rely on (auto-margin
+//! overflow behavior, `align_self`'s alignment-safety keywords, the
+//! over-constrained-inset stretch, absolute items and `min_size`) are each
+//! cited with a source line and a real measured before/after in
+//! `docs/taffy-behaviors.md` at the workspace root — check there before
+//! re-deriving one from scratch, and add to it rather than only restating
+//! a finding in a doc comment here.
 
 use accesskit::{Node, Role};
 use aurora_theme::Scales;
@@ -334,6 +342,13 @@ impl DialogHandle {
 ///   buttons then overflow it and stop being hit-testable, since
 ///   [`crate::WidgetTree::hit_test`] will not descend into a node whose
 ///   parent's bounds exclude the point.
+///
+/// **`parent` must also be a flex container** — the vertical centring
+/// specifically relies on taffy's flexbox absolute-item layout path
+/// (`align_self`/auto-inset behavior that only exists for flex items).
+/// Every node this crate builds is a flex container today, so this is
+/// unenforced and untested; it is the next precondition to violate if a
+/// grid or block-layout parent is ever introduced.
 ///
 /// # Errors
 ///

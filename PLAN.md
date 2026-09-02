@@ -6332,6 +6332,16 @@ structural design work.
     to the window, so below ~34 px it fails again — real clamping needs
     either a scrollable dialog body or a measured text stack, neither of
     which exists. Documented in `root_style` rather than papered over.
+  - **Design-owner note (FR-027):** centring the dialog vertically is a
+    visible placement change, not just a layout fix — dialogs used to
+    sit 15% down from the top and now sit at the window's vertical
+    middle. Raised here rather than silently shipped: the 15% inset it
+    replaces was itself an engineering placeholder invented one round
+    earlier (`0.77.6`), never design-reviewed, and nothing is actually
+    rendered yet for Cahya to look at (dialogs still paint no surface,
+    no title, no message — noted a few lines below, "followed as a
+    precedent for layout but not for paint"). Review is pending, folded
+    into that still-open painting gap rather than tracked separately.
 
   Also in the same round, from the same review: `root_style`'s doc
   comment claimed that a definite vertical-inset pair "collapses the
