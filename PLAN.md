@@ -19121,7 +19121,7 @@ severity choice.
   - the per-tile conversion-call count, `~393,000` → **458,752** (seven
     per texel), which was inconsistent with its own sentence's wording;
   - the CPU-fallback `upload_sync` p50 "after" range, `1.51–1.53 ms` →
-    **`1.51–1.78 ms`**, after an independent four-run reproduction landed
+    **`1.50–1.78 ms`**, after an independent four-run reproduction landed
     two runs outside it, with the coarseness of an n=12 p50 now stated;
   - four PLAN.md citations of `residency.rs:187-199`, a line range the
     function has not occupied since 0.92.0 grew its doc comment.
@@ -19194,6 +19194,28 @@ severity choice.
   cannot pass it. 1 test added, 0 changed, 0 removed. No new dependency, no
   `unsafe`, no lint exception beyond one `#[allow(clippy::too_many_lines)]`
   on the new test.
+
+  **0.92.2 — four follow-ups an independent Judge caught, applied
+  directly.** All doc-only. (1) The `1.51–1.78 ms` digit two paragraphs
+  above the correction list is a typo for `1.50–1.78 ms`, the figure
+  stated correctly everywhere else in this entry — worth fixing precisely
+  because it sits inside a list of corrections to wrong numbers, where a
+  wrong digit invites a future reader to "re-correct" the right one back.
+  (2) The exhaustive single-NaN/no-NaN bit-exactness claim
+  (`residency.rs`'s doc comment) now states explicitly that it holds in
+  every build profile tested, and *why* — it follows from IEEE 754's own
+  single-NaN propagation rule, unlike the double-NaN case, which is
+  profile-dependent because it follows from what a particular optimizer
+  emits. (3) The double-NaN pinning test's portability claim is now
+  disclosed as `x86_64`-measured only: an `aarch64` target running with
+  `FPCR.DN` set (default-NaN mode) could collapse the test's own two
+  "measured, not assumed" candidate payloads to the same value, which
+  would fail the test's `assert_ne!` guard loudly rather than pass
+  silently — a real, disclosed gap, not an assumed pass. (4) `aurora-app`'s
+  `FrameStages::upload_sync` doc now states plainly that "still the
+  stage's largest single share" is inferred from the unchanged `memcpy`
+  share, not re-measured — no fresh internal probe split has actually been
+  taken since 0.92.0.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

@@ -259,7 +259,13 @@ const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
 /// little-endian serialize — every finite value, both infinities, both
 /// signed zeros, every subnormal, and every single-NaN combination. That
 /// half was established exhaustively over all 65,536 × 65,536 (RGB bits ×
-/// alpha bits) texels by an independent review pass and holds.
+/// alpha bits) texels by an independent review pass and holds **in every
+/// build profile tested** (`opt-level = 1`, the workspace's default, and
+/// `opt-level = 3` / `--release`) — unlike the double-NaN case below,
+/// which is profile-dependent, this one follows from IEEE 754's own
+/// single-NaN propagation rule, not from what a particular optimizer
+/// happens to emit, so there is no reason to expect a third profile to
+/// behave differently.
 ///
 /// **When a texel's RGB channel and its alpha are *both* NaN, the two
 /// spellings can disagree on the result's NaN payload.** 0.92.0's doc
@@ -2601,6 +2607,20 @@ mod tests {
     /// payload. Hard-pinning a byte would therefore encode this machine's
     /// optimizer, not the contract, and would break on `--release` or on
     /// `aarch64`.
+    ///
+    /// **`x86_64`-measured; `aarch64` is a real, disclosed gap, not an
+    /// assumed pass.** This test's own "measured, not assumed" two
+    /// candidate payloads (below) rest on `NaN × 1.0` propagating one
+    /// operand's payload — true under IEEE 754's default rounding on
+    /// `x86_64`, but not universal: an `aarch64` target running with
+    /// `FPCR.DN` set (default-NaN mode) returns a single canonical NaN for
+    /// *any* NaN-involving multiply, collapsing both candidates to the
+    /// same value. If that happens, the `assert_ne!` a few lines below
+    /// that guards against exactly this fails loudly and immediately,
+    /// rather than the test silently passing on a fixture that no longer
+    /// distinguishes anything -- but it does mean this test has not been
+    /// run on `aarch64`, and may need a second, DN-aware fixture there
+    /// rather than an unmodified port.
     ///
     /// So this pins everything that *is* portable, and each of these is a
     /// real constraint rather than a restatement:

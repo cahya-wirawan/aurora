@@ -28215,8 +28215,12 @@ mod tests {
         /// real PCIe/GPU bandwidth. So "`upload_sync` dominates the
         /// frame" is true as an *interval*, but it is not an upload-
         /// bandwidth finding: it is a CPU serialization loop (a scalar
-        /// one when this was written; vectorized since 0.92.0, and still
-        /// the stage's largest single share).
+        /// one when this was written; vectorized since 0.92.0). Whether
+        /// it's *still* the stage's largest single share is inferred,
+        /// not re-measured -- it follows arithmetically from the
+        /// `memcpy` share being unchanged while the serializer's own
+        /// time fell, but no fresh internal probe split has actually
+        /// been taken since 0.92.0.
         upload_sync: Vec<f64>,
         /// Building the command encoder, bind group, pipeline and the
         /// one render pass. Records commands; runs nothing.
