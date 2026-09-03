@@ -227,15 +227,17 @@
 //!
 //!      Three things it does **not** do, named rather than implied:
 //!
-//!      1. **Nothing in the app calls it.** `aurora_app::App`'s
-//!         `open_file`/`open_aur_file` are the intended callers and are
-//!         blocked on an ordering/aliasing problem —
+//!      1. **Only one of the app's two open paths calls it.**
+//!         `aurora_app::App::open_file`'s flat-image path does, as of
+//!         0.82.0, sweeping the outgoing document before it writes the
+//!         incoming image's pixels. `open_aur_file` still does not:
 //!         `aurora_io::read_aur` fills the store with the *new*
-//!         document's tiles before the old one is dropped, and both
-//!         documents' surface ids derive from `LayerId`s that restart
-//!         at zero. See that function's own doc comment for the full
-//!         account. So this is real, tested library code with no live
-//!         behaviour change behind it yet.
+//!         document's tiles before the caller holds any tree to sweep
+//!         against, and both documents' surface ids derive from
+//!         `LayerId`s that restart at zero, so there is no point in
+//!         that path where a sweep is safe. See
+//!         [`crate::forget_document_surfaces`]'s own doc comment for
+//!         the full account.
 //!      2. **A redo entry dropped mid-session still leaks — and this
 //!         is the one leak path here that the shipped app really
 //!         walks.** `History::push` (private) clears the redo stack on

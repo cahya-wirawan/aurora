@@ -1099,6 +1099,60 @@ fn replace_document(
     Ok((layer_rows, topmost_pixel_layer(layers)))
 }
 
+/// The store-side half of replacing the current document with a freshly
+/// opened flat image: frees every tile the *outgoing* document still
+/// holds (`aurora_doc::forget_document_surfaces`), then writes `image`'s
+/// own pixels onto the incoming layer's surface
+/// (`aurora_io::write_into_store`). Returns how many tiles were freed.
+///
+/// # The order is the whole point, and it is not interchangeable
+///
+/// `aurora_core::IdGenerator::new` restarts a fresh
+/// `aurora_doc::LayerTree`'s layer-id counter at zero, and a
+/// `aurora_tile::SurfaceId` *is* a `LayerId` (ADR 0010 — derived, not
+/// allocated), so the incoming document's first layer claims exactly
+/// the surface the outgoing one's first layer already owns. That makes
+/// the two orderings do different things:
+///
+/// - Sweeping **after** the write deletes the pixels just written —
+///   the freshly opened document would come up blank.
+/// - Sweeping **before** it is what makes the incoming layer's surface
+///   genuinely empty, so `write_into_store`'s own documented
+///   assumption — "the rest of a freshly allocated tile is already
+///   zero", which is how it justifies writing only the region the
+///   image actually covers — actually holds.
+///
+/// The second is not merely tidier; it is a correctness fix. Nothing
+/// clips a tile read to a layer's declared `bounds` (`resolve_tile`
+/// does not, and a `bounds` is a position hint rather than an enforced
+/// clip anyway), and `aurora_io::write_aur` persists whole tiles. So a
+/// surviving tile of a *larger* previous document was composited onto
+/// the canvas for a smaller new one and written straight into the very
+/// same open's own autosave.
+///
+/// Takes the outgoing tree and history **by value**, the same contract
+/// as the `aurora_doc::forget_document_surfaces` it delegates to:
+/// sweeping a document that is still in use must not compile.
+fn replace_document_pixels(
+    store: &mut aurora_tile::TileStore,
+    outgoing_layers: aurora_doc::LayerTree,
+    outgoing_history: aurora_doc::History,
+    incoming_layers: &aurora_doc::LayerTree,
+    incoming_layer: aurora_doc::LayerId,
+    image: &aurora_io::Image,
+) -> usize {
+    let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store);
+    if let Some(surface) = incoming_layers.surface_id(incoming_layer)
+        && let Err(err) = aurora_io::write_into_store(image, store, surface)
+    {
+        tracing::warn!(
+            ?err,
+            "failed to write the opened image's pixels into the tile store"
+        );
+    }
+    freed
+}
+
 // -- Crash recovery: an unclosed-session marker, plus a real autosave --
 //
 // PLAN.md M1.8's "crash recovery UI" bullet detected whether the
@@ -10040,6 +10094,15 @@ impl App {
     /// session defaults — a newly opened document has no relationship
     /// to whatever pan/zoom/selection/in-progress-drag the *previous*
     /// one had.
+    ///
+    /// The *previous* document's tiles are freed from the shared store
+    /// before the new one's pixels are written, in that order and not
+    /// the other ([`replace_document_pixels`], which owns the full
+    /// argument): both documents' surface ids derive from `LayerId`s
+    /// that restart at zero, so they alias — sweeping afterwards would
+    /// delete the document just opened, and not sweeping at all left
+    /// the previous document's pixels to be composited onto a smaller
+    /// new one and persisted into this very call's own autosave.
     fn open_file(&mut self, path: &Path) {
         if is_aur_path(path) {
             self.open_aur_file(path);
@@ -10076,15 +10139,34 @@ impl App {
         // here, rather than derived back out of the one layer just
         // built from it (`document_canvas_size`'s own fallback role).
         let canvas_size = (image.width(), image.height());
+
+        // Every fallible step is behind us: nothing below this line can
+        // still bail out, so this is the point at which the incoming
+        // document becomes *the* document. The swap hands back the
+        // outgoing tree/history by value, which is exactly what
+        // `replace_document_pixels` needs to sweep them -- and taking
+        // them out of `self` in the same statement that installs the
+        // new ones is what makes it impossible to sweep a document that
+        // is still live. Do not introduce a fallible step between here
+        // and the sweep/write below.
+        let outgoing_layers = std::mem::replace(&mut self.layers, layers);
+        let outgoing_history = std::mem::replace(&mut self.history, history);
+
         if let Some(store) = self.tile_store.as_mut() {
-            if let Some(surface) = layers.surface_id(layer_id)
-                && let Err(err) = aurora_io::write_into_store(&image, store, surface)
-            {
-                tracing::warn!(
-                    ?err,
-                    "failed to write the opened image's pixels into the tile store"
-                );
-            }
+            // Sweep, *then* write -- see `replace_document_pixels` for
+            // why that order is forced and what the other one costs.
+            let freed = replace_document_pixels(
+                store,
+                outgoing_layers,
+                outgoing_history,
+                &self.layers,
+                layer_id,
+                &image,
+            );
+            tracing::debug!(
+                freed_tiles = freed,
+                "freed the previous document's tiles before writing the opened image's"
+            );
             // After the pixels land in the store, not before: the
             // autosave container carries this document's real tiles now,
             // so writing it first would persist an empty one.
@@ -10098,13 +10180,18 @@ impl App {
             self.skipped_tiles = aurora_io::SkippedTiles::new();
             write_autosave(
                 &autosave_path(),
-                &layers,
-                &history,
+                &self.layers,
+                &self.history,
                 canvas_size,
                 &mut self.skipped_tiles,
                 store,
             );
         } else {
+            // Nothing to free beyond the in-memory structure itself:
+            // with no live tile store there is no surface anything
+            // could still be holding tiles under, so dropping the
+            // outgoing tree/history here *is* the whole cleanup.
+            drop((outgoing_layers, outgoing_history));
             tracing::warn!("no live tile store; skipping the opened document's autosave");
             // `self.skipped_tiles` keeps whatever the *previous* document
             // carried -- harmlessly stale, not wrong: with no live store,
@@ -10113,12 +10200,11 @@ impl App {
             // different document can never reach a file on disk.
         }
 
-        self.layers = layers;
         self.canvas_size = canvas_size;
-        self.history = history;
         // A freshly opened document has no relationship to the previous
-        // one's own undo state either -- `self.history` above is a
-        // brand-new, empty `History` (not merged with the old one), so
+        // one's own undo state either -- the `std::mem::replace` above
+        // installed a brand-new, empty `History` (not merged with the
+        // old one, which was swept and dropped instead), so
         // keeping the old `pixel_history`/`undo_order` around would let
         // Ctrl+Z reach into a document that's no longer open, and
         // `undo_order` would already be desynced from `history`'s own
@@ -12123,13 +12209,13 @@ mod tests {
         open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
         pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
         pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
-        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
-        select_layer, shift_bounds, skipped_tiles_dialog_actions, skipped_tiles_message,
-        skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect, tile_store_scratch_dir,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
+        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
+        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
+        skipped_tiles_message, skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
+        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -13726,6 +13812,170 @@ mod tests {
         assert_eq!(active_layer, Some(new_layer_id));
         assert_eq!(layer_rows.len(), 1);
         assert_eq!(layer_rows.values().copied().next(), Some(new_layer_id));
+    }
+
+    /// [`fake_image`] with a caller-chosen colour, so two documents in
+    /// the same test can be told apart texel by texel. Kept separate
+    /// rather than growing a parameter onto `fake_image`, whose dozen
+    /// or so callers do not care what colour they get.
+    fn filled_image(width: u32, height: u32, rgba: [f32; 4]) -> aurora_io::Image {
+        let samples: Vec<half::f16> = (0..width as usize * height as usize)
+            .flat_map(|_| rgba.map(half::f16::from_f32))
+            .collect();
+        match aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// `App` itself is not constructible under test (see
+    /// `loading_a_documents_view_leaves_a_moved_layers_origin_non_negative`
+    /// for why), so these two call the store-side step
+    /// `App::open_file` delegates to — [`replace_document_pixels`] —
+    /// rather than re-spelling its sweep-then-write body here, which
+    /// would let the real one drift while the suite stayed green.
+    #[test]
+    fn replacing_a_documents_pixels_frees_the_outgoing_documents_tiles_and_keeps_the_incoming_ones()
+    {
+        let (_scratch, mut store) = real_tile_store();
+
+        // The outgoing document: 600x600, which at TILE = 256 is a 3x3
+        // tile grid, so its far corner tile is one only *it* covers.
+        let outgoing_image = filled_image(600, 600, [1.0, 0.0, 0.0, 1.0]);
+        let (outgoing_layers, outgoing_history, outgoing_layer) =
+            document_from_image("outgoing", &outgoing_image);
+        let Some(outgoing_surface) = outgoing_layers.surface_id(outgoing_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&outgoing_image, &mut store, outgoing_surface)
+        {
+            unreachable!("{err:?}");
+        }
+        let far_corner = aurora_tile::TileId { x: 2, y: 2 };
+        assert!(
+            store.contains_tile(outgoing_surface, far_corner),
+            "a 600x600 image spans a 3x3 grid at TILE = {}",
+            aurora_tile::TILE
+        );
+
+        // The incoming one: smaller, a different colour -- and, by
+        // construction, the *same* surface.
+        let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
+        let (incoming_layers, _incoming_history, incoming_layer) =
+            document_from_image("incoming", &incoming_image);
+        let Some(incoming_surface) = incoming_layers.surface_id(incoming_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        // Pinned deliberately, before the call under test: the whole
+        // reason the sweep has to come first is that these two ids
+        // collide (`IdGenerator::new` restarts at zero, and a
+        // `SurfaceId` is a `LayerId`). If a later change ever gives
+        // documents distinct surface-id namespaces, this fails loudly
+        // instead of leaving the rest of the test quietly vacuous.
+        assert_eq!(
+            outgoing_surface, incoming_surface,
+            "two freshly built documents must still alias the same surface for this test to \
+             mean anything"
+        );
+
+        let freed = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            incoming_layer,
+            &incoming_image,
+        );
+
+        assert_eq!(freed, 9, "the outgoing document's whole 3x3 tile grid");
+        assert!(
+            !store.contains_tile(incoming_surface, far_corner),
+            "a tile only the outgoing document ever covered must not survive onto the incoming \
+             document's (aliasing) surface"
+        );
+
+        let read = match aurora_io::read_from_store(&mut store, incoming_surface, 100, 100) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(first) = read.samples().get(0..4) else {
+            unreachable!("a 100x100 RGBA image has at least one texel");
+        };
+        assert_eq!(
+            first,
+            [0.0, 0.0, 1.0, 1.0].map(half::f16::from_f32),
+            "the incoming image's own pixels must be what the surface holds -- neither the \
+             outgoing document's colour nor a blank tile"
+        );
+    }
+
+    /// The correctness half, distinct from the leak half above: nothing
+    /// clips a tile read to a layer's declared `bounds`, and
+    /// `aurora_io::write_into_store` writes only the region the image
+    /// covers (relying on a freshly allocated tile being zero). So
+    /// without the sweep, the part of the incoming document's edge tile
+    /// that its own image does *not* cover still reads the outgoing
+    /// document's paint -- which is composited onto the canvas and
+    /// written into the same open's own autosave.
+    #[test]
+    fn an_opened_images_partial_edge_tile_holds_no_pixels_from_the_previous_document() {
+        let (_scratch, mut store) = real_tile_store();
+
+        let outgoing_image = filled_image(600, 600, [1.0, 0.0, 0.0, 1.0]);
+        let (outgoing_layers, outgoing_history, outgoing_layer) =
+            document_from_image("outgoing", &outgoing_image);
+        let Some(outgoing_surface) = outgoing_layers.surface_id(outgoing_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&outgoing_image, &mut store, outgoing_surface)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
+        let (incoming_layers, _incoming_history, incoming_layer) =
+            document_from_image("incoming", &incoming_image);
+        let Some(incoming_surface) = incoming_layers.surface_id(incoming_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        assert_eq!(
+            outgoing_surface, incoming_surface,
+            "the two documents must still alias the same surface for this test to mean anything"
+        );
+
+        let _freed = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            incoming_layer,
+            &incoming_image,
+        );
+
+        // The whole of tile (0, 0) -- 256x256, of which the incoming
+        // 100x100 image covers only the top-left corner.
+        let read = match aurora_io::read_from_store(
+            &mut store,
+            incoming_surface,
+            aurora_tile::TILE,
+            aurora_tile::TILE,
+        ) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // (150, 150): inside that one tile, outside the incoming
+        // image's own 100x100 extent, and squarely inside what the
+        // outgoing document had painted red.
+        let start = (150 * aurora_tile::TILE as usize + 150) * aurora_tile::CHANNELS;
+        let Some(outside) = read.samples().get(start..start + aurora_tile::CHANNELS) else {
+            unreachable!("a 256x256 RGBA image has a texel at (150, 150)");
+        };
+        assert_eq!(
+            outside,
+            [0.0, 0.0, 0.0, 0.0].map(half::f16::from_f32),
+            "a texel outside the opened image's own extent must be empty, not the previous \
+             document's paint"
+        );
     }
 
     #[test]

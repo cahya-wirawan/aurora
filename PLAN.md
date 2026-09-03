@@ -15325,12 +15325,16 @@ severity choice.
 
   **What this does *not* fix, stated plainly:**
 
-  - **Zero live-app behaviour change.** Nothing in `aurora-app` calls
-    it. The shipped app has no reachable path to layer delete (no UI
-    wires to it) and none to document discard that could use this yet.
-    This is real, tested library code and nothing more.
+  - **Zero live-app behaviour change** *(true as of 0.80.1; **no longer
+    true** — see the 0.82.0 addendum below, which wires
+    `App::open_file` to it)*. Nothing in `aurora-app` called it. The
+    shipped app has no reachable path to layer delete (no UI wires to
+    it) and none to document discard that could use this yet. This was
+    real, tested library code and nothing more.
   - **Wiring it into `App::open_file`/`open_aur_file` is blocked, and
-    that is the named next step.** `aurora_io::read_aur` fills the
+    that is the named next step** *(half done: `open_file` landed in
+    0.82.0 — see that addendum; `open_aur_file` is still blocked, for
+    exactly the reason below)*. `aurora_io::read_aur` fills the
     store with the *new* document's tiles before the old
     `layers`/`history` are dropped, and both documents derive surface
     ids from `LayerId`s that restart at zero — so sweeping after the
@@ -15617,6 +15621,102 @@ severity choice.
   warnings cargo doc --workspace --no-deps --all-features` all clean
   locally. Library-only, same as 0.81.0; no GPU or interactive
   verification, and none applicable.
+
+  **Addendum 2026-09-03 (0.82.0) — `App::open_file` now sweeps the
+  outgoing document before writing the incoming one's pixels. This is
+  the first live-app behaviour change of the 0.80.0 line, and it closes
+  a real correctness bug, not only the leak.** The 0.80.0/0.80.1
+  bullets above that say "Zero live-app behaviour change" and "Wiring
+  it into `App::open_file`/`open_aur_file` is blocked" are, as of this
+  addendum, **false for `open_file`** and true only for
+  `open_aur_file`. What landed:
+
+  - `aurora_app::replace_document_pixels(store, outgoing_layers,
+    outgoing_history, incoming_layers, incoming_layer, image) -> usize`
+    — one function holding both halves in the one order that is
+    correct: `aurora_doc::forget_document_surfaces` on the outgoing
+    document **first**, then `aurora_io::write_into_store` for the
+    incoming image. It takes the outgoing tree/history **by value**,
+    the same contract it delegates to.
+  - `App::open_file` captures the outgoing tree/history with
+    `std::mem::replace` at the exact point where every fallible step
+    (read, decode, `load_scales`, `replace_document`'s panel rebuild)
+    is already behind it, installing the incoming ones in the same
+    statement. Nothing below that line can bail, which is what makes
+    sweeping-before-writing safe here and is exactly what
+    `open_aur_file` cannot arrange. The no-store branch just drops the
+    pair — with no store there is no surface to free tiles under.
+
+  **The live correctness bug this closes, stated plainly.**
+  `aurora_core::IdGenerator::new` restarts every fresh `LayerTree`'s
+  layer-id counter at zero and a `SurfaceId` *is* a `LayerId`, so a
+  newly opened flat image's single layer is *guaranteed* to claim the
+  same surface the previous document's first layer already owned.
+  Nothing clips a tile read to a layer's declared `bounds`
+  (`resolve_tile` does not; a `bounds` is a position hint, the same
+  property that made 0.73.0's narrowed invalidation unsound), and
+  `write_into_store` writes only the region the image covers because
+  "the rest of a freshly allocated tile is already zero" — an
+  assumption that was simply false on a reused surface. So opening a
+  small image after a larger one **composited the larger document's
+  leftover pixels onto the canvas around the new image, and persisted
+  them into that very same open's own autosave**. Both symptoms and
+  the leak share one root cause and one fix; sweeping first fixes all
+  of it at once.
+
+  **`open_aur_file` is deliberately out of scope, and the reason is an
+  ordering problem rather than a residue one.** `aurora_io::read_aur`
+  fills the store with the *new* document's tiles before the caller
+  holds any tree to sweep against, so there is no point in that path
+  where a sweep is safe: after the read it deletes the document just
+  loaded, before the read it destroys the live document on an open
+  that can still fail. The residue half is already handled —
+  `aur.rs`'s `roll_back_committed_tiles` drops every tile a failed
+  read had committed. Closing the ordering half needs one of two real
+  architectural changes, and neither was attempted here: a
+  **per-document `SurfaceId` namespace** (allocated rather than
+  `LayerId`-derived ids, which would also close the mask-instance
+  aliasing the 0.81.1 addendum discloses), or a **staging `TileStore`
+  the read fills first, swapped in atomically on success**. That is a
+  decision to take deliberately, not a patch.
+
+  Tests: two in `aurora-app`, both calling `replace_document_pixels`
+  directly (`App` is not constructible under test — it needs a real
+  `EventLoopProxy` — and re-spelling the sweep-then-write body in a
+  test is the exact drift hazard
+  `loading_a_documents_view_leaves_a_moved_layers_origin_non_negative`
+  already warns about).
+  `replacing_a_documents_pixels_frees_the_outgoing_documents_tiles_and_keeps_the_incoming_ones`
+  pins the leak half: 9 tiles freed for a 600×600 outgoing document
+  (a 3×3 grid at `TILE = 256`), its far-corner tile gone, and the
+  incoming 100×100 image's own colour readable back. It asserts
+  `outgoing_surface == incoming_surface` *before* the call, so the
+  guaranteed collision is itself pinned and the test fails loudly
+  rather than going vacuous if documents ever gain distinct surface-id
+  namespaces.
+  `an_opened_images_partial_edge_tile_holds_no_pixels_from_the_previous_document`
+  pins the correctness half: a texel at (150, 150) — inside the
+  incoming document's single edge tile, outside its own 100×100 extent
+  — must read `[0, 0, 0, 0]`.
+
+  Both were verified non-vacuous by two scratch mutations, each fully
+  reverted: **swapping the order** (write, then sweep) turns the
+  read-back into `[0, 0, 0, 0]` — the freshly opened document comes up
+  blank — and **deleting the sweep entirely** makes the freed count 0,
+  leaves the far-corner tile present, and makes the edge texel read
+  `[1, 0, 0, 1]`, which is the previous document's red and is
+  character-for-character the live bug. Note the order-swap mutation
+  leaves the edge-tile test *green* (sweeping last destroys everything,
+  including the stale pixels), which is why both tests are needed:
+  neither alone distinguishes all three behaviours.
+
+  **Verified (0.82.0)**: see the command list reported with the commit.
+  CPU/data-model only. **No GPU or interactive verification** — and
+  unlike 0.80.0/0.81.x this round *is* live app behaviour, so
+  CLAUDE.md's own rule bites: a green test run is not evidence that the
+  canvas shows the right thing on real hardware. Confirming the
+  stale-pixel symptom is gone in the running editor (open a large
+  image, then a small one) needs a human.
 
   **Review found three real defects, all fixed by 0.70.4**: a
   cross-layer `SurfaceId` collision reachable through a crafted/
@@ -17626,8 +17726,12 @@ tooling-gated, fall into one of four buckets:
    already do) — the last named in 0.70.4 after review found it
    undisclosed, and addressed in two halves since. **0.80.0** added
    `TileStore::forget_surface` + `aurora_doc::forget_document_surfaces`,
-   which can free a *discarded document's* content and mask surfaces
-   but is called by nothing in the app yet. **0.81.0 closed the other
+   which can free a *discarded document's* content and mask surfaces;
+   **0.82.0 wired it into `App::open_file`'s flat-image path**, closing
+   both that leak and a live correctness bug (a previous, larger
+   document's stale pixels composited onto a smaller new one and
+   autosaved), with `open_aur_file` still blocked on an ordering
+   problem. **0.81.0 closed the other
    half**: a removed-then-re-added mask no longer resurrects the old
    mask's spatially-shifted coverage, because `History::add_mask` now
    clears that derived surface via the new

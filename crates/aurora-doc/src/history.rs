@@ -1192,15 +1192,14 @@ impl std::fmt::Debug for History {
 /// deliberately no structural validation. It cannot make the sweep
 /// name `aurora-app`'s reserved composite surface (both guards in
 /// `RemovedSubtree::surfaces` exclude it), but it can name arbitrary
-/// layer ids. That is the same cross-document aliasing hazard the
-/// "wiring this into the app" section below is already blocked on,
-/// not a new one.
+/// layer ids. That is the same cross-document aliasing the section
+/// below on wiring this into the app describes, not a new one.
 ///
 /// # What is still not covered
 ///
 /// Two gaps, each one a surface this sweep can no longer name (a
-/// third, separate limitation — that nothing in the app calls this at
-/// all yet — is the follow-on section further down):
+/// third, separate limitation — which of the app's own open paths can
+/// call this at all — is the section further down):
 ///
 /// 1. **A redo entry dropped mid-session.** `History`'s private `push`
 ///    helper clears the redo stack on any new structural activity, and
@@ -1223,19 +1222,34 @@ impl std::fmt::Debug for History {
 ///    but supported shape (see [`History`]'s own doc comments), so this
 ///    is reachable by construction, not merely in theory.
 ///
-/// # Named follow-on: wiring this into the app
+/// # Wired into the app's flat-image open; `.aur` still is not
 ///
-/// `aurora_app::App::open_file`/`open_aur_file` are the callers this
-/// exists for, and they cannot call it yet. `aurora_io::read_aur`
-/// decodes the *new* document's tiles straight into the same store
-/// before the old `layers`/`history` are dropped, and both documents
-/// derive surface ids from `LayerId`s that restart counting from zero
-/// — so the two documents' surfaces alias. Sweeping *after* the read
-/// would delete the document just loaded; sweeping *before* it would
-/// destroy the current document's pixels on an open that can still
-/// fail. Solving that ordering/aliasing problem (a per-document
-/// surface-id namespace, or a staging store the read fills first) is
-/// real follow-on work and is not done here.
+/// `aurora_app::App::open_file`'s flat-image path calls this as of
+/// 0.82.0, through its own `replace_document_pixels`: it sweeps the
+/// outgoing document **before** writing the incoming image's pixels.
+/// That order is forced by the same aliasing described above — both
+/// documents derive surface ids from `LayerId`s that restart counting
+/// from zero, so the incoming document's first layer claims exactly
+/// the surface the outgoing one's first layer owns. Sweeping first is
+/// also what makes the incoming layer's surface genuinely empty, which
+/// `aurora_io::write_into_store` already assumes ("the rest of a
+/// freshly allocated tile is already zero") when it writes only the
+/// region the image covers. It is safe to sweep first there because
+/// every fallible step of that open — read, decode, panel rebuild —
+/// is already behind it.
+///
+/// `aurora_app::App::open_aur_file` remains blocked, and the reason is
+/// specifically an *ordering* problem rather than a residue one:
+/// `aurora_io::read_aur` fills the store with the new document's tiles
+/// before the caller holds any tree to sweep against, so there is no
+/// point in that path where the outgoing document can be swept without
+/// either destroying the document just loaded (sweeping after) or
+/// destroying the live one on an open that can still fail (sweeping
+/// before). The residue half is already handled: that reader rolls
+/// back its own partial writes on failure. Solving the ordering half
+/// (a per-document surface-id namespace, or a staging store the read
+/// fills before an atomic swap) is real follow-on work and is not done
+/// here.
 // Deliberate: see "Why this takes both by value" above. Taking these by
 // reference would make sweeping a live document compile.
 #[allow(clippy::needless_pass_by_value)]
