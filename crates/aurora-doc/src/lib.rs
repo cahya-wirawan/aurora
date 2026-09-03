@@ -41,7 +41,7 @@ mod tree;
 pub use error::DocError;
 pub use history::{History, forget_document_surfaces};
 pub use layer::{BlendMode, Layer, LayerId, LayerKind, LayerLock, LayerMask};
-pub use mask::{MASK_SURFACE_BIT, read_mask_coverage, write_mask_coverage};
+pub use mask::{MASK_SURFACE_BIT, forget_mask_coverage, read_mask_coverage, write_mask_coverage};
 pub use selection::{Selection, SelectionSet};
 pub use text_safety::sanitize_display_name;
 pub use tree::{LayerTree, MAX_LAYER_TREE_DEPTH};

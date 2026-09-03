@@ -1993,6 +1993,27 @@ impl LayerTree {
     /// every save and every crash-recovery autosave for the rest of the
     /// session. A rectangle no writer will accept has no business
     /// entering the tree, so it is refused where it is created.
+    ///
+    /// # This does not clear residual coverage
+    ///
+    /// A mask surface id is derived from the layer's own id
+    /// ([`Self::mask_surface_id`]), so a mask added here lands on the
+    /// same surface any *previous* mask on this layer painted into —
+    /// and [`Self::remove_mask`] drops only the [`LayerMask`] struct.
+    /// This function holds no `aurora_tile::TileStore` handle and so
+    /// cannot do anything about that; keeping [`LayerTree`] free of the
+    /// store is deliberate.
+    ///
+    /// **[`crate::History::add_mask`] is the caller that closes the
+    /// gap** — it takes a store and calls
+    /// [`crate::mask::forget_mask_coverage`] straight after this
+    /// returns. A caller that bypasses [`crate::History`] and calls this
+    /// directly must make that call itself, or the new mask inherits the
+    /// old one's painted coverage, shifted by the offset between the two
+    /// `bounds` origins. That is the same documented, accepted
+    /// bypass shape [`crate::forget_document_surfaces`]'s own "a removal
+    /// that bypassed `History` entirely" gap already records for
+    /// [`Self::remove`].
     pub fn add_mask(&mut self, id: LayerId, bounds: Rect) -> Result<(), DocError> {
         let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
         if entry.mask.is_some() {

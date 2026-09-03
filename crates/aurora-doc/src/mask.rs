@@ -116,27 +116,58 @@
 //!    is *derived* from its layer's id, not allocated, and that has
 //!    consequences the crate only partly handles. Three shapes, all
 //!    harmless today (no mask coverage is ever painted yet) and all
-//!    real the moment item 1 lands. Only the third has had any of it
-//!    addressed (0.80.0, and only its document-discard half):
+//!    real the moment item 1 lands. The first is **fixed** as of
+//!    0.81.0; the third has had only its document-discard half
+//!    addressed (0.80.0); the second is untouched:
 //!
 //!    - **Remove a mask, add a new one to the same layer, and the old
-//!      one's painted coverage comes back.** The new mask resolves to
-//!      the same [`crate::LayerTree::mask_surface_id`], and
+//!      one's painted coverage comes back — fixed in 0.81.0.** The new
+//!      mask resolves to the same
+//!      [`crate::LayerTree::mask_surface_id`], and
 //!      [`crate::LayerTree::remove_mask`] drops only the `LayerMask`
-//!      struct — the tiles under that surface are untouched. A fresh
-//!      mask would therefore start out wearing the deleted mask's
-//!      pixels. Fixing this means clearing (or otherwise invalidating)
-//!      that surface's tiles on `remove_mask`, which is a store
-//!      operation `aurora-doc` does not have a handle to at that call
-//!      site. **Widened in scope by `.aur` persistence (0.71.0):** this
-//!      was previously session-scoped — the stale tiles died with the
-//!      process, since nothing wrote them anywhere durable. A mask
-//!      surface's tiles now survive a save/load round trip like any
-//!      other, so the same stale coverage can persist *across*
-//!      sessions and travel inside a shared `.aur` file. Still
-//!      unreachable today (nothing paints mask coverage yet), but the
-//!      fix, whenever it lands, now has to account for on-disk state
-//!      too, not just the live store.
+//!      struct — so the tiles under that surface used to survive into
+//!      the replacement, which then opened wearing the deleted mask's
+//!      pixels, shifted by the offset between the two masks' `bounds`
+//!      origins (coverage is addressed relative to the mask's own
+//!      origin — see "The addressing convention" above). `.aur`
+//!      persistence (0.71.0) had widened this from session-scoped to
+//!      durable: a mask surface's tiles round-trip through a save like
+//!      any other, so the stale coverage could travel inside a shared
+//!      file.
+//!
+//!      [`crate::History::add_mask`] now takes an
+//!      `aurora_tile::TileStore` and calls
+//!      [`forget_mask_coverage`] immediately after the tree accepts the
+//!      new mask, so a fresh mask starts from unpainted coverage.
+//!
+//!      **The clear is at `add_mask` time, not `remove_mask` time, on
+//!      purpose.** Removing a mask is undoable —
+//!      `LayerOp::RestoreMask` puts the exact `LayerMask` back on the
+//!      same derived surface — so freeing the tiles at removal would
+//!      make Ctrl+Z restore a blank mask with the user's coverage
+//!      already destroyed. That is the same rule the layer-removal
+//!      bullet further down states, and `history.rs`'s own
+//!      `undo_of_a_remove_mask_still_finds_its_painted_coverage`
+//!      exists to keep it that way.
+//!
+//!      Two residuals, named rather than implied:
+//!
+//!      1. **[`crate::LayerTree::add_mask`] called directly still does
+//!         not clear.** It holds no store handle, and keeping
+//!         [`crate::LayerTree`] store-agnostic is deliberate; a caller
+//!         that bypasses [`crate::History`] must call
+//!         [`forget_mask_coverage`] itself. Same documented, accepted
+//!         bypass shape as [`crate::forget_document_surfaces`]'s own
+//!         "a removal that bypassed `History` entirely" gap.
+//!      2. **Once a new mask is actually committed, the old one's
+//!         coverage cannot be brought back by undo.** Undoing past the
+//!         add restores the previous `LayerMask` struct exactly, but
+//!         its pixels are gone: one derived surface can hold only one
+//!         mask's tiles. Accepted and tested
+//!         (`add_mask_makes_the_removed_masks_coverage_unrecoverable_by_undo`),
+//!         not silently lost. Holding both would need a surface per
+//!         mask *instance* — allocated rather than derived ids — which
+//!         is a separate decision.
 //!    - **Coverage written outside the mask's own grid is dropped on
 //!      save.** [`write_mask_coverage`] does not check the `TileId` it
 //!      is given against the grid `crate::LayerMask::bounds` spans, and
@@ -347,6 +378,47 @@ pub fn write_mask_coverage(
     Ok(())
 }
 
+/// Frees every tile stored under `id`'s mask surface, so a mask on that
+/// layer starts from unpainted coverage.
+///
+/// Returns how many tiles were actually forgotten — `0` for a layer the
+/// tree does not contain, and `0` for the structurally unreachable
+/// reserved-id branch [`crate::LayerTree::mask_surface_id`] documents.
+/// Both are honest no-ops rather than errors: there is no coverage to
+/// free either way.
+///
+/// **This destroys pixels, and that is its whole purpose** — the same
+/// warning `aurora_tile::TileStore::forget_surface` carries, which is
+/// the call this delegates to. There is no way back from it.
+///
+/// # Why this takes `&LayerTree`, unlike `forget_document_surfaces`
+///
+/// [`crate::forget_document_surfaces`] deliberately takes its
+/// [`crate::LayerTree`] and [`crate::History`] **by value**, so that
+/// sweeping a document the user still has open is a compile error. That
+/// reasoning does not transfer here, and inverting it is the point:
+/// this is a *live-document* operation by design. Its one intended
+/// caller — [`crate::History::add_mask`] — runs it on a tree that is
+/// still in active use, immediately after a genuinely new
+/// [`crate::LayerMask`] has been committed onto that very tree, to clear
+/// whatever a previously removed mask left behind under the same
+/// derived surface. A by-value signature would make that call
+/// impossible to write.
+///
+/// The narrower blast radius is what makes that safe: this touches
+/// exactly one layer's mask surface, never its pixel content and never
+/// another layer's anything.
+pub fn forget_mask_coverage(
+    layers: &crate::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    id: crate::LayerId,
+) -> usize {
+    let Some(surface) = layers.mask_surface_id(id) else {
+        return 0;
+    };
+    store.forget_surface(surface)
+}
+
 /// Reads one texel's mask coverage, per this module's own storage
 /// convention.
 ///
@@ -528,6 +600,101 @@ mod tests {
         let side = aurora_tile::TILE as usize;
         assert!(write_mask_coverage(&mut store, surface, tile, side, 0, 1.0).is_err());
         assert!(write_mask_coverage(&mut store, surface, tile, 0, side, 1.0).is_err());
+    }
+
+    /// A layer tree holding `count` root pixel layers, with the ids in
+    /// creation order.
+    fn tree_of(count: usize) -> (crate::LayerTree, Vec<crate::LayerId>) {
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let mut tree = crate::LayerTree::new();
+        let mut ids = Vec::new();
+        for index in 0..count {
+            let Ok(id) = tree.add_pixel_layer(format!("layer {index}"), bounds, None) else {
+                unreachable!("an empty parent accepts a root layer");
+            };
+            ids.push(id);
+        }
+        (tree, ids)
+    }
+
+    #[test]
+    // An id the tree does not hold has no mask surface to free, so this
+    // is a plain no-op rather than an error or a panic -- the same
+    // "return something honest instead of asserting" shape
+    // `mask_surface_id` itself already takes.
+    fn forget_mask_coverage_of_an_unknown_layer_is_zero() {
+        let (_dir, mut store) = real_tile_store();
+        let (tree, ids) = tree_of(1);
+        let Some(known) = ids.first() else {
+            unreachable!("one layer was created");
+        };
+        // Painted so a sweep that ignored its `id` argument entirely
+        // would have something to wrongly free, and be caught below.
+        let Some(surface) = tree.mask_surface_id(*known) else {
+            unreachable!("a layer in the tree has a mask surface");
+        };
+        if let Err(err) = write_mask_coverage(&mut store, surface, tile_zero(), 1, 1, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        let unknown = aurora_core::Id::from_raw(9_999);
+        assert_eq!(
+            super::forget_mask_coverage(&tree, &mut store, unknown),
+            0,
+            "an unknown layer has no coverage to free"
+        );
+        assert!(
+            store.contains_tile(surface, tile_zero()),
+            "and freeing nothing must not have touched a real layer's mask"
+        );
+    }
+
+    #[test]
+    // The blast radius: one layer's mask surface, and nothing else --
+    // not its own pixel content, and not another layer's anything.
+    fn forget_mask_coverage_frees_only_the_requested_layers_mask() {
+        let (_dir, mut store) = real_tile_store();
+        let (tree, ids) = tree_of(2);
+        let [a, b] = ids.as_slice() else {
+            unreachable!("two layers were created");
+        };
+        let (a, b) = (*a, *b);
+        let surfaces = |id| {
+            let (Some(content), Some(mask)) = (tree.surface_id(id), tree.mask_surface_id(id))
+            else {
+                unreachable!("a pixel layer in the tree has both surfaces");
+            };
+            (content, mask)
+        };
+        let (a_content, a_mask) = surfaces(a);
+        let (b_content, b_mask) = surfaces(b);
+        for surface in [a_content, a_mask, b_content, b_mask] {
+            if let Err(err) = write_mask_coverage(&mut store, surface, tile_zero(), 2, 3, 0.25) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        assert_eq!(super::forget_mask_coverage(&tree, &mut store, a), 1);
+        assert!(!store.contains_tile(a_mask, tile_zero()), "a's mask freed");
+        for (surface, what) in [
+            (a_content, "a's own pixel content"),
+            (b_mask, "b's mask"),
+            (b_content, "b's pixel content"),
+        ] {
+            assert!(
+                store.contains_tile(surface, tile_zero()),
+                "{what} must be untouched"
+            );
+        }
+    }
+
+    fn tile_zero() -> aurora_tile::TileId {
+        aurora_tile::TileId { x: 0, y: 0 }
     }
 
     #[test]

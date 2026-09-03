@@ -15368,7 +15368,8 @@ severity choice.
     discouraged but supported shape, so this is reachable by
     construction. Disclosed in 0.80.1, undisclosed before it.
   - Follow-on (4)'s **other** half — remove-a-mask-then-add-one
-    resurrecting stale, spatially-shifted coverage — is untouched.
+    resurrecting stale, spatially-shifted coverage — is untouched as of
+    0.80.1. **Closed in 0.81.0; see that addendum below.**
 
   Tests: three in `aurora-tile` (`forget_surface` across all three
   residences plus a spared second surface; an untouched surface
@@ -15423,6 +15424,98 @@ severity choice.
   warnings cargo doc --workspace --no-deps --all-features` all clean
   locally. Library-only, no GPU or interactive verification, and none
   is applicable — nothing in the app calls any of this yet.
+
+  **Addendum 2026-09-03 (0.81.0) — follow-on (4)'s other half is closed:
+  a new mask no longer inherits the removed one's coverage.** What
+  landed:
+
+  - `aurora_doc::mask::forget_mask_coverage(&LayerTree, &mut TileStore,
+    LayerId) -> usize` — resolves `mask_surface_id` and hands it to
+    `TileStore::forget_surface`; `0` (a real no-op) for an unknown layer
+    and for the structurally unreachable reserved-id branch. Unlike
+    `forget_document_surfaces` it takes the tree **by reference**, and
+    that inversion is the point rather than an oversight: this is a
+    live-document operation by design, called on a tree still in active
+    use. Its blast radius is what makes that safe — one layer's mask
+    surface, never its pixel content and never another layer's
+    anything, which is its own test.
+  - `History::add_mask` now takes a `&mut TileStore` and calls it
+    immediately after `tree.add_mask` succeeds. The ordering is
+    load-bearing and commented inline: a refusal (unknown layer,
+    `MaskAlreadyExists`, an out-of-range rectangle) returns before
+    anything touches the store, so a failed call cannot destroy a *live*
+    mask's coverage. Nine call sites, all tests inside `history.rs`,
+    updated; `LayerTree::add_mask`/`remove_mask` stay store-agnostic.
+
+  **The seam is `add_mask`, not `remove_mask` — deliberately, and this
+  is the whole design decision.** The obvious shape is to free the tiles
+  when the mask is removed, and it is wrong for exactly the reason the
+  layer-removal bullet above already gives: `remove_mask` is undoable
+  via `LayerOp::RestoreMask`, so freeing there would make Ctrl+Z restore
+  a blank mask with the user's painted coverage already destroyed. It
+  would also directly invert 0.80.0's own
+  `forget_document_surfaces_frees_both_content_and_mask_tiles`, which
+  asserts the coverage survives a `remove_mask`. `History::remove_mask`
+  is therefore unchanged in behaviour; only its doc comment grew, to say
+  why.
+
+  **What this does *not* fix, stated plainly:**
+
+  - **Still zero live-app behaviour change.** Nothing paints mask
+    coverage yet (follow-on (1), the brush/tool UI, is still not built),
+    so this is a correctness fix landing ahead of the feature that would
+    make it reachable, not a user-visible one.
+  - **`LayerTree::add_mask` called directly still does not clear.** It
+    holds no store handle, and keeping `LayerTree` store-agnostic is
+    deliberate; a caller bypassing `History` must call
+    `forget_mask_coverage` itself. Same documented, accepted bypass
+    shape as the `LayerTree::remove` gap above, and now stated in that
+    function's own doc comment. `aurora-io`'s and `aurora-app`'s tests
+    are the direct callers today, and they paint no coverage.
+  - **Once a new mask is committed, the old one's coverage is
+    unrecoverable by undo.** Undoing past the add restores the previous
+    `LayerMask` struct exactly — bounds, `enabled`, `inverted` — but not
+    its pixels: one derived surface holds one mask's tiles. Accepted,
+    and pinned by a test named for it rather than left to be discovered.
+    Holding both would need a surface per mask *instance* (allocated,
+    not derived, ids) — a separate decision, along with the still-absent
+    `set_mask_bounds`, and neither is taken here.
+
+  Tests: five in `history.rs` —
+  `add_mask_after_a_remove_starts_from_unpainted_coverage` (re-adds with
+  a *different* rectangle, so the origin shift is actually exercised,
+  and asserts the tiles survive the `remove_mask` first);
+  `add_mask_clears_only_that_layers_mask_surface` (two masked layers,
+  byte-exact on the three surfaces that must not move);
+  `undo_of_a_remove_mask_still_finds_its_painted_coverage` (the
+  anti-naive test, the mask-shaped twin of 0.80.0's);
+  `add_mask_makes_the_removed_masks_coverage_unrecoverable_by_undo`
+  (pins the accepted consequence above); and
+  `add_mask_refused_as_already_existing_leaves_its_coverage_alone`
+  (pins the ordering). Two in `mask.rs`:
+  `forget_mask_coverage_of_an_unknown_layer_is_zero` and
+  `forget_mask_coverage_frees_only_the_requested_layers_mask`.
+
+  Non-vacuity was verified the same way 0.80.0's was: a scratch
+  mutation moving the `forget_mask_coverage` call from `add_mask` into
+  `remove_mask` — i.e. implementing the fix at the wrong seam — turns
+  `undo_of_a_remove_mask_still_finds_its_painted_coverage` red on its
+  coverage assertion, and takes 0.80.0's
+  `forget_document_surfaces_frees_both_content_and_mask_tiles` down with
+  it. Reverted.
+
+  **Verified (0.81.0)**: `cargo fmt --all --check`,
+  `check_layering.py`, `check_no_hardcoded_style.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace` (1,566
+  passing), `cargo test --workspace --doc`, and `RUSTDOCFLAGS=-D
+  warnings cargo doc --workspace --no-deps --all-features` all clean
+  locally. That last one caught a broken intra-doc link (`LayerTree::add`
+  — the real constructors are `add_pixel_layer`/`add_group`) that plain
+  `cargo doc` only warned about, which is exactly the gap CLAUDE.md
+  notes it exists to close. Library-only; no GPU or interactive
+  verification, and none is applicable — nothing in the app reaches this
+  path yet.
 
   **Review found three real defects, all fixed by 0.70.4**: a
   cross-layer `SurfaceId` collision reachable through a crafted/
@@ -17428,15 +17521,19 @@ tooling-gated, fall into one of four buckets:
    painted coverage survives save/load. Three slices of it are still
    open and named as such: a brush/tool UI for painting a mask,
    mask-pixel undo/history, and mask-surface lifecycle cleanup (a
-   removed-then-re-added mask resurrects its old, now
-   spatially-shifted coverage; a deleted layer's mask tiles leak the
-   same way its pixel tiles already do) — the last named in 0.70.4
-   after review found it undisclosed, and **half-addressed in 0.80.0**
-   by `TileStore::forget_surface` +
-   `aurora_doc::forget_document_surfaces`, which can free a *discarded
-   document's* content and mask surfaces but is called by nothing in
-   the app yet (see M1.9's own 0.80.0 addendum for what is and is not
-   fixed). The first is what still keeps
+   deleted layer's mask tiles still leak the same way its pixel tiles
+   already do) — the last named in 0.70.4 after review found it
+   undisclosed, and addressed in two halves since. **0.80.0** added
+   `TileStore::forget_surface` + `aurora_doc::forget_document_surfaces`,
+   which can free a *discarded document's* content and mask surfaces
+   but is called by nothing in the app yet. **0.81.0 closed the other
+   half**: a removed-then-re-added mask no longer resurrects the old
+   mask's spatially-shifted coverage, because `History::add_mask` now
+   clears that derived surface via the new
+   `aurora_doc::mask::forget_mask_coverage` — at *add* time, not remove
+   time, since undo of a removal still needs those tiles. See M1.9's own
+   0.80.0 and 0.81.0 addenda for what is and is not fixed in each. The
+   first is what still keeps
    every other slice, persistence included, from ever running end to
    end through the editor. Asked Cahya which of these two to
    pick up next (2026-08-12); answer was to pause rather than commit to
