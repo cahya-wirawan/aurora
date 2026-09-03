@@ -7162,10 +7162,12 @@ fn note_gpu_composite_submit() {}
 ///   accumulators an all-`Multiply` stack would.
 ///
 /// **Each is created separately and lazily** (0.84.1). `current` is
-/// created by the first root layer that resolves to real content at this
-/// tile, so a tile with no touched layer anywhere still does zero GPU
-/// work. `spare` is created by the first blend-math layer of *any*
-/// expressible mode that actually
+/// created by the first root layer that resolves — which, per the
+/// lazy-paging correction below (0.86.1), is not the same as "this tile
+/// has painted content": a visible layer resolves at every tile
+/// coordinate, so only a tile with no *visible* layer anywhere still
+/// does zero GPU work. `spare` is created by the first blend-math layer
+/// of *any* expressible mode that actually
 /// reaches this tile — never before, and never a second time for a
 /// second mode — so an all-`Normal` document (every
 /// plain imported PNG/JPEG/TIFF) allocates and clears exactly one

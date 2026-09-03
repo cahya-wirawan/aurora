@@ -15366,6 +15366,19 @@ severity choice.
   local change in `aurora-app`. Both doc comments now state the true
   reachability and point here.
 
+  **A third site missed the correction (fixed in 0.86.2).** The
+  accumulator-pair doc comment (`begin_gpu_composite_tile`'s body,
+  ~line 7164) still read "a tile with no touched layer anywhere still
+  does zero GPU work" — the exact wording the other two sites' 0.86.1
+  correction exists to retire — contradicting them ~150 lines apart in
+  the same function. An independent Judge caught it; the Reviser and
+  both Verifiers had each read past it. Reworded to match: zero GPU
+  work only when no layer anywhere is *visible*, not merely "untouched"
+  at this tile. Also fixed in the same commit: a doc comment pointing at
+  a test by a stale name (`composite.rs`, the record-without-submitting
+  test's doc cross-reference had not been updated when the test itself
+  was renamed in 0.86.0).
+
 - [x] **Real per-pixel grayscale mask coverage — done 2026-09-02
   (0.70.0), closing the "rectangular clip only" limitation the
   mask-aggregation round (0.37.0) named and every round since carried

@@ -1388,7 +1388,7 @@ impl TileCompositor {
     ///   readback recorded into a *different*, earlier-submitted encoder
     ///   sees the destination as it was before this call. That is the
     ///   subject of this module's own
-    ///   `composite_over_with_opacity_records_without_submitting` test.
+    ///   `composite_over_with_opacity_records_into_the_encoder_without_submitting_it` test.
     /// - **Ordering within one command buffer is still guaranteed.**
     ///   Passes recorded back to back into one encoder execute in
     ///   recording order, so a later pass sampling a texture an earlier
