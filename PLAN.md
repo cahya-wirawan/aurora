@@ -17747,6 +17747,160 @@ severity choice.
   "doc-only follow-up, no new patch" precedent this file's own history
   already establishes (e.g. the plain "Correct PLAN.md" commit between
   0.10.2 and 0.11.0, no version of its own).
+
+  **Per-stage frame breakdown, 2026-09-03 (0.88.0) — diagnosis only, no
+  fix.** Three consecutive earlier rounds each optimized one
+  plausible-sounding stage of this frame (per-tile submit batching in
+  0.86.0, the blank-tile skip in 0.87.0, and the narrowed invalidation
+  work before them) without anyone having measured which stage actually
+  dominates. This round measures it. Both benchmarks now print a
+  per-stage split of every frame under `--nocapture`; **nothing is
+  asserted on the new numbers**, both `BUDGET_MS` constants and both
+  assertions are untouched, and `total` keeps its exact pre-existing
+  definition (`t0.elapsed()`), so the split cannot move either verdict.
+
+  Adapter, verbatim from the runs themselves
+  (`AURORA_REQUIRE_GPU=1 cargo test --release -p aurora-app --
+  --nocapture --test-threads=1 recomposite_and_present_loop`, three
+  runs): `GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`.
+
+  `recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling`
+  (GPU path, n=40, ranges across the three runs):
+
+  | stage | mean (ms) | p50 (ms) | p99 (ms) | share of mean total |
+  |---|---|---|---|---|
+  | total | 27.14–29.09 | 26.75–27.49 | 37.05–49.66 | 100% |
+  | `set_origin` | 0.01 | 0.01–0.02 | 0.02–0.03 | ~0.1% |
+  | `stamp_dab` | 0.37–0.40 | 0.35–0.38 | 0.68–0.72 | 1.3–1.4% |
+  | `recomposite` | 11.23–12.00 | 11.00–11.42 | 18.91–31.19 | 41.3–42.0% |
+  | `upload_sync` | 14.90–16.13 | 14.67–15.23 | 16.70–24.07 | 54.5–55.5% |
+  | `record_pass` | 0.02–0.03 | 0.02 | 0.31–0.39 | ~0.1% |
+  | `submit_poll` | 0.51–0.59 | 0.48–0.61 | 0.72–0.87 | 1.8–2.2% |
+
+  Worst single frame, run 1 (every number from one real frame, not an
+  order statistic): total 49.66 ms = `set_origin` 0.03 + `stamp_dab`
+  0.11 + `recomposite` 31.19 + `upload_sync` 17.19 + `record_pass` 0.39
+  + `submit_poll` 0.76, `gpu_tiles` 1. Runs 2 and 3: 40.88 ms
+  (`recomposite` 16.43 + `upload_sync` 23.44) and 37.05 ms
+  (`recomposite` 19.07 + `upload_sync` 16.70).
+
+  `recomposite_and_present_loop_exercises_the_cpu_fallback_path`
+  (CPU fallback, n=12, ranges across the same three runs):
+
+  | stage | mean (ms) | p50 (ms) | p99 (ms) | share of mean total |
+  |---|---|---|---|---|
+  | total | 16.10–16.89 | 16.01–16.51 | 18.44–23.14 | 100% |
+  | `set_origin` | 0.02 | 0.01 | 0.08–0.13 | ~0.1% |
+  | `stamp_dab` | 0.30–0.31 | 0.32–0.35 | 0.38–0.42 | 1.8–1.9% |
+  | `recomposite` | 8.68–8.75 | 8.50–8.60 | 11.31–11.57 | 51.8–53.9% |
+  | `upload_sync` | 6.66–6.77 | 6.58–6.67 | 7.56–8.04 | 39.8–41.8% |
+  | `record_pass` | 0.05–0.68 | 0.02 | 0.34–7.98 | 0.3–4.0% |
+  | `submit_poll` | 0.38–0.41 | 0.42–0.43 | 0.58–0.72 | 2.3–2.4% |
+
+  Worst single frame, run 1: total 23.14 ms = `set_origin` 0.00 +
+  `stamp_dab` 0.10 + `recomposite` 6.68 + `upload_sync` 7.65 +
+  `record_pass` 7.98 + `submit_poll` 0.72, `gpu_tiles` 0. That 7.98 ms
+  `record_pass` is frame #0 only (first-ever `CanvasPipeline` bind-group
+  and pipeline creation, which this loop caches thereafter) — runs 2 and
+  3 put their worst frame at #2 with `record_pass` at 0.02 ms, so it is
+  a one-time warm-up cost, not a steady-state stage.
+
+  **The answer this round exists to give.** *No single stage holds a
+  majority of the mean in the GPU-path test, but two of the six hold
+  essentially all of it:* `upload_sync` (`TileResidency::sync`, 54.5–55.5%)
+  and `recomposite` (`recomposite_visible_tiles`, 41.3–42.0%) together
+  account for **95.8–97.0%** of the mean frame. In the CPU-fallback test
+  the same two stages swap rank and still hold **93.6–95.7%**:
+  `recomposite` 51.8–53.9% (a bare majority) and `upload_sync`
+  39.8–41.8%. Everything else — pan bookkeeping, the brush dab itself,
+  building the render pass, and the submit+poll of the present pass —
+  is **under 4.5% combined in both tests**. The p99 story is the same
+  pair: every worst frame recorded above is `recomposite` + `upload_sync`
+  plus noise.
+
+  Two sub-findings that follow directly, and that no prior round had
+  visibility into:
+
+  - **`upload_sync` was never the target of any of the three prior
+    optimization rounds**, and it is the single largest stage on the GPU
+    path. This is the atlas-upload bandwidth cost `spike/FINDINGS.md`
+    already named ("Upload bandwidth caps pan speed", ~18 MB per
+    screenful) showing up in the real app, on the real path, for the
+    first time.
+  - **The GPU is not what the GPU path waits on.** Inside
+    `recomposite_visible_tiles`, the sub-phase means are phase 1
+    (per-tile issue / immediate CPU composite) 9.49–10.17 ms, phase 2
+    (the single per-frame `device.poll(Wait)`) **0.03–0.04 ms**, phase 3
+    (readback drain + composite-surface write) 1.68–1.79 ms. Phase 2 is
+    free; the cost is CPU-side. Consistent with `gpu_tiles` measuring a
+    steady **3.0 GPU-composited tiles per frame** against an 800×600
+    viewport's ~20 visible tiles — the other ~17 are blank and take
+    0.87.0's CPU blank-tile path, so most of phase 1 is a CPU walk over
+    tiles that produce nothing. On the CPU-fallback test `gpu_tiles` is
+    a steady **0.0/frame**, which is the intended control and confirms
+    that test genuinely never enters `begin_gpu_composite_tile`.
+
+  **A baseline discrepancy, flagged not fixed.** The 98.75 ms / 54.10 ms
+  p99 figures in this entry above — and the identical pair in
+  `CLAUDE.md`'s own "The live app, measured end to end" table — were
+  measured on this sandbox's *old Mesa llvmpipe software renderer*, not
+  on real GPU hardware; that hardware attribution is already corrected
+  earlier in this entry, but the numbers themselves still stand
+  unlabelled in `CLAUDE.md`. They should not be read as RTX 3090
+  figures. Separately, these fresh runs do **not** reproduce 0.86.0's
+  own real-RTX-3090 figures either (mean ~53.30 ms / p99 ~59.29 ms GPU
+  path; mean ~30.34 ms / p99 ~32.95 ms CPU fallback): three runs today
+  give mean 27.14–29.09 / p99 37.05–49.66 and mean 16.10–16.89 / p99
+  18.44–23.14 respectively, roughly half. The most plausible cause is
+  0.87.0's own blank-tile skip, which landed *after* those 0.86.0
+  measurements and which the `gpu_tiles`=3-of-~20 finding above shows is
+  active on 85% of this fixture's tiles every frame — but that is an
+  untested hypothesis, not a measured attribution, and nobody has
+  re-run 0.86.0's exact commit to confirm it. **`CLAUDE.md`'s table is
+  deliberately left alone in this round** — correcting it is its own
+  work with its own before/after evidence, not a side effect of a
+  diagnostic commit.
+
+  **This round changes no compositing, upload, or render-pass
+  behaviour**, and it does not move the 60 FPS verdict in either
+  direction: both benchmarks are still over the 16.7 ms budget (GPU path
+  ~1.6–1.7× at the mean, ~2.2–3.0× at p99; CPU fallback ~1.0× at the
+  mean, ~1.1–1.4× at p99), exactly as before.
+
+  Disclosed limitations, in order of how much they should temper the
+  above:
+
+  - **Phase 2 is wall-clock stall, not GPU execution time.** It measures
+    how long the frame *blocked* on `device.poll(Wait)`, which is a
+    lower bound on GPU cost and can read near-zero when work already
+    finished before the poll was reached. Real GPU-side timing needs
+    `wgpu` timestamp queries (`Features::TIMESTAMP_QUERY` plus a query
+    set per pass), deliberately not added here. So "the GPU is not what
+    we wait on" is a claim about *stalls*, not about GPU utilisation.
+  - **One adapter, one platform.** Linux/Vulkan/RTX 3090 only. No
+    Metal, no DX12, no integrated GPU, no software fallback re-check.
+  - **Run-to-run noise is real and is why ranges are reported**, not
+    single figures. The GPU-path p99 spans 37.05–49.66 ms across three
+    otherwise identical runs — a 34% spread on n=40. Any future claim of
+    an improvement on this benchmark needs to clear that spread, which
+    is exactly the trap 0.86.0's own null result documented.
+  - **The stages do not sum exactly to `total`.** Marks are taken
+    between statements, so the microseconds in the pushes and in
+    `Instant::now` itself land nowhere, and `total` is read before the
+    pushes happen. Shares are therefore approximate to well under a
+    percent, which does not affect any conclusion drawn above.
+  - **Per-stage p99s are independent order statistics** and need not
+    come from the same frame; they will not add to the total's own p99.
+    That is why a single worst-frame breakdown is reported separately
+    for each test.
+  - **The instrumentation is test-only.** The three-phase timer inside
+    `recomposite_visible_tiles` is a `#[cfg(test)]` static plus a
+    `#[cfg(not(test))]` zero-sized no-op, the same pattern
+    `DARKEN_GPU_DISPATCHES` and `GPU_COMPOSITE_SUBMITS` already use in
+    this file; `cargo build --workspace` (flagless, no test cfg) and
+    `cargo clippy -p aurora-app -- -D warnings` (lib target only, i.e.
+    `cfg(not(test))`) are both clean, which is what confirms the
+    shipping build carries none of it.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

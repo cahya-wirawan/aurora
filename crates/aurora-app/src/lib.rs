@@ -7224,6 +7224,99 @@ fn note_gpu_composite_submit() {
 #[cfg(not(test))]
 fn note_gpu_composite_submit() {}
 
+/// Test-only wall-clock accumulator for [`recomposite_visible_tiles`]'s
+/// own three internal phases, in nanoseconds: `[0]` phase 1 (the
+/// per-tile loop that either issues a GPU composite or composites on the
+/// CPU immediately), `[1]` phase 2 (the single per-frame
+/// `device.poll(Wait)`), `[2]` phase 3 (draining every pending tile's
+/// readback and writing it into the composite surface).
+///
+/// **What this measures, stated precisely.** Wall-clock time spent
+/// inside each phase on the calling thread. For phase 2 that is *how
+/// long the frame blocked waiting on the GPU*, which is not the same
+/// thing as how long the GPU spent executing — work may already have
+/// completed before the poll was reached, or several tiles' work may
+/// overlap. Real GPU execution time needs `wgpu` timestamp queries
+/// (`Features::TIMESTAMP_QUERY` plus a query set per pass), which this
+/// diagnostic round deliberately does not add. Read phase 2 as "stall",
+/// not as "GPU cost".
+///
+/// Same soundness argument as [`GPU_COMPOSITE_SUBMITS`] and
+/// [`DARKEN_GPU_DISPATCHES`]: the counter is process-global and
+/// `Relaxed`, which is fine because every caller that reaches the GPU
+/// arms holds `GPU_TEST_LOCK` via `real_gpu_context`. A *CPU-only*
+/// caller of `recomposite_visible_tiles` does not hold that lock and
+/// will also accumulate here, which is exactly why
+/// `take_recomposite_phase_ms` reads-and-zeroes and why its callers zero
+/// it once before their own measurement loop.
+///
+/// Nothing is ever asserted on these numbers — they exist to answer
+/// "which phase costs the most", printed under `--nocapture`.
+#[cfg(test)]
+static RECOMPOSITE_PHASE_NANOS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Test-only phase stopwatch feeding [`RECOMPOSITE_PHASE_NANOS`]. Built
+/// once at the top of [`recomposite_visible_tiles`]; `mark` is called at
+/// the end of each of its three phases, in order.
+#[cfg(test)]
+#[derive(Debug)]
+struct RecompositePhases {
+    /// When the phase now in progress began.
+    last: std::time::Instant,
+    /// Which [`RECOMPOSITE_PHASE_NANOS`] slot the next `mark` credits. A
+    /// fourth or later `mark` would find no slot and is silently
+    /// dropped rather than panicking (`indexing_slicing` is denied
+    /// workspace-wide, and this is instrumentation — it must never be
+    /// able to cost a user their work).
+    phase: usize,
+}
+
+#[cfg(test)]
+impl RecompositePhases {
+    fn start() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            phase: 0,
+        }
+    }
+
+    fn mark(&mut self) {
+        let now = std::time::Instant::now();
+        // `duration_since`, never `now - self.last`: `Sub` for `Instant`
+        // panics on an inverted pair, and this crate denies `panic`.
+        let elapsed = now.duration_since(self.last);
+        if let Some(slot) = RECOMPOSITE_PHASE_NANOS.get(self.phase) {
+            let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+            slot.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.last = now;
+        self.phase = self.phase.saturating_add(1);
+    }
+}
+
+/// The shipping build's version: a zero-sized type whose `mark` compiles
+/// to nothing, exactly as [`note_gpu_composite_submit`] does above. The
+/// counter itself does not exist outside `cfg(test)`.
+#[cfg(not(test))]
+#[derive(Debug)]
+struct RecompositePhases;
+
+#[cfg(not(test))]
+impl RecompositePhases {
+    fn start() -> Self {
+        Self
+    }
+
+    // `&mut self` deliberately mirrors the `cfg(test)` signature so the
+    // call sites are identical in both builds; there is nothing to read.
+    #[allow(clippy::unused_self)]
+    fn mark(&mut self) {}
+}
+
 /// GPU-accelerated compositing for one visible composite tile, for the
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
 /// the whole document: every visible top-level layer is an
@@ -7999,6 +8092,9 @@ fn recomposite_visible_tiles(
     gpu: Option<&aurora_gpu::GpuContext>,
     mut compositor: Option<&mut aurora_render::TileCompositor>,
 ) {
+    // Test-only, no-op in the shipping build (see `RecompositePhases`).
+    let mut phases = RecompositePhases::start();
+
     // The tile grid `residency.visible_tiles()` walks is anchored to the
     // *active* layer's own origin (`canvas_local_origin`'s own doc
     // comment) — every other layer's own document-space tile boundaries
@@ -8153,6 +8249,7 @@ fn recomposite_visible_tiles(
             write_composited(store, cache, tile_id, &composited);
         }
     }
+    phases.mark();
 
     // Phase 2: one poll for the whole frame -- drives every pending
     // tile's `map_async` callback to completion in a single blocking
@@ -8163,6 +8260,7 @@ fn recomposite_visible_tiles(
             timeout: None,
         });
     }
+    phases.mark();
 
     // Phase 3: drain every pending tile's result. `rx.recv()` inside
     // `finish_tile_readback` returns immediately here, since phase 2's
@@ -8180,6 +8278,7 @@ fn recomposite_visible_tiles(
         };
         write_composited(store, cache, tile_id, &composited);
     }
+    phases.mark();
 }
 
 /// Which composite `aurora_tile::TileId`s [`recomposite_visible_tiles`]
@@ -13086,14 +13185,14 @@ mod tests {
         DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess,
         GPU_COMPOSITE_SUBMITS, Key, KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
         MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, RecoveredDocument, ShutdownState, UndoKind,
-        UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
-        apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
-        background_color_from_theme, begin_drag, begin_gpu_composite_tile, brush_stroke_mut,
-        canvas_area_logical_size, canvas_area_physical_rect, canvas_area_physical_size,
-        canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer, clean_shutdown_cleanup,
-        clear_session_marker, close_command_palette, close_dialog, collect_widget_paints,
-        commit_ending_drag, composite_document, composite_reference_origin,
+        RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_PHASE_NANOS, RailResize, RecoveredDocument,
+        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
         composite_roots_into_tile, composite_surface_id, continue_drag,
         crash_recovery_dialog_actions, crash_recovery_dialog_message,
         create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
@@ -18123,6 +18222,27 @@ mod tests {
     /// too.
     fn take_gpu_composite_submit_count() -> u64 {
         GPU_COMPOSITE_SUBMITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reads [`RECOMPOSITE_PHASE_NANOS`] and resets it to zero in the
+    /// same read-and-zero shape as the two counters above, converting to
+    /// milliseconds for reporting: `[phase 1, phase 2, phase 3]` of
+    /// [`recomposite_visible_tiles`].
+    ///
+    /// Diagnostic only — nothing asserts on the result, and phase 2 is
+    /// *wall-clock stall on the poll*, not GPU execution time. See
+    /// [`RECOMPOSITE_PHASE_NANOS`]'s own doc comment for the full
+    /// limitation.
+    fn take_recomposite_phase_ms() -> [f64; 3] {
+        let mut out = [0.0_f64; 3];
+        for (slot, dest) in RECOMPOSITE_PHASE_NANOS.iter().zip(out.iter_mut()) {
+            let nanos = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *dest = nanos as f64 / 1_000_000.0;
+            }
+        }
+        out
     }
 
     fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
@@ -26885,7 +27005,7 @@ mod tests {
         frames: u32,
         start: (u32, u32),
         pan_step_px: (u32, u32),
-    ) -> Vec<f64> {
+    ) -> FrameStages {
         let device = gpu.device();
         let queue = gpu.queue();
         let mut residency = aurora_gpu::TileResidency::new(device, queue, viewport);
@@ -26893,23 +27013,17 @@ mod tests {
         let mut compositor = aurora_render::TileCompositor::new(device);
         let mut cache = CompositeCache::default();
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frame-timing-target"),
-            size: wgpu::Extent3d {
-                width: viewport.0,
-                height: viewport.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
+        let target = frame_timing_target(device, viewport);
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut timings = Vec::with_capacity(frames as usize);
+        let mut stages = FrameStages::with_capacity(frames as usize);
+        // Zero both process-global test counters once, before the loop, so
+        // the numbers below describe only this loop's own work and not
+        // whatever GPU test ran earlier in the same binary -- the exact
+        // precedent `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack`
+        // sets at its own call site.
+        let _ = take_gpu_composite_submit_count();
+        let _ = take_recomposite_phase_ms();
         for step in 0..frames {
             let x = start.0 + step * pan_step_px.0;
             let y = start.1 + step * pan_step_px.1;
@@ -26917,6 +27031,7 @@ mod tests {
 
             #[allow(clippy::cast_precision_loss)]
             residency.set_origin(queue, (x as f32, y as f32), viewport, 1.0);
+            let t_set_origin = std::time::Instant::now();
 
             // A `TileError` here (observed in practice under this
             // helper's own tight `real_tile_store()` budget: a page-in
@@ -26949,6 +27064,7 @@ mod tests {
                 );
             }
             cache.bump();
+            let t_stamp_dab = std::time::Instant::now();
 
             recomposite_visible_tiles(
                 &residency,
@@ -26959,7 +27075,9 @@ mod tests {
                 Some(gpu),
                 Some(&mut compositor),
             );
+            let t_recomposite = std::time::Instant::now();
             let _ = residency.sync(queue, store, composite_surface_id(), false, usize::MAX);
+            let t_upload_sync = std::time::Instant::now();
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame-timing"),
@@ -26987,15 +27105,175 @@ mod tests {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
+            let t_record_pass = std::time::Instant::now();
             queue.submit(std::iter::once(encoder.finish()));
             let _ = device.poll(wgpu::PollType::Wait {
                 submission_index: None,
                 timeout: None,
             });
+            let t_submit_poll = std::time::Instant::now();
 
-            timings.push(t0.elapsed().as_secs_f64() * 1000.0);
+            // `total` keeps its pre-instrumentation definition byte for
+            // byte -- `t0.elapsed()`, read here before anything else is
+            // recorded -- so the two callers' budget assertions see
+            // exactly the number they saw before the split existed.
+            // Everything else is additive and asserted on by nothing.
+            stages.push_frame(
+                t0.elapsed().as_secs_f64() * 1000.0,
+                [
+                    t0,
+                    t_set_origin,
+                    t_stamp_dab,
+                    t_recomposite,
+                    t_upload_sync,
+                    t_record_pass,
+                    t_submit_poll,
+                ],
+                take_gpu_composite_submit_count(),
+                take_recomposite_phase_ms(),
+            );
         }
-        timings
+        stages
+    }
+
+    /// Per-frame, per-stage timings collected by
+    /// [`measure_pan_and_paint_frames`]. Every vector is `frames` long
+    /// and indexed by frame.
+    ///
+    /// **Diagnostic only.** Nothing in this file asserts on any of these
+    /// numbers. `total` is defined exactly as it always was --
+    /// `t0.elapsed()` across the whole frame body -- so introducing the
+    /// per-stage split cannot move either caller's CI-safety budget
+    /// assertion. The per-stage vectors will not sum exactly to `total`:
+    /// the marks are taken between statements, so the handful of
+    /// microseconds spent in the pushes and in `Instant::now` itself lands
+    /// nowhere, and `total` is read before the pushes happen.
+    ///
+    /// Added 0.88.0 for a single purpose: three consecutive earlier rounds
+    /// each optimized one plausible-sounding stage of this frame without
+    /// anyone measuring which stage actually dominates. This measures it.
+    #[derive(Debug)]
+    struct FrameStages {
+        /// Whole-frame time, the pre-existing definition and the only
+        /// series either caller asserts on.
+        total: Vec<f64>,
+        /// `TileResidency::set_origin` -- pan bookkeeping plus its
+        /// uniform write.
+        set_origin: Vec<f64>,
+        /// `aurora_brush::stamp_dab` plus `CompositeCache::bump`.
+        stamp_dab: Vec<f64>,
+        /// `recomposite_visible_tiles` in full; `recomposite_phases`
+        /// breaks this one down further.
+        recomposite: Vec<f64>,
+        /// `TileResidency::sync` -- staging and uploading the composite
+        /// surface's dirty tiles to the GPU.
+        upload_sync: Vec<f64>,
+        /// Building the command encoder, bind group, pipeline and the
+        /// one render pass. Records commands; runs nothing.
+        record_pass: Vec<f64>,
+        /// `queue.submit` plus the blocking `device.poll(Wait)` -- the
+        /// closest thing here to "the GPU actually ran", though it is
+        /// still wall-clock stall, not a timestamp query.
+        submit_poll: Vec<f64>,
+        /// `begin_gpu_composite_tile`'s own submit count for this frame,
+        /// i.e. how many tiles genuinely took the GPU compositing path.
+        /// Zero on a frame that fell back to the CPU for every tile --
+        /// which is the whole point of reporting it: it is what separates
+        /// "the GPU path ran and was fast" from "the GPU path silently
+        /// declined and the CPU computed the same pixels".
+        gpu_tiles: Vec<u64>,
+        /// `[phase 1, phase 2, phase 3]` milliseconds inside
+        /// `recomposite_visible_tiles` -- see
+        /// [`RECOMPOSITE_PHASE_NANOS`], and note that phase 2 is
+        /// wall-clock stall on the poll rather than GPU execution time.
+        recomposite_phases: Vec<[f64; 3]>,
+    }
+
+    impl FrameStages {
+        fn with_capacity(frames: usize) -> Self {
+            Self {
+                total: Vec::with_capacity(frames),
+                set_origin: Vec::with_capacity(frames),
+                stamp_dab: Vec::with_capacity(frames),
+                recomposite: Vec::with_capacity(frames),
+                upload_sync: Vec::with_capacity(frames),
+                record_pass: Vec::with_capacity(frames),
+                submit_poll: Vec::with_capacity(frames),
+                gpu_tiles: Vec::with_capacity(frames),
+                recomposite_phases: Vec::with_capacity(frames),
+            }
+        }
+
+        /// Records one frame. `marks` are the seven `Instant`s bounding
+        /// the six stages, in frame order: frame start, then one after
+        /// each of `set_origin`, the dab, `recomposite_visible_tiles`,
+        /// `residency.sync`, the render-pass scope, and
+        /// `submit` + `poll`.
+        ///
+        /// Consecutive pairs are differenced with
+        /// `Duration::duration_since`, never `Instant - Instant`: `Sub`
+        /// for `Instant` panics on an inverted pair, and this workspace
+        /// denies `panic`. Destructuring the array (rather than indexing
+        /// it) likewise keeps the denied `indexing_slicing` out of it.
+        fn push_frame(
+            &mut self,
+            total_ms: f64,
+            marks: [std::time::Instant; 7],
+            gpu_tiles: u64,
+            recomposite_phases: [f64; 3],
+        ) {
+            let [
+                t0,
+                set_origin,
+                stamp_dab,
+                recomposite,
+                upload_sync,
+                record_pass,
+                submit_poll,
+            ] = marks;
+            self.total.push(total_ms);
+            self.set_origin.push(ms(set_origin.duration_since(t0)));
+            self.stamp_dab
+                .push(ms(stamp_dab.duration_since(set_origin)));
+            self.recomposite
+                .push(ms(recomposite.duration_since(stamp_dab)));
+            self.upload_sync
+                .push(ms(upload_sync.duration_since(recomposite)));
+            self.record_pass
+                .push(ms(record_pass.duration_since(upload_sync)));
+            self.submit_poll
+                .push(ms(submit_poll.duration_since(record_pass)));
+            self.gpu_tiles.push(gpu_tiles);
+            self.recomposite_phases.push(recomposite_phases);
+        }
+    }
+
+    /// A `Duration` as milliseconds, the unit every number in
+    /// [`FrameStages`] and [`ms_stats`] is expressed in.
+    fn ms(span: std::time::Duration) -> f64 {
+        span.as_secs_f64() * 1000.0
+    }
+
+    /// The offscreen render target [`measure_pan_and_paint_frames`]
+    /// presents into -- the same headless technique
+    /// `spike/vertical-slice`'s own `headless_bench` uses, never a real
+    /// swapchain. Split out of that function only to keep it under
+    /// `clippy::too_many_lines`; the descriptor is unchanged.
+    fn frame_timing_target(device: &wgpu::Device, viewport: (u32, u32)) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("frame-timing-target"),
+            size: wgpu::Extent3d {
+                width: viewport.0,
+                height: viewport.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
     }
 
     /// Mean, p50, p99, and max of `values` (sorted in place) -- the same
@@ -27025,6 +27303,117 @@ mod tests {
             unreachable!("caller always passes a non-empty slice")
         };
         (mean, p50, p99, max)
+    }
+
+    /// Prints [`FrameStages`]'s per-stage breakdown under `--nocapture`.
+    /// Asserts nothing, by design: this is a diagnostic, and 0.88.0
+    /// deliberately lands measurement without also landing a threshold
+    /// nobody has evidence for yet.
+    ///
+    /// Three things are reported, in this order:
+    ///
+    /// 1. **The single worst-total frame's own breakdown.** Found *before*
+    ///    any sorting, because [`ms_stats`] sorts its slice in place --
+    ///    after that call the frame indices no longer line up across
+    ///    stages.
+    /// 2. **mean / p50 / p99 / max per stage**, plus each stage's share of
+    ///    the mean total. Read the shares as an attribution of the
+    ///    *average* frame. The per-stage **p99s are independent order
+    ///    statistics** -- stage A's p99 and stage B's p99 need not come
+    ///    from the same frame, and they will not generally add up to the
+    ///    total's own p99. That is exactly why item 1 above is reported
+    ///    separately: it is the one row where every number is from one
+    ///    real frame.
+    /// 3. **GPU tiles composited per frame** (`gpu_tiles`), and the
+    ///    `recomposite_visible_tiles` sub-phase means. A GPU-path test
+    ///    reporting `gpu_tiles mean=0.0` would mean the path under test
+    ///    never ran and every number above describes the CPU fallback --
+    ///    a finding, not a footnote.
+    fn report_frame_stages(label: &str, stages: &mut FrameStages) {
+        let frames = stages.total.len();
+        if frames == 0 {
+            println!("{label}: no frames measured");
+            return;
+        }
+
+        // Before `ms_stats` sorts anything: which frame was worst overall?
+        let mut worst_index = 0_usize;
+        let mut worst_total = f64::NEG_INFINITY;
+        for (index, &total) in stages.total.iter().enumerate() {
+            if total > worst_total {
+                worst_total = total;
+                worst_index = index;
+            }
+        }
+        let at = |series: &[f64]| series.get(worst_index).copied().unwrap_or(f64::NAN);
+        println!(
+            "{label}: worst frame (#{worst_index} of {frames}) total={worst_total:.2}ms = \
+             set_origin {:.2} + stamp_dab {:.2} + recomposite {:.2} + upload_sync {:.2} + \
+             record_pass {:.2} + submit_poll {:.2} (ms; gpu_tiles={})",
+            at(&stages.set_origin),
+            at(&stages.stamp_dab),
+            at(&stages.recomposite),
+            at(&stages.upload_sync),
+            at(&stages.record_pass),
+            at(&stages.submit_poll),
+            stages
+                .gpu_tiles
+                .get(worst_index)
+                .map_or_else(|| "?".to_owned(), u64::to_string),
+        );
+
+        // `mean_total` from an unsorted copy: `ms_stats` sorts in place,
+        // and `stages.total` is the caller's own series -- it still owns
+        // it and still feeds it to its own `ms_stats` call afterwards.
+        #[allow(clippy::cast_precision_loss)]
+        let mean_total = stages.total.iter().sum::<f64>() / frames as f64;
+
+        // (name, series) pairs, walked in real frame order. `total` first
+        // so every share below is read against a number already printed.
+        let mut series: [(&str, &mut Vec<f64>); 7] = [
+            ("total      ", &mut stages.total),
+            ("set_origin ", &mut stages.set_origin),
+            ("stamp_dab  ", &mut stages.stamp_dab),
+            ("recomposite", &mut stages.recomposite),
+            ("upload_sync", &mut stages.upload_sync),
+            ("record_pass", &mut stages.record_pass),
+            ("submit_poll", &mut stages.submit_poll),
+        ];
+        for (name, values) in &mut series {
+            let (mean, p50, p99, max) = ms_stats(values);
+            let share = if mean_total > 0.0 {
+                mean / mean_total * 100.0
+            } else {
+                f64::NAN
+            };
+            println!(
+                "{label}:   {name} mean={mean:8.2}ms p50={p50:8.2}ms p99={p99:8.2}ms \
+                 max={max:8.2}ms share_of_mean_total={share:5.1}%"
+            );
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let gpu_tiles_mean = stages.gpu_tiles.iter().copied().sum::<u64>() as f64 / frames as f64;
+        let mut phase_means = [0.0_f64; 3];
+        for phases in &stages.recomposite_phases {
+            for (src, dest) in phases.iter().zip(phase_means.iter_mut()) {
+                *dest += *src;
+            }
+        }
+        for dest in &mut phase_means {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *dest /= frames as f64;
+            }
+        }
+        let [phase1, phase2, phase3] = phase_means;
+        println!(
+            "{label}:   gpu_tiles mean={gpu_tiles_mean:.1}/frame (0 would mean the GPU \
+             compositing path never ran); recomposite sub-phase means: phase1 \
+             issue/cpu-composite={phase1:.2}ms phase2 poll-wait={phase2:.2}ms phase3 \
+             readback+write={phase3:.2}ms (phase2 is wall-clock stall, not GPU execution time \
+             -- no timestamp queries)"
+        );
     }
 
     /// Real, headless, GPU-gated end-to-end frame-timing measurement of
@@ -27177,6 +27566,24 @@ mod tests {
     /// all yet, only this sandbox's software Vulkan adapter (see the
     /// budget paragraph above); and this is one adapter, one platform
     /// (Linux) -- not cross-platform evidence.
+    ///
+    /// **0.88.0 added a per-stage breakdown** via
+    /// [`report_frame_stages`], printed under `--nocapture` and asserted
+    /// on by nothing — `BUDGET_MS` and the assertion below are
+    /// untouched, and `total` keeps its exact pre-existing definition
+    /// (`t0.elapsed()`), so the split cannot move this test's verdict.
+    /// The finding for this test: no single stage is a majority, but
+    /// `upload_sync` (`TileResidency::sync`, 54.5–55.5% of the mean
+    /// frame) and `recomposite` (41.3–42.0%) hold 95.8–97.0% of it
+    /// between them; everything else is under 4.5% combined. Inside
+    /// `recomposite_visible_tiles` the poll-wait sub-phase is
+    /// 0.03–0.04 ms, i.e. this path does not stall on the GPU, and
+    /// `gpu_tiles` is a steady 3.0/frame against ~20 visible tiles.
+    /// See PLAN.md's M1.10 "Per-stage frame breakdown" addendum for the
+    /// full tables, the fresh whole-frame numbers (which no longer match
+    /// the 0.86.0-era figures quoted elsewhere in this file), and the
+    /// disclosed limitations — chiefly that the poll-wait number is
+    /// wall-clock stall, not GPU execution time.
     #[test]
     fn recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling() {
         // Real GitHub Actions CI runs (2026-08-12) hit p99 up to 889ms --
@@ -27240,7 +27647,7 @@ mod tests {
             "a single Normal-blend, full-bounds pixel layer must qualify for the GPU path"
         );
 
-        let mut timings = measure_pan_and_paint_frames(
+        let mut stages = measure_pan_and_paint_frames(
             &context,
             &layers,
             layer_id,
@@ -27251,7 +27658,12 @@ mod tests {
             (100_000, 100_000),
             (200, 120),
         );
-        let (mean, p50, p99, max) = ms_stats(&mut timings);
+        report_frame_stages(
+            "recomposite_and_present_loop (GPU path, 300,000px ceiling, pan+paint)",
+            &mut stages,
+        );
+        let timings = &mut stages.total;
+        let (mean, p50, p99, max) = ms_stats(timings);
         println!(
             "recomposite_and_present_loop (GPU path, 300,000px ceiling, pan+paint): n={} \
              mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms (nominal budget \
@@ -27283,6 +27695,25 @@ mod tests {
     /// honest number for it, not to re-measure the GPU-path scenario a
     /// second time. Same "generous CI-safe budget" reasoning and the same
     /// four NOT-covered caveats as the sibling test above apply here too.
+    ///
+    /// **0.88.0 added a per-stage breakdown** via
+    /// [`report_frame_stages`], printed under `--nocapture` and asserted
+    /// on by nothing — `BUDGET_MS` and the assertion below are
+    /// untouched, and `total` keeps its exact pre-existing definition.
+    /// The finding for this test: `recomposite` (51.8–53.9% of the mean
+    /// frame) and `upload_sync` (39.8–41.8%) hold 93.6–95.7% of it
+    /// between them, with `gpu_tiles` a steady 0.0/frame — which is the
+    /// intended control, confirming this test genuinely never enters
+    /// `begin_gpu_composite_tile`. See PLAN.md's M1.10 "Per-stage frame
+    /// breakdown" addendum for the full tables and limitations.
+    ///
+    /// **The 30.34/29.98/32.95 figures quoted just below are 0.86.0-era
+    /// and no longer reproduce**: three fresh runs on 2026-09-03, same
+    /// adapter, gave mean 16.10–16.89 ms, p50 16.01–16.51 ms, p99
+    /// 18.44–23.14 ms. 0.87.0's blank-tile skip landing in between is
+    /// the plausible but unconfirmed cause. Left in place rather than
+    /// silently overwritten — see the same PLAN.md addendum, which
+    /// flags this discrepancy rather than resolving it.
     ///
     /// **Measured locally (release build, `AURORA_REQUIRE_GPU=1`, on
     /// this sandbox's real adapter as printed by the run itself:
@@ -27351,7 +27782,7 @@ mod tests {
             "a Screen-blend root layer must disqualify the document from the GPU path"
         );
 
-        let mut timings = measure_pan_and_paint_frames(
+        let mut stages = measure_pan_and_paint_frames(
             &context,
             &layers,
             layer_id,
@@ -27362,7 +27793,12 @@ mod tests {
             (50_000, 50_000),
             (200, 120),
         );
-        let (mean, p50, p99, max) = ms_stats(&mut timings);
+        report_frame_stages(
+            "recomposite_and_present_loop (CPU fallback path, 300,000px ceiling, pan+paint)",
+            &mut stages,
+        );
+        let timings = &mut stages.total;
+        let (mean, p50, p99, max) = ms_stats(timings);
         println!(
             "recomposite_and_present_loop (CPU fallback path, 300,000px ceiling, pan+paint): \
              n={} mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms (nominal budget \
