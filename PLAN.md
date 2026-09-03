@@ -16718,6 +16718,138 @@ severity choice.
   warnings" cargo doc --workspace --no-deps --all-features`), all
   clean.
 
+- [x] **GPU blend-mode math, slice 3 of the epic: `BlendMode::Darken`
+  ported and wired — done 2026-09-03 (0.85.0).** The second real blend
+  mode on the GPU path, built to the exact template the four
+  0.83.0–0.84.2 rounds established, and the round that shows the
+  template is actually reusable rather than a one-off.
+
+  What landed:
+
+  - **`fs_composite_darken`** in `crates/aurora-render/src/shaders/composite.wgsl`,
+    structurally identical to `fs_composite_multiply` in every line but
+    one: `min(cb, s.rgb)` where the other has `cb * s.rgb`. `Darken` is
+    a *separable* mode (`blend_channel`'s `cb.min(cs)`, no guards, no
+    branches, no division), and WGSL's `min()` on a `vec3<f32>` is
+    componentwise, so a single intrinsic is exactly the three
+    independent per-channel minima. It shares `backdrop_tex` (binding
+    3), the `Opacity` uniform (binding 2) and
+    `TileCompositor::bind_group_layout_blend` with the `Multiply` entry
+    point — **no new binding, no new bind group layout**.
+  - **`TileCompositor::composite_darken_over_with_opacity`**, a
+    deliberate line-for-line mirror of
+    `composite_multiply_over_with_opacity`: same `Blend::None` replace,
+    same `(src, backdrop, dst)` parameter order, same aliasing rule,
+    same Rust-side `opacity.clamp(0.0, 1.0)` with the `sa * opacity`
+    product left unclamped. Only the five label constants, the fragment
+    entry-point string and the method name differ. The shared
+    scaffolding the earlier rounds extracted (`composite_pipeline`,
+    `opacity_uniform_buffer`, `blend_bind_group_layout`) was reused
+    unchanged and needed no edits at all — which is the concrete
+    evidence that 0.83.1's extraction paid for itself.
+  - **`aurora-app` wiring**: `document_qualifies_for_gpu_compositing`
+    gains `Darken` as a fourth admitted mode, and
+    `begin_gpu_composite_tile` gains a `Darken` arm immediately after
+    the `Multiply` one. That arm is the interesting part: it takes the
+    **same single `spare` accumulator** via the same
+    `get_or_insert_with`, so a stack mixing `Multiply` and `Darken`
+    allocates exactly the same two textures per tile an all-`Multiply`
+    stack does. `spare` is a shared scratch target the arms take turns
+    rendering into, not a per-mode resource.
+
+  **The mixed-mode tests are the point of this round.** Repeating one
+  blend mode through a ping-pong proves the two accumulators can trade
+  places; it does not prove a *second* mode can reuse the same pair. Two
+  new tests separate those:
+
+  - `aurora-render`'s
+    `composite_darken_and_multiply_chained_through_one_ping_pong_pair_match_three_cpu_layers`
+    runs `Normal` → `Multiply` → `Darken` through one pair on one
+    `TileCompositor`, so the `Darken` pass renders into the very texture
+    the `Multiply` pass sampled — a write-after-read hazard *across two
+    different pipelines out of one `PipelineCache`*, which is the case a
+    cache keyed on too little would get wrong.
+  - `aurora-app`'s
+    `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack`
+    is the full-stack version: five root layers
+    (`Normal`/`Multiply`/`Normal`/`Darken`/`Darken`) forcing **three**
+    swaps — an odd count, so the fold ends on the member it did not
+    start on — where **layer 4's `Darken` reuses the `spare` that layer
+    2's `Multiply` created**, never `Darken`'s own first use. Both tests
+    carry an explicit vacuity guard (a CPU-side recomposite of the same
+    stack with `Darken` replaced by `Multiply`, asserted *different*), so
+    a mis-dispatched arm cannot pass them.
+
+  Nine other new tests: seven `composite_darken_*` siblings in
+  `aurora-render` covering exactly what the `Multiply` suite covers (the
+  arithmetic against an asymmetric pair, the un-premultiply branch, the
+  whole-tile spatial-addressing comparison, a non-1.0 opacity, an
+  unclamped source alpha above 1.0, a clamped out-of-range opacity, and
+  the `ab > 0.0` guard's untaken branch), plus `aurora-app`'s headless
+  `document_qualifies_for_gpu_compositing_admits_a_darken_blend_mode`
+  and its two-layer
+  `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_darken_blend_document`.
+  **Fixture values are not copied from the `Multiply` siblings.**
+  `Darken` collapses to `Normal` when the source is darker in every
+  channel and to a no-op when it is lighter in every channel, so a
+  fixture sitting on one side of that boundary in all three channels
+  would pass with the wrong arm dispatched; every fixture here takes its
+  minimum from the backdrop in at least one channel and from the source
+  in at least one other.
+
+  **Remaining-mode counts, updated.** `aurora-render` now has **24**
+  formulas still to port (26 variants in its own `BlendMode`, which
+  excludes `Dissolve`, minus `Multiply` and `Darken`);
+  `aurora-app`'s predicate now rejects **23** of `aurora-doc`'s 27
+  modes (admitting `Normal`, `Multiply`, `Darken`, `Dissolve`). Several
+  doc comments carrying the pre-0.84.1 "other 25" phrasing were stale
+  before this round and were corrected while being touched.
+
+  **Verified on Vulkan/NVIDIA only**, the same one-backend-one-vendor
+  caveat every prior round in this epic carries: Metal and DX12 remain
+  unverified for the whole blend-math path, including the `ab > 0.0`
+  guard's untaken branch (a shader-compiler property, and `min(NaN, x)`
+  is exactly the sort of expression whose NaN handling differs between
+  backends — which is why `Darken` gets its own transparent-backdrop
+  test rather than inheriting `Multiply`'s).
+
+  Left as named, not attempted: **merging the two blend-math methods
+  behind a `mode` parameter or a generic helper.** Two ported modes is
+  two samples, and a shape invented from two samples is the kind of
+  abstraction the third mode has to fight. Worth revisiting once three
+  or four have landed and the genuinely-common part is visible; the
+  bodies are near-identical today, and that duplication is deliberate.
+  Also still open, unchanged by this round: the per-tile cost of the
+  ping-pong on a real document has not been measured, and there is still
+  no runtime force-CPU-composite escape hatch for a backend where this
+  mechanism misbehaves.
+
+  One lint change was needed and is disclosed here rather than left to be
+  discovered: `begin_gpu_composite_tile` crossed
+  `clippy::too_many_lines` (107 against a 100 limit) on the new arm, so
+  it now carries `#[allow(clippy::too_many_lines)]` alongside its
+  existing `too_many_arguments` allow, with a comment saying why. The
+  body is one loop whose `match` gains a fixed ~13-line arm per mode, so
+  this will keep drifting as more modes land; splitting the arms out
+  would mean handing each a `&mut` borrow of both accumulator `Option`s
+  plus `device`/`queue`/`tile_extent`, which is exactly the locality the
+  `std::mem::swap` shape exists to preserve.
+
+  **Verified (0.85.0)**: `AURORA_REQUIRE_GPU=1 cargo test -p
+  aurora-render -- --nocapture composite_darken` — **8 passed**, and
+  `... composite_multiply` — **8 passed**, every run printing
+  `GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`;
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app -- --nocapture darken`
+  (3 passed), `... document_qualifies_for_gpu_compositing` (7 passed),
+  `... --nocapture recomposite_visible_tiles` (20 passed, each
+  GPU-gated one printing the same real adapter line); then the full gate
+  (`fmt --check`, `check_layering.py`, `check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` at **1,601 passing**, `cargo test --workspace
+  --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`), all clean.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG

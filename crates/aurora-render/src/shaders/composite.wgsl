@@ -68,12 +68,15 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // The accumulator ("backdrop") texture, sampled as a *texture* rather
 // than reached through the fixed-function blend unit. Binding 3 is the
 // next free slot after src_tex (0), src_smp (1) and the opacity uniform
-// (2) declared above; only fs_composite_multiply below uses it, through
-// its own bind group layout (`TileCompositor::bind_group_layout_blend`),
-// so neither existing entry point's layout gains an entry.
+// (2) declared above; only the real blend-math entry points below --
+// fs_composite_multiply and fs_composite_darken -- use it, through the
+// one bind group layout they share
+// (`TileCompositor::bind_group_layout_blend`), so neither
+// fixed-function entry point's own layout gains an entry.
 //
 // Named `backdrop_tex` after the Rust parameter it is actually bound to
-// (`TileCompositor::composite_multiply_over_with_opacity`'s `backdrop`),
+// (`TileCompositor::composite_multiply_over_with_opacity`'s and
+// `composite_darken_over_with_opacity`'s `backdrop`),
 // deliberately *not* `dst_tex`: `dst` on the Rust side is the render
 // target this entry point writes to, which is a different texture
 // entirely and must never alias this one. Calling the sampled backdrop
@@ -141,6 +144,42 @@ fn fs_composite_multiply(in: VsOut) -> @location(0) vec4<f32> {
         cb = bd.rgb / ab;
     }
     let b = cb * s.rgb;                       // blend_rgb(Multiply, cb, cs)
+    let blended = ab_inv * s.rgb + ab * b;
+    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+}
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
+// exactly, for `BlendMode::Darken` only -- the second blend mode ported
+// to the GPU, and structurally identical to `fs_composite_multiply`
+// above in every line but one.
+//
+// Read that entry point's own comment for the full derivation of the
+// surrounding "over": the alpha compositing around `B(Cb, Cs)` is
+// blend-mode-independent, so only the `b = ...` line below differs.
+//
+// `blend_rgb(Darken, cb, cs)` is `blend_channel`'s `cb.min(cs)` applied
+// per channel, through `blend_rgb`'s own generic per-channel arm (it is
+// a separable mode, not one of the six whole-triple ones). WGSL's
+// `min()` on a `vec3<f32>` is componentwise, so one intrinsic is
+// exactly those three independent per-channel minima -- not a
+// whole-colour selection, which is `DarkerColor`, a different mode.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2)
+// and `TileCompositor::bind_group_layout_blend` with
+// `fs_composite_multiply`; no new binding, no new layout.
+@fragment
+fn fs_composite_darken(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let a = s.a * opacity.value;
+    let inv = 1.0 - a;
+    let ab = bd.a;
+    let ab_inv = 1.0 - ab;
+    var cb = vec3<f32>(0.0, 0.0, 0.0);
+    if (ab > 0.0) {
+        cb = bd.rgb / ab;
+    }
+    let b = min(cb, s.rgb);                   // blend_rgb(Darken, cb, cs)
     let blended = ab_inv * s.rgb + ab * b;
     return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
 }
