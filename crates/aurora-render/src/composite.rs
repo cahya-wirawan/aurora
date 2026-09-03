@@ -1019,6 +1019,16 @@ fn blend_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 /// [`TileCompositor::composite_over`] and
 /// [`TileCompositor::composite_over_with_opacity`] are field-for-field
 /// what those two methods built inline before, `label` included.
+///
+/// **`bind_group_layout` is not part of `key`, and `get_or_create_with`
+/// caches by `key` alone.** Today that's safe only because each
+/// `fragment_entry` this crate ever calls with is paired with exactly
+/// one layout, at exactly one call site. A future blend mode that reused
+/// an existing `fragment_entry` string against a *different* layout
+/// would silently receive the wrong cached pipeline — wrong bind-group
+/// count, not a compile error. Keep that one-entry-point-one-layout
+/// pairing intact, or fold the layout into `PipelineKey` (an
+/// `aurora-gpu` API change, not attempted here) before it stops holding.
 fn composite_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -3338,7 +3348,7 @@ mod tests {
     #[test]
     /// The fractional-accumulator-alpha case, which is what actually
     /// exercises the shader's backdrop-recovery branch
-    /// (`if (ab > 0.0) { cb = d.rgb / ab; }`) -- the mirror of
+    /// (`if (ab > 0.0) { cb = bd.rgb / ab; }`) -- the mirror of
     /// [`composite_layer_into`]'s own `straight_backdrop` divide, and
     /// the same gap
     /// `composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`
@@ -3632,6 +3642,142 @@ mod tests {
                 (gpu - cpu).abs() <= tolerance,
                 "channel {channel}: the in-shader Multiply path and composite_tile_cpu diverged \
                  by more than {tolerance} at opacity {opacity} ({gpu} vs {cpu}). Full texels: \
+                 {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// `fs_composite_multiply` deliberately does not clamp `sa *
+    /// opacity.value` -- only `opacity` is clamped Rust-side, mirroring
+    /// `composite_layer_into`'s own `let opacity = opacity.clamp(0.0,
+    /// 1.0)` followed by an unclamped `sa * opacity`. `f16` can legally
+    /// hold a source alpha above `1.0`, and nothing pinned that this
+    /// method preserves rather than silently clamps it.
+    fn composite_multiply_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.5, 0.75, 0.25, 1.0];
+        let top_rgba = [0.25, 0.5, 1.0, 2.0]; // alpha > 1.0, legal in f16
+        let opacity = 1.0;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
+        compositor.composite_multiply_over_with_opacity(
+            &context,
+            &top_view,
+            &backdrop_view,
+            &dst_view,
+            opacity,
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::Multiply),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: a source alpha above 1.0 must reach composite_tile_cpu's \
+                 own formula unclamped, not silently clamped to 1.0 first ({gpu} vs {cpu}). \
+                 Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The Multiply-path mirror of
+    /// `composite_over_with_opacity_clamps_an_out_of_range_opacity`: an
+    /// opacity above `1.0` must clamp to `1.0` on this path too, not
+    /// overshoot the source's own contribution.
+    fn composite_multiply_over_with_opacity_clamps_an_out_of_range_opacity() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.5, 0.75, 0.25, 1.0];
+        let top_rgba = [0.25, 0.5, 1.0, 1.0];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
+        // 5.0, clamped Rust-side before it ever reaches the uniform --
+        // if the clamp were missing, `a` would come out > 1.0 and the
+        // final `inv = 1.0 - a` would go negative.
+        compositor.composite_multiply_over_with_opacity(
+            &context,
+            &top_view,
+            &backdrop_view,
+            &dst_view,
+            5.0,
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::Multiply),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: an opacity above 1.0 must clamp to 1.0, matching the \
+                 opacity-1.0 result, not overshoot it ({gpu} vs {cpu}). Full texels: \
                  {gpu_result:?} vs {cpu_result:?}"
             );
         }

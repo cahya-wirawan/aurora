@@ -16313,6 +16313,50 @@ severity choice.
   interactive verification and no performance claim**, and still nothing
   in the running app reaches this code.
 
+  **Addendum (0.83.2): three cheap Judge follow-ups, applied directly.**
+  The round passed at 0.944 with no blocking issues; three of the six
+  named follow-ups were cheap enough to close immediately rather than
+  leave as named debt:
+
+  - A stale doc-comment reference to the pre-rename `d.rgb / ab` (the
+    rename to `bd` in 0.83.1 missed one comment) is corrected.
+  - `composite_pipeline`'s doc comment now states the real hazard
+    explicitly: `PipelineKey` does not include bind-group-layout
+    identity, and `get_or_create_with` caches by key alone, so the
+    one-`fragment_entry`-one-layout pairing every call site currently
+    honours is load-bearing, not incidental — a future blend mode that
+    reused an existing entry point against a different layout would
+    silently receive the wrong cached pipeline. Not restructured (that
+    is an `aurora-gpu` API decision, out of scope here); named so it
+    cannot be rediscovered the hard way once there are 26 entry points
+    instead of 3.
+  - Two new tests close the coverage gap the Judge named:
+    `composite_multiply_over_with_opacity_does_not_clamp_a_source_alpha_above_one`
+    (an `f16` source alpha of `2.0`, asserting the shader's own
+    unclamped-product reasoning against a real `composite_tile_cpu`
+    call, not a hand value) and
+    `composite_multiply_over_with_opacity_clamps_an_out_of_range_opacity`
+    (opacity `5.0`, the Multiply-path mirror of
+    `composite_over_with_opacity_clamps_an_out_of_range_opacity`). Both
+    pass on the same real adapter (`NVIDIA GeForce RTX 3090, Vulkan,
+    DiscreteGpu`), bringing the suite to 8 tests, all confirmed
+    non-silent.
+
+  Left as named, not attempted: Metal/DX12 verification (hardware-
+  gated, same tail as Phase 0's own), and the workspace-wide absence of
+  `wgpu` error-scope handling (pre-existing, and a decision of its own
+  scale — not something to fold into a documentation patch).
+
+  **Verified (0.83.2)**: `AURORA_REQUIRE_GPU=1 cargo test -p
+  aurora-render -- --nocapture composite_multiply` — **8 passed**, each
+  printing the real adapter line — then the same full gate as 0.83.1
+  (`fmt --check`, `check_layering.py`, `check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test
+  --workspace` at 1,581 passing, `cargo test --workspace --doc`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`), all clean.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
