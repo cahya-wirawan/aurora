@@ -18086,9 +18086,22 @@ severity choice.
   assertions included, and a third test now pins the byte layout
   *absolutely* — against hand-derived IEEE 754 half-precision patterns
   (`0.5 -> 0x3800`, `0.25 -> 0x3400`, `0.125 -> 0x3000`,
-  `0.0625 -> 0x2C00`, low byte first), not merely cross-checked against
-  the other implementation in the same file, plus a clear-then-refill
-  pass matching `sync`'s actual buffer reuse. `TileResidency::sync`'s
+  `0.0625 -> 0x2C00`, `0.03125 -> 0x2800`, low byte first), not merely
+  cross-checked against the other implementation in the same file, plus a
+  clear-then-refill pass matching `sync`'s actual buffer reuse.
+  (**0.89.1 corrected that third test and the claim made for it** — as
+  written in 0.89.0 its two texels shared one straight RGB *and*
+  premultiplied to the same colour, differing only in alpha, so hoisting
+  the r/g/b read out of the loop and reusing texel 0's colour passed all
+  three fused-serializer tests. It now uses two genuinely different
+  colours, and a fourth test,
+  `the_fused_serializer_advances_rgb_and_alpha_for_every_texel`, walks six
+  texels of distinct premultiplied RGB through the hot-path serializer
+  *without* referencing `premultiply_rgba` at all — the previous gap was
+  that every test of the function `sync` actually calls was either
+  relative to its cold `upload_mip` sibling or blind to the per-texel RGB
+  advance. Both mutations were confirmed failing before the fix landed.)
+  `TileResidency::sync`'s
   loop structure, budget checks, dirty-flag handling and reused-buffer
   design are all untouched, as is `upload_mip`'s separate path. No new
   dependency; no new lint exception; no assertion added or tightened
@@ -18111,6 +18124,16 @@ severity choice.
   Whole-frame `total` over the same runs: GPU path mean 27.08–28.39 →
   26.38–28.50 ms, p99 40.16–45.85 → 37.83–38.01 ms; CPU fallback mean
   16.26–17.32 → 16.15–16.23 ms, p99 18.65–30.50 → 18.78–19.20 ms.
+  **Do not read the whole-frame p99 pair as a ~15% win**, tempting as the
+  non-overlapping ranges make it: this entry's own noise bullet above
+  records the GPU-path whole-frame p99 spanning **37.05–49.66 ms across
+  three *identical* runs** (a 34% spread on n=40), which fully contains
+  both the before (40.16–45.85) and the after (37.83–38.01) ranges quoted
+  here. Both sit inside already-documented noise. It is also the wrong
+  metric to attribute to this change at all — the stage 0.89.0 actually
+  touched, `upload_sync`, showed **no** p99 improvement and got *wider*
+  on the GPU path (table above), so a whole-frame p99 move cannot be
+  credited to it.
 
   **Honest reading: a small, probably-real improvement that does not
   clear noise on every metric, and nowhere near what the 4× call-count
@@ -18123,6 +18146,19 @@ severity choice.
     runs. That is the strongest signal here: roughly **0.13–0.73 ms
     (~1–5%) off the GPU-path stage and 0.25–0.37 ms (~4–6%) off the CPU
     fallback's**, i.e. about **0.5–2.5% of the whole frame**.
+
+    **The two legs of that claim are not equally firm, and 0.89.1
+    separates them.** The GPU-path leg (n=40) held across four further
+    independent re-runs of the after-side and is on solid ground. The
+    **CPU-fallback leg (n=12) should be read as suggestive, not
+    conclusive**: re-running that benchmark nine times found one
+    after-side run at p50 **7.05 ms**, *above* the top of the recorded
+    before range (6.67 ms). Eight of nine matched the table, and it did
+    not reproduce on demand (a forced rebuild gave a normal figure), so
+    it reads as ambient system noise rather than a defect — but had that
+    run landed in the original three-run sample, "the ranges do not
+    overlap" would have been false for this leg. Three runs at n=12 is
+    simply not enough to support the wording as stated.
   - **The GPU-path `mean` ranges overlap** (14.79–15.78 → 14.18–15.50):
     the noisiest after-run is slower than the quietest before-run. On
     that metric alone this change is **inside run-to-run noise** and

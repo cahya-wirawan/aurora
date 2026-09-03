@@ -27199,6 +27199,17 @@ mod tests {
         ///   `memcpy`.
         /// - **~0%** `TileStore::get` (the tile-store read).
         ///
+        /// **Those percentages were probed against the pre-0.89.0 loop**,
+        /// which issued four separate 2-byte appends per texel; 0.89.0
+        /// batched them into one 8-byte append and **no fresh internal
+        /// probe has been re-taken since**. Treat the split as
+        /// approximate rather than current. It is very unlikely to have
+        /// moved much: 0.89.0 bought only ~1-5% off this stage's p50 and
+        /// nothing at p99, and the reason it bought so little is that the
+        /// per-texel `f16 -> f32 -> multiply -> f16` arithmetic — not the
+        /// append bookkeeping it removed — was always the larger share of
+        /// the 87.1%.
+        ///
         /// The actual GPU DMA copy does **not** execute in this interval:
         /// `write_texture` only records it, and it runs at the later
         /// `queue.submit`, which lands in [`Self::submit_poll`] -- where
@@ -27754,7 +27765,12 @@ mod tests {
     ///   `extend_premultiplied_le_bytes` serialize loop and ~13%
     ///   `write_texture`'s staging `memcpy`; the real GPU DMA runs later,
     ///   at `queue.submit`, inside `submit_poll`. See [`FrameStages`]'s
-    ///   own `upload_sync` field doc.
+    ///   own `upload_sync` field doc. Those two shares were probed
+    ///   against the pre-0.89.0 four-append loop and have **not** been
+    ///   re-probed since 0.89.0 batched the appends, so read them as
+    ///   approximate: that change bought only ~1-5% off the stage
+    ///   precisely because the scalar arithmetic, not the appends it
+    ///   removed, was always the bulk of the ~87%.
     /// - The ~17 tiles per frame that do *not* take the GPU path are not
     ///   cheap and are not skipped: each is materialized as a full
     ///   transparent tile, written back, marked fully dirty, and then

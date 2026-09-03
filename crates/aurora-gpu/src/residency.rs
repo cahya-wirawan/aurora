@@ -155,6 +155,20 @@ fn premultiply_rgba(texels: &mut [f16]) {
 /// calls and the R/G/B/A order are unchanged, so the output is
 /// bit-for-bit what the four-append version produced.
 ///
+/// **What that actually bought, measured: almost nothing, and it
+/// disproved the rationale in the paragraph above.** Roughly 1-5% off
+/// the `upload_sync` stage's p50, no improvement at p99 (noise-dominated
+/// in both directions), and the GPU-path stage *mean* stayed inside
+/// run-to-run noise; the 60 FPS verdict did not move. Removing 3-of-4
+/// append calls per texel from a stage that is ~87% this one loop should
+/// have been dramatic if capacity checks and small `memcpy`s were where
+/// the time went — so they are not. **The per-texel
+/// `f16 -> f32 -> multiply -> f16` arithmetic is**, which redirects the
+/// next attempt here to vectorizing that conversion rather than any
+/// further append bookkeeping. Do not read this function as a solved
+/// throughput problem. PLAN.md's 0.89.0 addendum under M1.10 has the
+/// full before/after tables, the sample sizes, and the caveats.
+///
 /// **Parallelizing per tile with `rayon` is NOT done**, and is not merely
 /// a code change. `rayon` is not a dependency of this crate, nor of any
 /// other real workspace crate — it appears in `Cargo.lock` only as a
@@ -2002,15 +2016,36 @@ mod tests {
     /// same order and encoding as before. Both tests above pin that
     /// *relative* to another implementation in this file; this one pins
     /// it *absolutely*, against hand-derived IEEE 754 half-precision bit
-    /// patterns, so a matching mistake in both implementations still
-    /// fails here.
+    /// patterns, so a mistake made identically in both implementations
+    /// still fails here.
+    ///
+    /// **What two texels can and cannot establish**, since 0.89.0's
+    /// version of this comment overclaimed it. Sixteen hand-derived bytes
+    /// pin the encoding, the little-endian order, the R/G/B/A channel
+    /// order, the premultiply-RGB-but-*not*-alpha rule, and — because
+    /// 0.89.1 gave texel 1 a different colour as well as a different
+    /// alpha — that the loop re-reads r/g/b per texel instead of reusing
+    /// texel 0's. It does **not** stand in for a buffer-length walk; that
+    /// is `the_fused_serializer_advances_rgb_and_alpha_for_every_texel`
+    /// below, which covers six texels without hand-derived hex.
+    ///
+    /// The 0.89.1 correction is worth keeping because the original pair
+    /// was weaker than it looked in *two* stacked ways. Its two texels
+    /// shared one straight RGB **and** premultiplied to the same
+    /// 0.25/0.125/0.0625, differing only in alpha — so hoisting the
+    /// r/g/b read out of the loop and reusing the first texel's colour
+    /// passed every fused-serializer test in this file. Fixing only the
+    /// premultiplied halves (leaving the straight RGB shared) still would
+    /// not have caught it, since the hoist reads the straight values.
+    /// Both had to change.
     ///
     /// Every value is a power of two and every premultiplied product is
     /// too, so both the `f32 -> f16` conversions and the multiplies are
     /// exact and no tolerance is needed. Expected encodings (sign 0, then
     /// 5 exponent bits biased by 15, then 10 zero mantissa bits), stored
     /// low byte first: `0.5 = 2^-1 -> 0x3800`, `0.25 = 2^-2 -> 0x3400`,
-    /// `0.125 = 2^-3 -> 0x3000`, `0.0625 = 2^-4 -> 0x2C00`.
+    /// `0.125 = 2^-3 -> 0x3000`, `0.0625 = 2^-4 -> 0x2C00`,
+    /// `0.03125 = 2^-5 -> 0x2800`.
     ///
     /// It also repeats the call after `out.clear()`, which is the reuse
     /// pattern [`TileResidency::sync`] actually uses: one buffer, cleared
@@ -2020,10 +2055,15 @@ mod tests {
     fn the_fused_serializer_writes_each_texel_as_eight_little_endian_bytes_in_rgba_order() {
         // Texel 0: alpha 0.5, so the premultiplied RGB is 0.25, 0.125,
         // 0.0625 and alpha stays 0.5.
-        // Texel 1: alpha 0.25, so the premultiplied RGB is 0.25, 0.125,
-        // 0.0625 again and alpha stays 0.25 — same colour bytes, a
-        // different alpha byte, which is what catches a swapped channel.
-        let texels: Vec<f16> = [[0.5f32, 0.25, 0.125, 0.5], [1.0, 0.5, 0.25, 0.25]]
+        // Texel 1: a *different* colour under a different alpha, so all
+        // eight of its bytes differ from texel 0's — straight RGB 0.25,
+        // 0.125, 0.5 under alpha 0.25, giving premultiplied 0.0625,
+        // 0.03125, 0.125. Both the straight *and* the premultiplied
+        // triples differ per channel, which is what makes this test fail
+        // if the loop stops re-reading r/g/b per texel. Within each texel
+        // all four bytes are distinct too, so no channel can be swapped
+        // for another without changing the vector below.
+        let texels: Vec<f16> = [[0.5f32, 0.25, 0.125, 0.5], [0.25, 0.125, 0.5, 0.25]]
             .iter()
             .flatten()
             .map(|&channel| f16::from_f32(channel))
@@ -2035,8 +2075,13 @@ mod tests {
         assert_eq!(
             out,
             vec![
+                // 0.25 -> 0x3400, 0.125 -> 0x3000, 0.0625 -> 0x2C00,
+                // alpha 0.5 -> 0x3800 (premultiplying alpha too would
+                // have written 0x3400 here).
                 0x00, 0x34, 0x00, 0x30, 0x00, 0x2C, 0x00, 0x38, //
-                0x00, 0x34, 0x00, 0x30, 0x00, 0x2C, 0x00, 0x34,
+                // 0.0625 -> 0x2C00, 0.03125 -> 0x2800, 0.125 -> 0x3000,
+                // alpha 0.25 -> 0x3400 (premultiplied would be 0x2C00).
+                0x00, 0x2C, 0x00, 0x28, 0x00, 0x30, 0x00, 0x34,
             ],
             "two texels, eight little-endian bytes each, in R G B A order"
         );
@@ -2046,6 +2091,74 @@ mod tests {
         out.clear();
         extend_premultiplied_le_bytes(&texels, &mut out);
         assert_eq!(first, out, "clear-then-refill must be byte-identical");
+    }
+
+    /// The hot-path serializer's own multi-texel walk — every channel of
+    /// every texel, decoded straight back out of the bytes it wrote.
+    ///
+    /// This exists because of a real gap found reviewing 0.89.0.
+    /// `extend_premultiplied_le_bytes` is what [`TileResidency::sync`]
+    /// calls on every frame, yet every test it had either compared it
+    /// against [`premultiply_rgba`] (its *cold* sibling, reached only
+    /// from `upload_mip`) or used two texels whose premultiplied colours
+    /// happened to be identical. So the equivalent of
+    /// `premultiply_rgba_walks_every_texel_in_the_buffer` — hoist the
+    /// r/g/b read out of the loop and reuse texel 0's colour for the rest
+    /// — was pinned for the cold function and **not** for the hot one.
+    /// Nothing here touches [`premultiply_rgba`]: this is the fused
+    /// serializer measured against arithmetic stated in the test itself.
+    ///
+    /// Every texel's premultiplied RGB triple is distinct from every
+    /// other's, and the alphas vary independently, so reusing any earlier
+    /// texel's channels — or writing alpha premultiplied — fails. Every
+    /// value is a power of two (or zero), so the products and the
+    /// `f32 <-> f16` round trips are exact and `assert_eq!` on `f32` is
+    /// legitimate rather than a tolerance bug.
+    #[test]
+    fn the_fused_serializer_advances_rgb_and_alpha_for_every_texel() {
+        // (straight r, g, b, a) -> (premultiplied r, g, b, unchanged a).
+        let cases = [
+            ([1.0f32, 0.5, 0.25, 1.0], [1.0f32, 0.5, 0.25, 1.0]),
+            ([1.0, 0.5, 0.25, 0.5], [0.5, 0.25, 0.125, 0.5]),
+            ([0.5, 0.25, 0.125, 0.5], [0.25, 0.125, 0.0625, 0.5]),
+            ([0.25, 1.0, 0.5, 0.25], [0.0625, 0.25, 0.125, 0.25]),
+            // Fully transparent: RGB must zero, alpha must stay 0.0.
+            ([1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 0.0, 0.0]),
+            ([0.125, 0.0625, 1.0, 1.0], [0.125, 0.0625, 1.0, 1.0]),
+        ];
+
+        let texels: Vec<f16> = cases
+            .iter()
+            .flat_map(|(straight, _)| straight.iter())
+            .map(|&channel| f16::from_f32(channel))
+            .collect();
+
+        let mut out = Vec::new();
+        extend_premultiplied_le_bytes(&texels, &mut out);
+        assert_eq!(out.len(), cases.len() * CHANNELS * 2);
+
+        let decoded: Vec<[f32; 4]> = out
+            .chunks_exact(CHANNELS * 2)
+            .map(|texel| match texel {
+                [r_lo, r_hi, g_lo, g_hi, b_lo, b_hi, a_lo, a_hi] => [
+                    f16::from_le_bytes([*r_lo, *r_hi]).to_f32(),
+                    f16::from_le_bytes([*g_lo, *g_hi]).to_f32(),
+                    f16::from_le_bytes([*b_lo, *b_hi]).to_f32(),
+                    f16::from_le_bytes([*a_lo, *a_hi]).to_f32(),
+                ],
+                _ => unreachable!("chunks_exact(8) yields exactly eight bytes"),
+            })
+            .collect();
+
+        let expected: Vec<[f32; 4]> = cases
+            .iter()
+            .map(|&(_, premultiplied)| premultiplied)
+            .collect();
+        assert_eq!(
+            decoded, expected,
+            "each texel must carry its own premultiplied RGB and its own \
+             untouched alpha"
+        );
     }
 
     /// The whole arithmetic contract, on one texel at a time — no GPU
