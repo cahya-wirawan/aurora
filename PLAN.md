@@ -15577,6 +15577,26 @@ severity choice.
   sitting on the next tree's ghost surface. Worked around in the test
   with a fresh `TileStore` per case, and commented there.
 
+  **0.87.2 — three small correctness-of-wording fixes an independent
+  Judge caught, applied directly.** None changed behavior; all three
+  were prose-accuracy issues in comments this exact round had just
+  rewritten. (1) A doc-comment paragraph in `resolve_tile` had gone
+  through enough edits to leave orphaned line breaks and one
+  ungrammatical sentence — rewrapped. (2) The GPU-then-CPU-fallback
+  disclosure said `budget.next_tile` is "charged twice" for a blank
+  tile; `next_tile` *resets* its per-tile counter rather than
+  accumulating, so calling it twice is idempotent, not a double
+  charge — the real, correctly-identified cost is the duplicated
+  CPU-side root walk itself, not a budget miscount. (3) `clip_color`'s
+  0.87.1 doc comment claimed `lum`'s weights "sum to exactly `1.0`" as
+  the reason both denominators are exactly `0.0` for an achromatic
+  input; `0.3f32 + 0.59f32 + 0.11f32` is not bit-exact, so for some
+  achromatic inputs the true denominator is a tiny nonzero rounding
+  residue rather than exactly `0.0` — reworded to say so, while noting
+  (per the Judge's own worked check) that this residual case still
+  resolves correctly by numerator/denominator cancellation, not because
+  the guard fires.
+
 - [x] **Real per-pixel grayscale mask coverage — done 2026-09-02
   (0.70.0), closing the "rectangular clip only" limitation the
   mask-aggregation round (0.37.0) named and every round since carried

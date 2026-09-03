@@ -417,12 +417,15 @@ fn sat(c: [f32; 3]) -> f32 {
 ///
 /// **Both divisions are guarded against a zero denominator** (0.87.1),
 /// the same way [`set_sat`]'s own `max > min` check below already is,
-/// and for the same underlying reason. [`lum`]'s weights sum to exactly
-/// `1.0`, so `n <= l <= x` always holds — with equality on *both* sides
-/// precisely when every channel is equal. An achromatic input therefore
-/// makes `l - n` and `x - l` both exactly `0.0`, while the numerators
-/// `(r - l) * …` are exactly `0.0` too, so the division was `0.0 / 0.0`
-/// — NaN — for any achromatic colour with a channel outside
+/// and for the same underlying reason. [`lum`]'s weights sum to very
+/// nearly `1.0` in `f32` (`0.3 + 0.59 + 0.11` is not bit-exact), so
+/// `n <= l <= x` always holds to within rounding — equal on *both*
+/// sides, in exact arithmetic, precisely when every channel is equal.
+/// An achromatic input therefore makes `l - n` and `x - l` each either
+/// exactly `0.0`, or a tiny nonzero rounding residue too small to change
+/// the guard's outcome in practice — and where it *is* exactly `0.0`,
+/// the numerators `(r - l) * …` are exactly `0.0` too, so the division
+/// was `0.0 / 0.0` — NaN — for any achromatic colour with a channel outside
 /// `0.0..=1.0`, which is exactly the case that makes a branch fire at
 /// all. That was reachable from ordinary content: [`blend_color`] is
 /// `SetLum(Cs, Lum(Cb))`, so any achromatic *source* (grey, white,

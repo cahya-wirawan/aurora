@@ -7443,42 +7443,38 @@ fn note_gpu_composite_submit() {}
 /// `None` if no visible root-level layer has any **stored** content
 /// overlapping this tile — either because there is no visible root layer
 /// at all, or (as of 0.87.0) because not one of them has ever had a pixel
-/// stored at the tile being composited. Cheaper
-/// handled by the CPU path's own blank-tile handling
-/// than by a real, empty GPU round trip. The caller falls back
-/// to the CPU path for this one tile
+/// stored at the tile being composited. That case is cheaper handled by
+/// the CPU path's own blank-tile handling than by a real, empty GPU
+/// round trip. The caller falls back to the CPU path for this one tile
 /// immediately, without anything to batch, the same "one bad tile
 /// shouldn't abort the rest" discipline [`resolve_tile`]'s own callers
 /// already use.
 ///
 /// The second half of that is new in 0.87.0. Before it, a visible layer
-/// resolved
-/// at *every* tile coordinate, because the tile store answers an
-/// unpainted coordinate by materializing a blank tile rather than by
-/// signalling absence, so a
-/// blank region of a document with any visible layer still took the
-/// full GPU path and composited transparency for real.
-/// [`resolve_tile`] now asks
-/// `aurora_tile::TileStore::contains_tile` (same-origin branch) and
-/// [`LayerWindow::is_blank`] (windowed branch) first and answers `None`
-/// for such a layer, so this bail is reachable for an ordinary blank tile
-/// of an ordinary visible document. What it deliberately does **not**
-/// cover is a tile painted and then erased to full transparency: that is
-/// real stored content, `contains_tile` reports it as present, and it
-/// still takes the whole path — only "never stored" is safe to treat as
-/// absence. See the lazily-built accumulators'
-/// own comment in the body, and PLAN.md's M1.10 "Empty-tile GPU
-/// composite work". Also `None` for the one defensive case above — a
-/// resolved blend mode outside `{Normal, Multiply, Darken}` — logged,
-/// falling
-/// this one tile back to the CPU path, and not reachable through the
-/// real caller while the predicate and this function agree (it *is*
-/// reachable by calling this function directly, which is what
+/// resolved at *every* tile coordinate, because the tile store answers
+/// an unpainted coordinate by materializing a blank tile rather than by
+/// signalling absence, so a blank region of a document with any visible
+/// layer still took the full GPU path and composited transparency for
+/// real. [`resolve_tile`] now asks `aurora_tile::TileStore::contains_tile`
+/// (same-origin branch) and [`LayerWindow::is_blank`] (windowed branch)
+/// first and answers `None` for such a layer, so this bail is reachable
+/// for an ordinary blank tile of an ordinary visible document. What it
+/// deliberately does **not** cover is a tile painted and then erased to
+/// full transparency: that is real stored content, `contains_tile`
+/// reports it as present, and it still takes the whole path — only
+/// "never stored" is safe to treat as absence. See the lazily-built
+/// accumulators' own comment in the body, and PLAN.md's M1.10
+/// "Empty-tile GPU composite work". Also `None` for the one defensive
+/// case above — a resolved blend mode outside `{Normal, Multiply,
+/// Darken}` — logged, falling this one tile back to the CPU path, and
+/// not reachable through the real caller while the predicate and this
+/// function agree (it *is* reachable by calling this function directly,
+/// which is what
 /// `begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode`
-/// does, so the arm is covered rather than merely asserted about). A real
-/// GPU-side failure (a lost device, a bad map) can no
-/// longer be detected here — resolving the map is [`finish_tile_readback`]'s
-/// job now, in phase 3, once this function has already returned.
+/// does, so the arm is covered rather than merely asserted about). A
+/// real GPU-side failure (a lost device, a bad map) can no longer be
+/// detected here — resolving the map is [`finish_tile_readback`]'s job
+/// now, in phase 3, once this function has already returned.
 // `too_many_lines`: 124, against a 100 limit, measured at 0.86.1. It
 // first crossed on the second ported blend mode (0.85.0, at 107) -- the
 // body is one loop whose `match` gains a fixed ~13-line arm per mode, so
@@ -8136,8 +8132,11 @@ fn recomposite_visible_tiles(
             // root, has each one bail in `resolve_tile`, creates no
             // accumulator and returns `None` -- indistinguishable here
             // from "the GPU path declined for some other reason" -- so
-            // this fallback walks the same roots again, and
-            // `budget.next_tile` is charged twice for the one tile.
+            // this fallback walks the same roots again. `budget.next_tile`
+            // (called on both paths, see the comment above) just resets
+            // its per-tile counter, so calling it twice is idempotent, not
+            // a double charge -- the real cost is the duplicated CPU-side
+            // root walk itself.
             //
             // Cheap in absolute terms after 0.87.0 (each of those
             // resolves is now three hash lookups, not a tile
