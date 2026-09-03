@@ -30,6 +30,8 @@
 //! design pass). Tracked as the next step on this bullet, not silently
 //! skipped.
 
+use std::collections::HashSet;
+
 use aurora_core::Rect;
 
 use crate::error::DocError;
@@ -1089,6 +1091,72 @@ impl std::fmt::Debug for History {
             .field("journal_len", &self.journal.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Frees every `aurora_tile::TileStore` surface a discarded document
+/// could still be addressing — its live layers' content and mask
+/// surfaces, *plus* every layer captured on either undo/redo stack —
+/// and returns how many tiles were actually forgotten.
+///
+/// Without this, a document that goes away takes nothing with it. A
+/// surface id is derived from a `LayerId` rather than allocated, and
+/// `aurora_tile::TileStore` has no notion of which document a surface
+/// belongs to, so every tile the discarded document ever painted stays
+/// resident (or paged out to the scratch disk) for the lifetime of the
+/// process with nothing left able to name it.
+///
+/// # Why this takes both by value
+///
+/// Because the alternative signature is dangerous in a way review
+/// cannot reliably catch. Taking `&LayerTree`/`&History` would let a
+/// caller sweep a *live* document — silently destroying the pixels of
+/// every layer the user still has open, with no error and no way back
+/// (see `aurora_tile::TileStore::forget_surface`). By value, that is a
+/// compile error instead: the caller has given the document up, and
+/// cannot use it afterwards. It is not an ergonomic accident, and it
+/// should not be relaxed to references.
+///
+/// # What is deliberately not consulted
+///
+/// [`History`]'s crash-recovery journal. It is an ever-growing record
+/// of what this document did, and it is discarded with the document
+/// this call is discarding — so a surface named only there names
+/// nothing anyone can still reach. Both *stacks* are walked, though,
+/// including the redo stack: an added-then-undone layer's subtree sits
+/// on the redo stack and nowhere else, and its tiles are exactly as
+/// orphaned as any other's.
+///
+/// # Named follow-on: wiring this into the app
+///
+/// `aurora_app::App::open_file`/`open_aur_file` are the callers this
+/// exists for, and they cannot call it yet. `aurora_io::read_aur`
+/// decodes the *new* document's tiles straight into the same store
+/// before the old `layers`/`history` are dropped, and both documents
+/// derive surface ids from `LayerId`s that restart counting from zero
+/// — so the two documents' surfaces alias. Sweeping *after* the read
+/// would delete the document just loaded; sweeping *before* it would
+/// destroy the current document's pixels on an open that can still
+/// fail. Solving that ordering/aliasing problem (a per-document
+/// surface-id namespace, or a staging store the read fills first) is
+/// real follow-on work and is not done here.
+// Deliberate: see "Why this takes both by value" above. Taking these by
+// reference would make sweeping a live document compile.
+#[allow(clippy::needless_pass_by_value)]
+pub fn forget_document_surfaces(
+    layers: LayerTree,
+    history: History,
+    store: &mut aurora_tile::TileStore,
+) -> usize {
+    let mut surfaces: HashSet<aurora_tile::SurfaceId> = layers.all_surfaces().into_iter().collect();
+    for op in history.undo_stack.iter().chain(history.redo_stack.iter()) {
+        if let LayerOp::Restore(removed) = op {
+            surfaces.extend(removed.surfaces());
+        }
+    }
+    surfaces
+        .into_iter()
+        .map(|surface| store.forget_surface(surface))
+        .sum()
 }
 
 #[cfg(test)]
@@ -2989,5 +3057,346 @@ mod tests {
             super::MAX_DESCRIPTIONS.saturating_mul(super::MAX_ROOT_SEARCH_ENTRIES) <= 1_000_000,
             "the panel's whole worst case must stay a trivial number of comparisons"
         );
+    }
+
+    // ---- `forget_document_surfaces` -------------------------------
+
+    /// A real, scratch-disk-backed store, the same fixture shape
+    /// `mask.rs`'s own round-trip tests use. These tests are about what
+    /// actually happens to tiles, so a mock would prove nothing.
+    fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(8) else {
+            unreachable!("8 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("a freshly created tempdir must be usable: {err:?}"),
+        };
+        (dir, store)
+    }
+
+    fn tile() -> aurora_tile::TileId {
+        aurora_tile::TileId { x: 0, y: 0 }
+    }
+
+    /// Fills tile `(0, 0)` of `surface` with a pattern derived from
+    /// `seed` -- distinctive per surface, and not uniform within the
+    /// tile, so a byte-exact comparison later is a real one.
+    fn paint(store: &mut aurora_tile::TileStore, surface: aurora_tile::SurfaceId, seed: u32) {
+        let Ok(entry) = store.get_mut(surface, tile()) else {
+            unreachable!("a real store must serve this tile");
+        };
+        for (index, sample) in entry.texels_mut().iter_mut().enumerate() {
+            let value = f32::from((index as u32 % 97 + seed) as u16) / 512.0;
+            *sample = half::f16::from_f32(value);
+        }
+    }
+
+    fn texels(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+    ) -> Vec<half::f16> {
+        let Ok(entry) = store.get(surface, tile()) else {
+            unreachable!("a real store must serve this tile");
+        };
+        entry.texels().to_vec()
+    }
+
+    fn expected_pattern(seed: u32) -> Vec<half::f16> {
+        (0..aurora_tile::SAMPLES)
+            .map(|index| {
+                let value = f32::from((index as u32 % 97 + seed) as u16) / 512.0;
+                half::f16::from_f32(value)
+            })
+            .collect()
+    }
+
+    fn content_surface(tree: &LayerTree, id: crate::LayerId) -> aurora_tile::SurfaceId {
+        let Some(surface) = tree.surface_id(id) else {
+            unreachable!("a pixel layer in the tree has a content surface");
+        };
+        surface
+    }
+
+    fn mask_surface(tree: &LayerTree, id: crate::LayerId) -> aurora_tile::SurfaceId {
+        let Some(surface) = tree.mask_surface_id(id) else {
+            unreachable!("a layer in the tree has a mask surface");
+        };
+        surface
+    }
+
+    #[test]
+    // The leak this exists to close, at its smallest: removing a layer
+    // deliberately keeps its tiles (undo needs them), and only
+    // discarding the whole document frees them.
+    fn forget_document_surfaces_frees_a_removed_pixel_layers_content_tiles() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(id) = history.add_pixel_layer(&mut tree, "Paint", bounds(), None) else {
+            unreachable!("an empty tree accepts a root layer");
+        };
+        let surface = content_surface(&tree, id);
+        paint(&mut store, surface, 1);
+        assert!(store.contains_tile(surface, tile()));
+
+        if let Err(err) = history.remove(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            store.contains_tile(surface, tile()),
+            "removing a layer must NOT free its tiles -- undo still needs them"
+        );
+
+        assert_eq!(
+            super::forget_document_surfaces(tree, history, &mut store),
+            1
+        );
+        assert!(
+            !store.contains_tile(surface, tile()),
+            "discarding the document must free the removed layer's tiles"
+        );
+        assert!(
+            texels(&mut store, surface)
+                .iter()
+                .all(|sample| sample.to_f32() == 0.0),
+            "a swept surface must read back blank, not carrying its old pixels"
+        );
+    }
+
+    #[test]
+    // Masks double the number of surfaces a layer can orphan, and the
+    // mask surface is derived rather than stored -- so the sweep must
+    // not gate on the `LayerMask` struct still being there.
+    fn forget_document_surfaces_frees_both_content_and_mask_tiles() {
+        // Case one: the mask is still attached when the layer goes.
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(id) = history.add_pixel_layer(&mut tree, "Masked", bounds(), None) else {
+            unreachable!("an empty tree accepts a root layer");
+        };
+        if let Err(err) = history.add_mask(&mut tree, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        let content = content_surface(&tree, id);
+        let mask = mask_surface(&tree, id);
+        paint(&mut store, content, 1);
+        if let Err(err) = crate::write_mask_coverage(&mut store, mask, tile(), 3, 4, 0.25) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.remove(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            super::forget_document_surfaces(tree, history, &mut store),
+            2
+        );
+        assert!(!store.contains_tile(content, tile()), "content freed");
+        assert!(!store.contains_tile(mask, tile()), "mask coverage freed");
+
+        // Case two: the mask was *removed* before the layer was, so the
+        // captured entry carries no `LayerMask` at all -- but
+        // `remove_mask` leaves the coverage behind (see `crate::mask`'s
+        // own lifecycle notes), so the sweep must still reach it.
+        let (_dir2, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(id) = history.add_pixel_layer(&mut tree, "Was masked", bounds(), None) else {
+            unreachable!("an empty tree accepts a root layer");
+        };
+        if let Err(err) = history.add_mask(&mut tree, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        let content = content_surface(&tree, id);
+        let mask = mask_surface(&tree, id);
+        paint(&mut store, content, 2);
+        if let Err(err) = crate::write_mask_coverage(&mut store, mask, tile(), 1, 1, 0.5) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.remove_mask(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            store.contains_tile(mask, tile()),
+            "removing the mask struct leaves its coverage behind -- the residue this must find"
+        );
+        if let Err(err) = history.remove(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            super::forget_document_surfaces(tree, history, &mut store),
+            2
+        );
+        assert!(!store.contains_tile(content, tile()));
+        assert!(
+            !store.contains_tile(mask, tile()),
+            "residual mask coverage must be freed even with no LayerMask left"
+        );
+    }
+
+    #[test]
+    // One `remove` of a group detaches a whole subtree, and every
+    // descendant owns surfaces of its own. A sweep that only looked at
+    // the captured root would free one surface and leak the rest.
+    fn forget_document_surfaces_frees_every_descendants_surfaces_not_just_the_groups() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(group) = history.add_group(&mut tree, "Group", None) else {
+            unreachable!("an empty tree accepts a root group");
+        };
+        let Ok(plain) = history.add_pixel_layer(&mut tree, "Plain", bounds(), Some(group)) else {
+            unreachable!("a group accepts a child");
+        };
+        let Ok(masked) = history.add_pixel_layer(&mut tree, "Masked", bounds(), Some(group)) else {
+            unreachable!("a group accepts a child");
+        };
+        if let Err(err) = history.add_mask(&mut tree, masked, bounds()) {
+            unreachable!("{err:?}");
+        }
+        let Ok(nested) = history.add_group(&mut tree, "Nested", Some(group)) else {
+            unreachable!("a group accepts a child group");
+        };
+        let Ok(deep) = history.add_pixel_layer(&mut tree, "Deep", bounds(), Some(nested)) else {
+            unreachable!("a group accepts a child");
+        };
+        if let Err(err) = history.add_mask(&mut tree, deep, bounds()) {
+            unreachable!("{err:?}");
+        }
+
+        // Every surface the subtree owns, painted for real: five layers
+        // (two of them groups, which have masks but no content).
+        let mut painted = Vec::new();
+        for (seed, id) in [plain, masked, deep].into_iter().enumerate() {
+            let surface = content_surface(&tree, id);
+            paint(&mut store, surface, seed as u32 + 1);
+            painted.push(surface);
+        }
+        for id in [group, plain, masked, nested, deep] {
+            let surface = mask_surface(&tree, id);
+            if let Err(err) = crate::write_mask_coverage(&mut store, surface, tile(), 0, 0, 0.5) {
+                unreachable!("{err:?}");
+            }
+            painted.push(surface);
+        }
+
+        // `aurora-app`'s reserved composite surface must never be one
+        // of the ids this machinery emits -- both as a set membership
+        // check and, below, as a tile that survives the sweep.
+        let composite = aurora_tile::SurfaceId::from_raw(u64::MAX);
+        assert!(
+            !tree.all_surfaces().contains(&composite),
+            "no layer may derive the reserved composite surface"
+        );
+        paint(&mut store, composite, 9);
+
+        if let Err(err) = history.remove(&mut tree, group) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            super::forget_document_surfaces(tree, history, &mut store),
+            painted.len(),
+            "every content and mask surface in the subtree must be swept"
+        );
+        for surface in painted {
+            assert!(
+                !store.contains_tile(surface, tile()),
+                "a descendant's surface must be freed too, not just the group's own"
+            );
+        }
+        assert!(
+            store.contains_tile(composite, tile()),
+            "the reserved composite surface must survive a document sweep"
+        );
+    }
+
+    #[test]
+    /// The anti-naive-implementation test, and the reason the sweep
+    /// lives at document-discard time rather than inside
+    /// `LayerTree::remove_capturing`.
+    ///
+    /// **This test fails against a "free the tiles when the layer is
+    /// removed" implementation**, which is the obvious shape and a
+    /// strictly worse regression than the leak it would fix: Ctrl+Z
+    /// after deleting a layer would restore it blank, silently, with
+    /// the user's pixels already gone. Deleting a layer must keep its
+    /// tiles; only discarding the document may free them.
+    fn undo_of_a_remove_still_finds_the_removed_layers_painted_pixels() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(id) = history.add_pixel_layer(&mut tree, "Precious", bounds(), None) else {
+            unreachable!("an empty tree accepts a root layer");
+        };
+        let surface = content_surface(&tree, id);
+        paint(&mut store, surface, 7);
+        let before = texels(&mut store, surface);
+        assert_eq!(
+            before,
+            expected_pattern(7),
+            "the fixture painted what it meant to"
+        );
+
+        if let Err(err) = history.remove(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+
+        assert!(
+            tree.contains(id),
+            "undo must put the layer back in the tree"
+        );
+        assert_eq!(
+            content_surface(&tree, id),
+            surface,
+            "the restored layer must address the same surface it painted into"
+        );
+        assert_eq!(
+            texels(&mut store, surface),
+            before,
+            "the restored layer's pixels must come back byte-exact, not blank"
+        );
+    }
+
+    #[test]
+    // Undoing an *add* leaves the layer's subtree on the redo stack and
+    // nowhere else. Scanning only `undo_stack` would leak it.
+    fn forget_document_surfaces_frees_a_layer_that_was_added_then_undone() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(id) = history.add_pixel_layer(&mut tree, "Undone", bounds(), None) else {
+            unreachable!("an empty tree accepts a root layer");
+        };
+        let content = content_surface(&tree, id);
+        let mask = mask_surface(&tree, id);
+        paint(&mut store, content, 3);
+        if let Err(err) = crate::write_mask_coverage(&mut store, mask, tile(), 2, 2, 0.75) {
+            unreachable!("{err:?}");
+        }
+
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(!tree.contains(id), "the add was undone");
+        assert!(history.can_redo(), "its subtree is on the redo stack");
+        assert!(
+            !history.can_undo(),
+            "and on neither the undo stack nor the tree"
+        );
+
+        assert_eq!(
+            super::forget_document_surfaces(tree, history, &mut store),
+            2
+        );
+        assert!(!store.contains_tile(content, tile()));
+        assert!(!store.contains_tile(mask, tile()));
     }
 }

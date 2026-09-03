@@ -100,6 +100,47 @@ pub(crate) struct RemovedSubtree {
     pub(crate) entries: Vec<(LayerId, LayerEntry)>,
 }
 
+impl RemovedSubtree {
+    /// Every `aurora_tile::SurfaceId` the captured entries address —
+    /// the detached counterpart of [`LayerTree::all_surfaces`], for a
+    /// subtree that is no longer in any tree and so cannot be asked.
+    ///
+    /// **This deliberately mirrors [`LayerTree::surface_id`] and
+    /// [`LayerTree::mask_surface_id`] by hand**, because their real
+    /// bodies need a live tree to look an entry's kind up in and there
+    /// isn't one here. The two guards reproduced below are theirs,
+    /// exactly:
+    ///
+    /// - a content surface only for [`LayerKind::Pixel`], and only for
+    ///   an id below [`crate::MASK_SURFACE_BIT`] (an id with that bit
+    ///   set would address some other layer's *mask* storage);
+    /// - a mask surface for any kind, groups included, but only for an
+    ///   id below `MASK_SURFACE_BIT - 1` (the single id whose masked
+    ///   form is `u64::MAX`, `aurora-app`'s reserved composite
+    ///   surface).
+    ///
+    /// If these ever diverge from the two functions they copy, this
+    /// returns a surface id some *other* owner holds — freeing the
+    /// wrong layer's pixels, or sweeping the composite surface — so
+    /// change all three together or none.
+    pub(crate) fn surfaces(&self) -> Vec<aurora_tile::SurfaceId> {
+        let mut out = Vec::with_capacity(self.entries.len());
+        for (id, entry) in &self.entries {
+            if id.to_raw() < crate::MASK_SURFACE_BIT
+                && matches!(entry.kind, LayerKind::Pixel { .. })
+            {
+                out.push(aurora_tile::SurfaceId::from_raw(id.to_raw()));
+            }
+            if id.to_raw() < crate::MASK_SURFACE_BIT - 1 {
+                out.push(aurora_tile::SurfaceId::from_raw(
+                    id.to_raw() | crate::MASK_SURFACE_BIT,
+                ));
+            }
+        }
+        out
+    }
+}
+
 /// A forest of layers: pixel layers and groups, nested to any depth.
 ///
 /// **Ordering convention, used throughout this crate**: sibling lists
@@ -1735,6 +1776,37 @@ impl LayerTree {
         Some(aurora_tile::SurfaceId::from_raw(
             id.to_raw() | crate::MASK_SURFACE_BIT,
         ))
+    }
+
+    /// Every `aurora_tile::SurfaceId` this tree's layers currently
+    /// address — each pixel layer's own content surface
+    /// ([`Self::surface_id`]) and every layer's mask surface
+    /// ([`Self::mask_surface_id`]), for every entry the tree holds.
+    ///
+    /// Crate-private on purpose: this module owns the two derivation
+    /// rules, so the enumeration of their results belongs beside them
+    /// rather than in a caller that would have to re-derive the guards.
+    /// [`crate::forget_document_surfaces`] is the one consumer.
+    ///
+    /// Walks `layers` itself rather than recursing from
+    /// [`Self::roots`], because the point is exhaustiveness: an entry
+    /// unreachable from any root still owns tiles in the store, and
+    /// `LayerTreeRepr`'s own `validate_shape` only guarantees
+    /// reachability for a tree that came in through deserialization.
+    ///
+    /// A mask surface is emitted whether or not the layer currently
+    /// carries a [`crate::LayerMask`] — deliberately. `remove_mask`
+    /// drops only the struct, leaving whatever coverage was painted
+    /// under that derived surface behind (see [`crate::mask`]'s own
+    /// lifecycle notes), so gating on `mask.is_some()` would leave
+    /// exactly the residue this enumeration exists to find.
+    pub(crate) fn all_surfaces(&self) -> Vec<aurora_tile::SurfaceId> {
+        let mut out = Vec::with_capacity(self.layers.len());
+        for id in self.layers.keys() {
+            out.extend(self.surface_id(*id));
+            out.extend(self.mask_surface_id(*id));
+        }
+        out
     }
 
     #[must_use]

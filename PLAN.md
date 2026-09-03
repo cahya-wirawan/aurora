@@ -15275,6 +15275,82 @@ severity choice.
   `apply_mask`'s, and `resolve_tile`'s; now that 0.71.0 has closed (2),
   those doc comments name the remaining three.
 
+  **Addendum 2026-09-03 (0.80.0) — one half of follow-on (4) now has a
+  primitive; the app still cannot reach it.** Read the scope precisely,
+  because it is narrow. What landed:
+
+  - `aurora_tile::TileStore::forget_surface(surface) -> usize` —
+    `forget_tile` for every tile the store currently holds under one
+    surface, in all three places content lives (resident, pending,
+    paged out), scratch files deleted. It walks the store's own keys,
+    not the surface's declared tile grid, deliberately: a layer's
+    `bounds` is a position hint and not an enforced clip on what was
+    really painted (the same property that made 0.73.0's narrowed
+    composite invalidation unsound), so a bounds-derived walk would
+    silently miss exactly the leaked tiles it exists to find. Key
+    collection peeks (`LruCache::iter` takes `&self`) so a sweep cannot
+    reorder somebody else's LRU.
+  - `aurora_doc::forget_document_surfaces(layers, history, store)` —
+    takes the `LayerTree` and `History` **by value**, so sweeping a
+    *live* document is a compile error rather than a silent destruction
+    of the user's pixels. Sweeps every live layer's content and mask
+    surface plus every `RemovedSubtree` captured on the undo **or redo**
+    stack (an added-then-undone layer lives only on the latter). The
+    crash-recovery journal is deliberately not consulted — it is
+    discarded with the document.
+  - Two crate-private enumerators behind it: `LayerTree::all_surfaces`
+    (walks the internal layer map, not `roots()`, so an unreachable
+    entry is still counted) and `RemovedSubtree::surfaces` (mirrors
+    `surface_id`/`mask_surface_id`'s guards by hand, since a detached
+    subtree has no tree to ask; its doc comment says so and says what
+    divergence would cost). Neither gates on a `LayerMask` still being
+    attached, which is what makes the sweep reach coverage left behind
+    by `remove_mask`.
+
+  **What this does *not* fix, stated plainly:**
+
+  - **Zero live-app behaviour change.** Nothing in `aurora-app` calls
+    it. The shipped app has no reachable path to layer delete (no UI
+    wires to it) and none to document discard that could use this yet.
+    This is real, tested library code and nothing more.
+  - **Wiring it into `App::open_file`/`open_aur_file` is blocked, and
+    that is the named next step.** `aurora_io::read_aur` fills the
+    store with the *new* document's tiles before the old
+    `layers`/`history` are dropped, and both documents derive surface
+    ids from `LayerId`s that restart at zero — so sweeping after the
+    read deletes the document just loaded, and sweeping before it
+    destroys the current document on an open that can still fail. That
+    ordering/aliasing problem needs solving first (a per-document
+    surface-id namespace, or a staging store); recorded in
+    `forget_document_surfaces`'s own doc comment.
+  - **Within a live session a deleted layer's tiles are still held, on
+    purpose.** Undo restores the captured subtree under the same ids
+    and therefore the same surfaces, so freeing at delete time would
+    make Ctrl+Z restore a blank layer with the pixels already gone —
+    strictly worse than the leak. `history.rs`'s
+    `undo_of_a_remove_still_finds_the_removed_layers_painted_pixels`
+    pins that, and was verified non-vacuous by emulating the naive
+    free-at-remove implementation and watching it go red.
+  - **A redo entry evicted mid-session still leaks.** `History::push`
+    clears the redo stack on new activity and drops those captured
+    subtrees, after which nothing can name their tiles and the
+    document-discard sweep will never see them. Freeing them there was
+    *not* taken this round — `push` has no store handle, and giving it
+    one is a wider change. Named in `mask.rs`, not dropped.
+  - Follow-on (4)'s **other** half — remove-a-mask-then-add-one
+    resurrecting stale, spatially-shifted coverage — is untouched.
+
+  Tests: three in `aurora-tile` (`forget_surface` across all three
+  residences plus a spared second surface; an untouched surface
+  forgetting nothing; the LRU-recency check), five in `aurora-doc`
+  (removed pixel layer; content + mask, including a layer whose mask
+  was removed first; a whole group subtree with a nested masked
+  descendant, plus an assertion that `aurora-app`'s reserved
+  `u64::MAX` composite surface is never emitted and survives a sweep;
+  the anti-naive undo test above; an added-then-undone layer, which
+  fails if only `undo_stack` is scanned). Each was verified
+  non-vacuous by a scratch mutation, reverted.
+
   **Review found three real defects, all fixed by 0.70.4**: a
   cross-layer `SurfaceId` collision reachable through a crafted/
   untrusted `.aur` manifest (a `LayerId` with bit 63 already set
@@ -17282,7 +17358,12 @@ tooling-gated, fall into one of four buckets:
    removed-then-re-added mask resurrects its old, now
    spatially-shifted coverage; a deleted layer's mask tiles leak the
    same way its pixel tiles already do) — the last named in 0.70.4
-   after review found it undisclosed. The first is what still keeps
+   after review found it undisclosed, and **half-addressed in 0.80.0**
+   by `TileStore::forget_surface` +
+   `aurora_doc::forget_document_surfaces`, which can free a *discarded
+   document's* content and mask surfaces but is called by nothing in
+   the app yet (see M1.9's own 0.80.0 addendum for what is and is not
+   fixed). The first is what still keeps
    every other slice, persistence included, from ever running end to
    end through the editor. Asked Cahya which of these two to
    pick up next (2026-08-12); answer was to pause rather than commit to

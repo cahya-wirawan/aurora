@@ -9,7 +9,7 @@
 //! thread and one real LRU memory bound covering all of them combined —
 //! the property a naive one-store-per-surface design would not have.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -621,6 +621,60 @@ impl TileStore {
         self.forget_pending(key);
         self.resident.pop(&key);
         held
+    }
+
+    /// [`Self::forget_tile`] for every tile this store currently holds
+    /// under `surface`, whichever of the three places it lives in.
+    /// Returns how many tiles were actually forgotten.
+    ///
+    /// **This destroys pixels, and that is its whole purpose** — the
+    /// same warning [`Self::forget_tile`] carries, multiplied by a
+    /// whole surface. It exists for the caller shape that owns a
+    /// surface id and has just finished with it for good: a document
+    /// being discarded, whose layer (and mask) surfaces would otherwise
+    /// stay resident in this store for the lifetime of the process with
+    /// nothing left able to name them. There is no way back from it,
+    /// and it is not an eviction knob — see [`Self::forget_tile`] for
+    /// that distinction, and for what happens to a background write
+    /// already in flight (nothing this call has to wait for).
+    ///
+    /// # Why it walks what the store holds, not the surface's grid
+    ///
+    /// The cost is O(tiles this store currently holds), not O(the
+    /// surface's declared tile grid), and that is deliberate rather
+    /// than a compromise. A layer's declared `bounds` is a *position
+    /// hint*, not an enforced clip on the pixels actually painted into
+    /// its surface (the same property that made 0.73.0's narrowed
+    /// composite invalidation unsound, and 0.73.1 revert it). A
+    /// bounds-derived walk would therefore visit exactly the tiles a
+    /// caller expected to exist and silently leave behind every tile
+    /// that was really leaking — the opposite of what this is for. The
+    /// store's own keys are the only exhaustive answer available.
+    ///
+    /// # Recency
+    ///
+    /// Collecting the matching keys peeks rather than gets, the same
+    /// rule [`Self::contains_tile`] and [`Self::is_dirty`] follow:
+    /// `LruCache::iter` takes `&self`, so it structurally cannot
+    /// promote anything. That matters for the surface-not-found case
+    /// especially — sweeping a surface this store has never seen must
+    /// be a genuine no-op, not a reordering of somebody else's tiles.
+    pub fn forget_surface(&mut self, surface: SurfaceId) -> usize {
+        let mut ids: HashSet<TileId> = HashSet::new();
+        ids.extend(
+            self.resident
+                .iter()
+                .filter(|((held, _), _)| *held == surface)
+                .map(|((_, id), _)| *id),
+        );
+        for (held, id) in self.paged_out.keys().chain(self.pending.keys()) {
+            if *held == surface {
+                ids.insert(*id);
+            }
+        }
+        ids.into_iter()
+            .filter(|id| self.forget_tile(surface, *id))
+            .count()
     }
 
     /// Blocks until every write submitted so far has actually reached
@@ -1371,6 +1425,133 @@ mod tests {
                 "forgetting a tile nothing holds must report that it held nothing"
             );
         }
+    }
+
+    #[test]
+    // The whole-surface sweep has to reach the same three places
+    // `forget_tile` does, for every tile of that surface -- and reach
+    // *only* that surface, since one store holds many.
+    fn forget_surface_drops_every_tile_of_that_surface_from_every_place_it_can_live() {
+        for evict_and_flush in [false, true] {
+            let (_dir, mut store) = store(1);
+            let doomed = SurfaceId::from_raw(1);
+            let spared = SurfaceId::from_raw(2);
+            let targets = [
+                TileId { x: 0, y: 0 },
+                TileId { x: 1, y: 0 },
+                TileId { x: 0, y: 1 },
+            ];
+            let bystander = TileId { x: 7, y: 7 };
+
+            for (surface, id) in targets
+                .iter()
+                .map(|id| (doomed, *id))
+                .chain(std::iter::once((spared, bystander)))
+            {
+                let Ok(tile) = store.get_mut(surface, id) else {
+                    unreachable!("a fresh store must serve this tile");
+                };
+                for sample in tile.texels_mut() {
+                    *sample = half::f16::from_f32(0.5);
+                }
+            }
+            let paths: Vec<std::path::PathBuf> = targets
+                .iter()
+                .map(|id| store.tile_path(doomed, *id))
+                .collect();
+            if evict_and_flush {
+                // A budget of 1 already evicted all but the last tile
+                // touched; the flush confirms those writes, so they sit
+                // in `paged_out` with real files behind them.
+                if let Err(err) = store.flush() {
+                    unreachable!("test-local scratch disk must accept the write: {err:?}");
+                }
+                assert!(
+                    paths.iter().any(|path| path.exists()),
+                    "at least one doomed tile really is on disk"
+                );
+            }
+            for id in targets {
+                assert!(store.contains_tile(doomed, id));
+            }
+            assert!(store.contains_tile(spared, bystander));
+
+            assert_eq!(
+                store.forget_surface(doomed),
+                targets.len(),
+                "every tile of the swept surface must be reported forgotten"
+            );
+
+            for (id, path) in targets.iter().zip(paths.iter()) {
+                assert!(
+                    !store.contains_tile(doomed, *id),
+                    "nothing may still hold a tile of the swept surface"
+                );
+                assert!(
+                    !path.exists(),
+                    "a swept tile's scratch file must be deleted, not orphaned"
+                );
+            }
+            assert!(
+                store.contains_tile(spared, bystander),
+                "another surface's tiles must be untouched by the sweep"
+            );
+            let Ok(tile) = store.get(spared, bystander) else {
+                unreachable!("a real store must serve this tile");
+            };
+            assert!(
+                // Bit equality rather than `==`: the round trip really
+                // is exact, and this workspace denies `float_cmp`.
+                tile.texels()
+                    .iter()
+                    .all(|sample| sample.to_bits() == half::f16::from_f32(0.5).to_bits()),
+                "the spared surface must keep its own pixels, not come back blank"
+            );
+        }
+    }
+
+    #[test]
+    // Sweeping a surface nothing was ever written to is a no-op that
+    // says so, rather than a panic or a phantom count.
+    fn forget_surface_of_an_untouched_surface_forgets_nothing() {
+        let (_dir, mut store) = store(4);
+        let written = SurfaceId::from_raw(11);
+        if store.get_mut(written, TileId { x: 0, y: 0 }).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert_eq!(store.forget_surface(SurfaceId::from_raw(12)), 0);
+        assert!(
+            store.contains_tile(written, TileId { x: 0, y: 0 }),
+            "sweeping an untouched surface must not disturb a written one"
+        );
+    }
+
+    #[test]
+    // The sweep's key collection peeks rather than gets, for
+    // `contains_tile_does_not_bump_lru_recency`'s reason: a sweep of
+    // some *other* surface must not change which tile the next
+    // eviction picks.
+    fn forget_surface_of_an_untouched_surface_does_not_bump_lru_recency() {
+        let (_dir, mut store) = store(2);
+        let s = surface();
+        let old = TileId { x: 0, y: 0 };
+        let new = TileId { x: 1, y: 0 };
+        for id in [old, new] {
+            if store.get_mut(s, id).is_err() {
+                unreachable!("a fresh store must serve this tile");
+            }
+        }
+        // If the walk promoted anything, the eviction below would take
+        // `new` rather than `old`.
+        assert_eq!(store.forget_surface(SurfaceId::from_raw(999)), 0);
+        if store.get_mut(s, TileId { x: 2, y: 0 }).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(
+            !store.resident.contains(&(s, old)),
+            "the least recently used tile must still be the one evicted"
+        );
+        assert!(store.resident.contains(&(s, new)));
     }
 
     #[test]

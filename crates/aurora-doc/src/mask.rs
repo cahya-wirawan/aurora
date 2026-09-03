@@ -112,11 +112,12 @@
 //!    reversible operations plus dirtied tiles (§7.3.3); mask writes go
 //!    through no history operation at all yet, so painting a mask would
 //!    not be undoable.
-//! 3. **Mask-surface lifecycle: nothing clears mask tiles.** A mask
-//!    surface id is *derived* from its layer's id, not allocated, and
-//!    that has a consequence nothing currently handles. Two shapes,
-//!    both harmless today (no mask coverage is ever painted yet) and
-//!    both real the moment item 1 lands:
+//! 3. **Mask-surface lifecycle: still incomplete.** A mask surface id
+//!    is *derived* from its layer's id, not allocated, and that has
+//!    consequences the crate only partly handles. Three shapes, all
+//!    harmless today (no mask coverage is ever painted yet) and all
+//!    real the moment item 1 lands. Only the third has had any of it
+//!    addressed (0.80.0, and only its document-discard half):
 //!
 //!    - **Remove a mask, add a new one to the same layer, and the old
 //!      one's painted coverage comes back.** The new mask resolves to
@@ -145,12 +146,51 @@
 //!      across time. Harmless while `bounds` is immutable after
 //!      `crate::LayerTree::add_mask`; real the moment a mask can be
 //!      moved or resized, which is when this item is done anyway.
-//!    - **Deleting a layer leaves its mask tiles in the store.** This
-//!      is not new and not specific to masks — a deleted layer's *own*
-//!      pixel tiles leak exactly the same way today, because nothing
-//!      reclaims a surface — but masks double the number of surfaces
-//!      that can be orphaned, so it is worth naming here rather than
-//!      leaving it to be rediscovered.
+//!    - **Deleting a layer leaves its mask tiles in the store —
+//!      deliberately, and now with a way out.** This is not specific to
+//!      masks: a deleted layer's *own* pixel tiles are held exactly the
+//!      same way, and masks merely double the number of surfaces
+//!      involved. Two halves, and 0.80.0 changed only one of them.
+//!
+//!      *Within a live session, the tiles stay, on purpose.*
+//!      [`crate::History`] undoes a remove by restoring the captured
+//!      subtree under its original ids, which derive the very same
+//!      surfaces — so freeing a removed layer's tiles at delete time
+//!      would make Ctrl+Z restore a blank layer with the user's pixels
+//!      already destroyed. That is strictly worse than holding them,
+//!      and `history.rs`'s own
+//!      `undo_of_a_remove_still_finds_the_removed_layers_painted_pixels`
+//!      test exists to keep it that way.
+//!
+//!      *When the whole document is discarded, they can now be freed.*
+//!      [`crate::forget_document_surfaces`] (0.80.0) takes a
+//!      [`crate::LayerTree`] and a [`crate::History`] **by value** and
+//!      sweeps every surface either can still name — live layers'
+//!      content and mask surfaces, plus every subtree captured on the
+//!      undo *or* redo stack — through
+//!      `aurora_tile::TileStore::forget_surface`. Note it does not gate
+//!      on a [`crate::LayerMask`] still being attached, which is what
+//!      makes it reach the residue the first bullet above describes.
+//!
+//!      Two things it does **not** do yet, named rather than implied:
+//!
+//!      1. **Nothing in the app calls it.** `aurora_app::App`'s
+//!         `open_file`/`open_aur_file` are the intended callers and are
+//!         blocked on an ordering/aliasing problem —
+//!         `aurora_io::read_aur` fills the store with the *new*
+//!         document's tiles before the old one is dropped, and both
+//!         documents' surface ids derive from `LayerId`s that restart
+//!         at zero. See that function's own doc comment for the full
+//!         account. So this is real, tested library code with no live
+//!         behaviour change behind it yet.
+//!      2. **A redo entry evicted mid-session still leaks.**
+//!         `History::push` clears the redo stack on any new activity,
+//!         and the captured subtrees it drops there take their surface
+//!         ids with them — after which nothing can name those tiles and
+//!         the document-discard sweep will never see them either.
+//!         Freeing them at that point is a real opportunity and was not
+//!         taken this round: `push` has no store handle, and giving it
+//!         one is a wider change than this round's scope.
 
 /// The bit that separates mask surfaces from layer-pixel surfaces in
 /// the shared `aurora_tile::TileStore`'s single `SurfaceId` space.
