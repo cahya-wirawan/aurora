@@ -19259,19 +19259,88 @@ severity choice.
   only 1.70 ms of phase 1's 10.68 ms (~16%). The dominant cost is
   `cpu_fallback_empty` at 8.95 ms — **~84% of phase 1, ~58% of the whole
   15.41 ms mean frame** — tiles where the GPU arm was reachable,
-  `begin_gpu_composite_tile` returned `None` (`gpu_issue_declined` itself
-  is cheap, 0.03 ms), and the CPU fallback then walked the same root
-  stack again and folded nothing. This is 0.87.1's disclosed double
-  root walk (see "Empty-tile GPU composite work" elsewhere in this M1.10
-  section), isolated as its own number here for the first time rather
-  than folded anonymously into phase 1's total, and it names a concrete
-  next-round candidate: short-circuiting or caching that walk for tiles
-  that will resolve empty, instead of re-walking every root every frame.
+  `begin_gpu_composite_tile` returned `None`, and the CPU fallback then
+  ran and folded nothing.
+
+  **What that slot actually contains — corrected in 0.93.1.** This
+  paragraph originally said `cpu_fallback_empty` "is 0.87.1's disclosed
+  double root walk." That was **wrong, and self-contradicting with the
+  code's own doc comment landed in the same commit**, which assigns the
+  double walk to the *separate* `gpu_issue_declined` slot — measured at
+  **0.03 ms**, not 8.95 ms. `gpu_issue_declined` = 0.03 ms is the double
+  walk's own number, isolated on its own for the first time here (see
+  "Empty-tile GPU composite work" elsewhere in this M1.10 section); the
+  double walk is a real, still-open residual, but it is **not** where
+  phase 1's time goes.
+
+  `cpu_fallback_empty` is a **composite interval, not one cost**, and the
+  instrumentation as committed cannot distinguish its sub-parts. In order,
+  it contains: `aurora_render::transparent_tile`'s allocate-and-zero of a
+  whole `SAMPLES`-length buffer; the second, declining root walk; an
+  **unconditional `aurora_render::un_premultiply_in_place` pass over all
+  262,144 samples of that untouched buffer**; and `write_composited`'s
+  `is_resident` check, `get_mut`, and full-tile bitwise `to_bits`
+  comparison. A hand-instrumented split of that interval (Red-team,
+  0.93.1, same RTX 3090 / Vulkan, by mutating the code to time each
+  sub-part) attributes it as:
+
+  | GPU-path phase 1, hand-split | measured |
+  |---|---|
+  | real GPU dispatch (`gpu_issue_ok`) | 1.50 ms |
+  | the actual double root walk (alloc + walk) | 0.24 ms |
+  | `un_premultiply_in_place` over an all-transparent, zero-fold tile | **6.49 ms (~59% of phase 1)** |
+  | `write_composited` (residency check + `get_mut` + 262,144-element `to_bits` compare) | 2.82 ms |
+
+  The same split on the CPU-fallback benchmark: real blend math 4.51 ms,
+  un-premultiply 3.45 ms, write 1.50 ms — i.e. **43% of that path is also
+  not blend math**. So `cpu_fallback_real` is not "blend math" on its own
+  either; it carries the same un-premultiply and write tail.
+
+  **The corrected next-round lever**, replacing this entry's original
+  "short-circuit or cache the root walk" (which the split shows would
+  recover only ~0.24 ms of ~9 ms): for a tile whose
+  `composite_roots_into_tile` reports **zero roots folded**, skip
+  `un_premultiply_in_place` entirely and skip `write_composited`'s
+  full-tile compare (and possibly `transparent_tile`'s allocation too, by
+  hoisting a reusable scratch buffer). That is a behaviour change, so it is
+  deliberately *not* attempted in this diagnostic round; 0.93.1 does plumb
+  the fold count out of `composite_roots_into_tile` as a return value,
+  which is the signal such a skip would branch on.
+
+  Those four numbers are **mutation-based estimates, not slots of
+  `RECOMPOSITE_TILE_COST_NANOS`.** A follow-up round wanting exact figures
+  with this round's own rigour should add sixth and seventh slots
+  (un-premultiply, `write_composited`) and re-measure; 0.93.1 deliberately
+  did not, since adding instrumentation is the next round's job and the
+  estimate is already decisive about which lever matters.
+
   On the CPU-fallback benchmark — which never enters the GPU arm at all,
   so both `gpu_issue_*` slots correctly read `0.00` — the same split runs
   `cpu_fallback_empty` 4.14 ms / `cpu_fallback_real` 6.44 ms, the expected
   shape for a fixture that genuinely does real blend work on most of its
-  tiles.
+  tiles. Two caveats on reading that table, added in 0.93.1:
+  `cpu_fallback_real = 0.00 ms` on the *GPU-path* benchmark is
+  near-structural for that fixture rather than an empirical finding — any
+  tile with stored content takes `begin_gpu_composite_tile`, so only
+  never-stored tiles reach the CPU fallback and those fold nothing by
+  construction; read it as a consistency check. And `other = 0.00 ms` on
+  both is a property of this specific one-root-layer fixture (a `roots()`
+  walk of length one, one `Vec::push`), not evidence that the costs that
+  slot absorbs — the whole pre-loop setup (`composite_reference_origin`,
+  `document_qualifies_for_gpu_compositing`, `CompositeBudget::for_pass`)
+  and the `Some(pending)` arm's `pending_gpu.push`, which takes no mark of
+  its own — are universally free.
+
+  **The CPU-fallback benchmark's absolute numbers are soft.** Red-team's
+  three reproduction runs of the same command on the same hardware landed
+  at mean 11.35/11.47/11.35 ms, p99 13.96/14.05/14.11 ms, phase 1
+  9.09/9.18/9.10 ms — consistently ~20% *below* the single committed run
+  (13.92 / 21.47 / 10.58 ms), most likely because that run's frame 0 is
+  included in an n=12 mean with no warm-up and absorbs lazy shader-pipeline
+  creation. The **ratios** between sub-costs reproduced exactly. Read this
+  benchmark's figures as proportions, not as absolute frame times; the
+  GPU-path benchmark's larger n=40 is less exposed to the same effect but
+  is a single run too.
 
   Verified: full local CI gate green (`cargo fmt --all --check`,
   `check_layering.py` — 20 crates, `check_no_hardcoded_style.py` — 28
@@ -19279,14 +19348,153 @@ severity choice.
   --all-targets --all-features -- -D warnings`, `cargo test --workspace`
   — **1,633 passing**, 0 failed, 10 ignored), plus the real GPU run above
   (adapter line confirmed on every invocation) producing the numbers in
-  the table, with the residual row confirming the five-way split
-  partitions phase 1's own mark to within `Instant::now()` overhead (five
-  extra clock reads per tile), not a bookkeeping bug. 1 new test
-  (`recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable`,
-  the mark-placement trip-wire: asserts only that the two structurally
-  impossible `gpu_issue_*` slots stay zero when no `GpuContext` or
-  `TileCompositor` is supplied, not a timing claim), 0 removed. No new
-  dependency, no `unsafe`.
+  the table. **The residual row is much weaker evidence than this entry
+  originally claimed** — see the 0.93.1 correction below; it confirms only
+  that no interval went entirely uncredited, not that any interval landed
+  in the right slot. 1 new test
+  (`recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable`:
+  asserts that the two structurally impossible `gpu_issue_*` slots stay
+  zero when no `GpuContext` or `TileCompositor` is supplied, not a timing
+  claim — and, as 0.93.1 discloses, that guards `mark_gpu_issue`'s
+  slot-*selection*, not mark placement in general), 0 removed. No new
+  dependency, no `unsafe`. Lint exceptions, disclosed exhaustively the way
+  the 0.92.x entries above do it: one new `#[allow(clippy::too_many_lines)]`
+  on `measure_pan_and_paint_frames`, whose body grew past the default
+  100-line threshold once the split's per-frame plumbing joined it — the
+  alternative would have moved code across a *measured* interval boundary,
+  changing the numbers to satisfy a lint; and one new
+  `#[allow(clippy::too_many_arguments)]` on `FrameStages::push_frame`, at
+  eight arguments against a threshold of seven, for the same
+  no-meaningful-grouping reason `measure_pan_and_paint_frames` already
+  carried that allow.
+
+  **0.93.1 (2026-09-04) — the phase-1 attribution was wrong and its
+  self-check was fake; both corrected.** An independent Critic and Red-team
+  both found the same two blocking problems in 0.93.0, and Red-team proved
+  each empirically rather than by reading. Still diagnostic only: no
+  compositing behaviour, no `BUDGET_MS`, no benchmark assertion changed.
+
+  1. **The causal attribution of the dominant cost was wrong** (fixed
+     above, in this entry's own text). 0.93.0 said `cpu_fallback_empty`
+     (8.95 ms, ~84% of phase 1) "is 0.87.1's disclosed double root walk" —
+     while the code doc comment added in the *same commit* assigned the
+     double walk to `gpu_issue_declined`, which measured 0.03 ms. A 300×
+     internal contradiction. Red-team's hand-split of the interval puts the
+     real dominant cost at an unconditional `un_premultiply_in_place` pass
+     over an all-transparent, zero-fold tile: ~6.49 ms, ~59% of phase 1.
+     The corrected lever is to skip that pass and `write_composited`'s
+     full-tile compare for a zero-fold tile — not to cache the root walk,
+     which is worth ~0.24 ms.
+  2. **The "reconciliation residual" could not detect a misplaced or
+     dropped mark**, and both the code and PLAN.md claimed it could.
+     Red-team deleted the `tile_costs.mark_gpu_issue(...)` call site and
+     re-ran the real benchmark: the residual stayed bit-for-bit identical
+     at 0.0001 ms while 1.5 ms of real GPU dispatch was silently
+     reclassified into `other`. Root cause: `credit()` credits
+     `duration_since(self.last)` to whatever in-range slot it is handed and
+     always advances `self.last`, so the five slots' sum is *identically*
+     the span from the first credit to the last, however the intervals are
+     distributed. The residual detects only an interval nothing credits at
+     all — the two small head/tail gaps. It is also not sensitive to
+     per-tile clock-read count, so 0.93.0's "five extra clock reads per
+     tile sets the tolerance" was wrong too. Every doc comment and PLAN.md
+     sentence making that claim now states plainly what the residual does
+     and does not catch, **and the self-check was made real** rather than
+     merely re-described: a new `RECOMPOSITE_MARK_IMBALANCE` counter
+     reconciles, per pass, one classifying `mark_gpu_issue` against each
+     tile that entered the loop body (and `mark_cpu_fallback` at most once
+     per such tile). It must print `0`, the benchmark reports it, and the
+     trip-wire test now asserts it — so the deletion Red-team performed
+     would now fail a test instead of going silent.
+  3. **`CPU_ROOT_FOLDS`'s race with `composite_document` is gone, not
+     merely disclosed.** Both reviewers found by static analysis that
+     `composite_document` — ~34 test call sites, none holding
+     `GPU_TEST_LOCK` — also reached `note_cpu_root_fold()`, so a foreign
+     fold landing inside `mark_cpu_fallback`'s delta window would
+     reclassify an empty tile as real under threaded `cargo test`. Fixed
+     the thorough way (option b): `composite_roots_into_tile` now returns
+     `(Vec<half::f16>, usize)` — texels plus roots actually folded — and
+     the process-global counter, its two accessors and its `cfg(not(test))`
+     twin are deleted outright. Four call sites updated; three discard the
+     count. No new dependency.
+  4. The trip-wire test's stated grid math was wrong: `TileResidency::grid_for`
+     is `viewport.div_ceil(TILE) + 1` per axis, so a 600×600 viewport gives
+     **4×4 = 16** tiles and **fifteen** empty ones, not 3×3 and eight. The
+     assertions never depended on the count; the stated reasoning did.
+  5. The same test's doc oversold what it guards. With `mark_gpu_issue`
+     deleted it still passed, because both `gpu_issue_*` slots then read a
+     trivial zero either way. Its doc now says it guards `mark_gpu_issue`'s
+     `(reachable, issued) → slot` *mapping*, and names the new mark-balance
+     assertion as the part that covers dropped marks.
+  6. The `other` slot's doc omitted two things it really absorbs: the whole
+     pre-loop setup between `RecompositeTileCosts::start()` and the first
+     `begin_tile()`, and the `Some(pending)` arm's `pending_gpu.push`, which
+     takes no mark of its own. Both named now, and this entry states that
+     `other = 0.00 ms` is a property of the one-root-layer fixture rather
+     than evidence those costs are free.
+  7. `cpu_fallback_real = 0.00 ms` on the GPU-path benchmark is disclosed
+     above as near-structural for that fixture — a consistency check, not
+     an empirical finding.
+  8. 0.93.0's verification paragraph did not disclose the new
+     `#[allow(clippy::too_many_lines)]` on `measure_pan_and_paint_frames`
+     (or the `too_many_arguments` allow on `push_frame`), dropping a
+     discipline the 0.92.x entries kept. Both are now listed there.
+  9. The "shipping build unaffected" wording is softened where it appeared:
+     `gpu_arm_reachable` and the per-tile `issued.is_some()` are **not**
+     behind `cfg(test)`. No shipping-build *behaviour* changes, and an
+     optimized release build drops them entirely (checked at 0.93.0 via
+     `nm`/`strings`), but an unoptimized debug build (`cargo run -p
+     aurora-app` with no `--release`) keeps two cheap boolean reads per pass
+     and one `Option::is_some` per tile — negligible, but real.
+  10. The CPU-fallback benchmark's absolute numbers are now disclosed above
+      as ~20% run-to-run variant (three reproduction runs all landed below
+      the committed one, almost certainly cold-start frame 0 inside an n=12
+      mean), better read as ratios than absolute frame times. Not re-run
+      here.
+
+  What is deliberately **not** done: no sixth/seventh timing slot to
+  measure the un-premultiply / `write_composited` split with this round's
+  own rigour (named as the next round's job — the mutation-based estimate
+  is already decisive about which lever matters), and no behaviour change
+  to act on the lever.
+
+  Verified: full local CI gate green (`cargo fmt --all --check`,
+  `check_layering.py` — 20 crates, `check_no_hardcoded_style.py` — 28
+  files, `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace` —
+  **1,633 passing**, 0 failed, 10 ignored, unchanged from 0.93.0 since this
+  round adds no test, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
+  warnings" cargo doc --workspace --no-deps --all-features`), plus the real
+  GPU benchmark re-run under `AURORA_REQUIRE_GPU=1` on the same RTX 3090
+  (`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`, adapter line confirmed)
+  to check that the fold count plumbed by value still classifies the two
+  CPU slots the way the deleted global did:
+
+  | | 0.93.0's committed run | 0.93.1's re-run |
+  |---|---|---|
+  | GPU path total mean / p50 / p99 | 15.41 / 14.77 / 37.22 ms | 16.52 / 16.20 / 36.96 ms |
+  | GPU path phase 1 | 10.68 ms | 11.59 ms |
+  | GPU path `gpu_issue_ok` / `declined` | 1.70 / 0.03 ms | 1.68 / 0.03 ms |
+  | GPU path `cpu_fallback_empty` / `real` / `other` | 8.95 / 0.00 / 0.00 ms | 9.87 / 0.00 / 0.00 ms |
+  | CPU fallback total mean / p50 / p99 | 13.92 / 13.88 / 21.47 ms | 12.41 / 11.74 / 19.33 ms |
+  | CPU fallback phase 1 | 10.58 ms | 9.56 ms |
+  | CPU fallback `empty` / `real` | 4.14 / 6.44 ms | 3.82 / 5.74 ms |
+  | `mark_imbalance` (must be 0) | *did not exist* | **0** on every frame of both |
+
+  Classification is intact and the shape reproduces. The absolute numbers
+  moved by roughly the ~20% Red-team's reproduction runs found — this
+  re-run also lands *below* 0.93.0's committed CPU-fallback figures and
+  slightly *above* its GPU-path ones — which is the run-to-run variance
+  disclosed above, not an effect of this change (nothing here touches a
+  compositing path). Both benchmarks' own assertions and `BUDGET_MS` are
+  untouched, and both still miss the 16.7 ms budget on their p99, exactly
+  as before.
+
+  0 new tests, 1 test strengthened (two new assertions), 0 removed. No new
+  dependency, no `unsafe`, no new lint exception — 0.93.0's two are now
+  disclosed in its own entry above, and this round's plumbing added a ninth
+  argument under `push_frame`'s existing `too_many_arguments` allow rather
+  than a new one.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
