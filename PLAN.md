@@ -17914,9 +17914,24 @@ severity choice.
     14.9–16.1 ms across the unprobed runs, so read this as "~87% of
     whichever figure", not as a fourth decimal place), i.e. **~44% of the
     whole GPU-path frame**, in a scalar single-threaded loop. This is the
-    largest single measured hot spot in the frame. Three separate things
-    were bundled under this one bullet; they are now split, because only
-    the first is done:
+    largest single measured hot spot in the frame.
+
+    > **The "~44% of the whole GPU-path frame" figure above is stale as
+    > of 0.90.0 — do not quote it forward.** It was measured when
+    > `write_composited` unconditionally re-dirtied every tile, so
+    > `upload_sync` was ~27% of the frame and this loop was ~87% of that.
+    > 0.90.0's unchanged-tile skip cut how many tiles reach this function
+    > at all. A fresh baseline taken on the same fixture and the same
+    > adapter immediately before the 0.92.0 work below measured
+    > `upload_sync` at **27.2–28.2% of the GPU-path frame mean**
+    > (5.19–5.44 ms of a 19.00–20.04 ms frame) — so the stage share
+    > itself did not move much on *this* fixture, but the absolute
+    > numbers did, and the ~87%-of-stage sub-share was never re-probed
+    > after 0.89.0 and is not re-asserted here. Take the 0.92.0 entry's
+    > own before/after table as the current number.
+
+    Three separate things were bundled under this one bullet; they are
+    now split, because only the first is done:
     - **Batching the four per-channel byte appends into one — done in
       0.89.0**, measured below.
     - **Parallelizing per tile with `rayon` — NOT done, and not merely a
@@ -17939,7 +17954,9 @@ severity choice.
       measurement below is in fact the argument *for* looking here next:
       batching the appends moved the stage only slightly, which points at
       the per-texel arithmetic rather than the append bookkeeping as
-      where the time actually goes.
+      where the time actually goes. **Update: done in 0.92.0, see
+      below** — and unlike the append batching, this one moved the
+      stage by a factor, not a couple of percent.
   - **Stop re-dirtying and re-uploading an unchanged, already-transparent
     composite tile.** `write_composited`'s unconditional
     `mark_dirty(full_tile)` is what forces the re-upload. Not doing it
@@ -18205,7 +18222,10 @@ severity choice.
     dependency plus a restructuring of `sync`'s shared-buffer loop.
   - **SIMD / vectorization of the `f16 ↔ f32` conversion** — untouched,
     unmeasured, and by the negative result above the most promising
-    remaining lever on this function.
+    remaining lever on this function. **Update: done in 0.92.0, see
+    below** — the negative result was a correct signpost: vectorizing
+    the conversion cut the stage by ~2.4×, where batching the appends
+    had bought ~2–5%.
   - **The second diagnostic-round candidate — stop re-dirtying and
     re-uploading unchanged, already-transparent composite tiles** —
     entirely untouched. `write_composited`'s unconditional
@@ -18799,6 +18819,170 @@ severity choice.
   through, so the invariant is enforced once rather than re-derived by
   every future caller. Not done in 0.90.1 — this is a design decision
   about a new API shape, not a bug fix, and belongs in its own round.
+
+  **0.92.0 (2026-09-01) — vectorize `extend_premultiplied_le_bytes`'s
+  `f16 → f32 → multiply → f16` arithmetic, which 0.89.0's negative result
+  had correctly fingered as the remaining hot spot. It worked: the
+  `upload_sync` stage fell by ~2.4× on both benchmarks, with
+  non-overlapping 3-run ranges, and this time the pre-stated success
+  threshold was genuinely met rather than argued around.**
+
+  **The crate evaluation, and why the obvious answer was the wrong one.**
+  The starting suggestion for this round was the `wide` crate. It was
+  evaluated and **rejected**, for a decisive reason: **`wide` has no
+  `f16` lane type at all.** Its lane vocabulary is `i8`/`i16`/`i32`/`i64`,
+  `u8`/`u16`/`u32`/`u64`, `f32` and `f64` — so it cannot vectorize the
+  `f16 ↔ f32` conversion, which is precisely the part that costs. It
+  would have vectorized only the alpha multiply, leaving every one of the
+  ~393,000 scalar conversion calls per tile exactly where they were.
+  Secondarily: without a target-feature bump this round deliberately did
+  not make (no `RUSTFLAGS`, no `.cargo/config.toml` edit), `wide`'s
+  widest guaranteed lane width on baseline `x86_64` is SSE2's 128 bits —
+  four `f32` lanes, for the one operation that was never the bottleneck.
+  And it would have been a new runtime dependency with its own `cargo
+  deny` licence review.
+
+  **What was used instead: `half`'s own slice API — zero new
+  dependencies.** `half` is already a workspace dependency (`half = "2"`,
+  resolving to 2.7.1) and ships `half::slice::HalfFloatSliceExt`'s
+  `convert_to_f32_slice` / `convert_from_f32_slice`. Verified by reading
+  the vendored 2.7.1 source rather than assumed:
+  `src/binary16/arch.rs`'s `f16_to_f32_slice` / `f32_to_f16_slice` reach
+  the **same** hardware F16C instructions the scalar path already used
+  (`_mm256_cvtph_ps` / `_mm256_cvtps_ph`, i.e. `vcvtph2ps` / `vcvtps2ph`)
+  via `convert_chunked_slice_8` — **eight lanes per instruction, behind
+  one `is_x86_feature_detected!("f16c")` check for the whole slice**
+  instead of one per sample.
+
+  **Which is the real explanation of the cost, and why "make `from_f32`
+  faster" was never the fix.** `half`'s scalar `f16::from_f32` /
+  `f32::from(f16)` were *already* using F16C hardware. The arithmetic was
+  never slow. What was slow is the per-call overhead wrapped around it:
+  each call runs its own feature-detection check and then calls a
+  `#[target_feature(enable = "f16c")]` function, which cannot be inlined
+  into a caller not compiled with that feature. At the old per-texel
+  granularity a 256×256 tile paid that roughly 393,000 times. Removing
+  that bookkeeping — not changing the instructions — is the entire win,
+  which is also why the win is as large as it is.
+
+  **The correctness decision worth recording: alpha is read from the
+  source chunk, never from the narrowed scratch buffer.**
+  `premultiply_rgba` (deliberately left scalar, as the reference
+  implementation the equivalence tests compare against) does not touch
+  alpha at all, so alpha's `f16` bits must pass through bit-untouched.
+  They would not have, had alpha been taken from the round-tripped
+  buffer: `f16 → f32 → f16` is **not** the identity for a signalling
+  NaN, which the F16C widening quiets (`0x7c01` becomes `0x7e01`). Bit
+  exactness with the scalar path is otherwise sound because `half`'s
+  scalar and 8-wide `x86` paths issue the same instructions with the same
+  rounding immediate (`_MM_FROUND_TO_NEAREST_INT`), and the multiply
+  keeps the scalar path's `rgb * alpha` operand order so single-NaN
+  products carry the same payload.
+
+  **All three pre-existing equivalence tests pass unchanged — no
+  assertion was weakened, and none needed to be.** What that *does not*
+  establish, and is worth being blunt about: every pre-existing fixture
+  in this module is 2–10 texels, i.e. shorter than one 64-texel chunk, so
+  all of them land entirely in the new scalar remainder path. On the
+  original three tests alone, **the vectorized main loop would have been
+  completely untested.** One test was added to close that
+  (`the_fused_serializer_matches_premultiply_then_serialize_across_a_chunk_boundary`,
+  131 texels = two full chunks plus a 3-texel remainder, values varying
+  per texel and per channel, with extreme bit patterns including a
+  signalling NaN placed inside both chunks *and* the remainder).
+
+  **That new test was mutation-checked, not merely observed to pass.**
+  Deliberately reintroducing the alpha-from-scratch-buffer bug made it
+  fail on exactly the predicted bytes (`1, 126` = `0x7e01` where the
+  reference has `1, 124` = `0x7c01`) — **while all three pre-existing
+  tests still passed**. So the new test is the only guard in the tree for
+  that decision, and it is a real guard.
+
+  **Before/after, same fixture, same adapter, three runs per side**
+  (`AURORA_REQUIRE_GPU=1 cargo test --release -p aurora-app -- --nocapture
+  --test-threads=1 recomposite_and_present_loop`; adapter reported on
+  every run as `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`). Ranges
+  are min–max across the three runs, not single figures:
+
+  | GPU path, n=40 | before | after |
+  |---|---|---|
+  | `upload_sync` mean | 5.19–5.44 ms | **2.14–2.40 ms** |
+  | `upload_sync` p50 | 4.46–5.19 ms | **1.82–2.18 ms** |
+  | `upload_sync` p99 | 16.78–26.99 ms | **8.11–8.28 ms** |
+  | whole frame mean | 19.00–20.04 ms | 15.88–17.53 ms |
+  | whole frame p50 | 18.10–20.03 ms | 15.30–17.23 ms |
+  | whole frame p99 | 37.61–52.66 ms | 28.50–38.72 ms |
+  | `upload_sync` stage share of frame mean | 27.2–28.2% | 13.4–13.7% |
+
+  | CPU fallback, n=12 | before | after |
+  |---|---|---|
+  | `upload_sync` mean | 3.72–3.81 ms | **1.56–1.70 ms** |
+  | `upload_sync` p50 | 3.69–3.89 ms | **1.51–1.53 ms** |
+  | `upload_sync` p99 | 7.65–7.92 ms | **3.64–3.78 ms** |
+  | whole frame mean | 14.31–14.74 ms | 12.03–13.22 ms |
+  | whole frame p50 | 14.15–14.86 ms | 11.86–12.50 ms |
+  | whole frame p99 | 17.47–23.13 ms | 14.75–19.43 ms |
+
+  **The pre-stated success threshold was: a win only if `upload_sync`
+  mean AND p50 both fall by a margin whose 3-run ranges do not overlap
+  the baseline's. Met, on both benchmarks, with clear separation** —
+  GPU mean 5.19–5.44 → 2.14–2.40 (gap 2.79 ms), GPU p50 4.46–5.19 →
+  1.82–2.18 (gap 2.28 ms), CPU mean 3.72–3.81 → 1.56–1.70, CPU p50
+  3.69–3.89 → 1.51–1.53. `upload_sync` p99 also separated cleanly on
+  both, which 0.89.0's change never managed. This is stated as a real
+  result rather than hedged because the ranges genuinely do not touch —
+  unlike 0.89.0, where they did and the entry said so.
+
+  **The upload-volume control line is bit-identical across all six
+  runs**, which is what makes the comparison a CPU-time measurement
+  rather than a confound: GPU path `mean=6.8 tiles/frame (min=2 max=20),
+  mean=3.41 MB/frame (min=1048576B max=10485760B)`; CPU fallback
+  `mean=4.9 tiles/frame (min=2 max=9), mean=2.46 MB/frame
+  (min=1048576B max=4718592B)`. Identical before and after, as it must
+  be — this change alters no upload volume, only the CPU cost of
+  producing the same bytes.
+
+  **What this does NOT do, stated plainly:**
+
+  - **It does not close the 60 FPS gate.** The GPU path's frame p50 is
+    now 15.30–17.23 ms against a 16.7 ms budget — straddling it, not
+    beating it — and its p99 is still 28.50–38.72 ms, ~1.7–2.3× over.
+    The CPU-fallback fixture's p50 (11.86–12.50 ms) is now under budget,
+    but that fixture uses a smaller viewport and has never been the
+    binding case. **The gate remains open**, and `recomposite` is now
+    the dominant stage (~68% of the GPU-path frame mean) — that is where
+    the next attempt belongs, not here.
+  - **It is verified on exactly one configuration**: Linux, Vulkan,
+    NVIDIA RTX 3090, `x86_64` **with F16C** (confirmed present in
+    `/proc/cpuinfo`, alongside AVX). No Metal, no DX12, no macOS, no
+    Windows.
+  - **The other targets are reasoned about, not measured.** On
+    `x86_64` without F16C, `half` falls back to its own software
+    conversion: the code stays *correct* (the equivalence tests are
+    hardware-independent) but the hardware speedup does not apply, and
+    whether the batched form is still faster there than the scalar one
+    is **unmeasured**. On `aarch64`, `half` takes its own `fp16` NEON
+    path — also unverified here. Do not read the table above as a
+    cross-platform claim.
+  - **Both benchmarks still call `CompositeCache::bump()` once per
+    frame**, so the stage shares remain a property of this fixture, not
+    a general result — the same caveat every entry in this section
+    carries.
+  - **`premultiply_rgba` was deliberately left scalar and untouched.**
+    It is the cold `upload_mip` sibling and the reference implementation
+    two equivalence tests compare against; vectorizing it too would have
+    removed the independent oracle. `TileResidency::sync`'s loop
+    structure is likewise unchanged.
+  - **`rayon` per-tile parallelism is still not done** and is unaffected
+    by this round — same two blockers as before (a genuine new runtime
+    dependency, and `sync`'s shared-buffer loop needing restructuring
+    first).
+
+  Zero new dependencies (`Cargo.lock`'s diff is the 20 workspace version
+  strings and nothing else), no `unsafe` added to `aurora-gpu`, no
+  `RUSTFLAGS` or `.cargo/config.toml` change, no new lint exception.
+  `cargo deny check all`: `advisories ok, bans ok, licenses ok, sources
+  ok`. 1 test added, 0 changed.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use aurora_core::MAX_DOCUMENT_EXTENT;
 use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileId, TileStore};
 use half::f16;
+use half::slice::HalfFloatSliceExt;
 
 use crate::error::GpuError;
 
@@ -120,6 +121,14 @@ fn premultiply_rgba(texels: &mut [f16]) {
     }
 }
 
+/// Texels converted per vectorized chunk. 64 texels = 256 samples, so
+/// the two scratch arrays in [`extend_premultiplied_le_bytes`] are 1 KiB
+/// (`f32`) and 512 B (`f16`) and stay in L1, and `SAMPLES /
+/// CHUNK_SAMPLES` is exactly 1024 — the real upload path never reaches
+/// the scalar remainder.
+const CHUNK_TEXELS: usize = 64;
+const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
+
 /// Appends `texels` to `out` as the little-endian `f16` bytes
 /// `wgpu::Queue::write_texture` wants, **premultiplied on the way**
 /// ([`premultiply_rgba`]'s arithmetic, applied per texel as the bytes are
@@ -136,18 +145,19 @@ fn premultiply_rgba(texels: &mut [f16]) {
 /// did anyway.
 ///
 /// **This function itself is the real cost, not the bus** (measured,
-/// `aurora-app`'s M1.10 per-stage frame breakdown, PLAN.md, 0.88.1 —
-/// probed against the pre-0.89.0 four-append loop and not re-probed
-/// since; 0.89.0's own measurement below found batching bought only
-/// ~1-5% of the stage, so this ~87% figure has almost certainly not
-/// moved): on the real pan-while-painting benchmark, this loop is ~87%
-/// of the `upload_sync` stage's time — a single-threaded scalar
+/// `aurora-app`'s M1.10 per-stage frame breakdown, PLAN.md, 0.88.1): on
+/// the real pan-while-painting benchmark, this loop dominated the
+/// `upload_sync` stage's time — a single-threaded scalar
 /// `f16 -> f32 -> premultiply -> f16` conversion, not GPU bandwidth. The
 /// actual GPU DMA of the bytes this produces happens later, at the next
 /// `queue.submit`, and measures near line-rate there. Before optimizing
 /// this as a *bandwidth* problem (fewer bytes, mip streaming), check
 /// whether it's cheaper to fix as a *throughput* problem first — see the
-/// PLAN.md entry for the measured numbers.
+/// PLAN.md entry for the measured numbers. (0.88.1 quoted "~87% of the
+/// stage" from a probe of the pre-0.89.0 four-append loop. Do not quote
+/// that figure forward: 0.90.0's unchanged-tile skip cut how many tiles
+/// reach this function at all, so the share is stale. PLAN.md's 0.92.0
+/// entry states what a fresh baseline actually measured instead.)
 ///
 /// **Batching the four channel writes is done (0.89.0)**: the loop body
 /// concatenates the four `to_le_bytes()` pairs into one 8-byte array and
@@ -163,14 +173,73 @@ fn premultiply_rgba(texels: &mut [f16]) {
 /// the `upload_sync` stage's p50, no improvement at p99 (noise-dominated
 /// in both directions), and the GPU-path stage *mean* stayed inside
 /// run-to-run noise; the 60 FPS verdict did not move. Removing 3-of-4
-/// append calls per texel from a stage that is ~87% this one loop should
-/// have been dramatic if capacity checks and small `memcpy`s were where
-/// the time went — so they are not. **The per-texel
-/// `f16 -> f32 -> multiply -> f16` arithmetic is**, which redirects the
+/// append calls per texel from a stage this loop dominates should have
+/// been dramatic if capacity checks and small `memcpy`s were where the
+/// time went — so they are not. **The per-texel
+/// `f16 -> f32 -> multiply -> f16` arithmetic is**, which redirected the
 /// next attempt here to vectorizing that conversion rather than any
-/// further append bookkeeping. Do not read this function as a solved
-/// throughput problem. PLAN.md's 0.89.0 addendum under M1.10 has the
-/// full before/after tables, the sample sizes, and the caveats.
+/// further append bookkeeping. PLAN.md's 0.89.0 addendum under M1.10 has
+/// the full before/after tables, the sample sizes, and the caveats.
+///
+/// # Vectorizing the conversion (0.92.0): the crate evaluation
+///
+/// **Why "just call `from_f32` in a loop, but faster" is not the fix.**
+/// `half`'s scalar `f16::from_f32` / `f32::from(f16)` already use the
+/// hardware F16C instructions (`vcvtps2ph` / `vcvtph2ps`) on `x86_64` —
+/// they are not slow *arithmetic*. What is slow is the per-call
+/// overhead around them: each one runs its own
+/// `is_x86_feature_detected!("f16c")` check and then calls a
+/// `#[target_feature(enable = "f16c")]` function, which cannot be
+/// inlined into a caller that was not compiled with that feature. At
+/// today's per-texel granularity a 256×256 tile pays that overhead
+/// three times per texel for RGB plus once for the widening of alpha —
+/// on the order of 393,000 non-inlinable calls, each preceded by a
+/// feature-detection check, per tile. That bookkeeping, not the
+/// conversion, is the cost.
+///
+/// **`wide` was evaluated and rejected.** The user's starting
+/// suggestion was the `wide` crate. It is the wrong tool here, for two
+/// independent reasons. First and decisively: **`wide` has no `f16` lane
+/// type at all.** Its lane vocabulary is `i8`/`i16`/`i32`/`i64`,
+/// `u8`/`u16`/`u32`/`u64`, `f32` and `f64` — so it cannot vectorize the
+/// `f16` ↔ `f32` conversion, which is the part that costs. It would
+/// vectorize only the alpha multiply, leaving all ~393,000 scalar
+/// conversion calls exactly where they are. Second: without a
+/// target-feature bump this round is not making (no `RUSTFLAGS`, no
+/// `.cargo/config.toml`), `wide`'s widest guaranteed lane width on
+/// baseline `x86_64` is SSE2's 128 bits — four `f32` lanes for the one
+/// operation that was never the bottleneck. It would also be a new
+/// runtime dependency, with the licence review that implies.
+///
+/// **`half`'s own slice API was chosen instead.** `half` is already a
+/// dependency (`half = "2"`, resolving to 2.7.1), and it ships
+/// [`half::slice::HalfFloatSliceExt`] — `convert_to_f32_slice` and
+/// `convert_from_f32_slice` — which reach the *same* F16C instructions
+/// through `_mm256_cvtph_ps` / `_mm256_cvtps_ph`, eight lanes per
+/// instruction, behind **one** feature-detection check for the whole
+/// slice rather than one per sample. That is genuine SIMD
+/// vectorization of the expensive half of the work, with **zero new
+/// dependencies** and no `unsafe` in this crate — strictly better than
+/// what adding `wide` could have given. On a CPU without F16C, `half`
+/// falls back to its own software conversion and this code stays
+/// correct, just not faster; on `aarch64` it takes `half`'s own `fp16`
+/// NEON path. Neither non-F16C `x86_64` nor `aarch64` is verified here.
+///
+/// **Bit-exactness with the scalar path is not assumed, it is checked.**
+/// `half`'s scalar and 8-wide x86 paths issue the same instructions with
+/// the same rounding immediate (`_MM_FROUND_TO_NEAREST_INT`), and the
+/// multiply keeps the scalar path's `rgb * alpha` operand order so a
+/// single-NaN product carries the same payload. The equivalence tests
+/// below pin this against [`premultiply_rgba`], which is deliberately
+/// left scalar as the reference implementation.
+///
+/// **Why alpha is read from the source chunk, never from the narrowed
+/// buffer.** [`premultiply_rgba`] does not touch alpha at all, so its
+/// bits pass through untouched — and `f16 -> f32 -> f16` is *not* the
+/// identity for a signalling NaN, which the F16C widening quiets
+/// (`0x7c01` becomes `0x7e01`). Taking alpha from the round-tripped
+/// buffer would therefore silently change one class of input. It is
+/// copied straight from `chunk` instead.
 ///
 /// **Parallelizing per tile with `rayon` is NOT done**, and is not merely
 /// a code change. `rayon` is not a dependency of this crate, nor of any
@@ -188,7 +257,53 @@ fn premultiply_rgba(texels: &mut [f16]) {
 /// whose length is not a multiple of [`CHANNELS`] contributes nothing for
 /// its final incomplete texel rather than emitting corrupt bytes.
 fn extend_premultiplied_le_bytes(texels: &[f16], out: &mut Vec<u8>) {
-    for texel in texels.chunks_exact(CHANNELS) {
+    // `wide`/`narrow` name the sample width (`f32`/`f16`) of the scratch
+    // buffers. `wide` is deliberately *not* a reference to the rejected
+    // crate of the same name — see the doc comment above.
+    let mut wide = [0f32; CHUNK_SAMPLES];
+    let mut narrow = [f16::ZERO; CHUNK_SAMPLES];
+    let mut chunks = texels.chunks_exact(CHUNK_SAMPLES);
+    for chunk in chunks.by_ref() {
+        // One vectorized f16 -> f32 pass: 8 lanes per `vcvtph2ps`, one
+        // feature-detection check for the whole slice.
+        chunk.convert_to_f32_slice(&mut wide);
+        for texel in wide.chunks_exact_mut(CHANNELS) {
+            let [r, g, b, a] = texel else {
+                continue;
+            };
+            let alpha = *a;
+            // Operand order (rgb * alpha) matches the scalar path's, so
+            // single-NaN products keep the same payload.
+            *r *= alpha;
+            *g *= alpha;
+            *b *= alpha;
+        }
+        // One vectorized f32 -> f16 pass: 8 lanes per `vcvtps2ph`.
+        narrow.convert_from_f32_slice(&wide);
+        // Alpha comes from `chunk`, never from `narrow`: f16 -> f32 -> f16
+        // is not the identity for a signalling NaN (0x7c01 -> 0x7e01), and
+        // `premultiply_rgba` leaves alpha's bits untouched -- this must too.
+        for (premultiplied, source) in narrow
+            .chunks_exact(CHANNELS)
+            .zip(chunk.chunks_exact(CHANNELS))
+        {
+            let [r, g, b, _] = premultiplied else {
+                continue;
+            };
+            let [_, _, _, a] = source else {
+                continue;
+            };
+            let [r_lo, r_hi] = r.to_le_bytes();
+            let [g_lo, g_hi] = g.to_le_bytes();
+            let [b_lo, b_hi] = b.to_le_bytes();
+            let [a_lo, a_hi] = a.to_le_bytes();
+            out.extend_from_slice(&[r_lo, r_hi, g_lo, g_hi, b_lo, b_hi, a_lo, a_hi]);
+        }
+    }
+    // Trailing partial chunk, unchanged contract: whole texels in the
+    // remainder are premultiplied scalar-wise; a final incomplete texel
+    // contributes nothing.
+    for texel in chunks.remainder().chunks_exact(CHANNELS) {
         let [r, g, b, a] = texel else {
             continue;
         };
@@ -1114,7 +1229,9 @@ impl std::fmt::Debug for TileResidency {
 
 #[cfg(test)]
 mod tests {
-    use super::{TILE_BYTES, TileResidency, extend_premultiplied_le_bytes, premultiply_rgba};
+    use super::{
+        CHUNK_TEXELS, TILE_BYTES, TileResidency, extend_premultiplied_le_bytes, premultiply_rgba,
+    };
     use crate::test_support::{real_context, real_tile_store};
     use aurora_tile::{CHANNELS, SurfaceId, TILE, TileId};
     use half::f16;
@@ -2250,6 +2367,95 @@ mod tests {
             "the batched writer must match the in-place premultiply-then-\
              serialize path bit-for-bit, including on NaN, infinity, \
              subnormal and signed-zero inputs"
+        );
+    }
+
+    /// The vectorized main loop, which nothing else in this module
+    /// reaches. **Every other fixture here is 2-10 texels** — all of
+    /// them shorter than one [`CHUNK_TEXELS`]-texel chunk, so all of
+    /// them land entirely in `extend_premultiplied_le_bytes`'s scalar
+    /// remainder. Without this test, 0.92.0's `half::slice`-vectorized
+    /// path would be completely untested and every green run above
+    /// would be measuring the fallback.
+    ///
+    /// `CHUNK_TEXELS * 2 + 3` texels straddles the boundary in the one
+    /// way that catches an off-by-one in either direction: two full
+    /// vectorized chunks *plus* a non-empty scalar remainder, so a
+    /// chunk dropped, double-counted, or a remainder started at the
+    /// wrong offset all show up as a byte mismatch. Channel values vary
+    /// per texel and per channel (derived from the texel index) so that
+    /// a swapped R/G/B, a stale scratch-buffer lane carried across
+    /// chunks, or an alpha read from the wrong texel cannot hide behind
+    /// uniform data — as it would if every texel were identical.
+    ///
+    /// Every fifth texel is filled from a cycle of extreme bit patterns
+    /// instead, **including a signalling NaN**, and every fifth texel
+    /// puts extremes inside both vectorized chunks *and* the scalar
+    /// remainder (texels 0, 5, … 125, 130). That placement is the point:
+    /// `the_fused_serializer_matches_premultiply_then_serialize_for_extreme_values`
+    /// is only 40 samples, so it never leaves the remainder, and a
+    /// vectorized path that sourced alpha from the round-tripped `f16`
+    /// scratch buffer instead of the original chunk would quiet `0x7c01`
+    /// to `0x7e01` and pass that test anyway. This one fails on it.
+    #[test]
+    fn the_fused_serializer_matches_premultiply_then_serialize_across_a_chunk_boundary() {
+        const EXTREMES: [u16; 8] = [
+            0x0000, // +0
+            0x8000, // -0
+            0x0001, // smallest subnormal
+            0x03ff, // largest subnormal
+            0x7bff, // largest finite (65504)
+            0x7c00, // +infinity
+            0xfc00, // -infinity
+            0x7c01, // signalling NaN — quieted by an f16 -> f32 -> f16
+                    // round trip, which is why alpha must not take one
+        ];
+        let texel_count = CHUNK_TEXELS * 2 + 3;
+        let mut extremes = EXTREMES.iter().cycle();
+        let mut source: Vec<f16> = Vec::with_capacity(texel_count * CHANNELS);
+        for i in 0..texel_count {
+            if i % 5 == 0 {
+                for _ in 0..CHANNELS {
+                    // `cycle()` over a non-empty array never yields
+                    // `None`; the fallback is only here because the
+                    // workspace denies `unwrap`.
+                    let bits = extremes.next().copied().unwrap_or(0x3800);
+                    source.push(f16::from_bits(bits));
+                }
+                continue;
+            }
+            let n = i as f32;
+            // Distinct per channel and per texel, so no two samples in
+            // the buffer share a value by accident.
+            source.push(f16::from_f32(n / 137.0));
+            source.push(f16::from_f32(1.0 - n / 149.0));
+            source.push(f16::from_f32(((i * 7) % 137) as f32 / 137.0));
+            // Alpha sweeps 0.0 through 1.0 inclusive, so both the
+            // fully-transparent and fully-opaque texels appear inside
+            // the vectorized region.
+            source.push(f16::from_f32(((i * 13) % 131) as f32 / 130.0));
+        }
+        assert_eq!(
+            source.len(),
+            texel_count * CHANNELS,
+            "the fixture must be a whole number of texels"
+        );
+
+        let mut in_place = source.clone();
+        premultiply_rgba(&mut in_place);
+        let mut expected = Vec::new();
+        for sample in &in_place {
+            expected.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let mut fused = Vec::new();
+        extend_premultiplied_le_bytes(&source, &mut fused);
+
+        assert_eq!(
+            fused, expected,
+            "the vectorized writer must match the scalar in-place \
+             premultiply-then-serialize path bit-for-bit across a chunk \
+             boundary and into the scalar remainder"
         );
     }
 
