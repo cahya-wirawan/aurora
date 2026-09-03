@@ -15167,6 +15167,127 @@ severity choice.
   specific to software rendering. Re-measuring on real hardware before
   treating this as a settled performance win is the honest next step.
 
+- [x] **Batch one composite tile's GPU work into a single
+  `queue.submit` — done 2026-09-03 (0.86.0). The direct sequel to the
+  poll-batching entry above, and, unlike it, measured on real GPU
+  hardware.** That round batched the *synchronization* (N blocking
+  `device.poll` calls per frame down to one). This round batches the
+  *submission*: one `wgpu::CommandEncoder` and one `queue.submit` per
+  composite tile, where every step used to submit its own command
+  buffer.
+
+  **What was wrong.** Each of `aurora_render::TileCompositor`'s
+  compositing methods — `composite_over`,
+  `composite_over_with_opacity`, `composite_multiply_over_with_opacity`,
+  `composite_darken_over_with_opacity` — created its own encoder and
+  submitted it internally, and so did
+  `create_composite_accumulator`'s clear pass and
+  `begin_tile_readback`'s copy. So `begin_gpu_composite_tile` issued
+  **three** submits per tile for the simplest real document (one
+  `Normal` layer: clear + layer + readback) and N + 2 (or N + 3 once a
+  `Multiply`/`Darken` layer forced the `spare` accumulator's own clear)
+  for an N-layer one.
+
+  **What changed.** All five compositor entry points are now pure
+  recorders taking a `&mut wgpu::CommandEncoder` — no
+  `create_command_encoder`, no `queue.submit`. `begin_gpu_composite_tile`
+  opens one encoder per tile, records every accumulator clear, every
+  layer's blend pass and the readback copy into it, and submits once.
+  `begin_tile_readback` split into `record_tile_readback` (records the
+  copy, no submit) and `map_pending_readback` (starts the map, with a
+  documented precondition that the filling submit has already happened).
+  Both early-exit paths drop the unfinished encoder, so a bailed tile
+  now issues *zero* GPU work rather than an already-submitted clear
+  nothing would read. `context` is still passed because the device
+  builds pipelines/bind groups and the queue uploads the opacity
+  uniform.
+
+  **Two new tests, because neither half is visible to the other.**
+  `aurora-app`'s
+  `begin_gpu_composite_tile_issues_exactly_one_submit_for_a_mixed_blend_tile`
+  asserts a per-tile count of exactly 1 via a `#[cfg(test)]`
+  `GPU_COMPOSITE_SUBMITS` counter (same three-piece shape as the
+  existing `DARKEN_GPU_DISPATCHES`), on the five-layer mixed
+  `Normal`/`Multiply`/`Normal`/`Darken`/`Darken` fixture that cost
+  **eight** submits before this round (two accumulator clears + five
+  layer passes + one readback). That counter cannot see a submit
+  reintroduced inside `aurora-render`, so `aurora-render`'s
+  `composite_over_with_opacity_records_into_the_encoder_without_submitting_it`
+  covers the other half: it holds an unsubmitted encoder, reads the
+  destination back through a separate command buffer and asserts it is
+  *unchanged*, then submits and asserts the real blend. Additionally,
+  the two "chained through a ping-pong pair" tests now record all three
+  passes into one encoder and submit once — previously they proved
+  read-after-write and write-after-read ordering only *across*
+  submissions; they now prove it *within a single command buffer*,
+  which is precisely the guarantee `begin_gpu_composite_tile` depends
+  on.
+
+  **Measured, on real hardware, and the honest answer is: no
+  measurable improvement on this benchmark.** Adapter, verbatim from
+  `aurora_gpu::test_support::real_context_or_skip`'s own line on the
+  runs themselves (`AURORA_REQUIRE_GPU=1`, release build): `GPU adapter:
+  NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`.
+  `recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling`,
+  n=40 per run, three runs each:
+
+  | | mean (ms) | p50 (ms) | p99 (ms) |
+  |---|---|---|---|
+  | before | 55.82 / 53.54 / 53.39 | 53.48 / 53.35 / 53.14 | 78.42 / 64.71 / 66.35 |
+  | after | 52.91 / 54.84 / 53.30 | 52.67 / 53.58 / 53.26 | 62.13 / 64.16 / 59.29 |
+  | drift control (diff stashed, rebuilt, re-run) | 53.12 | 52.76 | 66.01 |
+
+  The within-group spread is as large as the between-group difference,
+  and the drift control — the *unchanged* code rebuilt and re-measured
+  after all the "after" runs — lands inside both groups, so nothing here
+  supports an improvement claim. The single high figure (78.42 ms
+  "before" p99) was the first run of a cold session and reads as warm-up.
+  **Reported as a null result, not reframed as a pass.**
+
+  Why that is expected rather than a refutation: **this benchmark's
+  document is a single `Normal` layer**, so its per-tile submit count
+  went 3 → 1. Three submits is real overhead but small against a ~53 ms
+  frame dominated by tile paging, the brush dab, the GPU→CPU→GPU
+  readback round trip and atlas upload bandwidth — the costs
+  `spike/FINDINGS.md` already named as the bottleneck. The saving scales
+  with layer count (N + 2 → 1), which is exactly what this fixture does
+  not exercise. The change is justified by the asserted submit count and
+  by removing per-pass submission from the hot path, not by this number.
+
+  **The CPU-fallback sibling benchmark
+  (`recomposite_and_present_loop_exercises_the_cpu_fallback_path`) is an
+  unmoved control, not a second measurement**: its document sits at a
+  blend mode the GPU path cannot express, so it never enters
+  `begin_gpu_composite_tile` at all. Before: mean 29.81–30.02, p50
+  29.52–29.90, p99 32.23–32.72 (n=12, three runs). After: mean
+  30.34–31.57, p50 29.98–31.46, p99 32.95–35.84. That is noise on an
+  untouched path, and it bounds how much of the GPU-path comparison
+  above could be sandbox drift.
+
+  **A stale doc claim corrected in the same commit, because this
+  round's own runs contradicted it.** Both benchmark tests' doc comments
+  said this sandbox's adapter was "Mesa llvmpipe, software rendering,
+  confirmed via `GpuContext::adapter_info()`", one of them explicitly
+  "correcting" an earlier NVIDIA claim. Every `AURORA_REQUIRE_GPU=1` run
+  in this round printed `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`,
+  and `AURORA_REQUIRE_GPU=1` fails outright on a `DeviceType::Cpu`
+  adapter, so the tests could not have passed under llvmpipe. Both
+  comments are corrected, and their recorded numbers replaced with this
+  round's measured ones. Only what was verified here is stated; the
+  history of how that claim got written is not re-litigated.
+
+  **Scope, deliberately narrow.** Per-tile only. `recomposite_visible_
+  tiles`'s existing per-frame poll batching (phase 2's single
+  `device.poll`) is untouched, and it still issues one submit per
+  qualifying tile. **Named follow-on, deliberately not attempted here:
+  cross-tile / per-frame command-buffer batching** — folding several
+  tiles' passes into one encoder, or submitting all of a frame's tiles
+  as one command buffer. That is where the remaining submission
+  overhead is, and it interacts with the per-tile accumulator lifetimes
+  in ways this round did not want to decide alongside the API change.
+  The GPU → CPU → GPU readback round trip named in the entry above
+  likewise remains open and untouched.
+
 - [x] **Real per-pixel grayscale mask coverage — done 2026-09-02
   (0.70.0), closing the "rectangular clip only" limitation the
   mask-aggregation round (0.37.0) named and every round since carried

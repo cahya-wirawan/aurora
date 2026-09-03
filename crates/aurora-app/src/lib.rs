@@ -6702,8 +6702,10 @@ fn decode_f16_samples(data: &[u8]) -> Option<Vec<half::f16>> {
 }
 
 /// One composite tile's GPU readback, issued
-/// (`copy_texture_to_buffer` + `queue.submit` + `slice.map_async`) but
-/// not yet resolved — the "phase 1" unit [`begin_tile_readback`]
+/// (`copy_texture_to_buffer` recorded by [`record_tile_readback`], the
+/// tile's single `queue.submit`, then `slice.map_async` in
+/// [`map_pending_readback`]) but
+/// not yet resolved — the "phase 1" unit [`map_pending_readback`]
 /// produces and [`finish_tile_readback`] consumes, once a single
 /// per-frame `device.poll` has driven every pending tile's `map_async`
 /// callback to completion. See [`recomposite_visible_tiles`]'s own doc
@@ -6725,33 +6727,33 @@ struct PendingGpuReadback {
     rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
-/// Issues the GPU→CPU readback for one already-composited destination
-/// `texture` — `copy_texture_to_buffer`, `queue.submit`, and
-/// `slice.map_async` — without blocking on any of it: deliberately no
-/// `device.poll` call here at all, unlike this function's own
-/// single-tile-at-a-time predecessor. This is phase 1's own per-tile
-/// unit of work; [`recomposite_visible_tiles`] calls this once per
-/// GPU-qualifying tile, collects every [`PendingGpuReadback`] it
-/// returns into a `Vec`, then polls **once** for the whole batch before
-/// resolving any of them via [`finish_tile_readback`].
+/// Records the GPU→CPU copy for one already-composited destination
+/// `texture` into `encoder` and returns the destination buffer —
+/// `copy_texture_to_buffer` and nothing else. Deliberately **no
+/// submit and no `device.poll`**.
+///
+/// This is one half of what was a single `begin_tile_readback` before
+/// 0.86.0; [`map_pending_readback`] is the other. They were split
+/// because the copy has to be *recorded* into the same per-tile encoder
+/// that carries the tile's clear and blend passes (so the whole tile
+/// costs one `queue.submit`), while the `map_async` that turns the
+/// result into a [`PendingGpuReadback`] can only legally happen *after*
+/// that submit. One function could not sit on both sides of the submit;
+/// two can.
 ///
 /// `texture` must be `Rgba16Float`, `TILE`×`TILE`, with `COPY_SRC` usage,
 /// matching [`begin_gpu_composite_tile`]'s own destination texture.
-fn begin_tile_readback(
+fn record_tile_readback(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
     texture: &wgpu::Texture,
-    tile_id: aurora_tile::TileId,
-) -> PendingGpuReadback {
+) -> wgpu::Buffer {
     let bytes_per_row = aurora_tile::TILE * 8; // Rgba16Float, already 256-byte aligned.
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gpu-composite-readback"),
         size: u64::from(bytes_per_row) * u64::from(aurora_tile::TILE),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("gpu-composite-readback"),
     });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -6774,17 +6776,33 @@ fn begin_tile_readback(
             depth_or_array_layers: 1,
         },
     );
-    queue.submit(std::iter::once(encoder.finish()));
-
-    let (tx, rx) = std::sync::mpsc::channel();
     readback
+}
+
+/// Starts the asynchronous map of a readback `buffer`
+/// [`record_tile_readback`] filled, pairing it with its `tile_id` as the
+/// [`PendingGpuReadback`] phase 3 will resolve. No `device.poll` here:
+/// [`recomposite_visible_tiles`] polls **once** for the whole frame's
+/// batch, then drains every pending tile via [`finish_tile_readback`].
+///
+/// **Precondition: the command buffer that recorded the copy into
+/// `buffer` must already have been submitted.** `map_async` on a buffer
+/// whose filling copy is still sitting in an unfinished encoder would
+/// map it before the copy ever runs, and the caller would decode stale
+/// or uninitialised bytes as if they were the tile's composite — a
+/// silently wrong tile, not an error. [`begin_gpu_composite_tile`] is
+/// the only caller and calls this on the line after its single
+/// `queue.submit`; keep it that way.
+fn map_pending_readback(buffer: wgpu::Buffer, tile_id: aurora_tile::TileId) -> PendingGpuReadback {
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
     PendingGpuReadback {
         tile_id,
-        buffer: readback,
+        buffer,
         rx,
     }
 }
@@ -6896,11 +6914,22 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// reaches these through `queue.write_texture`, only through render
 /// passes.
 ///
-/// The clear is a real, submitted render pass rather than a
-/// `LoadOp::Clear` on the first blend, because
-/// `composite_over_with_opacity` always uses `LoadOp::Load` — it has no
-/// "this is the first layer" mode — so an accumulator a `Normal` layer
-/// blends onto must already hold known transparent content.
+/// The clear is a real render pass rather than a `LoadOp::Clear` on the
+/// first blend, because `composite_over_with_opacity` always uses
+/// `LoadOp::Load` — it has no "this is the first layer" mode — so an
+/// accumulator a `Normal` layer blends onto must already hold known
+/// transparent content.
+///
+/// **Recorded onto the caller's encoder, not submitted here** (0.86.0).
+/// Until then this function opened its own `wgpu::CommandEncoder` and
+/// submitted it, which cost every composite tile one whole queue
+/// submission (two, for a tile that also needed the `spare`) before a
+/// single layer had been blended. It now records the clear pass into the
+/// one encoder [`begin_gpu_composite_tile`] opens for the whole tile, so
+/// the clear, every layer's blend pass and the readback copy all travel
+/// in one command buffer. Ordering is unaffected: passes within a single
+/// command buffer execute in recording order, and this one is recorded
+/// before any pass that loads from the texture it clears.
 ///
 /// **That reasoning is load-bearing for the first member only.** The
 /// second (`spare`) is created inside whichever blend-math arm reaches
@@ -6917,7 +6946,7 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// one texture and one clear per tile, not two.
 fn create_composite_accumulator(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
     size: wgpu::Extent3d,
     label: &str,
 ) -> (wgpu::Texture, wgpu::TextureView) {
@@ -6936,28 +6965,22 @@ fn create_composite_accumulator(
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gpu-composite-clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gpu-composite-clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-        queue.submit(std::iter::once(encoder.finish()));
     }
 
     (texture, view)
@@ -7011,6 +7034,45 @@ fn note_darken_gpu_dispatch() {
 /// dispatch arm compiles down to everywhere else.
 #[cfg(not(test))]
 fn note_darken_gpu_dispatch() {}
+
+/// Test-only count of the `queue.submit` calls
+/// [`begin_gpu_composite_tile`] itself has issued — the whole point of
+/// 0.86.0 being that this is now exactly **one per composited tile**,
+/// however many accumulators that tile creates and however many layers
+/// it folds.
+///
+/// **What it can and cannot see** (the same disclosure
+/// [`DARKEN_GPU_DISPATCHES`] carries about itself). It counts the
+/// submit `begin_gpu_composite_tile` makes, and nothing else. It would
+/// **not** notice a `queue.submit` reintroduced inside one of
+/// `aurora_render::TileCompositor`'s own methods — those are in another
+/// crate, and a per-tile count of 1 would remain a per-tile count of 1
+/// while every layer quietly submitted again underneath it. What guards
+/// that other half is `aurora-render`'s own
+/// `composite_over_with_opacity_records_into_the_encoder_without_submitting_it`,
+/// which holds an unsubmitted encoder and proves the destination has not
+/// changed yet. Neither check subsumes the other, and both are needed.
+///
+/// Reads and writes are `Relaxed` and the counter is process-global,
+/// which is sound for the same reason `DARKEN_GPU_DISPATCHES` is: every
+/// caller of `begin_gpu_composite_tile` needs a real `GpuContext`, and
+/// this module's `real_gpu_context` hands one out only under
+/// `GPU_TEST_LOCK`, so no two GPU tests are inside this counter at once.
+#[cfg(test)]
+static GPU_COMPOSITE_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Increments [`GPU_COMPOSITE_SUBMITS`]. Called from
+/// [`begin_gpu_composite_tile`] immediately after the one
+/// `queue.submit` it is reporting.
+#[cfg(test)]
+fn note_gpu_composite_submit() {
+    GPU_COMPOSITE_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The shipping build's version: nothing at all, exactly as with
+/// [`note_darken_gpu_dispatch`] above.
+#[cfg(not(test))]
+fn note_gpu_composite_submit() {}
 
 /// GPU-accelerated compositing for one visible composite tile, for the
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
@@ -7121,11 +7183,48 @@ fn note_darken_gpu_dispatch() {}
 /// translucent composite tile — and so every export and every eyedropper
 /// read — carried premultiplied values.
 ///
+/// **One `wgpu::CommandEncoder` and one `queue.submit` for the whole
+/// tile** (0.86.0). This function opens a single encoder before walking
+/// the layer stack and records everything into it — each accumulator's
+/// clear pass ([`create_composite_accumulator`]), every layer's blend
+/// pass, and the final readback copy ([`record_tile_readback`]) — then
+/// submits it exactly once at the bottom. Before 0.86.0 each of those
+/// steps created and submitted its own command buffer, because
+/// `aurora_render::TileCompositor`'s methods each ended in a
+/// `queue.submit` of their own; they are pure recorders now. The
+/// simplest real case — one `Normal` layer — went from **three**
+/// submits per tile (clear, layer, readback) to one; an N-layer tile
+/// from N + 2 (or N + 3 once a `Multiply`/`Darken` layer forces the
+/// `spare` accumulator's clear) to one.
+///
+/// This is safe precisely because ordering inside a command buffer is
+/// recording order: the clear is recorded before the first
+/// `LoadOp::Load` blend that needs it, each ping-pong pass is recorded
+/// after the pass whose output it samples, and the readback copy is
+/// recorded last. `aurora-render`'s two "chained through a ping-pong
+/// pair" tests pin exactly that hazard pair inside one command buffer on
+/// real hardware, and this module's own
+/// `begin_gpu_composite_tile_issues_exactly_one_submit_for_a_mixed_blend_tile`
+/// pins the count.
+///
+/// **A bailed tile now costs nothing.** Both early returns below (an
+/// inexpressible blend mode; no root layer with content here) drop the
+/// encoder without finishing it, so no command buffer reaches the queue
+/// at all — where before they had already submitted at least a clear
+/// pass whose result nothing would read.
+///
+/// **Scope is one tile.** [`recomposite_visible_tiles`]'s existing
+/// per-frame batching — every tile's work issued before a single
+/// `device.poll` resolves them all — is untouched; this is one submit
+/// per *tile*, not per frame. Folding several tiles into one command
+/// buffer is a further, deliberately separate change.
+///
 /// **Issues the readback, does not wait for it**: the `current`
 /// accumulator's
-/// GPU→CPU copy is *started* via [`begin_tile_readback`] — which itself
-/// issues `copy_texture_to_buffer` + `queue.submit` + `slice.map_async`
-/// with no `device.poll` call — and this function returns the resulting
+/// GPU→CPU copy is recorded by [`record_tile_readback`], carried out by
+/// the single submit above, and handed to [`map_pending_readback`] —
+/// `slice.map_async` with no `device.poll` call — and this function
+/// returns the resulting
 /// [`PendingGpuReadback`] unresolved. This is the "phase 1" half of the
 /// batched shape [`recomposite_visible_tiles`]'s own doc comment
 /// describes: every visible tile's GPU work (this function, once per
@@ -7190,6 +7289,33 @@ fn begin_gpu_composite_tile(
         height: aurora_tile::TILE,
         depth_or_array_layers: 1,
     };
+
+    // **One encoder for this whole tile** (0.86.0). Every accumulator
+    // clear, every layer's blend pass and the final readback copy are
+    // recorded into this one command buffer and submitted exactly once,
+    // at the bottom. Before 0.86.0 each of those recorded and submitted
+    // its own: a single-layer document -- the common case, and the shape
+    // of the app's own default startup document's `Normal` layer -- cost
+    // three `queue.submit` calls per tile (clear, layer, readback), and
+    // an N-layer tile cost N + 2 (or N + 3 once a blend-math layer forced
+    // the `spare` accumulator's clear).
+    //
+    // Ordering is unaffected, and that is the load-bearing claim:
+    // passes within a single command buffer execute in recording order,
+    // so the clear still precedes the first `LoadOp::Load` blend, each
+    // ping-pong pass still sees the previous pass's finished output in
+    // the texture it samples, and the readback copy still happens last.
+    // `aurora-render`'s two "chained through a ping-pong pair" tests pin
+    // exactly that, inside one command buffer, on real hardware.
+    //
+    // Note it is *created* here, before the loop, but nothing is
+    // recorded into it unless a layer actually resolves. An encoder that
+    // is dropped without `finish()` submits nothing at all, which is why
+    // both early-exit paths below can simply return: see them for the
+    // detail.
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu-composite-tile"),
+    });
 
     // Built lazily, on the first root layer that actually resolves to
     // real content for this tile -- a tile with no touched layer
@@ -7264,9 +7390,30 @@ fn begin_gpu_composite_tile(
             continue;
         };
 
-        let current_accumulator = current.get_or_insert_with(|| {
-            create_composite_accumulator(device, queue, tile_extent, "gpu-composite-a")
-        });
+        // Deliberately not `get_or_insert_with`: the constructor now
+        // needs `&mut encoder`, and a closure capturing it would hold
+        // that borrow across the compositor calls further down. The
+        // explicit form keeps the borrow to one statement.
+        if current.is_none() {
+            current = Some(create_composite_accumulator(
+                device,
+                &mut encoder,
+                tile_extent,
+                "gpu-composite-a",
+            ));
+        }
+        let Some(current_accumulator) = current.as_mut() else {
+            // Unreachable: just filled above. Not an `unreachable!` --
+            // this workspace denies `panic!`, and a bail to the CPU path
+            // is the same "one bad tile shouldn't abort the rest"
+            // handling every other failure here gets.
+            tracing::warn!(
+                ?tile_id,
+                "the composite accumulator vanished immediately after being created -- \
+                 falling back to the CPU path for this tile"
+            );
+            return None;
+        };
 
         let src_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gpu-composite-src"),
@@ -7307,6 +7454,7 @@ fn begin_gpu_composite_tile(
             aurora_render::BlendMode::Normal => {
                 compositor.composite_over_with_opacity(
                     gpu,
+                    &mut encoder,
                     &current_accumulator.1,
                     &src_view,
                     opacity,
@@ -7326,11 +7474,28 @@ fn begin_gpu_composite_tile(
             // `spare` becomes `current`, and the exhausted backdrop
             // becomes the next blend-math pass's render target.
             aurora_render::BlendMode::Multiply => {
-                let spare_accumulator = spare.get_or_insert_with(|| {
-                    create_composite_accumulator(device, queue, tile_extent, "gpu-composite-b")
-                });
+                // Explicit `is_none`/`as_mut` rather than
+                // `get_or_insert_with`, for the same reason as `current`
+                // above: the constructor takes `&mut encoder` now.
+                if spare.is_none() {
+                    spare = Some(create_composite_accumulator(
+                        device,
+                        &mut encoder,
+                        tile_extent,
+                        "gpu-composite-b",
+                    ));
+                }
+                let Some(spare_accumulator) = spare.as_mut() else {
+                    tracing::warn!(
+                        ?tile_id,
+                        "the spare composite accumulator vanished immediately after being \
+                         created -- falling back to the CPU path for this tile"
+                    );
+                    return None;
+                };
                 compositor.composite_multiply_over_with_opacity(
                     gpu,
+                    &mut encoder,
                     &src_view,
                     &current_accumulator.1,
                     &spare_accumulator.1,
@@ -7347,11 +7512,25 @@ fn begin_gpu_composite_tile(
             // entry point behind it, differs: `min(Cb, Cs)` per channel
             // instead of `Cb * Cs`.
             aurora_render::BlendMode::Darken => {
-                let spare_accumulator = spare.get_or_insert_with(|| {
-                    create_composite_accumulator(device, queue, tile_extent, "gpu-composite-b")
-                });
+                if spare.is_none() {
+                    spare = Some(create_composite_accumulator(
+                        device,
+                        &mut encoder,
+                        tile_extent,
+                        "gpu-composite-b",
+                    ));
+                }
+                let Some(spare_accumulator) = spare.as_mut() else {
+                    tracing::warn!(
+                        ?tile_id,
+                        "the spare composite accumulator vanished immediately after being \
+                         created -- falling back to the CPU path for this tile"
+                    );
+                    return None;
+                };
                 compositor.composite_darken_over_with_opacity(
                     gpu,
+                    &mut encoder,
                     &src_view,
                     &current_accumulator.1,
                     &spare_accumulator.1,
@@ -7392,7 +7571,13 @@ fn begin_gpu_composite_tile(
     // `?`: no root layer resolved to real content at this tile, so no
     // accumulator was ever created and there is nothing to read back --
     // the caller falls this one tile back to the CPU path, which handles
-    // "no visible layers" as transparent black for free.
+    // "no visible layers" as transparent black for free. `encoder` is
+    // dropped here without `finish()`, so nothing at all reaches the
+    // queue: a bailed tile now issues **zero** GPU work, where before
+    // 0.86.0 it had already submitted a clear pass (and, for the
+    // inexpressible-blend-mode bail above, every layer pass up to the
+    // offending one) that no one would ever read. That is a strict
+    // improvement, not merely a wash.
     let (composite_texture, _view) = current?;
 
     // `composite_texture` -- whichever member of the pair the fold ended
@@ -7411,12 +7596,17 @@ fn begin_gpu_composite_tile(
     // through, rather than this function spending a second per-tile
     // texture and an extra queue submission on a GPU pass to do the same
     // division a different way.
-    Some(begin_tile_readback(
-        device,
-        queue,
-        &composite_texture,
-        tile_id,
-    ))
+    //
+    // Recorded into the same encoder as everything above, then submitted
+    // with it: one `queue.submit` for this whole tile. The `map_async`
+    // that follows is deliberately *after* that submit -- see
+    // `map_pending_readback`'s own documented precondition for what
+    // mapping a buffer whose filling copy is still unsubmitted would
+    // silently do.
+    let readback = record_tile_readback(device, &mut encoder, &composite_texture);
+    queue.submit(std::iter::once(encoder.finish()));
+    note_gpu_composite_submit();
+    Some(map_pending_readback(readback, tile_id))
 }
 
 /// Recomposites every tile in `residency`'s own currently-visible grid
@@ -7643,8 +7833,15 @@ fn recomposite_visible_tiles(
     };
 
     // Phase 1: issue every GPU-qualifying, not-yet-current tile's GPU
-    // work (clear + per-layer blend + readback submit/map_async), with
-    // no blocking wait yet. A tile with nothing to batch -- the document
+    // work (clear + per-layer blend + readback copy), with
+    // no blocking wait yet. As of 0.86.0 each such tile costs exactly
+    // **one** `queue.submit` -- `begin_gpu_composite_tile` records all of
+    // that into a single command encoder -- where it used to cost one
+    // per pass. That is strictly a per-*tile* change: this loop still
+    // issues one submit per qualifying tile, and phase 2's single
+    // per-frame `device.poll` below is untouched. Folding several tiles
+    // into one command buffer is separate, deliberately unattempted work.
+    // A tile with nothing to batch -- the document
     // doesn't qualify, `gpu`/`compositor` aren't available this session,
     // or this specific tile has no visible layers at all -- is
     // composited on the CPU path immediately, right here, since that
@@ -12607,18 +12804,18 @@ mod tests {
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
-        DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key,
-        KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey,
-        PALETTE_TOML, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
-        RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
-        active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
-        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
-        begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_reference_origin, composite_surface_id, continue_drag,
-        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess,
+        GPU_COMPOSITE_SUBMITS, Key, KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
+        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds, PointerButton,
+        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, RecoveredDocument, ShutdownState, UndoKind,
+        UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
+        apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
+        background_color_from_theme, begin_drag, begin_gpu_composite_tile, brush_stroke_mut,
+        canvas_area_logical_size, canvas_area_physical_rect, canvas_area_physical_size,
+        canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer, clean_shutdown_cleanup,
+        clear_session_marker, close_command_palette, close_dialog, collect_widget_paints,
+        commit_ending_drag, composite_document, composite_reference_origin, composite_surface_id,
+        continue_drag, crash_recovery_dialog_actions, crash_recovery_dialog_message,
         create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
         document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
         effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
@@ -17637,6 +17834,15 @@ mod tests {
     /// the ordering.
     fn take_darken_gpu_dispatch_count() -> u64 {
         DARKEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reads [`GPU_COMPOSITE_SUBMITS`] and resets it to zero in one
+    /// step, exactly as [`take_darken_gpu_dispatch_count`] above does
+    /// for its own counter and for the same reason: a test that only
+    /// read it would be counting every earlier GPU test in this binary
+    /// too.
+    fn take_gpu_composite_submit_count() -> u64 {
+        GPU_COMPOSITE_SUBMITS.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
@@ -25845,6 +26051,125 @@ mod tests {
         );
     }
 
+    /// **One `queue.submit` for one composite tile** (0.86.0) — the
+    /// batching this round exists to produce, asserted as a number
+    /// rather than left as a claim in a doc comment.
+    ///
+    /// The fixture is the same five-layer mixed
+    /// `Normal`/`Multiply`/`Normal`/`Darken`/`Darken` root stack the
+    /// test directly above uses, and it is deliberately the *worst* case
+    /// this path currently has: it creates both accumulators and runs
+    /// five blend passes. [`begin_gpu_composite_tile`] is called
+    /// directly, on one tile, so the count is unambiguous — the count is
+    /// per tile, and going through `recomposite_visible_tiles` would
+    /// multiply it by however many tiles that call's residency grid
+    /// happens to mark visible.
+    ///
+    /// **Pre-change number for this exact fixture: eight.** Every step
+    /// below created and submitted its own command buffer before this
+    /// round:
+    ///
+    /// - 1 — `current`'s clear pass, created by layer 1 (`Normal`);
+    /// - 1 — `spare`'s clear pass, created by layer 2 (`Multiply`), the
+    ///   first blend-math layer to reach this tile;
+    /// - 5 — one per layer, since each of
+    ///   `composite_over_with_opacity`,
+    ///   `composite_multiply_over_with_opacity` and
+    ///   `composite_darken_over_with_opacity` ended in a `queue.submit`
+    ///   of its own;
+    /// - 1 — the readback's `copy_texture_to_buffer`.
+    ///
+    /// It is **one** now. The simplest real case — a single-layer
+    /// `Normal` document, which is every plain imported PNG/JPEG/TIFF
+    /// and the app's own default startup document — went from three to
+    /// one by the same arithmetic.
+    ///
+    /// **What this cannot see**, stated the way [`GPU_COMPOSITE_SUBMITS`]
+    /// states it: a `queue.submit` reintroduced *inside* one of
+    /// `aurora_render::TileCompositor`'s methods would leave this count
+    /// at 1 and this test green. `aurora-render`'s own
+    /// `composite_over_with_opacity_records_into_the_encoder_without_submitting_it`
+    /// is what covers that half.
+    #[test]
+    fn begin_gpu_composite_tile_issues_exactly_one_submit_for_a_mixed_blend_tile() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+                (
+                    "l3",
+                    aurora_doc::BlendMode::Normal,
+                    0.75,
+                    [0.0, 0.25, 1.0, 1.0],
+                ),
+                (
+                    "l4",
+                    aurora_doc::BlendMode::Darken,
+                    0.5,
+                    [0.25, 1.0, 0.5, 1.0],
+                ),
+                (
+                    "l5",
+                    aurora_doc::BlendMode::Darken,
+                    1.0,
+                    [0.75, 0.5, 0.25, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "setup: this stack must qualify for the GPU path, or the call below would be \
+             measuring a case the real caller never takes"
+        );
+
+        // Zero the counter inside `real_gpu_context`'s lock, so what is
+        // read below is this call's submits and nothing else's.
+        let _ = take_gpu_composite_submit_count();
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let pending = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            pending.is_some(),
+            "setup: this tile must really composite on the GPU -- a None here would make the \
+             submit count below vacuously low for the wrong reason (a bailed tile issues zero \
+             submits, which is correct behaviour but not what this test is measuring)"
+        );
+
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            1,
+            "one composite tile must cost exactly one queue.submit, however many accumulators \
+             it creates and however many layers it folds -- this same five-layer fixture cost \
+             eight before 0.86.0 (two accumulator clears + five layer passes + one readback), \
+             and a count above 1 means a per-pass submit came back"
+        );
+    }
+
     /// **`Dissolve` on the GPU path** (0.84.1, ISSUE-7's outcome).
     /// `Dissolve` is admitted by `document_qualifies_for_gpu_compositing`
     /// without a line of new WGSL, because it never reaches the GPU as
@@ -26442,13 +26767,12 @@ mod tests {
     /// [`recomposite_and_present_loop_exercises_the_cpu_fallback_path`]
     /// below.
     ///
-    /// **Budget**: nominally 16.7 ms (60 FPS). **Measured locally (this
-    /// sandbox's real Vulkan adapter -- Mesa llvmpipe, software
-    /// rendering, confirmed via `GpuContext::adapter_info()`; an earlier
-    /// pass through this comment and PLAN.md mislabeled this "NVIDIA RTX
-    /// 3090," corrected once actually checked rather than assumed --
-    /// release build): mean 34.60 ms, p50 35.44 ms, p99
-    /// 98.75 ms, max 98.75 ms (n=40) -- well over the 16.7 ms budget**,
+    /// **Budget**: nominally 16.7 ms (60 FPS). **Measured locally
+    /// (release build, `AURORA_REQUIRE_GPU=1`, on this sandbox's real
+    /// adapter as printed by `aurora_gpu::test_support::
+    /// real_context_or_skip` on the run itself: `NVIDIA GeForce RTX 3090
+    /// (Vulkan, DiscreteGpu)`): mean 53.30 ms, p50 53.26 ms, p99
+    /// 59.29 ms (n=40) -- well over the 16.7 ms budget**,
     /// an honest, real finding, not a rounded-up pass: this is the exact
     /// "pan while painting" scenario `spike/FINDINGS.md`'s "Third run"
     /// section already found marginal/over budget for panning alone
@@ -26458,7 +26782,7 @@ mod tests {
     /// through `aurora-app`'s own real path, at a larger 800x600 viewport
     /// than the spike's panning figures used alone. The assertion below
     /// uses 3000 ms -- roughly 3.4x the worst p99 (889ms) real GitHub
-    /// Actions CI runs actually produced (2026-08-12), not the ~99ms this
+    /// Actions CI runs actually produced (2026-08-12), not the ~60ms this
     /// local sandbox measures -- as the CI-safety threshold. The original
     /// 350ms figure (~3.5x this sandbox's own local p99) caused real CI
     /// failures: GitHub's own runner turned out to be far slower/noisier
@@ -26470,6 +26794,38 @@ mod tests {
     /// real trip-wire against a multiples-worse algorithmic regression.
     /// See PLAN.md's M1.10 section for this same number recorded with an
     /// honest verdict (over budget, not passing).
+    ///
+    /// **0.86.0's per-tile submit batching did not move this number.**
+    /// This is the benchmark that change was measured against, and the
+    /// honest result is *no measurable improvement*. Three release runs
+    /// each, same adapter, same session:
+    ///
+    /// | | mean | p50 | p99 |
+    /// |---|---|---|---|
+    /// | before | 55.82 / 53.54 / 53.39 | 53.48 / 53.35 / 53.14 | 78.42 / 64.71 / 66.35 |
+    /// | after | 52.91 / 54.84 / 53.30 | 52.67 / 53.58 / 53.26 | 62.13 / 64.16 / 59.29 |
+    /// | control (stashed, rebuilt) | 53.12 | 52.76 | 66.01 |
+    ///
+    /// The spread within each group is as large as the difference
+    /// between them, and a post-change re-measurement of the *unchanged*
+    /// code (the control row, produced by stashing the diff and
+    /// rebuilding) lands squarely inside both — so nothing here supports
+    /// a claim of improvement. The one visibly high figure, the 78.42 ms
+    /// "before" p99, was the first run of a cold session and is best read
+    /// as warm-up, not as a cost the change removed.
+    ///
+    /// Why that is unsurprising rather than a failure of the change:
+    /// **this benchmark's document is a single `Normal` layer**, so its
+    /// per-tile submit count went from three (accumulator clear, one
+    /// layer pass, readback copy) to one. Three submits per tile is real
+    /// overhead, but it is small against a ~53 ms frame dominated by tile
+    /// paging, the brush dab, the GPU→CPU→GPU readback round trip, and
+    /// atlas upload bandwidth — the costs `spike/FINDINGS.md` already
+    /// named. The saving scales with layer count (an N-layer tile went
+    /// from N + 2 or N + 3 submits to one), which is exactly the case
+    /// this fixture does not exercise. The change is justified by the
+    /// submit count `begin_gpu_composite_tile_issues_exactly_one_submit_
+    /// for_a_mixed_blend_tile` asserts, not by this number.
     ///
     /// **A store-budget confound an independent review caught and this
     /// fixed**: the first version of this test used the shared
@@ -26627,11 +26983,10 @@ mod tests {
     /// second time. Same "generous CI-safe budget" reasoning and the same
     /// four NOT-covered caveats as the sibling test above apply here too.
     ///
-    /// **Measured locally (this sandbox's real Vulkan adapter -- Mesa
-    /// llvmpipe, software rendering, not the "NVIDIA RTX 3090" this
-    /// comment originally and wrongly said, see the sibling test's own
-    /// budget paragraph above for how that was found -- release build):
-    /// mean 25.08 ms, p50 22.57 ms, p99 54.10 ms, max 54.10 ms (n=12) -- also
+    /// **Measured locally (release build, `AURORA_REQUIRE_GPU=1`, on
+    /// this sandbox's real adapter as printed by the run itself:
+    /// `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`):
+    /// mean 30.34 ms, p50 29.98 ms, p99 32.95 ms (n=12) -- also
     /// over the 16.7 ms nominal budget**, reported honestly, not rounded
     /// up (the same figures recorded in PLAN.md's M1.10 section --
     /// reconciled to one canonical run rather than two separately-quoted
@@ -26641,6 +26996,19 @@ mod tests {
     /// than the CPU fallback itself being cheaper than the GPU path in
     /// general -- the two tests use different viewport sizes on purpose
     /// (see above) and are not a controlled GPU-vs-CPU comparison.
+    ///
+    /// **This test is an unmoved control for 0.86.0's per-tile submit
+    /// batching, not a second measurement of it.** Its document is
+    /// deliberately at a blend mode the GPU path cannot express, so every
+    /// tile here goes through `composite_tile_cpu` and *never enters*
+    /// `begin_gpu_composite_tile` — the only function that change
+    /// touched. Its numbers before and after that change (mean
+    /// 29.81–30.02 / p50 29.52–29.90 / p99 32.23–32.72 before; mean
+    /// 30.34–31.57 / p50 29.98–31.46 / p99 32.95–35.84 after, three runs
+    /// each) are therefore run-to-run noise on an untouched path, and
+    /// exist to bound how much of the GPU-path comparison is sandbox
+    /// drift rather than the change.
+    ///
     /// Budget below: 1500 ms, roughly 3.7x the worst p99 (409ms) real
     /// GitHub Actions CI runs actually produced (2026-08-12) -- the
     /// original 180ms figure (~3.3x this sandbox's own local p99) caused

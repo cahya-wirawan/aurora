@@ -25,14 +25,12 @@ const LABEL_MULTIPLY: &str = "composite.multiply";
 const LABEL_MULTIPLY_UNIFORM: &str = "composite.multiply.opacity";
 /// That method's own per-call bind group.
 const LABEL_MULTIPLY_BIND_GROUP: &str = "composite.multiply.bind_group";
-/// That method's own command encoder.
-const LABEL_MULTIPLY_ENCODER: &str = "composite.multiply.encoder";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_MULTIPLY_PASS: &str = "composite.multiply.pass";
 /// The pipeline layout and render pipeline behind
 /// [`TileCompositor::composite_darken_over_with_opacity`] — the same
-/// five-label set `Multiply` above carries, for the same reason: two
+/// four-label set `Multiply` above carries, for the same reason: two
 /// blend-math pipelines sharing one `"composite"` label would leave a
 /// `wgpu` validation message or a frame capture unable to say which
 /// blend mode is at fault.
@@ -41,29 +39,38 @@ const LABEL_DARKEN: &str = "composite.darken";
 const LABEL_DARKEN_UNIFORM: &str = "composite.darken.opacity";
 /// That method's own per-call bind group.
 const LABEL_DARKEN_BIND_GROUP: &str = "composite.darken.bind_group";
-/// That method's own command encoder.
-const LABEL_DARKEN_ENCODER: &str = "composite.darken.encoder";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_DARKEN_PASS: &str = "composite.darken.pass";
 
 /// Everything that differs between one shader-computed blend mode's
 /// composite pass and another's: the `shaders/composite.wgsl` fragment
-/// entry point, and the five `wgpu` debug labels that name its pipeline,
-/// uniform buffer, bind group, encoder and render pass.
+/// entry point, and the four `wgpu` debug labels that name its pipeline,
+/// uniform buffer, bind group and render pass.
 ///
 /// This is the whole variation between
 /// [`TileCompositor::composite_multiply_over_with_opacity`] and
-/// [`TileCompositor::composite_darken_over_with_opacity`] — six
+/// [`TileCompositor::composite_darken_over_with_opacity`] — five
 /// `&'static str`s. Everything else those two methods do is
 /// `composite_blend_over_with_opacity`, which they now
 /// both delegate to; see that method for why the collapse was safe to
 /// make at two modes rather than deferred to a third.
 ///
-/// Carrying `fragment_entry` here rather than as a seventh parameter is
-/// deliberate: it keeps the shared method at exactly seven arguments
-/// (`self` included), which is `clippy::too_many_arguments`'s own limit,
-/// so a third mode adds a `const` and not an `allow`.
+/// There is deliberately **no encoder label here any more** (0.86.0).
+/// These methods no longer create a `wgpu::CommandEncoder` at all — the
+/// caller supplies one and they only record into it — so the encoder's
+/// label now belongs to whoever opened it (`aurora-app`'s
+/// `begin_gpu_composite_tile` names its single per-tile encoder), not to
+/// one pass recorded inside it. `LABEL_MULTIPLY_ENCODER` and
+/// `LABEL_DARKEN_ENCODER` were deleted with the encoders they named.
+///
+/// Carrying `fragment_entry` here rather than as a parameter is still
+/// deliberate: it keeps the shared method's argument list one shorter
+/// than it would otherwise be. That no longer stays under
+/// `clippy::too_many_arguments`'s own seven-argument limit — the
+/// caller-supplied encoder is an eighth slot, so the method now carries
+/// an explicit `allow` — but a mode is still a `const` here rather than
+/// yet another argument at every call site.
 struct BlendPass {
     /// The `shaders/composite.wgsl` `@fragment` entry point that
     /// computes this mode's formula. It is also the discriminating
@@ -77,8 +84,6 @@ struct BlendPass {
     uniform: &'static str,
     /// The per-call bind group.
     bind_group: &'static str,
-    /// The command encoder.
-    encoder: &'static str,
     /// The render pass itself.
     pass: &'static str,
 }
@@ -91,7 +96,6 @@ const BLEND_PASS_MULTIPLY: BlendPass = BlendPass {
     pipeline: LABEL_MULTIPLY,
     uniform: LABEL_MULTIPLY_UNIFORM,
     bind_group: LABEL_MULTIPLY_BIND_GROUP,
-    encoder: LABEL_MULTIPLY_ENCODER,
     pass: LABEL_MULTIPLY_PASS,
 };
 
@@ -101,7 +105,6 @@ const BLEND_PASS_DARKEN: BlendPass = BlendPass {
     pipeline: LABEL_DARKEN,
     uniform: LABEL_DARKEN_UNIFORM,
     bind_group: LABEL_DARKEN_BIND_GROUP,
-    encoder: LABEL_DARKEN_ENCODER,
     pass: LABEL_DARKEN_PASS,
 };
 
@@ -1286,9 +1289,16 @@ impl TileCompositor {
     /// with straight-alpha "source-over" blending. Both views must be
     /// `Rgba16Float`, the same size, and `dst`'s owning texture must
     /// include `RENDER_ATTACHMENT` usage.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0). Nothing on
+    /// the GPU happens until the caller finishes `encoder` and submits
+    /// it — see [`Self::composite_over_with_opacity`]'s own doc comment
+    /// for the full account of why every compositor method here is a
+    /// pure recorder now.
     pub fn composite_over(
         &mut self,
         context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
         dst: &wgpu::TextureView,
         src: &wgpu::TextureView,
     ) {
@@ -1321,8 +1331,6 @@ impl TileCompositor {
             ],
         });
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(LABEL) });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(LABEL),
@@ -1344,7 +1352,6 @@ impl TileCompositor {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        context.queue().submit(std::iter::once(encoder.finish()));
     }
 
     /// Blends `src` over `dst` in place exactly like [`Self::composite_over`]
@@ -1364,12 +1371,41 @@ impl TileCompositor {
     ///
     /// A separate bind group layout/pipeline from `composite_over`'s own
     /// (a third binding, the opacity uniform buffer) — `composite_over`
-    /// itself is entirely unchanged by this method's existence: same
-    /// signature, same shader entry point, same pipeline key, so every
-    /// caller/test of it keeps its exact prior behaviour.
+    /// itself is otherwise unchanged by this method's existence: same
+    /// shader entry point, same pipeline key.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0). Until this
+    /// method returned an implicitly-submitted command buffer of its
+    /// own, so a caller compositing N layers onto one accumulator paid N
+    /// `queue.submit` calls, plus one for its clear and one for its
+    /// readback. `aurora-app`'s `begin_gpu_composite_tile` — the only
+    /// production caller — issued three submits per tile even for the
+    /// simplest single-layer document. It now opens one
+    /// `wgpu::CommandEncoder` per tile, hands it to every method here in
+    /// turn, and submits once. Two consequences a caller must know:
+    ///
+    /// - **Nothing observable happens until the caller submits.** A
+    ///   readback recorded into a *different*, earlier-submitted encoder
+    ///   sees the destination as it was before this call. That is the
+    ///   subject of this module's own
+    ///   `composite_over_with_opacity_records_without_submitting` test.
+    /// - **Ordering within one command buffer is still guaranteed.**
+    ///   Passes recorded back to back into one encoder execute in
+    ///   recording order, so a later pass sampling a texture an earlier
+    ///   pass rendered into reads the earlier pass's finished result —
+    ///   which is exactly what `begin_gpu_composite_tile`'s ping-pong
+    ///   accumulator pair relies on, and what the chained
+    ///   `composite_multiply_*`/`composite_darken_*` tests below pin.
+    ///
+    /// `context` is still needed: `device()` builds the pipeline and
+    /// bind group, and `queue()` uploads the opacity uniform via
+    /// `write_buffer`. That upload is a queue-level write flushed by
+    /// whichever submit comes next, and it targets a buffer created
+    /// fresh inside this call, so no ordering hazard follows from it.
     pub fn composite_over_with_opacity(
         &mut self,
         context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
         dst: &wgpu::TextureView,
         src: &wgpu::TextureView,
         opacity: f32,
@@ -1418,8 +1454,6 @@ impl TileCompositor {
             ],
         });
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(LABEL) });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(LABEL),
@@ -1441,7 +1475,6 @@ impl TileCompositor {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        context.queue().submit(std::iter::once(encoder.finish()));
     }
 
     /// Composites `src` over `backdrop` with **`BlendMode::Multiply`**
@@ -1513,9 +1546,19 @@ impl TileCompositor {
     /// `src`'s and `backdrop`'s must include `TEXTURE_BINDING`.
     /// `opacity` is clamped to `0.0..=1.0`, exactly as
     /// `composite_over_with_opacity` clamps it.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0), like every
+    /// other compositor method here — see
+    /// [`Self::composite_over_with_opacity`] for what that means for a
+    /// caller and why the change was made. The ping-pong this method
+    /// exists to serve is *why* it is safe: `backdrop` is read by a pass
+    /// recorded after the pass that wrote it, in the same command
+    /// buffer, and within one command buffer passes execute in recording
+    /// order.
     pub fn composite_multiply_over_with_opacity(
         &mut self,
         context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
         src: &wgpu::TextureView,
         backdrop: &wgpu::TextureView,
         dst: &wgpu::TextureView,
@@ -1523,6 +1566,7 @@ impl TileCompositor {
     ) {
         self.composite_blend_over_with_opacity(
             context,
+            encoder,
             src,
             backdrop,
             dst,
@@ -1594,9 +1638,14 @@ impl TileCompositor {
     /// owning texture must include `RENDER_ATTACHMENT` usage, and both
     /// `src`'s and `backdrop`'s must include `TEXTURE_BINDING`.
     /// `opacity` is clamped to `0.0..=1.0`.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0) — the same
+    /// as its `Multiply` sibling directly above, for the same reasons;
+    /// see [`Self::composite_over_with_opacity`] for the full account.
     pub fn composite_darken_over_with_opacity(
         &mut self,
         context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
         src: &wgpu::TextureView,
         backdrop: &wgpu::TextureView,
         dst: &wgpu::TextureView,
@@ -1604,6 +1653,7 @@ impl TileCompositor {
     ) {
         self.composite_blend_over_with_opacity(
             context,
+            encoder,
             src,
             backdrop,
             dst,
@@ -1643,9 +1693,24 @@ impl TileCompositor {
     /// would let it name a `fragment_entry` that does not exist (a
     /// pipeline-creation failure, not a compile error) or pair an entry
     /// point with the wrong labels.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0) — see
+    /// [`Self::composite_over_with_opacity`] for what that means and why
+    /// it changed.
+    // `too_many_arguments`: eight, against clippy's own seven-argument
+    // limit. The eighth slot is the caller-supplied `encoder` that
+    // replaced this method's own internal `create_command_encoder` +
+    // `queue.submit` pair in 0.86.0, which is the whole point of the
+    // change: one encoder and one submit per composite tile instead of
+    // one per pass. Dropping a parameter to get back under the limit
+    // would mean either re-creating an encoder here (undoing the change)
+    // or bundling `src`/`backdrop`/`dst` into a struct whose only
+    // purpose is to satisfy a lint.
+    #[allow(clippy::too_many_arguments)]
     fn composite_blend_over_with_opacity(
         &mut self,
         context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
         src: &wgpu::TextureView,
         backdrop: &wgpu::TextureView,
         dst: &wgpu::TextureView,
@@ -1700,9 +1765,6 @@ impl TileCompositor {
             ],
         });
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(blend_pass.encoder),
-        });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(blend_pass.pass),
@@ -1736,7 +1798,6 @@ impl TileCompositor {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        context.queue().submit(std::iter::once(encoder.finish()));
     }
 }
 
@@ -2836,6 +2897,32 @@ mod tests {
         );
     }
 
+    /// Opens one throwaway [`wgpu::CommandEncoder`], lets `record` write
+    /// into it, and submits it — the two lines every compositor method
+    /// here used to run internally, before 0.86.0 turned them all into
+    /// pure recorders so `aurora-app` could fold a whole composite
+    /// tile's passes into a single submit.
+    ///
+    /// Used at the single-call test sites below precisely so those tests
+    /// keep the submission structure they had before that change (one
+    /// submit per compositor call), and so what they assert stays a
+    /// statement about the *pixels* rather than about batching. The two
+    /// "chained through a ping-pong pair" tests deliberately do **not**
+    /// use it — see their own doc comments.
+    fn submit_one(
+        context: &aurora_gpu::GpuContext,
+        record: impl FnOnce(&mut wgpu::CommandEncoder),
+    ) {
+        let mut encoder =
+            context
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("composite-test"),
+                });
+        record(&mut encoder);
+        context.queue().submit(std::iter::once(encoder.finish()));
+    }
+
     /// A `TILE`x`TILE` `Rgba16Float` texture, pre-filled solid `rgba` via
     /// `write_texture` (the same upload technique `aurora_gpu::TileResidency`
     /// uses), with whichever `usage` flags the caller needs on top of the
@@ -3073,7 +3160,9 @@ mod tests {
         let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over(&context, &dst_view, &src_view);
+        submit_one(&context, |encoder| {
+            compositor.composite_over(&context, encoder, &dst_view, &src_view);
+        });
 
         let rgba8 = read_rgba8(device, queue, &dst);
         let actual = match aurora_testkit::Image::new(TILE, TILE, rgba8) {
@@ -3116,7 +3205,9 @@ mod tests {
         let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over(&context, &dst_view, &src_view);
+        submit_one(&context, |encoder| {
+            compositor.composite_over(&context, encoder, &dst_view, &src_view);
+        });
 
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         // Straight-alpha "over": result = src*src.a + dst*(1-src.a).
@@ -3147,7 +3238,9 @@ mod tests {
         let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over(&context, &dst_view, &src_view);
+        submit_one(&context, |encoder| {
+            compositor.composite_over(&context, encoder, &dst_view, &src_view);
+        });
 
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         assert_eq!((r, g, b, a), (0.0, 0.0, 1.0, 1.0));
@@ -3178,9 +3271,13 @@ mod tests {
 
         let mut compositor = TileCompositor::new(device);
         assert_eq!(compositor.pipelines.len(), 0);
-        compositor.composite_over(&context, &dst_view, &src_view);
+        submit_one(&context, |encoder| {
+            compositor.composite_over(&context, encoder, &dst_view, &src_view);
+        });
         assert_eq!(compositor.pipelines.len(), 1);
-        compositor.composite_over(&context, &dst_view, &src_view);
+        submit_one(&context, |encoder| {
+            compositor.composite_over(&context, encoder, &dst_view, &src_view);
+        });
         assert_eq!(
             compositor.pipelines.len(),
             1,
@@ -3227,7 +3324,9 @@ mod tests {
         let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &dst_view, &src_view, 0.25);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(&context, encoder, &dst_view, &src_view, 0.25);
+        });
 
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         assert_eq!((r, g, b, a), (0.25, 0.0, 0.75, 1.0));
@@ -3261,7 +3360,9 @@ mod tests {
         let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &dst_view, &src_view, 0.0);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(&context, encoder, &dst_view, &src_view, 0.0);
+        });
 
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         assert_eq!((r, g, b, a), (0.0, 0.0, 1.0, 1.0));
@@ -3293,7 +3394,9 @@ mod tests {
         let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &dst_view, &src_view, 5.0);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(&context, encoder, &dst_view, &src_view, 5.0);
+        });
 
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         assert_eq!(
@@ -3337,7 +3440,10 @@ mod tests {
         let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &dst_view, &src_view, opacity);
+        submit_one(&context, |encoder| {
+            compositor
+                .composite_over_with_opacity(&context, encoder, &dst_view, &src_view, opacity);
+        });
         let gpu_result = read_first_texel(device, queue, &dst);
 
         let dst_texels = solid_texels(dst_rgba);
@@ -3355,6 +3461,92 @@ mod tests {
         );
     }
 
+    /// **The compositor methods record; they do not submit** (0.86.0) —
+    /// the half of that change no pixel differential and no submit
+    /// counter can see.
+    ///
+    /// Every other test in this module submits the encoder it opened
+    /// before reading anything back, so all of them would pass just as
+    /// happily if `composite_over_with_opacity` had quietly kept its own
+    /// internal `queue.submit`: the pixels would be identical either
+    /// way, and `aurora-app`'s own per-tile submit counter only ever
+    /// sees the submit `begin_gpu_composite_tile` itself issues, never
+    /// one reintroduced down here. That is the exact mutation this test
+    /// exists to kill.
+    ///
+    /// It works by reading the destination twice through
+    /// [`read_first_texel`], which opens, submits and polls a command
+    /// buffer entirely of its own:
+    ///
+    /// 1. Record the composite into an encoder and *hold* it, unfinished.
+    ///    Read the destination — it must still be the seeded colour,
+    ///    because nothing has been submitted.
+    /// 2. Submit that encoder. Read again — now it must be the blended
+    ///    result.
+    ///
+    /// A method that submitted internally would fail step 1. A method
+    /// that recorded nothing at all would fail step 2, so neither half
+    /// is vacuous on its own.
+    ///
+    /// The two colours are chosen so the blend is unmistakable: an
+    /// opaque blue destination and an opaque red source at full opacity,
+    /// which "over" replaces outright. Exact-power-of-two channels, so
+    /// the comparisons are equalities rather than tolerances, matching
+    /// this module's sibling tests.
+    #[test]
+    fn composite_over_with_opacity_records_into_the_encoder_without_submitting_it() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let dst_rgba = [0.0, 0.0, 1.0, 1.0];
+        let src_rgba = [1.0, 0.0, 0.0, 1.0];
+
+        let dst = solid_tile(
+            device,
+            queue,
+            dst_rgba,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let src = solid_tile(device, queue, src_rgba, wgpu::TextureUsages::empty());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("composite-records-without-submitting"),
+        });
+        compositor.composite_over_with_opacity(&context, &mut encoder, &dst_view, &src_view, 1.0);
+
+        // Step 1. `read_first_texel` submits and polls its own command
+        // buffer, so the GPU has genuinely caught up with everything
+        // that *was* submitted -- and the composite above is not part of
+        // it, because `encoder` is still open right here.
+        let before = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            before,
+            (0.0, 0.0, 1.0, 1.0),
+            "the destination must still hold its seeded colour: the composite was recorded into \
+             an encoder that has not been submitted, so it cannot have run yet -- a failure here \
+             means a compositor method reintroduced an internal queue.submit, which is exactly \
+             the per-tile batching this round removed"
+        );
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // Step 2. The same recording, now submitted, must produce the
+        // real blend -- otherwise "it didn't run yet" above would be
+        // satisfied just as well by a method that recorded nothing.
+        let after = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            after,
+            (1.0, 0.0, 0.0, 1.0),
+            "submitting the recorded encoder must produce the real source-over result"
+        );
+    }
+
     // -- Real in-shader blend-mode math on the GPU, slice 1 of the
     // blend-mode port: `Multiply` only, via
     // `TileCompositor::composite_multiply_over_with_opacity` and the
@@ -3362,8 +3554,8 @@ mod tests {
     //
     // These tests exist to answer one specific question the rest of
     // this workspace had never answered: **can a shader sample a texture
-    // that a previous render pass wrote to as a colour attachment, after
-    // an intervening `queue.submit`?** Nothing here had ever done it --
+    // that a previous render pass wrote to as a colour attachment?**
+    // Nothing here had ever done it --
     // every prior GPU test in this file seeds its sampled textures with
     // `queue.write_texture` and only ever *writes* to a render
     // attachment. Real blend-mode math has no alternative: the
@@ -3371,10 +3563,17 @@ mod tests {
     // so `Cb` has to arrive as a sampled texture.
     //
     // Every one of them therefore builds its accumulator with a real
-    // `composite_over_with_opacity` render pass (which submits on its
-    // own) and then hands that same texture to the multiply pass as
-    // `backdrop`. Seeding it with `write_texture` instead would pass
-    // just as easily and prove nothing about the mechanism.
+    // `composite_over_with_opacity` render pass and then hands that same
+    // texture to the multiply pass as `backdrop`. Seeding it with
+    // `write_texture` instead would pass just as easily and prove
+    // nothing about the mechanism.
+    //
+    // Each of those two passes still goes through its own `submit_one`
+    // here (0.86.0), so these tests keep exercising the across-
+    // submissions case they always did. The *within-one-command-buffer*
+    // case -- the one `aurora-app` now actually relies on -- is what the
+    // two "chained through a ping-pong pair" tests below pin, and they
+    // are deliberately the only tests here that batch.
     //
     // What each covers, and why none is redundant (0.83.1 added the
     // last four after review found the original two collectively blind
@@ -3573,14 +3772,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
-        compositor.composite_multiply_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            1.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
 
         let accumulator = read_first_texel(device, queue, &backdrop);
         assert_eq!(
@@ -3653,19 +3863,25 @@ mod tests {
         // A half-opacity bottom layer leaves a *premultiplied*
         // accumulator whose alpha is 0.5 -- exactly the state whose raw
         // colour is not its straight colour.
-        compositor.composite_over_with_opacity(
-            &context,
-            &backdrop_view,
-            &bottom_view,
-            bottom_opacity,
-        );
-        compositor.composite_multiply_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            1.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                bottom_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
 
         let bottom_texels = solid_texels(grey);
         let top_texels = solid_texels(grey);
@@ -3765,14 +3981,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
-        compositor.composite_multiply_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            1.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
 
         // The accumulator itself must have survived its render pass
         // texel-for-texel first, or a spatial failure downstream would
@@ -3870,14 +4097,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
-        compositor.composite_multiply_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            opacity,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
 
         let bottom_texels = solid_texels(bottom_rgba);
         let top_texels = solid_texels(top_rgba);
@@ -3938,14 +4176,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
-        compositor.composite_multiply_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            opacity,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
 
         let bottom_texels = solid_texels(bottom_rgba);
         let top_texels = solid_texels(top_rgba);
@@ -4003,17 +4252,28 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
         // 5.0, clamped Rust-side before it ever reaches the uniform --
         // if the clamp were missing, `a` would come out > 1.0 and the
         // final `inv = 1.0 - a` would go negative.
-        compositor.composite_multiply_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            5.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                5.0,
+            );
+        });
 
         let bottom_texels = solid_texels(bottom_rgba);
         let top_texels = solid_texels(top_rgba);
@@ -4098,14 +4358,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 0.0);
-        compositor.composite_multiply_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            1.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                0.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
 
         let gpu_accumulator = read_first_texel(device, queue, &backdrop);
         assert_eq!(
@@ -4152,9 +4423,18 @@ mod tests {
     /// contents of A are compared against a single three-layer
     /// [`composite_tile_cpu`] call.
     ///
-    /// It works, with no barrier, copy or synchronisation beyond what
-    /// `wgpu` already inserts between submissions -- on Vulkan/NVIDIA.
-    /// Metal and DX12 are unverified.
+    /// It works, with no barrier, copy or explicit synchronisation of
+    /// any kind -- on Vulkan/NVIDIA. Metal and DX12 are unverified.
+    ///
+    /// **Since 0.86.0 all three passes share one encoder and one
+    /// submit**, which strengthens what this proves rather than merely
+    /// restating it. Until then each compositor call submitted its own
+    /// command buffer, so the ordering the test relied on was whatever
+    /// `wgpu` inserts *between submissions*; now it is recording order
+    /// *within a single command buffer* — which is exactly the guarantee
+    /// `aurora-app`'s `begin_gpu_composite_tile` depends on, since it
+    /// folds a whole tile's clear, layer passes and readback into one
+    /// encoder. This test is the concrete evidence for that dependency.
     fn composite_multiply_over_with_opacity_chained_through_a_ping_pong_pair_matches_three_cpu_layers()
      {
         let Some(context) = real_context() else {
@@ -4182,16 +4462,35 @@ mod tests {
         let l3_view = l3.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        // Pass 1: build the accumulator in `ping`.
-        compositor.composite_over_with_opacity(&context, &ping_view, &l1_view, 1.0);
-        // Pass 2: sample `ping`, write `pong`.
-        compositor
-            .composite_multiply_over_with_opacity(&context, &l2_view, &ping_view, &pong_view, 1.0);
-        // Pass 3: sample `pong`, write back into `ping` -- the texture
-        // pass 2 read from. This is the hop 0.83.0 never took.
-        compositor.composite_multiply_over_with_opacity(
-            &context, &l3_view, &pong_view, &ping_view, opacity3,
-        );
+        // All three passes go into **one** encoder and **one** submit
+        // (0.86.0) -- deliberately, and unlike every single-call test in
+        // this module, which keeps its own `submit_one`. This is the
+        // arrangement `aurora-app`'s `begin_gpu_composite_tile` actually
+        // has now, so this test is what pins that both hazards below
+        // resolve correctly *inside a single command buffer*, where
+        // ordering comes from recording order rather than from `wgpu`'s
+        // between-submission synchronisation:
+        //
+        // - read-after-write: pass 2 samples `ping`, which pass 1 wrote;
+        // - write-after-read: pass 3 renders into `ping`, which pass 2
+        //   sampled.
+        //
+        // Before 0.86.0 each pass carried its own internal submit, so
+        // this test proved the same thing only across submissions.
+        submit_one(&context, |encoder| {
+            // Pass 1: build the accumulator in `ping`.
+            compositor.composite_over_with_opacity(&context, encoder, &ping_view, &l1_view, 1.0);
+            // Pass 2: sample `ping`, write `pong`.
+            compositor.composite_multiply_over_with_opacity(
+                &context, encoder, &l2_view, &ping_view, &pong_view, 1.0,
+            );
+            // Pass 3: sample `pong`, write back into `ping` -- the
+            // texture pass 2 read from. This is the hop 0.83.0 never
+            // took.
+            compositor.composite_multiply_over_with_opacity(
+                &context, encoder, &l3_view, &pong_view, &ping_view, opacity3,
+            );
+        });
 
         let t1 = solid_texels(layer1);
         let t2 = solid_texels(layer2);
@@ -4310,14 +4609,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
-        compositor.composite_darken_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            1.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_darken_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
 
         let accumulator = read_first_texel(device, queue, &backdrop);
         assert_eq!(
@@ -4406,19 +4716,25 @@ mod tests {
         // A half-opacity bottom layer leaves a *premultiplied*
         // accumulator whose alpha is 0.5 -- exactly the state whose raw
         // colour is not its straight colour.
-        compositor.composite_over_with_opacity(
-            &context,
-            &backdrop_view,
-            &bottom_view,
-            bottom_opacity,
-        );
-        compositor.composite_darken_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            1.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                bottom_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_darken_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
 
         let bottom_texels = solid_texels(bottom_rgba);
         let top_texels = solid_texels(top_rgba);
@@ -4509,14 +4825,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
-        compositor.composite_darken_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            1.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_darken_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
 
         // The accumulator itself must have survived its render pass
         // texel-for-texel first, or a spatial failure downstream would
@@ -4612,14 +4939,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
-        compositor.composite_darken_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            opacity,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_darken_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
 
         let bottom_texels = solid_texels(bottom_rgba);
         let top_texels = solid_texels(top_rgba);
@@ -4680,14 +5018,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
-        compositor.composite_darken_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            opacity,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_darken_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
 
         let bottom_texels = solid_texels(bottom_rgba);
         let top_texels = solid_texels(top_rgba);
@@ -4745,17 +5094,28 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
         // 5.0, clamped Rust-side before it ever reaches the uniform --
         // if the clamp were missing, `a` would come out > 1.0 and the
         // final `inv = 1.0 - a` would go negative.
-        compositor.composite_darken_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            5.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_darken_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                5.0,
+            );
+        });
 
         let bottom_texels = solid_texels(bottom_rgba);
         let top_texels = solid_texels(top_rgba);
@@ -4838,14 +5198,25 @@ mod tests {
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut compositor = TileCompositor::new(device);
-        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 0.0);
-        compositor.composite_darken_over_with_opacity(
-            &context,
-            &top_view,
-            &backdrop_view,
-            &dst_view,
-            1.0,
-        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                0.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_darken_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
 
         let gpu_accumulator = read_first_texel(device, queue, &backdrop);
         assert_eq!(
@@ -4936,15 +5307,30 @@ mod tests {
         // and the one in which a cache keyed on too little would hand
         // the second mode the first mode's pipeline.
         let mut compositor = TileCompositor::new(device);
-        // Pass 1: build the accumulator in `ping`.
-        compositor.composite_over_with_opacity(&context, &ping_view, &l1_view, 1.0);
-        // Pass 2: sample `ping`, write `pong`.
-        compositor
-            .composite_multiply_over_with_opacity(&context, &l2_view, &ping_view, &pong_view, 1.0);
-        // Pass 3: a *different* blend mode, sampling `pong` and writing
-        // back into `ping` -- the same shared pair, no third texture.
-        compositor
-            .composite_darken_over_with_opacity(&context, &l3_view, &pong_view, &ping_view, 1.0);
+        // One encoder, one submit, all three passes (0.86.0) -- the same
+        // deliberate exception its `Multiply`-only sibling above makes,
+        // and for the same reason: this is the shape
+        // `begin_gpu_composite_tile` now has, so the read-after-write
+        // (pass 2 samples what pass 1 wrote) and write-after-read (pass
+        // 3 renders into what pass 2 sampled) hazards are proven to
+        // resolve from recording order *within one command buffer*, not
+        // merely across submissions. Two blend modes sharing that one
+        // buffer is the additional thing this test, and not its sibling,
+        // pins.
+        submit_one(&context, |encoder| {
+            // Pass 1: build the accumulator in `ping`.
+            compositor.composite_over_with_opacity(&context, encoder, &ping_view, &l1_view, 1.0);
+            // Pass 2: sample `ping`, write `pong`.
+            compositor.composite_multiply_over_with_opacity(
+                &context, encoder, &l2_view, &ping_view, &pong_view, 1.0,
+            );
+            // Pass 3: a *different* blend mode, sampling `pong` and
+            // writing back into `ping` -- the same shared pair, no third
+            // texture.
+            compositor.composite_darken_over_with_opacity(
+                &context, encoder, &l3_view, &pong_view, &ping_view, 1.0,
+            );
+        });
 
         let t1 = solid_texels(layer1);
         let t2 = solid_texels(layer2);
