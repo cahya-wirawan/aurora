@@ -15196,11 +15196,19 @@ severity choice.
   `begin_tile_readback` split into `record_tile_readback` (records the
   copy, no submit) and `map_pending_readback` (starts the map, with a
   documented precondition that the filling submit has already happened).
-  Both early-exit paths drop the unfinished encoder, so a bailed tile
-  now issues *zero* GPU work rather than an already-submitted clear
-  nothing would read. `context` is still passed because the device
-  builds pipelines/bind groups and the queue uploads the opacity
-  uniform.
+  Both early-exit paths drop the unfinished encoder, so neither submits
+  a command buffer where before at least a clear pass nothing would read
+  had already been submitted. (**Corrected in 0.86.1**: the original
+  wording here and in the code said a bailed tile now issues *zero* GPU
+  work, which is true of only one of the two bails. The "no accumulator
+  was ever created" bail genuinely issues nothing. The
+  inexpressible-blend-mode bail discards its *recorded* passes but not
+  the `queue.write_texture` uploads it already issued — those are
+  queue-level operations, not commands in the dropped encoder, so every
+  layer up to and including the offending one has already paid a full
+  tile-sized upload. Cheaper than before, not free.) `context` is still
+  passed because the device builds pipelines/bind groups and the queue
+  uploads the opacity uniform.
 
   **Two new tests, because neither half is visible to the other.**
   `aurora-app`'s
@@ -15287,6 +15295,76 @@ severity choice.
   in ways this round did not want to decide alongside the API change.
   The GPU → CPU → GPU readback round trip named in the entry above
   likewise remains open and untouched.
+
+  **Peak GPU memory per tile is now O(N) in that tile's visible root
+  layers, not O(1)** (disclosed 0.86.1; the code comment claimed O(1),
+  which described the pre-0.86.0 shape). Each loop iteration creates a
+  fresh tile-sized `Rgba16Float` `src_texture` (plus the compositor
+  call's uniform buffer and bind group), and with no intermediate submit
+  those stay alive — referenced by the unfinished encoder — until the
+  tile's one submit retires. `TILE × TILE × 8` bytes per visible root
+  layer, transient, freed after the readback. CPU side is still O(1) (one
+  layer's texels at a time). This is the price of the single submit and
+  is taken deliberately; reverting it would reintroduce per-layer
+  submits and defeat the whole round.
+
+  **What this round's benchmark structurally could not measure**
+  (disclosed 0.86.1). The batching serializes GPU submission behind the
+  *whole* tile's CPU-side resolution: nothing reaches the queue until
+  every layer of that tile has been resolved, uploaded and recorded,
+  where before each layer's passes were submitted as soon as they were
+  recorded and could overlap the next layer's CPU work. For a
+  multi-layer tile that is a real possible latency *regression* even as
+  the submit count falls. The benchmark used above is a **single-layer**
+  document, so it exercises neither the N + 2 → 1 scaling benefit nor
+  this pipelining risk — the null result it produced is uninformative in
+  both directions. A multi-layer pan-while-painting benchmark is the
+  named follow-on that would settle it; until it exists, the scaling
+  benefit is a reasoned expectation and the pipelining cost is
+  **unmeasured**, not ruled out.
+
+  **Three unfireable guards removed (0.86.1).** 0.86.0 wrote
+  `if x.is_none() { x = Some(create(…)) }` followed by
+  `let Some(y) = x.as_mut() else { bail }` three times over — the
+  `current` accumulator and the `spare` in each of the `Multiply` and
+  `Darken` arms — to keep `get_or_insert_with`'s closure from holding
+  `&mut encoder` across the compositor calls. All three `else` arms were
+  provably unreachable (instrumented and confirmed to take zero hits
+  across the whole suite). They are replaced by one shared
+  `accumulator_or_create` helper built on `Option::take` +
+  `Option::insert`, which returns the `&mut` to what it just stored and
+  so has no second fallible lookup to guard — the same fix, and the same
+  reasoning, as 0.84.1's removal of 0.84.0's two unfireable index
+  guards.
+
+- [ ] **Empty-tile GPU composite work: a blank tile still pays a full
+  per-layer GPU round trip.** Found and disclosed in 0.86.1 while
+  correcting `begin_gpu_composite_tile`'s doc comments, which had
+  described its "nothing resolved" bail as reachable whenever "no root
+  layer resolved to real content at this tile". It is not.
+  `TileStore::get`/`ensure_resident` answer *any* tile coordinate ever
+  asked for with `Ok(`a blank tile`)` rather than signalling absence —
+  core to their lazy-paging design, and the same class of thing PLAN.md
+  already records as "a layer's declared `bounds` is a position hint,
+  not an enforced clip on its real painted content". So `resolve_tile`
+  returns `Some` for every visible layer at every coordinate, and the
+  bail is reachable **only when every layer in the tree is invisible**.
+
+  The cost is real and lands squarely on the already-failing 60 FPS
+  gate: panning into blank canvas at the 300,000 × 300,000 px ceiling
+  currently issues, per tile, one `TILE × TILE × 8` byte upload
+  (512 KiB at `TILE` = 256) plus a blend pass **per visible layer**, then
+  one submit and a full 512 KiB GPU→CPU readback — to produce
+  transparent pixels. A document with ten visible layers pays ten
+  uploads, 5 MiB of PCIe traffic, per empty tile.
+
+  **Deliberately not attempted in 0.86.1**, which was a
+  correction round. Fixing it means giving the tile store (or this
+  function) a way to distinguish "blank because nothing was ever
+  painted there" from "blank because it is transparent there" — a real
+  API and design decision inside `aurora-tile`'s lazy-paging core, not a
+  local change in `aurora-app`. Both doc comments now state the true
+  reachability and point here.
 
 - [x] **Real per-pixel grayscale mask coverage — done 2026-09-02
   (0.70.0), closing the "rectangular clip only" limitation the

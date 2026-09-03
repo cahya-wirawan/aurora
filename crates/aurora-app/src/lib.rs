@@ -6986,6 +6986,43 @@ fn create_composite_accumulator(
     (texture, view)
 }
 
+/// Returns `slot`'s accumulator pair, creating and clearing it via
+/// [`create_composite_accumulator`] first if the slot is empty.
+///
+/// **Why this exists at all**: `Option::get_or_insert_with` is the
+/// obvious call here and does not compile — the closure would have to
+/// capture `&mut encoder`, and that borrow would then live as long as
+/// the returned `&mut` reference into `slot`, which the compositor
+/// calls immediately downstream also need `&mut encoder` for. The
+/// `take()`/`insert()` pair sequences the two borrows instead: the
+/// `&mut encoder` handed to [`create_composite_accumulator`] is
+/// released when that call returns, *before* `slot.insert` takes its
+/// own borrow of `slot`.
+///
+/// **And why not `is_none()` + `as_mut()`**: 0.86.0 wrote exactly that,
+/// three times over (the `current` accumulator, and the `spare` in each
+/// of the `Multiply` and `Darken` arms), which left three `else` arms
+/// that could not fire — a slot filled one statement earlier cannot be
+/// empty. This workspace has removed that same class of unfireable
+/// guard once already (see [`begin_gpu_composite_tile`]'s own note on
+/// 0.84.0's index guards). `Option::insert` returns the `&mut` to what
+/// it just stored, so there is no second, fallible lookup to guard:
+/// the unreachable state is unrepresentable rather than defended
+/// against. 0.86.1.
+fn accumulator_or_create<'slot>(
+    slot: &'slot mut Option<(wgpu::Texture, wgpu::TextureView)>,
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    size: wgpu::Extent3d,
+    label: &str,
+) -> &'slot mut (wgpu::Texture, wgpu::TextureView) {
+    let pair = match slot.take() {
+        Some(existing) => existing,
+        None => create_composite_accumulator(device, encoder, size, label),
+    };
+    slot.insert(pair)
+}
+
 /// Test-only count of the times [`begin_gpu_composite_tile`]'s `Darken`
 /// arm has actually dispatched a real GPU blend pass.
 ///
@@ -7207,11 +7244,40 @@ fn note_gpu_composite_submit() {}
 /// `begin_gpu_composite_tile_issues_exactly_one_submit_for_a_mixed_blend_tile`
 /// pins the count.
 ///
-/// **A bailed tile now costs nothing.** Both early returns below (an
-/// inexpressible blend mode; no root layer with content here) drop the
-/// encoder without finishing it, so no command buffer reaches the queue
-/// at all — where before they had already submitted at least a clear
-/// pass whose result nothing would read.
+/// **What a bailed tile actually costs** (stated precisely; 0.86.0's
+/// own wording claimed "costs nothing" for both bails, which was true of
+/// only one of them — corrected in 0.86.1). Both early returns below
+/// drop the encoder without calling `finish()`, so neither submits a
+/// command buffer, and every *recorded* pass — clears, blends, the
+/// readback copy — is discarded unexecuted. That is the whole cost for
+/// one of the two:
+///
+/// - **No accumulator was ever created** (`current?`, below): genuinely
+///   zero GPU work. The loop resolved nothing, so nothing was recorded
+///   and nothing was uploaded either. Where before 0.86.0 this bail had
+///   already submitted a clear pass no one would read, it now issues
+///   literally nothing.
+/// - **An inexpressible blend mode** (the `other_mode` arm): the
+///   recorded command buffer is discarded, but the uploads already
+///   issued are **not** undone. `queue.write_texture` is a queue-level
+///   operation, not a command recorded into this function's encoder, so
+///   by the time this bail fires every layer processed *before* it —
+///   including the offending layer itself, whose source texels are
+///   uploaded before its mode is matched on — has already had its
+///   full tile-sized `Rgba16Float` window (`TILE × TILE × 8` bytes)
+///   written to a fresh GPU texture, and dropping an unfinished encoder
+///   cannot take that back. So this bail costs one such upload per
+///   layer up to and including the offending one, plus those textures'
+///   own allocation; what it saves relative to pre-0.86.0 is the clear
+///   and blend *passes*, which used to be submitted and executed and
+///   are now discarded. Cheaper than it was, not free.
+///
+/// The distinction is academic while the real caller and
+/// `document_qualifies_for_gpu_compositing` agree — that arm is not
+/// reachable through `recomposite_visible_tiles` — but it is exactly
+/// what a direct caller (and
+/// `begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode`)
+/// pays.
 ///
 /// **Scope is one tile.** [`recomposite_visible_tiles`]'s existing
 /// per-frame batching — every tile's work issued before a single
@@ -7246,13 +7312,21 @@ fn note_gpu_composite_submit() {}
 /// CPU-only, a one-shot operation where this isn't latency-critical the
 /// way the live canvas is.
 ///
-/// `None` if there are no visible root-level layers at all (an empty
-/// composite tile — cheaper handled by the CPU path's own "empty
-/// `layers` → transparent black" default than by a real, empty GPU round
-/// trip) — the caller falls back to the CPU path for this one tile
+/// `None` if there are no visible root-level layers at all — cheaper
+/// handled by the CPU path's own "empty `layers` → transparent black"
+/// default than by a real, empty GPU round trip. The caller falls back
+/// to the CPU path for this one tile
 /// immediately, without anything to batch, the same "one bad tile
 /// shouldn't abort the rest" discipline [`resolve_tile`]'s own callers
-/// already use. Also `None` for the one defensive case above — a
+/// already use. Note that "no visible layers" is the whole of it, and
+/// **not** "this tile has no painted content": a visible layer resolves
+/// at *every* tile coordinate, because the tile store answers an
+/// unpainted coordinate with a blank tile rather than with absence, so a
+/// blank region of a document with any visible layer still takes the
+/// full GPU path and composites transparency for real. That was
+/// overstated here before 0.86.1; see the lazily-built accumulators'
+/// own comment in the body, and PLAN.md's M1.10 "Empty-tile GPU
+/// composite work" follow-on. Also `None` for the one defensive case above — a
 /// resolved blend mode outside `{Normal, Multiply, Darken}` — logged,
 /// falling
 /// this one tile back to the CPU path, and not reachable through the
@@ -7263,10 +7337,11 @@ fn note_gpu_composite_submit() {}
 /// GPU-side failure (a lost device, a bad map) can no
 /// longer be detected here — resolving the map is [`finish_tile_readback`]'s
 /// job now, in phase 3, once this function has already returned.
-// `too_many_lines`: 107, against a 100 limit, as of the second ported
-// blend mode (0.85.0) -- the body is one loop whose `match` gains a
-// fixed ~13-line arm per mode, so it crossed the threshold on `Darken`
-// and will keep drifting as more land. Splitting the arms out would
+// `too_many_lines`: 124, against a 100 limit, measured at 0.86.1. It
+// first crossed on the second ported blend mode (0.85.0, at 107) -- the
+// body is one loop whose `match` gains a fixed ~13-line arm per mode, so
+// it will keep drifting as more land -- and 0.86.0's single-encoder
+// batching added the rest. Splitting the arms out would
 // mean handing each a `&mut` borrow of both accumulator `Option`s plus
 // `device`/`queue`/`tile_extent`, which is exactly the shape the swap
 // exists to keep local. The same allow `recomposite_visible_tiles` just
@@ -7317,16 +7392,51 @@ fn begin_gpu_composite_tile(
         label: Some("gpu-composite-tile"),
     });
 
-    // Built lazily, on the first root layer that actually resolves to
-    // real content for this tile -- a tile with no touched layer
-    // anywhere must do zero GPU work and return `None`, exactly as the
-    // collect-then-check-empty shape this replaces did. Resolving and
-    // compositing one layer at a time this way (rather than collecting
-    // every root's own `Vec<half::f16>` before uploading any of them)
-    // means this tile's peak memory is one resolved layer's texels plus
-    // one GPU-side src texture and the accumulator pair, not one texel
-    // buffer per visible root -- the same shape
-    // `composite_roots_into_tile`'s own CPU path already has (0.51.0).
+    // Built lazily, on the first root layer that actually resolves for
+    // this tile; if none does, no GPU work is issued and this returns
+    // `None`, exactly as the collect-then-check-empty shape this
+    // replaces did.
+    //
+    // **How often "none does" actually happens, honestly** (corrected in
+    // 0.86.1; 0.86.0's wording here said "a tile with no touched layer
+    // anywhere", which reads as "this tile is empty" and is wrong).
+    // `resolve_tile` only yields `None` for a layer that is *invisible*
+    // or unreadable -- not for one that simply has no painted content
+    // near this tile. `TileStore::get`/`ensure_resident` answer any tile
+    // coordinate ever asked for with `Ok(`a blank tile`)` rather than
+    // signalling absence, which is core to their lazy-paging design, so
+    // a visible layer whose real pixels are a thousand tiles away still
+    // resolves *here*, to transparent texels. This bail is therefore
+    // reachable only when every layer in the tree is invisible -- not
+    // when the tile is merely empty. The consequence is real and
+    // measurable: panning into blank canvas costs a full upload, blend,
+    // submit and readback per visible layer per tile to produce
+    // transparent output. Fixing that means teaching the tile store (or
+    // this function) to distinguish "blank because nothing was ever
+    // painted" from "blank because it is transparent there", which is a
+    // separate, larger change -- see PLAN.md, M1.10, "Empty-tile GPU
+    // composite work".
+    //
+    // **Peak GPU memory is O(N) in this tile's visible root layers**
+    // (corrected in 0.86.1; the 0.86.0 wording below claimed O(1),
+    // which described the pre-0.86.0 submit-per-layer behaviour). CPU
+    // side it is still O(1): one resolved layer's `Vec<half::f16>` and
+    // its `bytes` staging copy at a time, both dropped at the end of
+    // each iteration, rather than every root's texels collected up
+    // front -- the same shape `composite_roots_into_tile`'s own CPU path
+    // has (0.51.0). GPU side it is not, and 0.86.0's single-encoder
+    // batching is why: each iteration creates a fresh `src_texture`
+    // (plus the uniform buffer and bind group the compositor call
+    // builds), and with no intermediate `queue.submit` those stay
+    // referenced by the still-unfinished encoder for the rest of the
+    // loop. Dropping the Rust handle at the end of the iteration does
+    // not free them; the recorded commands hold them. So an N-layer
+    // tile holds N tile-sized `Rgba16Float` source textures
+    // (`TILE × TILE × 8` bytes each) plus the accumulator pair live
+    // until this tile's one submit-and-readback completes, where
+    // pre-0.86.0 it held one at a time. They are transient -- freed once
+    // that submit retires -- and this is the price of AC-1's single
+    // submit per tile, taken deliberately rather than by accident.
     //
     // Two *separately* lazy accumulators, not one eagerly-created pair.
     // `current` always holds the fold so far and is created by the first
@@ -7390,30 +7500,18 @@ fn begin_gpu_composite_tile(
             continue;
         };
 
-        // Deliberately not `get_or_insert_with`: the constructor now
-        // needs `&mut encoder`, and a closure capturing it would hold
-        // that borrow across the compositor calls further down. The
-        // explicit form keeps the borrow to one statement.
-        if current.is_none() {
-            current = Some(create_composite_accumulator(
-                device,
-                &mut encoder,
-                tile_extent,
-                "gpu-composite-a",
-            ));
-        }
-        let Some(current_accumulator) = current.as_mut() else {
-            // Unreachable: just filled above. Not an `unreachable!` --
-            // this workspace denies `panic!`, and a bail to the CPU path
-            // is the same "one bad tile shouldn't abort the rest"
-            // handling every other failure here gets.
-            tracing::warn!(
-                ?tile_id,
-                "the composite accumulator vanished immediately after being created -- \
-                 falling back to the CPU path for this tile"
-            );
-            return None;
-        };
+        // Created on the first layer that resolves, reused by every one
+        // after it. Deliberately not `get_or_insert_with` -- see
+        // `accumulator_or_create`'s own doc comment for why that does
+        // not compile, and why this shape leaves no unreachable "the
+        // accumulator vanished" arm behind (0.86.1).
+        let current_accumulator = accumulator_or_create(
+            &mut current,
+            device,
+            &mut encoder,
+            tile_extent,
+            "gpu-composite-a",
+        );
 
         let src_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gpu-composite-src"),
@@ -7468,31 +7566,19 @@ fn begin_gpu_composite_tile(
             // first blend-math layer that actually reaches this tile,
             // rather than alongside the first accumulator. `spare` is
             // shared with the `Darken` arm below rather than owned by
-            // this one: `get_or_insert_with` creates it once, whichever
-            // arm gets there first. The written
+            // this one: `accumulator_or_create` creates it once,
+            // whichever arm gets there first. The written
             // one is now the fold, so the two swap places: what was
             // `spare` becomes `current`, and the exhausted backdrop
             // becomes the next blend-math pass's render target.
             aurora_render::BlendMode::Multiply => {
-                // Explicit `is_none`/`as_mut` rather than
-                // `get_or_insert_with`, for the same reason as `current`
-                // above: the constructor takes `&mut encoder` now.
-                if spare.is_none() {
-                    spare = Some(create_composite_accumulator(
-                        device,
-                        &mut encoder,
-                        tile_extent,
-                        "gpu-composite-b",
-                    ));
-                }
-                let Some(spare_accumulator) = spare.as_mut() else {
-                    tracing::warn!(
-                        ?tile_id,
-                        "the spare composite accumulator vanished immediately after being \
-                         created -- falling back to the CPU path for this tile"
-                    );
-                    return None;
-                };
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
                 compositor.composite_multiply_over_with_opacity(
                     gpu,
                     &mut encoder,
@@ -7512,22 +7598,13 @@ fn begin_gpu_composite_tile(
             // entry point behind it, differs: `min(Cb, Cs)` per channel
             // instead of `Cb * Cs`.
             aurora_render::BlendMode::Darken => {
-                if spare.is_none() {
-                    spare = Some(create_composite_accumulator(
-                        device,
-                        &mut encoder,
-                        tile_extent,
-                        "gpu-composite-b",
-                    ));
-                }
-                let Some(spare_accumulator) = spare.as_mut() else {
-                    tracing::warn!(
-                        ?tile_id,
-                        "the spare composite accumulator vanished immediately after being \
-                         created -- falling back to the CPU path for this tile"
-                    );
-                    return None;
-                };
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
                 compositor.composite_darken_over_with_opacity(
                     gpu,
                     &mut encoder,
@@ -7568,16 +7645,31 @@ fn begin_gpu_composite_tile(
         }
     }
 
-    // `?`: no root layer resolved to real content at this tile, so no
-    // accumulator was ever created and there is nothing to read back --
-    // the caller falls this one tile back to the CPU path, which handles
-    // "no visible layers" as transparent black for free. `encoder` is
-    // dropped here without `finish()`, so nothing at all reaches the
-    // queue: a bailed tile now issues **zero** GPU work, where before
-    // 0.86.0 it had already submitted a clear pass (and, for the
-    // inexpressible-blend-mode bail above, every layer pass up to the
-    // offending one) that no one would ever read. That is a strict
-    // improvement, not merely a wash.
+    // `?`: not one root layer resolved, so no accumulator was ever
+    // created and there is nothing to read back -- the caller falls this
+    // one tile back to the CPU path, which handles "no visible layers"
+    // as transparent black for free.
+    //
+    // **When this fires** (corrected in 0.86.1, which previously said
+    // "no root layer resolved to real content at this tile"): only when
+    // every layer in the tree is invisible or unreadable, *not* when
+    // this tile happens to be blank. A visible layer resolves at every
+    // tile coordinate, because the tile store answers an unpainted one
+    // with a blank tile rather than with absence -- so a document with
+    // one visible layer never reaches this line, however far the
+    // viewport pans from that layer's painted pixels. See the
+    // accumulators' own comment above and PLAN.md's M1.10 "Empty-tile
+    // GPU composite work".
+    //
+    // `encoder` is dropped here without `finish()`, so no command buffer
+    // reaches the queue. For *this* bail that means zero GPU work of any
+    // kind, since the loop never got as far as an upload either, where
+    // before 0.86.0 it had already submitted a clear pass no one would
+    // read. The inexpressible-blend-mode bail above is the weaker case:
+    // it likewise discards its recorded passes, but the
+    // `queue.write_texture` uploads it already issued are queue-level
+    // operations and are not undone -- see this function's own doc
+    // comment for the full accounting.
     let (composite_texture, _view) = current?;
 
     // `composite_texture` -- whichever member of the pair the fold ended
