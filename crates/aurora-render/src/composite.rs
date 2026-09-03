@@ -919,12 +919,20 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// depends on both `aurora-render` and `aurora-doc`) actually had a
 /// per-layer opacity to apply — `composite_over` itself is unchanged, so
 /// every existing caller/test keeps its exact prior behaviour. Neither
-/// method knows about blend *modes* (`Multiply`, `Screen`, ...) — those
-/// stay CPU-only (`composite_tile_cpu`); see `aurora-app`'s own
-/// `gpu_composite_tile`/`document_qualifies_for_gpu_compositing` (a
-/// higher crate — `aurora-render` cannot name it directly, PRD §7.2's
-/// layering) for exactly which tiles this primitive can and can't
-/// correctly express on its own.
+/// of those two methods knows about blend *modes* at all: both express
+/// `Normal` and only `Normal`, since the fixed-function
+/// `Blend::AlphaBlending` unit they drive has no other formula.
+///
+/// [`Self::composite_multiply_over_with_opacity`] (0.83.0) is the first
+/// method here that does express a blend *mode*:
+/// `aurora_doc::BlendMode::Multiply`, computed in WGSL against a
+/// separately-sampled backdrop rather than by the fixed-function unit.
+/// The remaining 25 modes stay CPU-only (`composite_tile_cpu`) until
+/// their own formulas are ported. See `aurora-app`'s own
+/// `begin_gpu_composite_tile`/`document_qualifies_for_gpu_compositing`
+/// (a higher crate — `aurora-render` cannot name it directly, PRD
+/// §7.2's layering) for exactly which whole documents those primitives
+/// can and can't correctly composite between them.
 pub struct TileCompositor {
     bind_group_layout: wgpu::BindGroupLayout,
     /// The [`Self::composite_over_with_opacity`]-only sibling of
@@ -2939,7 +2947,8 @@ mod tests {
     }
 
     // -- `composite_over_with_opacity`: the opacity-aware GPU primitive
-    // real multi-layer compositing (`aurora-app`'s `gpu_composite_tile`)
+    // real multi-layer compositing (`aurora-app`'s
+    // `begin_gpu_composite_tile`)
     // needs. Every hand-computed expected value below uses exact powers
     // of two (0.25, 0.5, 0.75, 1.0) deliberately -- these round-trip
     // bit-exactly through both `f16` and every intermediate `f32`

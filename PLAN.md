@@ -16366,6 +16366,25 @@ severity choice.
   canvas composites it through `composite_multiply_over_with_opacity`'s
   WGSL math instead of routing the whole document to the CPU fallback.
 
+  > **Correction (0.84.1): that "set a root-level layer to `Multiply`"
+  > framing understated the exposure, and is wrong about the scope of
+  > this change.** It reads as opt-in. It is not. The app's own default
+  > startup fixture — `demo_document`, which `startup_document` builds
+  > every launch that isn't recovering an autosave — *already* contains a
+  > root-level `Multiply` pixel layer ("Color balance", opacity 0.8). So
+  > the moment `document_qualifies_for_gpu_compositing` admitted
+  > `Multiply`, **every user's very first frame, on every backend,
+  > started going through the new ping-pong path with no action on their
+  > part.** That matters specifically because of the hardware paragraph
+  > further down this entry: the mechanism is verified on Vulkan/NVIDIA
+  > only, so the unverified-Metal/DX12 gate applies to the *first-run
+  > experience*, not to a fixture a user would have to go build. 0.84.1
+  > pins this with `the_default_startup_document_is_on_the_gpu_composite_path`,
+  > a headless assertion, so the transition is reviewable and a future
+  > change to either `demo_document` or the predicate shows up as a
+  > failing test rather than a silent change to what every user's GPU
+  > touches first.
+
   **What landed**, entirely inside `aurora-app`
   (`aurora-render` is unchanged except for one doc comment that said
   "nothing in the application calls this," which is no longer true):
@@ -16390,13 +16409,18 @@ severity choice.
     Both carry `TEXTURE_BINDING` now, since either can end up being the
     sampled backdrop, and the final readback copies from whichever
     member the fold *ended* on rather than unconditionally from the
-    first.
+    first. *(Superseded by 0.84.1: creating them **together** was an
+    avoidable regression for all-`Normal` documents, which never read
+    the second one. Each is created separately and lazily now.)*
   - A defensive third arm (a mode outside `{Normal, Multiply}` reaching
     this function, or an accumulator index out of range) logs and
     returns `None`, falling that one tile back to the CPU path. It is
     unreachable while the predicate and this function agree; it exists
     so that if they ever drift, the failure is a slower composite and a
-    log line rather than a silently wrong one.
+    log line rather than a silently wrong one. *(Superseded by 0.84.1:
+    the index-out-of-range half of that arm could not actually fire, and
+    the index it guarded is gone. The inexpressible-mode half stays, and
+    now has a test that really executes it.)*
 
   **The first-layer degeneracy — a real finding, and the reason no
   special case was needed.** The obvious worry is the bottom-most layer:
@@ -16497,6 +16521,152 @@ severity choice.
   warnings`, `cargo test --workspace`, `cargo test --workspace --doc`,
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
   --all-features`), all clean.
+
+- [x] **GPU blend-mode math, slice 2 follow-ups: the ping-pong pair made
+  lazy, the swap made unrepresentably-wrong-proof, and the disclosure
+  corrected — done 2026-09-03 (0.84.1).** A patch round over 0.84.0,
+  from an independent critic + red-team review of it. **No correctness
+  defect was found**: both reviews independently confirmed the swap
+  dispatch and the widened predicate are right, red team by sabotaging
+  the swap three ways on real hardware and by building all-`Multiply`,
+  mixed, and five-layer odd-swap fixtures. What they found instead was
+  an avoidable performance regression, a materially misleading scope
+  claim, coverage that rested on one fixture by luck of parity, and two
+  stale doc comments. All fixed here.
+
+  - **The second accumulator is now lazy** (the one behaviour change).
+    0.84.0 created *both* members of the ping-pong pair, and ran both
+    their clear passes, the moment any layer resolved at a tile —
+    including for an all-`Normal` document, which is every plain
+    imported PNG/JPEG/TIFF and never reads the second one. That was pure
+    added cost on the exact path already measured 3.2-5.9× over the
+    60 FPS budget. `current` is still created by the first layer that
+    resolves; `spare` is now created by the first `Multiply` layer that
+    actually reaches that tile. An all-`Normal` document is back to
+    exactly one texture and one clear per tile — its pre-0.84.0 cost.
+    This is only about *when* the second texture appears; the fold
+    semantics are unchanged, and caching the pair across tiles/frames
+    remains the separate, still-deferred optimisation named above.
+  - **The `usize` accumulator index is gone**, replaced by two owned
+    `Option<(Texture, TextureView)>` locals swapped with
+    `std::mem::swap`. 0.84.0's index came with two "index out of range"
+    bail branches that provably could not fire: the unsigned `1 -
+    current` they nominally protected against would itself have gone
+    wrong *before* either guard ran, so they were dead code offering
+    false assurance. Moving the pairs instead keeps each texture with
+    its own view by construction and leaves the "which member is
+    current" state with no wrong value to hold. Both bails and their
+    `tracing::warn!` calls are deleted — and with them the
+    `#[allow(clippy::too_many_lines)]` 0.84.0 had to add to this
+    function, which is no longer needed (verified by removing it and
+    re-running clippy, not assumed).
+  - **`Dissolve` admitted to the predicate** (investigated on the
+    review's prompt, and it really is free). `Dissolve` never reaches
+    the GPU blend dispatch as `Dissolve` at all: `resolve_tile`
+    intercepts it, runs `dissolve_gate` on the CPU, and hands back an
+    already-gated buffer at `(opacity = 1.0, blend_mode = Normal)`, so
+    the existing `Normal` arm composites it with **zero new WGSL**. It
+    is safe to route either way because `dissolve_gate`'s noise is a
+    pure function of a texel's absolute document-space position — no RNG
+    state, no layer identity — and both paths call the same
+    `resolve_tile` with the same `doc_origin`, so the two must agree
+    *bit-exactly*. The new differential test asserts exactly that, with
+    `assert_eq!` rather than a tolerance. Groups and the other 24 modes
+    still disqualify the whole document, unchanged.
+  - **Two stale doc comments corrected.** `aurora-render`'s
+    `TileCompositor` struct doc still said blend modes including
+    `Multiply` "stay CPU-only" — the very claim 0.84.0 falsified — and
+    still named `gpu_composite_tile`, renamed to
+    `begin_gpu_composite_tile` rounds ago. It now says plainly that
+    `composite_over`/`composite_over_with_opacity` express only
+    `Normal`, `composite_multiply_over_with_opacity` expresses
+    `Multiply`, and the other 25 modes stay CPU-only. (Two other
+    `gpu_composite_tile` mentions in `aurora-app` are deliberate
+    references to that function's *predecessor* and are left alone.)
+    `create_composite_accumulator`'s own doc justified clearing *both*
+    members with "because `composite_over_with_opacity` always uses
+    `LoadOp::Load`" — true only of the member a `Normal` layer blends
+    onto. It now says which member that reasoning is load-bearing for,
+    and that the clear on the other is belt-and-braces, kept because one
+    safe shared constructor beats a conditional one.
+
+  **Five new tests, and the parity finding behind two of them.** The
+  readback-index invariant — does the fold read back from the member it
+  actually ended on — turns on the **parity of the swap count**, not on
+  how many layers a fixture has. 0.84.0's four-layer test has an *even*
+  swap count, so the fold returns to the member it started in and a
+  fixed-index readback passes it by coincidence; only the two-layer
+  test (one swap) caught that bug, and it is the simplest possible
+  fixture, so an edit to it would have taken the coverage with it
+  silently.
+
+  - `recomposite_visible_tiles_gpu_path_reads_back_the_right_member_after_an_odd_swap_count`
+    (new): five root layers, three `Multiply` — three swaps, odd, so the
+    fold ends on the member it did *not* start on, while still
+    exercising more than one swap and a `Normal` blend onto a post-swap
+    accumulator. Differential against the real `composite_tile_cpu`
+    reference, not a hand-derived golden.
+  - `recomposite_visible_tiles_gpu_path_composites_an_all_multiply_stack`
+    (new): no `Normal` anchor layer at all, so the first layer
+    multiplies over a fully transparent backdrop. This is the case the
+    0.84.0 entry reasons about at length under "the first-layer
+    degeneracy" but had no app-level test for — only an `aurora-render`
+    primitive test, one crate down, which knows nothing about this
+    function's accumulator bookkeeping. Differential *and* absolute
+    (`(0.25, 0.375, 0.5, 1.0)`).
+  - `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_dissolve_blend_document`
+    (new): the `Dissolve` bit-exactness differential above, at opacity
+    0.5 so the gate is a real partly-on/partly-off decision rather than
+    a pass-everything one.
+  - `begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode`
+    (new): calls the private function **directly**, bypassing the
+    predicate gate the way a future drift between the two would, with a
+    `Screen` layer the predicate rejects — and asserts it returns `None`
+    rather than panicking or compositing the wrong formula. The
+    defensive arm was previously reachable-but-uncovered, which is
+    exactly the shape a later regression breaks with nothing going red.
+  - `document_qualifies_for_gpu_compositing_admits_a_dissolve_blend_mode`
+    and `the_default_startup_document_is_on_the_gpu_composite_path`
+    (new, both headless): the widened arm, and the correction at the top
+    of the 0.84.0 entry, each pinned by an assertion.
+
+  **Negative-controlled.** The "always read back the first-created
+  member" sabotage was reapplied in the new representation (swap the two
+  *views* but leave the textures put, so dispatch stays correct and only
+  the readback is wrong), run, and reverted from a pre-sabotage copy.
+  Result, exactly as the parity argument predicts: the two-layer test
+  (one swap) **fails**, the new five-layer test (three swaps) **fails**,
+  and both even-swap fixtures — the four-layer mixed stack and the new
+  all-`Multiply` stack — **pass**. The invariant is parity, and it now
+  rests on two independent odd-parity fixtures rather than one.
+
+  **Scope, stated honestly.** Still **Vulkan / NVIDIA GeForce RTX 3090
+  (`DiscreteGpu`) only**, under `AURORA_REQUIRE_GPU=1`; Metal and DX12
+  remain unverified for this mechanism, and per the correction at the
+  top of the 0.84.0 entry that gate covers the default startup document.
+  **No interactive verification and no performance claim.** The lazy
+  second accumulator removes work that provably could not have been
+  read, which is an argument from the code's shape, not a measurement —
+  nothing here was run against the 60 FPS gate, and the round does not
+  move it. The laziness itself is not directly asserted by a test:
+  nothing in the current shape can observe texture *creation*, and
+  inventing a counter to observe it was judged worse than the structural
+  argument (`spare` is created inside the `Multiply` arm and nowhere
+  else). **24 of the 27 blend modes remain** on the GPU path, plus group
+  isolation.
+
+  **Verified (0.84.1)**: `cargo check -p aurora-app`;
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app` for
+  `recomposite_visible_tiles_gpu` (10 tests),
+  `begin_gpu_composite_tile`, `document_qualifies_for_gpu_compositing`
+  and `the_default_startup_document...` — every GPU-gated run printing
+  `GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`;
+  `cargo test -p aurora-app -- composite_document`; then the full gate
+  (`fmt --check`, `check_layering.py`, `check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test
+  --workspace`, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
+  warnings" cargo doc --workspace --no-deps --all-features`), all clean.
 
 ### M1.10 — Phase 1 gate
 

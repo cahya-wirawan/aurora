@@ -6589,9 +6589,9 @@ fn composite_roots_into_tile(
 }
 
 /// Whether every visible root-level layer in `layers` is an
-/// [`aurora_doc::LayerKind::Pixel`] layer at one of the two blend modes
-/// [`begin_gpu_composite_tile`] can express — no groups, no third mode.
-/// The two are:
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the three
+/// `aurora_doc::BlendMode`s [`begin_gpu_composite_tile`] can express —
+/// no groups, no fourth mode. The three are:
 ///
 /// - [`aurora_doc::BlendMode::Normal`] (and a layer with no explicit
 ///   `blend_mode` recorded, which *is* `Normal`), composited by
@@ -6603,9 +6603,27 @@ fn composite_roots_into_tile(
 ///   which computes the whole composite — the `Cb * Cs` *and* the "over"
 ///   — in WGSL against a sampled backdrop, so the fixed-function unit's
 ///   `Normal`-only limitation does not apply to it.
+/// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
+///   GPU-side support at all and never reaches
+///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
+///   `Dissolve` is not a colour-blend function; it is a per-pixel
+///   binary visibility decision, and [`resolve_tile`] already makes that
+///   decision on the CPU ([`dissolve_gate`]) *before* returning, handing
+///   back an already-gated buffer at `(opacity = 1.0, blend_mode =
+///   Normal)`. Whatever consumes that tuple therefore only ever sees
+///   `Normal` — so admitting `Dissolve` here reuses the existing
+///   `Normal` GPU arm exactly and adds no WGSL. It is also safe to route
+///   either way: `dissolve_gate`'s noise is a pure function of a texel's
+///   *absolute document-space* position (never a tile-relative
+///   coordinate, never RNG state, never layer identity — see its own doc
+///   comment), so the GPU and CPU paths, which call the same
+///   [`resolve_tile`] with the same `doc_origin`, are handed bit-
+///   identical gated texels. `recomposite_visible_tiles_gpu_and_cpu_
+///   paths_agree_on_a_dissolve_blend_document` pins that on real
+///   hardware.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
-/// layer at any of the other 25 blend modes) routes the *whole document*
+/// layer at any of the other 24 blend modes) routes the *whole document*
 /// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
 /// already composites every one of those cases correctly — this only
 /// exists to find a faster path for the common cases, never to replace
@@ -6628,7 +6646,11 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                 (layers.kind(id), layers.blend_mode(id)),
                 (
                     Some(aurora_doc::LayerKind::Pixel { .. }),
-                    Some(aurora_doc::BlendMode::Normal | aurora_doc::BlendMode::Multiply) | None
+                    Some(
+                        aurora_doc::BlendMode::Normal
+                            | aurora_doc::BlendMode::Multiply
+                            | aurora_doc::BlendMode::Dissolve
+                    ) | None
                 )
             )
     })
@@ -6842,7 +6864,9 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 
 /// Creates one member of [`begin_gpu_composite_tile`]'s ping-pong
 /// accumulator pair: a tile-sized `Rgba16Float` texture cleared to fully
-/// transparent black, plus its default view.
+/// transparent black, plus its default view. Called at most twice per
+/// tile, and each call is separately lazy — the second member only
+/// exists once a `Multiply` layer has actually reached that tile.
 ///
 /// Usage is `RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`.
 /// `RENDER_ATTACHMENT` because every blend pass renders into one of the
@@ -6857,8 +6881,21 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// The clear is a real, submitted render pass rather than a
 /// `LoadOp::Clear` on the first blend, because
 /// `composite_over_with_opacity` always uses `LoadOp::Load` — it has no
-/// "this is the first layer" mode — so the accumulator must hold known
-/// transparent content before anything blends onto it.
+/// "this is the first layer" mode — so an accumulator a `Normal` layer
+/// blends onto must already hold known transparent content.
+///
+/// **That reasoning is load-bearing for the first member only.** The
+/// second (`spare`) is created inside the `Multiply` arm and handed
+/// straight to `composite_multiply_over_with_opacity` as its `dst`,
+/// which clears and fully overwrites it (`LoadOp::Clear`, no blending,
+/// a fullscreen triangle), so nothing ever reads its cleared contents.
+/// The clear stays for both because this is one shared constructor and
+/// "every accumulator starts transparent" is the simpler invariant to
+/// keep than "this one may hold garbage as long as the next pass happens
+/// to be a `Multiply`" — a future third caller would inherit the safe
+/// shape rather than the conditional one. What 0.84.1 removed is the
+/// *unconditional* second call: an all-`Normal` document now pays for
+/// one texture and one clear per tile, not two.
 fn create_composite_accumulator(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -6910,9 +6947,9 @@ fn create_composite_accumulator(
 /// GPU-accelerated compositing for one visible composite tile, for the
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
 /// the whole document: every visible top-level layer is an
-/// [`aurora_doc::LayerKind::Pixel`] layer at `Normal` or `Multiply`, no
-/// groups. Callers must check that first — this function does not
-/// re-check it itself, beyond one defensive bail (below).
+/// [`aurora_doc::LayerKind::Pixel`] layer at `Normal`, `Multiply` or
+/// `Dissolve`, no groups. Callers must check that first — this function
+/// does not re-check it itself, beyond one defensive bail (below).
 ///
 /// Reuses [`resolve_tile`] once per visible root-level layer, bottom to
 /// top, exactly as [`recomposite_visible_tiles`]'s own CPU path already
@@ -6920,10 +6957,12 @@ fn create_composite_accumulator(
 /// (`read_layer_window`/direct `TileStore::get`) `resolve_tile`'s own
 /// `Pixel` branch already establishes, not reimplemented here. Since
 /// [`document_qualifies_for_gpu_compositing`] has already ruled out every
-/// group and every blend mode outside `{Normal, Multiply}` for this
-/// document, `resolve_tile`'s own returned `aurora_render::BlendMode` is
-/// one of those two for every entry this collects, and the `match` below
-/// dispatches on it. A third mode reaching here would mean the predicate
+/// group and every blend mode outside `{Normal, Multiply, Dissolve}` for
+/// this document — and `resolve_tile` itself turns a `Dissolve` layer
+/// into an already-gated buffer at `Normal` before returning —
+/// `resolve_tile`'s own returned `aurora_render::BlendMode` is one of
+/// `{Normal, Multiply}` for every entry this collects, and the `match`
+/// below dispatches on it. A third mode reaching here would mean the predicate
 /// and this function had drifted apart, so that arm logs and returns
 /// `None` (falling this tile back to the CPU path) rather than
 /// compositing the wrong formula silently.
@@ -6935,30 +6974,49 @@ fn create_composite_accumulator(
 /// cannot — it *samples* the backdrop to compute `Cb * Cs`, and
 /// sampling the texture a pass renders into is undefined, so its `dst`
 /// must be a different view from its `backdrop` (that method's own
-/// documented aliasing rule). This function therefore keeps **two**
-/// identically-sized `Rgba16Float` accumulators and an index (`current`)
-/// naming whichever one currently holds the fold so far:
+/// documented aliasing rule). This function therefore keeps up to
+/// **two** identically-sized `Rgba16Float` accumulators — `current`,
+/// always holding the fold so far, and `spare`, the second member the
+/// ping-pong needs:
 ///
-/// - `Normal` blends in place onto `current`; the index does not move.
+/// - `Normal` blends in place onto `current`; nothing moves, and no
+///   second texture is touched or even created.
 /// - `Multiply` reads `current` as the backdrop and writes the finished
-///   composite into the *other* member, then makes that one `current`.
+///   composite into `spare`, then the two swap places.
 ///
-/// Both are created together, lazily, on the first root layer that
-/// actually resolves to real content at this tile — a tile with no
-/// touched layer anywhere still does zero GPU work — and both carry
-/// `RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`, because either one
-/// can end up being the backdrop a later `Multiply` layer samples, and
-/// either one can end up being the member the readback copies from.
-/// They are not cached across tiles or frames; doing so is separate,
-/// deliberately deferred work.
+/// **Each is created separately and lazily** (0.84.1). `current` is
+/// created by the first root layer that resolves to real content at this
+/// tile, so a tile with no touched layer anywhere still does zero GPU
+/// work. `spare` is created by the first `Multiply` layer that actually
+/// reaches this tile — never before — so an all-`Normal` document (every
+/// plain imported PNG/JPEG/TIFF) allocates and clears exactly one
+/// accumulator per tile, the same cost it had before 0.84.0 introduced
+/// the pair at all. Both carry `RENDER_ATTACHMENT | COPY_SRC |
+/// TEXTURE_BINDING`, because after a swap either one can end up being
+/// the backdrop a later `Multiply` layer samples, and either one can end
+/// up being the member the readback copies from. Neither is cached
+/// across tiles or frames; doing so is separate, deliberately deferred
+/// work.
+///
+/// The swap is `std::mem::swap` on the two owned `(texture, view)`
+/// pairs, not an index into a `[_; 2]`: an index has out-of-range values
+/// that then have to be defended against or assumed away, whereas moving
+/// the pairs themselves keeps each texture with its own view by
+/// construction and leaves "which member is current" with no wrong state
+/// to be in. (0.84.0 used a `usize` index guarded by two bail branches
+/// that could not actually fire — the unsigned `1 - current` they
+/// nominally protected against would have gone wrong before either guard
+/// ran. 0.84.1 removed the index and both guards together.)
 ///
 /// For each resolved layer (bottom to top), immediately: uploads its own tile-sized
 /// texel window into a fresh scratch `Rgba16Float` source texture
 /// (`TEXTURE_BINDING | COPY_DST`), then dispatches on that layer's blend
-/// mode as above. Both accumulators are cleared to fully transparent
-/// black at creation, since `composite_over_with_opacity` always uses
-/// `LoadOp::Load` and so needs real, known-transparent content before
-/// the first layer blends onto it.
+/// mode as above. Every accumulator is cleared to fully transparent
+/// black at creation — load-bearing for `current`, whose very first
+/// `Normal` blend uses `LoadOp::Load` and so needs real, known content
+/// under it; belt-and-braces for `spare`, which the `Multiply` pass that
+/// created it overwrites completely. See
+/// [`create_composite_accumulator`]'s own doc comment.
 ///
 /// **Leaves a premultiplied accumulator behind, on purpose**: once the
 /// fold is done the `current` accumulator holds *premultiplied* alpha —
@@ -7014,19 +7072,17 @@ fn create_composite_accumulator(
 /// trip) — the caller falls back to the CPU path for this one tile
 /// immediately, without anything to batch, the same "one bad tile
 /// shouldn't abort the rest" discipline [`resolve_tile`]'s own callers
-/// already use. Also `None` for the two defensive cases above — a blend
-/// mode outside `{Normal, Multiply}`, or an accumulator index out of
-/// range — each logged, each falling this one tile back to the CPU path,
-/// neither reachable while the predicate and this function agree. A real
+/// already use. Also `None` for the one defensive case above — a
+/// resolved blend mode outside `{Normal, Multiply}` — logged, falling
+/// this one tile back to the CPU path, and not reachable through the
+/// real caller while the predicate and this function agree (it *is*
+/// reachable by calling this function directly, which is what
+/// `begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode`
+/// does, so the arm is covered rather than merely asserted about). A real
 /// GPU-side failure (a lost device, a bad map) can no
 /// longer be detected here — resolving the map is [`finish_tile_readback`]'s
 /// job now, in phase 3, once this function has already returned.
-// `too_many_lines`: 108, against a 100 limit. The ping-pong restructure
-// (0.84.0) added the blend-mode dispatch and its two defensive bails to
-// a function whose length is mostly the explanatory comments this file
-// favours; the same allow its own caller `recomposite_visible_tiles`
-// already carries.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn begin_gpu_composite_tile(
     gpu: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
@@ -7056,14 +7112,29 @@ fn begin_gpu_composite_tile(
     // buffer per visible root -- the same shape
     // `composite_roots_into_tile`'s own CPU path already has (0.51.0).
     //
-    // *Two* accumulators, created together: `Multiply` cannot blend in
-    // place (it samples its backdrop, and sampling the render target is
-    // undefined -- see `composite_multiply_over_with_opacity`'s own
-    // aliasing rule), so the fold ping-pongs between them. `current`
-    // names whichever one holds the fold so far; the readback at the end
-    // copies out of that one, not unconditionally out of the first.
-    let mut accumulators: Option<[(wgpu::Texture, wgpu::TextureView); 2]> = None;
-    let mut current: usize = 0;
+    // Two *separately* lazy accumulators, not one eagerly-created pair.
+    // `current` always holds the fold so far and is created by the first
+    // layer that resolves at all; `spare` is the second member the
+    // ping-pong needs, and it is created only by the first `Multiply`
+    // layer that actually reaches this tile -- `Multiply` cannot blend
+    // in place (it samples its backdrop, and sampling the render target
+    // is undefined -- see `composite_multiply_over_with_opacity`'s own
+    // aliasing rule), so it, and only it, needs a second texture to
+    // render into. An all-`Normal` document -- every plain imported
+    // PNG/JPEG/TIFF -- therefore allocates and clears exactly one
+    // accumulator per tile, exactly as it did before 0.84.0 introduced
+    // the pair; the second texture and its own clear pass are not spent
+    // on a document that would never read them.
+    //
+    // The swap is `std::mem::swap` on the two `Option` payloads rather
+    // than an index into a `[_; 2]`: an index invites an out-of-range
+    // value that has to be either defended against or assumed away,
+    // while moving the whole `(texture, view)` pair keeps each texture
+    // with its own view by construction and makes "which member is
+    // current" unrepresentable in any wrong state. The readback at the
+    // end copies out of `current`, whichever texture that now is.
+    let mut current: Option<(wgpu::Texture, wgpu::TextureView)> = None;
+    let mut spare: Option<(wgpu::Texture, wgpu::TextureView)> = None;
 
     for &id in layers.roots().iter().rev() {
         // `1`: a root-level layer, the same depth `aurora-doc`'s own
@@ -7084,11 +7155,8 @@ fn begin_gpu_composite_tile(
             continue;
         };
 
-        let pair = accumulators.get_or_insert_with(|| {
-            [
-                create_composite_accumulator(device, queue, tile_extent, "gpu-composite-a"),
-                create_composite_accumulator(device, queue, tile_extent, "gpu-composite-b"),
-            ]
+        let current_accumulator = current.get_or_insert_with(|| {
+            create_composite_accumulator(device, queue, tile_extent, "gpu-composite-a")
         });
 
         let src_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -7122,51 +7190,54 @@ fn begin_gpu_composite_tile(
         );
         let src_view = src_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Both views up front, as shared borrows, so the `match` arms
-        // below only have to pick. `.get` rather than `pair[current]`:
-        // the workspace denies `indexing_slicing`, and a bad index here
-        // should fall this tile back to the CPU path, not panic in a
-        // session holding unsaved work.
-        let other = 1 - current;
-        let (Some((_, current_view)), Some((_, other_view))) = (pair.get(current), pair.get(other))
-        else {
-            tracing::warn!(
-                current,
-                other,
-                "gpu composite accumulator index out of range -- falling back to the CPU path \
-                 for this tile"
-            );
-            return None;
-        };
-
         match blend_mode {
             // The fixed-function blend unit computes "source over" in
             // place: `current` is both the backdrop it loads and the
-            // target it stores, so the pair does not move.
+            // target it stores, so nothing moves and no second texture
+            // is ever needed.
             aurora_render::BlendMode::Normal => {
-                compositor.composite_over_with_opacity(gpu, current_view, &src_view, opacity);
+                compositor.composite_over_with_opacity(
+                    gpu,
+                    &current_accumulator.1,
+                    &src_view,
+                    opacity,
+                );
             }
             // Reads `current` as the sampled backdrop and writes the
-            // finished composite into the other member -- they must be
-            // different views (`composite_multiply_over_with_opacity`'s
-            // own aliasing rule). The written one is now the fold, so
-            // `current` follows it.
+            // finished composite into `spare` -- they must be different
+            // views (`composite_multiply_over_with_opacity`'s own
+            // aliasing rule), which is the entire reason a second
+            // texture exists, and why it is created right here, on the
+            // first `Multiply` layer that actually reaches this tile,
+            // rather than alongside the first accumulator. The written
+            // one is now the fold, so the two swap places: what was
+            // `spare` becomes `current`, and the exhausted backdrop
+            // becomes the next `Multiply`'s render target.
             aurora_render::BlendMode::Multiply => {
+                let spare_accumulator = spare.get_or_insert_with(|| {
+                    create_composite_accumulator(device, queue, tile_extent, "gpu-composite-b")
+                });
                 compositor.composite_multiply_over_with_opacity(
                     gpu,
                     &src_view,
-                    current_view,
-                    other_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
                     opacity,
                 );
-                current = other;
+                std::mem::swap(current_accumulator, spare_accumulator);
             }
-            // Unreachable in practice: `document_qualifies_for_gpu_
-            // compositing` admits only `Normal` and `Multiply`, and
+            // Unreachable through the real caller: `document_qualifies_
+            // for_gpu_compositing` admits only `Normal`, `Multiply` and
+            // `Dissolve` (which `resolve_tile` has already reduced to
+            // `Normal` by the time it gets here), and
             // `recomposite_visible_tiles` checks it before calling this.
             // If the two ever drift apart, bail to the CPU path rather
             // than composite some other mode with the wrong formula --
-            // a silently wrong composite is the worse failure.
+            // a silently wrong composite is the worse failure. Reachable
+            // by calling this function directly, which is what
+            // `begin_gpu_composite_tile_falls_back_for_an_inexpressible_
+            // blend_mode` does, so this arm is covered by a real test
+            // rather than only reasoned about.
             other_mode => {
                 tracing::warn!(
                     ?other_mode,
@@ -7178,15 +7249,11 @@ fn begin_gpu_composite_tile(
         }
     }
 
-    let pair = accumulators?;
-    let Some((composite_texture, _view)) = pair.get(current) else {
-        tracing::warn!(
-            current,
-            "gpu composite accumulator index out of range at readback -- falling back to the \
-             CPU path for this tile"
-        );
-        return None;
-    };
+    // `?`: no root layer resolved to real content at this tile, so no
+    // accumulator was ever created and there is nothing to read back --
+    // the caller falls this one tile back to the CPU path, which handles
+    // "no visible layers" as transparent black for free.
+    let (composite_texture, _view) = current?;
 
     // `composite_texture` -- whichever member of the pair the fold ended
     // on -- now holds this tile's finished composite in *premultiplied*
@@ -7206,7 +7273,7 @@ fn begin_gpu_composite_tile(
     Some(begin_tile_readback(
         device,
         queue,
-        composite_texture,
+        &composite_texture,
         tile_id,
     ))
 }
@@ -7280,8 +7347,8 @@ fn begin_gpu_composite_tile(
 /// sitting unwired**: when `gpu`/`compositor` are both `Some` *and*
 /// [`document_qualifies_for_gpu_compositing`] confirms the whole document
 /// is GPU-tractable (every visible root-level layer an
-/// [`aurora_doc::LayerKind::Pixel`] layer at `Normal` or `Multiply`, no
-/// groups), each tile is
+/// [`aurora_doc::LayerKind::Pixel`] layer at `Normal`, `Multiply` or
+/// `Dissolve`, no groups), each tile is
 /// composited via [`begin_gpu_composite_tile`]/[`finish_tile_readback`] —
 /// `aurora_render::TileCompositor::composite_over_with_opacity`'s real
 /// fixed-function blend unit for `Normal`, and
@@ -12402,30 +12469,31 @@ mod tests {
         RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
         active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
         aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
-        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
-        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
-        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
-        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
-        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
-        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
-        skipped_tiles_message, skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
+        composite_document, composite_reference_origin, composite_surface_id, continue_drag,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
+        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
+        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
+        resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
+        tile_overlaps_doc_rect, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -24071,6 +24139,79 @@ mod tests {
         );
     }
 
+    /// `Dissolve` needs no GPU-side support to be admitted (0.84.1):
+    /// `resolve_tile` intercepts it on the CPU, applies `dissolve_gate`,
+    /// and hands back an already-gated buffer at `(opacity = 1.0,
+    /// blend_mode = Normal)` — so `begin_gpu_composite_tile` only ever
+    /// sees `Normal` for such a layer and reuses its existing arm. Pins
+    /// the third `matches!` arm headlessly; the GPU-vs-CPU differential
+    /// sibling below proves the composite is actually identical either
+    /// way on real hardware.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_dissolve_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Dissolve) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Dissolve pixel layer must qualify for the GPU path as of 0.84.1 -- \
+             resolve_tile has already reduced it to Normal by the time the GPU path dispatches"
+        );
+    }
+
+    /// **The disclosure this round owed** (0.84.1). 0.84.0's own PLAN.md
+    /// entry framed the widened predicate as something a user opts into
+    /// by setting a root-level layer to `Multiply`. It is not: the app's
+    /// own default startup fixture ([`demo_document`], used by
+    /// [`startup_document`]) already has a root-level `Multiply` pixel
+    /// layer — "Color balance", at opacity 0.8 — so admitting `Multiply`
+    /// put *every first launch, on every backend* onto the new ping-pong
+    /// GPU path with no user action at all.
+    ///
+    /// That is a real, deliberate scope fact rather than an accident, so
+    /// it gets an assertion instead of a footnote: this test is what
+    /// makes the transition reviewable, and what would make a future
+    /// change to either `demo_document`'s layer stack or the predicate's
+    /// admitted mode set show up as a failing test rather than a silent
+    /// change to what the first frame every user ever sees runs through.
+    /// Cheap and headless — no GPU, no tile store, just the predicate.
+    #[test]
+    fn the_default_startup_document_is_on_the_gpu_composite_path() {
+        let (layers, _history) = demo_document();
+        let multiply_roots = layers
+            .roots()
+            .iter()
+            .filter(|&&id| layers.blend_mode(id) == Some(aurora_doc::BlendMode::Multiply))
+            .count();
+        assert_eq!(
+            multiply_roots, 1,
+            "setup: demo_document is expected to carry exactly one root-level Multiply layer \
+             (\"Color balance\") -- if that changed, this test's own premise needs rewriting, \
+             not deleting"
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "the default startup document must be GPU-tractable as of 0.84.0 -- this is not an \
+             opt-in path: every user hits begin_gpu_composite_tile's Multiply arm on first \
+             launch, which is why the Metal/DX12 hardware gate applies to the first-run \
+             experience and not merely to a hand-built fixture"
+        );
+    }
+
     #[test]
     fn document_qualifies_for_gpu_compositing_ignores_an_invisible_disqualifying_layer() {
         let mut layers = aurora_doc::LayerTree::new();
@@ -24951,6 +25092,391 @@ mod tests {
                  Full texels: {gpu_result:?} vs {cpu_result:?}"
             );
         }
+    }
+
+    /// Builds a document of root-level solid-colour pixel layers from
+    /// `entries` (bottom to top: name, blend mode, opacity, RGBA), each
+    /// filling the whole of tile `(0, 0)` on its own surface — the
+    /// fixture shape every ping-pong differential test below needs, so
+    /// the interesting part of each of those tests is its layer table
+    /// rather than twenty lines of `add_pixel_layer`/`set_blend_mode`
+    /// boilerplate. Deliberately a *new* helper used only by the tests
+    /// added in 0.84.1: the 0.84.0 tests above keep their own inline
+    /// setup untouched.
+    fn solid_root_stack(
+        store: &mut aurora_tile::TileStore,
+        entries: &[(&str, aurora_doc::BlendMode, f32, [f32; 4])],
+    ) -> aurora_doc::LayerTree {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        for &(name, mode, opacity, rgba) in entries {
+            let id = match layers.add_pixel_layer(name, bounds, None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = layers.set_blend_mode(id, mode) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_opacity(id, opacity) {
+                unreachable!("{err:?}");
+            }
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("just created as a pixel layer");
+            };
+            fill_solid(store, surface, aurora_tile::TileId { x: 0, y: 0 }, rgba);
+        }
+        layers
+    }
+
+    /// One texel's own `(r, g, b, a)` channels — the shape
+    /// [`read_first_texel`] already returns, named here only so the
+    /// helper below can return a pair of them without tripping
+    /// `clippy::type_complexity`.
+    type Texel = (f32, f32, f32, f32);
+
+    /// Composites `layers` twice through [`recomposite_visible_tiles`] —
+    /// once with a real GPU context and compositor (the
+    /// [`begin_gpu_composite_tile`] path), once with neither (forcing
+    /// `composite_tile_cpu`) — and returns tile `(0, 0)`'s own first
+    /// texel from each, as `(gpu, cpu)`. Each run gets its own fresh
+    /// [`CompositeCache`], so the second is a real recomposite and not a
+    /// cache hit on the first's result.
+    fn gpu_and_cpu_first_texel(
+        context: &aurora_gpu::GpuContext,
+        store: &mut aurora_tile::TileStore,
+        layers: &aurora_doc::LayerTree,
+    ) -> (Texel, Texel) {
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            layers,
+            None,
+            store,
+            &mut gpu_cache,
+            Some(context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_first_texel(store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, layers, None, store, &mut cpu_cache, None, None);
+        let cpu_result = read_first_texel(store, composite_surface_id(), tile_id);
+
+        (gpu_result, cpu_result)
+    }
+
+    /// Asserts the GPU and CPU composites of the same fixture agree
+    /// channel by channel, within the same `2 * f16::EPSILON` tolerance
+    /// (and with the same "this is a finding, not a reason to loosen the
+    /// assertion" framing) every hand-written differential above uses.
+    /// `what` names the fixture in the failure message.
+    fn assert_gpu_matches_cpu(gpu_result: Texel, cpu_result: Texel, what: &str) {
+        assert_ne!(
+            gpu_result,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: {what} must really composite to something -- two transparent-black results \
+             would agree vacuously"
+        );
+        let tolerance = 2.0 * f32::from(half::f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the GPU and CPU paths diverged by more than {tolerance} on \
+                 {what} ({gpu} vs {cpu}) -- that is a real finding to report, not a reason to \
+                 loosen this assertion. Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    /// **The readback-index test, with the parity that actually matters**
+    /// (0.84.1). Whether `begin_gpu_composite_tile` reads back from the
+    /// right member of the ping-pong pair is decided by the *parity* of
+    /// the swap count, not by how many layers a fixture has — and before
+    /// this test, the whole invariant rested on exactly one fixture. The
+    /// four-layer sibling above has an **even** number of swaps (two), so
+    /// the fold ends where it started and a "always read back the first
+    /// member" bug passes it by coincidence; only the two-layer
+    /// `..._agree_on_a_multiply_blend_document` (one swap, odd) catches
+    /// that bug, and it is the simplest possible fixture — an edit to it
+    /// would silently take the coverage with it.
+    ///
+    /// Five root-level layers, three of them `Multiply`, so three swaps:
+    ///
+    /// | # | mode       | opacity | pass writes | `current` after |
+    /// |---|------------|---------|-------------|-----------------|
+    /// | 1 | `Normal`   | 1.0     | A, in place | A               |
+    /// | 2 | `Multiply` | 1.0     | B (from A)  | **B**           |
+    /// | 3 | `Normal`   | 0.75    | B, in place | B               |
+    /// | 4 | `Multiply` | 0.5     | A (from B)  | **A**           |
+    /// | 5 | `Multiply` | 1.0     | B (from A)  | **B**           |
+    ///
+    /// The fold therefore ends on B, the member that was *not* current
+    /// at the start, while still exercising more than one swap and a
+    /// `Normal` blend onto a post-swap accumulator (layer 3). A
+    /// fixed-index readback composites layers 1-4 and silently drops
+    /// layer 5's contribution; that is a plausible-looking image, not an
+    /// error, which is exactly why it needs an assertion rather than a
+    /// crash to catch it.
+    ///
+    /// Differential only, against the real `composite_tile_cpu`
+    /// reference the CPU path runs — deliberately not a hand-derived
+    /// golden, which for five chained composites would restate the
+    /// arithmetic under test rather than check it.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_reads_back_the_right_member_after_an_odd_swap_count() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+                (
+                    "l3",
+                    aurora_doc::BlendMode::Normal,
+                    0.75,
+                    [0.0, 0.25, 1.0, 1.0],
+                ),
+                (
+                    "l4",
+                    aurora_doc::BlendMode::Multiply,
+                    0.5,
+                    [0.25, 1.0, 0.5, 1.0],
+                ),
+                (
+                    "l5",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.75, 0.5, 0.25, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a five-layer Normal/Multiply root stack must qualify for the GPU path -- otherwise \
+             this test would compare the CPU path against itself and prove nothing about which \
+             accumulator the readback copies from"
+        );
+
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a five-layer stack with three Multiply layers (an odd swap count, so the fold ends \
+             on the member it did not start on)",
+        );
+    }
+
+    /// **The all-`Multiply` document** (0.84.1): no `Normal` anchor layer
+    /// at all, so the very first layer composited is a `Multiply` over a
+    /// still-fully-transparent accumulator.
+    ///
+    /// 0.84.0's own commit message reasons about exactly this case at
+    /// length — `Multiply` over a transparent backdrop degenerates to
+    /// what `Normal` would produce, because
+    /// `composite_layer_into`'s straight-backdrop recovery is guarded on
+    /// `backdrop_alpha > 0.0`, so the general dispatch needs no
+    /// first-layer special case — but the only test that knew about that
+    /// degeneracy was an `aurora-render` primitive test, one crate down,
+    /// which knows nothing about this function's own accumulator
+    /// bookkeeping. This pins it at the app level: with two `Multiply`
+    /// layers the fold swaps twice, and the first swap happens with the
+    /// backdrop still empty.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_composites_an_all_multiply_stack() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "an all-Multiply root stack must qualify for the GPU path"
+        );
+
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "an all-Multiply stack, whose first layer multiplies over a fully transparent \
+             backdrop",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.375, 0.5, 1.0),
+            "the bottom Multiply layer over a transparent backdrop must degenerate to Normal \
+             (leaving (0.5, 0.75, 1.0, 1.0)), and the second must then multiply it by 0.5 -- a \
+             different answer here means the first-layer-over-nothing case is not behaving the \
+             way 0.84.0 reasoned it would"
+        );
+    }
+
+    /// **`Dissolve` on the GPU path** (0.84.1, ISSUE-7's outcome).
+    /// `Dissolve` is admitted by `document_qualifies_for_gpu_compositing`
+    /// without a line of new WGSL, because it never reaches the GPU as
+    /// `Dissolve` at all: [`resolve_tile`] intercepts it, runs
+    /// [`dissolve_gate`], and returns an already-gated buffer at
+    /// `(opacity = 1.0, blend_mode = Normal)`, so the existing `Normal`
+    /// arm composites it.
+    ///
+    /// The differential is what makes that argument checkable rather
+    /// than merely plausible. `dissolve_gate`'s noise is a pure function
+    /// of a texel's absolute document-space position — no RNG state, no
+    /// layer identity — and both paths call the same `resolve_tile` with
+    /// the same `doc_origin`, so the two runs must agree *bit for bit*,
+    /// not merely within tolerance. A layer at opacity 0.5 is used
+    /// deliberately: it makes the gate a real, partly-on/partly-off
+    /// decision rather than a pass-everything one, so a path that
+    /// re-applied opacity, reseeded the noise, or skipped the gate
+    /// entirely would diverge here.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_dissolve_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "bottom",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.25, 0.5, 0.75, 1.0],
+                ),
+                (
+                    "dissolved",
+                    aurora_doc::BlendMode::Dissolve,
+                    0.5,
+                    [1.0, 0.0, 0.0, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Dissolve pixel layer must qualify for the GPU path as of 0.84.1 -- \
+             otherwise this test would compare the CPU path against itself"
+        );
+
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        assert_eq!(
+            gpu_result, cpu_result,
+            "Dissolve is decided entirely on the CPU inside resolve_tile, from a \
+             position-seeded hash with no RNG state, so the GPU and CPU paths must agree \
+             bit-exactly -- not merely within a float tolerance. A divergence here means the \
+             gate is being applied differently (or twice, or not at all) on one of the paths"
+        );
+        assert_ne!(
+            gpu_result,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: the fixture must really composite to something"
+        );
+    }
+
+    /// **The defensive `_` arm, actually executed** (0.84.1). The last
+    /// arm of `begin_gpu_composite_tile`'s blend dispatch exists for a
+    /// blend mode `document_qualifies_for_gpu_compositing` should already
+    /// have excluded: it logs and returns `None`, falling that one tile
+    /// back to the CPU path rather than compositing the wrong formula
+    /// silently. Through the real caller it is unreachable, which is
+    /// precisely why it had no coverage — and unreachable-but-uncovered
+    /// code is what a future regression breaks without anything going
+    /// red.
+    ///
+    /// So call the private function directly, bypassing the gate the
+    /// same way a drifted predicate one day might: a two-layer document
+    /// whose top layer is `Screen`, which the predicate rejects (asserted
+    /// here, so this test fails loudly if `Screen` is ever admitted and
+    /// this fixture stops probing the arm it is named for). The assertion
+    /// is that this fails *safe* — `None`, not a panic, not a partial
+    /// composite of the wrong formula.
+    #[test]
+    fn begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "bottom",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+                (
+                    "screened",
+                    aurora_doc::BlendMode::Screen,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            !document_qualifies_for_gpu_compositing(&layers),
+            "setup: Screen must still disqualify the document -- if it is ever admitted, this \
+             test needs a different mode, not deleting: its whole point is to reach the arm the \
+             real caller cannot"
+        );
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let pending = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            pending.is_none(),
+            "a blend mode the GPU path cannot express must fall this tile back to the CPU path \
+             (None), not composite it with the wrong formula and not panic"
+        );
     }
 
     /// The batched-poll restructuring's own correctness proof: the
