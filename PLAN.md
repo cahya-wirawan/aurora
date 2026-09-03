@@ -18411,6 +18411,15 @@ severity choice.
     0.90.1, and deliberately out of scope for both: the real fix is
     persisting dirty state across page-out/page-in, named as the deferred
     follow-on below.
+
+    **Tracked as a real, live defect, not merely a deferred follow-on**
+    (per an independent Judge's review of this round): this is a
+    stale-pixel path on the main frame path, proven hot by this round's
+    own measurements, at exactly the document size the invariant above
+    is written for — not a corner case awaiting convenient scheduling.
+    It should be picked up on its own priority, not only revisited
+    whenever the deferred persist-dirty-across-paging work happens to
+    get scheduled.
   - **`upload_sync` mean and p50 fall by ~2.9–3.3× (GPU) and ~1.8–2×
     (CPU fallback)**, with ranges nowhere near overlapping, and the
     stage's share of the mean frame drops from 53.1–53.9% to 26.2–26.3%
@@ -18584,6 +18593,20 @@ severity choice.
   0.90.0 benchmark table above was re-run after the fix to confirm the
   measured win survives; see the re-run note under that table.
   2 tests changed, 1 added.
+
+  **Named follow-on (per an independent Judge's review of this round):
+  the fix closes the one known reader, but nothing structural stops a
+  second one.** `write_composited`'s residency guard now depends on a
+  cross-file invariant — "no reader of the composite surface may call
+  `TileStore::get`/`get_mut` without first checking `contains_tile`" —
+  that is enforced only by a doc comment, not by a type or a lint. A
+  future second reader added to `sample_pixel`'s neighbourhood, or a new
+  tool entirely, could silently reintroduce this exact bug. The cheapest
+  structural close would be a single gated accessor for the composite
+  surface (or a `TileStore` peek-read API) that every reader is routed
+  through, so the invariant is enforced once rather than re-derived by
+  every future caller. Not done in 0.90.1 — this is a design decision
+  about a new API shape, not a bug fix, and belongs in its own round.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
