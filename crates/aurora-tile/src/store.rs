@@ -653,28 +653,76 @@ impl TileStore {
     ///
     /// # Recency
     ///
-    /// Collecting the matching keys peeks rather than gets, the same
-    /// rule [`Self::contains_tile`] and [`Self::is_dirty`] follow:
-    /// `LruCache::iter` takes `&self`, so it structurally cannot
-    /// promote anything. That matters for the surface-not-found case
-    /// especially — sweeping a surface this store has never seen must
-    /// be a genuine no-op, not a reordering of somebody else's tiles.
+    /// A sweep cannot reorder any *other* surface's LRU, in either of
+    /// its two steps:
+    ///
+    /// - Collecting the matching keys peeks rather than gets, the same
+    ///   rule [`Self::contains_tile`] and [`Self::is_dirty`] follow:
+    ///   `LruCache::iter` takes `&self`, so it structurally cannot
+    ///   promote anything. That matters for the surface-not-found case
+    ///   especially — sweeping a surface this store has never seen must
+    ///   be a genuine no-op, not a reordering of somebody else's tiles.
+    /// - Freeing a matched key does mutate `resident`, but only by
+    ///   removal: [`Self::forget_tile`]'s single call there is
+    ///   `LruCache::pop`, which unlinks that one node from the
+    ///   recency list and joins its two neighbours to each other. It
+    ///   never touches the head, and it never moves a node it did not
+    ///   remove, so every surviving entry keeps its position relative
+    ///   to every other. (`LruCache::get`, which *does* promote, is
+    ///   not on this path.)
     pub fn forget_surface(&mut self, surface: SurfaceId) -> usize {
-        let mut ids: HashSet<TileId> = HashSet::new();
-        ids.extend(
+        self.forget_surfaces(&HashSet::from([surface]))
+    }
+
+    /// [`Self::forget_surface`] for a whole set of surfaces at once,
+    /// in a single pass over what this store holds. Returns how many
+    /// tiles were actually forgotten, summed across all of them.
+    ///
+    /// **This destroys pixels** — every word of
+    /// [`Self::forget_surface`]'s warning applies here, and that
+    /// method is a one-element call into this one, so the two share a
+    /// body as well as a contract. Read its doc comment for why the
+    /// sweep walks the store's own keys rather than any surface's
+    /// declared tile grid, and for what a sweep does (nothing) to
+    /// another surface's LRU recency.
+    ///
+    /// # Why batching is not just sugar
+    ///
+    /// Because the per-surface cost is a full scan. Each sweep has to
+    /// look at every key in `resident`, `paged_out` and `pending` to
+    /// find the ones it owns, so calling [`Self::forget_surface`] in a
+    /// loop over a document's surfaces costs O(surfaces × tiles held)
+    /// — and the one caller shape this exists for, discarding a whole
+    /// document, has ~2 surfaces per layer and runs at exactly the
+    /// moment the store is fullest. One pass over the keys, testing
+    /// each against the requested set, is O(tiles held) instead.
+    pub fn forget_surfaces(&mut self, surfaces: &HashSet<SurfaceId>) -> usize {
+        let mut keys: HashSet<(SurfaceId, TileId)> = HashSet::new();
+        keys.extend(
             self.resident
                 .iter()
-                .filter(|((held, _), _)| *held == surface)
-                .map(|((_, id), _)| *id),
+                .map(|(key, _)| *key)
+                .filter(|(held, _)| surfaces.contains(held)),
         );
-        for (held, id) in self.paged_out.keys().chain(self.pending.keys()) {
-            if *held == surface {
-                ids.insert(*id);
+        for key in self.paged_out.keys().chain(self.pending.keys()) {
+            if surfaces.contains(&key.0) {
+                keys.insert(*key);
             }
         }
-        ids.into_iter()
-            .filter(|id| self.forget_tile(surface, *id))
-            .count()
+        // An explicit loop, deliberately, rather than
+        // `keys.into_iter().filter(...).count()`: that idiom frees
+        // every tile only because `count` happens to drain the whole
+        // iterator, and a later edit to any short-circuiting adapter
+        // would silently stop the sweep part-way with nothing but the
+        // returned tally — which no small-fixture test would notice —
+        // to say so.
+        let mut freed = 0;
+        for (surface, id) in keys {
+            if self.forget_tile(surface, id) {
+                freed += 1;
+            }
+        }
+        freed
     }
 
     /// Blocks until every write submitted so far has actually reached
@@ -1269,6 +1317,7 @@ mod tests {
 
     use super::TileStore;
     use crate::tile::{CHANNELS, SurfaceId, TILE, TileId};
+    use std::collections::HashSet;
     use std::num::NonZeroUsize;
 
     fn store(budget: usize) -> (tempfile::TempDir, TileStore) {
@@ -1550,6 +1599,91 @@ mod tests {
         assert!(
             !store.resident.contains(&(s, old)),
             "the least recently used tile must still be the one evicted"
+        );
+        assert!(store.resident.contains(&(s, new)));
+    }
+
+    #[test]
+    // The batched entry point, which `forget_surface` is now a
+    // one-element call into: one pass over the store's keys must free
+    // every requested surface and only those.
+    fn forget_surfaces_frees_every_requested_surface_and_spares_the_rest() {
+        let (_dir, mut store) = store(8);
+        let doomed = [SurfaceId::from_raw(1), SurfaceId::from_raw(2)];
+        let spared = SurfaceId::from_raw(3);
+        let ids = [TileId { x: 0, y: 0 }, TileId { x: 1, y: 0 }];
+        for surface in doomed.iter().copied().chain(std::iter::once(spared)) {
+            for id in ids {
+                if store.get_mut(surface, id).is_err() {
+                    unreachable!("a fresh store must serve this tile");
+                }
+            }
+        }
+
+        let requested: HashSet<SurfaceId> = doomed
+            .iter()
+            .copied()
+            // A surface this store has never seen, mixed in: it must
+            // contribute nothing rather than throw the tally off.
+            .chain(std::iter::once(SurfaceId::from_raw(404)))
+            .collect();
+        assert_eq!(
+            store.forget_surfaces(&requested),
+            4,
+            "two surfaces of two tiles each, and nothing for the unseen one"
+        );
+        for surface in doomed {
+            for id in ids {
+                assert!(!store.contains_tile(surface, id));
+            }
+        }
+        for id in ids {
+            assert!(
+                store.contains_tile(spared, id),
+                "a surface that was not asked for must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    // The other half of the recency claim, which
+    // `forget_surface_of_an_untouched_surface_does_not_bump_lru_recency`
+    // cannot reach: a sweep that really *does* free tiles must still
+    // leave every surviving entry's position relative to every other
+    // exactly as it was. `forget_tile` removes via `LruCache::pop`,
+    // which unlinks one node and joins its neighbours; nothing on this
+    // path promotes.
+    fn a_sweep_that_frees_tiles_does_not_reorder_another_surfaces_lru() {
+        let (_dir, mut store) = store(3);
+        let s = surface();
+        let doomed = SurfaceId::from_raw(77);
+        let old = TileId { x: 0, y: 0 };
+        let new = TileId { x: 1, y: 0 };
+        // Touch order: `old`, then `new`, then the doomed surface's own
+        // tile -- so `old` is the least recently used of the survivors.
+        for (surface, id) in [(s, old), (s, new), (doomed, TileId { x: 9, y: 9 })] {
+            if store.get_mut(surface, id).is_err() {
+                unreachable!("a fresh store must serve this tile");
+            }
+        }
+
+        assert_eq!(
+            store.forget_surface(doomed),
+            1,
+            "this sweep must really free something, or it proves nothing"
+        );
+
+        // Refill to the budget, then push one past it. The victim must
+        // be `old`: if freeing the doomed tile had disturbed the two
+        // survivors' order, `new` would go instead.
+        for id in [TileId { x: 2, y: 0 }, TileId { x: 3, y: 0 }] {
+            if store.get_mut(s, id).is_err() {
+                unreachable!("a fresh store must serve this tile");
+            }
+        }
+        assert!(
+            !store.resident.contains(&(s, old)),
+            "the least recently used survivor must still be the one evicted"
         );
         assert!(store.resident.contains(&(s, new)));
     }

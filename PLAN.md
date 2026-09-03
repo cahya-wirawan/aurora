@@ -15289,15 +15289,31 @@ severity choice.
     composite invalidation unsound), so a bounds-derived walk would
     silently miss exactly the leaked tiles it exists to find. Key
     collection peeks (`LruCache::iter` takes `&self`) so a sweep cannot
-    reorder somebody else's LRU.
+    reorder somebody else's LRU; nor can the freeing step, which
+    removes through `LruCache::pop` (unlinks one node, joins its
+    neighbours, promotes nothing) — 0.80.1 pinned that second half with
+    its own test, the first having been the only one covered before.
+  - `TileStore::forget_surfaces(&HashSet<SurfaceId>) -> usize`
+    (0.80.1) is now the primitive and `forget_surface` a one-element
+    call into it. Each sweep costs a full scan of everything the store
+    holds, so the per-surface loop the discard path used was
+    O(surfaces × tiles held) — ~2 surfaces per layer, run at exactly
+    the moment the store is fullest. One pass, testing each key against
+    the requested set, is O(tiles held).
   - `aurora_doc::forget_document_surfaces(layers, history, store)` —
     takes the `LayerTree` and `History` **by value**, so sweeping a
     *live* document is a compile error rather than a silent destruction
     of the user's pixels. Sweeps every live layer's content and mask
     surface plus every `RemovedSubtree` captured on the undo **or redo**
-    stack (an added-then-undone layer lives only on the latter). The
-    crash-recovery journal is deliberately not consulted — it is
-    discarded with the document.
+    stack (an added-then-undone layer lives only on the latter), and —
+    since 0.80.1 — every `Restore` entry in the crash-recovery journal
+    too. The journal was skipped in 0.80.0 on the stated grounds that a
+    surface named only there "names nothing anyone can still reach",
+    which review correctly called circular: that is a description of
+    this leak, not a reason to skip it. `add_pixel_layer`/`add_group`
+    journal the same `LayerOp::Restore` they push onto the undo stack,
+    so after an undo followed by a `clear_redo` the journal is the last
+    place naming that subtree's surfaces.
   - Two crate-private enumerators behind it: `LayerTree::all_surfaces`
     (walks the internal layer map, not `roots()`, so an unreachable
     entry is still counted) and `RemovedSubtree::surfaces` (mirrors
@@ -15331,12 +15347,26 @@ severity choice.
     `undo_of_a_remove_still_finds_the_removed_layers_painted_pixels`
     pins that, and was verified non-vacuous by emulating the naive
     free-at-remove implementation and watching it go red.
-  - **A redo entry evicted mid-session still leaks.** `History::push`
-    clears the redo stack on new activity and drops those captured
-    subtrees, after which nothing can name their tiles and the
-    document-discard sweep will never see them. Freeing them there was
-    *not* taken this round — `push` has no store handle, and giving it
-    one is a wider change. Named in `mask.rs`, not dropped.
+  - **A redo entry dropped mid-session still leaks — and this is the
+    one leak path here the shipped app really walks.** The private
+    `History::push` clears the redo stack on new structural activity,
+    and so does the **public** `History::clear_redo`, which
+    `aurora_app::UndoOrder::record` calls on every committed edit (so a
+    pixel edit and a structural edit invalidate each other's pending
+    redo). 0.80.0's disclosures named only `push` and so under-stated
+    the reachability; 0.80.1 names both, in `mask.rs` and in
+    `forget_document_surfaces`'s own doc comment. The 0.80.1 journal
+    sweep recovers the subset of those subtrees that came from an *add*
+    (whose `Restore` is journalled as well); anything else on that
+    stack is still gone. Freeing at the clearing point needs a store
+    handle neither `push` nor `clear_redo` has — a wider change.
+  - **A removal that bypassed `History` entirely leaks.**
+    `LayerTree::remove` (as opposed to `remove_capturing`) discards the
+    subtree rather than handing it back, so no `RemovedSubtree` reaches
+    either stack or the journal and those surfaces are past even the
+    sweep's reach. Mixing direct `LayerTree` calls with `History` is a
+    discouraged but supported shape, so this is reachable by
+    construction. Disclosed in 0.80.1, undisclosed before it.
   - Follow-on (4)'s **other** half — remove-a-mask-then-add-one
     resurrecting stale, spatially-shifted coverage — is untouched.
 
@@ -15350,6 +15380,49 @@ severity choice.
   the anti-naive undo test above; an added-then-undone layer, which
   fails if only `undo_stack` is scanned). Each was verified
   non-vacuous by a scratch mutation, reverted.
+
+  0.80.1 added six more. Two in `aurora-tile`:
+  `forget_surfaces_frees_every_requested_surface_and_spares_the_rest`
+  (batch entry point, including an unseen surface mixed into the
+  request that must contribute nothing to the tally) and
+  `a_sweep_that_frees_tiles_does_not_reorder_another_surfaces_lru` —
+  the half of the recency claim the pre-existing test could not reach,
+  since it only ever swept a surface the store had never seen and so
+  said nothing about the *freeing* step. Three in `aurora-doc`'s
+  `tree.rs`, all parameterized over ten boundary raw ids (both sides of
+  `MASK_SURFACE_BIT` and of `MASK_SURFACE_BIT - 1`, an ordinary id with
+  the mask bit set, `u64::MAX - 1`, `u64::MAX`) crossed with both
+  `LayerKind` variants: a **differential** one splicing the very same
+  `RemovedSubtree` into a real `LayerTree` and holding its detached
+  `surfaces()` against the live `surface_id`/`mask_surface_id` pair it
+  mirrors by hand (`restore` deliberately skips
+  `validate_layer_id_range`, which is what makes the out-of-range ids
+  comparable at all); one against an independently written reference
+  phrased in terms of *which half of the id space* an id sits in rather
+  than the numeric thresholds all three real implementations use, so
+  the mirrored pair cannot drift together and stay green; and one
+  asserting the reserved composite sentinel is never emitted. One in
+  `history.rs`:
+  `forget_document_surfaces_frees_a_surface_only_the_journal_still_names`,
+  which adds a layer, undoes it, calls `clear_redo()`, and then frees
+  2 tiles where the pre-0.80.1 two-stack body freed 0.
+
+  Each of the six was verified non-vacuous by a scratch mutation,
+  reverted: dropping the journal from the chain; widening each of
+  `RemovedSubtree::surfaces`'s two guards in turn (the content-guard
+  mutation makes a `u64::MAX` pixel layer emit the reserved composite
+  sentinel itself, which is exactly the hazard that doc comment names);
+  rebuilding the LRU by drain-and-reinsert after a sweep; and having
+  the batch entry point honour only one surface of the requested set.
+
+  **Verified (0.80.1)**: `cargo fmt --all --check`,
+  `check_layering.py`, `check_no_hardcoded_style.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace` (1,559
+  passing), `cargo test --workspace --doc`, and `RUSTDOCFLAGS=-D
+  warnings cargo doc --workspace --no-deps --all-features` all clean
+  locally. Library-only, no GPU or interactive verification, and none
+  is applicable — nothing in the app calls any of this yet.
 
   **Review found three real defects, all fixed by 0.70.4**: a
   cross-layer `SurfaceId` collision reachable through a crafted/

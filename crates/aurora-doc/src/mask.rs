@@ -167,12 +167,14 @@
 //!      [`crate::LayerTree`] and a [`crate::History`] **by value** and
 //!      sweeps every surface either can still name — live layers'
 //!      content and mask surfaces, plus every subtree captured on the
-//!      undo *or* redo stack — through
-//!      `aurora_tile::TileStore::forget_surface`. Note it does not gate
-//!      on a [`crate::LayerMask`] still being attached, which is what
-//!      makes it reach the residue the first bullet above describes.
+//!      undo *or* redo stack, plus (since 0.80.1) every `Restore`
+//!      entry in the crash-recovery journal — through
+//!      `aurora_tile::TileStore::forget_surfaces`. Note it does not
+//!      gate on a [`crate::LayerMask`] still being attached, which is
+//!      what makes it reach the residue the first bullet above
+//!      describes.
 //!
-//!      Two things it does **not** do yet, named rather than implied:
+//!      Three things it does **not** do, named rather than implied:
 //!
 //!      1. **Nothing in the app calls it.** `aurora_app::App`'s
 //!         `open_file`/`open_aur_file` are the intended callers and are
@@ -183,14 +185,27 @@
 //!         at zero. See that function's own doc comment for the full
 //!         account. So this is real, tested library code with no live
 //!         behaviour change behind it yet.
-//!      2. **A redo entry evicted mid-session still leaks.**
-//!         `History::push` clears the redo stack on any new activity,
-//!         and the captured subtrees it drops there take their surface
-//!         ids with them — after which nothing can name those tiles and
-//!         the document-discard sweep will never see them either.
-//!         Freeing them at that point is a real opportunity and was not
-//!         taken this round: `push` has no store handle, and giving it
-//!         one is a wider change than this round's scope.
+//!      2. **A redo entry dropped mid-session still leaks — and this
+//!         is the one leak path here that the shipped app really
+//!         walks.** `History::push` (private) clears the redo stack on
+//!         any new structural activity, and so does the *public*
+//!         `History::clear_redo`, which `aurora_app::UndoOrder::record`
+//!         calls on every committed edit so that a pixel edit and a
+//!         structural edit invalidate each other's pending redo. The
+//!         captured subtrees go with the cleared stack, and nothing can
+//!         name their tiles afterwards. The 0.80.1 journal sweep
+//!         recovers the subset that came from an *add* (whose `Restore`
+//!         is journalled too); anything else on that stack is gone.
+//!         Freeing at the clearing point needs a store handle neither
+//!         `push` nor `clear_redo` has, which is a wider change than
+//!         this round's scope.
+//!      3. **A removal that bypassed `History` entirely leaks.**
+//!         `LayerTree::remove` (as opposed to `remove_capturing`)
+//!         discards the subtree rather than handing it back, so no
+//!         `RemovedSubtree` reaches either stack or the journal and
+//!         those surfaces are past even the sweep's reach. Mixing
+//!         direct `LayerTree` calls with `History` is a discouraged but
+//!         supported shape, so this is reachable by construction.
 
 /// The bit that separates mask surfaces from layer-pixel surfaces in
 /// the shared `aurora_tile::TileStore`'s single `SurfaceId` space.

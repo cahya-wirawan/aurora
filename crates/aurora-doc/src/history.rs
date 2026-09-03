@@ -1116,15 +1116,67 @@ impl std::fmt::Debug for History {
 /// cannot use it afterwards. It is not an ergonomic accident, and it
 /// should not be relaxed to references.
 ///
-/// # What is deliberately not consulted
+/// # What is walked
 ///
-/// [`History`]'s crash-recovery journal. It is an ever-growing record
-/// of what this document did, and it is discarded with the document
-/// this call is discarding — so a surface named only there names
-/// nothing anyone can still reach. Both *stacks* are walked, though,
-/// including the redo stack: an added-then-undone layer's subtree sits
-/// on the redo stack and nowhere else, and its tiles are exactly as
-/// orphaned as any other's.
+/// Three sources, and the third was added in 0.80.1:
+///
+/// - every live layer's content and mask surface, via this crate's own
+///   crate-private `LayerTree::all_surfaces`;
+/// - every `RemovedSubtree` captured on the undo stack
+///   **or the redo stack** — an added-then-undone layer's subtree sits
+///   on the latter and nowhere else, and its tiles are exactly as
+///   orphaned as any other's;
+/// - every `Restore` entry in [`History`]'s own crash-recovery
+///   journal.
+///
+/// The journal used to be skipped, on the stated grounds that a
+/// surface named only there "names nothing anyone can still reach" —
+/// which is a description of this leak, not a reason to leave it. The
+/// case is concrete: [`History::add_pixel_layer`]/[`History::add_group`]
+/// push the same `LayerOp::Restore` onto the journal as onto the undo
+/// stack, so once that stack entry is consumed by an undo and the
+/// resulting redo entry is dropped (see the gap below), the journal
+/// can be the last place naming that subtree's surfaces. Sweeping it
+/// too is a strict superset at the cost of one more `Restore` scan,
+/// and this function's whole contract is that the caller has given
+/// the document up.
+///
+/// One caveat that does not change the decision, but is worth knowing:
+/// unlike the two stacks, a journal can come from *outside* this
+/// process — [`History::load_journal`] deserializes one whole, with
+/// deliberately no structural validation. It cannot make the sweep
+/// name `aurora-app`'s reserved composite surface (both guards in
+/// `RemovedSubtree::surfaces` exclude it), but it can name arbitrary
+/// layer ids. That is the same cross-document aliasing hazard the
+/// "wiring this into the app" section below is already blocked on,
+/// not a new one.
+///
+/// # What is still not covered
+///
+/// Two gaps, each one a surface this sweep can no longer name (a
+/// third, separate limitation — that nothing in the app calls this at
+/// all yet — is the follow-on section further down):
+///
+/// 1. **A redo entry dropped mid-session.** `History`'s private `push`
+///    helper clears the redo stack on any new structural activity, and
+///    so does the *public* [`History::clear_redo`] — which
+///    `aurora_app::UndoOrder::record` calls on every committed edit, to
+///    keep this history's redo stack and `aurora_brush::PixelHistory`'s
+///    invalidating each other. That makes this the one leak path here
+///    that is live and reachable in the shipped app today. The captured
+///    subtrees go with the cleared stack; the journal sweep above
+///    recovers the ones that came from an *add* (whose `Restore` is
+///    also journalled), but not a redo entry that arrived any other
+///    way. Freeing at that point needs a store handle neither `push`
+///    nor `clear_redo` has, which is a wider change than this round.
+/// 2. **A removal that bypassed [`History`] entirely.**
+///    [`LayerTree::remove`] — as opposed to `remove_capturing` — drops
+///    the subtree on the floor rather than handing it back, so no
+///    `RemovedSubtree` reaches either stack or the journal and the
+///    removed layer's surfaces are beyond even this sweep's reach.
+///    Mixing direct `LayerTree` calls with `History` is a discouraged
+///    but supported shape (see [`History`]'s own doc comments), so this
+///    is reachable by construction, not merely in theory.
 ///
 /// # Named follow-on: wiring this into the app
 ///
@@ -1148,15 +1200,21 @@ pub fn forget_document_surfaces(
     store: &mut aurora_tile::TileStore,
 ) -> usize {
     let mut surfaces: HashSet<aurora_tile::SurfaceId> = layers.all_surfaces().into_iter().collect();
-    for op in history.undo_stack.iter().chain(history.redo_stack.iter()) {
+    for op in history
+        .undo_stack
+        .iter()
+        .chain(history.redo_stack.iter())
+        .chain(history.journal.iter())
+    {
         if let LayerOp::Restore(removed) = op {
             surfaces.extend(removed.surfaces());
         }
     }
-    surfaces
-        .into_iter()
-        .map(|surface| store.forget_surface(surface))
-        .sum()
+    // One batched call, not one `forget_surface` per surface: each of
+    // those does its own full scan of everything the store holds, so
+    // the loop would be O(surfaces × tiles held) at exactly the moment
+    // the store is fullest.
+    store.forget_surfaces(&surfaces)
 }
 
 #[cfg(test)]
@@ -3395,6 +3453,56 @@ mod tests {
         assert_eq!(
             super::forget_document_surfaces(tree, history, &mut store),
             2
+        );
+        assert!(!store.contains_tile(content, tile()));
+        assert!(!store.contains_tile(mask, tile()));
+    }
+
+    #[test]
+    /// The journal as *last* namer, which is why 0.80.1 started
+    /// sweeping it.
+    ///
+    /// Add a layer, undo it (its subtree moves to the redo stack), then
+    /// `clear_redo()` — which the shipped app's own
+    /// `aurora_app::UndoOrder::record` calls on every committed edit.
+    /// After that the tree does not hold the layer, neither stack holds
+    /// its subtree, and the crash-recovery journal's `Restore` entry is
+    /// the only thing left in the whole document that can name its
+    /// surfaces. Against the pre-0.80.1 body, which chained only the
+    /// two stacks, this frees 0 tiles instead of 2.
+    fn forget_document_surfaces_frees_a_surface_only_the_journal_still_names() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(id) = history.add_pixel_layer(&mut tree, "Journalled", bounds(), None) else {
+            unreachable!("an empty tree accepts a root layer");
+        };
+        let content = content_surface(&tree, id);
+        let mask = mask_surface(&tree, id);
+        paint(&mut store, content, 5);
+        if let Err(err) = crate::write_mask_coverage(&mut store, mask, tile(), 4, 4, 0.5) {
+            unreachable!("{err:?}");
+        }
+
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        history.clear_redo();
+
+        assert!(!tree.contains(id), "the add was undone");
+        assert!(!history.can_undo(), "nothing left on the undo stack");
+        assert!(!history.can_redo(), "and clear_redo emptied the other one");
+        assert!(
+            history.journal_len() > 0,
+            "the journal is the only place left naming this subtree"
+        );
+        assert!(store.contains_tile(content, tile()));
+        assert!(store.contains_tile(mask, tile()));
+
+        assert_eq!(
+            super::forget_document_surfaces(tree, history, &mut store),
+            2,
+            "a journal-only-reachable subtree's surfaces must still be swept"
         );
         assert!(!store.contains_tile(content, tile()));
         assert!(!store.contains_tile(mask, tile()));
