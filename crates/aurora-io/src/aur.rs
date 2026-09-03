@@ -1302,11 +1302,24 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
 
     // Every tile this scan commits is recorded, and undone if the scan
     // does not finish -- see `read_persisted_tiles` for why a partial
-    // read must not survive.
+    // read must not survive. `elided` is the same idea for the
+    // positions the scan would clear rather than write: applied only
+    // once the scan is known to have succeeded, so a rejected file
+    // clears nothing it merely elided (0.82.2).
     let mut committed: Vec<(SurfaceId, TileId)> = Vec::new();
-    if let Err(err) = read_persisted_tiles(&mut zip, &manifest.layers, store, &mut committed) {
+    let mut elided: Vec<(SurfaceId, TileId)> = Vec::new();
+    if let Err(err) = read_persisted_tiles(
+        &mut zip,
+        &manifest.layers,
+        store,
+        &mut committed,
+        &mut elided,
+    ) {
         roll_back_committed_tiles(store, &committed, &err);
         return Err(err);
+    }
+    for (surface, tile_id) in elided {
+        store.forget_tile(surface, tile_id);
     }
 
     Ok(AurDocument {
@@ -1455,12 +1468,21 @@ fn read_skipped_tiles<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<Skipped
 /// is the part still waiting on the architectural fix PLAN.md's 0.82.1
 /// addendum names.
 ///
-/// One accepted consequence on the failure path: a read that fails
-/// part-way has, at the positions it already cleared, dropped the live
-/// document's tiles with nothing to restore them. That is not a new
-/// class of loss — rollback *already* drops (rather than restores) the
-/// live tiles at every position the file did have an entry for — it is
-/// the same loss at more positions.
+/// **The clears are deferred, not applied inline (0.82.2).** This scan
+/// only *records* which positions it would clear, in `elided`; nothing
+/// is actually forgotten from `store` until [`read`] sees the whole scan
+/// succeed. A read that fails part-way therefore leaves every
+/// not-yet-cleared position exactly as it was, on top of `committed`'s
+/// existing guarantee for positions the file actually wrote — so a
+/// rejected container now destroys nothing beyond what its own entries
+/// overwrote, on either list. The first attempt at this (0.82.1) called
+/// `forget_tile` inline instead, which was strictly worse on the failure
+/// path than the bug it fixed: at a position the file simply elided, the
+/// live document's tile had not been touched by anything, and the
+/// inline clear destroyed it anyway, for a read that then failed.
+/// `elided` costs the same twelve bytes per entry `committed` already
+/// does, and the two lists are disjoint by construction (a position is
+/// never on both — it either got a real write or a missing one).
 ///
 /// # Errors
 ///
@@ -1474,6 +1496,7 @@ fn read_persisted_tiles<R: Read + Seek>(
     layers: &LayerTree,
     store: &mut TileStore,
     committed: &mut Vec<(SurfaceId, TileId)>,
+    elided: &mut Vec<(SurfaceId, TileId)>,
 ) -> Result<(), IoError> {
     for (surface, bounds) in persisted_surfaces(layers) {
         // Range-checked and charged against the whole-document budget
@@ -1490,7 +1513,8 @@ fn read_persisted_tiles<R: Read + Seek>(
                     // written (see this module's own doc comment), so
                     // the store must read blank here afterwards.
                     //
-                    // `forget_tile`, not `continue`: "stays at the
+                    // `forget_tile` (deferred, see this function's own
+                    // doc comment), not `continue`: "stays at the
                     // store's own default" was only true of a store
                     // that held nothing at this key. This reader writes
                     // into the *caller's live* store, and a fresh
@@ -1501,19 +1525,20 @@ fn read_persisted_tiles<R: Read + Seek>(
                     // pixels visible under the new one -- in the
                     // *interior* of the new document, not just at its
                     // edges, since a whole interior tile is elided when
-                    // it was blank at save time. See the 0.82.1
-                    // addendum in PLAN.md.
+                    // it was blank at save time. See the 0.82.1/0.82.2
+                    // addenda in PLAN.md.
                     //
-                    // Nothing is recorded for rollback: this commits no
-                    // content, it removes some. The cost is three hash
-                    // lookups per elided position on a store that holds
-                    // nothing there, and it materializes nothing --
+                    // Recorded here, cleared only once `read` sees the
+                    // whole scan succeed -- this commits no content, so
+                    // it does not belong on `committed`, but it must
+                    // not touch `store` before this read is known to
+                    // succeed either. Materializes nothing -- still
                     // deliberately not "write an explicit blank tile",
                     // which would materialize every blank grid position
                     // of every persisted surface and is unbounded at the
                     // §7.3.1 ceiling.
                     Err(zip::result::ZipError::FileNotFound) => {
-                        store.forget_tile(surface, tile_id);
+                        elided.push((surface, tile_id));
                         continue;
                     }
                     Err(err) => return Err(err.into()),
@@ -4257,6 +4282,87 @@ mod tests {
         assert!(
             store.contains_tile(mask_surface, TileId { x: 0, y: 0 }),
             "a successful read must leave its mask tile in the store"
+        );
+    }
+
+    /// The 0.82.2 fix, pinned: a read that fails *after* eliding one
+    /// position must not have cleared that position on the way. 0.82.1
+    /// called `forget_tile` inline the moment it saw a missing entry —
+    /// correct on a successful read, but on a read that then fails
+    /// later (here, on the mask tile, which `persisted_surfaces` always
+    /// yields after a layer's own content), it destroyed a live tile
+    /// nothing else had touched, for an open that ultimately failed.
+    ///
+    /// Same shape as `a_read_that_fails_on_a_mask_tile_leaves_no_content_tile_behind_either`,
+    /// but with no content entry at all rather than a valid one: the
+    /// content position is *elided*, not *committed*, so it is
+    /// `elided`'s guarantee under test, not `committed`'s.
+    #[test]
+    fn a_failed_read_does_not_clear_a_position_it_only_elided() {
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("masked", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_mask(id, mask_bounds()) {
+            unreachable!("{err:?}");
+        }
+        let (Some(content_surface), Some(mask_surface)) =
+            (layers.surface_id(id), layers.mask_surface_id(id))
+        else {
+            unreachable!("a pixel layer with a mask has both surfaces");
+        };
+        let manifest = ManifestReadForTest {
+            version: super::MANIFEST_VERSION,
+            canvas_width: 1000,
+            canvas_height: 1000,
+            color_space: super::ColorSpaceTag::Srgb,
+            layers,
+        };
+        let manifest_bytes = match postcard::to_allocvec(&manifest) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // No entry at all for the content tile -- elided, not written --
+        // and a mask entry `codec::decode` genuinely rejects, so the
+        // scan fails strictly after recording the elision.
+        let mask_entry = super::tile_entry_name(mask_surface, TileId { x: 0, y: 0 });
+        let container = container_with(
+            &manifest_bytes,
+            &[(mask_entry, b"this is not an encoded tile".to_vec())],
+        );
+
+        let (_dir, mut store) = real_tile_store();
+        // The live document's own tile, sitting under the exact key the
+        // file's content surface will elide. Distinctive, so a clear
+        // would be unmistakable.
+        {
+            let tile = match store.get_mut(content_surface, TileId { x: 0, y: 0 }) {
+                Ok(tile) => tile,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            for sample in tile.texels_mut() {
+                *sample = f16::from_f32(1.0);
+            }
+        }
+
+        match read(container, &mut store) {
+            Err(super::IoError::Tile(_)) => {}
+            other => unreachable!("expected a tile decode failure, got {other:?}"),
+        }
+
+        let survived = match store.get(content_surface, TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            survived.texels().iter().all(|s| exactly(s.to_f32(), 1.0)),
+            "a position the read only elided must survive a read that failed later, \
+             untouched by the clear that never got to run"
+        );
+        assert!(
+            !store.contains_tile(mask_surface, TileId { x: 0, y: 0 }),
+            "the mask tile itself must still not survive its own decode failure"
         );
     }
 

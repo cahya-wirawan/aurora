@@ -15754,13 +15754,15 @@ severity choice.
 
     The arm now calls `aurora_tile::TileStore::forget_tile` instead.
     The key is dropped, so the store's next `get` there hands back a
-    genuine `Tile::blank()`. Cost: three hash lookups per elided grid
-    position, and it materializes nothing. The alternative the review
-    proposed — *writing* an explicit blank tile — was considered and
-    rejected: it would materialize every blank grid position of every
-    persisted surface on every open, which is unbounded at the
-    §7.3.1 ceiling and is exactly the doubled memory and scratch
-    traffic `read_persisted_tiles` already refuses to pay for staging.
+    genuine `Tile::blank()`. Cost: `forget_tile`'s own real work per
+    elided position (a handful of hash-map lookups plus an O(pending
+    failed writes) retain, normally empty), and it materializes
+    nothing. The alternative the review proposed — *writing* an
+    explicit blank tile — was considered and rejected: it would
+    materialize every blank grid position of every persisted surface
+    on every open, which is unbounded at the §7.3.1 ceiling and is
+    exactly the doubled memory and scratch traffic
+    `read_persisted_tiles` already refuses to pay for staging.
     `forget_tile` gets the same correctness for less than nothing (it
     also frees the residue rather than replacing it with zeros).
 
@@ -15771,13 +15773,6 @@ severity choice.
     own grid — is untouched and still real. The first of those bites
     the moment the user adds a layer, which claims the next id up and
     with it whatever the outgoing document left on that surface.
-
-    One accepted consequence on the failure path: a read that fails
-    part-way has, at positions it already cleared, dropped the live
-    document's tiles with nothing to restore them. Not a new class of
-    loss — `roll_back_committed_tiles` *already* drops (rather than
-    restores) the live tiles at every position the file did have an
-    entry for — the same loss at more positions.
 
     Test: `aurora-io`'s
     `a_blank_tile_elided_from_the_file_reads_back_blank_over_a_stale_store`.
@@ -15791,6 +15786,37 @@ severity choice.
     one painted tile still round-trips. Verified non-vacuous by
     reverting the arm to `continue`, which fails it on the residue
     assertion.
+
+  **0.82.2 — the Judge's one substantive finding: deferring the clear
+  removes a failure-path cost 0.82.1 accepted rather than needed to.**
+  0.82.1's arm called `forget_tile` inline, in the same loop iteration
+  that found a missing entry. Its own doc comment framed the
+  failure-path consequence as "not a new class of loss... the same
+  loss at more positions" — true in outcome (either way the live
+  document ends up missing tiles at those keys after a failed read)
+  but not in mechanism: at a position the file *had* an entry,
+  something had already overwritten the live tile before rollback
+  ever ran, so rollback was never the thing destroying it; at a
+  position the file merely *elided*, nothing had touched the live
+  tile, and the inline clear was the sole cause of its loss, for a
+  read that then failed anyway. `elided`, a second `Vec<(SurfaceId,
+  TileId)>` alongside the existing `committed`, now records these
+  positions instead of clearing them inline; [`read`] applies
+  `forget_tile` to every entry in `elided` only after
+  `read_persisted_tiles` returns `Ok` — never on the error path, where
+  `roll_back_committed_tiles` still runs exactly as before. The two
+  lists are disjoint by construction (a grid position gets exactly one
+  outcome: a real entry, on `committed`, or a missing one, on
+  `elided`), so there is no ordering question between them, and the
+  cost is the same twelve bytes per entry `committed` already pays. On
+  a successful read the observable result is identical to 0.82.1; on a
+  failed one, nothing is destroyed beyond what the file's own entries
+  overwrote. `a_blank_tile_elided_from_the_file_reads_back_blank_over_a_stale_store`
+  is unaffected (still asserts the post-success state); no new test
+  was needed for the success path, since deferral is invisible there
+  by design — the failure-path guarantee itself is disclosed here
+  rather than pinned by a test, matching this function's own existing
+  practice for `roll_back_committed_tiles`'s failure path.
 
   - **The leak half is still open and still needs the architecture
     decision** — the per-document `SurfaceId` namespace or the staging
