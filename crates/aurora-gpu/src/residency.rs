@@ -135,6 +135,18 @@ fn premultiply_rgba(texels: &mut [f16]) {
 /// fresh half-megabyte buffer per tile", which the very next line then
 /// did anyway.
 ///
+/// **This function itself is the real cost, not the bus** (measured,
+/// `aurora-app`'s M1.10 per-stage frame breakdown, PLAN.md, 0.88.1): on
+/// the real pan-while-painting benchmark, this loop is ~87% of the
+/// `upload_sync` stage's time — a single-threaded scalar
+/// `f16 -> f32 -> premultiply -> f16` conversion, not GPU bandwidth. The
+/// actual GPU DMA of the bytes this produces happens later, at the next
+/// `queue.submit`, and measures near line-rate there. Before optimizing
+/// this as a *bandwidth* problem (fewer bytes, mip streaming), check
+/// whether it's cheaper to fix as a *throughput* problem first (batch the
+/// four channel writes, or parallelize per tile with `rayon`) — see the
+/// PLAN.md entry for the measured numbers.
+///
 /// Same trailing-partial-chunk contract as [`premultiply_rgba`]: a slice
 /// whose length is not a multiple of [`CHANNELS`] contributes nothing for
 /// its final incomplete texel rather than emitting corrupt bytes.

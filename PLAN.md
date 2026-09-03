@@ -17843,10 +17843,9 @@ severity choice.
     support: `report_frame_stages` printed the *mean* alone, and the one
     per-frame sample it did print (the worst-total frame) showed
     `gpu_tiles=1`. 0.88.1 added min/max, and it is **not** steady —
-    measured **min 1, max 5** over 40 frames. The remaining ~17 tiles —
-    the other ~17 have nothing stored and take 0.87.0's CPU path, so
-    most of phase 1 is a CPU walk over tiles that produce no visible
-    pixels. On the CPU-fallback test `gpu_tiles` is **0/frame on every
+    measured **min 1, max 5** over 40 frames. The other ~17 tiles have
+    nothing stored and take 0.87.0's CPU path, so most of phase 1 is a
+    CPU walk over tiles that produce no visible pixels. On the CPU-fallback test `gpu_tiles` is **0/frame on every
     frame**, which is the intended control and confirms that test
     genuinely never enters `begin_gpu_composite_tile`.
 
@@ -17931,6 +17930,25 @@ severity choice.
   this entry, adds `gpu_tiles` min/max and the `SyncStats`
   tiles/bytes-per-frame line to `report_frame_stages` (both print-only,
   in `#[cfg(test)]` code), and asserts on none of it.
+
+  **0.88.2 — three follow-up corrections an independent Judge caught,
+  applied directly.** All doc-only, no behaviour change: (1) the
+  GPU-path test's own "what this does NOT cover" list still claimed "no
+  real GPU hardware has been confirmed for this test at all yet, only
+  this sandbox's software Vulkan adapter" — directly contradicting the
+  budget paragraph two sentences above it, which already quotes the
+  real `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`; a leftover from
+  before this sandbox's hardware was corrected elsewhere in this file,
+  missed by the Builder, the Reviser, and both Verifiers across this
+  round. (2) A duplicated, dangling clause in this entry's own
+  `gpu_tiles` paragraph above ("The remaining ~17 tiles — the other ~17
+  have nothing stored..."). (3) `extend_premultiplied_le_bytes`'s own
+  doc comment (`residency.rs:141-152`, the candidate this entry names
+  as the largest measured hot spot) still only carried the *old*
+  "bandwidth-bound" attribution from `spike/FINDINGS.md`; it now points
+  at this measurement and states plainly that the function itself, not
+  the bus, is the cost — so a reader who lands there directly, without
+  reading this PLAN.md entry first, gets the corrected story too.
 
   **A baseline discrepancy, flagged not fixed.** The 98.75 ms / 54.10 ms
   p99 figures in this entry above — and the identical pair in

@@ -27721,10 +27721,15 @@ mod tests {
     /// same headless technique `spike/vertical-slice`'s own
     /// `headless_bench` already validated, never a real swapchain); no
     /// CPU-fallback path in *this* test (the sibling test below covers
-    /// that); no real GPU hardware has been confirmed for this test at
-    /// all yet, only this sandbox's software Vulkan adapter (see the
-    /// budget paragraph above); and this is one adapter, one platform
-    /// (Linux) -- not cross-platform evidence.
+    /// that); and this is one adapter, one platform (Linux) -- not
+    /// cross-platform evidence. The adapter itself IS confirmed real,
+    /// not software: `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`,
+    /// printed verbatim by every `AURORA_REQUIRE_GPU=1` run and quoted
+    /// in the budget paragraph above -- an older draft of this comment
+    /// claimed the opposite (a leftover from when this sandbox really
+    /// did have only Mesa llvmpipe, corrected once already elsewhere in
+    /// this file); the one-adapter/one-platform caveat above is the
+    /// real, narrower limitation.
     ///
     /// **0.88.0 added a per-stage breakdown** via
     /// [`report_frame_stages`], printed under `--nocapture` and asserted
