@@ -8246,7 +8246,7 @@ fn recomposite_visible_tiles(
     // the `copy_from_slice` and, far more expensively, the `mark_dirty`
     // that follows it are then pure waste: the dirty flag is what makes
     // `aurora_gpu::TileResidency::sync` serialize the tile through its
-    // scalar `f16 -> premultiply -> le_bytes` loop and hand ~512 KB to
+    // `f16 -> premultiply -> le_bytes` loop and hand ~512 KB to
     // `queue.write_texture`. So this removes work rather than speeding it
     // up. `cache.mark_current` still happens on both branches: whether
     // the bytes moved has nothing to do with whether the tile is now
@@ -28178,9 +28178,9 @@ mod tests {
         /// breakdown of this interval:
         ///
         /// - **87.1%** `aurora_gpu::residency`'s
-        ///   `extend_premultiplied_le_bytes` -- a single-threaded, scalar
+        ///   `extend_premultiplied_le_bytes` -- a single-threaded
         ///   `f16 -> f32 -> premultiply -> f16 -> le_bytes` loop over
-        ///   every texel of every dirty tile. No `rayon`, no SIMD.
+        ///   every texel of every dirty tile. No `rayon`.
         /// - **12.7%** `queue.write_texture`'s own CPU-side staging
         ///   `memcpy`.
         /// - **~0%** `TileStore::get` (the tile-store read).
@@ -28189,12 +28189,24 @@ mod tests {
         /// which issued four separate 2-byte appends per texel; 0.89.0
         /// batched them into one 8-byte append and **no fresh internal
         /// probe has been re-taken since**. Treat the split as
-        /// approximate rather than current. It is very unlikely to have
-        /// moved much: 0.89.0 bought only ~1-5% off this stage's p50 and
-        /// nothing at p99, and the reason it bought so little is that the
-        /// per-texel `f16 -> f32 -> multiply -> f16` arithmetic — not the
-        /// append bookkeeping it removed — was always the larger share of
-        /// the 87.1%.
+        /// approximate rather than current: 0.89.0 bought only ~1-5% off
+        /// this stage's p50 and nothing at p99, because the per-texel
+        /// `f16 -> f32 -> multiply -> f16` arithmetic — not the append
+        /// bookkeeping it removed — was always the larger share of the
+        /// 87.1%.
+        ///
+        /// **Then 0.92.0 vectorized exactly that arithmetic, so the split
+        /// is now stale in a known direction.** This text said "scalar"
+        /// and "no SIMD" through 0.92.0; both were false from 0.92.0
+        /// onward, and the words are corrected above. The loop converts
+        /// through `half::slice::HalfFloatSliceExt`, eight lanes per F16C
+        /// instruction, and 0.92.0 measured that as a genuine, externally
+        /// reproduced ~2.4x cut to this stage — so its share of the
+        /// interval fell substantially and `write_texture`'s `memcpy`
+        /// share rose correspondingly. **Do not quote 87.1%/12.7%
+        /// forward.** PLAN.md's 0.92.0 entry carries the current
+        /// before/after table for this stage; no fresh *internal* split
+        /// has been probed since.
         ///
         /// The actual GPU DMA copy does **not** execute in this interval:
         /// `write_texture` only records it, and it runs at the later
@@ -28202,7 +28214,9 @@ mod tests {
         /// 0.51-0.61 ms for 10 MB works out to ~17 GB/s, consistent with
         /// real PCIe/GPU bandwidth. So "`upload_sync` dominates the
         /// frame" is true as an *interval*, but it is not an upload-
-        /// bandwidth finding: it is a scalar CPU serialization loop.
+        /// bandwidth finding: it is a CPU serialization loop (a scalar
+        /// one when this was written; vectorized since 0.92.0, and still
+        /// the stage's largest single share).
         upload_sync: Vec<f64>,
         /// Building the command encoder, bind group, pipeline and the
         /// one render pass. Records commands; runs nothing.
@@ -28821,7 +28835,7 @@ mod tests {
     /// picking the next optimization target:
     ///
     /// - `upload_sync` is **not** GPU upload bandwidth. It is ~87%
-    ///   `aurora_gpu::residency`'s scalar, single-threaded
+    ///   `aurora_gpu::residency`'s single-threaded
     ///   `extend_premultiplied_le_bytes` serialize loop and ~13%
     ///   `write_texture`'s staging `memcpy`; the real GPU DMA runs later,
     ///   at `queue.submit`, inside `submit_poll`. See [`FrameStages`]'s
@@ -28829,8 +28843,18 @@ mod tests {
     ///   against the pre-0.89.0 four-append loop and have **not** been
     ///   re-probed since 0.89.0 batched the appends, so read them as
     ///   approximate: that change bought only ~1-5% off the stage
-    ///   precisely because the scalar arithmetic, not the appends it
-    ///   removed, was always the bulk of the ~87%.
+    ///   precisely because the per-texel conversion arithmetic, not the
+    ///   appends it removed, was always the bulk of the ~87%.
+    ///
+    ///   **Stale in a known direction since 0.92.0.** This bullet called
+    ///   that loop "scalar" through 0.92.0; it is not, and has not been
+    ///   since 0.92.0 vectorized the conversion through
+    ///   `half::slice::HalfFloatSliceExt` for a measured, independently
+    ///   reproduced ~2.4x cut to this stage. The loop's share of the
+    ///   interval therefore fell substantially and the `memcpy`'s rose;
+    ///   read PLAN.md's 0.92.0 before/after table as the current number
+    ///   rather than the ~87%/~13% split, which no fresh internal probe
+    ///   has re-taken.
     /// - The ~17 tiles per frame that do *not* take the GPU path are not
     ///   cheap and are not skipped: each is materialized as a full
     ///   transparent tile, written back, marked fully dirty, and then

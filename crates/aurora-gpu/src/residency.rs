@@ -37,7 +37,7 @@ const TILE_BYTES: usize = SAMPLES * 2;
 /// "over" collapsed to pure background, and the canvas rendered as pure
 /// checkerboard. (That sentence said "straight-alpha" until 0.68.0 moved
 /// the alpha-convention boundary to upload time — see
-/// [`premultiply_rgba`]; the conclusion is unchanged either way, since
+/// `premultiply_rgba`; the conclusion is unchanged either way, since
 /// both formulas collapse to the background at `a = 0`.)
 ///
 /// It *did* land on them. `write_uniform` makes the atlas cover `1/zoom`
@@ -79,6 +79,22 @@ const MIP_LEVELS: u32 = 4;
 /// Converts a tile's straight-alpha texels to **premultiplied** alpha in
 /// place: each texel's `r`/`g`/`b` multiplied by its own `a`.
 ///
+/// **Test-only since 0.92.1**, and `#[cfg(test)]` so that stays true:
+/// this is the scalar *reference* implementation the equivalence tests
+/// below pin `extend_premultiplied_le_bytes` against, not a path any
+/// upload takes. Both real upload paths ([`TileResidency::sync`] and
+/// [`TileResidency::upload_mip`]) call `extend_premultiplied_le_bytes`.
+/// They did not between 0.92.0 and 0.92.1 — `upload_mip` still ran this
+/// function — and that split is exactly what made the two paths disagree
+/// on a double-NaN texel while writing the same atlas texture. Keeping
+/// the reference compiled only under `cfg(test)` is what stops that
+/// regression from being reintroduced by accident.
+///
+/// The rest of this comment is the canonical write-up of *why* the atlas
+/// holds premultiplied alpha at all. It is still accurate and still the
+/// thing `canvas.wgsl`, `render_test.rs` and PLAN.md point at; only the
+/// function that applies it on the real upload path has moved.
+///
 /// This is the alpha-convention boundary for the atlas, and it is here
 /// — at upload — rather than in the shader, for one reason:
 /// **hardware texture filtering has to happen in the premultiplied
@@ -109,6 +125,7 @@ const MIP_LEVELS: u32 = 4;
 /// pattern below is what ties this to `CHANNELS == 4`, which
 /// `premultiply_rgba_is_written_against_a_four_channel_texel` pins
 /// against the crate's own constant rather than leaving it implied.
+#[cfg(test)]
 fn premultiply_rgba(texels: &mut [f16]) {
     for texel in texels.chunks_exact_mut(CHANNELS) {
         let [r, g, b, a] = texel else {
@@ -131,7 +148,7 @@ const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
 
 /// Appends `texels` to `out` as the little-endian `f16` bytes
 /// `wgpu::Queue::write_texture` wants, **premultiplied on the way**
-/// ([`premultiply_rgba`]'s arithmetic, applied per texel as the bytes are
+/// (`premultiply_rgba`'s arithmetic, applied per texel as the bytes are
 /// written rather than in a separate pass over a separate buffer).
 ///
 /// This exists so [`TileResidency::sync`] needs one reusable buffer for
@@ -192,9 +209,16 @@ const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
 /// `#[target_feature(enable = "f16c")]` function, which cannot be
 /// inlined into a caller that was not compiled with that feature. At
 /// today's per-texel granularity a 256×256 tile pays that overhead
-/// three times per texel for RGB plus once for the widening of alpha —
-/// on the order of 393,000 non-inlinable calls, each preceded by a
-/// feature-detection check, per tile. That bookkeeping, not the
+/// **seven times per texel**: one `f32::from` to widen alpha, three more
+/// to widen R/G/B, and three `f16::from_f32` calls to narrow the three
+/// products back down. That is `7 × 65,536 = 458,752` non-inlinable
+/// calls, each preceded by a feature-detection check, per tile. (This
+/// paragraph said "three times per texel for RGB plus once for the
+/// widening of alpha — on the order of 393,000" through 0.92.0. Both
+/// halves were wrong and they were wrong inconsistently: the prose named
+/// four operations, which would be 262,144, while the figure implied six.
+/// Counted against the pre-0.92.0 body itself — `git show HEAD^` at the
+/// 0.92.1 commit — it is seven and 458,752.) That bookkeeping, not the
 /// conversion, is the cost.
 ///
 /// **`wide` was evaluated and rejected.** The user's starting
@@ -203,7 +227,7 @@ const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
 /// type at all.** Its lane vocabulary is `i8`/`i16`/`i32`/`i64`,
 /// `u8`/`u16`/`u32`/`u64`, `f32` and `f64` — so it cannot vectorize the
 /// `f16` ↔ `f32` conversion, which is the part that costs. It would
-/// vectorize only the alpha multiply, leaving all ~393,000 scalar
+/// vectorize only the alpha multiply, leaving all 458,752 scalar
 /// conversion calls exactly where they are. Second: without a
 /// target-feature bump this round is not making (no `RUSTFLAGS`, no
 /// `.cargo/config.toml`), `wide`'s widest guaranteed lane width on
@@ -225,16 +249,74 @@ const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
 /// correct, just not faster; on `aarch64` it takes `half`'s own `fp16`
 /// NEON path. Neither non-F16C `x86_64` nor `aarch64` is verified here.
 ///
-/// **Bit-exactness with the scalar path is not assumed, it is checked.**
-/// `half`'s scalar and 8-wide x86 paths issue the same instructions with
-/// the same rounding immediate (`_MM_FROUND_TO_NEAREST_INT`), and the
-/// multiply keeps the scalar path's `rgb * alpha` operand order so a
-/// single-NaN product carries the same payload. The equivalence tests
-/// below pin this against [`premultiply_rgba`], which is deliberately
-/// left scalar as the reference implementation.
+/// **Bit-exactness with the scalar path: what is guaranteed, and the one
+/// case that is not.** `half`'s scalar and 8-wide x86 paths issue the same
+/// conversion instructions with the same rounding immediate
+/// (`_MM_FROUND_TO_NEAREST_INT`), and the multiply keeps the scalar
+/// path's `rgb * alpha` operand order. So for **any input where at most
+/// one of a texel's RGB channel and its alpha is NaN**, this function is
+/// bit-for-bit identical to `premultiply_rgba` followed by a plain
+/// little-endian serialize — every finite value, both infinities, both
+/// signed zeros, every subnormal, and every single-NaN combination. That
+/// half was established exhaustively over all 65,536 × 65,536 (RGB bits ×
+/// alpha bits) texels by an independent review pass and holds.
+///
+/// **When a texel's RGB channel and its alpha are *both* NaN, the two
+/// spellings can disagree on the result's NaN payload.** 0.92.0's doc
+/// comment claimed bit-exactness without qualification; that claim was
+/// false for exactly this case, which is why it is spelled out here
+/// instead of hedged. What is still guaranteed is that the result is *a*
+/// NaN carrying one of the two NaN operands' payloads, quieted — the pixel
+/// was already meaningless before and after, so this turns garbage into
+/// different garbage rather than corrupting a good pixel. What is *not*
+/// guaranteed is *which* operand's payload survives: `NaN × NaN` returns
+/// the quieted **first source operand** on x86, and which of `rgb` and
+/// `alpha` ends up "first" is an operand-order detail of whatever code
+/// LLVM emits. Neither IEEE 754 nor this source pins it down.
+///
+/// **Measured, because the shape of it is not what it looks like.** Per
+/// channel position, "which operand's payload survives" on `x86_64`
+/// (0.92.1, this sandbox, all 30 ordered pairs of six distinct NaN
+/// payloads, every texel of a full chunk):
+///
+/// | profile | this function | `premultiply_rgba` | agree? |
+/// |---|---|---|---|
+/// | `opt-level = 1` (the default test profile) | rgb, rgb, **alpha** | rgb, rgb, **alpha** | yes, bit-exact |
+/// | `opt-level = 3` (`--release`) | **alpha**, rgb, **alpha** | rgb, rgb, **alpha** | no — R diverges |
+///
+/// Three things worth reading off that table, none of them obvious. The
+/// divergence between the two paths is **release-only**: at the profile
+/// `cargo test` and `cargo nextest` actually use, they agree bit-for-bit
+/// even here. `premultiply_rgba` is **not** a scalar baseline that IEEE
+/// 754 pins — LLVM auto-vectorizes its loop too, and it already sources
+/// B's payload from `alpha` at every profile measured, so the divergence
+/// is between two *different* auto-vectorizations of the same arithmetic
+/// rather than between a vector path and a scalar one. And the choice
+/// varies by *channel position*, not by texel or by payload: LLVM
+/// vectorizes some of the three multiplies and leaves others alone, and
+/// which ones move with the optimizer.
+///
+/// `the_fused_serializer_agrees_on_a_double_nan_texel_up_to_the_payload_operand`
+/// below pins what survives all of that — the payload comes from one of
+/// the two operands and never from anywhere else, each channel position
+/// chooses consistently across every texel and every payload pair, and
+/// alpha passes through untouched — so a toolchain change that moved this
+/// somewhere else fails a test instead of passing silently. It
+/// deliberately does not assert *which* operand, since that is the part
+/// the table shows to be profile-dependent.
+///
+/// Reachability, stated rather than hand-waved: `aurora-io`'s 16-bit-float
+/// TIFF reader takes raw `f16` samples verbatim with no NaN filtering, so
+/// a malformed or adversarial file can construct this input directly. The
+/// consequence is bounded to the above.
+///
+/// The equivalence tests below pin all of this against
+/// `premultiply_rgba`, which is deliberately left in the obvious scalar
+/// spelling as the reference implementation, and which is `#[cfg(test)]`
+/// since 0.92.1 because that is now its only role.
 ///
 /// **Why alpha is read from the source chunk, never from the narrowed
-/// buffer.** [`premultiply_rgba`] does not touch alpha at all, so its
+/// buffer.** `premultiply_rgba` does not touch alpha at all, so its
 /// bits pass through untouched — and `f16 -> f32 -> f16` is *not* the
 /// identity for a signalling NaN, which the F16C widening quiets
 /// (`0x7c01` becomes `0x7e01`). Taking alpha from the round-tripped
@@ -253,7 +335,7 @@ const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
 /// would have to be reworked before any per-tile parallelism could be
 /// sound. Treat it as a separate, unmade decision.
 ///
-/// Same trailing-partial-chunk contract as [`premultiply_rgba`]: a slice
+/// Same trailing-partial-chunk contract as `premultiply_rgba`: a slice
 /// whose length is not a multiple of [`CHANNELS`] contributes nothing for
 /// its final incomplete texel rather than emitting corrupt bytes.
 fn extend_premultiplied_le_bytes(texels: &[f16], out: &mut Vec<u8>) {
@@ -273,7 +355,10 @@ fn extend_premultiplied_le_bytes(texels: &[f16], out: &mut Vec<u8>) {
             };
             let alpha = *a;
             // Operand order (rgb * alpha) matches the scalar path's, so
-            // single-NaN products keep the same payload.
+            // single-NaN products keep the same payload. A *double*-NaN
+            // product does not necessarily -- see the doc comment's
+            // "Bit-exactness" section; it is disclosed, tested and
+            // deliberately not chased.
             *r *= alpha;
             *g *= alpha;
             *b *= alpha;
@@ -1076,7 +1161,9 @@ impl TileResidency {
                 };
                 // Premultiplied on the way in -- see `premultiply_rgba`
                 // for why the atlas, and only the atlas, holds that
-                // convention. The store's own tile is untouched.
+                // convention (it is the test-only reference now; this
+                // function is what actually applies it, on both this path
+                // and `upload_mip`'s). The store's own tile is untouched.
                 bytes.clear();
                 extend_premultiplied_le_bytes(tile.texels(), &mut bytes);
                 queue.write_texture(
@@ -1170,15 +1257,24 @@ impl TileResidency {
         // The same premultiply `sync` applies, for the same reason: both
         // write into the same atlas texture, so both must leave it in
         // the same alpha convention or `fs_canvas` would be right about
-        // level 0 and wrong about every other level. `texels` itself is
-        // a borrowed slice the caller still owns, so this copies rather
-        // than mutating in place.
-        let mut staging = texels.to_vec();
-        premultiply_rgba(&mut staging);
-        let mut bytes = Vec::with_capacity(staging.len() * 2);
-        for sample in &staging {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
+        // level 0 and wrong about every other level.
+        //
+        // **The same *function*, too, as of 0.92.1 — not merely the same
+        // arithmetic.** 0.92.0 vectorized `sync`'s serializer and left
+        // this path on a separate scalar `premultiply_rgba` +
+        // serialize-loop pair, which made the two disagree for the first
+        // time: the two spellings are not bit-identical on a texel whose
+        // RGB channel *and* alpha are both NaN (see
+        // `extend_premultiplied_le_bytes`'s "Bit-exactness" section), so
+        // the atlas could hold one NaN payload at level 0 and a different
+        // one at level 1 for the same source texel. That is precisely the
+        // failure mode the paragraph above warns about, so both paths now
+        // call the one function. It also drops this path's `to_vec()`
+        // copy and its second buffer: `texels` is a borrowed slice the
+        // caller still owns, and the fused serializer reads it without
+        // mutating it.
+        let mut bytes = Vec::with_capacity(texels.len() * 2);
+        extend_premultiplied_le_bytes(texels, &mut bytes);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -2389,14 +2485,31 @@ mod tests {
     /// uniform data — as it would if every texel were identical.
     ///
     /// Every fifth texel is filled from a cycle of extreme bit patterns
-    /// instead, **including a signalling NaN**, and every fifth texel
-    /// puts extremes inside both vectorized chunks *and* the scalar
-    /// remainder (texels 0, 5, … 125, 130). That placement is the point:
+    /// instead, so extremes land in both vectorized chunks *and* the
+    /// scalar remainder (texels 0, 5, … 125, 130). That placement is the
+    /// point:
     /// `the_fused_serializer_matches_premultiply_then_serialize_for_extreme_values`
-    /// is only 40 samples, so it never leaves the remainder, and a
-    /// vectorized path that sourced alpha from the round-tripped `f16`
-    /// scratch buffer instead of the original chunk would quiet `0x7c01`
-    /// to `0x7e01` and pass that test anyway. This one fails on it.
+    /// is only 40 samples, so it never leaves the remainder.
+    ///
+    /// **Where the signalling NaN actually lands, measured (0.92.1).**
+    /// `EXTREMES` has eight entries and a texel consumes four, so
+    /// consecutive extreme texels alternate between its first and second
+    /// half; `0x7c01` is the last entry, so it reaches the **alpha**
+    /// channel only on the odd-numbered extreme texels — indices 5, 15,
+    /// 25, … 125, thirteen of them, **all inside the vectorized region**
+    /// (`0..128`). Remainder texel 130 is an extreme texel too, but its
+    /// alpha is `0x03ff`, not the signalling NaN.
+    ///
+    /// That matters because the alpha channel is the only one the
+    /// "sourced alpha from the round-tripped `f16` scratch buffer instead
+    /// of the original chunk" mutation can change: such a path would
+    /// quiet `0x7c01` to `0x7e01`, pass the 40-sample extremes test above
+    /// anyway, and fail here — at those thirteen texels. 0.92.0 recorded
+    /// that mutation as failing "at exactly texel indices 1 and 126";
+    /// that was wrong (it appears to have read the hex pattern `0x7e01`'s
+    /// two little-endian bytes as indices) and is corrected here. The
+    /// mutation was re-run for 0.92.1 and the test is still non-vacuous:
+    /// it fails when the mutation is applied.
     #[test]
     fn the_fused_serializer_matches_premultiply_then_serialize_across_a_chunk_boundary() {
         const EXTREMES: [u16; 8] = [
@@ -2456,6 +2569,248 @@ mod tests {
             "the vectorized writer must match the scalar in-place \
              premultiply-then-serialize path bit-for-bit across a chunk \
              boundary and into the scalar remainder"
+        );
+    }
+
+    /// The one input class where the two premultiply spellings are not
+    /// bit-identical, pinned so it stays the only one and so a toolchain
+    /// change cannot move it unnoticed.
+    ///
+    /// 0.92.0's doc comment claimed bit-exactness with `premultiply_rgba`
+    /// without qualification. An independent exhaustive pass (all 65,536
+    /// RGB bit patterns × all 65,536 alpha bit patterns) found that claim
+    /// true everywhere **except** a texel whose RGB channel *and* whose
+    /// alpha are both NaN: there the result is still a NaN, but its
+    /// payload can come from the other operand, because `NaN × NaN`
+    /// returns the quieted *first source operand* on x86 and which operand
+    /// is "first" is a property of the code LLVM emits, not of this source.
+    ///
+    /// **Why this cannot simply assert the divergence.** Measured on
+    /// `x86_64` while writing this test, per channel position, as "which
+    /// operand's payload survives":
+    ///
+    /// | profile | `extend_premultiplied_le_bytes` | `premultiply_rgba` |
+    /// |---|---|---|
+    /// | `opt-level = 1` (the default test profile) | rgb, rgb, **alpha** | rgb, rgb, **alpha** |
+    /// | `opt-level = 3` (`--release`) | **alpha**, rgb, **alpha** | rgb, rgb, **alpha** |
+    ///
+    /// The two paths *agree* at the profile this test actually runs under,
+    /// and disagree only under `--release`; `premultiply_rgba` is itself
+    /// auto-vectorized and is not an IEEE-pinned scalar baseline; and the
+    /// choice moves per channel position rather than per texel or per
+    /// payload. Hard-pinning a byte would therefore encode this machine's
+    /// optimizer, not the contract, and would break on `--release` or on
+    /// `aarch64`.
+    ///
+    /// So this pins everything that *is* portable, and each of these is a
+    /// real constraint rather than a restatement:
+    ///
+    /// - the result is a NaN whose payload is one of the two operands',
+    ///   quieted — never a third value, never a finite number, never an
+    ///   infinity;
+    /// - for a given channel position, the operand chosen is the **same**
+    ///   for every texel in the buffer and for every payload pair, in both
+    ///   paths, so a lane-dependent, texel-dependent or payload-dependent
+    ///   choice fails even though a channel-dependent one is tolerated;
+    /// - the two paths' *agreement* is likewise a per-channel-position
+    ///   property, constant across every texel and payload pair — so
+    ///   "they diverge, but only on a fixed set of channels" stays true
+    ///   whichever profile this runs under, and an input-dependent
+    ///   divergence would fail;
+    /// - alpha itself passes through bit-for-bit untouched, double NaN
+    ///   included.
+    ///
+    /// The two candidate payloads are **measured, not assumed**: a fixture
+    /// with one NaN operand and `1.0` for the other leaves exactly one NaN
+    /// in the multiply, and IEEE 754 propagates that one whatever the
+    /// operand order, so those two runs define "payload from `rgb`" and
+    /// "payload from `alpha`" by construction. The fixture is exactly
+    /// [`CHUNK_TEXELS`] texels, so every texel goes through the vectorized
+    /// path and none through the scalar remainder.
+    #[test]
+    // Long because the fixture, the two measured candidate payloads, and
+    // the four separate properties being pinned all have to be visible
+    // together for the test to be readable at all; the same allow
+    // `residency_test.rs`'s own readback tests carry.
+    #[allow(clippy::too_many_lines)]
+    fn the_fused_serializer_agrees_on_a_double_nan_texel_up_to_the_payload_operand() {
+        /// f16 `1.0` — a multiplicative identity that is not itself NaN.
+        const ONE: u16 = 0x3c00;
+        /// Distinct NaN payloads: quiet and signalling, both signs, plus
+        /// an all-ones mantissa and an arbitrary interior pattern.
+        const NANS: [u16; 6] = [0x7e00, 0x7c01, 0xfe00, 0xfc01, 0x7fff, 0x7d55];
+        /// RGB channels per texel — the ones the multiply touches.
+        const COLOUR: usize = 3;
+
+        fn fixture(rgb: u16, alpha: u16) -> Vec<f16> {
+            let mut texels = Vec::with_capacity(CHUNK_TEXELS * CHANNELS);
+            for _ in 0..CHUNK_TEXELS {
+                texels.push(f16::from_bits(rgb));
+                texels.push(f16::from_bits(rgb));
+                texels.push(f16::from_bits(rgb));
+                texels.push(f16::from_bits(alpha));
+            }
+            texels
+        }
+        fn fused(rgb: u16, alpha: u16) -> Vec<u8> {
+            let mut out = Vec::new();
+            extend_premultiplied_le_bytes(&fixture(rgb, alpha), &mut out);
+            out
+        }
+        fn reference(rgb: u16, alpha: u16) -> Vec<u8> {
+            let mut in_place = fixture(rgb, alpha);
+            premultiply_rgba(&mut in_place);
+            let mut out = Vec::new();
+            for sample in &in_place {
+                out.extend_from_slice(&sample.to_le_bytes());
+            }
+            out
+        }
+        /// The four channels of texel `index`, straight back out of the
+        /// serialized bytes.
+        fn texel(bytes: &[u8], index: usize) -> [u16; CHANNELS] {
+            let mut out = [0u16; CHANNELS];
+            let start = index * CHANNELS * 2;
+            let Some(slice) = bytes.get(start..start + CHANNELS * 2) else {
+                unreachable!("the fixture always has this many texels");
+            };
+            for (channel, pair) in out.iter_mut().zip(slice.chunks_exact(2)) {
+                *channel = match pair {
+                    [lo, hi] => u16::from_le_bytes([*lo, *hi]),
+                    _ => unreachable!("chunks_exact(2) yields exactly two bytes"),
+                };
+            }
+            out
+        }
+        /// Which operand's payload `bits` came from, or `None` if it came
+        /// from neither -- the failure this whole test exists to catch.
+        fn sourced_from_alpha(bits: u16, from_rgb: u16, from_alpha: u16) -> Option<bool> {
+            if bits == from_alpha {
+                Some(true)
+            } else if bits == from_rgb {
+                Some(false)
+            } else {
+                None
+            }
+        }
+
+        // Per channel position, established by the first observation and
+        // asserted equal by every one after it, across every texel and
+        // every payload pair: which operand each path took, and whether
+        // the two paths agreed.
+        let mut fused_choice: [Option<bool>; COLOUR] = [None; COLOUR];
+        let mut reference_choice: [Option<bool>; COLOUR] = [None; COLOUR];
+        let mut discriminating_pairs = 0usize;
+
+        for &rgb in &NANS {
+            for &alpha in &NANS {
+                // Multiplying by 1.0 leaves exactly one NaN operand, so
+                // IEEE 754 propagates *that* one regardless of order --
+                // these are the two candidate answers by construction,
+                // not by assumption.
+                let from_rgb = texel(&fused(rgb, ONE), 0);
+                let from_alpha = texel(&fused(ONE, alpha), 0);
+                for channel in 0..COLOUR {
+                    for (label, probe) in [("rgb", &from_rgb), ("alpha", &from_alpha)] {
+                        let bits = probe.get(channel).copied().unwrap_or_default();
+                        assert!(
+                            f16::from_bits(bits).is_nan(),
+                            "the single-NaN {label} probe must stay NaN on channel \
+                             {channel} (rgb {rgb:#06x}, alpha {alpha:#06x}), got \
+                             {bits:#06x}"
+                        );
+                    }
+                }
+                if rgb == alpha {
+                    // Identical operands carry identical payloads, so this
+                    // pair cannot tell the two sourcings apart. Skipped,
+                    // not asserted about -- `discriminating_pairs` below
+                    // is what keeps that from hollowing the test out.
+                    continue;
+                }
+                discriminating_pairs += 1;
+
+                let fused_bytes = fused(rgb, alpha);
+                let reference_bytes = reference(rgb, alpha);
+                assert_eq!(fused_bytes.len(), CHUNK_TEXELS * CHANNELS * 2);
+                assert_eq!(reference_bytes.len(), fused_bytes.len());
+
+                for index in 0..CHUNK_TEXELS {
+                    // Index 0 is this function's own output, index 1 the
+                    // reference's -- both pinned by the same rules.
+                    let paths = [
+                        (
+                            "extend_premultiplied_le_bytes",
+                            texel(&fused_bytes, index),
+                            &mut fused_choice,
+                        ),
+                        (
+                            "premultiply_rgba",
+                            texel(&reference_bytes, index),
+                            &mut reference_choice,
+                        ),
+                    ];
+                    for (path, observed, pinned) in paths {
+                        for channel in 0..COLOUR {
+                            let rgb_payload = from_rgb.get(channel).copied().unwrap_or_default();
+                            let alpha_payload =
+                                from_alpha.get(channel).copied().unwrap_or_default();
+                            // `NANS` is chosen so quieting keeps every
+                            // payload distinct -- without that, "came from
+                            // alpha" and "came from rgb" would be the same
+                            // observation and the pin below would be vacuous.
+                            assert_ne!(
+                                rgb_payload, alpha_payload,
+                                "the two candidate payloads must differ (channel \
+                                 {channel}, rgb {rgb:#06x}, alpha {alpha:#06x})"
+                            );
+                            let bits = observed.get(channel).copied().unwrap_or_default();
+                            let Some(took_alpha) =
+                                sourced_from_alpha(bits, rgb_payload, alpha_payload)
+                            else {
+                                unreachable!(
+                                    "{path} produced {bits:#06x} on channel {channel} of \
+                                     texel {index} for rgb {rgb:#06x} times alpha \
+                                     {alpha:#06x}: neither operand's quieted payload \
+                                     ({rgb_payload:#06x} from rgb, {alpha_payload:#06x} \
+                                     from alpha)"
+                                );
+                            };
+                            match pinned.get_mut(channel) {
+                                Some(slot @ None) => *slot = Some(took_alpha),
+                                Some(Some(previous)) => assert_eq!(
+                                    *previous, took_alpha,
+                                    "{path} must source channel {channel}'s payload from \
+                                     the same operand for every texel and every payload \
+                                     pair; it changed at texel {index}, rgb {rgb:#06x}, \
+                                     alpha {alpha:#06x}"
+                                ),
+                                None => unreachable!("channel is below COLOUR"),
+                            }
+                        }
+                        assert_eq!(
+                            observed.get(COLOUR),
+                            Some(&alpha),
+                            "{path} must pass alpha through untouched even when both it \
+                             and rgb are NaN (rgb {rgb:#06x}, texel {index})"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            discriminating_pairs, 30,
+            "every ordered pair of distinct payloads from NANS must have been \
+             checked; a smaller number means the fixture stopped discriminating"
+        );
+        assert!(
+            fused_choice
+                .iter()
+                .chain(reference_choice.iter())
+                .all(Option::is_some),
+            "every colour channel of both paths must have been observed, or this \
+             test asserted less than it claims"
         );
     }
 

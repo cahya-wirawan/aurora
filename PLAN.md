@@ -17863,7 +17863,7 @@ severity choice.
      probes placed inside `TileResidency::sync` itself
      (`crates/aurora-gpu/src/residency.rs`) break that ~15 ms interval
      down as **87.1% `extend_premultiplied_le_bytes`**
-     (`crates/aurora-gpu/src/residency.rs:187-199` — a single-threaded,
+     (`crates/aurora-gpu/src/residency.rs` — a single-threaded,
      scalar `f16 → f32 → premultiply → f16 → le_bytes` loop over every
      texel of every dirty tile; no `rayon`, no SIMD), **12.7%
      `queue.write_texture`'s CPU-side staging `memcpy`**, and **~0%**
@@ -17909,7 +17909,7 @@ severity choice.
   0.88.0's implied "optimize GPU upload":
 
   - **Make `extend_premultiplied_le_bytes` cheaper**
-    (`crates/aurora-gpu/src/residency.rs:187-199`). Measured at ~12.4 ms
+    (`crates/aurora-gpu/src/residency.rs`). Measured at ~12.4 ms
     of the ~14.3 ms `upload_sync` stage in the probe run (that stage means
     14.9–16.1 ms across the unprobed runs, so read this as "~87% of
     whichever figure", not as a fourth decimal place), i.e. **~44% of the
@@ -17986,7 +17986,7 @@ severity choice.
   round. (2) A duplicated, dangling clause in this entry's own
   `gpu_tiles` paragraph above ("The remaining ~17 tiles — the other ~17
   have nothing stored..."). (3) `extend_premultiplied_le_bytes`'s own
-  doc comment (`residency.rs:187-199`, the candidate this entry names
+  doc comment (`residency.rs`, the candidate this entry names
   as the largest measured hot spot) still only carried the *old*
   "bandwidth-bound" attribution from `spike/FINDINGS.md`; it now points
   at this measurement and states plainly that the function itself, not
@@ -18088,7 +18088,7 @@ severity choice.
 
   *What changed, and only this.* The body of
   `extend_premultiplied_le_bytes`
-  (`crates/aurora-gpu/src/residency.rs:187-199`) previously issued **four
+  (`crates/aurora-gpu/src/residency.rs`) previously issued **four
   separate 2-byte `out.extend_from_slice` calls per texel**, one per
   channel. It now destructures each channel's `to_le_bytes()` into named
   low/high bytes, concatenates all four pairs into **one 8-byte array**,
@@ -18123,7 +18123,10 @@ severity choice.
   applied directly, plus one thing worth committing rather than leaving
   as review notes.** All doc-only except the last: (1) four stale line
   citations to `residency.rs:173-185` corrected to `187-199` (the doc
-  comment additions above pushed the function down); (2) the same
+  comment additions above pushed the function down) — **which went stale
+  again the moment 0.92.0 grew that comment further, so 0.92.1 dropped the
+  line numbers from all four rather than chasing them a third time; the
+  function name is the durable citation**; (2) the same
   "probed pre-0.89.0, not re-probed since" caveat the two `aurora-app`
   sites already carry is now also on this file's own `~87%` claim
   two paragraphs above; (3) a fifth test,
@@ -18834,7 +18837,7 @@ severity choice.
   `u8`/`u16`/`u32`/`u64`, `f32` and `f64` — so it cannot vectorize the
   `f16 ↔ f32` conversion, which is precisely the part that costs. It
   would have vectorized only the alpha multiply, leaving every one of the
-  ~393,000 scalar conversion calls per tile exactly where they were.
+  458,752 scalar conversion calls per tile exactly where they were.
   Secondarily: without a target-feature bump this round deliberately did
   not make (no `RUSTFLAGS`, no `.cargo/config.toml` edit), `wide`'s
   widest guaranteed lane width on baseline `x86_64` is SSE2's 128 bits —
@@ -18861,9 +18864,22 @@ severity choice.
   each call runs its own feature-detection check and then calls a
   `#[target_feature(enable = "f16c")]` function, which cannot be inlined
   into a caller not compiled with that feature. At the old per-texel
-  granularity a 256×256 tile paid that roughly 393,000 times. Removing
-  that bookkeeping — not changing the instructions — is the entire win,
-  which is also why the win is as large as it is.
+  granularity a 256×256 tile paid that **458,752** times: seven
+  non-inlinable conversion calls per texel (one `f32::from` to widen
+  alpha, three more for R/G/B, three `f16::from_f32` to narrow the
+  products) × 65,536 texels. Removing that bookkeeping — not changing the
+  instructions — is the entire win, which is also why the win is as large
+  as it is.
+
+  **Correction (0.92.1): this figure was "~393,000" as first written, and
+  both it and the prose around it were wrong.** `residency.rs`'s own doc
+  comment named four operations ("three times per texel for RGB plus once
+  for the widening of alpha"), which is 262,144, while the number implied
+  six. Counted against the actual pre-0.92.0 function body (`git show
+  HEAD^:crates/aurora-gpu/src/residency.rs` at the 0.92.1 commit) it is
+  seven per texel and 458,752 per tile. Both sites are corrected; the
+  qualitative conclusion — that per-call bookkeeping, not the F16C
+  arithmetic, was the cost — is unchanged.
 
   **The correctness decision worth recording: alpha is read from the
   source chunk, never from the narrowed scratch buffer.**
@@ -18888,15 +18904,36 @@ severity choice.
   completely untested.** One test was added to close that
   (`the_fused_serializer_matches_premultiply_then_serialize_across_a_chunk_boundary`,
   131 texels = two full chunks plus a 3-texel remainder, values varying
-  per texel and per channel, with extreme bit patterns including a
-  signalling NaN placed inside both chunks *and* the remainder).
+  per texel and per channel, with extreme bit patterns placed in both
+  chunks *and* the remainder).
 
   **That new test was mutation-checked, not merely observed to pass.**
-  Deliberately reintroducing the alpha-from-scratch-buffer bug made it
-  fail on exactly the predicted bytes (`1, 126` = `0x7e01` where the
-  reference has `1, 124` = `0x7c01`) — **while all three pre-existing
-  tests still passed**. So the new test is the only guard in the tree for
-  that decision, and it is a real guard.
+  Deliberately reintroducing the alpha-from-scratch-buffer bug makes it
+  fail — **while all three pre-existing tests still pass**. So the new
+  test is the only guard in the tree for that decision, and it is a real
+  guard.
+
+  **Correction (0.92.1) — the stated divergence was wrong, twice.** This
+  entry said the mutation fails "on exactly the predicted bytes (`1, 126`
+  = `0x7e01` where the reference has `1, 124` = `0x7c01`)", and the round
+  also recorded that as failing "at exactly texel indices 1 and 126".
+  `1, 126` and `1, 124` are the little-endian *byte values* of `0x7e01`
+  and `0x7c01`, not positions of anything; reading them as texel indices
+  compounded the confusion. Re-measured directly for 0.92.1, with the
+  mutation applied and the diverging texels enumerated: the divergence is
+  **13 texels, at indices 5, 15, 25, … 125 — stride 5, all inside the
+  vectorized region (`0..128`)**.
+
+  The reason is worth writing down, because it also corrects the sentence
+  above about where the signalling NaN lands. `EXTREMES` holds eight
+  patterns and a texel consumes four, so consecutive extreme texels
+  alternate between its two halves; `0x7c01` is the last entry, so it
+  reaches the **alpha** channel only on the odd-numbered extreme texels.
+  Alpha is the only channel this mutation can change, so those thirteen
+  texels are the whole divergence. Remainder texel 130 *is* an extreme
+  texel, but its alpha is `0x03ff` — so the claim that the signalling NaN
+  lands in the remainder as well as the chunks was false **for the alpha
+  channel specifically**, which is the only one that matters here.
 
   **Before/after, same fixture, same adapter, three runs per side**
   (`AURORA_REQUIRE_GPU=1 cargo test --release -p aurora-app -- --nocapture
@@ -18917,7 +18954,7 @@ severity choice.
   | CPU fallback, n=12 | before | after |
   |---|---|---|
   | `upload_sync` mean | 3.72–3.81 ms | **1.56–1.70 ms** |
-  | `upload_sync` p50 | 3.69–3.89 ms | **1.51–1.53 ms** |
+  | `upload_sync` p50 | 3.69–3.89 ms | **1.50–1.78 ms** (see below) |
   | `upload_sync` p99 | 7.65–7.92 ms | **3.64–3.78 ms** |
   | whole frame mean | 14.31–14.74 ms | 12.03–13.22 ms |
   | whole frame p50 | 14.15–14.86 ms | 11.86–12.50 ms |
@@ -18928,10 +18965,24 @@ severity choice.
   the baseline's. Met, on both benchmarks, with clear separation** —
   GPU mean 5.19–5.44 → 2.14–2.40 (gap 2.79 ms), GPU p50 4.46–5.19 →
   1.82–2.18 (gap 2.28 ms), CPU mean 3.72–3.81 → 1.56–1.70, CPU p50
-  3.69–3.89 → 1.51–1.53. `upload_sync` p99 also separated cleanly on
+  3.69–3.89 → 1.50–1.78. `upload_sync` p99 also separated cleanly on
   both, which 0.89.0's change never managed. This is stated as a real
   result rather than hedged because the ranges genuinely do not touch —
   unlike 0.89.0, where they did and the entry said so.
+
+  **Correction (0.92.1): the CPU-fallback p50 "after" range was stated too
+  tightly.** It read `1.51–1.53 ms`, from this round's own three runs. An
+  independent four-run reproduction landed two runs *outside* it, at
+  **1.78 ms and 1.58 ms**, and 0.92.1's own three re-runs added `1.50 ms`;
+  the range above is widened to `1.50–1.78 ms` to span all ten observed
+  runs. The verdict does not move — every one of
+  those runs is still less than half the `3.69–3.89 ms` baseline, and the
+  before/after ranges still do not overlap — but **p50 of an n=12 sample
+  is a coarse order statistic and these ranges should be read as
+  indicative, not precise.** The n=40 GPU-path figures are the sturdier
+  ones. The same caution applies to every three-run range in this table:
+  three samples of a noisy p50 bound run-to-run variance loosely at
+  best.
 
   **The upload-volume control line is bit-identical across all six
   runs**, which is what makes the comparison a CPU-time measurement
@@ -18972,7 +19023,9 @@ severity choice.
     It is the cold `upload_mip` sibling and the reference implementation
     two equivalence tests compare against; vectorizing it too would have
     removed the independent oracle. `TileResidency::sync`'s loop
-    structure is likewise unchanged.
+    structure is likewise unchanged. **Superseded in 0.92.1**: leaving
+    `upload_mip` on it was a real regression, not a neutral choice — see
+    the 0.92.1 entry below.
   - **`rayon` per-tile parallelism is still not done** and is unaffected
     by this round — same two blockers as before (a genuine new runtime
     dependency, and `sync`'s shared-buffer loop needing restructuring
@@ -18983,6 +19036,164 @@ severity choice.
   `RUSTFLAGS` or `.cargo/config.toml` change, no new lint exception.
   `cargo deny check all`: `advisories ok, bans ok, licenses ok, sources
   ok`. 1 test added, 0 changed.
+
+  **0.92.1 (2026-09-03) — a correction round on 0.92.0, from independent
+  review. One real behavioural regression, one false correctness claim,
+  and four accuracy fixes. No performance change intended and none
+  measured.**
+
+  **The regression: 0.92.0 vectorized only one of the two upload paths.**
+  `TileResidency::sync` moved to `extend_premultiplied_le_bytes`;
+  `TileResidency::upload_mip` was left on its own `premultiply_rgba` +
+  serialize-loop pair, and the entry above recorded that as a deliberate,
+  neutral choice ("vectorizing it too would have removed the independent
+  oracle"). It was not neutral. The two spellings are *not* bit-identical
+  on every input (below), and both write into the **same atlas texture**,
+  so the atlas could hold one NaN payload at level 0 and a different one
+  at level 1 for the same source texel. A comment sitting directly above
+  `upload_mip`'s premultiply call had warned about exactly this — "both
+  write into the same atlas texture, so both must leave it in the same
+  alpha convention or `fs_canvas` would be right about level 0 and wrong
+  about every other level" — and 0.92.0 made it live for the first time.
+  Fixed by routing `upload_mip` through `extend_premultiplied_le_bytes`
+  too, which also drops its `to_vec()` copy and its second buffer.
+  `premultiply_rgba` is now `#[cfg(test)]`, so the split cannot be
+  reintroduced silently: it exists only as the equivalence tests' oracle.
+
+  **The false claim: "bit-exactness with the scalar path is not assumed,
+  it is checked" was unqualified, and false in one case.** An independent
+  exhaustive pass (all 65,536 RGB bit patterns × all 65,536 alpha bit
+  patterns) found the two paths agree everywhere **except** a texel whose
+  RGB channel *and* whose alpha are both NaN, where the surviving NaN
+  payload can come from the other operand: `NaN × NaN` returns the quieted
+  *first source operand* on x86, and which operand is "first" is a
+  property of the code LLVM emits. Reachable from untrusted input —
+  `aurora-io`'s 16-bit-float TIFF reader takes raw `f16` samples with no
+  NaN filtering — but bounded: a NaN becomes a *different* NaN, never a
+  good pixel becoming a bad one. The doc comment now states precisely
+  what is and is not guaranteed instead of claiming more than it has.
+
+  **Two things measured in the course of fixing it that the review's own
+  account got wrong, and that matter more than the fix.** Per channel
+  position, "which operand's payload survives", on `x86_64`, over all 30
+  ordered pairs of six distinct NaN payloads and every texel of a full
+  chunk:
+
+  | profile | `extend_premultiplied_le_bytes` | `premultiply_rgba` |
+  |---|---|---|
+  | `opt-level = 1` (the default test profile) | rgb, rgb, **alpha** | rgb, rgb, **alpha** |
+  | `opt-level = 3` (`--release`) | **alpha**, rgb, **alpha** | rgb, rgb, **alpha** |
+
+  First: the divergence **between the two paths is release-only**. At the
+  profile `cargo test` and `cargo nextest` actually use, they agree
+  bit-for-bit even on a double-NaN texel. Second: `premultiply_rgba` is
+  **not** a scalar baseline that IEEE 754 pins. LLVM auto-vectorizes its
+  loop too, and it already sources channel B's payload from `alpha` at
+  every profile measured — so this is a divergence between two *different*
+  auto-vectorizations of the same arithmetic, not between a vector path
+  and a scalar one. The root cause as first reported ("the scalar
+  `f32::from(*r) * alpha`") was therefore half right.
+
+  **The pinning test asserts what survives all of that**, deliberately not
+  the bytes: the payload comes from one of the two operands and never
+  anywhere else; each channel position chooses the *same* operand for
+  every texel and every payload pair, in both paths; and alpha passes
+  through bit-for-bit untouched. Hard-pinning a byte would encode this
+  machine's optimizer rather than the contract, and would break under
+  `--release` or on `aarch64`. The two candidate payloads are *measured*
+  per pair (one NaN operand against `1.0`, where IEEE 754 propagates that
+  operand regardless of order) rather than assumed. Non-vacuity checked by
+  two mutations, both of which the new test catches: sourcing alpha from
+  the narrowed buffer (fails the alpha-untouched clause), and forcing a
+  canonical `f32::NAN` (fails the "one of the two operands" clause). The
+  test passes at `opt-level = 1` *and* under `--release` — including the
+  profile where the two paths genuinely disagree.
+
+  **Four accuracy corrections, each recorded at the site it was wrong**
+  (details in the 0.92.0 entry above, corrected in place):
+
+  - the mutation-test claim that reintroducing the alpha-sourcing bug
+    fails "at texel indices 1 and 126" — really **13 texels at indices 5,
+    15, … 125**, all inside the vectorized region — and the related claim
+    that the signalling NaN lands in the scalar remainder as well as the
+    chunks, which is false for the alpha channel, the only one that
+    matters there;
+  - the per-tile conversion-call count, `~393,000` → **458,752** (seven
+    per texel), which was inconsistent with its own sentence's wording;
+  - the CPU-fallback `upload_sync` p50 "after" range, `1.51–1.53 ms` →
+    **`1.51–1.78 ms`**, after an independent four-run reproduction landed
+    two runs outside it, with the coarseness of an n=12 p50 now stated;
+  - four PLAN.md citations of `residency.rs:187-199`, a line range the
+    function has not occupied since 0.92.0 grew its doc comment.
+
+  **Also corrected: `aurora-app`'s two per-stage-breakdown doc sites**
+  still described this loop as "single-threaded, scalar … No `rayon`, no
+  SIMD" and "scalar, single-threaded" in the present tense, with staleness
+  disclaimers that stopped at 0.89.0. Both now say the loop is
+  `half::slice`-vectorized and that the probed 87.1%/12.7% stage split is
+  stale **in a known direction** — the loop's share fell substantially per
+  0.92.0's own measurement — and point at 0.92.0's before/after table as
+  the current number instead of the old percentages.
+
+  **Files touched beyond the two named above, and why.** Making
+  `premultiply_rgba` test-only changed what four comments elsewhere were
+  describing: `canvas.wgsl` (two sites) and `render_test.rs` both name it
+  as the thing that premultiplies on the upload path and as the mutation
+  target for the halo A/B controls, and `residency_test.rs` and
+  `aurora-render`'s `preview.rs` refer to "`upload_mip`'s own
+  premultiply". None of those are behaviour; each now names
+  `extend_premultiplied_le_bytes` as what runs, keeping
+  `premultiply_rgba` as the place the alpha-convention rationale is
+  written down. Nothing in `aurora-render` or the shader changed
+  semantically.
+
+  **Performance re-verified, not assumed.** `upload_mip` is a cold path
+  with no call site in `aurora-app`, so routing it through the shared
+  function should cost the measured hot path nothing. Checked rather than
+  argued — same benchmark, same adapter (`NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)`), same command, three runs:
+
+  | at 0.92.1, min–max of 3 runs | 0.92.0's "after" | 0.92.1 |
+  |---|---|---|
+  | GPU path `upload_sync` mean | 2.14–2.40 ms | 2.16–2.29 ms |
+  | GPU path `upload_sync` p50 | 1.82–2.18 ms | 1.84–1.91 ms |
+  | GPU path `upload_sync` p99 | 8.11–8.28 ms | 8.14–11.87 ms |
+  | CPU fallback `upload_sync` mean | 1.56–1.70 ms | 1.55–1.64 ms |
+  | CPU fallback `upload_sync` p50 | 1.50–1.78 ms | 1.50–1.60 ms |
+  | CPU fallback `upload_sync` p99 | 3.64–3.78 ms | 3.63–4.23 ms |
+
+  Every mean and p50 sits inside 0.92.0's own range: **no regression, and
+  the ~2.4× win from 0.92.0 stands.** The two p99 columns are the honest
+  exceptions and are reported rather than smoothed. Run 1's GPU p99 of
+  11.87 ms and CPU p99 of 4.23 ms both come from frame #0 of their run —
+  the same cold-start frame whose `recomposite` also spiked (32.51 ms
+  against 20.70/21.26 ms in runs 2 and 3), i.e. warm-up in a stage this
+  change does not touch, not upload cost. Runs 2 and 3 land at 8.14 and
+  8.55 ms, inside the old range. p99 over n=40 is effectively the worst
+  frame, so a single cold frame moves it entirely; this is the same
+  coarse-order-statistic caveat the CPU p50 correction above records.
+
+  **The upload-volume control lines are bit-identical to 0.92.0's**, which
+  is what makes this a CPU-time comparison rather than a confound: GPU path
+  `mean=6.8 tiles/frame (min=2 max=20), mean=3.41 MB/frame`; CPU fallback
+  `mean=4.9 tiles/frame (min=2 max=9), mean=2.46 MB/frame`. Same fixture,
+  same bytes, same adapter.
+
+  **Verification.** Full gate green: `cargo fmt --all --check`,
+  `check_layering.py` (20 crates), `check_no_hardcoded_style.py`
+  (28 files), `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace`
+  (**1,632 passing**, 0 failed, 10 ignored), `cargo test --workspace
+  --doc`, `cargo doc --workspace --no-deps --all-features`, `cargo deny
+  check all` (`advisories ok, bans ok, licenses ok, sources ok`). The
+  `upload_mip` change was additionally run under `AURORA_REQUIRE_GPU=1` on
+  the RTX 3090, where `residency_test.rs`'s
+  `upload_mip_lands_in_the_correct_slot_and_level` reads the mip level
+  back off the real texture and asserts the premultiply happened — the
+  test 0.68.4 deliberately made translucent so deleting the premultiply
+  cannot pass it. 1 test added, 0 changed, 0 removed. No new dependency, no
+  `unsafe`, no lint exception beyond one `#[allow(clippy::too_many_lines)]`
+  on the new test.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

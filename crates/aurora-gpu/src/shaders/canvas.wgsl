@@ -50,7 +50,10 @@ fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
     // that is the workspace's universal convention and none of it
     // changed. The conversion happens at *upload*, in
     // `TileResidency::sync` and `TileResidency::upload_mip`
-    // (`residency.rs`'s `premultiply_rgba`), so the atlas texture -- and
+    // (`residency.rs`'s `extend_premultiplied_le_bytes`, which both call
+    // as of 0.92.1; `premultiply_rgba` is the same arithmetic in the
+    // obvious scalar spelling, kept as the test-only reference and as the
+    // place that rationale is written down), so the atlas texture -- and
     // only the atlas texture -- is premultiplied by the time this shader
     // samples it.
     //
@@ -82,8 +85,10 @@ fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
     // (0.52.0's fix stands, untouched); what changed is that the *atlas*
     // is now premultiplied deliberately, at upload. So: if you are ever
     // tempted to restore `c.rgb * c.a + ...` here, the question to ask
-    // first is whether `premultiply_rgba` still runs on both upload
-    // paths. If it does, this line is correct as written and changing it
+    // first is whether the premultiply still runs on both upload paths
+    // (`extend_premultiplied_le_bytes` since 0.92.1; `premultiply_rgba`
+    // before that). If it does, this line is correct as written and
+    // changing it
     // will double-count alpha in the other direction (translucent
     // content rendering too dark).
     //

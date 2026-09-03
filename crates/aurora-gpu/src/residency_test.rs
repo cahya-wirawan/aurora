@@ -409,7 +409,8 @@ fn paint(store: &mut aurora_tile::TileStore, surface: SurfaceId, id: TileId, rgb
 
 /// The first texel of the atlas slot `id` maps to, read back off the real
 /// texture as `[r, g, b, a]` — **premultiplied**, which is the convention
-/// the atlas holds (see `premultiply_rgba`).
+/// the atlas holds (see `premultiply_rgba`, which is where that is
+/// written down; `extend_premultiplied_le_bytes` is what applies it).
 fn atlas_first_texel(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
