@@ -19495,6 +19495,222 @@ severity choice.
   disclosed in its own entry above, and this round's plumbing added a ninth
   argument under `push_frame`'s existing `too_many_arguments` allow rather
   than a new one.
+
+  **0.94.0 (2026-09-04) — acting on 0.93.1's corrected lever. Unlike
+  0.93.0 and 0.93.1, this round changes behaviour.** Those two were
+  diagnostic: they measured phase 1, then corrected their own
+  mis-attribution of it. What they left standing was a named, measured,
+  unclaimed win — `aurora-app`'s `composite_roots_into_tile` ran
+  `aurora_render::un_premultiply_in_place` over all 262,144 samples of
+  **every** composite tile, including the many tiles per frame where no
+  root folded anything and the buffer was still `transparent_tile`'s own
+  untouched output. 0.93.1's hand-split put that pass at ~6.49 ms of the
+  GPU-path benchmark's ~9.87 ms `cpu_fallback_empty`. It is now skipped
+  when `folded == 0`.
+
+  **Why the skip is output-identical, not an approximation.** Three facts
+  compose, and each is pinned by a test rather than argued at the call
+  site:
+
+  1. *Provenance.* `composited` is seeded by
+     `aurora_render::transparent_tile`, and the only thing that ever
+     writes to it is the `composite_layer_into` call inside the same `if
+     let Some(..)` that increments `folded`. So `folded == 0` means
+     literally no write happened. Pinned at the caller, on bits, by two
+     new `aurora-app` tests:
+     `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
+     (empty `LayerTree`, loop body never runs) and
+     `composite_roots_into_tile_folds_nothing_at_a_tile_a_real_layer_never_painted`
+     (a real visible pixel layer, loop runs, `resolve_tile` declines —
+     the case that actually dominates a frame, and the one that would
+     catch a regression where `resolve_tile` starts returning `Some` with
+     a blank buffer, silently paying the pass back on every empty tile
+     without changing a pixel).
+  2. *What that output is.* `transparent_tile` is all canonical `+0.0`
+     — bit pattern `0x0000`, never `-0.0`, a subnormal, or a `NaN`.
+  3. *What the pass does to it.* On an all-`0x0000` buffer
+     `un_premultiply_in_place` is a **bitwise identity**: every alpha is
+     `0.0`, so its `alpha > 0.0` arm never runs, its else-arm writes the
+     identical `0x0000` back into `r`/`g`/`b`, and `a` is never assigned.
+
+  **Facts 2 and 3 are pinned in `aurora-render`, the crate that owns the
+  function**, by two new tests there —
+  `transparent_tile_is_all_canonical_positive_zero_bits` and
+  `un_premultiply_in_place_is_a_bitwise_identity_on_a_transparent_tile`
+  — deliberately not at the `aurora-app` call site. A future change to
+  the zero-alpha arm (writing a sentinel, normalizing `a`, anything)
+  must fail *there*, next to the code being changed, rather than
+  silently stopping the caller's skip from being output-identical. Note
+  the identity test is a strictly stronger claim than the existing
+  `un_premultiply_in_place_zeroes_the_colour_of_a_fully_transparent_texel`,
+  which starts from *coloured* transparent texels and so only shows the
+  output is zero — not that the input was already the output, which is
+  what the skip needs. `un_premultiply_in_place`'s own doc comment now
+  states that one of its three `aurora-app` call sites is conditional and
+  names the test that makes that sound.
+
+  **The condition is `folded == 0`, deliberately not "the buffer looks
+  transparent."** The weaker premise would cover strictly more tiles (a
+  real layer resolving to fully transparent texels), but establishing it
+  requires scanning all 262,144 samples — the same whole-buffer pass
+  being removed — so it would spend the win to find it. `folded` is
+  already counted for `RecompositeTileCosts`, so the condition is free.
+
+  **What else changed (separable, and measured only jointly — see
+  below).** `write_composited`'s bitwise comparison moved from a
+  hand-written `zip(..).all(|(have, want)| have.to_bits() ==
+  want.to_bits())` loop into a new `tiles_are_bitwise_identical` free
+  function spelled `have.reinterpret_cast() == want.reinterpret_cast()`
+  (`half::slice::HalfFloatSliceExt`, a safe zero-copy `&[u16]` view — no
+  `unsafe`, no copy, no new dependency). This is an **implementation**
+  change, not a weaker predicate: `[u16]` slice equality *is*
+  element-wise `f16::to_bits` equality, and bitwise is still the correct
+  predicate rather than `==` (`-0.0 == 0.0` is `true` on different bits;
+  `NaN != NaN` would report an unchanged tile as changed forever). New
+  test `tiles_are_bitwise_identical_distinguishes_negative_zero_and_matches_nan_to_itself`
+  pins exactly those two cases plus the length mismatch, so a later
+  "simplification" to `==` fails.
+
+  **The residency guard, the length guard, and all three write branches
+  around it are untouched by construction** — the diff replaces one
+  expression on one line and nothing else inside that closure. The
+  0.90.0 `forget_surface` guard (`is_resident` asked *before* `get_mut`)
+  and the 0.91.0 evicted-then-reinstated dirty-flag mechanism
+  (`TileStore::is_dirty`/`evicted_dirty`) are byte-for-byte as they were;
+  `aurora-tile` is not touched at all this round. Skipping the
+  comparison *entirely* for `folded == 0` was considered and rejected:
+  that would delete the `forget_surface` correctness guard for exactly
+  the tiles it exists to protect.
+
+  **Measured on the real RTX 3090, three runs each way, same session,
+  same binary layout, same machine state** (`AURORA_REQUIRE_GPU=1 cargo
+  test --release -p aurora-app -- --nocapture --test-threads=1
+  recomposite_and_present_loop`; `NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)` confirmed on every run). "Before" is this same tree with
+  both changes reverted in place, *not* 0.93.1's committed table — that
+  table was recorded in a different session and its totals differ enough
+  from this session's baseline (GPU-path mean 16.52 ms there vs
+  15.12–16.02 ms here) that comparing across them would have credited
+  machine state to this change:
+
+  | metric (mean ms/frame unless noted) | before (3 runs, min–max) | after (3 runs, min–max) |
+  |---|---|---|
+  | GPU path **`cpu_fallback_empty`** | 8.95 – 9.42 | **2.13 – 2.25** |
+  | GPU path `cpu_fallback_real` | 0.00 | 0.00 |
+  | GPU path `gpu_issue_ok` / `declined` | 1.47–1.61 / 0.03–0.04 | 1.48–1.55 / 0.02–0.03 |
+  | GPU path phase 1 | 10.46 – 11.07 | 3.64 – 3.82 |
+  | GPU path total mean | 15.12 – 16.02 | 8.16 – 8.47 |
+  | GPU path total p50 | 14.82 – 15.56 | 7.58 – 8.38 |
+  | GPU path total **p99** | 28.21 – 35.94 | **23.29 – 23.72** |
+  | CPU fallback **`cpu_fallback_empty`** | 3.51 – 3.81 | **1.10 – 1.16** |
+  | CPU fallback `cpu_fallback_real` | 5.77 – 6.03 | 5.66 – 5.70 |
+  | CPU fallback phase 1 | 9.29 – 9.84 | 6.75 – 6.86 |
+  | CPU fallback total mean | 11.46 – 12.13 | 9.00 – 9.12 |
+  | CPU fallback total p50 | 11.37 – 11.81 | 8.66 – 8.91 |
+  | CPU fallback total **p99** | 14.20 – 15.00 | **12.17 – 12.70** |
+  | `mark_imbalance` (must be 0) | **0** on every frame of both | **0** on every frame of both |
+  | `COMPOSITE_WRITE_OUTCOMES` GPU path, `[skipped, changed, not_resident]` mean/frame | 13.2 / 1.3 / 5.5 | **13.2 / 1.3 / 5.5** |
+  | `COMPOSITE_WRITE_OUTCOMES` CPU fallback | 4.1 / 1.2 / 3.7 | **4.1 / 1.2 / 3.7** |
+
+  **The write-outcome fingerprint is identical to the printed precision
+  on both benchmarks, and so are the `upload_sync moved` tile/byte
+  counts** — behavioural evidence that no write *decision* changed, only
+  timing. That is the check that matters most here, because the whole
+  soundness argument is "the bytes are the same," and these buckets are
+  `write_composited`'s own record of whether it thought so.
+
+  **Is the win close to the ~6.49 ms estimate? Yes, slightly better.**
+  GPU-path `cpu_fallback_empty` drops 6.8 ms (9.00 mid-point → 2.18),
+  against a predicted 6.49. `cpu_fallback_real` is unchanged, exactly as
+  the design says it must be — a tile that folded a root still runs the
+  pass. The ~0.3 ms by which the drop exceeds the estimate is consistent
+  with `tiles_are_bitwise_identical` also shaving a little off the same
+  slot, but that is **inside this benchmark's ~20% run-to-run variance
+  and is not a measurement**: the "before" column reverted both changes
+  together, so the two are measured jointly and Step 3's own contribution
+  is **not isolated**. It is kept on the strength of being a strictly
+  cheaper spelling of an unchanged predicate with a test pinning that
+  predicate, not on a number — stated plainly rather than credited.
+
+  **Both benchmarks still miss the 16.7 ms p99 budget where it was
+  missed before, and the 60 FPS gate is still open.** The GPU path's p99
+  is **23.29–23.72 ms, ~1.4× the budget** (was ~1.7–2.2×). The
+  CPU-fallback benchmark's p99 (12.17–12.70 ms) is under 16.7 ms in this
+  session — but it was *also* under it before this change (14.20–15.00
+  ms), so that is this machine's baseline and not something this round
+  achieved; PLAN.md's headline 60 FPS table above was measured at
+  different viewport/state and stands as the honest historical figure.
+  Neither benchmark's assertions nor `BUDGET_MS` were touched, and both
+  still assert only the loose CI-safety thresholds — a green run is not
+  the budget being met.
+
+  **Deliberately not done, with reasons:**
+  - *No new "already known empty" cache or flag state.* A per-tile
+    "known transparent" bit would skip more, and would reintroduce
+    exactly the 0.90.0 `forget_surface` / 0.91.0 eviction bug class —
+    cached state about a surface that can be discarded or evicted out
+    from under it — for a small further win. `CompositeCache` still has
+    exactly one field.
+  - *Not skipping `write_composited`'s comparison for `folded == 0`.*
+    That deletes the `forget_surface` correctness guard.
+  - *`transparent_tile`'s per-call allocation* (~0.24 ms by 0.93.1's
+    hand-split, shared with the root walk) — not worth the surface area
+    of a reusable buffer threaded through the loop.
+  - *`begin_gpu_composite_tile`'s return type*, which would separate
+    "genuinely empty" from "bailed" and retire 0.87.1's double root walk
+    — still the named follow-on, still bigger than this round.
+  - **The sixth and seventh timing slots 0.93.1 named as follow-on work
+    are now unnecessary.** Their purpose was to measure the
+    un-premultiply pass and `write_composited` separately inside
+    `cpu_fallback_empty`. The pass is no longer in that slot at all, so
+    **`cpu_fallback_empty` itself is the before/after metric** — the
+    table above is that measurement, taken without adding instrumentation
+    whose own cost would land in the interval being measured. Both the
+    `RECOMPOSITE_TILE_COST_NANOS` doc comment and the benchmark's own
+    printed legend are updated to say so, rather than continuing to
+    describe the pass as unconditional.
+
+  Verified: the full local gate in CI's own order — `cargo fmt --all
+  --check`, `python3 scripts/check_layering.py` (20 crates OK), `python3
+  scripts/check_no_hardcoded_style.py` (28 files, clean), `cargo check
+  --workspace --locked` (`Cargo.lock` regenerated for the version bump,
+  then re-checked `--locked` clean), `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace`
+  under `AURORA_REQUIRE_GPU=1` — **1,638 passing, 0 failed, 10 ignored**
+  (was 1,633; **5 new tests**, 0 changed, 0 removed) — plus `cargo test
+  --workspace --doc` and `RUSTDOCFLAGS="-D warnings" cargo doc
+  --workspace --no-deps --all-features`, both clean. The 0.90.0/0.91.0
+  correctness guards were additionally run by name under
+  `AURORA_REQUIRE_GPU=1` with the real adapter printed:
+  `recomposite_visible_tiles_skips_the_dirty_mark_when_a_tile_recomposites_byte_identically`,
+  `recomposite_visible_tiles_still_dirties_a_tile_whose_content_really_changed`,
+  `a_forgotten_composite_tile_is_dirtied_again_even_though_its_content_is_unchanged`,
+  `a_composite_tile_evicted_mid_pass_is_still_re_uploaded_to_the_real_atlas`,
+  and `recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable`
+  — 5 passed. That last one asserts `cpu_empty > 0.0` and **still passes
+  unmodified**: the skip made the interval much cheaper but nowhere near
+  zero, so no assertion needed loosening (and none was loosened).
+
+  **Two non-vacuity mutations, run by hand rather than assumed** — the
+  check that the skip is actually tested in the direction that matters:
+
+  - `if folded > 0` → `if false` (always skip): both
+    `composite_document_un_premultiplies_a_translucent_root_level_layer`
+    and `recomposite_visible_tiles_un_premultiplies_a_translucent_root_level_layer`
+    **FAIL**, each reporting the premultiplied `(0.5, 0.5, 0.5, 0.5)`
+    where straight `(1.0, 1.0, 1.0, 0.5)` is required. So the pass is
+    genuinely load-bearing for a folded tile and the suite notices its
+    removal.
+  - `if folded > 0` → `if true` (the exact pre-change behaviour):
+    **384 passed, 0 failed** in `aurora-app`, including the three new
+    tests. Then restored to `if folded > 0`: **384 passed, 0 failed**.
+    Identical results either way is the byte-identity claim shown
+    empirically, not just asserted.
+
+  No new dependency (`half` was already a workspace dependency of
+  `aurora-app`), **no new `unsafe`** (`reinterpret_cast` is a safe
+  method), no new lint exception, no `unwrap`/`expect`/`panic`/
+  `indexing_slicing`. `aurora-tile` untouched.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

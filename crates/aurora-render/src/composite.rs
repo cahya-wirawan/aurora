@@ -919,6 +919,19 @@ fn straighten_channel(channel: f16, alpha: f32) -> f16 {
 /// Texels are processed in [`aurora_tile::CHANNELS`]-wide chunks; a
 /// trailing partial chunk (which a correctly sized
 /// [`aurora_tile::SAMPLES`]-length buffer never has) is left untouched.
+///
+/// **One of those three `aurora-app` call sites is conditional as of
+/// 0.94.0.** `composite_roots_into_tile` skips this call for a tile no
+/// root folded into, because on such a buffer — [`transparent_tile`]'s
+/// own untouched output — this function is a bitwise identity: every
+/// alpha is `0.0`, so the `alpha > 0.0` arm never runs and the else-arm
+/// writes back the `0x0000` already there. That is a claim about *this*
+/// function's behaviour, so it is pinned by tests in this module rather
+/// than at the call site — `un_premultiply_in_place_is_a_bitwise_identity_on_a_transparent_tile`
+/// and `transparent_tile_is_all_canonical_positive_zero_bits`. Changing
+/// the zero-alpha arm to write anything other than what it read must
+/// fail those, since the caller's skip would otherwise silently stop
+/// being output-identical.
 pub fn un_premultiply_in_place(texels: &mut [f16]) {
     for texel in texels.chunks_exact_mut(CHANNELS) {
         let [r, g, b, a] = texel else { continue };
@@ -1922,6 +1935,64 @@ mod tests {
         let mut texels = solid_texels([0.4, 0.6, 0.8, 0.0]);
         un_premultiply_in_place(&mut texels);
         assert_eq!(first_texel(&texels), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    /// **A premise `aurora-app` depends on, pinned in the crate that owns
+    /// the function.** `transparent_tile` is spelled
+    /// `vec![f16::from_f32(0.0); SAMPLES]`, and `f16::from_f32(0.0)` is
+    /// canonical *positive* zero — bit pattern `0x0000`, never `-0.0`
+    /// (`0x8000`), a subnormal, or a `NaN`. As of 0.94.0
+    /// `aurora-app`'s `composite_roots_into_tile` skips
+    /// [`un_premultiply_in_place`] entirely for a tile no root folded
+    /// into, and its argument that the skip is *output-identical* rather
+    /// than an approximation starts here: the buffer it skips over is
+    /// this one, untouched.
+    ///
+    /// Should someone change `transparent_tile` to seed anything else —
+    /// `-0.0`, or a sentinel — this test fails here, in this crate,
+    /// rather than silently changing what a caller two crates up writes
+    /// into the composite surface.
+    #[test]
+    fn transparent_tile_is_all_canonical_positive_zero_bits() {
+        let tile = transparent_tile();
+        assert_eq!(tile.len(), SAMPLES);
+        assert!(
+            tile.iter().all(|sample| sample.to_bits() == 0),
+            "transparent_tile must be all canonical +0.0 bits"
+        );
+    }
+
+    /// **The other half of the same premise**, and the reason
+    /// `aurora-app`'s 0.94.0 skip removes *work* rather than changing a
+    /// result: run on an all-`0x0000` buffer, this function is a bitwise
+    /// identity. Every texel's `alpha` is `0.0`, so `if alpha > 0.0` is
+    /// false for all of them, the else-arm writes the identical `0x0000`
+    /// back into `r`/`g`/`b`, and `a` is never assigned at all.
+    ///
+    /// Note this is a strictly stronger claim than
+    /// `un_premultiply_in_place_zeroes_the_colour_of_a_fully_transparent_texel`
+    /// above, which starts from *coloured* transparent texels and so only
+    /// shows the output is zero — not that the input was already the
+    /// output. The skip needs the identity, so the identity is what is
+    /// asserted, over a whole real-length buffer and on bits rather than
+    /// on `f32` values (`-0.0 == 0.0` would let a sign-bit change pass a
+    /// value comparison).
+    ///
+    /// A future change to the zero-alpha arm — writing a sentinel,
+    /// normalizing `a`, anything at all — must therefore fail *here*,
+    /// which is the point of the test living in this crate.
+    #[test]
+    fn un_premultiply_in_place_is_a_bitwise_identity_on_a_transparent_tile() {
+        let before = transparent_tile();
+        let mut after = transparent_tile();
+        un_premultiply_in_place(&mut after);
+        assert!(
+            before
+                .iter()
+                .zip(&after)
+                .all(|(b, a)| b.to_bits() == a.to_bits()),
+            "un_premultiply_in_place must be a bitwise identity on an all-zero buffer"
+        );
     }
 
     /// The *other* divide-by-alpha hazard, and the one the `a == 0.0`

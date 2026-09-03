@@ -6659,7 +6659,12 @@ fn resolve_tile(
 /// up fractional — a lone opaque-white root layer at 50% opacity folds
 /// to `(0.5, 0.5, 0.5, 0.5)` — so this function runs
 /// `aurora_render::un_premultiply_in_place` on the finished accumulator
-/// before returning it, recovering the true `(1.0, 1.0, 1.0, 0.5)`. That
+/// before returning it, recovering the true `(1.0, 1.0, 1.0, 0.5)`.
+/// **As of 0.94.0 that pass is conditional on at least one root having
+/// actually folded** — see the `folded == 0` block at the end of the body
+/// for the three-fact argument that skipping it there is output-identical
+/// rather than an approximation. The *contract* is unchanged: what this
+/// returns is straight-alpha texels either way. That
 /// is the same step `resolve_tile`'s `Group` arm has always run on a
 /// group's isolated buffer, and it was missing here (and from the GPU
 /// compositing path, which now reaches the identical call through
@@ -6690,7 +6695,10 @@ fn resolve_tile(
 /// `aurora_render::composite_layer_into` this tile cost. Zero means every
 /// root declined at this tile ([`resolve_tile`] returned `None` for all of
 /// them) and the returned buffer is `aurora_render::transparent_tile`'s
-/// own untouched output, straightened for nothing.
+/// own untouched output — which since 0.94.0 is returned *without* the
+/// straightening pass running over it, since on that specific buffer the
+/// pass is a bitwise identity. So this count is now load-bearing for more
+/// than diagnostics: it is the predicate that skip reads.
 ///
 /// That count is the only signal distinguishing those two cases: the
 /// texels alone cannot, and scanning them for non-transparency would cost
@@ -6733,15 +6741,54 @@ fn composite_roots_into_tile(
     // eyedropper, the canvas atlas) that all expect straight alpha --
     // see this function's own doc comment above.
     //
-    // **This runs unconditionally, including when `folded == 0`** -- it
-    // straightens a whole 262,144-sample all-transparent buffer that no
-    // root contributed to. Red-team measured that pass at ~6.5 ms of the
-    // GPU-path benchmark's ~10.7 ms phase 1 (0.93.1), which makes skipping
-    // it for a zero-fold tile the largest single lever this diagnostic
-    // round found. Deliberately *not* skipped here: that is a behaviour
-    // change, and this round is diagnostic only. See PLAN.md, M1.10,
-    // 0.93.1.
-    aurora_render::un_premultiply_in_place(&mut composited);
+    // # Skipped entirely when `folded == 0` (0.94.0)
+    //
+    // **This is output-identical, not an approximation.** Three facts
+    // compose into that, and all three are pinned by tests rather than
+    // asserted here:
+    //
+    // 1. *Provenance.* `composited` was seeded by
+    //    `aurora_render::transparent_tile` above and the **only** thing
+    //    that ever writes to it is the `composite_layer_into` call in the
+    //    loop above -- which sits inside the same `if let Some(..)` that
+    //    increments `folded`. So `folded == 0` means literally no write
+    //    happened, and the buffer is still `transparent_tile`'s own
+    //    output. `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
+    //    (and its never-painted-pixel-layer sibling) pin that end to end,
+    //    on bits.
+    // 2. *What that output is.* `transparent_tile` is all canonical
+    //    `+0.0` -- bit pattern `0x0000`, not `-0.0`, not a subnormal --
+    //    pinned in the crate that owns it by
+    //    `transparent_tile_is_all_canonical_positive_zero_bits`.
+    // 3. *What this pass does to it.* On an all-`0x0000` buffer
+    //    `un_premultiply_in_place` is a **bitwise identity**: every alpha
+    //    is `0.0`, so its `alpha > 0.0` arm never runs, its else-arm
+    //    writes the identical `0x0000` back into `r`/`g`/`b`, and `a` is
+    //    never assigned. Pinned by
+    //    `un_premultiply_in_place_is_a_bitwise_identity_on_a_transparent_tile`,
+    //    deliberately in `aurora-render` next to the function itself, so
+    //    that changing the zero-alpha arm fails *there* rather than
+    //    silently changing what this caller writes into the composite
+    //    surface.
+    //
+    // What it buys: this pass is a full 262,144-sample chunked walk with
+    // an `f16 -> f32 -> f16` round trip per channel, and 0.93.1's
+    // hand-split measured it at **~6.49 ms of the GPU-path benchmark's
+    // ~9.87 ms `cpu_fallback_empty`** -- the largest single lever that
+    // diagnostic round found. Most tiles of most frames are exactly this
+    // case: the visible grid extends well past whatever the user has
+    // painted.
+    //
+    // **Why the condition is `folded == 0` and not "the buffer looks
+    // transparent."** The weaker premise would cover more tiles (a real
+    // layer that resolved to fully transparent texels), but establishing
+    // it requires scanning all 262,144 samples -- which is the same
+    // whole-buffer pass being removed, so it would spend the win to find
+    // it. `folded` is already counted for `RecompositeTileCosts`, so this
+    // condition costs nothing.
+    if folded > 0 {
+        aurora_render::un_premultiply_in_place(&mut composited);
+    }
     (composited, folded)
 }
 
@@ -7534,16 +7581,20 @@ impl RecompositePhases {
 ///   largest single number (8.95 ms of 10.68 ms), so what it contains
 ///   matters. In order: `aurora_render::transparent_tile`'s
 ///   allocate-and-zero of a whole `SAMPLES`-length buffer; the second root
-///   walk that folds nothing; `aurora_render::un_premultiply_in_place`
-///   over all 262,144 samples of that untouched buffer, which runs
-///   unconditionally; and `write_composited`'s `is_resident` check,
-///   `get_mut`, and full-tile bitwise `to_bits` comparison. A
-///   hand-instrumented split (Red-team, 0.93.1, same RTX 3090) put the
-///   un-premultiply pass at ~6.49 ms, `write_composited` at ~2.82 ms and
-///   the root walk at only ~0.24 ms. Those are mutation-based estimates,
-///   not slots of this array; a later round wanting exact numbers should
-///   add sixth and seventh slots and measure them with this round's own
-///   rigor.
+///   walk that folds nothing; and `write_composited`'s `is_resident`
+///   check, `get_mut`, and full-tile bitwise comparison
+///   (`tiles_are_bitwise_identical`). A hand-instrumented split
+///   (Red-team, 0.93.1, same RTX 3090) put `aurora_render::un_premultiply_in_place`
+///   at ~6.49 ms of this slot, `write_composited` at ~2.82 ms and the root
+///   walk at only ~0.24 ms.
+///
+///   **The un-premultiply pass is no longer in this slot at all (0.94.0).**
+///   [`composite_roots_into_tile`] skips it when `folded == 0`, which is
+///   exactly the condition that routes a tile to *this* slot — see that
+///   function's own `folded == 0` block for why the skip is
+///   output-identical. So this slot's own before/after value **is** the
+///   measurement of that change, which is why 0.93.1's named follow-on of
+///   adding sixth and seventh slots was not needed to land it.
 /// - `[3]` **`cpu_fallback_real`**: the CPU fallback ran and folded at
 ///   least one root, i.e. it did genuine per-texel blend math. It contains
 ///   the same un-premultiply and `write_composited` tail as `[2]` does, so
@@ -8418,6 +8469,35 @@ fn begin_gpu_composite_tile(
     Some(map_pending_readback(readback, tile_id))
 }
 
+/// Whether two whole-tile texel buffers are bitwise identical — the
+/// predicate [`recomposite_visible_tiles`]' `write_composited` asks to
+/// decide whether a recomposited tile's bytes actually moved.
+///
+/// **Deliberately not `==`.** `-0.0 == 0.0` is `true` while the two have
+/// different bit patterns the GPU can distinguish, and `NaN != NaN` would
+/// report an unchanged tile as changed forever. Bitwise identity is the
+/// correct predicate for "the bytes an upload would produce are the bytes
+/// it already produced", and it is what the hand-written
+/// `zip(..).all(|(have, want)| have.to_bits() == want.to_bits())` loop
+/// this replaced (0.94.0) computed too.
+///
+/// So this is an **implementation** change to a hot loop, not a change of
+/// meaning: `half::slice::HalfFloatSliceExt::reinterpret_cast` is a safe,
+/// zero-copy `&[u16]` view of the very same memory (no `unsafe` here, and
+/// no copy), and `[u16]` slice equality *is* element-wise `f16::to_bits`
+/// equality — with a length check and a `memcmp`-shaped comparison the
+/// compiler can vectorize, instead of a per-sample `to_bits` round trip.
+///
+/// A length mismatch answers `false`. Callers must still treat a wrongly
+/// sized buffer as their own decision rather than reading `false` as
+/// "content changed" — `write_composited` has its own length guard ahead
+/// of this, and keeps it.
+#[must_use]
+fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
+    use half::slice::HalfFloatSliceExt as _;
+    have.reinterpret_cast() == want.reinterpret_cast()
+}
+
 /// Recomposites every tile in `residency`'s own currently-visible grid
 /// from `layers.roots()`'s own bottom-to-top, visible root-level
 /// entries into `store`'s reserved composite surface
@@ -8694,12 +8774,10 @@ fn recomposite_visible_tiles(
     // the atlas records alongside each slot, so a `forget_surface` could
     // invalidate the slots itself (PLAN.md, M1.10).
     //
-    // The comparison is over `f16::to_bits`, deliberately not `==`:
-    // `-0.0 == 0.0` is `true` while the two have different bit patterns
-    // the GPU can distinguish, and `NaN != NaN` would report an unchanged
-    // tile as changed forever. Bitwise identity is both the cheaper and
-    // the correct predicate for "the bytes an upload would produce are
-    // the bytes it already produced".
+    // The comparison itself is `tiles_are_bitwise_identical` -- bitwise,
+    // deliberately not `==`; see that function's own doc comment for why,
+    // and for why 0.94.0's faster spelling of it is an implementation
+    // change rather than a weaker predicate.
     let write_composited = |store: &mut aurora_tile::TileStore,
                             cache: &mut CompositeCache,
                             tile_id: aurora_tile::TileId,
@@ -8719,12 +8797,7 @@ fn recomposite_visible_tiles(
             );
             return;
         }
-        let unchanged = was_resident
-            && dest
-                .texels()
-                .iter()
-                .zip(composited)
-                .all(|(have, want)| have.to_bits() == want.to_bits());
+        let unchanged = was_resident && tiles_are_bitwise_identical(dest.texels(), composited);
         if unchanged {
             note_composite_write_skipped();
         } else {
@@ -13893,9 +13966,10 @@ mod tests {
         reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
         sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
         skipped_tiles_message, skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        tile_store_scratch_dir, tiles_are_bitwise_identical, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -24041,6 +24115,120 @@ mod tests {
         assert_eq!(result, (0.0, 0.0, 0.0, 0.0));
     }
 
+    /// Pins fact 1 of 0.94.0's three-fact skip argument, at the caller:
+    /// when no root folds, what `composite_roots_into_tile` returns is
+    /// bitwise all-zero — not merely "near transparent", and not
+    /// something whose zero-ness depends on the straightening pass that
+    /// is now skipped.
+    ///
+    /// The assertion is on `to_bits`, not on `f32` values, deliberately:
+    /// `-0.0 == 0.0` would let a sign-bit difference pass a value
+    /// comparison, and `write_composited`'s unchanged-tile skip compares
+    /// bits, so bits are what matter downstream. `folded == 0` is
+    /// asserted alongside, since it is the predicate the skip reads —
+    /// a version of this test that only checked the texels would still
+    /// pass if `folded` started coming back wrong.
+    ///
+    /// No GPU needed: this calls the CPU helper directly.
+    #[test]
+    fn composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds() {
+        let (_dir, mut store) = real_tile_store();
+        let layers = aurora_doc::LayerTree::new();
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let (composited, folded) = composite_roots_into_tile(
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert_eq!(folded, 0, "an empty layer tree folds nothing");
+        assert_eq!(composited.len(), aurora_tile::SAMPLES);
+        assert!(
+            composited.iter().all(|sample| sample.to_bits() == 0),
+            "a zero-fold tile must be bitwise all-zero, not merely near-transparent"
+        );
+    }
+
+    /// The same claim on the case that actually dominates a real frame,
+    /// and the one an empty-`LayerTree` test cannot reach: a **real,
+    /// visible pixel layer that has simply never painted at the queried
+    /// tile**. Eight of `unchanged_skip_fixture`'s nine visible tiles are
+    /// this, and so is most of the benchmark grid.
+    ///
+    /// Worth having separately because the two get to `folded == 0` by
+    /// different routes. Above, `layers.roots()` is empty and the loop
+    /// body never runs at all. Here the loop runs, walks a root, and
+    /// `resolve_tile` declines — so this is what would catch a regression
+    /// where `resolve_tile` starts returning `Some` with an all-zero
+    /// buffer for a never-painted layer (materializing a blank tile,
+    /// say). That would leave the texels identical while making `folded`
+    /// nonzero, silently costing the straightening pass back on every
+    /// blank tile without changing any pixel — invisible to every other
+    /// test in this module.
+    #[test]
+    fn composite_roots_into_tile_folds_nothing_at_a_tile_a_real_layer_never_painted() {
+        let (_dir, mut store, layers, _surface, painted) = unchanged_skip_fixture();
+        // Two tiles right of the one `unchanged_skip_fixture` filled, so
+        // the 10x10 layer's own content cannot reach it.
+        let never_painted = aurora_tile::TileId {
+            x: painted.x + 2,
+            y: painted.y,
+        };
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let (composited, folded) = composite_roots_into_tile(
+            &layers,
+            &mut store,
+            never_painted,
+            (i64::from(never_painted.x) * i64::from(aurora_tile::TILE), 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert_eq!(
+            folded, 0,
+            "a visible layer that never painted at this tile must decline, not fold a blank"
+        );
+        assert_eq!(composited.len(), aurora_tile::SAMPLES);
+        assert!(
+            composited.iter().all(|sample| sample.to_bits() == 0),
+            "a zero-fold tile must be bitwise all-zero, not merely near-transparent"
+        );
+    }
+
+    /// 0.94.0's faster spelling of `write_composited`'s comparison is an
+    /// implementation change, so this pins the two cases that make it a
+    /// *bitwise* predicate rather than `==`, and would silently regress
+    /// if someone "simplified" it to `have == want`.
+    ///
+    /// `-0.0` is built with `from_bits(0x8000)` rather than
+    /// `from_f32(-0.0)` so the test states the exact bit pattern it means
+    /// instead of depending on a conversion to preserve a sign bit.
+    #[test]
+    fn tiles_are_bitwise_identical_distinguishes_negative_zero_and_matches_nan_to_itself() {
+        let zero = half::f16::from_f32(0.0);
+        let negative_zero = half::f16::from_bits(0x8000);
+        let nan = half::f16::from_f32(f32::NAN);
+        assert_eq!(zero.to_bits(), 0, "the +0.0 side must be canonical");
+        assert!(
+            !tiles_are_bitwise_identical(&[zero], &[negative_zero]),
+            "-0.0 and +0.0 differ in bits and must compare as changed"
+        );
+        assert!(
+            tiles_are_bitwise_identical(&[nan], &[nan]),
+            "a NaN must match itself, or an unchanged tile is changed forever"
+        );
+        assert!(tiles_are_bitwise_identical(&[zero, nan], &[zero, nan]));
+        assert!(!tiles_are_bitwise_identical(
+            &[zero],
+            &[half::f16::from_f32(1.0)]
+        ));
+        assert!(
+            !tiles_are_bitwise_identical(&[zero], &[zero, zero]),
+            "a length mismatch answers false"
+        );
+    }
+
     #[test]
     fn recomposite_visible_tiles_skips_an_already_current_tile() {
         let Some(context) = real_gpu_context() else {
@@ -29331,9 +29519,12 @@ mod tests {
              stack was walked again on the CPU -- measured small (~0.03 ms), so it is a real \
              residual but not where phase 1's time goes. cpu_fallback_empty is a COMPOSITE \
              interval, not one cost: transparent_tile's allocate-and-zero, the declining root \
-             walk, an unconditional un_premultiply_in_place over all 262,144 samples (the \
-             largest part, ~6.5 ms by hand-split), and write_composited's residency check plus \
-             full-tile bitwise compare. Both gpu_issue_* slots read ~0 on a document that never \
+             walk, and write_composited's residency check plus full-tile bitwise compare. As of \
+             0.94.0 it no longer contains un_premultiply_in_place at all -- that pass is skipped \
+             for exactly the zero-fold tiles this slot times (output-identical; see \
+             composite_roots_into_tile), and it was the largest part, ~6.5 ms by 0.93.1's \
+             hand-split, so this slot's own before/after value is the measurement of that \
+             change. Both gpu_issue_* slots read ~0 on a document that never \
              qualifies for GPU compositing at all (the CPU-fallback benchmark), because no GPU \
              arm was ever entered -- that is correct, not a missing measurement. \
              cpu_fallback_empty vs cpu_fallback_real is decided by the fold count \
