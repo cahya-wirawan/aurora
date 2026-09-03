@@ -15508,7 +15508,8 @@ severity choice.
     `has_any_tiles(surface) -> bool` — both new `TileStore` API
     decisions, deliberately not taken in 0.81.1.
 
-  Tests: five in `history.rs` —
+  Tests: seven in `history.rs` (five from 0.81.0, two more from 0.81.1
+  below) —
   `add_mask_after_a_remove_starts_from_unpainted_coverage` (re-adds with
   a *different* rectangle, so the origin shift is actually exercised,
   and asserts the tiles survive the `remove_mask` first);
@@ -15517,11 +15518,15 @@ severity choice.
   `undo_of_a_remove_mask_still_finds_its_painted_coverage` (the
   anti-naive test, the mask-shaped twin of 0.80.0's);
   `add_mask_makes_the_removed_masks_coverage_unrecoverable_by_undo`
-  (pins the accepted consequence above); and
+  (pins the accepted consequence above);
   `add_mask_refused_as_already_existing_leaves_its_coverage_alone`
-  (pins the ordering). Two in `mask.rs`:
-  `forget_mask_coverage_of_an_unknown_layer_is_zero` and
-  `forget_mask_coverage_frees_only_the_requested_layers_mask`.
+  (pins the ordering);
+  `add_mask_undone_leaves_the_old_mask_reading_the_new_masks_coverage`
+  (0.81.1 — pins the *worse* reading the addendum below corrects); and
+  `add_mask_refused_for_an_out_of_range_rectangle_leaves_residual_coverage_alone`
+  (0.81.1 — closes the one named-safe refusal branch that had no test).
+  Two in `mask.rs`: `forget_mask_coverage_of_an_unknown_layer_is_zero`
+  and `forget_mask_coverage_frees_only_the_requested_layers_mask`.
 
   Non-vacuity was verified the same way 0.80.0's was: a scratch
   mutation moving the `forget_mask_coverage` call from `add_mask` into
@@ -15586,9 +15591,23 @@ severity choice.
 
   What 0.81.1 deliberately does *not* do: implement the `TileStore`
   cost optimization, change the seam, plumb a store into `LayerTree`,
-  weaken any existing assertion, or investigate the `.aur` round trip
-  (add → paint → remove → `write_aur` → `read_aur` → add), which
-  remains an open follow-up nothing here covers.
+  or weaken any existing assertion.
+
+  **The `.aur` round trip (add → paint → remove → `write_aur` →
+  `read_aur` → add) turns out to already be answered, not open.**
+  `aurora_io::aur::persisted_surfaces` (`aur.rs:1598-1628`) only walks
+  `layers.mask(id)` — a layer with no mask attached contributes no mask
+  surface to the file at all. So the exact sequence named above never
+  reaches disk: the write happens after `remove_mask`, at which point
+  the layer is maskless and its (still-resident, per 0.80.0's design)
+  coverage is simply never persisted. Reopening the file therefore
+  starts the layer maskless with nothing to resurrect, and the
+  subsequent `add` behaves exactly as the in-process case does. This
+  does *not* extend to the harder case named just above (undo past an
+  `add_mask`, then save) — a layer whose *restored* mask is live at
+  save time persists whatever its surface currently holds, stale
+  reading included — but that is the already-disclosed undo residual,
+  not a new `.aur`-specific gap.
 
   **Verified (0.81.1)**: `cargo fmt --all --check`,
   `check_layering.py`, `check_no_hardcoded_style.py`, `cargo check
