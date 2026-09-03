@@ -39,13 +39,16 @@
 //! label (this crate draws no glyphs at all), so a collapsed row and an
 //! expanded one are pixel-identical apart from what their descendants
 //! do; `expanded` reaches the accessibility node only. `Dialog` paints
-//! a modal's own surface — the same rounded-rect-plus-outline shape
-//! `CommandPalette` gets, from `surface.overlay` rather than
-//! `surface.raised` ([`paint_dialog`] has the vocabulary citation and
-//! the three themes where the two tokens collide) — and **nothing
-//! else**: no title glyph, no message glyph (this crate draws no
-//! glyphs), and no scrim dimming the window behind it (out of scope,
-//! see `widgets::dialog`'s own module doc comment). Every other
+//! a modal's own surface — a `surface.overlay` rounded rect with an
+//! unconditional `border.default` outline, the same fill-plus-border
+//! shape `Panel` already has and for the same measured reason (without
+//! it, a Light-theme dialog is byte-identical to the panel behind it;
+//! [`paint_dialog`] has the full account, the vocabulary citation for
+//! `surface.overlay` over `surface.raised`, and the honest
+//! Colour-Critical residual) — and **nothing else**: no title glyph, no
+//! message glyph (this crate draws no glyphs), and no scrim dimming the
+//! window behind it (out of scope, see `widgets::dialog`'s own module
+//! doc comment). Every other
 //! [`WidgetKind`] (`Container` on its own, a dialog's own message node
 //! included) returns `Ok(vec![])` too — a real, deliberate "nothing to
 //! paint," not an error.
@@ -624,36 +627,79 @@ fn paint_command_palette(
     Ok(paints)
 }
 
-/// A modal dialog's own surface, and nothing else — structurally the
-/// same shape as [`paint_command_palette`] above (one `scales.radius.md`
-/// rounded rect, filled at full opacity, plus the conditional
-/// [`control_outline`]), with exactly one deliberate difference: the
-/// token.
+/// A modal dialog's own surface: a `scales.radius.md` rounded rect
+/// filled with `surface.overlay`, an **unconditional `border.default`
+/// outline over it**, and the conditional [`control_outline`] on top of
+/// that in a theme whose `border.control_opacity` is above zero. No
+/// title glyph, no message glyph, no scrim.
 ///
 /// **`surface.overlay`, not `surface.raised`.**
 /// `design/tokens/vocabulary.md` defines `surface.overlay` as
 /// "Elevation 2: modals, dialogs" and `surface.raised` as "Elevation 1:
 /// dropdowns, popovers, context menus" — a modal alert
 /// (`widgets::dialog` builds nothing else: `Role::AlertDialog` plus
-/// `Node::set_modal`) is the former, a command palette the latter. That
-/// is the whole reason these are two functions rather than one shared
-/// helper taking a token.
+/// `Node::set_modal`) is the former, a command palette the latter.
 ///
-/// **Do not "simplify" the two into one on the strength of a quick
-/// look at the themes**: the two tokens resolve *byte-identically* in
-/// three of the five built-in themes — Light (both `neutral.900`), High
-/// Contrast Dark (both `hc.black`) and High Contrast Light (both
-/// `hc.white`) — so in those three a dialog and a command palette really
-/// do paint the same colour, and no rendered-pixel test can tell this
-/// function's choice from the other's there. Only Dark (`neutral.200`
-/// vs `neutral.300`) and Colour-Critical (`cc.raised` `#4c4c4c` vs
-/// `cc.overlay` `#5a5a5a`) distinguish them today, and this module's own
+/// **The unconditional border is the load-bearing part, not decoration
+/// — a fill alone made this widget genuinely invisible.** In the Light
+/// theme `design/themes/light.toml` resolves `surface.overlay`,
+/// `surface.raised`, `surface.panel` *and* `surface.canvas` all to
+/// `neutral.900` `#f5f5f6`, and sets `border.control_opacity = 0.0`, so
+/// through `0.79.0` a dialog's entire paint was one `#f5f5f6` fill with
+/// [`control_outline`] returning `None` — byte-identical to the
+/// [`paint_panel`] surface behind it, at 1.000:1, with nothing else
+/// (this crate draws no shadows) to separate them. That is reachable in
+/// the shipping app: `aurora-app`'s enforced 640×480 minimum window
+/// still centres a real dialog over real `WidgetKind::Panel` chrome.
+/// [`paint_panel`] hit exactly this failure mode once already, on real
+/// hardware, and was fixed with an unconditional `border.default`
+/// stroke at a 1.0 logical-pixel width; this is that same fix, the same
+/// token, the same width, applied to the same class of bug rather than
+/// a new invention. In Light it buys a 2.47:1 edge against both the
+/// dialog's own fill and the panel behind it.
+///
+/// **The honest residual: Colour-Critical.** There, `border.default`
+/// (`cc.border_mid` `#6e6e6e`) clears `cc.overlay` `#5a5a5a` by only
+/// ≈1.35:1 and `cc.canvas` `#545454` by ≈1.49:1 — a real edge, but a
+/// faint one. That is **not a new gap and not specific to this
+/// function**: [`paint_panel`]'s own border is the same token against
+/// the same canvas at the same ≈1.49:1, so it is the existing, accepted
+/// tradeoff of a deliberately neutral, deliberately close-valued grey
+/// theme (`design/themes/color-critical.toml`'s own header: "not
+/// extreme contrast, just non-biasing chroma"). Raising it would mean
+/// changing that theme's `border.default`, a design-owner decision
+/// (PRD FR-027 *Ownership*), not this function's.
+///
+/// **Why the conditional [`control_outline`] is kept as well**, unlike
+/// [`paint_panel`], which has only the one border: the two High
+/// Contrast themes set `border.control_opacity = 1.0` with
+/// `border.control` at pure white/black, which is their brief's
+/// "mandatory strong borders on every control" taken literally. Dropping
+/// it to match `paint_panel` exactly would have *downgraded* those two
+/// themes from a 21:1 outline to `border.default`'s `hc.mid_gray`. So a
+/// dialog paints two shapes in Dark/Light/Colour-Critical and three in
+/// the two High Contrast themes, the third drawn last and therefore on
+/// top — coincident with the second, and deliberately so.
+///
+/// **These are two functions rather than one token-parameterized helper
+/// for a documentation reason, not a testing one.** An earlier version
+/// of this comment said "do not simplify," implying a shared helper
+/// would make some test vacuous; that was imprecise — nothing here
+/// depends on the duplication, and no drift between the two has
+/// occurred. The real reason is narrower: each function carries its own
+/// `vocabulary.md` elevation citation next to the token it actually
+/// resolves, which a shared helper would move away from both call
+/// sites. Worth knowing either way: the two tokens resolve
+/// *byte-identically* in three of the five built-in themes — Light
+/// (both `neutral.900`), High Contrast Dark (both `hc.black`) and High
+/// Contrast Light (both `hc.white`) — so in those three no
+/// rendered-pixel test can tell this function's token choice from
+/// [`paint_command_palette`]'s. Only Dark (`neutral.200` vs
+/// `neutral.300`) and Colour-Critical (`cc.raised` `#4c4c4c` vs
+/// `cc.overlay` `#5a5a5a`) distinguish them, which is why
 /// `a_dialog_paints_surface_overlay_not_the_command_palettes_surface_
-/// raised` is deliberately scoped to exactly those two, with an explicit
-/// `assert_ne!` on the tokens first so it cannot quietly become a
-/// tautology if a theme's values ever change. The collision is a
-/// *theme's* choice about elevation, not evidence that the distinction
-/// is cosmetic.
+/// raised` is scoped to exactly those two and opens with an explicit
+/// `assert_ne!` on the tokens so it cannot quietly become a tautology.
 ///
 /// Still a real, honest gap, the same one [`paint_command_palette`]
 /// has: neither the dialog's title nor its message is drawn (no text
@@ -665,6 +711,11 @@ fn paint_dialog(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
+    // The same 1.0 logical px `paint_panel` strokes its own border at,
+    // and a plain engineering default for the same reason: no "border
+    // width" token exists in `design/tokens/scales.toml` yet.
+    const BORDER_WIDTH: f32 = 1.0;
+
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,
@@ -673,9 +724,16 @@ fn paint_dialog(
         scales.radius.md as f32,
     );
     let tolerance = tolerance_for_scale_factor(scale_factor);
-    let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
-    let [r, g, b] = theme.surface.overlay.to_srgb_f32();
-    let mut paints = vec![(mesh, [r, g, b, 1.0])];
+    let fill_mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    let [fr, fg, fb] = theme.surface.overlay.to_srgb_f32();
+
+    let border_mesh = stroke(&path, BORDER_WIDTH, tolerance).map_err(WidgetError::Paint)?;
+    let [br, bg, bb] = theme.border.default.to_srgb_f32();
+
+    let mut paints = vec![
+        (fill_mesh, [fr, fg, fb, 1.0]),
+        (border_mesh, [br, bg, bb, 1.0]),
+    ];
     if let Some(outline) = control_outline(&path, theme, 1.0, scale_factor)? {
         paints.push(outline);
     }
@@ -933,6 +991,7 @@ mod tests {
     const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
     const COLOR_CRITICAL_THEME_TOML: &str =
         include_str!("../../../design/themes/color-critical.toml");
+    const LIGHT_THEME_TOML: &str = include_str!("../../../design/themes/light.toml");
     const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
 
     fn dark_theme() -> Theme {
@@ -1014,6 +1073,31 @@ mod tests {
         match themes.resolve("Color-Critical", &palette) {
             Ok(theme) => theme,
             Err(err) => unreachable!("the committed Color-Critical theme must resolve: {err:?}"),
+        }
+    }
+
+    /// The real, committed Light theme. One test needs it --
+    /// `a_light_theme_dialog_is_not_invisible_against_the_panel_behind_it`
+    /// -- because Light is the theme where every elevated surface token
+    /// collapses onto the same `neutral.900` value *and*
+    /// `border.control_opacity` is `0.0`. `extends = "Dark"`, so the
+    /// parent has to be registered first, same as `color_critical_theme`
+    /// above.
+    fn light_theme() -> Theme {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(palette) => palette,
+            Err(err) => unreachable!("the committed palette must parse: {err:?}"),
+        };
+        let mut themes = ThemeSet::new();
+        if let Err(err) = themes.register(DARK_THEME_TOML) {
+            unreachable!("the committed Dark theme must register: {err:?}");
+        }
+        if let Err(err) = themes.register(LIGHT_THEME_TOML) {
+            unreachable!("the committed Light theme must register: {err:?}");
+        }
+        match themes.resolve("Light", &palette) {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("the committed Light theme must resolve: {err:?}"),
         }
     }
 
@@ -2626,23 +2710,127 @@ mod tests {
         (tree, handle)
     }
 
+    /// Resolves a dialog's own paint and asserts it is exactly the two
+    /// shapes every non-High-Contrast theme produces -- a
+    /// `surface.overlay` fill and the unconditional `border.default`
+    /// outline over it -- returning both. The High Contrast case (a
+    /// third, `border.control` shape on top) has its own test.
+    fn dialog_fill_and_border(
+        tree: &WidgetTree<WidgetKind>,
+        handle: &DialogHandle,
+        theme: &Theme,
+        scales: &Scales,
+    ) -> (Paint, Paint) {
+        let mut paints = match paint_widget(tree, handle.root, theme, scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            paints.len(),
+            2,
+            "a dialog paints a fill and a border: {paints:?}"
+        );
+        let border = paints.remove(1);
+        let fill = paints.remove(0);
+        (fill, border)
+    }
+
     #[test]
     #[allow(clippy::float_cmp)]
-    fn a_laid_out_dialog_paints_surface_overlay_at_full_opacity() {
+    fn a_laid_out_dialog_paints_surface_overlay_with_a_real_border_over_it() {
         let scales = scales();
         let (tree, handle) = laid_out_dialog(&scales);
         let theme = dark_theme();
 
-        let (mesh, color) = single_paint(&tree, handle.root, &theme, &scales, 1.0);
+        let ((fill_mesh, fill_color), (border_mesh, border_color)) =
+            dialog_fill_and_border(&tree, &handle, &theme, &scales);
         assert!(
-            !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+            !fill_mesh.vertices.is_empty() && !fill_mesh.indices.is_empty(),
             "a real, centred dialog box must tessellate to real geometry"
+        );
+        assert!(
+            !border_mesh.vertices.is_empty() && !border_mesh.indices.is_empty(),
+            "a dialog's own border must tessellate to real geometry too"
         );
         let [r, g, b] = theme.surface.overlay.to_srgb_f32();
         assert_eq!(
-            color,
+            fill_color,
             [r, g, b, 1.0],
             "a dialog's own surface must use surface.overlay at full opacity"
+        );
+        let [r, g, b] = theme.border.default.to_srgb_f32();
+        assert_eq!(
+            border_color,
+            [r, g, b, 1.0],
+            "a dialog's own border must use border.default at full opacity, the same \
+             token paint_panel already strokes its own with"
+        );
+    }
+
+    /// **The regression test for the Light-theme invisibility bug**
+    /// found by review of `0.79.0` and fixed in `0.79.1`, stated against
+    /// the exact widget pair that collides in the real app: a
+    /// `WidgetKind::Dialog` over a `WidgetKind::Panel`.
+    ///
+    /// `design/themes/light.toml` resolves `surface.overlay`,
+    /// `surface.panel`, `surface.raised` and `surface.canvas` all to
+    /// `neutral.900` `#f5f5f6`, and sets `border.control_opacity = 0.0`
+    /// so `control_outline` returns `None`. Through `0.79.0` a dialog's
+    /// *entire* paint was therefore one `#f5f5f6` fill, byte-identical
+    /// to the fill of the panel behind it at 1.000:1 -- reachable in the
+    /// shipping app at `aurora-app`'s enforced 640x480 minimum window,
+    /// where a real dialog does centre over real panel chrome. Nothing
+    /// in this crate draws shadows, so there was nothing else to
+    /// separate them.
+    ///
+    /// The first two assertions pin the collision itself rather than
+    /// assuming it, so this test still says what it means if Light's
+    /// tokens are later changed (it fails loudly rather than passing for
+    /// a new reason). The claim is deliberately *not* "the dialog's
+    /// whole paint list differs from the panel's" -- that is vacuous
+    /// here, since the two lists differ in corner radius alone
+    /// (`radius.md` vs `radius.sm`) and both borders come from the same
+    /// `border.default` token. The real claim is that a dialog paints at
+    /// least one colour its own backdrop does not, i.e. that its edge
+    /// exists at all.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_light_theme_dialog_is_not_invisible_against_the_panel_behind_it() {
+        let scales = scales();
+        let theme = light_theme();
+
+        assert_eq!(
+            theme.surface.overlay, theme.surface.panel,
+            "this test is only worth running while Light resolves a dialog's own fill \
+             token and a panel's to the same value -- if they ever separate, the \
+             invisibility this guards against is gone and this test needs rewriting"
+        );
+        assert_eq!(
+            theme.border.control_opacity, 0.0,
+            "... and while control_outline returns None in Light, which is what left \
+             a dialog with no second shape at all through 0.79.0"
+        );
+
+        let (tree, handle) = laid_out_dialog(&scales);
+        let paints = match paint_widget(&tree, handle.root, &theme, &scales, 1.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let [pr, pg, pb] = theme.surface.panel.to_srgb_f32();
+        let backdrop = [pr, pg, pb, 1.0];
+        assert!(
+            paints.iter().any(|(_, color)| *color != backdrop),
+            "in Light a dialog must paint at least one shape that is NOT the panel \
+             colour behind it, or it is literally invisible over real panel chrome: \
+             {paints:?}"
+        );
+        let Some((_, fill_color)) = paints.first() else {
+            unreachable!("a dialog always paints at least its own fill");
+        };
+        assert_eq!(
+            *fill_color, backdrop,
+            "and the fill really is the colliding one -- it is the border, not the \
+             fill, that is doing the work here"
         );
     }
 
@@ -2679,7 +2867,7 @@ mod tests {
             );
 
             let (tree, handle) = laid_out_dialog(&scales);
-            let (_, color) = single_paint(&tree, handle.root, &theme, &scales, 1.0);
+            let ((_, color), _) = dialog_fill_and_border(&tree, &handle, &theme, &scales);
             let [r, g, b] = overlay;
             assert_eq!(
                 color,
@@ -2696,9 +2884,18 @@ mod tests {
         }
     }
 
+    /// A dialog carries the unconditional `border.default` outline
+    /// [`paint_panel`] does *and* keeps the conditional `border.control`
+    /// one, so a High Contrast theme gets three shapes, not two. That is
+    /// deliberate: those two themes set `border.control` to pure
+    /// white/black at full opacity ("mandatory strong borders on every
+    /// control"), and collapsing to `border.default` alone -- an exact
+    /// mirror of `paint_panel` -- would have downgraded them to
+    /// `hc.mid_gray`. The third shape draws last, so it is what a user
+    /// of those themes actually sees.
     #[test]
     #[allow(clippy::float_cmp)]
-    fn a_dialog_gains_a_second_outline_shape_when_border_control_opacity_is_above_zero() {
+    fn a_dialog_gains_a_third_outline_shape_when_border_control_opacity_is_above_zero() {
         let scales = scales();
         let (tree, handle) = laid_out_dialog(&scales);
         let theme = high_contrast_theme();
@@ -2709,17 +2906,82 @@ mod tests {
         };
         assert_eq!(
             paints.len(),
-            2,
-            "a dialog paints its own surface plus the mandatory control outline: {paints:?}"
+            3,
+            "a dialog paints its own surface, its border.default outline, and the \
+             mandatory control outline over both: {paints:?}"
         );
-        let Some((_, outline_color)) = paints.get(1) else {
-            unreachable!("just asserted len() == 2");
+        let Some((_, border_color)) = paints.get(1) else {
+            unreachable!("just asserted len() == 3");
+        };
+        let [r, g, b] = theme.border.default.to_srgb_f32();
+        assert_eq!(
+            *border_color,
+            [r, g, b, 1.0],
+            "the unconditional border must still use border.default at full opacity"
+        );
+        let Some((_, outline_color)) = paints.get(2) else {
+            unreachable!("just asserted len() == 3");
         };
         let [r, g, b] = theme.border.control.to_srgb_f32();
         assert_eq!(
             *outline_color,
             [r, g, b, theme.border.control_opacity],
-            "the outline must use border.control at border.control_opacity"
+            "the control outline must use border.control at border.control_opacity, \
+             and must draw last so it lands on top of border.default"
+        );
+    }
+
+    /// **The corner radius is this widget's one real geometric decision,
+    /// and this is what pins it.** `paint_dialog` chooses
+    /// `scales.radius.md` (`4`); review of `0.79.0` found that mutating
+    /// it to every other value in the `radius` scale
+    /// (`none`/`sm`/`lg`/`pill`) left every dialog test in this crate
+    /// green, because none of them looked at the mesh's actual geometry
+    /// and this widget deliberately ships no golden image.
+    ///
+    /// Two assertions, read straight off the fill mesh.
+    /// `aurora_vector::rounded_rect` emits a real path anchor at
+    /// `(x, y + r)` -- where the top-left arc rejoins the left edge --
+    /// and `lyon`'s fill tessellator keeps every path endpoint as a
+    /// vertex, so:
+    ///
+    /// 1. that exact point must be present, which is false for `sm`
+    ///    (`2`), `lg` (`8`) and `pill` (clamped to half the box);
+    /// 2. the square corner `(x, y)` must be *absent*, which is what
+    ///    rules out `none` (`0`) -- the one mutation assertion 1 alone
+    ///    would miss.
+    ///
+    /// Verified by actually performing all four mutations, not assumed.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_dialogs_fill_mesh_has_the_radius_md_corner_and_not_a_square_one() {
+        let scales = scales();
+        let (tree, handle) = laid_out_dialog(&scales);
+        let theme = dark_theme();
+        let Some(bounds) = tree.bounds(handle.root) else {
+            unreachable!("just laid out");
+        };
+
+        let ((fill_mesh, _), _) = dialog_fill_and_border(&tree, &handle, &theme, &scales);
+        #[allow(clippy::cast_precision_loss)]
+        let (left, top, radius) = (bounds.x as f32, bounds.y as f32, scales.radius.md as f32);
+        assert!(
+            radius > 0.0,
+            "the committed radius.md must be a real, non-zero radius: {radius}"
+        );
+
+        let has = |x: f32, y: f32| fill_mesh.vertices.iter().any(|v| v.x == x && v.y == y);
+        assert!(
+            has(left, top + radius),
+            "the fill must carry rounded_rect's own (x, y + radius.md) anchor, which \
+             pins the radius to exactly {radius}: {:?}",
+            fill_mesh.vertices
+        );
+        assert!(
+            !has(left, top),
+            "... and must NOT carry the square top-left corner, which is what a \
+             radius of 0 would produce: {:?}",
+            fill_mesh.vertices
         );
     }
 

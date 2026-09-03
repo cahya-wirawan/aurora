@@ -6439,6 +6439,94 @@ structural design work.
   the `Scrollbar`/`TreeView` rounds, and a golden nobody can bless is
   debt, not evidence.
 
+  **`0.79.1` — what review found wrong with the round above, and what
+  was corrected.** Two independent reviewers converged on the same
+  blocker: **the paragraph "a dialog finally paints something" was
+  false in the Light theme.** `design/themes/light.toml` resolves
+  `surface.overlay`, `surface.raised`, `surface.panel` *and*
+  `surface.canvas` all to `neutral.900` `#f5f5f6`, and sets
+  `border.control_opacity = 0.0` so the conditional `control_outline`
+  returns `None` — so a Light-theme dialog's *entire* paint was one
+  fill byte-identical to the chrome behind it, at **1.000:1**, with no
+  border and (nothing in this crate draws shadows) nothing else to
+  separate them. It was reachable in the shipping app, at the
+  `(640, 480)` `min_inner_size` the round above added, overlapping real
+  `WidgetKind::Panel` chrome. Colour-Critical was near-false the same
+  way, at ≈1.1:1. The fix is the precedent `paint_panel` already set
+  when it hit this exact failure on real hardware: an **unconditional
+  `border.default` stroke at 1.0 logical px**, same token, same width.
+  In Light that buys a 2.47:1 edge. The conditional `border.control`
+  outline is *kept* on top of it, unlike `paint_panel`, because the two
+  High Contrast themes set it to pure white/black at full opacity, and
+  dropping it to mirror `paint_panel` exactly would have downgraded
+  them from 21:1 to `hc.mid_gray`; a dialog is therefore two shapes in
+  Dark/Light/Colour-Critical and three in the HC themes. **The honest
+  residual**: in Colour-Critical that border clears the surfaces around
+  it by only ≈1.35–1.49:1 — faint, but *identical* to what a `Panel`
+  already gets there from the same token, i.e. the existing accepted
+  tradeoff of a deliberately close-valued neutral theme, not a new gap.
+  Raising it means changing that theme's `border.default`, a
+  design-owner call. Both doc comments that overclaimed
+  (`widgets/dialog.rs`'s "what this does not do" paragraph and
+  `paint::paint_dialog`'s own) now state all of this plainly.
+
+  Test coverage was strengthened where review showed it was thin,
+  each item verified by actually performing the mutation:
+
+  - **The Light-theme bug now has a regression test.**
+    `a_light_theme_dialog_is_not_invisible_against_the_panel_behind_it`
+    pins the token collision itself first (so it cannot pass for a new
+    reason), then asserts a dialog paints at least one colour its own
+    backdrop does not. Confirmed red against `0.79.0`'s fill-only
+    `paint_dialog`.
+  - **The corner radius was completely unpinned.** Review mutated
+    `scales.radius.md` through all five `radius.*` values and every one
+    of the ten new tests stayed green.
+    `a_dialogs_fill_mesh_has_the_radius_md_corner_and_not_a_square_one`
+    reads the fill mesh directly for `rounded_rect`'s own `(x, y + r)`
+    anchor and for the *absence* of a square corner; all four mutations
+    (`none`/`sm`/`lg`/`pill`) now fail.
+  - **The five GPU gallery tests didn't test the round's own headline
+    decision.** Mutating `paint_dialog` to `surface.raised` left all six
+    green, because every claim was token-agnostic ("some colour differs
+    from the backdrop"). They now assert the sampled pixel's **exact
+    `theme.surface.overlay` byte value**; the mutation fails Dark and
+    Colour-Critical, and still cannot fail the other three, for the same
+    token-collision reason the unit test already scopes around.
+  - **Nothing proved a dialog paints in the *real* tree.**
+    `a_real_dialog_paints_real_shapes_in_the_real_workspace_tree`
+    (`aurora-app`, no GPU) drives `open_crash_recovery_dialog` into a
+    real `aurora_ui::build_workspace`, lays out at the enforced minimum
+    window size, and asserts `paint_order` reaches the dialog root and
+    `paint_widget` returns real, non-empty meshes.
+  - Smaller corrections: the gallery's "just outside the dialog" claim
+    was weakened in `0.79.0` from an exact byte check to a
+    pixel-agrees-with-pixel one and presented as like-for-like — it now
+    makes **both** comparisons, the second against the clear colour's
+    own byte with ±1 tolerance (`NEUTRAL_CLEAR`'s `0.5` has no exact
+    `Rgba8Unorm` byte); `DIALOG_COLOR_CRITICAL_CLEAR` is documented as
+    *not* test-load-bearing (review reverted it and everything still
+    passed — only `DIALOG_LIGHT_CLEAR` is mechanically required); the
+    sample-point guard now checks absolute properties (`>= 0`, inside
+    the image) rather than only relative ones, so an unusual
+    `DIALOG_CELL` cannot wrap a negative value through a `u32` cast;
+    `widgets/mod.rs`'s "there is no vector-first rendering yet …
+    nothing here draws a pixel" paragraph, stale since `aurora-vector`
+    became real, is rewritten (eleven `WidgetKind` variants tessellate
+    real geometry; what is missing is **glyphs**); and
+    `WidgetKind::Dialog`'s unit-like shape now discloses its own
+    trade-off (a future "danger" variant needs `Dialog(State)`, a
+    breaking change to every exhaustive match; no `#[non_exhaustive]`
+    was added — that is a wider API decision).
+
+  **Explicitly deferred, not fixed**: `design/check_contrast.py` gains
+  no new gated pair for the `accent.primary`-on-`surface.overlay`
+  composition a dialog introduces. Nothing currently fails, that script
+  is not in CI, and expanding its gated-pair list is a separate scope
+  decision. Also still true: no golden images, and the round's numbers
+  above were measured on a software-capable dev box, not re-blessed by
+  a human on real hardware.
+
 ### M1.9 — Basic tools and I/O
 
 - [x] **Move, marquee select, zoom, pan, eyedropper** — three of five

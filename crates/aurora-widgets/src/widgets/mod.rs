@@ -46,14 +46,25 @@
 //! menus/tooltips, `aurora-vector` path rendering for the curve editor)
 //! and are deliberately left open rather than stubbed out half-built.
 //!
-//! **No rendering**: every widget here produces layout (a `taffy::Style`,
-//! resolved from `aurora_theme::Scales` — invariant §7.3.10, no
-//! hardcoded spacing) and accessibility content (a real `accesskit::Node`
-//! with the right role/actions/value), but there is no vector-first
-//! rendering yet (a separate M1.7 bullet, blocked on `aurora-vector`
-//! still being an empty skeleton) — nothing here draws a pixel. This
-//! mirrors `WidgetTree` itself: a complete, tested logical model with
-//! painting layered on afterward, not built into the model.
+//! **Every module here is a model, not a painter** — and that is a
+//! division of labour, not a missing feature. A widget module produces
+//! layout (a `taffy::Style`, resolved from `aurora_theme::Scales` —
+//! invariant §7.3.10, no hardcoded spacing) and accessibility content
+//! (a real `accesskit::Node` with the right role/actions/value); the
+//! pixels are [`crate::paint_widget`]'s job, one layer over, which
+//! tessellates real geometry through `aurora-vector` for **eleven** of
+//! the [`WidgetKind`] variants below (every one except `Container`,
+//! [`WidgetKind::Dialog`] included as of `0.79.0`). This mirrors
+//! `WidgetTree` itself: a complete, tested logical model with painting
+//! layered on afterward, not built into the model.
+//!
+//! (That paragraph said "there is no vector-first rendering yet …
+//! nothing here draws a pixel" through `0.79.0`. It was written when
+//! `aurora-vector` really was an empty skeleton and went stale without
+//! being noticed. What is *actually* still missing is **glyphs**: no
+//! module here and nothing in `paint.rs` draws text, so every label,
+//! every dialog title and message, and every tree row's own name reach
+//! the accessibility tree and nothing else.)
 //!
 //! **One shared payload type**: [`WidgetTree`] is generic over a single
 //! payload `W` for the whole tree, so a tree containing more than one
@@ -150,10 +161,24 @@ pub enum WidgetKind {
     /// none: its paint is a pure function of its own bounds and the
     /// theme. Its fill is `surface.overlay` ("Elevation 2: modals,
     /// dialogs", `design/tokens/vocabulary.md`), deliberately *not* the
-    /// `surface.raised` [`CommandPalette`] resolves — see
+    /// `surface.raised` [`CommandPalette`] resolves, plus an
+    /// unconditional `border.default` outline — see
     /// `paint::paint_dialog`. Not one of `design/gallery/index.html`'s
     /// own 12 named widgets either, the same status [`Panel`] and
     /// [`CommandPalette`] already have.
+    ///
+    /// **The unit-like shape is a real, disclosed trade-off.** The
+    /// moment a dialog needs a visual *variant* — a destructive
+    /// "danger" alert painting `state.error` where a neutral one paints
+    /// `surface.overlay` is the obvious first one — this has to become
+    /// `Dialog(DialogState)`, which breaks every exhaustive `match` on
+    /// [`WidgetKind`] in and above this crate. This enum carries no
+    /// `#[non_exhaustive]` to soften that, deliberately: adding one is
+    /// an API decision affecting every existing match site, not a
+    /// dialog-sized change, and the blast radius today is small (every
+    /// consumer is a path dependency inside this workspace — nothing
+    /// here is published). Recorded so the cost is visible when someone
+    /// does need the variant, not so it reads as already handled.
     ///
     /// [`Panel`]: WidgetKind::Panel
     /// [`CommandPalette`]: WidgetKind::CommandPalette

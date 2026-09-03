@@ -292,8 +292,31 @@
 //! checked fix applies: `NEUTRAL_CLEAR`'s `#808080`, under two new
 //! named constants so a reader doesn't have to cross-reference the
 //! command palette's own token to see why the byte value is right here
-//! too. Nothing in this slice claims anything about how a dialog
-//! *reads* with real text, because no text is drawn.
+//! too.
+//!
+//! **The two constants are not equally load-bearing, and the table
+//! above shouldn't be read as saying they are.** Only
+//! `DIALOG_LIGHT_CLEAR` is *mechanically* required: with plain
+//! `LIGHT_CLEAR` the surface and the backdrop are the same byte and
+//! this file's own claims 1 and 4 contradict each other outright.
+//! `DIALOG_COLOR_CRITICAL_CLEAR` is a **pre-emptive** choice, and
+//! review confirmed it by reverting it: `#5a5a5a` against
+//! `COLOR_CRITICAL_CLEAR`'s `#545454` is six levels apart, not a
+//! collision, so every assertion here passes either way. It is kept
+//! because ≈1.1:1 is invisible to a *human*, and the thing a human will
+//! eventually be asked to do with these renders is bless a golden — but
+//! nothing today depends on it, and it should be changed freely if a
+//! better backdrop is found.
+//!
+//! Nothing in this slice claims anything about how a dialog *reads*
+//! with real text, because no text is drawn.
+//!
+//! As of `0.79.1` a dialog also paints an unconditional
+//! `border.default` outline (`paint_dialog`, and the Light-theme
+//! invisibility bug that motivated it). No backdrop in the table above
+//! changes: every sample point here is either well inside the dialog or
+//! two pixels outside it, and a 1 px stroke centred on the boundary
+//! reaches neither.
 //!
 //! Uses only `aurora_widgets`' public API, the same "exercised exactly
 //! as an external consumer would use it" discipline `tests/headless.rs`
@@ -733,11 +756,20 @@ const DIALOG_LIGHT_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
 /// `cc.overlay` (`#5a5a5a`) and `COLOR_CRITICAL_CLEAR` to `cc.canvas`
 /// (`#545454`). Those are two genuinely different token values, but
 /// they are **six levels out of 255 apart** — ≈1.1:1 by the real WCAG
-/// luminance formula, which is the same failure in substance as an
-/// outright collision: a human looking at the render would see no
+/// luminance formula: a human looking at the render would see no
 /// dialog. So this reuses `NEUTRAL_CLEAR`'s `#808080` too, where
 /// `#5a5a5a` clears it by a real margin, and Colour-Critical's own
 /// `accent.primary` (`#a4c8ff`) is far from both.
+///
+/// **Unlike [`DIALOG_LIGHT_CLEAR`], no assertion in this file needs
+/// this.** Six levels apart is not a byte collision, so every claim
+/// `assert_dialog_surface_is_distinct` makes passes just as well
+/// against plain `COLOR_CRITICAL_CLEAR` — review of `0.79.0` confirmed
+/// that by actually reverting it. This constant exists for the *human*
+/// step that hasn't happened yet: whoever eventually blesses a golden
+/// for this widget on real hardware needs to be able to see the dialog
+/// in the render. It is a legibility judgement, not a mechanical
+/// requirement, and it should be changed freely.
 const DIALOG_COLOR_CRITICAL_CLEAR: wgpu::Color = NEUTRAL_CLEAR;
 
 /// Serializes this file's real-GPU tests, this integration test's own
@@ -1468,13 +1500,33 @@ fn dialog_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2
     (tree, [handle.root, button])
 }
 
-/// The three rendered-pixel claims every theme's own `Dialog` gallery
+/// The four rendered-pixel claims every theme's own `Dialog` gallery
 /// makes, shared rather than restated five times — the same reasoning
 /// [`assert_scrollbar_states_are_distinct`] and
 /// [`assert_tree_view_states_are_distinct`] already record: a dialog
-/// resolves exactly one token (`surface.overlay`, plus the conditional
-/// `border.control` outline in the two High Contrast themes), so the
-/// claim really is identical in all five themes.
+/// resolves the same tokens in every theme (`surface.overlay`, an
+/// unconditional `border.default` outline, plus the conditional
+/// `border.control` one in the two High Contrast themes), so the claim
+/// really is identical in all five.
+///
+/// `expected_surface` is the caller's own `theme.surface.overlay`, and
+/// claim 2 checks the sampled pixel against its **exact byte value**.
+/// That is what makes these tests say something about *which* token a
+/// dialog resolves rather than merely that some colour fills its box:
+/// review of `0.79.0` mutated `paint_dialog` to `surface.raised` and
+/// every gallery test here stayed green, because each claim was
+/// token-agnostic. In **Dark** (`neutral.300` vs `neutral.200`) and
+/// **Colour-Critical** (`cc.overlay` vs `cc.raised`) that mutation now
+/// fails here. In the other three themes the two tokens resolve to the
+/// same byte value, so the same assertion cannot separate them — the
+/// exact-byte check is still real there (it pins the fill against the
+/// backdrop and against any future paint change), it just isn't
+/// evidence about the elevation choice, exactly as
+/// `paint::tests::a_dialog_paints_surface_overlay_not_the_command_
+/// palettes_surface_raised` already scopes itself to those same two
+/// themes and says why.
+///
+/// `clear` is the backdrop the image was cleared to, needed by claim 4.
 ///
 /// **Every sample point is derived from real `tree.bounds()`, never
 /// hardcoded and never a naive geometric centre.** Both matter here. A
@@ -1487,12 +1539,27 @@ fn dialog_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 2
 /// near the button, and "the surface is painted" would silently become
 /// "the button is painted." The surface sample is therefore taken
 /// halfway between the dialog's own top edge and the button's, which is
-/// message band and gap: dialog surface, nothing else, at any scale.
+/// message band and gap: dialog surface, nothing else.
+///
+/// That derivation holds **by construction, at any density**, but only
+/// one `Scales` fixture (the committed comfortable-density
+/// `scales.toml`) is ever run through it, so read that as reasoning
+/// rather than as coverage. The reasoning: the dialog's top padding and
+/// the message row above the button are both positive multiples of the
+/// same scale factor a density multiplier applies uniformly
+/// (`Scales::with_density` scales spacing and type size together), so
+/// `button_bounds.y > dialog_bounds.y` — the only property the midpoint
+/// needs — cannot invert with density. The guard below asserts it
+/// rather than trusting it, and
+/// [`dialog_gallery_lays_the_dialog_out_as_a_centred_box_with_real_bounds`]
+/// pins the same relation with no GPU at all.
 fn assert_dialog_surface_is_distinct(
     image: &aurora_testkit::Image,
     tree: &WidgetTree<WidgetKind>,
     dialog: WidgetId,
     button: WidgetId,
+    expected_surface: Color,
+    clear: wgpu::Color,
     theme_name: &str,
 ) {
     assert_eq!(image.width, DIALOG_GALLERY_SIZE.0);
@@ -1511,10 +1578,23 @@ fn assert_dialog_surface_is_distinct(
     // Two pixels left of the dialog's own left edge, at that same row:
     // the tightest available "just past the real bounds" point.
     let outside_x = dialog_bounds.x - 2;
+    // Absolute properties, not relative ones: every one of these three
+    // is about to be cast to `u32`, so a negative value would wrap to
+    // an enormous index rather than fail. `surface_y > dialog_bounds.y`
+    // alone (what this asserted through `0.79.0`) does not rule that
+    // out -- a dialog laid out above the top of the image satisfies it
+    // with `surface_y` still negative. Review constructed exactly that
+    // case at a `DIALOG_CELL` size other than the committed one.
     assert!(
-        outside_x > 0 && surface_y > dialog_bounds.y,
-        "{theme_name}: the dialog must leave real backdrop beside it and a real band \
-         above its button for these samples to mean anything: {dialog_bounds:?} / \
+        outside_x > 0
+            && surface_x >= 0
+            && surface_y >= 0
+            && surface_x < i64::from(image.width)
+            && surface_y < i64::from(image.height)
+            && surface_y > dialog_bounds.y,
+        "{theme_name}: every sample point must be a real pixel inside the image, and \
+         the dialog must leave real backdrop beside it and a real band above its \
+         button, for these samples to mean anything: {dialog_bounds:?} / \
          {button_bounds:?}"
     );
 
@@ -1522,7 +1602,7 @@ fn assert_dialog_surface_is_distinct(
     let (surface_x, surface_y, outside_x) = (surface_x as u32, surface_y as u32, outside_x as u32);
     let surface = sample_at(image, surface_x, surface_y);
     let outside = sample_at(image, outside_x, surface_y);
-    let corner = sample_at(image, 0, 0);
+    let origin_corner = sample_at(image, 0, 0);
 
     // 1. The surface exists at all: inside the dialog's own bounds it
     //    reads something other than what lies outside them.
@@ -1532,7 +1612,25 @@ fn assert_dialog_surface_is_distinct(
          bounds must differ from the backdrop two pixels past its left edge"
     );
 
-    // 2. ... and that surface is the dialog's own, not its action
+    // 2. ... and it is specifically `surface.overlay`, byte for byte.
+    //    `render_gallery`'s target is a plain `Rgba8Unorm` (not sRGB)
+    //    and `paint_widget` already returns straight sRGB-gamma bytes
+    //    at full opacity, so the token's own `u8` channels land in the
+    //    image unmodified -- no tolerance is needed or wanted here.
+    assert_eq!(
+        surface,
+        [
+            expected_surface.r,
+            expected_surface.g,
+            expected_surface.b,
+            u8::MAX
+        ],
+        "{theme_name}: the dialog's own surface must be exactly surface.overlay \
+         (Elevation 2: modals, dialogs), not merely some colour that differs from \
+         the backdrop"
+    );
+
+    // 3. ... and that surface is the dialog's own, not its action
     //    button's fill bleeding upward past the button's box.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let button_centre = sample_at(
@@ -1546,18 +1644,55 @@ fn assert_dialog_surface_is_distinct(
          action button, or claim 1 could be satisfied by the button alone"
     );
 
-    // 3. ... and it genuinely stops at the dialog's real bounds: the
-    //    pixel just outside them is the same untouched backdrop the
-    //    image's own far corner shows. (Compared corner-to-corner
-    //    rather than against the clear constant's byte value, because
-    //    `NEUTRAL_CLEAR`'s `0.5` has no exact `Rgba8Unorm` byte and the
-    //    rounding would be a distraction, not evidence.)
+    // 4. ... and it genuinely stops at the dialog's real bounds: the
+    //    pixel just outside them is still the untouched backdrop.
+    //
+    //    Two comparisons, because neither alone is enough. Against the
+    //    image's own origin pixel `(0, 0)` -- a corner no widget can
+    //    reach -- which is exact but, on its own, only proves two
+    //    pixels agree with each other rather than that either is the
+    //    intended backdrop. And against `clear`'s own byte value with a
+    //    +/-1 tolerance, which is what actually ties both to the
+    //    backdrop the caller asked for; the tolerance is needed because
+    //    `NEUTRAL_CLEAR`'s `0.5` has no exact `Rgba8Unorm` byte
+    //    (`0.5 * 255 = 127.5`) and the driver may round either way.
+    //    Through `0.79.0` only the first was made, described as a
+    //    like-for-like substitution for an exact-byte check it is
+    //    strictly weaker than.
     assert_eq!(
-        outside, corner,
+        outside, origin_corner,
         "{theme_name}: outside the dialog's own bounds the image must still be the \
-         untouched backdrop the far corner shows -- the surface must not extend past \
-         the box taffy actually gave it"
+         untouched backdrop the image's origin pixel shows -- the surface must not \
+         extend past the box taffy actually gave it"
     );
+    assert_backdrop_is_the_clear_colour(outside, clear, theme_name);
+}
+
+/// `pixel` is `clear`, within one byte per channel — the tolerance
+/// [`assert_dialog_surface_is_distinct`]'s own claim 4 explains
+/// (`NEUTRAL_CLEAR`'s `0.5` quantizes to `127.5`, so `127` and `128`
+/// are both correct answers and which one a driver gives is not
+/// something worth pinning).
+fn assert_backdrop_is_the_clear_colour(pixel: [u8; 4], clear: wgpu::Color, theme_name: &str) {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let expected = [
+        (clear.r * 255.0).round() as u8,
+        (clear.g * 255.0).round() as u8,
+        (clear.b * 255.0).round() as u8,
+        (clear.a * 255.0).round() as u8,
+    ];
+    for (channel, (actual, wanted)) in pixel.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            actual.abs_diff(*wanted) <= 1,
+            "{theme_name}: channel {channel} of the backdrop beside the dialog reads \
+             {actual}, but the image was cleared to {wanted} (+/-1 for the fact that \
+             a 0.5 clear has no exact byte): {pixel:?} vs {expected:?}"
+        );
+    }
 }
 
 /// Renders every widget in `tree` (`paint_widget`, in
@@ -5418,15 +5553,24 @@ fn render_gallery_produces_the_dialogs_own_surface() {
     };
     let scales = scales();
     let (tree, [dialog, button]) = dialog_gallery_tree(&scales);
+    let theme = dark_theme();
     let image = render_gallery(
         &context,
         &tree,
-        &dark_theme(),
+        &theme,
         &scales,
         DIALOG_GALLERY_SIZE,
         wgpu::Color::BLACK,
     );
-    assert_dialog_surface_is_distinct(&image, &tree, dialog, button, "Dark");
+    assert_dialog_surface_is_distinct(
+        &image,
+        &tree,
+        dialog,
+        button,
+        theme.surface.overlay,
+        wgpu::Color::BLACK,
+        "Dark",
+    );
 }
 
 #[test]
@@ -5436,15 +5580,24 @@ fn render_gallery_produces_the_dialogs_own_surface_in_light_theme() {
     };
     let scales = scales();
     let (tree, [dialog, button]) = dialog_gallery_tree(&scales);
+    let theme = light_theme();
     let image = render_gallery(
         &context,
         &tree,
-        &light_theme(),
+        &theme,
         &scales,
         DIALOG_GALLERY_SIZE,
         DIALOG_LIGHT_CLEAR,
     );
-    assert_dialog_surface_is_distinct(&image, &tree, dialog, button, "Light");
+    assert_dialog_surface_is_distinct(
+        &image,
+        &tree,
+        dialog,
+        button,
+        theme.surface.overlay,
+        DIALOG_LIGHT_CLEAR,
+        "Light",
+    );
 }
 
 #[test]
@@ -5454,15 +5607,24 @@ fn render_gallery_produces_the_dialogs_own_surface_in_high_contrast_dark_theme()
     };
     let scales = scales();
     let (tree, [dialog, button]) = dialog_gallery_tree(&scales);
+    let theme = high_contrast_dark_theme();
     let image = render_gallery(
         &context,
         &tree,
-        &high_contrast_dark_theme(),
+        &theme,
         &scales,
         DIALOG_GALLERY_SIZE,
         HIGH_CONTRAST_DARK_CLEAR,
     );
-    assert_dialog_surface_is_distinct(&image, &tree, dialog, button, "High Contrast Dark");
+    assert_dialog_surface_is_distinct(
+        &image,
+        &tree,
+        dialog,
+        button,
+        theme.surface.overlay,
+        HIGH_CONTRAST_DARK_CLEAR,
+        "High Contrast Dark",
+    );
 }
 
 #[test]
@@ -5472,15 +5634,24 @@ fn render_gallery_produces_the_dialogs_own_surface_in_high_contrast_light_theme(
     };
     let scales = scales();
     let (tree, [dialog, button]) = dialog_gallery_tree(&scales);
+    let theme = high_contrast_light_theme();
     let image = render_gallery(
         &context,
         &tree,
-        &high_contrast_light_theme(),
+        &theme,
         &scales,
         DIALOG_GALLERY_SIZE,
         HIGH_CONTRAST_LIGHT_CLEAR,
     );
-    assert_dialog_surface_is_distinct(&image, &tree, dialog, button, "High Contrast Light");
+    assert_dialog_surface_is_distinct(
+        &image,
+        &tree,
+        dialog,
+        button,
+        theme.surface.overlay,
+        HIGH_CONTRAST_LIGHT_CLEAR,
+        "High Contrast Light",
+    );
 }
 
 #[test]
@@ -5490,13 +5661,22 @@ fn render_gallery_produces_the_dialogs_own_surface_in_color_critical_theme() {
     };
     let scales = scales();
     let (tree, [dialog, button]) = dialog_gallery_tree(&scales);
+    let theme = color_critical_theme();
     let image = render_gallery(
         &context,
         &tree,
-        &color_critical_theme(),
+        &theme,
         &scales,
         DIALOG_GALLERY_SIZE,
         DIALOG_COLOR_CRITICAL_CLEAR,
     );
-    assert_dialog_surface_is_distinct(&image, &tree, dialog, button, "Colour-Critical");
+    assert_dialog_surface_is_distinct(
+        &image,
+        &tree,
+        dialog,
+        button,
+        theme.surface.overlay,
+        DIALOG_COLOR_CRITICAL_CLEAR,
+        "Colour-Critical",
+    );
 }

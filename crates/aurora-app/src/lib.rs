@@ -26285,6 +26285,92 @@ mod tests {
         );
     }
 
+    /// A real dialog in the **real workspace tree** actually reaches
+    /// paint, and paints something that is not the panel chrome behind
+    /// it.
+    ///
+    /// `aurora-widgets`' own gallery proves `paint_widget` in isolation,
+    /// on a tree built for the purpose; nothing proved that this crate's
+    /// own path -- `open_crash_recovery_dialog` into
+    /// `aurora_ui::build_workspace`'s tree, `compute_layout`, then
+    /// `WidgetTree::paint_order` -- ever visits the dialog's root at all.
+    /// A dialog inserted under a node `paint_order` never reaches, or
+    /// one whose bounds `clip_to_clipping_ancestors` clips to nothing,
+    /// would paint exactly zero shapes and every existing test here
+    /// would still pass, because they are all about hit-testing and
+    /// focus.
+    ///
+    /// This walks the same order [`collect_widget_paints`] does and
+    /// calls the same `paint_widget`, but never touches a GPU: that
+    /// function's only extra work is `GpuMesh::upload` plus
+    /// [`linearize_paint_color`], neither of which can turn a non-empty
+    /// mesh list into an empty one. Laid out at the enforced minimum
+    /// window size, which is the smallest real window a user can
+    /// actually produce and the size at which the dialog overlaps the
+    /// most chrome.
+    #[test]
+    // Both sides come from the same `Color::to_srgb_f32` call on the
+    // same underlying `u8` channels -- bit-exact, not accumulated float
+    // noise, the same precedent `paint.rs`'s own colour assertions
+    // already allow this lint for.
+    #[allow(clippy::float_cmp)]
+    fn a_real_dialog_paints_real_shapes_in_the_real_workspace_tree() {
+        let mut workspace = aurora_ui::build_workspace();
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        let scales = match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        };
+        let theme = match load_theme() {
+            Ok(theme) => theme,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        open_crash_recovery_dialog(&mut workspace, &mut focus, &mut dialog, &scales, false);
+        let Some(handle) = dialog.clone() else {
+            unreachable!("just opened");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        workspace
+            .tree
+            .compute_layout(MIN_WINDOW_WIDTH as f32, MIN_WINDOW_HEIGHT as f32);
+
+        let order = workspace.tree.paint_order();
+        assert!(
+            order.contains(&handle.root),
+            "the real paint order must reach the dialog's own root at all"
+        );
+
+        let paints = match aurora_widgets::paint_widget(
+            &workspace.tree,
+            handle.root,
+            &theme,
+            &scales,
+            1.0,
+        ) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(
+            !paints.is_empty(),
+            "a dialog open in the real workspace must paint at least one shape"
+        );
+        for (mesh, _) in &paints {
+            assert!(
+                !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
+                "every shape must tessellate to real geometry, not an empty mesh \
+                 clipped away by an ancestor: {paints:?}"
+            );
+        }
+        let [r, g, b] = theme.surface.panel.to_srgb_f32();
+        assert!(
+            paints.iter().any(|(_, color)| *color != [r, g, b, 1.0]),
+            "and at least one of them must not be the panel colour behind it -- \
+             which is the whole Light-theme bug 0.79.1 fixed, restated against the \
+             real tree: {paints:?}"
+        );
+    }
+
     #[test]
     fn handle_dialog_pointer_returns_false_when_no_dialog_is_open() {
         let mut workspace = aurora_ui::build_workspace();

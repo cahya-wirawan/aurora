@@ -8,14 +8,16 @@
 //! hidden-flag widget. **The precedent is now followed for paint as
 //! well as layout**: as of `0.79.0` a dialog's root carries its own
 //! [`WidgetKind::Dialog`] and `paint::paint_dialog` draws a real
-//! rounded-rect surface for it, exactly the shape
-//! `paint_command_palette` already had — with one deliberate
-//! difference, `surface.overlay` rather than `surface.raised`, because
+//! rounded-rect surface for it — `surface.overlay` rather than the
+//! command palette's `surface.raised`, because
 //! `design/tokens/vocabulary.md` names the former "Elevation 2: modals,
-//! dialogs" and reserves the latter for "Elevation 1: popovers". The
-//! dialog's *message* node stays a plain `WidgetKind::Container` and
-//! still draws nothing, for the reason the "what this does not do"
-//! paragraph at the end of this comment gives.
+//! dialogs" and reserves the latter for "Elevation 1: popovers" — plus
+//! an unconditional `border.default` outline over it, added in `0.79.1`
+//! and the part that actually makes the surface visible (see the "what
+//! this does not do" paragraph below for what `0.79.0` alone got
+//! wrong). The dialog's *message* node stays a plain
+//! `WidgetKind::Container` and still draws nothing, for the reason that
+//! same paragraph gives.
 //!
 //! `Role::AlertDialog`, not the plainer `Role::Dialog` — every dialog
 //! this crate can build today is an urgent, blocking prompt (a crash
@@ -52,10 +54,30 @@
 //! scans `aurora-widgets`/`aurora-ui` and nothing above them. See
 //! [`root_style`] for what the styles actually do and why.
 //!
-//! **What this does not do, stated plainly**: the root now paints a
-//! real `surface.overlay` panel behind its buttons, but this crate
-//! draws no glyphs anywhere, so the **title and the message are still
-//! invisible** — the message node is deliberately still a
+//! **What this does not do, stated plainly.** The root paints a
+//! `surface.overlay` panel behind its buttons *and* a `border.default`
+//! outline around it. The outline is not decoration and the claim it
+//! replaces was false: `0.79.0` shipped the fill alone and said "the
+//! root now paints a real `surface.overlay` panel behind its buttons"
+//! without disclosing that in the **Light theme that panel is
+//! invisible** — `design/themes/light.toml` resolves
+//! `surface.overlay`, `surface.raised`, `surface.panel` and
+//! `surface.canvas` all to `neutral.900` `#f5f5f6` and sets
+//! `border.control_opacity = 0.0`, so a dialog was byte-identical to
+//! the chrome behind it at 1.000:1, with no border and (this crate
+//! draws none anywhere) no shadow. It was reachable in the shipping
+//! app, at `aurora-app`'s own enforced 640x480 minimum window size,
+//! overlapping real `WidgetKind::Panel` chrome. `0.79.1` closed it with
+//! the same unconditional border `paint::paint_panel` was already given
+//! for the same bug on real hardware; `paint::paint_dialog` carries the
+//! numbers, and the **honest residual** — in Colour-Critical that
+//! border clears the surfaces around it by only ≈1.35-1.49:1, faint but
+//! real, and identical to what a `Panel` already gets in that
+//! deliberately close-valued theme.
+//!
+//! What is genuinely still missing: this crate draws no glyphs
+//! anywhere, so the **title and the message are still invisible** —
+//! the message node is deliberately still a
 //! [`WidgetKind::Container`] (it has nothing to draw but the text
 //! nothing can shape yet), and both strings reach the accessibility
 //! tree only. There is also **no scrim/backdrop**: nothing dims or
