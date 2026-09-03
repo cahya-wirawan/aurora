@@ -8530,7 +8530,11 @@ fn recomposite_visible_tiles(
 /// flags (`Tile::mark_dirty`/`TileStore::take_dirty`) are deliberately
 /// *not* reused for either kind of invalidation here, and the reason is
 /// **not** that they are lossy — since 0.91.0 they survive eviction
-/// (`TileStore::is_dirty`). It is that they answer a different question.
+/// (`TileStore::is_dirty`), with one narrow exception worth stating rather
+/// than glossing: a `sync` whose page-in *fails* has already consumed the
+/// record, and what gets that tile re-uploaded on a later frame is
+/// `TileResidency::sync` dropping the atlas slot's mapping, not the dirty
+/// flag surviving (0.91.1). It is that they answer a different question.
 /// A tile's dirty flag means "this tile's bytes have changed since the
 /// last GPU upload read them"; what this cache tracks is "this tile still
 /// needs recompositing *from the document*", which no amount of tile-store

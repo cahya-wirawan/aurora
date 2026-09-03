@@ -212,8 +212,31 @@ pub struct TileStore {
     ///
     /// **Bounded by `paged_out`, not by document size.** `make_room`
     /// inserts here only alongside a `paged_out` entry for the same key,
-    /// and every path that drops one drops the other — a constant factor
-    /// on a map this store already keeps, not a new growth term.
+    /// and every path that drops a `paged_out` entry drops this one too
+    /// ([`Self::forget_tile`] sweeps both; [`Self::forget_surfaces`] chains
+    /// this set into its key collection; both of `ensure_resident`'s paging
+    /// branches and `page_in` clear it via `make_resident`). The converse
+    /// is deliberately *not* true — [`Self::take_dirty`] drops the entry
+    /// here alone and leaves `paged_out` untouched, which is exactly what a
+    /// consumed "upload owed" record should do — but only the first
+    /// direction is what bounds this set, so it stays a subset of
+    /// `paged_out`: a constant factor on a map this store already keeps,
+    /// not a new growth term.
+    ///
+    /// **Only ever consumed by a surface something actually calls
+    /// [`Self::take_dirty`] on.** Today that is
+    /// `aurora_gpu::TileResidency::sync`, and only for the composite
+    /// surface. Layer and mask surfaces are marked dirty by other code
+    /// paths and never `take_dirty`'d, so once one of their tiles is
+    /// evicted while dirty it is recorded here, re-marked dirty on every
+    /// page-in and re-recorded on every eviction — permanently dirty by
+    /// construction. That costs nothing today (the set is still bounded by
+    /// `paged_out` above, and nothing reads those flags), and it is the
+    /// right answer for the composite surface, the only real consumer. It
+    /// would matter to a *future* reader of [`Self::is_dirty`] on a layer
+    /// or mask surface, which would find an always-true flag rather than a
+    /// meaningful one — such a reader needs to start consuming what it
+    /// peeks at, not just peek.
     evicted_dirty: HashSet<(SurfaceId, TileId)>,
     /// Mints the generation stamped on every [`WriteJob`] and stored in
     /// [`Self::pending`]. Store-wide and monotonic, not per key: a
@@ -994,6 +1017,20 @@ impl TileStore {
     /// the overlap — but the ordering is forced: the `paged_out` mapping
     /// must survive until `page_in` has actually succeeded, which is the
     /// whole point of the paragraph below.
+    ///
+    /// **A second window of the same class, in branch (b), named rather
+    /// than left implicit.** That branch runs `forget_pending`, then
+    /// `paged_out.remove`, then `make_resident` — and `make_resident` is
+    /// what clears the key's `evicted_dirty` record. So for one statement
+    /// the key is in `evicted_dirty` while being in *none* of `resident`,
+    /// `pending` or `paged_out`, which reads against `evicted_dirty`'s own
+    /// "bounded by `paged_out`" claim. Harmless for exactly the reasons
+    /// above (single-threaded, private method, nothing observes the gap),
+    /// and deliberately not reordered to close it: putting `make_resident`
+    /// first would only trade this unobservable window for the *other*
+    /// unobservable window branch (c) already has — the key resident and
+    /// `paged_out` at once — and would cost branch (b) the stronger
+    /// "never both true even mid-branch" property stated above.
     ///
     /// **A failed page-in keeps its mapping.** Branches (b) and (c)
     /// remove a key from `pending`/`paged_out` only once they hold a
@@ -2141,6 +2178,119 @@ mod tests {
         assert!(
             !store.is_dirty(s, a),
             "a consumed record must not resurrect itself at page-in time"
+        );
+    }
+
+    /// The one scratch file `(s, id)` has on disk, found by name rather
+    /// than through the private `tile_path`: the leading per-store
+    /// `instance` component is deliberately unpredictable, the trailing
+    /// `_{surface}_{x}_{y}.tile` is not.
+    fn scratch_file(dir: &std::path::Path, s: SurfaceId, id: TileId) -> std::path::PathBuf {
+        let suffix = format!("_{}_{}_{}.tile", s.to_raw(), id.x, id.y);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            unreachable!("the scratch directory lives as long as the store");
+        };
+        let mut found: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.to_string_lossy().ends_with(&suffix) {
+                found.push(path);
+            }
+        }
+        match found.as_slice() {
+            [only] => only.clone(),
+            other => unreachable!("exactly one scratch file must end in {suffix}: {other:?}"),
+        }
+    }
+
+    /// AC-4c, and the store-level premise the 0.91.1 fix in
+    /// `aurora_gpu::TileResidency::sync` rests on: **after `take_dirty`
+    /// has consumed an evicted-while-dirty record and the page-in that
+    /// followed it then *failed*, nothing at the store level remembers
+    /// that an upload is owed.**
+    ///
+    /// `is_dirty` is `false` (the record was consumed), `is_resident` is
+    /// `false` (the page-in failed), and `contains_tile` is still `true`
+    /// (the mapping survives, which is what makes the retry possible at
+    /// all). That combination is *correct* here — the store's job is to
+    /// hand the record over exactly once — and it is precisely why the
+    /// atlas cannot rely on the store to bring the tile back: `sync` has to
+    /// invalidate its own slot mapping, or the tile reads as resident and
+    /// clean forever. This test pins the premise so a future change to the
+    /// store that quietly restored the record (making the GPU-side fix look
+    /// redundant) shows up here first.
+    ///
+    /// Runs on any machine — the GPU-side regression test
+    /// (`aurora-gpu`'s `residency_test.rs`) self-skips without an adapter,
+    /// so this keeps the half that needs no hardware always checked.
+    #[test]
+    fn a_failed_page_in_after_take_dirty_leaves_nothing_that_remembers_the_owed_upload() {
+        let (dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        let Some(first) = tile.texels_mut().first_mut() else {
+            unreachable!("a tile always has texels");
+        };
+        *first = half::f16::from_f32(0.5);
+        tile.mark_dirty(super::WHOLE_TILE);
+
+        // Budget of 1: touching `b` evicts `a` while it is still dirty.
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        // Confirm the write, so `a`'s only copy is the file on disk and
+        // `ensure_resident` must take the page-in branch rather than
+        // reinstating it from `pending` (which cannot fail).
+        if let Err(err) = store.flush() {
+            unreachable!("the scratch write must land: {err}");
+        }
+        assert!(store.is_dirty(s, a), "evicted while dirty");
+
+        // `sync`'s real order: consume the record, *then* read the tile.
+        assert_eq!(store.take_dirty(s, a), Some(super::WHOLE_TILE));
+
+        // Deterministic page-in failure: the file is simply not there.
+        let path = scratch_file(dir.path(), s, a);
+        let hidden = path.with_extension("hidden");
+        if let Err(err) = std::fs::rename(&path, &hidden) {
+            unreachable!("renaming a file this test just watched appear: {err}");
+        }
+        assert!(
+            store.get(s, a).is_err(),
+            "the page-in must really fail, or this test proves nothing"
+        );
+
+        assert!(
+            !store.is_resident(s, a),
+            "the failed page-in put nothing in"
+        );
+        assert!(
+            !store.is_dirty(s, a),
+            "and the record is gone -- consumed before the read that failed. This is the whole \
+             reason `TileResidency::sync` has to drop its own slot mapping on that error."
+        );
+        assert!(
+            store.contains_tile(s, a),
+            "the paged-out mapping survives a failed read, so a retry is still possible"
+        );
+
+        // And the retry really does work once the file is back, which is
+        // what the atlas's slot invalidation buys.
+        if let Err(err) = std::fs::rename(&hidden, &path) {
+            unreachable!("restoring the file: {err}");
+        }
+        let Ok(tile) = store.get(s, a) else {
+            unreachable!("the scratch file is back, so this read must succeed");
+        };
+        assert_eq!(
+            tile.texels().first().map(|texel| texel.to_f32()),
+            Some(0.5),
+            "and it holds the edited pixels, not a blank"
         );
     }
 

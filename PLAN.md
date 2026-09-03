@@ -18446,9 +18446,16 @@ severity choice.
       much, never too little. That residual is disclosed in
       `TileStore`'s own type-level doc comment rather than left implicit.
     - **Not a new growth term.** `make_room` inserts here only alongside a
-      `paged_out` entry for the same key, and every path that drops one
-      drops the other (`forget_tile` sweeps it; `forget_surfaces` chains
-      it into its key collection), so this is a constant factor on a map
+      `paged_out` entry for the same key, and every path that drops a
+      `paged_out` entry drops the `evicted_dirty` one too (`forget_tile`
+      sweeps both; `forget_surfaces` chains the set into its key
+      collection; both of `ensure_resident`'s paging branches and `page_in`
+      clear it via `make_resident`). The converse does *not* hold, and
+      0.91.1 corrected this bullet and the field's own doc comment for
+      saying it did: `take_dirty` drops the `evicted_dirty` record alone
+      and leaves `paged_out` untouched, which is what consuming an "upload
+      owed" record should do. Only the first direction bounds the set, so
+      the subset property is intact and this is a constant factor on a map
       the store already keeps — not a map that grows with document size,
       which is the failure mode invariant §7.3.1 rules out and
       `write_generation`'s own doc comment already names.
@@ -18507,6 +18514,75 @@ severity choice.
     - **Verified on Vulkan/NVIDIA only** (RTX 3090, `DiscreteGpu`, printed
       by the test run). Metal and DX12 are unverified for this path, as
       they are for every other GPU mechanism this milestone has landed.
+
+    **0.91.1 — the fix above opened a real hole of its own, reproduced and
+    closed.** Independent review (Critic and Red-team agreeing, then a real
+    GPU readback) found that `TileResidency::sync` consumes a tile's dirty
+    record with `take_dirty` **before** the `store.get` that can now fail —
+    and its `Err` arm returned without touching `self.slots`. The resident
+    check at the top of the loop is against that *slot map*, not against
+    the store, so a page-in failure (a transient scratch-disk read error,
+    `ENOSPC`, or `TileStore`'s own `discard_stale_scratch_file` /
+    `cap_failed_writes` dropping a file after a failed write) left the slot
+    still mapping to that tile id, reading as resident on the next frame,
+    with the "upload owed" record already consumed. The tile was then
+    skipped **for the life of the mapping** — silently, with `SyncStats`
+    reporting `errors: 0, remaining: 0`, i.e. complete success, while the
+    atlas held pre-edit pixels indefinitely.
+
+    - **Newly reachable *because* of 0.91.0**, not pre-existing: before it,
+      `is_dirty` could only be `true` for a *resident* tile, whose `get`
+      cannot fail the way a page-in can, so the failure path was
+      unreachable for a dirty tile. 0.91.0 made `is_dirty` true for evicted
+      tiles too — exactly the case where the read hits the scratch disk.
+    - **The fix is one line**: `self.slots.remove(&slot);` in that `Err`
+      arm, before the `continue`. The next frame's resident check is then
+      genuinely `false` for the slot, so the tile is retried and
+      re-uploaded. `sync`'s loop, ordering and stats are otherwise
+      untouched. The in-code comment that justified the consume-before-get
+      ordering was **factually wrong** and is rewritten: it claimed "a
+      `get` that fails leaves the tile non-resident, so the next call's own
+      resident check retries it regardless of any dirty flag", which
+      confuses store residency with the atlas's slot map. The ordering is
+      sound *because of* the slot invalidation, not independently of it.
+    - **Reproduced, then guarded.** `aurora-gpu`'s `residency_test.rs`
+      gains a real-GPU test that paints a 2×2 grid red, syncs, edits one
+      tile blue, forces it out of a 4-tile store while dirty, `flush`es so
+      the tile's only copy is the file on disk, renames that file away,
+      syncs (asserting `errors: 1`), restores it, and syncs again —
+      asserting both the stats *and* the **atlas texture readback**.
+      Measured with the one-line fix reverted: `uploaded 0, errors 0,
+      remaining 0` and the atlas still `[1.0, 0.0, 0.0, 1.0]` — the stats
+      say success, the pixels are the previous frame's. Both halves are
+      needed: the stats alone look perfect on the broken code.
+    - **Plus a store-level probe in `aurora-tile`** pinning the premise the
+      GPU fix rests on, and it needs no adapter (the GPU test self-skips
+      without one): after `take_dirty` consumes an evicted-while-dirty
+      record and the page-in that follows *fails*, `is_dirty` is `false`,
+      `is_resident` is `false`, and `contains_tile` is still `true` —
+      nothing at the store level remembers the owed upload, which is
+      exactly why the atlas must invalidate its own slot.
+    - **Four documentation corrections in the same commit**, all found by
+      the same review: `evicted_dirty`'s "every path that drops one drops
+      the other" was a biconditional the code does not implement
+      (`take_dirty` drops the `evicted_dirty` entry alone — the subset
+      bound only needs the other direction, and is intact); the same field
+      now also records that it is only ever *consumed* by a surface
+      something calls `take_dirty` on, so a never-synced layer or mask
+      surface's evicted-while-dirty tiles stay permanently dirty by
+      construction (harmless today, but a trap for a future reader of
+      `is_dirty` on those surfaces); `ensure_resident`'s transient-invariant
+      comment now names the second one-statement window in branch (b) —
+      key in `evicted_dirty` while in none of
+      `resident`/`pending`/`paged_out` — alongside the branch (c) overlap it
+      already documented, with why reordering to close it would only trade
+      one unobservable window for another; and `CompositeCache`'s "they
+      survive eviction" parenthetical no longer overclaims, since a failed
+      page-in *does* consume the record and it is the slot invalidation
+      that recovers.
+    - **Same platform caveat**: reproduced and fixed on Vulkan/NVIDIA
+      (RTX 3090) only, with `AURORA_REQUIRE_GPU=1` confirming the test
+      really ran rather than self-skipping. Metal and DX12 unverified.
   - **`upload_sync` mean and p50 fall by ~2.9–3.3× (GPU) and ~1.8–2×
     (CPU fallback)**, with ranges nowhere near overlapping, and the
     stage's share of the mean frame drops from 53.1–53.9% to 26.2–26.3%
@@ -18587,6 +18663,20 @@ severity choice.
   documented under "Honest reading" above closes with them, and the skip
   rate rises by whatever the `not_resident` buckets currently hold (5.5
   and 3.7 tiles/frame here). Not attempted in this round or in 0.90.1.
+
+  **0.91.0/0.91.1 — read this bullet against the 0.91.0 entry below, which
+  supersedes half of it.** The dirtiness half landed: `TileStore` now keeps
+  the *fact* that an evicted tile was dirty (not the rectangle, which is
+  what would have needed an on-disk format change), and `TileResidency::sync`
+  drops an atlas slot's mapping when a page-in fails so the owed upload
+  cannot be lost that way either (0.91.1). What remains deferred is only
+  the second half: the per-surface atlas-generation mechanism that would
+  let `forget_surface` invalidate slots itself, which is what still keeps
+  `write_composited`'s residency guard for the separate
+  `forget_surface`-then-materialize-a-blank scenario. **The `not_resident`
+  buckets do not move until *that* lands** — the 0.91.0 entry says so
+  explicitly, and this bullet's "the skip rate rises by whatever they hold"
+  is conditional on the whole follow-on, not on the dirtiness half alone.
 
   Same platform limitations as the rest of this entry: one adapter, one
   platform (Linux/Vulkan/RTX 3090), **no Metal, no DX12** — and this

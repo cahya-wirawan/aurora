@@ -898,10 +898,27 @@ impl TileResidency {
                 // Committed: the budget is there and the tile is about to
                 // be read and written. Consuming it before `get` rather
                 // than after is deliberate -- `get` borrows `store`
-                // immutably for the rest of the iteration, and a `get`
-                // that *fails* leaves the tile non-resident, so the next
-                // call's own resident check retries it regardless of any
-                // dirty flag.
+                // immutably for the rest of the iteration.
+                //
+                // **What makes that ordering safe is the `Err` arm's
+                // `self.slots.remove(&slot)`, not the store's own
+                // residency.** The resident check above is against
+                // `self.slots` -- this atlas's slot mapping -- and not
+                // against `store`, so a `get` that fails after this line
+                // has consumed the dirty record leaves nothing else that
+                // remembers an upload is owed: the slot would still map to
+                // `id`, read as resident on the next call, and the tile
+                // would be skipped for the life of the mapping, silently,
+                // with `SyncStats` reporting `errors: 0, remaining: 0`.
+                // Dropping the mapping is what turns that into a retry.
+                //
+                // This became load-bearing in `aurora-tile` 0.91.0: before
+                // it, `is_dirty` could only be `true` for a *resident*
+                // tile, and a resident tile's `get` cannot fail the way a
+                // page-in can, so the failure path was unreachable for a
+                // dirty tile. It is reachable now (a scratch-disk read
+                // error, or the store dropping a failed write's file), so
+                // the ordering needs the slot invalidation to stay sound.
                 let _ = store.take_dirty(surface, id);
                 let tile = match store.get(surface, id) {
                     Ok(tile) => tile,
@@ -911,6 +928,17 @@ impl TileResidency {
                         // nothing more localized to retry against here.
                         // Still needs a real upload attempt later, same
                         // as a budget-skipped tile.
+                        //
+                        // And this line is what makes that later attempt
+                        // actually happen -- see the comment above the
+                        // `take_dirty` call for why nothing else would.
+                        // Removing a slot that some *other* id currently
+                        // occupies is impossible here: `slot` was derived
+                        // from `id`, and the only entry this can drop is
+                        // one mapping `slot` to something, which at worst
+                        // costs one redundant re-upload of whatever id that
+                        // was -- never a skipped one.
+                        self.slots.remove(&slot);
                         tracing::warn!(?id, %err, "skipping tile for this frame's upload");
                         stats.remaining += 1;
                         stats.errors += 1;
