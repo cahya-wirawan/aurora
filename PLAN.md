@@ -16357,6 +16357,147 @@ severity choice.
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
   --all-features`), all clean.
 
+- [x] **GPU blend-mode math, slice 2 of the epic: `Multiply` wired into
+  the real app — done 2026-09-03 (0.84.0).** The slice-1 entry above
+  ends with "no claim is made here that Multiply-blend documents
+  composite on the GPU in the real app." **They do now.** This is the
+  first round in this epic that changes behaviour a user can actually
+  reach: open a document, set a root-level layer to `Multiply`, and the
+  canvas composites it through `composite_multiply_over_with_opacity`'s
+  WGSL math instead of routing the whole document to the CPU fallback.
+
+  **What landed**, entirely inside `aurora-app`
+  (`aurora-render` is unchanged except for one doc comment that said
+  "nothing in the application calls this," which is no longer true):
+
+  - `document_qualifies_for_gpu_compositing` admits
+    `BlendMode::Multiply` alongside `Normal`/`None`. Groups and the
+    other 25 modes still disqualify the whole document, unchanged.
+  - `begin_gpu_composite_tile` now folds through a **ping-pong
+    accumulator pair** instead of one destination texture, dispatching
+    per layer on the blend mode `resolve_tile` already returns (it was
+    being discarded as `_blend_mode` before). `Normal` blends in place
+    on the current member; `Multiply` samples the current member as its
+    backdrop, writes the finished composite into the other, and makes
+    that one current. The pair exists because
+    `composite_multiply_over_with_opacity` cannot alias its `dst` and
+    `backdrop` — sampling the texture a pass renders into is undefined,
+    which slice 1 documented but deliberately left for the caller to
+    solve.
+  - Both members are created together, lazily, on the first root layer
+    that actually resolves at a tile, so the "a tile with no touched
+    layer does zero GPU work" property 0.69.0 established is preserved.
+    Both carry `TEXTURE_BINDING` now, since either can end up being the
+    sampled backdrop, and the final readback copies from whichever
+    member the fold *ended* on rather than unconditionally from the
+    first.
+  - A defensive third arm (a mode outside `{Normal, Multiply}` reaching
+    this function, or an accumulator index out of range) logs and
+    returns `None`, falling that one tile back to the CPU path. It is
+    unreachable while the predicate and this function agree; it exists
+    so that if they ever drift, the failure is a slower composite and a
+    log line rather than a silently wrong one.
+
+  **The first-layer degeneracy — a real finding, and the reason no
+  special case was needed.** The obvious worry is the bottom-most layer:
+  `Multiply` against a *fully transparent* backdrop has no backdrop
+  colour to multiply by. It turns out not to need handling at all.
+  `composite_layer_into`'s straight-backdrop recovery is guarded on
+  `backdrop_alpha > 0.0`, so over transparent black the whole formula
+  collapses to exactly what `Normal` produces — the source alone,
+  already pinned independently by `aurora-render`'s own
+  `composite_multiply_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`.
+  So a document whose *first* layer is `Multiply` composites correctly
+  through the general per-layer dispatch with no branch of its own; the
+  only cost is one wasted ping-pong swap on that layer. An optimisation
+  that special-cased the first layer onto the `Normal` arm was
+  considered and **deliberately not implemented** — it would buy one
+  avoided texture write per tile in one case, at the cost of a branch
+  whose correctness argument is subtler than the math it replaces.
+
+  **Four tests, two new, two retargeted, plus one new predicate test.**
+
+  - `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_multiply_blend_document`
+    (new): two opaque mid-grey root layers, bottom `Normal`, top
+    `Multiply`. Asserts the predicate is now `true` (which is what makes
+    it non-vacuous — this exact fixture was a CPU-fallback test before),
+    then GPU vs CPU within `2 * f16::EPSILON` *and* against the
+    hand-computed `(0.25, 0.25, 0.25, 1.0)`. A `Normal` composite of the
+    same inputs gives `0.5`, so a dispatch bug fails here.
+  - `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack`
+    (new): the swap-direction test. Four root layers forcing **two**
+    swaps plus a `Normal` blend onto a post-swap accumulator — the case
+    a two-layer fixture cannot distinguish, because with one swap "the
+    member the fold ended on" and "the member Multiply wrote" name the
+    same texture. Its doc comment carries the full layer table naming
+    which pass writes which member, so a future failure is diagnosable
+    rather than mysterious.
+  - `document_qualifies_for_gpu_compositing_admits_a_multiply_blend_mode`
+    (new): pins the widened arm directly, headlessly.
+  - Four tests that used `BlendMode::Multiply` specifically as a "this
+    must *not* run on GPU" example are retargeted to `BlendMode::Screen`
+    (a real mode with a 1:1 `translate_blend_mode` mapping and a real
+    CPU formula, still GPU-inexpressible):
+    `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_blend_mode`,
+    `recomposite_visible_tiles_falls_back_to_the_cpu_path_for_a_non_normal_blend_mode`
+    (expected value recomputed to `Screen(0.5, 0.5) = 0.75`, which
+    differs from *both* `Normal`'s `0.5` and `Multiply`'s `0.25`, so it
+    stays non-vacuous against both of the GPU path's own modes now),
+    `recomposite_and_present_loop_exercises_the_cpu_fallback_path`, and
+    `undoing_a_blend_mode_change_that_flips_the_compositing_path_invalidates_everything`.
+    Without this they would have silently stopped testing what their
+    names say. The three `composite_document` tests that use `Multiply`
+    are untouched: export stays CPU-only by design.
+
+  **Negative-controlled, three ways.** Each sabotage was applied
+  temporarily, run, and fully reverted (`diff` against a pre-sabotage
+  copy confirmed identical):
+
+  - *Never advance `current`*: both new tests fail.
+  - *Always read back member 0*: the two-layer test fails
+    (`0.5` vs `0.25`), the four-layer test **passes** — its two swaps
+    return the fold to member 0, so a fixed-index readback happens to be
+    right there. The two tests are complementary, not redundant, and
+    both doc comments now say so.
+  - *Swap on `Normal` instead of `Multiply`*: both new tests fail, and
+    so does the pre-existing all-`Normal`
+    `..._agree_on_a_real_multi_layer_document`.
+
+  **Scope, stated honestly.** Verified on **Vulkan / NVIDIA GeForce RTX
+  3090 (`DiscreteGpu`) only**, under `AURORA_REQUIRE_GPU=1` so a silent
+  skip could not have produced a pass. Metal and DX12 are unverified for
+  this specific mechanism, the same hardware-gated tail Phase 0 and the
+  slice-1 entry above already carry. **No interactive verification and
+  no performance claim** — CLAUDE.md's own "a green test run is not
+  evidence that canvas work is correct" rule applies; nobody has looked
+  at a `Multiply` layer on a real screen, and nothing here was measured
+  against the 60 FPS gate (it is a correctness round, and the composite
+  now costs an extra texture per qualifying tile, which could plausibly
+  make things *slower* until the accumulator pair is cached — see
+  below). **24 of the 27 blend modes remain**, plus `Dissolve`'s
+  stochastic gate and group isolation, before the GPU path covers what
+  the CPU path already does.
+
+  **Named, deliberately deferred**: caching the accumulator pair across
+  tiles and frames (every qualifying tile allocates and clears two
+  textures today — orthogonal, and the right time to do it is once there
+  is a measurement showing it matters); the first-layer special case
+  above; and the workspace-wide absence of `wgpu` error-scope handling,
+  which this round inherits unchanged from slice 1.
+
+  **Verified (0.84.0)**: `cargo check -p aurora-app`;
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app` for each new test and
+  for `document_qualifies_for_gpu_compositing`, `recomposite_visible_tiles`,
+  and `composite_document` as groups — every GPU-gated run printing
+  `GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`;
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render -- composite_multiply`;
+  then the full gate (`fmt --check`, `check_layering.py`,
+  `check_no_hardcoded_style.py`, `cargo check --workspace --locked`,
+  `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`, `cargo test --workspace`, `cargo test --workspace --doc`,
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`), all clean.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
@@ -16396,9 +16537,11 @@ severity choice.
   p99 98.75 ms, max 98.75 ms — against the 16.7 ms (60 FPS) budget,
   roughly 5.9× over at p99.** A second, smaller sibling test,
   `recomposite_and_present_loop_exercises_the_cpu_fallback_path`
-  (512×512 viewport, 12 frames, a `Multiply`-blend layer so
+  (512×512 viewport, 12 frames, a non-GPU-expressible blend layer so
   `document_qualifies_for_gpu_compositing` is `false` and every tile
-  takes the CPU fallback instead), measured mean 25.08 ms, p50 22.57 ms,
+  takes the CPU fallback instead — `Multiply` when measured, retargeted
+  to `Screen` in 0.84.0 once `Multiply` moved onto the GPU path),
+  measured mean 25.08 ms, p50 22.57 ms,
   p99 54.10 ms, max 54.10 ms — also over budget, roughly 3.2× at p99
   (smaller than the GPU-path numbers because of its smaller viewport, not
   because the CPU fallback is cheaper — the two tests aren't a controlled

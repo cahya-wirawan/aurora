@@ -1367,12 +1367,14 @@ impl TileCompositor {
     /// ported, so there is nothing to dispatch on yet; adding the
     /// parameter now would invent a shape the second mode may not want.
     ///
-    /// **Nothing in the application calls this.** `aurora-app`'s own
-    /// `document_qualifies_for_gpu_compositing` still admits only
-    /// `Normal`-blend layers, and is untouched by this method's
-    /// existence — wiring is separate, later work. The shader math is
-    /// proven against [`composite_tile_cpu`]'s own results by this
-    /// module's `composite_multiply_*` tests instead.
+    /// **The application calls this now** (0.84.0). `aurora-app`'s own
+    /// `document_qualifies_for_gpu_compositing` admits `Multiply`
+    /// alongside `Normal`, and `begin_gpu_composite_tile` dispatches to
+    /// this method for every `Multiply` root layer, ping-ponging between
+    /// two accumulator textures to satisfy the aliasing rule above. The
+    /// shader math is proven against [`composite_tile_cpu`]'s own results
+    /// by this module's `composite_multiply_*` tests independently of
+    /// that wiring.
     ///
     /// **Parameter order is inputs first, output last** — `(src,
     /// backdrop, dst)`, deliberately *not*
