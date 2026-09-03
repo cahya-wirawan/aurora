@@ -7115,6 +7115,55 @@ fn create_composite_accumulator(
 /// GPU-side failure (a lost device, a bad map) can no
 /// longer be detected here — resolving the map is [`finish_tile_readback`]'s
 /// job now, in phase 3, once this function has already returned.
+/// Test-only count of the times [`begin_gpu_composite_tile`]'s `Darken`
+/// arm has actually dispatched a real GPU blend pass.
+///
+/// **The gap this closes** (0.85.1). Every `Darken` test before this was
+/// either a differential ("the GPU path's texel equals the CPU path's")
+/// or a predicate assertion ("this document qualifies for the GPU
+/// path"). Neither can see whether the GPU arm *ran*: delete the whole
+/// `Darken` arm from the `match` below and every `Darken` tile falls
+/// through the defensive `_` arm to the CPU path, which computes the
+/// same correct answer — so the differential compares the CPU path
+/// against itself and still passes, and the predicate still holds
+/// because the predicate is a different function. That mutation was
+/// performed against 0.85.0 and the entire suite stayed green. A
+/// refactor could therefore drop `Darken` off the GPU path silently.
+///
+/// So the arm reports itself, and
+/// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack`
+/// asserts the count it expects. Reads and writes are `Relaxed` and the
+/// counter is process-global, which is sound only because every caller
+/// of `begin_gpu_composite_tile` needs a real `GpuContext` and this
+/// module's `real_gpu_context` hands one out only under
+/// `GPU_TEST_LOCK` — so no two GPU tests are ever inside this counter at
+/// once.
+///
+/// **Named follow-on: `Multiply` and `Dissolve` still have this exact
+/// gap.** Both are admitted by `document_qualifies_for_gpu_compositing`,
+/// both are covered only by GPU-vs-CPU differentials, and deleting
+/// either one's dispatch (for `Dissolve`, the `Normal` arm it is reduced
+/// to) would likewise leave the suite green. Instrumenting them is
+/// deliberately *not* done here — it would mean touching two arms this
+/// round did not otherwise change — and is left as its own round.
+#[cfg(test)]
+static DARKEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Increments [`DARKEN_GPU_DISPATCHES`]. Called from the `Darken` arm
+/// once per tile per `Darken` layer, immediately after the compositor
+/// call it is reporting.
+#[cfg(test)]
+fn note_darken_gpu_dispatch() {
+    DARKEN_GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The shipping build's version: nothing at all. The instrumentation
+/// exists to make a test non-vacuous, not to be carried by the editor —
+/// so the counter itself is `#[cfg(test)]` and this no-op is what the
+/// dispatch arm compiles down to everywhere else.
+#[cfg(not(test))]
+fn note_darken_gpu_dispatch() {}
+
 // `too_many_lines`: 107, against a 100 limit, as of the second ported
 // blend mode (0.85.0) -- the body is one loop whose `match` gains a
 // fixed ~13-line arm per mode, so it crossed the threshold on `Darken`
@@ -7179,6 +7228,20 @@ fn begin_gpu_composite_tile(
     // with its own view by construction and makes "which member is
     // current" unrepresentable in any wrong state. The readback at the
     // end copies out of `current`, whichever texture that now is.
+    //
+    // **The two `wgpu` debug labels below denote identity, not role.**
+    // `"gpu-composite-a"` and `"gpu-composite-b"` are baked into each
+    // texture at creation and never change, but `std::mem::swap`
+    // exchanges which one the `current`/`spare` bindings name — so after
+    // an odd number of blend-math layers the texture labelled `-b` *is*
+    // `current`, and the readback below copies out of it. A `wgpu`
+    // validation message or a frame capture naming one of these is
+    // therefore pointing at a physical texture, not at "the
+    // accumulator" or "the scratch target"; work out the role from the
+    // number of blend-math layers this tile saw, not from the letter.
+    // The labels are left as identities on purpose: a role-shaped label
+    // would be wrong for half of every tile's passes, which is worse
+    // than one that is never wrong and merely does not say the role.
     let mut current: Option<(wgpu::Texture, wgpu::TextureView)> = None;
     let mut spare: Option<(wgpu::Texture, wgpu::TextureView)> = None;
 
@@ -7294,6 +7357,12 @@ fn begin_gpu_composite_tile(
                     &spare_accumulator.1,
                     opacity,
                 );
+                // Reports that this arm really ran -- see
+                // `DARKEN_GPU_DISPATCHES` for the mutation (deleting
+                // this whole arm) that every 0.85.0 test survived, and
+                // for the note that the `Multiply` and `Dissolve` arms
+                // still have that gap.
+                note_darken_gpu_dispatch();
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
             // Unreachable through the real caller: `document_qualifies_
@@ -12538,8 +12607,8 @@ mod tests {
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
-        Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord,
-        MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey,
+        DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key,
+        KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey,
         PALETTE_TOML, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
         RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
         active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
@@ -17555,6 +17624,19 @@ mod tests {
             _guard: guard,
             context,
         })
+    }
+
+    /// Reads [`DARKEN_GPU_DISPATCHES`] and resets it to zero in one
+    /// atomic step, so a caller gets the count since *its* own last call
+    /// rather than a total accumulated across whatever ran before.
+    ///
+    /// The swap is `Relaxed` for the same reason the increment is: every
+    /// caller of `begin_gpu_composite_tile` holds `GPU_TEST_LOCK` (it
+    /// needs a `GpuContext`, and `real_gpu_context` is the only way to
+    /// get one here), so this is never contended and the lock supplies
+    /// the ordering.
+    fn take_darken_gpu_dispatch_count() -> u64 {
+        DARKEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn real_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
@@ -24164,8 +24246,10 @@ mod tests {
         );
     }
 
-    /// `Screen` stands in for "one of the 25 modes the GPU path still
-    /// cannot express" — it has a real, 1:1 `translate_blend_mode`
+    /// `Screen` stands in for "one of the 23 modes the GPU path still
+    /// cannot express" (27 `aurora_doc::BlendMode` variants minus the
+    /// four admitted as of 0.85.0: `Normal`, `Multiply`, `Darken` and
+    /// `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
     /// mapping and a real CPU formula, so it is a genuine blend mode
     /// being rejected, not an unimplemented one. This used to use
     /// `Multiply`, which 0.84.0 moved to the *admitted* side; the
@@ -25575,13 +25659,17 @@ mod tests {
     /// three *different* expressible modes in one stack, proving the
     /// ping-pong mechanism generalises past a single blend mode.
     ///
-    /// `begin_gpu_composite_tile` keeps **one** `spare` accumulator, not
-    /// one per mode. It is created by whichever blend-math layer reaches
-    /// a tile first, and every later blend-math layer — of any mode —
-    /// renders into that same texture. Every fixture before this one
-    /// exercised at most one non-`Normal` mode, so "one shared spare"
-    /// and "one spare per mode" were indistinguishable; this fixture
-    /// separates them.
+    /// **What this test proves, precisely** (corrected in 0.85.1 — see
+    /// the note at the bottom for what it used to claim). Two different
+    /// blend-math *pipelines* — `fs_composite_multiply` and
+    /// `fs_composite_darken`, built from one `PipelineCache` against one
+    /// bind-group layout — each dispatch correctly within a single
+    /// document, in a single pass over one tile's layer stack, including
+    /// the case where a `Darken` layer's write-target and sampled
+    /// backdrop were both produced by an earlier `Multiply` layer. That
+    /// is a real write-after-read hazard across two pipelines, and it is
+    /// what every fixture before this one (at most one non-`Normal` mode
+    /// each) could not reach.
     ///
     /// Five root-level layers, with the pair written as A (the
     /// initially-`current` member) and B:
@@ -25596,11 +25684,10 @@ mod tests {
     ///
     /// Three properties at once, none of which any prior fixture has:
     ///
-    /// - **Layer 4 is a `Darken` whose `spare` was created by layer 2's
-    ///   `Multiply`**, never by `Darken`'s own first use. If the two arms
-    ///   had somehow ended up with separate accumulators, layer 4 would
-    ///   render into a texture holding layers 1-2 rather than 1-3, and
-    ///   the result would be a plausible-looking wrong image.
+    /// - **Layer 4 is a `Darken` sampling a backdrop three layers deep**
+    ///   that a `Multiply` pass, not a `Normal` one, last wrote. Its
+    ///   `spare` write-target is likewise one layer 2's `Multiply`
+    ///   created, never `Darken`'s own first use.
     /// - **Three swaps, an odd count**, so the fold ends on the member it
     ///   did *not* start on and a fixed-index readback silently drops
     ///   layer 5.
@@ -25609,11 +25696,44 @@ mod tests {
     ///
     /// Differential against the real `composite_tile_cpu` reference —
     /// hand-computing five chained composites would restate the
-    /// arithmetic under test rather than check it. The guard that keeps
-    /// the differential from being vacuous is the second, CPU-only run
-    /// below: the same stack with both `Darken` layers replaced by
-    /// `Multiply` must composite to something *different*, so a
-    /// mis-dispatched arm cannot pass this test.
+    /// arithmetic under test rather than check it. Two separate guards
+    /// keep that differential from being vacuous:
+    ///
+    /// - The CPU-only run at the end: the same stack with both `Darken`
+    ///   layers replaced by `Multiply` must composite to something
+    ///   *different*, so an arm dispatching the wrong formula cannot
+    ///   pass.
+    /// - The [`DARKEN_GPU_DISPATCHES`] assertion (0.85.1): the `Darken`
+    ///   arm must actually have run on the GPU. Without it, deleting the
+    ///   arm outright routes every `Darken` tile to the CPU fallback,
+    ///   which produces the same correct texel — so the differential
+    ///   above would be comparing the CPU path against itself and would
+    ///   still pass. See that static for the mutation, and for the note
+    ///   that `Multiply` and `Dissolve` still carry the same gap.
+    ///
+    /// **What this test does *not* prove, and cannot** (0.85.1). Its
+    /// original doc comment and 0.85.0's commit message both claimed it
+    /// distinguished "one shared `spare` accumulator" from "one `spare`
+    /// per mode", the specific counterfactual being that a per-mode
+    /// spare would make layer 4 "render into a texture holding layers
+    /// 1-2 rather than 1-3". That is wrong twice over, and review proved
+    /// it by giving `Darken` its own private accumulator and watching
+    /// the whole suite — this test included — stay green.
+    ///
+    /// The confusion was between the render *target* and the sampled
+    /// *backdrop*. Layer 4 renders into `spare` and samples `current`;
+    /// only `current` carries the prior fold, and it is passed
+    /// explicitly, so it holds layers 1-3 whether or not `spare` is
+    /// shared. And every blend-math pass opens with
+    /// `LoadOp::Clear(TRANSPARENT)` before drawing a fullscreen
+    /// triangle, so its target's prior contents are never read at all.
+    /// Shared-versus-per-mode is therefore a pure memory-footprint
+    /// property with no pixel-observable consequence, and **no
+    /// differential test can distinguish it.** What actually holds the
+    /// property is `create_composite_accumulator`'s single
+    /// `get_or_insert_with` on one `spare` binding, plus that
+    /// function's own doc comment; making it *checkable* would need an
+    /// allocation counter, not a fixture.
     #[test]
     fn recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack() {
         let Some(context) = real_gpu_context() else {
@@ -25657,10 +25777,32 @@ mod tests {
             document_qualifies_for_gpu_compositing(&layers),
             "a mixed Normal/Multiply/Darken root stack must qualify for the GPU path -- \
              otherwise this test would compare the CPU path against itself and prove nothing \
-             about the shared spare accumulator"
+             about either blend-math pipeline dispatching"
         );
 
+        // Zero the counter inside `real_gpu_context`'s lock, so what the
+        // assertion below reads is this run's dispatches and nothing
+        // else's.
+        let _ = take_darken_gpu_dispatch_count();
         let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // Eight = this stack's two `Darken` layers, dispatched once each
+        // for every one of the four tiles `gpu_and_cpu_first_texel`'s
+        // 256x256 residency viewport marks visible at `TILE` = 256. The
+        // second, CPU-only run inside that helper adds none, which is
+        // itself part of what this pins. **A count of 0 is the failure
+        // this assertion exists for**: it means no `Darken` tile reached
+        // the GPU at all and every assertion below is being satisfied by
+        // the CPU fallback compared against itself. A count that is
+        // non-zero but not 8 means the viewport or tile geometry moved
+        // under this fixture -- re-derive it rather than loosening the
+        // assertion.
+        assert_eq!(
+            take_darken_gpu_dispatch_count(),
+            8,
+            "both Darken layers must have dispatched a real GPU blend pass on each of the four \
+             visible tiles -- 0 means the dispatch arm is gone and every assertion below is \
+             being satisfied by the CPU fallback running twice"
+        );
         assert_gpu_matches_cpu(
             gpu_result,
             cpu_result,
@@ -25995,13 +26137,14 @@ mod tests {
     }
 
     /// The fallback's own correctness proof, not just that it was taken:
-    /// a document with one `Screen`-blend layer (one of the 25 modes the
-    /// GPU path still cannot express — only `Normal` and `Multiply` are
-    /// ported) must still composite to `Screen`'s own real result, not to
+    /// a document with one `Screen`-blend layer (one of the 23 modes the
+    /// GPU path still cannot express — `Normal`, `Multiply`, `Darken` and
+    /// `Dissolve` are the four admitted as of 0.85.0) must still
+    /// composite to `Screen`'s own real result, not to
     /// whatever `Normal` would have produced for the same inputs — which
     /// would be a different, wrong value here, so this genuinely
     /// distinguishes "fell back and composited correctly" from "silently
-    /// used one of the GPU's own two formulas anyway."
+    /// used one of the GPU's own formulas anyway."
     ///
     /// This used `Multiply` until 0.84.0 wired that mode onto the GPU
     /// path, at which point the fixture would have stopped exercising
@@ -26469,7 +26612,7 @@ mod tests {
     /// A second, smaller measurement, exercising the CPU compositing
     /// fallback specifically -- `document_qualifies_for_gpu_compositing`
     /// returns `false` here (the single root layer's own blend mode is
-    /// `Screen`, one of the 25 modes the GPU path still cannot express;
+    /// `Screen`, one of the 23 modes the GPU path still cannot express;
     /// it was `Multiply` until 0.84.0 wired that mode onto the GPU path,
     /// which would have quietly turned this into a second GPU-path
     /// measurement), so every tile in this loop goes through

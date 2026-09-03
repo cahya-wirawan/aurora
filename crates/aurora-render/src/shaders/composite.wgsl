@@ -81,8 +81,11 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // target this entry point writes to, which is a different texture
 // entirely and must never alias this one. Calling the sampled backdrop
 // `dst_tex` read as exactly the aliasing the Rust doc comment warns
-// against, so the name was corrected in 0.83.1 before the remaining 25
-// blend modes were written against this file.
+// against, so the name was corrected in 0.83.1, while `Multiply` was
+// still the only ported mode and the 25 then-unported ones had yet to be
+// written against this file. That "25" is the 0.83.1 count and is not
+// maintained here; `Darken` (0.85.0) has since landed, and the live
+// numbers live in `TileCompositor`'s own doc comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)

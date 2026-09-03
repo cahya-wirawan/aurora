@@ -16755,7 +16755,12 @@ severity choice.
     `get_or_insert_with`, so a stack mixing `Multiply` and `Darken`
     allocates exactly the same two textures per tile an all-`Multiply`
     stack does. `spare` is a shared scratch target the arms take turns
-    rendering into, not a per-mode resource.
+    rendering into, not a per-mode resource. **(Corrected in 0.85.1:
+    that is true, and it is a memory-footprint property only. It is
+    held by the single `get_or_insert_with` on one `spare` binding, and
+    it is *not* observable in any composited pixel — see the 0.85.1
+    entry below, which retracts this round's claim that a test proved
+    it.)**
 
   **The mixed-mode tests are the point of this round.** Repeating one
   blend mode through a ping-pong proves the two accumulators can trade
@@ -16774,11 +16779,18 @@ severity choice.
     is the full-stack version: five root layers
     (`Normal`/`Multiply`/`Normal`/`Darken`/`Darken`) forcing **three**
     swaps — an odd count, so the fold ends on the member it did not
-    start on — where **layer 4's `Darken` reuses the `spare` that layer
-    2's `Multiply` created**, never `Darken`'s own first use. Both tests
+    start on — where **layer 4's `Darken` samples a backdrop three
+    layers deep that a `Multiply` pass last wrote**, and takes as its
+    write-target the `spare` layer 2's `Multiply` created. Both tests
     carry an explicit vacuity guard (a CPU-side recomposite of the same
     stack with `Darken` replaced by `Multiply`, asserted *different*), so
-    a mis-dispatched arm cannot pass them.
+    an arm dispatching the wrong *formula* cannot pass them.
+    **(Corrected in 0.85.1: this round additionally claimed the
+    full-stack test distinguished "one shared `spare`" from "one `spare`
+    per mode". It does not and no pixel test can — see the 0.85.1 entry.
+    Nor did any 0.85.0 test notice if the `Darken` arm stopped
+    dispatching on the GPU altogether; 0.85.1 adds the assertion that
+    does.)**
 
   Nine other new tests: seven `composite_darken_*` siblings in
   `aurora-render` covering exactly what the `Multiply` suite covers (the
@@ -16819,6 +16831,14 @@ severity choice.
   abstraction the third mode has to fight. Worth revisiting once three
   or four have landed and the genuinely-common part is visible; the
   bodies are near-identical today, and that duplication is deliberate.
+  **(Superseded in 0.85.1. Review measured this round's own diff and
+  the "two samples" argument did not survive it: the entire variation
+  between the two ~85-line bodies was six `&'static str`s, already
+  isolated into `PipelineKey::fragment_entry` plus a label prefix, and
+  the shared scaffolding had needed zero changes to take the second
+  mode. The bodies were merged in 0.85.1 as a pure extraction. What
+  *is* still deferred, and on better grounds, is the public `mode`
+  parameter — see the 0.85.1 entry.)**
   Also still open, unchanged by this round: the per-tile cost of the
   ping-pong on a real document has not been measured, and there is still
   no runtime force-CPU-composite escape hatch for a backend where this
@@ -16849,6 +16869,141 @@ severity choice.
   cargo test --workspace` at **1,601 passing**, `cargo test --workspace
   --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
   --all-features`), all clean.
+
+- [x] **GPU blend-mode math: the `Darken` round's claims corrected, its
+  dispatch made observable, and the two blend-math bodies merged —
+  done 2026-09-03 (0.85.1).** A review round on 0.85.0, not new
+  capability. The ported `Darken` math itself was found **correct**:
+  independent review mutated the formula, the accumulator binding, the
+  swap and the method call, and each mutation was caught by an existing
+  test. What did not hold up was what 0.85.0 *said* about its own
+  tests, and what those tests could actually see.
+
+  **The retraction.** 0.85.0's headline test
+  (`recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack`)
+  claimed to distinguish "one shared `spare` accumulator" from "one
+  `spare` per mode", with the stated counterfactual that a per-mode
+  spare would make layer 4 "render into a texture holding layers 1–2
+  rather than 1–3, producing a plausible-looking wrong image."
+  **Both halves are false.** Review gave `Darken` its own private
+  accumulator — a real code change — and the whole suite, that test
+  included, stayed green. The counterfactual conflates the render
+  *target* with the sampled *backdrop*: layer 4 samples `current`, which
+  is passed explicitly and carries layers 1–3 whether or not `spare` is
+  shared, and every blend-math pass opens with
+  `LoadOp::Clear(TRANSPARENT)` before drawing a fullscreen triangle, so
+  its target's prior contents are never read at all. Sharing is
+  therefore a pure memory-footprint property with **no pixel-observable
+  consequence, which no differential test can ever distinguish**. The
+  test's doc comment now states what it does prove — two different
+  blend-math pipelines each dispatching correctly within one document,
+  out of one `PipelineCache` against one bind-group layout, including a
+  `Darken` layer whose backdrop and write-target a `Multiply` layer
+  produced — and names the property it cannot reach. Making that
+  property checkable would need an allocation counter, not a fixture;
+  not attempted here.
+
+  **The real hole, and what closes it.** Review deleted
+  `begin_gpu_composite_tile`'s entire `Darken` arm, routing every
+  `Darken` tile through the defensive `_` arm to the CPU fallback.
+  **Every existing `Darken` test stayed green** — including the
+  GPU-vs-CPU differentials, because the CPU path computes the same
+  correct answer, so the differential silently compared the CPU path
+  against itself. A refactor could have dropped `Darken` off the GPU
+  path entirely with zero test failures. Closed by a `#[cfg(test)]`
+  `DARKEN_GPU_DISPATCHES` counter (a no-op `fn` in the shipping build,
+  so nothing is carried by the editor), incremented by the arm itself
+  and asserted at **exactly 8** — two `Darken` layers across the four
+  tiles the fixture's 256×256 residency viewport marks visible — by the
+  mixed-mode test. `Relaxed` ordering is sound because every caller
+  needs a `GpuContext` and `real_gpu_context` hands one out only under
+  `GPU_TEST_LOCK`. **Re-running the arm-deletion mutation against
+  0.85.1, the mixed-mode test now fails with `left: 0, right: 8`**,
+  while `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_darken_blend_document`
+  still passes — which is the point: the differential genuinely cannot
+  see this, and now something can.
+
+  **Named, not fixed: `Multiply` and `Dissolve` have the identical
+  gap.** Both are admitted by `document_qualifies_for_gpu_compositing`,
+  both are covered only by GPU-vs-CPU differentials, and deleting
+  either one's dispatch would likewise leave the suite green.
+  Instrumenting them would mean touching two arms this round did not
+  otherwise change, so it is deliberately left as its own round. The
+  `DARKEN_GPU_DISPATCHES` doc comment records this so it cannot be lost.
+
+  **The blend-math bodies, merged.** 0.85.0 deferred this on the
+  grounds that "two ported modes is two samples, and a shape invented
+  from two samples is what the third mode has to fight." Measured
+  against that round's own diff the argument did not hold: the two
+  ~85-line methods differed in exactly six `&'static str`s (five label
+  constants plus the fragment entry point), the variation was *already*
+  isolated into `PipelineKey::fragment_entry` plus a label prefix, and
+  the shared scaffolding (`composite_pipeline`,
+  `opacity_uniform_buffer`, `blend_bind_group_layout`) had needed zero
+  changes to take the second mode. So the abstraction was not being
+  invented from two samples — it had already been found by them. Both
+  methods are now one-line wrappers over a private
+  `TileCompositor::composite_blend_over_with_opacity`, differing only
+  in the `BlendPass` const (`BLEND_PASS_MULTIPLY` /
+  `BLEND_PASS_DARKEN`) they pass. A pure extraction on the same
+  discipline and the same "no existing test needed to change" bar
+  0.83.1 used when it extracted `composite_pipeline` and
+  `opacity_uniform_buffer` out from under these same callers — and
+  0.83.1 was itself a patch release, which is the precedent for this
+  one's number. A third mode is now a `const` and a wrapper.
+
+  `fragment_entry` rides inside `BlendPass` rather than as a seventh
+  parameter specifically so the shared method sits at exactly seven
+  arguments, `clippy::too_many_arguments`'s own limit: a fourth mode
+  adds a `const`, not an `allow`.
+
+  **What is still deferred, on better grounds:** the *public* `mode:
+  BlendMode` parameter. One dispatching entry point would have to
+  answer what happens for the 24 modes with no WGSL behind them —
+  panic (denied by this workspace's lints), a `Result` no caller can
+  act on, or silently doing `Normal` — and that answer belongs with
+  whatever ports enough of them to make the question concrete. Two
+  functions per mode is the cost until then.
+  `begin_gpu_composite_tile`'s own `clippy::too_many_lines` allow
+  **stays**: collapsing the app-side arms needs that same public
+  dispatching method, so the render-side merge does not reach it.
+
+  Doc-staleness swept for real this time. 0.85.0 claimed to have fixed
+  the "the GPU path still cannot express 25 modes" class and left three
+  behind in `aurora-app` — one of which still read "only `Normal` and
+  `Multiply` are ported", which 0.85.0's own commit falsified. All
+  three now say **23** (27 `aurora_doc::BlendMode` variants minus
+  `Normal`, `Multiply`, `Darken`, `Dissolve`) and name all four.
+  `composite_multiply_over_with_opacity`'s "exactly one mode is ported,
+  so there is nothing to dispatch on yet" — true at 0.83.0, falsified
+  at 0.85.0 — now points at the current reasoning instead. Two
+  historical counts that read as current-state contradictions
+  (`composite_pipeline`'s "exactly three call sites", which is four;
+  `composite.wgsl`'s "the remaining 25 blend modes") are now
+  unambiguously past-tense and say they are not maintained.
+
+  One cosmetic disclosure: the accumulator labels `"gpu-composite-a"` /
+  `"gpu-composite-b"` denote **identity, not role**. `std::mem::swap`
+  exchanges which one `current` names, so after an odd number of
+  blend-math layers the texture labelled `-b` *is* `current` and the
+  readback copies out of it — a `wgpu` validation message naming one
+  points at a physical texture, not at "the accumulator". Left as
+  identities on purpose (a role-shaped label would be wrong for half of
+  every tile's passes) with a comment at the swap saying so.
+
+  **Verified (0.85.1)**: `AURORA_REQUIRE_GPU=1 cargo test -p
+  aurora-render -- --nocapture composite_darken` — **8 passed** — and
+  `... composite_multiply` — **8 passed**; `AURORA_REQUIRE_GPU=1 cargo
+  test -p aurora-app -- --nocapture darken` (**3 passed**) and `...
+  recomposite_visible_tiles` (**20 passed**), every GPU-gated run
+  printing `GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)`; then the full gate (`fmt --check`,
+  `check_layering.py`, `check_no_hardcoded_style.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1 cargo test
+  --workspace`, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
+  warnings" cargo doc --workspace --no-deps --all-features`), all
+  clean.
 
 ### M1.10 — Phase 1 gate
 

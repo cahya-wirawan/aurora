@@ -46,6 +46,65 @@ const LABEL_DARKEN_ENCODER: &str = "composite.darken.encoder";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_DARKEN_PASS: &str = "composite.darken.pass";
+
+/// Everything that differs between one shader-computed blend mode's
+/// composite pass and another's: the `shaders/composite.wgsl` fragment
+/// entry point, and the five `wgpu` debug labels that name its pipeline,
+/// uniform buffer, bind group, encoder and render pass.
+///
+/// This is the whole variation between
+/// [`TileCompositor::composite_multiply_over_with_opacity`] and
+/// [`TileCompositor::composite_darken_over_with_opacity`] — six
+/// `&'static str`s. Everything else those two methods do is
+/// `composite_blend_over_with_opacity`, which they now
+/// both delegate to; see that method for why the collapse was safe to
+/// make at two modes rather than deferred to a third.
+///
+/// Carrying `fragment_entry` here rather than as a seventh parameter is
+/// deliberate: it keeps the shared method at exactly seven arguments
+/// (`self` included), which is `clippy::too_many_arguments`'s own limit,
+/// so a third mode adds a `const` and not an `allow`.
+struct BlendPass {
+    /// The `shaders/composite.wgsl` `@fragment` entry point that
+    /// computes this mode's formula. It is also the discriminating
+    /// field of the [`PipelineKey`] this pass caches under, so two modes
+    /// must never share one — see [`composite_pipeline`]'s own note on
+    /// `bind_group_layout` not being part of the key.
+    fragment_entry: &'static str,
+    /// Pipeline layout and render pipeline.
+    pipeline: &'static str,
+    /// The per-call opacity uniform buffer.
+    uniform: &'static str,
+    /// The per-call bind group.
+    bind_group: &'static str,
+    /// The command encoder.
+    encoder: &'static str,
+    /// The render pass itself.
+    pass: &'static str,
+}
+
+/// [`BlendMode::Multiply`]'s entry point and labels — field for field
+/// what `composite_multiply_over_with_opacity` passed inline before the
+/// two bodies were merged.
+const BLEND_PASS_MULTIPLY: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_multiply",
+    pipeline: LABEL_MULTIPLY,
+    uniform: LABEL_MULTIPLY_UNIFORM,
+    bind_group: LABEL_MULTIPLY_BIND_GROUP,
+    encoder: LABEL_MULTIPLY_ENCODER,
+    pass: LABEL_MULTIPLY_PASS,
+};
+
+/// [`BlendMode::Darken`]'s, likewise.
+const BLEND_PASS_DARKEN: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_darken",
+    pipeline: LABEL_DARKEN,
+    uniform: LABEL_DARKEN_UNIFORM,
+    bind_group: LABEL_DARKEN_BIND_GROUP,
+    encoder: LABEL_DARKEN_ENCODER,
+    pass: LABEL_DARKEN_PASS,
+};
+
 /// The byte size of `composite_over_with_opacity`'s own uniform buffer —
 /// a real `f32` opacity value plus 12 bytes of padding, matching
 /// `shaders/composite.wgsl`'s own `Opacity` struct exactly.
@@ -1050,13 +1109,17 @@ fn blend_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 /// `shaders/composite.wgsl` uses: the fullscreen-triangle vertex stage,
 /// one `Rgba16Float` colour target, no depth, no multisampling, and
 /// `key`'s own blend state. Everything that actually differs between the
-/// three composite paths is already in `key` (fragment entry point,
+/// composite paths is already in `key` (fragment entry point,
 /// blend state) or in `bind_group_layout`.
 ///
-/// Extracted in 0.83.1, while there were exactly three call sites and
-/// before the remaining 25 blend modes were ported against this file —
-/// each of those adds only a `PipelineKey`, not another copy of this
-/// descriptor. It is a pure extraction: the descriptors it builds for
+/// *Historical:* extracted in 0.83.1, back when this file had three call
+/// sites and only `Multiply` was ported — the bet being that each later
+/// blend mode would add a `PipelineKey` rather than another copy of this
+/// descriptor. It has held so far (`Darken`, 0.85.0, added exactly
+/// that). Those counts are the 0.83.1 ones and are not maintained here;
+/// the live numbers are [`TileCompositor`]'s own doc comment and
+/// `aurora-app`'s `document_qualifies_for_gpu_compositing`.
+/// It is a pure extraction: the descriptors it builds for
 /// [`TileCompositor::composite_over`] and
 /// [`TileCompositor::composite_over_with_opacity`] are field-for-field
 /// what those two methods built inline before, `label` included.
@@ -1404,9 +1467,15 @@ impl TileCompositor {
     /// updated in place needs a ping-pong pair or a copy of its own —
     /// deliberately not decided here.
     ///
-    /// **Multiply only, no `mode` parameter.** Exactly one mode is
-    /// ported, so there is nothing to dispatch on yet; adding the
-    /// parameter now would invent a shape the second mode may not want.
+    /// **Multiply only, no `mode` parameter.** This method is one mode's
+    /// name and nothing else: the body is
+    /// `composite_blend_over_with_opacity` applied to
+    /// `BLEND_PASS_MULTIPLY`. Read *that* method's doc comment for the
+    /// current reasoning on why the two ported modes are still two public
+    /// entry points rather than one taking a `mode` argument. (Until
+    /// 0.85.1 this paragraph said "exactly one mode is ported, so there
+    /// is nothing to dispatch on yet" — true when it was written at
+    /// 0.83.0, falsified by `Darken` at 0.85.0.)
     ///
     /// **The application calls this now** (0.84.0). `aurora-app`'s own
     /// `document_qualifies_for_gpu_compositing` admits `Multiply`
@@ -1452,82 +1521,14 @@ impl TileCompositor {
         dst: &wgpu::TextureView,
         opacity: f32,
     ) {
-        let device = context.device();
-        let opacity = opacity.clamp(0.0, 1.0);
-        let key = PipelineKey {
-            shader: LABEL,
-            vertex_entry: "vs_composite",
-            fragment_entry: "fs_composite_multiply",
-            target_format: wgpu::TextureFormat::Rgba16Float,
-            // The shader computes the whole composite itself, so the
-            // fixed-function unit must do nothing at all -- a plain
-            // replace. This is the one thing that makes real blend-mode
-            // math expressible on the GPU.
-            blend: Blend::None,
-        };
-        let layout = &self.bind_group_layout_blend;
-        let shader = &self.shader;
-        let pipeline = self.pipelines.get_or_create_with(key.clone(), || {
-            composite_pipeline(device, shader, &key, layout, LABEL_MULTIPLY)
-        });
-
-        // The same `Opacity` upload `composite_over_with_opacity` does,
-        // through the same helper — see it for why the 12 bytes of
-        // padding are three scalars rather than a `vec3<f32>`.
-        let uniform_buffer =
-            opacity_uniform_buffer(device, context.queue(), opacity, LABEL_MULTIPLY_UNIFORM);
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(LABEL_MULTIPLY_BIND_GROUP),
-            layout: &self.bind_group_layout_blend,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(src),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(backdrop),
-                },
-            ],
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(LABEL_MULTIPLY_ENCODER),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(LABEL_MULTIPLY_PASS),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: dst,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // Not `Load`: `dst` is a separate destination,
-                        // not the accumulator, and the fullscreen
-                        // triangle replaces every texel anyway.
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        context.queue().submit(std::iter::once(encoder.finish()));
+        self.composite_blend_over_with_opacity(
+            context,
+            src,
+            backdrop,
+            dst,
+            opacity,
+            &BLEND_PASS_MULTIPLY,
+        );
     }
 
     /// Composites `src` over `backdrop` with **`BlendMode::Darken`**
@@ -1556,16 +1557,29 @@ impl TileCompositor {
     /// `DarkerColor`, which picks one whole `(R, G, B)` triple by
     /// luminosity and is a different, still-CPU-only mode.
     ///
-    /// **No `mode` dispatch parameter, still.** Two ported modes are two
-    /// dedicated methods, exactly as
-    /// [`Self::composite_multiply_over_with_opacity`] is; the shared
-    /// scaffolding is already factored out (`composite_pipeline`,
-    /// `opacity_uniform_buffer`, `blend_bind_group_layout`), so what
-    /// the two bodies still hold in common is the bind-group and
-    /// render-pass boilerplate. Merging them behind a `mode` parameter or
-    /// a generic helper is a real option once more modes land — see this
-    /// module's own follow-on note — but it would be a shape invented
-    /// from two samples, so it is deliberately not done here.
+    /// **No `mode` dispatch parameter, still — but no duplicated body
+    /// either** (0.85.1). This method and
+    /// [`Self::composite_multiply_over_with_opacity`] are both one-line
+    /// wrappers over
+    /// `composite_blend_over_with_opacity`, differing only in the
+    /// `BlendPass` const they hand it. 0.85.0 shipped them as two
+    /// ~85-line near-copies and deferred the merge on the grounds that
+    /// "two samples is too thin a basis for the right abstraction";
+    /// review of that round's own diff did not support the claim, since
+    /// the entire variation was already six `&'static str`s and the
+    /// shared scaffolding (`composite_pipeline`,
+    /// `opacity_uniform_buffer`, `blend_bind_group_layout`) had needed
+    /// no changes at all to take a second mode. The merge landed in
+    /// 0.85.1 as a pure extraction instead.
+    ///
+    /// The *public* shape is still two named methods rather than one
+    /// `mode: BlendMode` parameter, and that part is a real deferral: a
+    /// `mode` parameter would have to say what happens for the 24 modes
+    /// with no WGSL entry point behind them (panic — denied here; return
+    /// a `Result` no caller can act on; silently do `Normal`), and the
+    /// answer belongs with whatever ports enough of them to make the
+    /// question concrete. Two total functions per mode is the cost until
+    /// then.
     ///
     /// **The application calls this** (0.85.0), the same way it calls the
     /// `Multiply` sibling: `aurora-app`'s
@@ -1588,32 +1602,83 @@ impl TileCompositor {
         dst: &wgpu::TextureView,
         opacity: f32,
     ) {
+        self.composite_blend_over_with_opacity(
+            context,
+            src,
+            backdrop,
+            dst,
+            opacity,
+            &BLEND_PASS_DARKEN,
+        );
+    }
+
+    /// The one body behind every shader-computed blend mode: build (or
+    /// reuse) `pass.fragment_entry`'s pipeline, upload the clamped
+    /// opacity, bind `src`/backdrop/uniform, and draw one fullscreen
+    /// triangle into `dst`.
+    ///
+    /// **Every "why" lives on
+    /// [`Self::composite_multiply_over_with_opacity`]** — the aliasing
+    /// rule (`dst` must not be `backdrop`), the `Blend::None` replace,
+    /// the `(src, backdrop, dst)` parameter order, the clamped `opacity`
+    /// against the deliberately unclamped `sa * opacity` product, the
+    /// `Rgba16Float`/usage requirements, and the inherited `wgpu`
+    /// validation-panic gap. None of it is mode-specific, which is
+    /// exactly why this method exists.
+    ///
+    /// **A pure extraction (0.85.1), not a redesign.** It is field for
+    /// field what `composite_multiply_over_with_opacity` and
+    /// `composite_darken_over_with_opacity` each built inline at 0.85.0,
+    /// with the six values that differed lifted into [`BlendPass`] — the
+    /// same discipline, and the same "no existing test needed to change"
+    /// bar, 0.83.1 used when it extracted [`composite_pipeline`] and
+    /// [`opacity_uniform_buffer`] out from under those same callers. The
+    /// `composite_multiply_*` and `composite_darken_*` differentials in
+    /// this module's tests, each checking the shader's output against
+    /// [`composite_tile_cpu`]'s own on real hardware, are what makes that
+    /// checkable rather than asserted.
+    ///
+    /// **Private, and staying private.** A caller outside this crate
+    /// picks a mode by picking a method; handing it a [`BlendPass`]
+    /// would let it name a `fragment_entry` that does not exist (a
+    /// pipeline-creation failure, not a compile error) or pair an entry
+    /// point with the wrong labels.
+    fn composite_blend_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        src: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        blend_pass: &BlendPass,
+    ) {
         let device = context.device();
         let opacity = opacity.clamp(0.0, 1.0);
         let key = PipelineKey {
             shader: LABEL,
             vertex_entry: "vs_composite",
-            fragment_entry: "fs_composite_darken",
+            fragment_entry: blend_pass.fragment_entry,
             target_format: wgpu::TextureFormat::Rgba16Float,
             // The shader computes the whole composite itself, so the
             // fixed-function unit must do nothing at all -- a plain
-            // replace, exactly as the `Multiply` sibling does.
+            // replace. This is the one thing that makes real blend-mode
+            // math expressible on the GPU.
             blend: Blend::None,
         };
         let layout = &self.bind_group_layout_blend;
         let shader = &self.shader;
         let pipeline = self.pipelines.get_or_create_with(key.clone(), || {
-            composite_pipeline(device, shader, &key, layout, LABEL_DARKEN)
+            composite_pipeline(device, shader, &key, layout, blend_pass.pipeline)
         });
 
         // The same `Opacity` upload `composite_over_with_opacity` does,
         // through the same helper — see it for why the 12 bytes of
         // padding are three scalars rather than a `vec3<f32>`.
         let uniform_buffer =
-            opacity_uniform_buffer(device, context.queue(), opacity, LABEL_DARKEN_UNIFORM);
+            opacity_uniform_buffer(device, context.queue(), opacity, blend_pass.uniform);
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(LABEL_DARKEN_BIND_GROUP),
+            label: Some(blend_pass.bind_group),
             layout: &self.bind_group_layout_blend,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -1636,11 +1701,11 @@ impl TileCompositor {
         });
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(LABEL_DARKEN_ENCODER),
+            label: Some(blend_pass.encoder),
         });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(LABEL_DARKEN_PASS),
+                label: Some(blend_pass.pass),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: dst,
                     depth_slice: None,
@@ -1649,6 +1714,15 @@ impl TileCompositor {
                         // Not `Load`: `dst` is a separate destination,
                         // not the accumulator, and the fullscreen
                         // triangle replaces every texel anyway.
+                        //
+                        // This is also why `aurora-app`'s "one shared
+                        // spare accumulator, not one per mode" property
+                        // is a memory-footprint claim and not a
+                        // pixel-observable one: whatever `dst` held
+                        // before this pass is discarded here, so giving
+                        // each mode its own `dst` texture would produce
+                        // byte-identical output. Only `backdrop`, which
+                        // is sampled, carries the prior fold.
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
