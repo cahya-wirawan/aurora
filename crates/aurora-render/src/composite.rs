@@ -915,9 +915,74 @@ pub struct TileCompositor {
     /// exact prior pipeline shape/behaviour, is untouched by this
     /// addition.
     bind_group_layout_opacity: wgpu::BindGroupLayout,
+    /// The [`Self::composite_multiply_over_with_opacity`]-only sibling of
+    /// `bind_group_layout_opacity` above: the same texture + sampler +
+    /// opacity-uniform triple, plus a fourth binding for the *backdrop*
+    /// texture the shader samples instead of reaching it through the
+    /// fixed-function blend unit. Kept entirely separate from both
+    /// layouts above for the same reason those two are separate from
+    /// each other — neither existing method's pipeline shape or
+    /// behaviour is touched by this addition.
+    bind_group_layout_blend: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     shader: wgpu::ShaderModule,
     pipelines: PipelineCache,
+}
+
+/// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
+/// layout's three bindings plus the backdrop texture at binding 3, which
+/// is what makes real in-shader blend math (`fs_composite_multiply`,
+/// `shaders/composite.wgsl`) possible at all — the fixed-function blend
+/// unit never hands a shader the backdrop's colour.
+///
+/// A free function rather than more lines inside
+/// [`TileCompositor::new`] purely to keep that constructor under
+/// `clippy::too_many_lines`; the two older layouts are deliberately left
+/// inline and untouched rather than refactored alongside it.
+fn blend_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(LABEL),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // The backdrop texture — the one binding that makes real
+            // in-shader blend math possible at all.
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
 }
 
 impl TileCompositor {
@@ -976,6 +1041,7 @@ impl TileCompositor {
                     },
                 ],
             });
+        let bind_group_layout_blend = blend_bind_group_layout(device);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some(LABEL),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -989,6 +1055,7 @@ impl TileCompositor {
         Self {
             bind_group_layout,
             bind_group_layout_opacity,
+            bind_group_layout_blend,
             sampler,
             shader,
             pipelines: PipelineCache::new(),
@@ -1210,6 +1277,167 @@ impl TileCompositor {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        context.queue().submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Composites `src` over `backdrop` with **`BlendMode::Multiply`**
+    /// math computed in the shader, writing the finished result into
+    /// `dst` — a *different* view from `backdrop`.
+    ///
+    /// This is the first GPU path in the workspace that expresses a
+    /// non-`Normal` blend mode at all. [`Self::composite_over`] and
+    /// [`Self::composite_over_with_opacity`] both leave the "over" math
+    /// to the fixed-function blend unit, which can only ever express
+    /// `Normal`: it has no way to hand the backdrop's *colour* to a
+    /// formula like `Cb * Cs`. So this method instead binds the
+    /// accumulator as a sampled texture (binding 3), computes the entire
+    /// composite — including the "over" — in `fs_composite_multiply`
+    /// (`shaders/composite.wgsl`), and writes the finished premultiplied
+    /// texel with `Blend::None` (a plain replace).
+    ///
+    /// **Read-and-write are separate textures on purpose.** Sampling the
+    /// same texture a pass is rendering into is undefined, so `dst` must
+    /// not alias `backdrop`; the colour attachment is therefore cleared
+    /// (`LoadOp::Clear`) rather than loaded, since nothing in `dst` is
+    /// being accumulated onto. A caller that wants the accumulator
+    /// updated in place needs a ping-pong pair or a copy of its own —
+    /// deliberately not decided here.
+    ///
+    /// **Multiply only, no `mode` parameter.** Exactly one mode is
+    /// ported, so there is nothing to dispatch on yet; adding the
+    /// parameter now would invent a shape the second mode may not want.
+    ///
+    /// **Nothing in the application calls this.** `aurora-app`'s own
+    /// `document_qualifies_for_gpu_compositing` still admits only
+    /// `Normal`-blend layers, and is untouched by this method's
+    /// existence — wiring is separate, later work. The shader math is
+    /// proven against [`composite_tile_cpu`]'s own results by this
+    /// module's `composite_multiply_*` tests instead.
+    ///
+    /// All three views must be `Rgba16Float` and the same size; `dst`'s
+    /// owning texture must include `RENDER_ATTACHMENT` usage, and both
+    /// `src`'s and `backdrop`'s must include `TEXTURE_BINDING`.
+    /// `opacity` is clamped to `0.0..=1.0`, exactly as
+    /// `composite_over_with_opacity` clamps it.
+    pub fn composite_multiply_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        dst: &wgpu::TextureView,
+        src: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        opacity: f32,
+    ) {
+        let device = context.device();
+        let opacity = opacity.clamp(0.0, 1.0);
+        let key = PipelineKey {
+            shader: LABEL,
+            vertex_entry: "vs_composite",
+            fragment_entry: "fs_composite_multiply",
+            target_format: wgpu::TextureFormat::Rgba16Float,
+            // The shader computes the whole composite itself, so the
+            // fixed-function unit must do nothing at all -- a plain
+            // replace. This is the one thing that makes real blend-mode
+            // math expressible on the GPU.
+            blend: Blend::None,
+        };
+        let layout = &self.bind_group_layout_blend;
+        let shader = &self.shader;
+        let pipeline = self.pipelines.get_or_create_with(key.clone(), || {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(LABEL),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(LABEL),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some(key.vertex_entry),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(key.fragment_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: key.target_format,
+                        blend: key.blend.to_wgpu(),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                multiview_mask: None,
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                cache: None,
+            })
+        });
+
+        // Byte-identical to `composite_over_with_opacity`'s own uniform
+        // upload, against the same `Opacity` struct — see that method
+        // for why the 12 bytes of padding are three scalars.
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(LABEL),
+            size: OPACITY_UNIFORM_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut bytes = Vec::with_capacity(OPACITY_UNIFORM_SIZE as usize);
+        bytes.extend_from_slice(&opacity.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 12]);
+        context.queue().write_buffer(&uniform_buffer, 0, &bytes);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(LABEL),
+            layout: &self.bind_group_layout_blend,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(backdrop),
+                },
+            ],
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(LABEL) });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(LABEL),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Not `Load`: `dst` is a separate destination,
+                        // not the accumulator, and the fullscreen
+                        // triangle replaces every texel anyway.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2838,6 +3066,207 @@ mod tests {
             "the GPU shader path and the CPU path must agree exactly on this Normal-mode, \
              exact-power-of-two case"
         );
+    }
+
+    // -- Real in-shader blend-mode math on the GPU, slice 1 of the
+    // blend-mode port: `Multiply` only, via
+    // `TileCompositor::composite_multiply_over_with_opacity` and the
+    // `fs_composite_multiply` entry point.
+    //
+    // These two tests exist to answer one specific question the rest of
+    // this workspace had never answered: **can a shader sample a texture
+    // that a previous render pass wrote to as a colour attachment, after
+    // an intervening `queue.submit`?** Nothing here had ever done it --
+    // every prior GPU test in this file seeds its sampled textures with
+    // `queue.write_texture` and only ever *writes* to a render
+    // attachment. Real blend-mode math has no alternative: the
+    // fixed-function blend unit can express `Normal` and nothing else,
+    // so `Cb` has to arrive as a sampled texture.
+    //
+    // Both tests therefore build their accumulator with a real
+    // `composite_over_with_opacity` render pass (which submits on its
+    // own) and then hand that same texture to the multiply pass as
+    // `backdrop`. Seeding it with `write_texture` instead would pass
+    // just as easily and prove nothing about the mechanism.
+
+    #[test]
+    /// The GPU counterpart of
+    /// `composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey`
+    /// above, asserting the identical value that test pins: 50% grey
+    /// multiplied by 50% grey is `0.5 * 0.5 = 0.25` per channel.
+    ///
+    /// The accumulator is fully opaque here (`alpha == 1.0`), so its
+    /// premultiplied and straight colours coincide and the shader's
+    /// backdrop-recovery divide is an identity -- deliberately the
+    /// simplest case, so a failure means the *mechanism* (sampling a
+    /// former render attachment, `Blend::None`, the bind group) is
+    /// wrong rather than the un-premultiply branch. The fractional-alpha
+    /// sibling below exercises that branch.
+    ///
+    /// `dst` is seeded opaque red first, so a pass that silently wrote
+    /// nothing would fail rather than accidentally read as a pass.
+    fn composite_multiply_over_with_opacity_blends_two_mid_greys_to_a_quarter_grey() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let grey = [0.5, 0.5, 0.5, 1.0];
+
+        // The accumulator, built by a real render pass rather than
+        // seeded -- that is the whole point of this test.
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, grey, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, grey, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        compositor.composite_over_with_opacity(&context, &backdrop_view, &bottom_view, 1.0);
+        compositor.composite_multiply_over_with_opacity(
+            &context,
+            &dst_view,
+            &top_view,
+            &backdrop_view,
+            1.0,
+        );
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.5, 0.5, 0.5, 1.0),
+            "setup: the first pass must really have produced the mid-grey accumulator the \
+             second pass then samples"
+        );
+        let (r, g, b, a) = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            (r, g, b, a),
+            (0.25, 0.25, 0.25, 1.0),
+            "Multiply(0.5, 0.5) = 0.25, the same value \
+             composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey pins on the CPU"
+        );
+    }
+
+    #[test]
+    /// The fractional-accumulator-alpha case, which is what actually
+    /// exercises the shader's backdrop-recovery branch
+    /// (`if (ab > 0.0) { cb = d.rgb / ab; }`) -- the mirror of
+    /// [`composite_layer_into`]'s own `straight_backdrop` divide, and
+    /// the same gap
+    /// `composite_tile_cpu_recovers_the_true_straight_alpha_backdrop_for_a_still_translucent_accumulator`
+    /// covers on the CPU. A fully opaque backdrop can never catch a
+    /// missing un-premultiply, because premultiplied and straight
+    /// colours are identical at `alpha == 1.0`.
+    ///
+    /// The expected value is **not hand-derived**: it comes from calling
+    /// the real [`composite_tile_cpu`] with the same two layers, so the
+    /// GPU and CPU formulas cannot drift apart behind a stale literal.
+    ///
+    /// Compared within `2 * f16::EPSILON`, the same tolerance and the
+    /// same reasoning `aurora-app`'s own GPU-vs-CPU parity test uses:
+    /// the two paths fold in different orders and precisions, and Vulkan
+    /// permits an `f32` multiply-add a couple of ULP of latitude, so
+    /// one-ULP-at-its-own-magnitude disagreement is expected rather than
+    /// a defect. It is still tight enough that a genuinely wrong blend,
+    /// or a missing un-premultiply, fails.
+    fn composite_multiply_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let grey = [0.5, 0.5, 0.5, 1.0];
+        let bottom_opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, grey, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, grey, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        // A half-opacity bottom layer leaves a *premultiplied*
+        // accumulator whose alpha is 0.5 -- exactly the state whose raw
+        // colour is not its straight colour.
+        compositor.composite_over_with_opacity(
+            &context,
+            &backdrop_view,
+            &bottom_view,
+            bottom_opacity,
+        );
+        compositor.composite_multiply_over_with_opacity(
+            &context,
+            &dst_view,
+            &top_view,
+            &backdrop_view,
+            1.0,
+        );
+
+        let bottom_texels = solid_texels(grey);
+        let top_texels = solid_texels(grey);
+        let cpu_accumulator = first_texel(&composite_tile_cpu(&[(
+            &bottom_texels,
+            bottom_opacity,
+            BlendMode::Normal,
+        )]));
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, bottom_opacity, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::Multiply),
+        ]));
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator, cpu_accumulator,
+            "setup: the accumulator the second pass samples must be the premultiplied, \
+             fractional-alpha state the CPU path also reaches"
+        );
+        assert!(
+            gpu_accumulator.3 > 0.0 && gpu_accumulator.3 < 1.0,
+            "setup: this test is only meaningful with a fractional accumulator alpha, got \
+             {gpu_accumulator:?}"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader Multiply path and composite_tile_cpu diverged \
+                 by more than {tolerance} against a translucent accumulator ({gpu} vs {cpu}) -- \
+                 that is a real finding to report, not a reason to loosen this assertion. Full \
+                 texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
     }
 
     // -- Non-separable blend modes (this round): `Hue`, `Saturation`,

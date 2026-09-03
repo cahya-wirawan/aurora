@@ -64,3 +64,73 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
     let color = textureSample(src_tex, src_smp, in.uv);
     return vec4<f32>(color.rgb, color.a * opacity.value);
 }
+
+// The accumulator ("backdrop") texture, sampled as a *texture* rather
+// than reached through the fixed-function blend unit. Binding 3 is the
+// next free slot after src_tex (0), src_smp (1) and the opacity uniform
+// (2) declared above; only fs_composite_multiply below uses it, through
+// its own bind group layout (`TileCompositor::bind_group_layout_blend`),
+// so neither existing entry point's layout gains an entry.
+@group(0) @binding(3) var dst_tex: texture_2d<f32>;
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
+// exactly, for `BlendMode::Multiply` only.
+//
+// **Why this exists at all.** Every other fragment entry point in this
+// file leaves the actual "over" math to the GPU's fixed-function blend
+// unit, which can express `Normal` and nothing else: it has no way to
+// read the backdrop as a *colour* and run `Cb * Cs` on it. A real blend
+// mode therefore has to compute the whole composite in the shader and
+// write the finished result with `Blend::None` (a plain replace) — which
+// means the accumulator has to arrive as a sampled texture (`dst_tex`),
+// not as the render target. So this entry point writes to a *different*
+// view than the one it samples; it cannot accumulate in place the way
+// fs_composite/fs_composite_opacity do.
+//
+// **The formula, step for step against the CPU reference.**
+// `composite_layer_into`'s loop body is, per texel:
+//
+//     alpha             = sa * opacity            (opacity pre-clamped)
+//     inverse           = 1 - alpha
+//     backdrop_alpha    = da
+//     backdrop_inverse  = 1 - backdrop_alpha
+//     straight_backdrop = d.rgb / backdrop_alpha, or [0,0,0] if da == 0
+//     b                 = blend_rgb(mode, straight_backdrop, s.rgb)
+//     blended           = backdrop_inverse * s.rgb + backdrop_alpha * b
+//     out.rgb           = inverse * d.rgb + alpha * blended
+//     out.a             = alpha + da * inverse
+//
+// and `blend_rgb(Multiply, cb, cs)` is `blend_channel`'s `cb * cs` per
+// channel. Each line below is that line, in the same order.
+//
+// `dst_tex` holds the *premultiplied* accumulator, exactly as the CPU
+// accumulator does; its straight colour is recovered by dividing by its
+// own alpha before blending — the `if (ab > 0.0)` guard is
+// `composite_layer_into`'s own `backdrop_alpha > 0.0` guard, and the
+// zero fallback is its `[0.0, 0.0, 0.0]`. The result is written back
+// premultiplied.
+//
+// `opacity.value` is not re-clamped here because the Rust caller
+// (`TileCompositor::composite_multiply_over_with_opacity`) already
+// clamps it to `0.0..=1.0` before uploading it, exactly as
+// `composite_over_with_opacity` does — and `composite_layer_into`
+// itself clamps the *opacity*, not the `sa * opacity` product, so
+// clamping the product here would be a real (if narrow) divergence from
+// the reference for a source alpha above 1.0, which an `f16` tile can
+// legitimately hold.
+@fragment
+fn fs_composite_multiply(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let d = textureSample(dst_tex, src_smp, in.uv);
+    let a = s.a * opacity.value;
+    let inv = 1.0 - a;
+    let ab = d.a;
+    let ab_inv = 1.0 - ab;
+    var cb = vec3<f32>(0.0, 0.0, 0.0);
+    if (ab > 0.0) {
+        cb = d.rgb / ab;
+    }
+    let b = cb * s.rgb;                       // blend_rgb(Multiply, cb, cs)
+    let blended = ab_inv * s.rgb + ab * b;
+    return vec4<f32>(inv * d.rgb + a * blended, a + d.a * inv);
+}

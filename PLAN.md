@@ -16057,6 +16057,111 @@ severity choice.
   --workspace` stood in, per CLAUDE.md. No GPU or interactive
   verification, and none is claimed.
 
+- [x] **GPU blend-mode math, slice 1 of the epic: the sample-a-former-
+  render-target mechanism, proven with `Multiply` — done 2026-09-03
+  (0.83.0).** This is the first slice of the "extending GPU compositing
+  beyond the Normal-blend/non-grouped case" item named under M1.10's
+  own "real, substantial, multi-round engineering work" heading (item
+  4). It deliberately proves *one mechanism* and wires nothing.
+
+  **The unknown it existed to answer.** Every GPU composite path in this
+  workspace leaves the actual "over" math to the fixed-function blend
+  unit (`aurora_gpu::Blend::AlphaBlending`), which can express `Normal`
+  and nothing else: it never hands the shader the backdrop's *colour*,
+  so `Cb * Cs` — or any of the other 25 formulas — is simply not
+  expressible that way. The only route is to compute the whole composite
+  in the shader and write the result with `Blend::None` (a plain
+  replace), which requires the accumulator to arrive as a **sampled
+  texture**. Nothing in the workspace had ever sampled a texture that a
+  previous render pass wrote to as a colour attachment (there are still
+  zero `copy_texture_to_texture` calls anywhere), so whether that works
+  cleanly here was the single largest unknown in the whole blend-mode
+  port. **It works.** Both new tests build their accumulator with a real
+  `composite_over_with_opacity` render pass — which submits on its own —
+  and then hand that same texture to the multiply pass as the backdrop;
+  both pass on real hardware (`GPU adapter: NVIDIA GeForce RTX 3090
+  (Vulkan, DiscreteGpu)`, under `AURORA_REQUIRE_GPU=1`, so a silent skip
+  could not have produced that result), with no validation errors and no
+  extra synchronisation, copy, or barrier beyond what `wgpu` already
+  inserts.
+
+  **What landed**, entirely inside `aurora-render`: a new
+  `fs_composite_multiply` entry point plus a `@group(0) @binding(3)`
+  backdrop texture in `shaders/composite.wgsl` (the existing
+  `fs_composite`/`fs_composite_opacity` entry points and the hard-won
+  16-byte `Opacity` struct are byte-for-byte untouched); a fourth
+  bind-group layout `TileCompositor::bind_group_layout_blend` (the two
+  existing layouts untouched); and one new method,
+  `TileCompositor::composite_multiply_over_with_opacity`, which is
+  `composite_over_with_opacity`'s body with four deltas — the new
+  layout, the backdrop bound at 3, the new fragment entry point,
+  `Blend::None` instead of `Blend::AlphaBlending`, and
+  `LoadOp::Clear(TRANSPARENT)` because it writes to a *separate*
+  destination view rather than accumulating in place (sampling the
+  texture a pass renders into is undefined, so `dst` must not alias
+  `backdrop`). `composite_over` and `composite_over_with_opacity` are
+  unchanged, and all six of their existing tests still pass unmodified.
+
+  **Multiply only, and no `mode` parameter.** One mode is ported, so
+  there is nothing to dispatch on yet; the shader mirrors
+  `composite_layer_into`'s loop body line for line — `alpha`, `inverse`,
+  `backdrop_alpha`, `backdrop_inverse`, the `> 0.0`-guarded
+  straight-backdrop recovery, `blend_rgb(Multiply, ...)` as `cb * cs`,
+  the two `blended_*`/output accumulations — with the opacity clamped
+  Rust-side exactly as `composite_over_with_opacity` clamps it, so the
+  product `sa * opacity` is left unclamped in the shader to match the
+  CPU reference exactly rather than diverging on a source alpha above
+  `1.0` (which an `f16` tile can legitimately hold).
+
+  **Two tests, both on real hardware.**
+  `composite_multiply_over_with_opacity_blends_two_mid_greys_to_a_quarter_grey`
+  asserts the exact value its CPU sibling
+  `composite_tile_cpu_multiply_blends_two_mid_greys_to_a_quarter_grey`
+  already pins (`0.5 * 0.5 = 0.25`) against a fully opaque accumulator —
+  the simplest case, so a failure means the mechanism is wrong rather
+  than the arithmetic.
+  `composite_multiply_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator`
+  builds a *fractional*-alpha accumulator (bottom layer at 50% opacity)
+  so the shader's un-premultiply branch actually runs, and compares
+  against the real `composite_tile_cpu` called with the same two layers
+  — the expected value is computed, never a hand-derived literal, so the
+  two paths cannot drift behind a stale constant — within `2 *
+  f16::EPSILON`, the same tolerance and reasoning `aurora-app`'s own
+  GPU-vs-CPU parity test uses. Both were negative-controlled: stubbing
+  the backdrop sample out to a constant makes both fail (`0.5` vs the
+  expected `0.25` and `0.375`), so they genuinely depend on the sampled
+  former render target rather than passing by construction.
+
+  **`aurora-app` is completely untouched, and this changes nothing a
+  user can see.** `document_qualifies_for_gpu_compositing`,
+  `translate_blend_mode`, `gpu_composite_tile` and the four existing
+  tests that use `BlendMode::Multiply` as a "this must *not* run on GPU"
+  example are all unmodified: the GPU fast path for real documents still
+  admits **only** `Normal`-blend, non-grouped layers, and a document
+  with a Multiply layer still composites on the CPU exactly as before.
+  This is proven-but-unwired infrastructure — the same "library code
+  with tests, zero live-app behaviour change" shape other
+  infrastructure-first rounds in this session used. Wiring it in (the
+  predicate, the ping-pong or copy the in-place accumulator needs, and
+  the dispatch a second mode will want) is the *next* slice, not this
+  one, and no claim is made here that Multiply-blend documents composite
+  on the GPU in the real app.
+
+  **Verified**: `cargo test -p aurora-render -- composite` (86 passed),
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render -- --nocapture
+  composite_multiply` (2 passed on the RTX 3090 named above), then
+  `cargo fmt --all --check`, `check_layering.py` (no layering change was
+  needed or made), `check_no_hardcoded_style.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace`, `cargo test
+  --workspace --doc`, and `RUSTDOCFLAGS="-D warnings" cargo doc
+  --workspace --no-deps --all-features` all clean locally. `cargo
+  nextest` is not installed on this box; `cargo test --workspace` stood
+  in, per CLAUDE.md. **No interactive verification**, and none is
+  claimed — nothing in the running app reaches this code. Nor is any
+  performance claim made: this was never measured against the 60 FPS
+  budget, and one extra texture sample per texel is not obviously free.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
@@ -17869,7 +17974,19 @@ tooling-gated, fall into one of four buckets:
    port of all 26 blend-mode formulas, or per-group isolated GPU
    passes — comparable in size to the six-round CPU blend-mode series
    that landed 0.27.0–0.32.0), and real per-pixel/grayscale mask
-   pixel storage. **The mask half is now partly done (0.70.0)**: ADR
+   pixel storage. **The blend-mode half now has its first slice
+   (0.83.0)**, and it deliberately bought a mechanism rather than a
+   feature: real blend math needs the accumulator as a *sampled
+   texture* (the fixed-function blend unit can only ever express
+   `Normal`), and nothing in this workspace had sampled a former render
+   attachment before. That now works, proven on real hardware with
+   `Multiply` ported in WGSL and checked against `composite_tile_cpu`.
+   **`aurora-app` is untouched** — the GPU fast path still admits only
+   `Normal`-blend, non-grouped layers, so this is unwired
+   infrastructure; the remaining 25 formulas, the in-place-accumulator
+   ping-pong, mode dispatch, and the `document_qualifies_for_gpu_
+   compositing` change are all still ahead. See M1.9's own 0.83.0
+   entry. **The mask half is now partly done (0.70.0)**: ADR
    0010's pattern was applied — coverage lives on its own surface in
    the shared `TileStore`, and `resolve_tile` composites it for real,
    feathering and all, and **`.aur` persistence landed in 0.71.0**, so
