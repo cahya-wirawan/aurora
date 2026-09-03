@@ -17863,7 +17863,7 @@ severity choice.
      probes placed inside `TileResidency::sync` itself
      (`crates/aurora-gpu/src/residency.rs`) break that ~15 ms interval
      down as **87.1% `extend_premultiplied_le_bytes`**
-     (`crates/aurora-gpu/src/residency.rs:173-185` — a single-threaded,
+     (`crates/aurora-gpu/src/residency.rs:187-199` — a single-threaded,
      scalar `f16 → f32 → premultiply → f16 → le_bytes` loop over every
      texel of every dirty tile; no `rayon`, no SIMD), **12.7%
      `queue.write_texture`'s CPU-side staging `memcpy`**, and **~0%**
@@ -17909,7 +17909,7 @@ severity choice.
   0.88.0's implied "optimize GPU upload":
 
   - **Make `extend_premultiplied_le_bytes` cheaper**
-    (`crates/aurora-gpu/src/residency.rs:173-185`). Measured at ~12.4 ms
+    (`crates/aurora-gpu/src/residency.rs:187-199`). Measured at ~12.4 ms
     of the ~14.3 ms `upload_sync` stage in the probe run (that stage means
     14.9–16.1 ms across the unprobed runs, so read this as "~87% of
     whichever figure", not as a fourth decimal place), i.e. **~44% of the
@@ -17969,7 +17969,7 @@ severity choice.
   round. (2) A duplicated, dangling clause in this entry's own
   `gpu_tiles` paragraph above ("The remaining ~17 tiles — the other ~17
   have nothing stored..."). (3) `extend_premultiplied_le_bytes`'s own
-  doc comment (`residency.rs:173-185`, the candidate this entry names
+  doc comment (`residency.rs:187-199`, the candidate this entry names
   as the largest measured hot spot) still only carried the *old*
   "bandwidth-bound" attribution from `spike/FINDINGS.md`; it now points
   at this measurement and states plainly that the function itself, not
@@ -18071,7 +18071,7 @@ severity choice.
 
   *What changed, and only this.* The body of
   `extend_premultiplied_le_bytes`
-  (`crates/aurora-gpu/src/residency.rs:173-185`) previously issued **four
+  (`crates/aurora-gpu/src/residency.rs:187-199`) previously issued **four
   separate 2-byte `out.extend_from_slice` calls per texel**, one per
   channel. It now destructures each channel's `to_le_bytes()` into named
   low/high bytes, concatenates all four pairs into **one 8-byte array**,
@@ -18101,6 +18101,23 @@ severity choice.
   that every test of the function `sync` actually calls was either
   relative to its cold `upload_mip` sibling or blind to the per-texel RGB
   advance. Both mutations were confirmed failing before the fix landed.)
+
+  **0.89.2 — three follow-up corrections an independent Judge caught,
+  applied directly, plus one thing worth committing rather than leaving
+  as review notes.** All doc-only except the last: (1) four stale line
+  citations to `residency.rs:173-185` corrected to `187-199` (the doc
+  comment additions above pushed the function down); (2) the same
+  "probed pre-0.89.0, not re-probed since" caveat the two `aurora-app`
+  sites already carry is now also on this file's own `~87%` claim
+  two paragraphs above; (3) a fifth test,
+  `the_fused_serializer_matches_premultiply_then_serialize_for_extreme_values`,
+  pins the batched writer against the in-place path for both
+  infinities, both signed zeros, the smallest and largest subnormals,
+  and a quiet and a signalling NaN — the specific inputs an
+  off-repo, hand-verified exhaustive 2^32 review sweep (0.89.0/0.89.1)
+  already proved equivalent, but that proof lived only in review notes
+  until now, so a future change to this loop has something in the tree
+  to fail against beyond the ordinary-value tests above.
   `TileResidency::sync`'s
   loop structure, budget checks, dirty-flag handling and reused-buffer
   design are all untouched, as is `upload_mip`'s separate path. No new

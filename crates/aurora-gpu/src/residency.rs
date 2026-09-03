@@ -136,9 +136,12 @@ fn premultiply_rgba(texels: &mut [f16]) {
 /// did anyway.
 ///
 /// **This function itself is the real cost, not the bus** (measured,
-/// `aurora-app`'s M1.10 per-stage frame breakdown, PLAN.md, 0.88.1): on
-/// the real pan-while-painting benchmark, this loop is ~87% of the
-/// `upload_sync` stage's time — a single-threaded scalar
+/// `aurora-app`'s M1.10 per-stage frame breakdown, PLAN.md, 0.88.1 —
+/// probed against the pre-0.89.0 four-append loop and not re-probed
+/// since; 0.89.0's own measurement below found batching bought only
+/// ~1-5% of the stage, so this ~87% figure has almost certainly not
+/// moved): on the real pan-while-painting benchmark, this loop is ~87%
+/// of the `upload_sync` stage's time — a single-threaded scalar
 /// `f16 -> f32 -> premultiply -> f16` conversion, not GPU bandwidth. The
 /// actual GPU DMA of the bytes this produces happens later, at the next
 /// `queue.submit`, and measures near line-rate there. Before optimizing
@@ -2158,6 +2161,53 @@ mod tests {
             decoded, expected,
             "each texel must carry its own premultiplied RGB and its own \
              untouched alpha"
+        );
+    }
+
+    /// A committed corner of the equivalence an independent review pass
+    /// (0.89.0/0.89.1) established exhaustively for every possible f16
+    /// bit pattern by hand, off-repo: this pins the same property for
+    /// the specific values that class of bug tends to hide in — both
+    /// infinities, both signed zeros, a signalling and a quiet NaN, and
+    /// the smallest/largest subnormals — so a future change to this
+    /// loop's arithmetic or byte order has *something* in the tree to
+    /// fail against, not just the ordinary-value tests above.
+    #[test]
+    fn the_fused_serializer_matches_premultiply_then_serialize_for_extreme_values() {
+        let bits: [u16; 10] = [
+            0x0000, // +0
+            0x8000, // -0
+            0x0001, // smallest subnormal
+            0x03ff, // largest subnormal
+            0x7bff, // largest finite (65504)
+            0x7c00, // +infinity
+            0xfc00, // -infinity
+            0x7e00, // quiet NaN
+            0x7c01, // signalling NaN
+            0x3800, // 0.5, an ordinary anchor among the extremes
+        ];
+        let source: Vec<f16> = bits
+            .iter()
+            .cycle()
+            .take(bits.len() * CHANNELS)
+            .map(|&b| f16::from_bits(b))
+            .collect();
+
+        let mut in_place = source.clone();
+        premultiply_rgba(&mut in_place);
+        let mut expected = Vec::new();
+        for sample in &in_place {
+            expected.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let mut fused = Vec::new();
+        extend_premultiplied_le_bytes(&source, &mut fused);
+
+        assert_eq!(
+            fused, expected,
+            "the batched writer must match the in-place premultiply-then-\
+             serialize path bit-for-bit, including on NaN, infinity, \
+             subnormal and signed-zero inputs"
         );
     }
 
