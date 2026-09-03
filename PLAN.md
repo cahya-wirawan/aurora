@@ -16162,6 +16162,157 @@ severity choice.
   performance claim made: this was never measured against the 60 FPS
   budget, and one extra texture sample per texel is not obviously free.
 
+  **Addendum (0.83.1): review hardening, and the backend caveat the
+  entry above should have carried.** Independent review of 0.83.0
+  raised nine issues, none critical or high. Everything below is inside
+  `aurora-render`; `aurora-app` is still untouched and there is still no
+  user-visible behaviour change.
+
+  - **"It works" means "it works on Vulkan/NVIDIA."** The claim above is
+    backed by exactly one backend on one vendor (`NVIDIA GeForce RTX
+    3090 (Vulkan, DiscreteGpu)`). **Metal and DX12 are unverified for
+    this path.** That caveat matters most for the shader's
+    `if (ab > 0.0)` guard around the straight-backdrop divide: whether a
+    compiler flattens that branch and evaluates the untaken `bd.rgb / ab`
+    anyway is a property of the *shader compiler*, so it is a
+    per-backend property and cannot be generalised from one green run
+    here. The macOS/Windows legs of this remain open work, on the same
+    hardware-gated footing as Phase 0's own tail.
+  - **The zero-alpha-backdrop case was tested, adversarially, and
+    passed.** Red-team review specifically drove a fully transparent
+    accumulator (`ab == 0.0`, so the guarded divide is a `0.0 / 0.0`)
+    with non-symmetric per-channel source values through the real
+    Vulkan/NVIDIA path and found **no `NaN` propagation and no
+    contamination** of any channel. That was a review-only finding
+    rather than a committed test, so 0.83.1 makes it a real test —
+    `composite_multiply_over_with_opacity_over_a_fully_transparent_backdrop_is_the_source_alone`
+    — which asserts finiteness *and* the exact `composite_tile_cpu`
+    value, so a future `naga`/backend change cannot regress it silently.
+    Still Vulkan/NVIDIA only, per the caveat above.
+  - **The test suite could not catch a spatial-addressing bug.** Both
+    original tests composited uniform-colour tiles and read back texel
+    0, which proves arithmetic and says nothing about *which* texel was
+    sampled — a V-flip, a transpose, or a half-texel UV offset would
+    have passed, in a round whose whole claim is that reading back a
+    former render target works *correctly*. Fixed:
+    `..._matches_the_cpu_across_a_spatially_varying_tile` composites two
+    patterned tiles (red varies with `x`, green with `y`, blue with the
+    quadrant, so both small and large misalignments show) and compares
+    **every texel** of the result against `composite_tile_cpu` via the
+    existing whole-tile `read_rgba8` helper.
+  - **Ping-pong chaining is now proven too, not just the single hop
+    (the review's open question).** 0.83.0 only ever showed pass K
+    sampling what pass K-1 *wrote*. Real accumulation also needs pass
+    K+1 writing a texture pass K *sampled from* — a write-after-read
+    hazard. It was cheap to add, so it was added rather than deferred:
+    `..._chained_through_a_ping_pong_pair_matches_three_cpu_layers` runs
+    `Normal` into A, `Multiply` A -> B, `Multiply` B -> A and compares
+    against one three-layer `composite_tile_cpu` call. **It works** —
+    again with no barrier, copy or synchronisation beyond what `wgpu`
+    inserts, and again on Vulkan/NVIDIA only. That de-risks the shape
+    the wiring slice will have to use before that slice designs against
+    it.
+  - **Two tests that could not distinguish a transposed binding, can
+    now.** The mid-greys test handed *identical* texels to `src` and
+    `backdrop`, so a copy-pasted bind group with bindings 0 and 3
+    swapped would have passed. Note that different *colours* alone do
+    not fix this — `Multiply` is commutative, and at two opaque layers
+    with `opacity == 1.0` the surrounding "over" terms collapse to
+    `Cb * Cs`, so `0.25` over `0.5` gives `0.125` either way round. The
+    source is therefore given its own fractional alpha, which breaks the
+    symmetry (`0.3125` correct vs `0.375` transposed); the spatial and
+    half-opacity tests break it independently as well. That test's name
+    changed with its values, so the `..._blends_two_mid_greys_to_a_
+    quarter_grey` named in the 0.83.0 entry above is now
+    `composite_multiply_over_with_opacity_multiplies_a_half_grey_backdrop_by_a_quarter_grey_source`
+    — six `composite_multiply_*` tests in total, not two.
+  - **A non-`1.0` opacity is covered.** Both original tests passed
+    `opacity: 1.0` and so never exercised the `s.a * opacity.value`
+    scale, while the sibling `composite_over_with_opacity` had `0.25`,
+    `0.0` and `5.0` cases. `..._at_half_opacity_matches_the_cpu` adds
+    one, with the expected value computed by `composite_tile_cpu`.
+  - **The WGSL backdrop binding was renamed `dst_tex` -> `backdrop_tex`
+    (local `d` -> `bd`).** It was bound to the Rust `backdrop`
+    parameter, while `dst` on the Rust side is the render target it must
+    *never* alias — so a reader mapping `dst_tex` to `dst` got it
+    exactly backwards, which is the precise confusion the Rust doc
+    comment warns about. Worth correcting before 25 more entry points
+    are written against that file.
+  - **The new method's parameters were reordered to `(context, src,
+    backdrop, dst, opacity)`** — inputs first, output last, and
+    deliberately a different shape from
+    `composite_over_with_opacity`'s `(context, dst, src, opacity)`, so
+    three consecutive same-typed `&TextureView` arguments cannot be
+    pattern-matched into the wrong slots from muscle memory. The change
+    is worth noting as evidence of the hazard: the reorder compiled
+    clean with the old call sites still in place, exactly the silent
+    swap it exists to prevent.
+  - **A pre-existing, workspace-wide gap is now named in the doc
+    comment.** Passing the same view as both `dst` and `backdrop` trips
+    `wgpu` validation rather than corrupting pixels silently — good —
+    but `push_error_scope`/`pop_error_scope`/`on_uncaptured_error`
+    appear **nowhere** under `crates/`, so any `wgpu` validation failure
+    reaches the user as `wgpu`'s own default panic, in a workspace whose
+    lints deny `panic!` precisely because a panic loses unsaved work.
+    That is **pre-existing and not introduced here**, and deliberately
+    *not* fixed in this slice: installing error scopes is a decision
+    about every `wgpu` call site in the workspace, not one method.
+    **Named as open follow-on work**, tracked here rather than left
+    implicit.
+  - **Labels are now distinguishable.** The new bind-group layout,
+    pipeline, bind group, encoder and render pass carry
+    `composite.blend.layout` / `composite.multiply*` labels instead of
+    sharing the bare `"composite"` label with two pre-existing
+    pipelines, which had left a validation message or a frame capture
+    unable to say which of three was at fault. The two pre-existing
+    objects keep their `"composite"` label byte-for-byte.
+  - **The ~120-line near-clone was de-duplicated before it ossified.**
+    `composite_multiply_over_with_opacity` was `composite_over_with_
+    opacity`'s body with four deltas, and 25 more modes would otherwise
+    have copy-pasted it 25 more times. Two small private free functions
+    now carry the shared parts — `composite_pipeline` (the
+    fullscreen-triangle pipeline descriptor every entry point in
+    `composite.wgsl` uses, varying only by `PipelineKey` and bind-group
+    layout) and `opacity_uniform_buffer` (the 16-byte `Opacity` upload,
+    which was byte-identical in both opacity-aware paths). It is a pure
+    extraction: all three call sites, `composite_over` and
+    `composite_over_with_opacity` included, still build field-for-field
+    the descriptors they built inline before, labels included, and every
+    one of their existing tests still passes unmodified.
+
+  **Negative-controlled, on real hardware.** Both new claims were
+  checked by injecting the exact bug each test exists to catch and
+  confirming the suite goes red, so neither passes by construction:
+
+  - **V-flip** (`backdrop_tex` sampled at `1.0 - in.uv.y`): **only**
+    `..._matches_the_cpu_across_a_spatially_varying_tile` fails
+    (`first mismatch (x, y, channel, gpu, cpu): Some((0, 0, 1, 84, 0))`);
+    the other five all still pass. That is precisely the blind spot
+    review identified, demonstrated rather than argued.
+  - **Transposed bindings 0 and 3** (`src` and `backdrop` swapped in the
+    bind group): **5 of 6 fail**, including the reworked
+    `..._multiplies_a_half_grey_backdrop_by_a_quarter_grey_source`,
+    which reports exactly the `0.375` its own doc comment predicts for a
+    transpose against the correct `0.3125`. Under the original 0.83.0
+    pair this fault was invisible. The one test that still passes is
+    `..._over_a_fully_transparent_backdrop_is_the_source_alone`, and
+    that is a genuine degeneracy rather than a gap: with a zero-alpha
+    backdrop and an opaque source, transposing them happens to produce
+    the same texel, which is worth knowing about that test's reach.
+
+  **Verified (0.83.1)**: `AURORA_REQUIRE_GPU=1 cargo test -p
+  aurora-render -- --nocapture composite_multiply` — **6 passed**, each
+  printing `GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`,
+  so none was a silent skip — then `cargo test -p aurora-render --
+  composite`, `cargo fmt --all --check`, `check_layering.py` (no
+  layering change needed or made), `check_no_hardcoded_style.py`, `cargo
+  check --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace`, `cargo test
+  --workspace --doc`, and `RUSTDOCFLAGS="-D warnings" cargo doc
+  --workspace --no-deps --all-features`, all clean. Still **no
+  interactive verification and no performance claim**, and still nothing
+  in the running app reaches this code.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG

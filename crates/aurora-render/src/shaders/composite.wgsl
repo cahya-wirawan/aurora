@@ -71,7 +71,16 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // (2) declared above; only fs_composite_multiply below uses it, through
 // its own bind group layout (`TileCompositor::bind_group_layout_blend`),
 // so neither existing entry point's layout gains an entry.
-@group(0) @binding(3) var dst_tex: texture_2d<f32>;
+//
+// Named `backdrop_tex` after the Rust parameter it is actually bound to
+// (`TileCompositor::composite_multiply_over_with_opacity`'s `backdrop`),
+// deliberately *not* `dst_tex`: `dst` on the Rust side is the render
+// target this entry point writes to, which is a different texture
+// entirely and must never alias this one. Calling the sampled backdrop
+// `dst_tex` read as exactly the aliasing the Rust doc comment warns
+// against, so the name was corrected in 0.83.1 before the remaining 25
+// blend modes were written against this file.
+@group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
 // exactly, for `BlendMode::Multiply` only.
@@ -82,8 +91,9 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // read the backdrop as a *colour* and run `Cb * Cs` on it. A real blend
 // mode therefore has to compute the whole composite in the shader and
 // write the finished result with `Blend::None` (a plain replace) — which
-// means the accumulator has to arrive as a sampled texture (`dst_tex`),
-// not as the render target. So this entry point writes to a *different*
+// means the accumulator has to arrive as a sampled texture
+// (`backdrop_tex`), not as the render target. So this entry point writes
+// to a *different*
 // view than the one it samples; it cannot accumulate in place the way
 // fs_composite/fs_composite_opacity do.
 //
@@ -103,7 +113,7 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // and `blend_rgb(Multiply, cb, cs)` is `blend_channel`'s `cb * cs` per
 // channel. Each line below is that line, in the same order.
 //
-// `dst_tex` holds the *premultiplied* accumulator, exactly as the CPU
+// `backdrop_tex` holds the *premultiplied* accumulator, exactly as the CPU
 // accumulator does; its straight colour is recovered by dividing by its
 // own alpha before blending — the `if (ab > 0.0)` guard is
 // `composite_layer_into`'s own `backdrop_alpha > 0.0` guard, and the
@@ -121,16 +131,16 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_composite_multiply(in: VsOut) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_smp, in.uv);
-    let d = textureSample(dst_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
     let a = s.a * opacity.value;
     let inv = 1.0 - a;
-    let ab = d.a;
+    let ab = bd.a;
     let ab_inv = 1.0 - ab;
     var cb = vec3<f32>(0.0, 0.0, 0.0);
     if (ab > 0.0) {
-        cb = d.rgb / ab;
+        cb = bd.rgb / ab;
     }
     let b = cb * s.rgb;                       // blend_rgb(Multiply, cb, cs)
     let blended = ab_inv * s.rgb + ab * b;
-    return vec4<f32>(inv * d.rgb + a * blended, a + d.a * inv);
+    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
 }
