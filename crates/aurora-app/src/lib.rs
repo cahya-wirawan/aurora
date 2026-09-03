@@ -8265,16 +8265,25 @@ fn recomposite_visible_tiles(
     //    transparent compares equal to that blank -- while the GPU atlas
     //    still holds the *previous* document's pixels for the same tile
     //    id. Skipping would leave them on screen.
-    // 2. `Tile::from_texels`, which is how a tile paged out to the scratch
-    //    disk comes back, always starts `dirty: None`. So dirty ->
-    //    evicted -> paged back in loses the flag, and nothing in the
-    //    reconstructed tile records that an upload was still owed.
+    // 2. **Closed in 0.91.0.** `Tile::from_texels`, which is how a tile
+    //    paged out to the scratch disk comes back, always starts
+    //    `dirty: None`, so dirty -> evicted -> paged back in used to lose
+    //    the flag entirely. `TileStore` now records a key that was dirty
+    //    when its own eviction took it out of memory and re-marks it on
+    //    the way back in (`TileStore::is_dirty`'s own doc comment has the
+    //    mechanism), so **this case no longer needs the guard** -- an
+    //    evicted-and-reinstated composite tile reports dirty on its own.
     //
+    // **Case 1 is what keeps the guard.** No dirty-flag mechanism can see
+    // it: a tile materialized blank after a `forget_surface` genuinely has
+    // nothing owed on it, and the mismatch is entirely between the atlas
+    // and a surface that was discarded out from under it.
     // `TileStore::is_resident` is exactly the "same in-memory `Tile`
     // throughout" condition, and it is asked *before* `get_mut`, which
     // would otherwise page the tile in (or materialize it blank) and make
     // every tile look resident. `contains_tile` would not do: it is also
-    // `true` for a paged-out tile, i.e. for case 2.
+    // `true` for a paged-out tile, which is a tile this must still be able
+    // to distinguish.
     //
     // **The guard is only sound because this is the composite surface's
     // sole materializer (0.90.1).** `is_resident` is `true` for a tile
@@ -8292,9 +8301,13 @@ fn recomposite_visible_tiles(
     // only such reader, by asking `contains_tile` before `get`; see that
     // function's own doc comment. **So: a new reader of
     // `composite_surface_id()` must not use `TileStore::get` without the
-    // same gate** -- the alternative, and the real fix that would let this
-    // whole guard go, is preserving dirtiness across page-out/page-in
-    // (PLAN.md, M1.10, still deferred).
+    // same gate.** 0.91.0's dirty-across-eviction fix does *not* retire
+    // this requirement -- it closes case 2, and this is case 1, whose
+    // mismatch is between the atlas and a surface that was discarded, with
+    // no owed upload anywhere for a dirty flag to carry. Retiring the
+    // guard would mean something else entirely: a per-surface generation
+    // the atlas records alongside each slot, so a `forget_surface` could
+    // invalidate the slots itself (PLAN.md, M1.10).
     //
     // The comparison is over `f16::to_bits`, deliberately not `==`:
     // `-0.0 == 0.0` is `true` while the two have different bit patterns
@@ -8515,13 +8528,18 @@ fn recomposite_visible_tiles(
 /// currently cached tile at once, not just the one(s) the triggering
 /// edit actually touched. `aurora_tile::TileStore`'s own per-tile dirty
 /// flags (`Tile::mark_dirty`/`TileStore::take_dirty`) are deliberately
-/// *not* reused for either kind of invalidation here: they only track
-/// resident tiles, so a tile dirtied by an edit and then evicted before
-/// a redraw ever consumes its flag would silently stop being reported
-/// dirty at all — a real correctness risk (a stale composite shown as
-/// current) both `bump` and `invalidate` avoid by acting synchronously,
-/// from data the caller already has in hand, rather than by querying
-/// tile-store state later.
+/// *not* reused for either kind of invalidation here, and the reason is
+/// **not** that they are lossy — since 0.91.0 they survive eviction
+/// (`TileStore::is_dirty`). It is that they answer a different question.
+/// A tile's dirty flag means "this tile's bytes have changed since the
+/// last GPU upload read them"; what this cache tracks is "this tile still
+/// needs recompositing *from the document*", which no amount of tile-store
+/// state can know — a layer's opacity changing dirties no tile at all
+/// until something recomposites. The two are also consumed by different
+/// owners: `aurora_gpu::TileResidency::sync` takes the dirty flag, so a
+/// cache reading it would be racing that consumer for the same bit. Acting
+/// synchronously, from data the caller already has in hand, is what keeps
+/// the two independent.
 ///
 /// `current` only ever grows within a session between bumps — a tile
 /// computed once is never individually evicted, even once panned away
@@ -24225,6 +24243,163 @@ mod tests {
              document's pixels (before {before:?}, after {after:?}, write_composited outcomes \
              {outcomes:?}, sync {stats:?})"
         );
+    }
+
+    /// A scratch store deliberately **too small** for one frame's working
+    /// set: 3 tiles against a 2x2 visible composite grid plus the same
+    /// document's own 2x2 layer grid, i.e. 8 distinct keys. Three rather
+    /// than four specifically because `recomposite_visible_tiles`'s GPU
+    /// path writes every composite tile in its phase-3 drain, so a
+    /// four-tile budget would leave all four resident again by the time
+    /// `sync` runs and the test would exercise nothing. That is the
+    /// opposite of what [`diff_tile_store`] is for, and it is not a
+    /// pathological fixture — at Aurora's 300,000 x 300,000 px document
+    /// ceiling a budget smaller than the working set is the *design
+    /// assumption* (invariant §7.3.1), and this session's own frame
+    /// measurements saw several composite tiles per frame evicted mid-pass
+    /// at ordinary document sizes.
+    fn evicting_tile_store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(3) else {
+            unreachable!("3 is non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("scratch dir just created by tempfile must work: {err:?}"),
+        };
+        (dir, store)
+    }
+
+    #[test]
+    /// AC-2: the end-to-end regression guard for the eviction hole 0.90.0
+    /// disclosed and 0.91.0 closed. `write_composited` marks a composite
+    /// tile dirty; a *later* tile of the same
+    /// [`recomposite_visible_tiles`] pass makes the store page that tile
+    /// out under budget pressure; before 0.91.0 it came back through
+    /// `Tile::from_texels` clean, so `aurora_gpu::TileResidency::sync`'s
+    /// `is_dirty` peek declined an upload and the atlas kept the *previous*
+    /// frame's pixels.
+    ///
+    /// Read back from the real atlas texture, not the store: the whole
+    /// failure mode is a tile store that holds exactly the right pixels
+    /// while the GPU shows something else, so any store-side assertion
+    /// would pass on the broken code.
+    ///
+    /// Frame 1 syncs with `force = true` deliberately — the setup step
+    /// that puts the "stale" content in the atlas must not itself be
+    /// defeatable by the very bug under test.
+    fn a_composite_tile_evicted_mid_pass_is_still_re_uploaded_to_the_real_atlas() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_scratch, mut store) = evicting_tile_store();
+
+        // 512x512 covers the whole 2x2 visible grid at TILE = 256, so
+        // every visible tile has real content on both frames.
+        let red = filled_image(512, 512, [1.0, 0.0, 0.0, 1.0]);
+        let (layers, _history, layer) = document_from_image("evicting", &red);
+        let Some(layer_surface) = layers.surface_id(layer) else {
+            unreachable!("document_from_image always builds a pixel layer");
+        };
+        if let Err(err) = aurora_io::write_into_store(&red, &mut store, layer_surface) {
+            unreachable!("{err:?}");
+        }
+
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let visible: Vec<aurora_tile::TileId> = residency.visible_tiles().collect();
+        assert_eq!(visible.len(), 4, "a 256x256 viewport is a 2x2 grid");
+
+        // Frame 1: red into the atlas.
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(layer),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            true,
+            usize::MAX,
+        );
+        for id in &visible {
+            let texel = atlas_texel(context.device(), context.queue(), &residency, *id);
+            assert!(
+                (texel[0] - 1.0).abs() < 0.01 && texel[3] > 0.99,
+                "the red frame must really be in the atlas, or this test proves nothing: {id:?} \
+                 {texel:?}"
+            );
+        }
+
+        // The edit: repaint the same layer blue, so every visible
+        // composite tile's content genuinely changes.
+        let blue = filled_image(512, 512, [0.0, 0.0, 1.0, 1.0]);
+        if let Err(err) = aurora_io::write_into_store(&blue, &mut store, layer_surface) {
+            unreachable!("{err:?}");
+        }
+        cache.bump();
+
+        // Frame 2, exactly as `redraw` runs it: recomposite, then sync.
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            Some(layer),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let outcomes = take_composite_write_outcomes();
+
+        // The scenario is asserted, not assumed: at least one visible
+        // composite tile really was paged out again between being written
+        // and being synced, and it really does still report dirty.
+        let evicted: Vec<aurora_tile::TileId> = visible
+            .iter()
+            .copied()
+            .filter(|id| !store.is_resident(composite_surface_id(), *id))
+            .collect();
+        assert!(
+            !evicted.is_empty(),
+            "the store's budget must be small enough to page a just-written composite tile out \
+             mid-pass, or this test exercises nothing: outcomes {outcomes:?}"
+        );
+        for id in &evicted {
+            assert!(
+                store.is_dirty(composite_surface_id(), *id),
+                "an upload is still owed for {id:?}, evicted while dirty"
+            );
+        }
+
+        let stats = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+
+        // The proof, from the atlas: no visible tile may still show red.
+        for id in &visible {
+            let texel = atlas_texel(context.device(), context.queue(), &residency, *id);
+            assert!(
+                texel[2] > 0.99 && texel[0] < 0.01,
+                "the atlas must show the edited document at {id:?}, not the previous frame's \
+                 pixels ({texel:?}; evicted mid-pass {evicted:?}, write_composited outcomes \
+                 {outcomes:?}, sync {stats:?})"
+            );
+        }
     }
 
     // -- `CompositeCache::invalidate_doc_rect` and the narrowed

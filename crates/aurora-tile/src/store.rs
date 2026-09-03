@@ -19,7 +19,7 @@ use lru::LruCache;
 
 use crate::codec;
 use crate::error::TileError;
-use crate::tile::{SurfaceId, Tile, TileId};
+use crate::tile::{SurfaceId, TILE, Tile, TileId};
 use crate::writer::{BackgroundWriter, WriteJob, WriteResult};
 
 /// Counters mirroring `spike/vertical-slice`'s own `Stats` (paging
@@ -90,17 +90,24 @@ pub struct Stats {
 /// behaviour for a memory bound meant to cover a whole document
 /// regardless of how many surfaces (layers) it has.
 ///
-/// **Known limitation, accepted rather than solved here**: a tile's dirty
-/// rectangle does not survive eviction. If a tile is evicted while still
-/// dirty (its pending changes never consumed, e.g. via GPU upload), that
-/// dirty state is lost — the pixel data itself is safely persisted, only
-/// the "what changed since last upload" bookkeeping is not. A freshly
-/// paged-in tile always starts clean, which is correct *relative to what
-/// is on disk*, but a consumer that was relying on an in-flight dirty
-/// rect across an eviction would need to re-derive it some other way.
-/// Solving this would mean persisting dirty state in the on-disk format,
-/// which is real, avoidable complexity for a corner case this milestone
-/// does not need to close.
+/// **Dirtiness survives eviction** (0.91.0). A tile that is evicted while
+/// still dirty (its pending changes never consumed, e.g. via GPU upload)
+/// is recorded in `evicted_dirty`, so [`Self::is_dirty`] keeps answering
+/// `true` for it while it is paged out, [`Self::take_dirty`] can consume
+/// that record without a page-in first, and paging the tile back in
+/// re-marks it dirty. Before 0.91.0 the fact was simply lost:
+/// `Tile::from_texels` starts clean, so dirty -> evicted -> paged back in
+/// read as clean, and `aurora_gpu::TileResidency::sync` declined an
+/// upload the GPU atlas genuinely still needed. That fired routinely
+/// rather than rarely — a store budget smaller than the visible working
+/// set is the *design assumption* at this project's 300,000 × 300,000 px
+/// document ceiling, not a fixture quirk.
+///
+/// **What is still not preserved: which rectangle.** A reinstated tile
+/// reads back dirty over its whole area, because the exact rect is the
+/// one part that would require changing the on-disk tile format to carry,
+/// and no consumer needs it — `sync` uploads whole tiles regardless. The
+/// error is toward uploading too much, never too little.
 ///
 /// **Eviction/revisit race, closed**: `make_room` evicts a tile by handing
 /// its encoded bytes to a background writer (`submit` never blocks — see
@@ -132,6 +139,18 @@ pub struct Stats {
 /// were submitted under, and the bytes themselves, shared with the
 /// queued [`WriteJob`] rather than copied into it.
 type PendingWrite = (u64, Arc<Vec<u8>>);
+
+/// The dirty rectangle [`TileStore::take_dirty`] reports for a tile that
+/// was dirty when an eviction took it out of `resident`: an eviction
+/// preserves only the *fact* that something was dirty (see
+/// `TileStore::evicted_dirty`), never which rectangle, so the whole tile
+/// is the only honest answer available.
+const WHOLE_TILE: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: TILE,
+    height: TILE,
+};
 
 #[derive(Debug)]
 pub struct TileStore {
@@ -167,6 +186,35 @@ pub struct TileStore {
     /// only surviving copy) and nothing else would ever drop it, which is
     /// exactly why this queue and its cap exist.
     failed_writes: VecDeque<(SurfaceId, TileId)>,
+    /// Keys that were **dirty when `make_room` took them out of
+    /// `resident`** — the one piece of a `Tile`'s state `codec::encode`
+    /// does not carry to the scratch disk, and which `Tile::from_texels`
+    /// therefore cannot reconstruct.
+    ///
+    /// Without this (every version before 0.91.0), dirty -> evicted ->
+    /// paged back in read as *clean*: `aurora_gpu::TileResidency::sync`'s
+    /// non-consuming [`Self::is_dirty`] peek then declined to re-upload a
+    /// tile whose atlas slot still nominally matched, and the GPU kept
+    /// showing pre-edit pixels.
+    ///
+    /// **A boolean, not the rectangle, deliberately.** No consumer needs
+    /// sub-rect precision — `sync` uploads whole tiles regardless of what
+    /// [`Self::take_dirty`] hands back — and persisting the exact rect
+    /// would mean changing the on-disk tile format. A reinstated tile
+    /// reads back dirty over its whole area (`WHOLE_TILE`), which errs
+    /// toward uploading too much, never too little.
+    ///
+    /// **Invariant: a key in here is never simultaneously resident.**
+    /// `make_room` is the only insert, for a key it has just popped *out*
+    /// of `resident`; `make_resident` — which every path that puts a tile
+    /// back goes through — removes the entry in the same call that
+    /// inserts into `resident`.
+    ///
+    /// **Bounded by `paged_out`, not by document size.** `make_room`
+    /// inserts here only alongside a `paged_out` entry for the same key,
+    /// and every path that drops one drops the other — a constant factor
+    /// on a map this store already keeps, not a new growth term.
+    evicted_dirty: HashSet<(SurfaceId, TileId)>,
     /// Mints the generation stamped on every [`WriteJob`] and stored in
     /// [`Self::pending`]. Store-wide and monotonic, not per key: a
     /// per-key counter would need a map that outlives its `pending`
@@ -478,6 +526,7 @@ impl TileStore {
             paged_out: HashMap::new(),
             pending: HashMap::new(),
             failed_writes: VecDeque::new(),
+            evicted_dirty: HashSet::new(),
             write_generation: 0,
             budget,
             scratch_dir,
@@ -514,28 +563,55 @@ impl TileStore {
         }
     }
 
-    /// Takes and clears `(surface, id)`'s accumulated dirty rectangle, if
-    /// it is currently resident and dirty. Returns `None` for a tile that
-    /// is not resident, not dirty, or has never been touched.
+    /// Takes and clears `(surface, id)`'s accumulated dirty rectangle.
+    /// Returns `None` for a tile that is not dirty or has never been
+    /// touched.
+    ///
+    /// # A tile that was dirty when it was evicted (0.91.0)
+    ///
+    /// …reports the **whole tile** here, and does so *even while it is not
+    /// resident*: an eviction keeps only the fact that an upload was owed,
+    /// never which rectangle (see this type's own `evicted_dirty` field),
+    /// so a whole-tile answer is the only honest one available. It errs
+    /// toward uploading too much, never too little.
+    ///
+    /// Consuming that record **here**, rather than only when the tile is
+    /// paged back in, is deliberate and load-bearing:
+    /// `aurora_gpu::TileResidency::sync` calls this *before* its
+    /// [`Self::get`], so a record that survived until the page-in would
+    /// re-dirty the tile the same frame it was uploaded and buy a second,
+    /// redundant ~512 KB upload on the next one.
     pub fn take_dirty(&mut self, surface: SurfaceId, id: TileId) -> Option<Rect> {
-        self.resident
-            .get_mut(&(surface, id))
-            .and_then(Tile::take_dirty)
+        let key = (surface, id);
+        let resident = self.resident.get_mut(&key).and_then(Tile::take_dirty);
+        // Checked even when the resident lookup answered: the invariant
+        // says the two are mutually exclusive, and asking anyway is what
+        // keeps a violation of it from stranding a record forever.
+        if self.evicted_dirty.remove(&key) {
+            return Some(WHOLE_TILE);
+        }
+        resident
     }
 
-    /// Whether `(surface, id)` is resident and currently dirty, **without
-    /// clearing it** — [`Self::take_dirty`]'s non-consuming counterpart,
-    /// for a caller that must decide whether it can act on the dirtiness
-    /// before consuming it (see [`Tile::is_dirty`]).
+    /// Whether `(surface, id)` is currently dirty, **without clearing
+    /// it** — [`Self::take_dirty`]'s non-consuming counterpart, for a
+    /// caller that must decide whether it can act on the dirtiness before
+    /// consuming it (see [`Tile::is_dirty`]).
+    ///
+    /// True in either of two cases, since 0.91.0: the tile is resident
+    /// and its own dirty rectangle is set, **or** it was dirty when an
+    /// eviction took it out of memory and nothing has consumed that record
+    /// yet. Before 0.91.0 only the first case existed, and the second read
+    /// as clean — which is exactly how a composite tile evicted mid-frame
+    /// used to lose its owed GPU upload.
     ///
     /// Peeks rather than gets, so asking does not bump LRU recency: a
     /// query is not an access, and a tile the caller then declines to
     /// upload should not have been promoted for having been asked about.
     #[must_use]
     pub fn is_dirty(&self, surface: SurfaceId, id: TileId) -> bool {
-        self.resident
-            .peek(&(surface, id))
-            .is_some_and(Tile::is_dirty)
+        let key = (surface, id);
+        self.resident.peek(&key).is_some_and(Tile::is_dirty) || self.evicted_dirty.contains(&key)
     }
 
     /// Whether `(surface, id)` is **resident in memory right now** — not
@@ -545,16 +621,26 @@ impl TileStore {
     ///
     /// # Why the distinction is load-bearing
     ///
-    /// A tile's dirty rectangle lives only in the resident [`Tile`].
-    /// Paging one out and back in reconstructs it through
-    /// `Tile::from_texels`, which starts clean — so a tile that was
-    /// marked dirty, evicted, and paged back in reads as *not* dirty
-    /// while an earlier upload of it may still be what a GPU atlas
-    /// holds. A caller that wants to skip re-marking a tile dirty on the
-    /// grounds that its content is unchanged therefore has to know the
-    /// flag was never silently dropped, and continuous residency is
-    /// precisely that condition. `aurora-app`'s `write_composited` is
-    /// that caller.
+    /// **Until 0.91.0 the reason was the dirty flag itself**: it lived
+    /// only in the resident [`Tile`], and paging one out and back in
+    /// reconstructed it through `Tile::from_texels`, which starts clean —
+    /// so a tile that was marked dirty, evicted, and paged back in read as
+    /// *not* dirty while an earlier upload of it was still what a GPU
+    /// atlas held. **That half is closed**: `evicted_dirty` now carries
+    /// the fact across the eviction, so [`Self::is_dirty`] answers `true`
+    /// for such a tile whether it is resident or not.
+    ///
+    /// What remains, and what this method is still for, is the *other*
+    /// half of the same question: a tile can be resident, byte-identical
+    /// to what a caller is about to write, and *still* have never been
+    /// uploaded — because it was materialized blank after a
+    /// [`Self::forget_surface`] rather than paged back in. No dirty-flag
+    /// mechanism can see that, since there is genuinely nothing owed on
+    /// the tile in hand; only the caller's own knowledge that the surface
+    /// was discarded can. A caller that wants to skip re-marking a tile
+    /// dirty on the grounds that its content is unchanged therefore still
+    /// needs this, and `aurora-app`'s `write_composited` is that caller —
+    /// see the next section for the bug that proved it.
     ///
     /// # What it does *not* mean
     ///
@@ -573,7 +659,7 @@ impl TileStore {
     ///
     /// So residency carries exactly one guarantee — *the same in-memory
     /// [`Tile`] has existed continuously since the caller last looked*,
-    /// hence no dirty flag was silently dropped. Any caller wanting the
+    /// hence it was not materialized blank in the meantime. Any caller wanting the
     /// stronger "somebody wrote these bytes" property needs that on the
     /// *writer* side too: every other reader of the surface must avoid
     /// materializing blanks (ask [`Self::contains_tile`] before
@@ -669,6 +755,11 @@ impl TileStore {
         self.paged_out.remove(&key);
         self.forget_pending(key);
         self.resident.pop(&key);
+        // Swept with the rest of what this key owns (0.91.0): the record
+        // outlives the tile it describes by design, so leaving it behind
+        // would make the brand-new blank the next `get` invents report
+        // dirty for an upload nothing owes any more.
+        self.evicted_dirty.remove(&key);
         held
     }
 
@@ -753,7 +844,17 @@ impl TileStore {
                 .map(|(key, _)| *key)
                 .filter(|(held, _)| surfaces.contains(held)),
         );
-        for key in self.paged_out.keys().chain(self.pending.keys()) {
+        // `evicted_dirty` is chained in even though every key in it is
+        // also in `paged_out` today (0.91.0's own invariant): the sweep is
+        // this store's exhaustive "drop everything for these surfaces"
+        // operation, and making it depend on another map's invariant to
+        // reach one of its own sets is how a later change to either leaks.
+        for key in self
+            .paged_out
+            .keys()
+            .chain(self.pending.keys())
+            .chain(self.evicted_dirty.iter())
+        {
             if surfaces.contains(&key.0) {
                 keys.insert(*key);
             }
@@ -930,8 +1031,7 @@ impl TileStore {
             let texels = codec::decode(bytes)?;
             self.forget_pending((surface, id));
             self.paged_out.remove(&(surface, id));
-            self.make_room();
-            self.resident.put((surface, id), Tile::from_texels(texels));
+            self.make_resident((surface, id), Tile::from_texels(texels));
             return Ok(());
         }
         // Same rule as the branch above, and this is the branch where it
@@ -947,8 +1047,7 @@ impl TileStore {
             self.paged_out.remove(&(surface, id));
             Ok(())
         } else {
-            self.make_room();
-            self.resident.put((surface, id), Tile::blank());
+            self.make_resident((surface, id), Tile::blank());
             self.stats.tiles_created += 1;
             Ok(())
         }
@@ -1275,9 +1374,24 @@ impl TileStore {
             }
         };
         self.stats.faults += 1;
-        self.make_room();
-        self.resident.put((surface, id), Tile::from_texels(texels));
+        self.make_resident((surface, id), Tile::from_texels(texels));
         Ok(())
+    }
+
+    /// Makes room and puts `tile` into `resident` under `key`, restoring
+    /// the dirty state an earlier eviction of this key would otherwise
+    /// have lost (`evicted_dirty`).
+    ///
+    /// Every one of the three places a tile enters `resident` goes through
+    /// here — [`Self::ensure_resident`]'s pending and blank branches and
+    /// `page_in` — so the restoration has one site rather than three to
+    /// keep in step.
+    fn make_resident(&mut self, key: (SurfaceId, TileId), mut tile: Tile) {
+        self.make_room();
+        if self.evicted_dirty.remove(&key) {
+            tile.mark_dirty(WHOLE_TILE);
+        }
+        self.resident.put(key, tile);
     }
 
     /// Evicts least-recently-used resident tiles, encoding and handing
@@ -1290,11 +1404,23 @@ impl TileStore {
     /// `LruCache::pop_lru` already orders by access recency across every
     /// key it holds, regardless of which surface a key belongs to, so
     /// this needs no surface-aware logic of its own to get that right.
+    ///
+    /// **Records a victim that was still dirty** (0.91.0) in
+    /// `evicted_dirty`, so the "an upload is still owed for this tile"
+    /// fact survives the round trip through the scratch disk that
+    /// `codec::encode`/`Tile::from_texels` cannot carry it across. See
+    /// that field's own doc comment for what is and is not preserved, and
+    /// `make_resident` for where it is put back.
     fn make_room(&mut self) {
         while self.resident.len() >= self.budget.get() {
             let Some(((victim_surface, victim_id), victim_tile)) = self.resident.pop_lru() else {
                 break;
             };
+            // Before the tile is dropped at the end of this iteration --
+            // it is the only thing that knows it was dirty.
+            if victim_tile.is_dirty() {
+                self.evicted_dirty.insert((victim_surface, victim_id));
+            }
             // Shared, not copied: the same bytes go into `pending` *and*
             // into the `WriteJob` below, and both are read-only for the
             // rest of their lives. Sharing one allocation turns what used
@@ -1467,10 +1593,16 @@ mod tests {
     #[test]
     // `is_resident` exists precisely because `contains_tile` is *not* a
     // substitute for it: the two disagree exactly on the paged-out case,
-    // which is the one where the resident `Tile`'s dirty rectangle has
-    // been silently reconstructed as clean by `Tile::from_texels`. A
-    // caller that skips re-marking a tile dirty on "its bytes are
-    // unchanged" grounds has to be able to see that difference.
+    // which is the one where the tile in hand is not the same in-memory
+    // `Tile` the caller last looked at. (Its *dirty rectangle* is no
+    // longer what makes that matter: since 0.91.0 the store re-marks a
+    // reinstated tile dirty from its own `evicted_dirty` record, so a
+    // paged-out tile keeps reporting dirty. What residency still answers
+    // is the separate question of whether a resident tile could have been
+    // materialized blank by a `forget_surface` since. See `is_resident`'s
+    // own doc comment.) A caller that skips re-marking a tile dirty on
+    // "its bytes are unchanged" grounds has to be able to see that
+    // difference.
     fn is_resident_is_false_for_a_paged_out_tile_contains_tile_still_holds() {
         let (_dir, mut store) = store(1);
         let s = surface();
@@ -1484,9 +1616,8 @@ mod tests {
         assert!(store.contains_tile(s, a));
 
         // Budget of 1, so touching `b` evicts `a`. `contains_tile` still
-        // finds it (its bytes survive in `pending`/`paged_out`), but it
-        // is no longer in memory -- and its dirty rectangle is gone with
-        // the `Tile` that held it.
+        // finds it (its bytes survive in `pending`/`paged_out`), but the
+        // `Tile` that held it is gone.
         if store.get(s, b).is_err() {
             unreachable!("a fresh store must serve this tile");
         }
@@ -1909,6 +2040,188 @@ mod tests {
         }
         assert_eq!(store.take_dirty(s, id), Some(rect));
         assert_eq!(store.take_dirty(s, id), None);
+    }
+
+    // -- Dirtiness across eviction (0.91.0) --
+    //
+    // Four tests around one property: an eviction must not silently
+    // consume the fact that a GPU upload is still owed. Every one of them
+    // forces a *real* eviction through `make_room` (budget 1, two tiles),
+    // rather than hand-constructing store state, because the whole bug
+    // was that the real eviction path dropped something.
+
+    /// AC-1. Before 0.91.0 this failed at the first post-eviction
+    /// `is_dirty`: the flag lived only in the resident `Tile`, and
+    /// `Tile::from_texels` rebuilt the paged-in tile clean.
+    #[test]
+    fn a_tile_evicted_while_dirty_still_reports_dirty_and_pages_back_in_dirty() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        tile.mark_dirty(aurora_core::Rect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        });
+        assert!(store.is_dirty(s, a), "just marked");
+
+        // Budget of 1, so touching `b` evicts `a` -- while `a` is still
+        // dirty, which is the whole scenario.
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(
+            !store.is_resident(s, a),
+            "evicted to make room for `b`, so no longer in memory"
+        );
+        assert!(
+            store.is_dirty(s, a),
+            "an eviction must not consume the fact that an upload is still owed"
+        );
+
+        // And paging it back in keeps that, so a consumer that only
+        // looks after the page-in sees it too.
+        if store.get(s, a).is_err() {
+            unreachable!("the tile's own bytes are in `pending`/`paged_out`");
+        }
+        assert!(store.is_resident(s, a));
+        assert!(store.is_dirty(s, a), "still owed after the page-in");
+        assert_eq!(
+            store.take_dirty(s, a),
+            Some(super::WHOLE_TILE),
+            "an eviction keeps only the fact, not the rectangle, so the whole tile is the only \
+             honest answer"
+        );
+        assert_eq!(store.take_dirty(s, a), None, "and consuming it clears it");
+        assert!(!store.is_dirty(s, a));
+    }
+
+    /// AC-4a. Mirrors the order `aurora_gpu::TileResidency::sync` really
+    /// uses: it calls `take_dirty` *before* `get`, so the record has to
+    /// be consumable while the tile is still non-resident -- and must not
+    /// then resurrect itself when the page-in finally happens, or every
+    /// frame would pay a second redundant ~512 KB upload.
+    #[test]
+    fn take_dirty_consumes_an_evicted_while_dirty_record_even_before_a_page_in() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        tile.mark_dirty(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(!store.is_resident(s, a), "evicted");
+
+        assert_eq!(
+            store.take_dirty(s, a),
+            Some(super::WHOLE_TILE),
+            "consumable without a page-in first, which is the order `sync` uses"
+        );
+        assert!(!store.is_dirty(s, a), "consumed");
+
+        if store.get(s, a).is_err() {
+            unreachable!("the tile's own bytes are in `pending`/`paged_out`");
+        }
+        assert!(
+            !store.is_dirty(s, a),
+            "a consumed record must not resurrect itself at page-in time"
+        );
+    }
+
+    /// AC-4b. The record is keyed like everything else this store holds,
+    /// so a surface-wide forget has to sweep it too -- otherwise a
+    /// discarded document's keys would leave entries behind, and the next
+    /// document reusing those `SurfaceId`s would find a brand-new blank
+    /// tile reporting dirty.
+    #[test]
+    fn forget_surface_clears_an_evicted_while_dirty_record() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        tile.mark_dirty(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.is_dirty(s, a), "evicted while dirty");
+
+        assert!(store.forget_surface(s) > 0, "something was held");
+        assert!(!store.is_dirty(s, a), "swept with everything else");
+        assert!(!store.contains_tile(s, a));
+
+        // And the blank the next `get` invents is clean, not a
+        // resurrection of the forgotten record.
+        if store.get(s, a).is_err() {
+            unreachable!("a forgotten tile reads back as a fresh blank");
+        }
+        assert!(!store.is_dirty(s, a), "a fresh blank is clean");
+    }
+
+    /// AC-4's negative control, and the reason the mechanism is a
+    /// *record* rather than "mark every paged-in tile dirty". That
+    /// broader implementation would pass all three tests above while
+    /// costing a redundant ~512 KB upload on every page-in for the life
+    /// of the process.
+    #[test]
+    fn a_tile_evicted_clean_pages_back_in_clean() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        let Ok(tile) = store.get_mut(s, a) else {
+            unreachable!("a fresh store must serve this tile");
+        };
+        tile.mark_dirty(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        // The upload that was owed happens: the flag is consumed while
+        // the tile is still resident, so the eviction below has nothing
+        // to preserve.
+        assert!(store.take_dirty(s, a).is_some());
+
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(!store.is_resident(s, a), "evicted");
+        assert!(!store.is_dirty(s, a), "and it was clean when it went");
+
+        if store.get(s, a).is_err() {
+            unreachable!("the tile's own bytes are in `pending`/`paged_out`");
+        }
+        assert!(
+            !store.is_dirty(s, a),
+            "a tile that was clean at eviction time must page back in clean -- re-uploading it \
+             would be pure waste"
+        );
     }
 
     // -- Eviction/revisit race (PLAN.md M1.1) --

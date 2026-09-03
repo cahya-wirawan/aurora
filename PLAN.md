@@ -18420,6 +18420,93 @@ severity choice.
     It should be picked up on its own priority, not only revisited
     whenever the deferred persist-dirty-across-paging work happens to
     get scheduled.
+
+    **0.91.0 — closed.** `TileStore` now keeps an `evicted_dirty:
+    HashSet<(SurfaceId, TileId)>`: `make_room` inserts a victim that was
+    still dirty when it popped it out of `resident`, and every path that
+    puts a tile back goes through one new private `make_resident` helper
+    that removes the entry and re-marks the reinstated tile. That
+    consolidation is part of the fix, not tidying — there were three
+    separate `make_room(); resident.put(...)` sites (`ensure_resident`'s
+    pending branch, its blank branch, and `page_in`), and a restoration
+    written at only some of them is the same bug wearing a different hat.
+    Both `is_dirty` *and* `take_dirty` consult the set, because
+    `TileResidency::sync` calls `take_dirty` **before** its `get`
+    (`crates/aurora-gpu/src/residency.rs`, ~line 905): restoring dirtiness
+    only at page-in time would have left `sync` peeking at a tile that is
+    still non-resident and answering "clean". `sync`'s loop and ordering
+    are untouched.
+
+    - **A boolean, not the rectangle, deliberately.** No consumer needs
+      sub-rect precision — `sync` uploads whole tiles regardless of what
+      `take_dirty` hands back — and persisting the exact rect is the one
+      part that would require changing the on-disk tile format
+      (`codec.rs`/`writer.rs` are untouched, AC-3). A reinstated tile
+      reads back dirty over its whole area, erring toward uploading too
+      much, never too little. That residual is disclosed in
+      `TileStore`'s own type-level doc comment rather than left implicit.
+    - **Not a new growth term.** `make_room` inserts here only alongside a
+      `paged_out` entry for the same key, and every path that drops one
+      drops the other (`forget_tile` sweeps it; `forget_surfaces` chains
+      it into its key collection), so this is a constant factor on a map
+      the store already keeps — not a map that grows with document size,
+      which is the failure mode invariant §7.3.1 rules out and
+      `write_generation`'s own doc comment already names.
+    - **What it does *not* close:** the *separate* `forget_surface`-then-
+      materialize-a-blank scenario 0.90.1 fixed in `sample_pixel`. No
+      dirty-flag mechanism can see that one — a tile materialized blank
+      after a surface was discarded genuinely has nothing owed on it, and
+      the mismatch is entirely between the atlas and a surface discarded
+      out from under it. So **`write_composited`'s residency guard stays**,
+      and so does the rule that a new reader of `composite_surface_id()`
+      must gate `TileStore::get` behind `contains_tile`. Retiring the
+      guard would need something else: a per-surface generation recorded
+      alongside each atlas slot, so a `forget_surface` could invalidate
+      slots itself. Not attempted here.
+    - **Five doc comments corrected in the same commit**, because a stale
+      claim surviving the round that disproves it is a defect in this
+      repo: `TileStore`'s type-level "Known limitation, accepted rather
+      than solved here" block (now "Dirtiness survives eviction", naming
+      the sub-rect residual that remains); `is_resident`'s "Why the
+      distinction is load-bearing" section (its premise *was* this bug —
+      now past tense, with the still-live `forget_surface` half stated as
+      what the method is actually for); the existing
+      `is_resident_is_false_for_a_paged_out_tile_contains_tile_still_holds`
+      test's comment about a dirty rect "silently reconstructed as clean";
+      `Tile::from_texels`'s "starts clean … by definition" claim (still
+      true of the tile, no longer true of the store's answer);
+      `write_composited`'s numbered residency-guard rationale in
+      `aurora-app` (case 2 closed, case 1 is what keeps the guard) and
+      `CompositeCache`'s justification for not reusing tile dirty flags
+      (the reason is no longer "they are lossy" but "they answer a
+      different question — changed-since-last-GPU-upload, not
+      needs-recompositing-from-the-document", and `sync` already consumes
+      them).
+    - **Tests.** Four in `aurora-tile`, all forcing a *real* eviction
+      through `make_room` (budget 1, two tiles) rather than
+      hand-constructing store state: dirty → evicted → reports dirty →
+      pages back in dirty (AC-1); `take_dirty` consuming the record
+      *before* any page-in and not resurrecting it afterwards, mirroring
+      `sync`'s real order; `forget_surface` sweeping the record; and — the
+      one that constrains the design — `a_tile_evicted_clean_pages_back_in_clean`,
+      the negative control that fails for a broader "mark every paged-in
+      tile dirty" implementation, which would otherwise pass everything
+      else while paying a redundant ~512 KB upload on every page-in
+      forever. Three of the four failed before the fix.
+    - **And one real-GPU test in `aurora-app`** reproducing the actual
+      frame path: `recomposite_visible_tiles` → `sync` against a 3-tile
+      store whose budget genuinely pages a just-written composite tile
+      out mid-pass (asserted, not assumed, via `!is_resident` on a visible
+      tile), then reading back the **real atlas texture**. With
+      `make_room`'s record removed it fails on the atlas itself — tile
+      (0, 0) still holding the previous frame's `[1.0, 0.0, 0.0, 1.0]`
+      while `sync` reported `uploaded: 3` of 4 — which is the bug
+      reproduced end to end rather than argued. Store-side assertions
+      alone would have passed on the broken code, which is the whole
+      reason the readback is there.
+    - **Verified on Vulkan/NVIDIA only** (RTX 3090, `DiscreteGpu`, printed
+      by the test run). Metal and DX12 are unverified for this path, as
+      they are for every other GPU mechanism this milestone has landed.
   - **`upload_sync` mean and p50 fall by ~2.9–3.3× (GPU) and ~1.8–2×
     (CPU fallback)**, with ranges nowhere near overlapping, and the
     stage's share of the mean frame drops from 53.1–53.9% to 26.2–26.3%
