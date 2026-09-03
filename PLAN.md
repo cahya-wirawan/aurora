@@ -6527,6 +6527,59 @@ structural design work.
   above were measured on a software-capable dev box, not re-blessed by
   a human on real hardware.
 
+  **`0.79.2` — Judge PASS (0.933) plus its cheap follow-ups, applied
+  directly.** The Judge independently recomputed every contrast ratio
+  above from the committed TOML (all confirmed to 2–3 significant
+  figures), read every new test body for vacuity (none found), and
+  endorsed keeping both outline shapes as composition-correct rather
+  than redundant: resolving a single outline colour instead would not
+  be equivalent in general, since `border.control` composites *over*
+  `border.default`, not as a substitute for it. It named one thing
+  nobody had flagged, and two cheap gaps, both closed here:
+
+  - **Dark's border is a chromatic no-op**, unnoticed until the Judge
+    recomputed the tokens: `design/themes/dark.toml` resolves
+    `border.default` and `surface.overlay` to the *same* `neutral.300`,
+    so the unconditional stroke this round added draws in Dark's own
+    fill colour — invisible on its own. Not a bug (Dark's dialog stays
+    genuinely visible via fill-vs-`surface.panel` contrast, the same
+    mechanism `paint_command_palette` already relies on), but
+    `paint_dialog`'s doc comment called the border "load-bearing, not
+    decoration" without saying that this is untrue in the one theme
+    most users run. A new paragraph in `paint.rs` discloses it.
+  - **The `aurora-app`-level real-tree test ran Dark only**, where its
+    "not the panel colour" assertion is nearly free — Dark's fill alone
+    already clears that bar. It's now parameterized over Dark *and*
+    Light (`a_real_dialog_paints_real_shapes_in_the_real_workspace_tree`
+    calls a shared `..._for(theme_name)` helper twice), closing the gap
+    between "the paint function is right" (already proven in
+    `paint.rs`/`tests/gallery.rs`) and "the shipping app actually is" —
+    Light is where the border is load-bearing, not Dark.
+
+  Three items were left as named, not silently dropped: raising
+  Colour-Critical's `border.default` is FR-027's owner's call, not
+  restated here beyond noting the residual now backs two widget kinds
+  instead of one; the five-place restatement of the Light-theme numbers
+  (`paint.rs`, `widgets/dialog.rs`, `widgets/mod.rs`,
+  `tests/gallery.rs`'s module doc, this file) is flagged as a
+  maintainability item worth a future single-source-of-truth pass, not
+  worth doing under this round; and real-hardware human verification of
+  the 2.47:1/1.49:1 edges remains outstanding, as already stated above.
+
+  **Process note from the Judge, worth keeping**: this is the third
+  round in a row (Scrollbar → History → this one, each independently)
+  where a round's *own* test suite didn't test its own headline design
+  decision — only an adversarial mutation caught it after the fact. The
+  proposed discipline for any future round touching paint/visual code:
+  state the headline decision in one sentence, write down the concrete
+  rejected alternative, actually apply that mutation before review and
+  record which tests go red, and where a mutation is undetectable in
+  some configurations (as Light/HC-Dark/HC-Light are here), say so
+  explicitly and add an `assert_ne!` precondition so the scoping can't
+  quietly rot into a tautology. Worth folding into how a Builder plans
+  test coverage up front, not just how a Critic/Red-team finds the gap
+  afterward.
+
 ### M1.9 — Basic tools and I/O
 
 - [x] **Move, marquee select, zoom, pan, eyedropper** — three of five

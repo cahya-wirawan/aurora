@@ -658,6 +658,18 @@ fn paint_command_palette(
 /// a new invention. In Light it buys a 2.47:1 edge against both the
 /// dialog's own fill and the panel behind it.
 ///
+/// **The border is a chromatic no-op in Dark, the default theme.**
+/// `design/themes/dark.toml` resolves both `border.default` and
+/// `surface.overlay` to the same `neutral.300` — the stroke this
+/// function draws is there for every *other* theme, but in Dark it
+/// paints a shape in its own fill's exact colour, invisible on its own.
+/// Dark's dialog is still genuinely visible: its fill (`neutral.300`)
+/// differs from `surface.panel` (`neutral.150`) behind it, so
+/// visibility there rests entirely on fill-vs-panel contrast, the same
+/// mechanism [`paint_command_palette`] already relies on. Not a gap —
+/// just worth knowing before assuming this stroke is what separates a
+/// dialog from its backdrop in the theme most users run.
+///
 /// **The honest residual: Colour-Critical.** There, `border.default`
 /// (`cc.border_mid` `#6e6e6e`) clears `cc.overlay` `#5a5a5a` by only
 /// ≈1.35:1 and `cc.canvas` `#545454` by ≈1.49:1 — a real edge, but a

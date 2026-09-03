@@ -12099,37 +12099,37 @@ mod tests {
         COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
         COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
-        ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, Drag,
-        ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord, MIN_WINDOW_HEIGHT,
-        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PanBounds, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RailResize, RecoveredDocument, ShutdownState, UndoKind,
-        UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
-        apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
-        background_color_from_theme, begin_drag, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_reference_origin, composite_surface_id, continue_drag,
-        crash_recovery_dialog_actions, crash_recovery_dialog_message,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
-        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
-        load_document_view, load_scales, load_theme, logical_point, logical_size,
-        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
-        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
-        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
-        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, reset_canvas_view, resized_rail_width, resolve_tile, run_command,
-        run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
-        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
-        tile_overlaps_doc_rect, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
+        Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess, Key, KeyChord,
+        MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey,
+        PALETTE_TOML, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RailResize,
+        RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
+        active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
+        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
+        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
+        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
+        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
+        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
+        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
+        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
+        move_refused_dialog_actions, move_refused_message, open_command_palette,
+        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
+        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, reset_canvas_view,
+        resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup, sample_pixel,
+        select_layer, shift_bounds, skipped_tiles_dialog_actions, skipped_tiles_message,
+        skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect, tile_store_scratch_dir,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -12139,6 +12139,7 @@ mod tests {
     #[cfg(unix)]
     use super::create_dir_owner_only;
     use aurora_doc::SelectionSet;
+    use aurora_theme::{Palette, ThemeSet};
     use aurora_ui::{CanvasView, Tool};
     use aurora_widgets::widgets::{insert_button, new_tree};
     use aurora_widgets::{FocusManager, WidgetId};
@@ -26285,6 +26286,12 @@ mod tests {
         );
     }
 
+    // Test-only: `load_theme` itself stays Dark-only (the app has no
+    // theme switching yet), so both TOML sources are loaded directly in
+    // the helper below rather than widening that production function's
+    // scope.
+    const LIGHT_THEME_TOML: &str = include_str!("../../../design/themes/light.toml");
+
     /// A real dialog in the **real workspace tree** actually reaches
     /// paint, and paints something that is not the panel chrome behind
     /// it.
@@ -26309,12 +26316,24 @@ mod tests {
     /// actually produce and the size at which the dialog overlaps the
     /// most chrome.
     #[test]
+    fn a_real_dialog_paints_real_shapes_in_the_real_workspace_tree() {
+        a_real_dialog_paints_real_shapes_in_the_real_workspace_tree_for("Dark");
+        // Dark alone would leave this test blind to the exact bug
+        // 0.79.1 fixed: `paint_dialog`'s doc comment on its own
+        // "chromatic no-op in Dark" paragraph notes the unconditional
+        // border draws nothing visible there, so Dark's pass proves
+        // only fill-vs-panel contrast, the same mechanism
+        // `paint_command_palette` already relied on. Light is where the
+        // border is load-bearing.
+        a_real_dialog_paints_real_shapes_in_the_real_workspace_tree_for("Light");
+    }
+
     // Both sides come from the same `Color::to_srgb_f32` call on the
     // same underlying `u8` channels -- bit-exact, not accumulated float
     // noise, the same precedent `paint.rs`'s own colour assertions
     // already allow this lint for.
     #[allow(clippy::float_cmp)]
-    fn a_real_dialog_paints_real_shapes_in_the_real_workspace_tree() {
+    fn a_real_dialog_paints_real_shapes_in_the_real_workspace_tree_for(theme_name: &str) {
         let mut workspace = aurora_ui::build_workspace();
         let mut focus = FocusManager::default();
         let mut dialog = None;
@@ -26322,7 +26341,18 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("{err}"),
         };
-        let theme = match load_theme() {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(palette) => palette,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut themes = ThemeSet::new();
+        if let Err(err) = themes.register(DARK_THEME_TOML) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = themes.register(LIGHT_THEME_TOML) {
+            unreachable!("{err:?}");
+        }
+        let theme = match themes.resolve(theme_name, &palette) {
             Ok(theme) => theme,
             Err(err) => unreachable!("{err:?}"),
         };
