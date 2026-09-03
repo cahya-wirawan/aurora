@@ -1238,18 +1238,34 @@ impl std::fmt::Debug for History {
 /// every fallible step of that open — read, decode, panel rebuild —
 /// is already behind it.
 ///
-/// `aurora_app::App::open_aur_file` remains blocked, and the reason is
-/// specifically an *ordering* problem rather than a residue one:
-/// `aurora_io::read_aur` fills the store with the new document's tiles
-/// before the caller holds any tree to sweep against, so there is no
-/// point in that path where the outgoing document can be swept without
-/// either destroying the document just loaded (sweeping after) or
-/// destroying the live one on an open that can still fail (sweeping
-/// before). The residue half is already handled: that reader rolls
-/// back its own partial writes on failure. Solving the ordering half
-/// (a per-document surface-id namespace, or a staging store the read
-/// fills before an atomic swap) is real follow-on work and is not done
-/// here.
+/// `aurora_app::App::open_aur_file` remains blocked. The obstacle is an
+/// *ordering* one — `aurora_io::read_aur` fills the store with the new
+/// document's tiles before the caller holds any tree to sweep against,
+/// so there is no point in that path where the outgoing document can be
+/// swept without either destroying the document just loaded (sweeping
+/// after) or destroying the live one on an open that can still fail
+/// (sweeping before). Solving it needs a per-document surface-id
+/// namespace, or a staging store the read fills before an atomic swap.
+/// That is real follow-on work and is not done here.
+///
+/// **Do not read "ordering problem" as "only a leak".** Until 0.82.1
+/// this doc comment said the residue half was "already handled" because
+/// `aurora_io`'s reader rolls back its own partial writes on failure.
+/// That was true only of a *failed* read. On a **successful** one, the
+/// same live pixel-corruption bug 0.82.0 fixed for the flat-image path
+/// was fully reachable on the `.aur` path, and worse: the `.aur` writer
+/// elides a blank tile entirely, and the reader skipped a missing
+/// entry, so a *whole interior tile* of the new document could keep
+/// showing the previous document's pixels — which `open_aur_file`'s own
+/// `write_autosave` then persisted.
+///
+/// 0.82.1 closed that half where it actually lives, in
+/// `aurora_io::aur`'s reader: a grid position with no entry now clears
+/// the store's key (`aurora_tile::TileStore::forget_tile`) instead of
+/// skipping it. What survives on that path is the leak, plus residue
+/// *outside* the incoming document's own persisted grids — a surface
+/// the new document has no layer for, or a position beyond a layer's
+/// own grid. Both still wait on the architectural change above.
 // Deliberate: see "Why this takes both by value" above. Taking these by
 // reference would make sweeping a live document compile.
 #[allow(clippy::needless_pass_by_value)]

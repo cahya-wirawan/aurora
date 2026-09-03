@@ -15333,8 +15333,10 @@ severity choice.
     real, tested library code and nothing more.
   - **Wiring it into `App::open_file`/`open_aur_file` is blocked, and
     that is the named next step** *(half done: `open_file` landed in
-    0.82.0 — see that addendum; `open_aur_file` is still blocked, for
-    exactly the reason below)*. `aurora_io::read_aur` fills the
+    0.82.0 — see that addendum; `open_aur_file`'s **leak** is still
+    blocked, for exactly the reason below, though its **stale-pixel**
+    half was fixed separately in `aurora-io`'s reader in 0.82.1)*.
+    `aurora_io::read_aur` fills the
     store with the *new* document's tiles before the old
     `layers`/`history` are dropped, and both documents derive surface
     ids from `LayerId`s that restart at zero — so sweeping after the
@@ -15664,21 +15666,32 @@ severity choice.
   the leak share one root cause and one fix; sweeping first fixes all
   of it at once.
 
-  **`open_aur_file` is deliberately out of scope, and the reason is an
-  ordering problem rather than a residue one.** `aurora_io::read_aur`
-  fills the store with the *new* document's tiles before the caller
-  holds any tree to sweep against, so there is no point in that path
-  where a sweep is safe: after the read it deletes the document just
-  loaded, before the read it destroys the live document on an open
-  that can still fail. The residue half is already handled —
-  `aur.rs`'s `roll_back_committed_tiles` drops every tile a failed
-  read had committed. Closing the ordering half needs one of two real
+  **`open_aur_file` is deliberately out of scope.** `aurora_io::
+  read_aur` fills the store with the *new* document's tiles before the
+  caller holds any tree to sweep against, so there is no point in that
+  path where a sweep is safe: after the read it deletes the document
+  just loaded, before the read it destroys the live document on an
+  open that can still fail. Closing that needs one of two real
   architectural changes, and neither was attempted here: a
   **per-document `SurfaceId` namespace** (allocated rather than
   `LayerId`-derived ids, which would also close the mask-instance
   aliasing the 0.81.1 addendum discloses), or a **staging `TileStore`
   the read fills first, swapped in atomically on success**. That is a
   decision to take deliberately, not a patch.
+
+  > **Correction, 0.82.1.** As first written, the paragraph above
+  > continued: "the reason is an ordering problem rather than a residue
+  > one… the residue half is already handled — `aur.rs`'s
+  > `roll_back_committed_tiles` drops every tile a failed read had
+  > committed." **That was wrong, and wrong in the direction that
+  > understates the bug.** The rollback only ever covered a *failed*
+  > read. On a **successful** one, the `.aur` path carried the exact
+  > live correctness bug this round fixed for `open_file` — the new
+  > document showing the previous one's pixels, and `open_aur_file`'s
+  > own `write_autosave` persisting them into that same open's
+  > autosave. A reader of the original wording would reasonably have
+  > concluded only a leak remained there. It did not. See the 0.82.1
+  > addendum below for what was done about it.
 
   Tests: two in `aurora-app`, both calling `replace_document_pixels`
   directly (`App` is not constructible under test — it needs a real
@@ -15717,6 +15730,121 @@ severity choice.
   canvas shows the right thing on real hardware. Confirming the
   stale-pixel symptom is gone in the running editor (open a large
   image, then a small one) needs a human.
+
+  **Addendum 2026-09-03 (0.82.1) — the `.aur` path's *correctness*
+  half is closed too, in the reader rather than the app; the leak
+  there is not.** Independent review of 0.82.0 found its own
+  disclosure overclaiming (corrected in the block-quote above, and in
+  `history.rs`/`mask.rs`), and that the two halves of the
+  `open_aur_file` gap have different causes and very different costs:
+
+  - **The correctness half was never blocked on the architecture
+    decision.** `aur.rs`'s writer elides a blank tile — only non-blank
+    tiles get a zip entry — and `read_persisted_tiles`'s
+    `FileNotFound` arm answered a missing entry with `continue`, on
+    the reasoning that the tile "stays at the store's own default".
+    That holds only for a store that holds nothing at that key. This
+    reader writes into the caller's *live* store, and a fresh
+    `LayerTree` restarts surface ids from the bottom of the space, so
+    the key an elided blank tile names is very likely one the previous
+    document already owns. **Worse than the flat-image case 0.82.0
+    fixed**: that one left residue only in the incoming document's
+    partial *edge* tile, whereas an elided blank tile can be a whole
+    *interior* tile of the new document.
+
+    The arm now calls `aurora_tile::TileStore::forget_tile` instead.
+    The key is dropped, so the store's next `get` there hands back a
+    genuine `Tile::blank()`. Cost: three hash lookups per elided grid
+    position, and it materializes nothing. The alternative the review
+    proposed — *writing* an explicit blank tile — was considered and
+    rejected: it would materialize every blank grid position of every
+    persisted surface on every open, which is unbounded at the
+    §7.3.1 ceiling and is exactly the doubled memory and scratch
+    traffic `read_persisted_tiles` already refuses to pay for staging.
+    `forget_tile` gets the same correctness for less than nothing (it
+    also frees the residue rather than replacing it with zeros).
+
+    Scope, stated exactly: after this, every grid position of every
+    surface in the file's own `layers` holds exactly that file's
+    content. Residue **outside** those grids — a surface the incoming
+    document has no layer for, or a position past an incoming layer's
+    own grid — is untouched and still real. The first of those bites
+    the moment the user adds a layer, which claims the next id up and
+    with it whatever the outgoing document left on that surface.
+
+    One accepted consequence on the failure path: a read that fails
+    part-way has, at positions it already cleared, dropped the live
+    document's tiles with nothing to restore them. Not a new class of
+    loss — `roll_back_committed_tiles` *already* drops (rather than
+    restores) the live tiles at every position the file did have an
+    entry for — the same loss at more positions.
+
+    Test: `aurora-io`'s
+    `a_blank_tile_elided_from_the_file_reads_back_blank_over_a_stale_store`.
+    A 300×300 layer (a 2×2 grid at `TILE = 256`) with only the far
+    tile painted, so the stale key is genuinely interior rather than a
+    partial edge tile; it asserts the archive holds exactly one
+    `tiles/` entry (so the file really did elide the other three, and
+    the test cannot pass on an explicit all-zero entry), writes red
+    residue under the elided key, reads the file back over that same
+    store, and requires the elided position to read all-zero while the
+    one painted tile still round-trips. Verified non-vacuous by
+    reverting the arm to `continue`, which fails it on the residue
+    assertion.
+
+  - **The leak half is still open and still needs the architecture
+    decision** — the per-document `SurfaceId` namespace or the staging
+    store above. `open_aur_file` never sweeps the outgoing document,
+    so its tiles stay resident with nothing able to name them. Its own
+    doc comment now says so directly rather than leaving it to be
+    inferred from this file.
+
+  Three smaller items from the same review, all in `aurora-app`:
+
+  - **The reserved composite surface is swept now too.**
+    `composite_surface_id()` (`SurfaceId::from_raw(u64::MAX)`) is
+    app-owned, so no `LayerTree` can name it and
+    `aurora_doc::forget_document_surfaces` structurally cannot reach
+    it — every composited tile the outgoing document produced at a
+    position the incoming one never revisits survived every open,
+    forever. `replace_document_pixels` adds one
+    `store.forget_surface(composite_surface_id())` after the existing
+    sweep. **A leak only, never a stale-pixel bug**: both open paths
+    call `composite_cache.bump()` immediately afterwards, and the
+    recomposite path writes whole tiles (including a fully transparent
+    one where nothing is visible), so a stale composite tile could
+    never be displayed. Pinned by
+    `replacing_a_documents_pixels_also_frees_the_reserved_composite_surfaces_tiles`,
+    verified non-vacuous. `replace_document_pixels`'s doc comment said
+    it freed "every tile the outgoing document still holds", which was
+    untrue of exactly this surface; it now names both sweeps.
+  - **The `surface_id() -> None` branch logs.** It was folded into the
+    same `if let` chain as a write failure, so a document whose
+    incoming layer had no surface returned having swept the outgoing
+    one and written nothing, with no log line at all — a blank canvas
+    with no trail. It has its own `else` and its own `tracing::error!`
+    now. Structurally unreachable today (`document_from_image` always
+    builds a pixel layer); logged anyway, because every other skipped
+    path in that crate does.
+  - **Known, separate, not-yet-tracked hazard, named here so it isn't
+    rediscovered:** `replace_document`'s three panel-repopulation
+    calls (`populate_layers_panel`, `populate_history_panel`,
+    `populate_properties_panel`) run sequentially and can partially
+    succeed. If the second or third fails, `self.workspace`'s UI tree
+    already shows the *new* document's rows while `self.layers` /
+    `self.history` still describe the *old* one, because both open
+    paths bail on that error before installing the incoming document.
+    **Pre-existing — not introduced by 0.82.0 and not fixed by
+    0.82.1**, and structurally unreachable in practice (the failure is
+    a missing panel body, which a real `aurora_ui::build_workspace`
+    always has). Recorded, not scheduled.
+
+  **Verified (0.82.1)**: see the command list reported with the
+  commit. CPU/data-model only. **No GPU or interactive verification**
+  — the 0.82.0 note above applies unchanged, and now covers a second
+  live path: confirming the `.aur` symptom is gone in the running
+  editor (open a large document, then a smaller `.aur` file saved with
+  blank interior tiles) also needs a human.
 
   **Review found three real defects, all fixed by 0.70.4**: a
   cross-layer `SurfaceId` collision reachable through a crafted/
@@ -17730,8 +17858,13 @@ tooling-gated, fall into one of four buckets:
    **0.82.0 wired it into `App::open_file`'s flat-image path**, closing
    both that leak and a live correctness bug (a previous, larger
    document's stale pixels composited onto a smaller new one and
-   autosaved), with `open_aur_file` still blocked on an ordering
-   problem. **0.81.0 closed the other
+   autosaved). `open_aur_file` carried the *same* live correctness bug,
+   and structurally worse — a `.aur` file elides blank tiles, so whole
+   *interior* tiles of the new document could show the old one's
+   pixels; **0.82.1 fixed that half in `aurora-io`'s reader** (a grid
+   position with no entry now clears the store's key). Its **leak**
+   half, and residue outside the incoming document's own persisted
+   grids, are still blocked on the ordering/namespace decision. **0.81.0 closed the other
    half**: a removed-then-re-added mask no longer resurrects the old
    mask's spatially-shifted coverage, because `History::add_mask` now
    clears that derived surface via the new

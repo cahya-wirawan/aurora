@@ -235,9 +235,19 @@
 //!         document's tiles before the caller holds any tree to sweep
 //!         against, and both documents' surface ids derive from
 //!         `LayerId`s that restart at zero, so there is no point in
-//!         that path where a sweep is safe. See
-//!         [`crate::forget_document_surfaces`]'s own doc comment for
-//!         the full account.
+//!         that path where a sweep is safe.
+//!
+//!         That leaves a real, live bug on the `.aur` path and not
+//!         merely a leak — the same stale-pixels-and-autosave bug
+//!         0.82.0 fixed for flat images, reachable on a *successful*
+//!         read (the reader's rollback only ever covered a *failed*
+//!         one). 0.82.1 closed the part of it that lives in
+//!         `aurora_io`'s reader — a grid position the file elided as
+//!         blank now clears the store's key rather than leaving the
+//!         previous document's tile there — so what remains is the
+//!         leak, plus residue outside the incoming document's own
+//!         persisted grids. See [`crate::forget_document_surfaces`]'s
+//!         own doc comment for the full account.
 //!      2. **A redo entry dropped mid-session still leaks — and this
 //!         is the one leak path here that the shipped app really
 //!         walks.** `History::push` (private) clears the redo stack on

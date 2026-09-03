@@ -1101,9 +1101,33 @@ fn replace_document(
 
 /// The store-side half of replacing the current document with a freshly
 /// opened flat image: frees every tile the *outgoing* document still
-/// holds (`aurora_doc::forget_document_surfaces`), then writes `image`'s
-/// own pixels onto the incoming layer's surface
-/// (`aurora_io::write_into_store`). Returns how many tiles were freed.
+/// holds — its layer and mask surfaces
+/// (`aurora_doc::forget_document_surfaces`) plus this crate's own
+/// reserved composite-preview surface ([`composite_surface_id`], which
+/// no `LayerTree` can name and so no `aurora-doc` sweep can reach) —
+/// then writes `image`'s own pixels onto the incoming layer's surface
+/// (`aurora_io::write_into_store`). Returns how many tiles were freed,
+/// summed across both sweeps.
+///
+/// # Why the composite surface is swept here too
+///
+/// It is a leak, not a correctness bug, and the distinction is worth
+/// keeping straight. Every caller of this bumps `composite_cache`
+/// immediately afterwards, which invalidates every cached tile, and the
+/// recomposite path writes a *whole* tile — including a fully
+/// transparent one for a location with nothing visible — so a stale
+/// composite tile can never be displayed. What it can do is sit in the
+/// store forever: a composited tile the outgoing document produced at a
+/// grid position the incoming document never revisits has nothing left
+/// able to name it, exactly like the layer tiles this already sweeps.
+/// Across a long session of opens that is unbounded.
+///
+/// Two passes over the store's keys instead of one, deliberately.
+/// `aurora_doc::forget_document_surfaces` builds its set from a
+/// `LayerTree`/`History` and structurally cannot be told about a
+/// surface id this crate reserves, so folding the two would mean
+/// leaking that id downward into `aurora-doc`. One extra O(tiles held)
+/// pass on the document-open path is the cheaper trade.
 ///
 /// # The order is the whole point, and it is not interchangeable
 ///
@@ -1141,10 +1165,23 @@ fn replace_document_pixels(
     incoming_layer: aurora_doc::LayerId,
     image: &aurora_io::Image,
 ) -> usize {
-    let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store);
-    if let Some(surface) = incoming_layers.surface_id(incoming_layer)
-        && let Err(err) = aurora_io::write_into_store(image, store, surface)
-    {
+    let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store)
+        + store.forget_surface(composite_surface_id());
+    // Its own `else`, not folded into the write below: a layer with no
+    // surface means the document just opened has nowhere to put its
+    // pixels and will come up blank. That is worth a loud line even
+    // though `document_from_image` always builds a pixel layer -- every
+    // other skipped or failed path in this crate says so, and a silent
+    // blank canvas is the one outcome a user cannot diagnose.
+    let Some(surface) = incoming_layers.surface_id(incoming_layer) else {
+        tracing::error!(
+            ?incoming_layer,
+            "the opened document's layer has no surface; its pixels were not written into the \
+             tile store and the canvas will be blank"
+        );
+        return freed;
+    };
+    if let Err(err) = aurora_io::write_into_store(image, store, surface) {
         tracing::warn!(
             ?err,
             "failed to write the opened image's pixels into the tile store"
@@ -10249,6 +10286,18 @@ impl App {
     /// (logged) if there's no live tile store, the file fails to open,
     /// or `read_aur` itself fails (corrupt file, missing manifest/
     /// history entry, or an unsupported future schema version).
+    ///
+    /// **Unlike [`Self::open_file`], this deliberately does not sweep
+    /// the outgoing document** — no [`replace_document_pixels`], no
+    /// `aurora_doc::forget_document_surfaces` — because `read_aur` has
+    /// already filled the store by the time this holds a tree it could
+    /// sweep against. So the outgoing document's tiles leak here, and
+    /// residue outside the incoming document's own persisted grids can
+    /// still show through. What is *not* left is residue *inside* those
+    /// grids: `aurora_io`'s reader clears every grid position the file
+    /// elided as blank (0.82.1). PLAN.md's 0.82.1 addendum has the full
+    /// account, including why closing the rest needs an architectural
+    /// change rather than a patch here.
     fn open_aur_file(&mut self, path: &Path) {
         let Some(store) = self.tile_store.as_mut() else {
             tracing::warn!(path = %path.display(), "no live tile store; cannot open a .aur file");
@@ -13906,6 +13955,67 @@ mod tests {
             [0.0, 0.0, 1.0, 1.0].map(half::f16::from_f32),
             "the incoming image's own pixels must be what the surface holds -- neither the \
              outgoing document's colour nor a blank tile"
+        );
+    }
+
+    /// The third surface no `LayerTree` can name: this crate's own
+    /// reserved composite-preview surface ([`composite_surface_id`]).
+    /// `aurora_doc::forget_document_surfaces` builds its sweep set from
+    /// a tree and a history, so it structurally cannot reach this one —
+    /// which meant every composited tile the outgoing document produced
+    /// survived every open, forever.
+    ///
+    /// A leak only, never a stale-pixel bug: `composite_cache.bump()`
+    /// runs right after this on both open paths and the recomposite
+    /// writes whole tiles. So this asserts the tile is *gone*, not that
+    /// anything reads differently.
+    #[test]
+    fn replacing_a_documents_pixels_also_frees_the_reserved_composite_surfaces_tiles() {
+        let (_scratch, mut store) = real_tile_store();
+
+        let outgoing_image = filled_image(600, 600, [1.0, 0.0, 0.0, 1.0]);
+        let (outgoing_layers, outgoing_history, outgoing_layer) =
+            document_from_image("outgoing", &outgoing_image);
+        let Some(outgoing_surface) = outgoing_layers.surface_id(outgoing_layer) else {
+            unreachable!("a freshly built pixel layer always has a content surface");
+        };
+        if let Err(err) = aurora_io::write_into_store(&outgoing_image, &mut store, outgoing_surface)
+        {
+            unreachable!("{err:?}");
+        }
+
+        // A composited tile at a grid position the 100x100 incoming
+        // document never revisits -- the case that leaked.
+        let far_corner = aurora_tile::TileId { x: 2, y: 2 };
+        if let Err(err) = store.get_mut(composite_surface_id(), far_corner) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            store.contains_tile(composite_surface_id(), far_corner),
+            "the composite tile this test is about must actually exist before the call"
+        );
+
+        let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
+        let (incoming_layers, _incoming_history, incoming_layer) =
+            document_from_image("incoming", &incoming_image);
+
+        let freed = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            incoming_layer,
+            &incoming_image,
+        );
+
+        assert!(
+            !store.contains_tile(composite_surface_id(), far_corner),
+            "the reserved composite surface's tiles must be freed along with the outgoing \
+             document's own"
+        );
+        assert_eq!(
+            freed, 10,
+            "the outgoing document's 3x3 grid plus the one composite tile"
         );
     }
 
