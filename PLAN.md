@@ -18583,6 +18583,21 @@ severity choice.
     - **Same platform caveat**: reproduced and fixed on Vulkan/NVIDIA
       (RTX 3090) only, with `AURORA_REQUIRE_GPU=1` confirming the test
       really ran rather than self-skipping. Metal and DX12 unverified.
+    - **0.91.2 — two follow-ups an independent Judge caught, applied
+      directly.** Both doc-only. (1) The `Err` arm's own comment justifying
+      `self.slots.remove(&slot)` opened by calling one case "impossible"
+      and then spent the rest of the sentence describing exactly that case
+      — reworded so it states plainly that the slot may by then map to a
+      *different* id (a later pan can revisit the same modulo slot before
+      this tile does), and that removing it is safe either way. (2) A real
+      cost of this fix, disclosed for the first time: a tile that fails
+      `get` on *every* attempt (a permanently corrupt scratch file, or one
+      `cap_failed_writes` already dropped) is no longer "retried once, then
+      silently skipped" — it is retried, and warned about, every frame,
+      forever. Harmless today because the only real caller
+      (`aurora-app`'s `redraw`) discards `SyncStats` outright, but named as
+      a real trap for a future caller that honors `remaining != 0` as
+      "request another frame."
   - **`upload_sync` mean and p50 fall by ~2.9–3.3× (GPU) and ~1.8–2×
     (CPU fallback)**, with ranges nowhere near overlapping, and the
     stage's share of the mean frame drops from 53.1–53.9% to 26.2–26.3%

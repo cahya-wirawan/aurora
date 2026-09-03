@@ -932,13 +932,27 @@ impl TileResidency {
                         // And this line is what makes that later attempt
                         // actually happen -- see the comment above the
                         // `take_dirty` call for why nothing else would.
-                        // Removing a slot that some *other* id currently
-                        // occupies is impossible here: `slot` was derived
-                        // from `id`, and the only entry this can drop is
-                        // one mapping `slot` to something, which at worst
-                        // costs one redundant re-upload of whatever id that
-                        // was -- never a skipped one.
+                        // `slot` was derived from `id`, but by the time this
+                        // runs the map might hold a *different* id at that
+                        // same slot (panning can revisit a slot before this
+                        // tile does). Removing it is still safe either way:
+                        // if it still mapped `slot` to `id`, this is exactly
+                        // the invalidation this whole comment is about; if it
+                        // had already moved on to some other id, dropping
+                        // that entry costs at worst one redundant re-upload
+                        // of that other id later -- never a skipped one.
                         self.slots.remove(&slot);
+                        // A cost worth naming, not just a mechanism: for a
+                        // tile that fails every time (a permanently corrupt
+                        // scratch file, or one `cap_failed_writes` already
+                        // dropped), this is no longer "retried once, then
+                        // silently skipped" -- it is "retried, and warned
+                        // about, every single frame, forever." Harmless
+                        // today because the only real caller
+                        // (`aurora-app`'s `redraw`) discards this
+                        // `SyncStats` outright, but a future caller that
+                        // honors `remaining != 0` as "request another
+                        // frame" would spin indefinitely on this tile.
                         tracing::warn!(?id, %err, "skipping tile for this frame's upload");
                         stats.remaining += 1;
                         stats.errors += 1;
