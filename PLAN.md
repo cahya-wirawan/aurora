@@ -16668,6 +16668,56 @@ severity choice.
   --workspace`, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
   warnings" cargo doc --workspace --no-deps --all-features`), all clean.
 
+  **Addendum (0.84.2): the Judge's PASS at 0.921 named two cheap gaps,
+  both closed.** The round's mandatory criteria were all satisfied and
+  the Judge specifically endorsed the Critic's BLOCK on 0.84.0 as
+  correct even though Red-team found no live correctness defect — a
+  landed performance regression and an understated disclosure are
+  block-worthy in their own right, not just style. Two follow-ups were
+  cheap enough to apply directly:
+
+  - **The Dissolve differential compared one texel, not the tile.**
+    `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_dissolve_blend_document`'s
+    own doc comment claimed a path that "reseeded the noise... would
+    diverge here," but `gpu_and_cpu_first_texel` only ever read
+    `(0, 0)` — on a fixture whose whole point is that different texels
+    take different branches of a position-seeded gate, that is
+    representative of nothing but the one position it happens to read.
+    A new `gpu_and_cpu_all_texels`/`read_all_texels` pair (mirroring
+    the existing single-texel helpers) compares the entire tile,
+    `assert_eq!`, still bit-exact; the test also now asserts both
+    branches of the gate genuinely fire on this fixture (some texels
+    show the dissolved colour, others show the bottom layer through),
+    so it cannot pass on a pass-everything or fail-everything gate by
+    accident.
+  - **Two doc comments quoted different remaining-mode counts (25 vs.
+    24) with no explanation.** Both were independently correct —
+    `aurora-render`'s own `BlendMode` enum has 26 variants (it excludes
+    `Dissolve`, which is a pre-composite gate, never a per-pixel
+    formula this crate ports) so "25" is formulas-still-to-port there;
+    `aurora-app`'s count of 24 is modes-the-predicate-still-rejects
+    out of all 27, one lower because `Dissolve` is admitted without
+    ever needing a formula here. `composite_multiply_over_with_opacity`'s
+    doc comment now states this explicitly, so a reader hitting both
+    numbers has the reconciliation right there instead of concluding
+    the two rounds disagree.
+
+  Left as named, not attempted (both are genuinely separate, larger
+  decisions): measuring the added per-tile cost on a real Multiply
+  document, and a runtime force-CPU-composite escape hatch for a
+  backend where this mechanism misbehaves — there is currently none,
+  and per the Judge's own note this round's path is no longer opt-in.
+
+  **Verified (0.84.2)**: `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app
+  -- --nocapture recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_dissolve_blend_document`
+  (1 passed, real adapter line printed); then the full gate (`fmt
+  --check`, `check_layering.py`, `check_no_hardcoded_style.py`, `cargo
+  check --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1 cargo test
+  --workspace`, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
+  warnings" cargo doc --workspace --no-deps --all-features`), all
+  clean.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG

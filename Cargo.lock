@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-ai"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-app"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-brush"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "aurora-gpu",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-cli"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-ai",
  "aurora-brush",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-color"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "lcms2",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-core"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "postcard",
  "serde",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-doc"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "aurora-graph",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-filters"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-gpu"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-graph"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-io"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-plugin"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "aurora-graph",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-render"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "aurora-gpu",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-testkit"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "png 0.17.16",
  "tempfile",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-text"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "aurora-vector",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-theme"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-tile"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "criterion",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-ui"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "accesskit",
  "aurora-ai",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-vector"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "aurora-core",
  "lyon",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-widgets"
-version = "0.84.1"
+version = "0.84.2"
 dependencies = [
  "accesskit",
  "accesskit_consumer",

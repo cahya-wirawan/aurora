@@ -928,7 +928,15 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// `aurora_doc::BlendMode::Multiply`, computed in WGSL against a
 /// separately-sampled backdrop rather than by the fixed-function unit.
 /// The remaining 25 modes stay CPU-only (`composite_tile_cpu`) until
-/// their own formulas are ported. See `aurora-app`'s own
+/// their own formulas are ported — this crate's own `BlendMode` enum
+/// has 26 variants (it excludes `Dissolve`, which is a pre-composite
+/// gate, never a per-pixel formula this crate would need to port), so
+/// 25 is "26 minus the one, `Multiply`, done so far." `aurora-app`'s own
+/// count of what its GPU predicate still rejects is 24, one lower,
+/// because `Dissolve` is *admitted* there (0.84.1) without ever needing
+/// a formula here — see PLAN.md's 0.84.1 addendum if the two numbers
+/// look inconsistent side by side; they're counting different things,
+/// not disagreeing. See `aurora-app`'s own
 /// `begin_gpu_composite_tile`/`document_qualifies_for_gpu_compositing`
 /// (a higher crate — `aurora-render` cannot name it directly, PRD
 /// §7.2's layering) for exactly which whole documents those primitives

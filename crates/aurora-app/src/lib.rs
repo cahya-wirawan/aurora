@@ -17564,6 +17564,19 @@ mod tests {
         (r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32())
     }
 
+    /// [`read_first_texel`]'s whole-tile counterpart — every sample of
+    /// the tile, in storage order, converted to `f32`.
+    fn read_all_texels(
+        store: &mut aurora_tile::TileStore,
+        surface: aurora_tile::SurfaceId,
+        tile: aurora_tile::TileId,
+    ) -> Vec<f32> {
+        let Ok(t) = store.get(surface, tile) else {
+            unreachable!("just written");
+        };
+        t.texels().iter().map(|s| s.to_f32()).collect()
+    }
+
     /// Renders `residency` through `canvas`/`pipeline` into a
     /// `viewport`-sized offscreen target and reads back one pixel — this
     /// crate's own real render+readback flow (the same shape
@@ -25175,6 +25188,43 @@ mod tests {
         (gpu_result, cpu_result)
     }
 
+    /// [`gpu_and_cpu_first_texel`]'s whole-tile counterpart, for a
+    /// fixture where a single texel isn't representative of the whole
+    /// tile — `Dissolve`'s per-texel stochastic gate is the reason this
+    /// exists (0.84.2): a solid-fill layer still composites differently
+    /// texel to texel once a position-seeded gate decides which texels
+    /// show it, so comparing only texel `(0, 0)` would miss a real
+    /// divergence (a re-seeded noise function, say) everywhere except
+    /// wherever the gate happens to agree at that one position.
+    fn gpu_and_cpu_all_texels(
+        context: &aurora_gpu::GpuContext,
+        store: &mut aurora_tile::TileStore,
+        layers: &aurora_doc::LayerTree,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+
+        let mut gpu_cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        recomposite_visible_tiles(
+            &residency,
+            layers,
+            None,
+            store,
+            &mut gpu_cache,
+            Some(context),
+            Some(&mut compositor),
+        );
+        let gpu_result = read_all_texels(store, composite_surface_id(), tile_id);
+
+        let mut cpu_cache = CompositeCache::default();
+        recomposite_visible_tiles(&residency, layers, None, store, &mut cpu_cache, None, None);
+        let cpu_result = read_all_texels(store, composite_surface_id(), tile_id);
+
+        (gpu_result, cpu_result)
+    }
+
     /// Asserts the GPU and CPU composites of the same fixture agree
     /// channel by channel, within the same `2 * f16::EPSILON` tolerance
     /// (and with the same "this is a finding, not a reason to loosen the
@@ -25368,7 +25418,16 @@ mod tests {
     /// deliberately: it makes the gate a real, partly-on/partly-off
     /// decision rather than a pass-everything one, so a path that
     /// re-applied opacity, reseeded the noise, or skipped the gate
-    /// entirely would diverge here.
+    /// entirely would diverge somewhere in the tile.
+    ///
+    /// **Whole tile, not one texel (0.84.2).** Both fill layers are
+    /// solid, but the gate is position-seeded, so the composite still
+    /// varies texel to texel: some show the dissolved red, the rest show
+    /// the blue-ish bottom layer through. Reading only texel `(0, 0)`
+    /// would have only ever exercised whichever branch that one position
+    /// happens to take, on this exact fixture, forever — a re-seeded
+    /// noise function could diverge everywhere else and this test would
+    /// never notice.
     #[test]
     fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_dissolve_blend_document() {
         let Some(context) = real_gpu_context() else {
@@ -25398,18 +25457,40 @@ mod tests {
              otherwise this test would compare the CPU path against itself"
         );
 
-        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        let (gpu_texels, cpu_texels) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
         assert_eq!(
-            gpu_result, cpu_result,
+            gpu_texels, cpu_texels,
             "Dissolve is decided entirely on the CPU inside resolve_tile, from a \
              position-seeded hash with no RNG state, so the GPU and CPU paths must agree \
-             bit-exactly -- not merely within a float tolerance. A divergence here means the \
-             gate is being applied differently (or twice, or not at all) on one of the paths"
+             bit-exactly across the whole tile -- not merely within a float tolerance, and not \
+             merely at one texel. A divergence here means the gate is being applied \
+             differently (or twice, or not at all) on one of the paths"
         );
-        assert_ne!(
-            gpu_result,
-            (0.0, 0.0, 0.0, 0.0),
+        assert!(
+            gpu_texels.iter().any(|&s| s != 0.0),
             "setup: the fixture must really composite to something"
+        );
+        // The gate must be a real, partly-on/partly-off decision on this
+        // fixture -- both red (dissolved, gated on) and the bottom
+        // layer's blue-ish colour (gated off) must genuinely appear,
+        // or this test would only ever prove agreement on a
+        // pass-everything or fail-everything gate.
+        let mut saw_dissolved = false;
+        let mut saw_bottom_only = false;
+        for chunk in gpu_texels.chunks_exact(4) {
+            let &[r, g, _b, _a] = chunk else {
+                unreachable!("a real tile's texel count is a multiple of 4");
+            };
+            if r > 0.9 && g < 0.1 {
+                saw_dissolved = true;
+            } else if g > 0.4 {
+                saw_bottom_only = true;
+            }
+        }
+        assert!(
+            saw_dissolved && saw_bottom_only,
+            "setup: the gate must show through at some texels and be blocked at others, or \
+             this fixture cannot tell a real gate from a pass-everything/fail-everything one"
         );
     }
 
