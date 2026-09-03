@@ -6682,6 +6682,11 @@ fn resolve_tile(
 /// itself is visible. `1` is the depth passed to [`resolve_tile`], the
 /// same depth `aurora-doc`'s own validator starts its budget at for a
 /// root-level layer.
+///
+/// Every root actually folded in here credits [`CPU_ROOT_FOLDS`] (a
+/// test-only counter, a no-op in the shipping build), which is what lets
+/// [`RecompositeTileCosts`] tell a CPU-fallback tile that did real blend
+/// math apart from one where every root declined.
 fn composite_roots_into_tile(
     layers: &aurora_doc::LayerTree,
     store: &mut aurora_tile::TileStore,
@@ -6703,6 +6708,10 @@ fn composite_roots_into_tile(
             budget,
         ) {
             aurora_render::composite_layer_into(&mut composited, &texels, opacity, blend_mode);
+            // Test-only, no-op in the shipping build: records that this
+            // tile did real blend math rather than finding every root
+            // declined. See `CPU_ROOT_FOLDS`.
+            note_cpu_root_fold();
         }
     }
     // The accumulator has stopped being an accumulator and is now this
@@ -7320,6 +7329,60 @@ fn note_composite_write_changed() {}
 #[cfg(not(test))]
 fn note_composite_write_not_resident() {}
 
+/// Test-only count of root-level layers [`composite_roots_into_tile`] has
+/// actually folded into an accumulator, i.e. calls to
+/// `aurora_render::composite_layer_into` — real blend math, as opposed to
+/// a root that declined at this tile.
+///
+/// **Why a counter and not a look at the result.** This is the only signal
+/// that distinguishes a CPU-fallback tile which did real per-texel blend
+/// work from one where *every* root declined ([`resolve_tile`] returned
+/// `None` for all of them) and the "composite" was a transparent
+/// accumulator handed straight back.
+/// [`composite_roots_into_tile`] returns a bare `Vec<half::f16>` with no
+/// record of how it was produced, and scanning those texels for
+/// non-transparency would itself cost more than the interval being
+/// measured — the instrumentation would become the finding.
+///
+/// **Specific to the CPU fallback path.** [`begin_gpu_composite_tile`]
+/// never calls [`composite_roots_into_tile`]; it calls [`resolve_tile`]
+/// directly. So a delta observed across the CPU-fallback arm of
+/// [`recomposite_visible_tiles`]'s phase-1 loop is attributable to that
+/// arm alone, which is what lets [`RecompositeTileCosts`] split
+/// `cpu_fallback_empty` from `cpu_fallback_real`.
+///
+/// Same soundness argument as [`COMPOSITE_WRITE_OUTCOMES`] and
+/// [`RECOMPOSITE_PHASE_NANOS`]: process-global and `Relaxed`. A GPU
+/// caller reaches it only via `real_gpu_context`'s `GPU_TEST_LOCK`, and a
+/// CPU-only caller holds no such lock and also accumulates here — which is
+/// fine, because the only consumer reads *deltas* within a single
+/// `recomposite_visible_tiles` call, not an absolute total.
+#[cfg(test)]
+static CPU_ROOT_FOLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Credits one [`CPU_ROOT_FOLDS`] fold.
+#[cfg(test)]
+fn note_cpu_root_fold() {
+    CPU_ROOT_FOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reads [`CPU_ROOT_FOLDS`] without resetting it.
+///
+/// Deliberately **not** the read-and-zero shape every other counter in
+/// this file uses: [`RecompositeTileCosts`] reads it twice per tile within
+/// one `recomposite_visible_tiles` call and compares the two values, so
+/// zeroing on read would destroy the very delta being computed.
+#[cfg(test)]
+fn cpu_root_folds() -> u64 {
+    CPU_ROOT_FOLDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The shipping build's version: nothing at all, exactly as with
+/// [`note_composite_write_skipped`] above. The counter itself does not
+/// exist outside `cfg(test)`.
+#[cfg(not(test))]
+fn note_cpu_root_fold() {}
+
 /// Test-only wall-clock accumulator for [`recomposite_visible_tiles`]'s
 /// own three internal phases, in nanoseconds: `[0]` phase 1 (the
 /// per-tile loop that either issues a GPU composite or composites on the
@@ -7348,6 +7411,10 @@ fn note_composite_write_not_resident() {}
 ///
 /// Nothing is ever asserted on these numbers — they exist to answer
 /// "which phase costs the most", printed under `--nocapture`.
+///
+/// Phase 1 is split five ways again by
+/// [`RECOMPOSITE_TILE_COST_NANOS`] (0.93.0), which answers *which branch*
+/// of the per-tile loop the phase-1 figure is actually made of.
 #[cfg(test)]
 static RECOMPOSITE_PHASE_NANOS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -7411,6 +7478,185 @@ impl RecompositePhases {
     // call sites are identical in both builds; there is nothing to read.
     #[allow(clippy::unused_self)]
     fn mark(&mut self) {}
+}
+
+/// Test-only wall-clock accumulator splitting
+/// [`RECOMPOSITE_PHASE_NANOS`]'s phase 1 — the per-tile loop — into five
+/// named per-branch sub-costs, in nanoseconds:
+///
+/// - `[0]` **`gpu_issue_ok`**: time inside the GPU arm on a tile where
+///   [`begin_gpu_composite_tile`] returned `Some`, i.e. real GPU work was
+///   recorded and submitted for this tile.
+/// - `[1]` **`gpu_issue_declined`**: time inside the GPU arm on a tile
+///   where the arm was *reachable* (the document qualifies and both `gpu`
+///   and `compositor` are available) but [`begin_gpu_composite_tile`]
+///   returned `None`, so the loop fell through to the CPU. This is
+///   0.87.1's disclosed double root walk — a blank tile of a qualifying
+///   document resolving its whole root stack twice — isolated on its own
+///   for the first time (0.93.0), rather than folded anonymously into
+///   phase 1's single number.
+/// - `[2]` **`cpu_fallback_empty`**: the CPU fallback ran (the
+///   [`composite_roots_into_tile`] + `write_composited` pair) and folded
+///   **zero** roots, so the "composite" was a transparent accumulator.
+/// - `[3]` **`cpu_fallback_real`**: the CPU fallback ran and folded at
+///   least one root, i.e. it did genuine per-texel blend math.
+/// - `[4]` **`other`**: everything else in the loop —
+///   `residency.visible_tiles()`'s own iteration, the `cache.is_current`
+///   skips, `doc_origin_for`, the trailing overhead after the last tile,
+///   **and the whole `issued` block whenever the GPU arm is not reachable
+///   at all**. That last case is deliberate: on a document that never
+///   qualifies for GPU compositing (the CPU-fallback benchmark) slots
+///   `[0]` and `[1]` should read an honest `0.0`, because no GPU arm was
+///   ever entered — crediting the `gpu_qualifies` test itself to a
+///   `gpu_issue` slot would invent GPU cost where there is none.
+///
+/// The `cpu_fallback_empty` / `cpu_fallback_real` split comes from
+/// [`CPU_ROOT_FOLDS`], not from inspecting the returned texels; see that
+/// counter's own doc comment for why.
+///
+/// **Exhaustive and non-overlapping by construction.** Every mark credits
+/// the interval since the previous mark and then resets the clock, so the
+/// five slots partition the same window `RecompositePhases`'s first `mark`
+/// measures — the stopwatch is started in the same breath as
+/// `RecompositePhases::start` and the last credit is taken immediately
+/// before phase 1 formally closes. The two are therefore two independent
+/// stopwatches over one interval, and
+/// `report_recomposite_tile_costs` prints their difference as a
+/// bookkeeping self-check: anything past accumulated `Instant::now`
+/// overhead (five extra clock reads per tile) is a misplaced mark, not a
+/// finding.
+///
+/// Same soundness argument as [`RECOMPOSITE_PHASE_NANOS`]: process-global
+/// and `Relaxed`, which is why `take_recomposite_tile_cost_ms`
+/// reads-and-zeroes and why its callers zero it once before measuring.
+///
+/// **Nothing is ever asserted on these timings.** They exist to answer
+/// "which branch of the phase-1 loop actually costs the ~10 ms", printed
+/// under `--nocapture`. The one test that does assert
+/// (`recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable`)
+/// asserts only the two *structurally* impossible slots are zero, which is
+/// a mark-placement trip-wire and not a timing claim.
+#[cfg(test)]
+static RECOMPOSITE_TILE_COST_NANOS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Test-only per-branch stopwatch feeding [`RECOMPOSITE_TILE_COST_NANOS`].
+/// Built once at the top of [`recomposite_visible_tiles`], alongside
+/// [`RecompositePhases`]; the `mark_*` methods are called at each branch
+/// boundary inside its phase-1 loop.
+#[cfg(test)]
+#[derive(Debug)]
+struct RecompositeTileCosts {
+    /// When the interval now in progress began.
+    last: std::time::Instant,
+    /// [`CPU_ROOT_FOLDS`] as of the previous mark, so
+    /// [`Self::mark_cpu_fallback`] can tell whether the interval just
+    /// closed folded any root at all.
+    folds_at_last_mark: u64,
+}
+
+#[cfg(test)]
+impl RecompositeTileCosts {
+    /// Real GPU work was recorded and submitted for this tile.
+    const GPU_ISSUE_OK: usize = 0;
+    /// The GPU arm was reachable but declined; 0.87.1's double root walk.
+    const GPU_ISSUE_DECLINED: usize = 1;
+    /// CPU fallback ran, zero roots folded.
+    const CPU_EMPTY: usize = 2;
+    /// CPU fallback ran, at least one root folded: real blend math.
+    const CPU_REAL: usize = 3;
+    /// Loop overhead, plus the whole `issued` block when the GPU arm is
+    /// unreachable.
+    const OTHER: usize = 4;
+
+    fn start() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            folds_at_last_mark: cpu_root_folds(),
+        }
+    }
+
+    /// Credits the interval since the previous mark to `slot` and restarts
+    /// the clock. An out-of-range `slot` is silently dropped rather than
+    /// panicking, matching [`RecompositePhases::mark`]'s own convention:
+    /// `indexing_slicing` is denied workspace-wide, and this is
+    /// instrumentation, which must never be able to cost a user their work.
+    fn credit(&mut self, slot: usize) {
+        let now = std::time::Instant::now();
+        // `duration_since`, never `now - self.last`: `Sub` for `Instant`
+        // panics on an inverted pair, and this crate denies `panic`.
+        let elapsed = now.duration_since(self.last);
+        if let Some(counter) = RECOMPOSITE_TILE_COST_NANOS.get(slot) {
+            let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+            counter.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.last = now;
+        self.folds_at_last_mark = cpu_root_folds();
+    }
+
+    /// Loop overhead: iteration, `is_current` skips, `doc_origin_for`, and
+    /// the loop's own trailing tail.
+    fn mark_other(&mut self) {
+        self.credit(Self::OTHER);
+    }
+
+    /// The `issued` block just closed. `reachable` is whether the GPU arm
+    /// could be entered at all this pass; `issued` is whether
+    /// [`begin_gpu_composite_tile`] returned `Some`.
+    fn mark_gpu_issue(&mut self, reachable: bool, issued: bool) {
+        let slot = match (reachable, issued) {
+            (false, _) => Self::OTHER,
+            (true, true) => Self::GPU_ISSUE_OK,
+            (true, false) => Self::GPU_ISSUE_DECLINED,
+        };
+        self.credit(slot);
+    }
+
+    /// The CPU fallback arm just closed. Whether any root was folded
+    /// decides which of the two CPU slots takes the cost; see
+    /// [`CPU_ROOT_FOLDS`].
+    fn mark_cpu_fallback(&mut self) {
+        let slot = if cpu_root_folds() == self.folds_at_last_mark {
+            Self::CPU_EMPTY
+        } else {
+            Self::CPU_REAL
+        };
+        self.credit(slot);
+    }
+}
+
+/// The shipping build's version: a zero-sized type whose `mark_*` methods
+/// compile to nothing, exactly as [`RecompositePhases`]'s own
+/// `cfg(not(test))` twin does above. The counter itself does not exist
+/// outside `cfg(test)`.
+#[cfg(not(test))]
+#[derive(Debug)]
+struct RecompositeTileCosts;
+
+#[cfg(not(test))]
+impl RecompositeTileCosts {
+    fn start() -> Self {
+        Self
+    }
+
+    // `&mut self` and the parameters deliberately mirror the `cfg(test)`
+    // signatures so the call sites are identical in both builds; there is
+    // nothing to read.
+    #[allow(clippy::unused_self)]
+    fn mark_other(&mut self) {}
+
+    /// See [`Self::mark_other`].
+    #[allow(clippy::unused_self)]
+    fn mark_gpu_issue(&mut self, _reachable: bool, _issued: bool) {}
+
+    /// See [`Self::mark_other`].
+    #[allow(clippy::unused_self)]
+    fn mark_cpu_fallback(&mut self) {}
 }
 
 /// GPU-accelerated compositing for one visible composite tile, for the
@@ -8190,6 +8436,12 @@ fn recomposite_visible_tiles(
 ) {
     // Test-only, no-op in the shipping build (see `RecompositePhases`).
     let mut phases = RecompositePhases::start();
+    // Started in the same breath as `phases`, so the five per-branch
+    // sub-costs partition exactly the window `phases`' first `mark` below
+    // measures and the reconciliation in `report_recomposite_tile_costs`
+    // is against the same interval. Also test-only, also a no-op in the
+    // shipping build (see `RecompositeTileCosts`).
+    let mut tile_costs = RecompositeTileCosts::start();
 
     // The tile grid `residency.visible_tiles()` walks is anchored to the
     // *active* layer's own origin (`canvas_local_origin`'s own doc
@@ -8384,11 +8636,21 @@ fn recomposite_visible_tiles(
     // reported" flag deliberately is not, so a malformed document warns
     // once per pass rather than once per invalidated tile per frame.
     let mut budget = CompositeBudget::for_pass(layers);
+    // All three conditions are loop-invariant, so this is computed once
+    // rather than per tile. Diagnostic use only (`RecompositeTileCosts`),
+    // deliberately *not* substituted into the `issued` block below: it is
+    // what distinguishes "never entered the GPU arm at all" -- the whole
+    // CPU-fallback benchmark -- from "entered, the GPU declined, fell
+    // through to the CPU", which is 0.87.1's disclosed double root walk.
+    let gpu_arm_reachable = gpu_qualifies && gpu.is_some() && compositor.is_some();
     for tile_id in residency.visible_tiles() {
         if cache.is_current(tile_id) {
             continue;
         }
         let doc_origin = doc_origin_for(tile_id);
+        // Credits this iteration's loop overhead so far -- including any
+        // `is_current` skips walked to get here -- to the `other` slot.
+        tile_costs.mark_other();
 
         let issued = if gpu_qualifies {
             match (gpu, compositor.as_deref_mut()) {
@@ -8410,6 +8672,7 @@ fn recomposite_visible_tiles(
         } else {
             None
         };
+        tile_costs.mark_gpu_issue(gpu_arm_reachable, issued.is_some());
 
         if let Some(pending) = issued {
             pending_gpu.push(pending);
@@ -8436,11 +8699,19 @@ fn recomposite_visible_tiles(
             // empty" from "bailed, fall back" -- a larger change than
             // this correction round should carry. See PLAN.md, M1.10,
             // "Empty-tile GPU composite work".
+            //
+            // As of 0.93.0 that cost is measured on its own, as
+            // `RECOMPOSITE_TILE_COST_NANOS`'s `gpu_issue_declined` slot,
+            // rather than folded anonymously into phase 1's single number.
             let composited =
                 composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget);
             write_composited(store, cache, tile_id, &composited);
+            tile_costs.mark_cpu_fallback();
         }
     }
+    // The loop's trailing overhead, credited before phase 1 formally
+    // closes so the five sub-costs still partition phase 1's own mark.
+    tile_costs.mark_other();
     phases.mark();
 
     // Phase 2: one poll for the whole frame -- drives every pending
@@ -13434,34 +13705,35 @@ mod tests {
         EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS, Key, KeyChord,
         MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey,
         PALETTE_TOML, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE,
-        RECOMPOSITE_PHASE_NANOS, RailResize, RecoveredDocument, ShutdownState, UndoKind, UndoOrder,
-        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
-        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
-        begin_drag, begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_reference_origin, composite_roots_into_tile,
-        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
-        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
-        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
-        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
-        skipped_tiles_message, skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect,
-        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
-        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
-        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
+        RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS, RailResize, RecoveredDocument,
+        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
+        composite_roots_into_tile, composite_surface_id, continue_drag,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
+        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
+        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
+        resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
+        tile_overlaps_doc_rect, tile_store_scratch_dir, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -18484,6 +18756,30 @@ mod tests {
     fn take_recomposite_phase_ms() -> [f64; 3] {
         let mut out = [0.0_f64; 3];
         for (slot, dest) in RECOMPOSITE_PHASE_NANOS.iter().zip(out.iter_mut()) {
+            let nanos = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *dest = nanos as f64 / 1_000_000.0;
+            }
+        }
+        out
+    }
+
+    /// Reads [`RECOMPOSITE_TILE_COST_NANOS`] and resets it to zero, same
+    /// read-and-zero shape as [`take_recomposite_phase_ms`] above,
+    /// converting to milliseconds:
+    /// `[gpu_issue_ok, gpu_issue_declined, cpu_fallback_empty,
+    /// cpu_fallback_real, other]` — the five-way split of phase 1's own
+    /// per-tile loop (0.93.0).
+    ///
+    /// Diagnostic only. The five sum to phase 1 by construction, which is
+    /// what `report_recomposite_tile_costs` cross-checks; see
+    /// [`RECOMPOSITE_TILE_COST_NANOS`]'s own doc comment for what each slot
+    /// means and for why `gpu_issue_ok`/`gpu_issue_declined` read zero on a
+    /// document that never qualifies for GPU compositing.
+    fn take_recomposite_tile_cost_ms() -> [f64; 5] {
+        let mut out = [0.0_f64; 5];
+        for (slot, dest) in RECOMPOSITE_TILE_COST_NANOS.iter().zip(out.iter_mut()) {
             let nanos = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
             #[allow(clippy::cast_precision_loss)]
             {
@@ -23639,6 +23935,86 @@ mod tests {
         );
     }
 
+    /// The mark-placement trip-wire for 0.93.0's five-way phase-1 split
+    /// (`RECOMPOSITE_TILE_COST_NANOS`). `gpu: None, compositor: None`
+    /// makes the GPU arm *unreachable*, so the two `gpu_issue_*` slots can
+    /// never legitimately be credited — and if a later edit moves a mark
+    /// so that they are, this fails. That part is genuinely deterministic;
+    /// the timing values themselves are not, and nothing here asserts a
+    /// magnitude.
+    ///
+    /// The grid is 3x3 composite tiles (a 600x600 viewport, `600/256 + 1`
+    /// per axis) with exactly one of them painted, so the run is
+    /// guaranteed to exercise both CPU slots: one tile folds a root
+    /// (`cpu_fallback_real`) and eight fold none (`cpu_fallback_empty`).
+    /// Both are asserted merely non-zero, which is robust — `Instant` has
+    /// nanosecond resolution here and blending or allocating a whole
+    /// 256x256 tile costs microseconds — while no upper bound is asserted
+    /// at all, since that would be a timing claim.
+    ///
+    /// A `GpuContext` is still needed for `TileResidency::new`, so this
+    /// test self-skips without an adapter like every other GPU-gated test
+    /// in this module. That also supplies the serialization the assertion
+    /// needs: `real_gpu_context` holds `GPU_TEST_LOCK` for the returned
+    /// guard's whole lifetime, and every other test in this binary that
+    /// reaches `recomposite_visible_tiles` needs the same guard, so
+    /// nothing else can be accumulating into these process-global slots
+    /// between the zeroing below and the read.
+    #[test]
+    fn recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [1.0, 0.0, 0.0, 1.0],
+        );
+
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (600, 600));
+        let mut cache = CompositeCache::default();
+        // Discard whatever earlier tests in this binary accumulated, so
+        // the read below describes only this call.
+        let _ = take_recomposite_tile_cost_ms();
+        recomposite_visible_tiles(
+            &residency, &layers, None, &mut store, &mut cache, None, None,
+        );
+
+        let [gpu_ok, gpu_declined, cpu_empty, cpu_real, _other] = take_recomposite_tile_cost_ms();
+        assert!(
+            gpu_ok == 0.0 && gpu_declined == 0.0,
+            "with no GpuContext and no TileCompositor the GPU arm is unreachable, so neither \
+             gpu_issue slot can be credited; got gpu_issue_ok={gpu_ok} \
+             gpu_issue_declined={gpu_declined} -- a mark is misplaced"
+        );
+        assert!(
+            cpu_real > 0.0,
+            "the one painted tile must land in cpu_fallback_real; got {cpu_real}"
+        );
+        assert!(
+            cpu_empty > 0.0,
+            "the eight unpainted tiles of the 3x3 grid must land in cpu_fallback_empty; \
+             got {cpu_empty}"
+        );
+    }
+
     #[test]
     fn recomposite_visible_tiles_recomputes_a_tile_after_the_cache_is_bumped() {
         let Some(context) = real_gpu_context() else {
@@ -27967,8 +28343,15 @@ mod tests {
     /// can set up its own `layers`/`store` (GPU-qualifying or not) without
     /// duplicating this frame loop. Returns one measured frame time in
     /// milliseconds per iteration, in order.
+    // `too_many_lines` joined this list in 0.93.0: the body was 100 lines
+    // exactly, and passing one more diagnostic series to `push_frame` put
+    // it at 101. The alternative -- carving a piece out of the *timed*
+    // loop -- would move code across a measured interval boundary for a
+    // lint's sake, which this diagnostic round deliberately will not do.
+    // The allow is well precedented in this file and crate.
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation
     )]
@@ -28110,6 +28493,7 @@ mod tests {
                 ],
                 take_gpu_composite_submit_count(),
                 take_recomposite_phase_ms(),
+                take_recomposite_tile_cost_ms(),
                 sync_stats,
                 take_composite_write_outcomes(),
             );
@@ -28125,9 +28509,16 @@ mod tests {
     /// sets at its own call site. Extracted from the loop's preamble in
     /// 0.90.0 only to keep that function under `clippy::too_many_lines`
     /// once a third counter joined it.
+    ///
+    /// Zeroes, in order: `GPU_COMPOSITE_SUBMITS`,
+    /// [`RECOMPOSITE_PHASE_NANOS`], [`RECOMPOSITE_TILE_COST_NANOS`]
+    /// (0.93.0's five-way phase-1 split) and [`COMPOSITE_WRITE_OUTCOMES`].
+    /// `CPU_ROOT_FOLDS` is deliberately absent: it is only ever read as a
+    /// delta inside one `recomposite_visible_tiles` call, never as a total.
     fn zero_frame_counters() {
         let _ = take_gpu_composite_submit_count();
         let _ = take_recomposite_phase_ms();
+        let _ = take_recomposite_tile_cost_ms();
         let _ = take_composite_write_outcomes();
     }
 
@@ -28244,6 +28635,17 @@ mod tests {
         /// [`RECOMPOSITE_PHASE_NANOS`], and note that phase 2 is
         /// wall-clock stall on the poll rather than GPU execution time.
         recomposite_phases: Vec<[f64; 3]>,
+        /// `[gpu_issue_ok, gpu_issue_declined, cpu_fallback_empty,
+        /// cpu_fallback_real, other]` milliseconds — phase 1 above split
+        /// by *which branch of its per-tile loop* the time went to
+        /// (0.93.0). These five sum to
+        /// [`Self::recomposite_phases`]'s first element by construction,
+        /// and `report_recomposite_tile_costs` prints the residual as a
+        /// bookkeeping self-check. See [`RECOMPOSITE_TILE_COST_NANOS`] for
+        /// what each slot means; `gpu_issue_declined` in particular is
+        /// 0.87.1's disclosed double root walk, measured on its own for
+        /// the first time.
+        recomposite_tile_costs: Vec<[f64; 5]>,
         /// Tiles `TileResidency::sync` actually serialized and uploaded
         /// this frame, from the `SyncStats` `sync` already returns and
         /// 0.88.0 discarded. Reported because it is what makes
@@ -28291,6 +28693,7 @@ mod tests {
                 submit_poll: Vec::with_capacity(frames),
                 gpu_tiles: Vec::with_capacity(frames),
                 recomposite_phases: Vec::with_capacity(frames),
+                recomposite_tile_costs: Vec::with_capacity(frames),
                 uploaded: Vec::with_capacity(frames),
                 bytes_uploaded: Vec::with_capacity(frames),
                 composite_writes: Vec::with_capacity(frames),
@@ -28308,12 +28711,19 @@ mod tests {
         /// for `Instant` panics on an inverted pair, and this workspace
         /// denies `panic`. Destructuring the array (rather than indexing
         /// it) likewise keeps the denied `indexing_slicing` out of it.
+        // Eight arguments, one past clippy's default threshold of seven,
+        // once 0.93.0's five-way phase-1 split joined the list. Same
+        // precedent as `measure_pan_and_paint_frames`, which already
+        // carries this allow for the same reason: these are per-frame
+        // diagnostic series with no meaningful grouping between them.
+        #[allow(clippy::too_many_arguments)]
         fn push_frame(
             &mut self,
             total_ms: f64,
             marks: [std::time::Instant; 7],
             gpu_tiles: u64,
             recomposite_phases: [f64; 3],
+            recomposite_tile_costs: [f64; 5],
             sync_stats: aurora_gpu::SyncStats,
             composite_writes: [u64; 3],
         ) {
@@ -28340,6 +28750,7 @@ mod tests {
                 .push(ms(submit_poll.duration_since(record_pass)));
             self.gpu_tiles.push(gpu_tiles);
             self.recomposite_phases.push(recomposite_phases);
+            self.recomposite_tile_costs.push(recomposite_tile_costs);
             self.uploaded.push(sync_stats.uploaded);
             self.bytes_uploaded.push(sync_stats.bytes_uploaded);
             self.composite_writes.push(composite_writes);
@@ -28508,6 +28919,11 @@ mod tests {
     /// sub-phase means, and what `TileResidency::sync` actually uploaded
     /// (tiles and MB per frame, mean/min/max).
     ///
+    /// It also prints, via [`report_recomposite_tile_costs`], the
+    /// `phase1 split (mean ms/frame): ...` line — phase 1 broken down by
+    /// which branch of its per-tile loop the time went to, with the
+    /// reconciliation residual against phase 1's own mark (0.93.0).
+    ///
     /// Split out of [`report_frame_stages`] in 0.88.1 purely to keep that
     /// function under `clippy::too_many_lines` once the `SyncStats` line
     /// was added -- no behaviour of either differs from inlining it, and
@@ -28546,6 +28962,8 @@ mod tests {
              readback+write={phase3:.2}ms (phase2 is wall-clock stall, not GPU execution time \
              -- no timestamp queries)"
         );
+
+        report_recomposite_tile_costs(label, stages, frames);
 
         // What `upload_sync` actually moved, from the `SyncStats` `sync`
         // already returns. Reported next to `gpu_tiles` because the two
@@ -28629,6 +29047,56 @@ mod tests {
              this fixture's TileStore budget is smaller than its per-frame working set, so \
              composite tiles are evicted and re-paged between frames and the guard \
              correctly refuses to compare them"
+        );
+    }
+
+    /// The 0.93.0 five-way split of phase 1, split out of
+    /// [`report_frame_counters`] for exactly the reason
+    /// [`report_composite_write_outcomes`] above was: to keep that function
+    /// under `clippy::too_many_lines`. Nothing about either differs from
+    /// inlining it, and `frames` is passed rather than recomputed so every
+    /// part of the report divides by the same denominator.
+    ///
+    /// Prints the per-frame mean of each of the five slots, plus the
+    /// **reconciliation residual** against phase 1's own single mark. The
+    /// two are independent stopwatches over the same interval, so the
+    /// residual is accumulated `Instant::now` overhead and nothing else; a
+    /// residual larger than that is a misplaced mark — a bookkeeping bug,
+    /// not a finding. Nothing here is asserted on.
+    fn report_recomposite_tile_costs(label: &str, stages: &FrameStages, frames: usize) {
+        let mut means = [0.0_f64; 5];
+        for costs in &stages.recomposite_tile_costs {
+            for (src, dest) in costs.iter().zip(means.iter_mut()) {
+                *dest += *src;
+            }
+        }
+        let mut phase1_total = 0.0_f64;
+        for phases in &stages.recomposite_phases {
+            phase1_total += phases.first().copied().unwrap_or_default();
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let denominator = frames as f64;
+        for dest in &mut means {
+            *dest /= denominator;
+        }
+        let phase1_mean = phase1_total / denominator;
+        let [gpu_ok, gpu_declined, cpu_empty, cpu_real, other] = means;
+        let sum = gpu_ok + gpu_declined + cpu_empty + cpu_real + other;
+        let residual = phase1_mean - sum;
+        println!(
+            "{label}:   phase1 split (mean ms/frame): gpu_issue_ok={gpu_ok:.2} \
+             gpu_issue_declined={gpu_declined:.2} cpu_fallback_empty={cpu_empty:.2} \
+             cpu_fallback_real={cpu_real:.2} other={other:.2} | sum={sum:.2} vs phase1 \
+             mark={phase1_mean:.2} residual={residual:.4}ms -- two independent stopwatches over \
+             the same interval, so anything past Instant::now() overhead (five extra clock reads \
+             per tile) is a bookkeeping bug, not a finding. gpu_issue_declined is 0.87.1's \
+             disclosed double root walk isolated on its own: the GPU arm was reachable but \
+             begin_gpu_composite_tile returned None, so the same root stack was walked again on \
+             the CPU. Both gpu_issue_* slots read ~0 on a document that never qualifies for GPU \
+             compositing at all (the CPU-fallback benchmark), because no GPU arm was ever \
+             entered -- that is correct, not a missing measurement. cpu_fallback_empty vs \
+             cpu_fallback_real is decided by CPU_ROOT_FOLDS, i.e. whether any root was actually \
+             folded, never by inspecting the resulting texels"
         );
     }
 

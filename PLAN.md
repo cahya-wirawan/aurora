@@ -19216,6 +19216,77 @@ severity choice.
   stage's largest single share" is inferred from the unchanged `memcpy`
   share, not re-measured — no fresh internal probe split has actually been
   taken since 0.92.0.
+
+  **0.93.0 (2026-09-04) — split phase 1 into five per-branch sub-costs, to
+  find out where its ~10.6 ms actually goes.** Diagnostic only: nothing
+  about `composite_layer_into`'s blend math, `begin_gpu_composite_tile`'s
+  dispatch logic, `BUDGET_MS`, or either benchmark's own assertion
+  changed — checked directly against `git diff`, not assumed. Added a
+  test-only per-branch stopwatch (`RecompositeTileCosts`, `cfg(test)`, a
+  no-op in the shipping build exactly like `RecompositePhases`) splitting
+  phase 1's per-tile loop into `gpu_issue_ok`, `gpu_issue_declined`,
+  `cpu_fallback_empty`, and `cpu_fallback_real`, plus loop overhead
+  (`other`); and a `CPU_ROOT_FOLDS` counter (`composite_roots_into_tile`
+  credits it once per root actually folded) that is the only way to tell
+  a CPU-fallback tile that did real blend work apart from one where every
+  root declined, short of inspecting texels directly.
+
+  Measured on the same fixture and the same adapter (`NVIDIA GeForce RTX
+  3090 (Vulkan, DiscreteGpu)`), one real run of `AURORA_REQUIRE_GPU=1
+  cargo test --release -p aurora-app -- --nocapture --test-threads=1
+  recomposite_and_present_loop`:
+
+  | | GPU path (n=40) | CPU fallback (n=12) |
+  |---|---|---|
+  | total mean / p50 / p99 | 15.41 / 14.77 / 37.22 ms | 13.92 / 13.88 / 21.47 ms |
+  | phase 1 mark | 10.68 ms | 10.58 ms |
+  | `gpu_issue_ok` | 1.70 ms | 0.00 ms |
+  | `gpu_issue_declined` | 0.03 ms | 0.00 ms |
+  | `cpu_fallback_empty` | 8.95 ms | 4.14 ms |
+  | `cpu_fallback_real` | 0.00 ms | 6.44 ms |
+  | `other` | 0.00 ms | 0.00 ms |
+  | residual (sum vs. phase 1 mark) | 0.0001 ms | 0.0001 ms |
+
+  (Nominal budget 16.7 ms. Both totals are well under the ~53/59 ms and
+  ~30/33 ms figures this project's report had recorded from 0.88.0,
+  which tracks with the compositing-skip and vectorization rounds landed
+  since — this is simply what the same benchmark returns today on this
+  hardware, not a claim about which specific round bought which specific
+  ms.)
+
+  **A lever, not a null result — and now a quantified one.** In the
+  GPU-path benchmark, genuine GPU dispatch (`gpu_issue_ok`) accounts for
+  only 1.70 ms of phase 1's 10.68 ms (~16%). The dominant cost is
+  `cpu_fallback_empty` at 8.95 ms — **~84% of phase 1, ~58% of the whole
+  15.41 ms mean frame** — tiles where the GPU arm was reachable,
+  `begin_gpu_composite_tile` returned `None` (`gpu_issue_declined` itself
+  is cheap, 0.03 ms), and the CPU fallback then walked the same root
+  stack again and folded nothing. This is 0.87.1's disclosed double
+  root walk (see "Empty-tile GPU composite work" elsewhere in this M1.10
+  section), isolated as its own number here for the first time rather
+  than folded anonymously into phase 1's total, and it names a concrete
+  next-round candidate: short-circuiting or caching that walk for tiles
+  that will resolve empty, instead of re-walking every root every frame.
+  On the CPU-fallback benchmark — which never enters the GPU arm at all,
+  so both `gpu_issue_*` slots correctly read `0.00` — the same split runs
+  `cpu_fallback_empty` 4.14 ms / `cpu_fallback_real` 6.44 ms, the expected
+  shape for a fixture that genuinely does real blend work on most of its
+  tiles.
+
+  Verified: full local CI gate green (`cargo fmt --all --check`,
+  `check_layering.py` — 20 crates, `check_no_hardcoded_style.py` — 28
+  files, `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace`
+  — **1,633 passing**, 0 failed, 10 ignored), plus the real GPU run above
+  (adapter line confirmed on every invocation) producing the numbers in
+  the table, with the residual row confirming the five-way split
+  partitions phase 1's own mark to within `Instant::now()` overhead (five
+  extra clock reads per tile), not a bookkeeping bug. 1 new test
+  (`recomposite_visible_tiles_credits_no_gpu_slot_when_the_gpu_arm_is_unreachable`,
+  the mark-placement trip-wire: asserts only that the two structurally
+  impossible `gpu_issue_*` slots stay zero when no `GpuContext` or
+  `TileCompositor` is supplied, not a timing claim), 0 removed. No new
+  dependency, no `unsafe`.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
