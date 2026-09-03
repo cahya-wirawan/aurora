@@ -538,6 +538,38 @@ impl TileStore {
             .is_some_and(Tile::is_dirty)
     }
 
+    /// Whether `(surface, id)` is **resident in memory right now** — not
+    /// merely held somewhere ([`Self::contains_tile`], which is also
+    /// `true` for a paged-out or pending tile, so it is *not* a
+    /// substitute for this).
+    ///
+    /// # Why the distinction is load-bearing
+    ///
+    /// A tile's dirty rectangle lives only in the resident [`Tile`].
+    /// Paging one out and back in reconstructs it through
+    /// `Tile::from_texels`, which starts clean — so a tile that was
+    /// marked dirty, evicted, and paged back in reads as *not* dirty
+    /// while an earlier upload of it may still be what a GPU atlas
+    /// holds. A caller that wants to skip re-marking a tile dirty on the
+    /// grounds that its content is unchanged therefore has to know the
+    /// flag was never silently dropped, and continuous residency is
+    /// precisely that condition. `aurora-app`'s `write_composited` is
+    /// that caller.
+    ///
+    /// It is also the condition that separates "this tile's bytes are
+    /// the bytes somebody wrote" from "[`Self::get`] would hand back a
+    /// brand-new `Tile::blank()`": a surface just dropped by
+    /// [`Self::forget_surface`] has no resident tile, so a blank
+    /// materialized after it compares equal to nothing anybody uploaded.
+    ///
+    /// One `LruCache` lookup, no I/O, no allocation. Peeks rather than
+    /// gets, for [`Self::is_dirty`]'s reason: asking is not an access
+    /// and must not bump LRU recency.
+    #[must_use]
+    pub fn is_resident(&self, surface: SurfaceId, id: TileId) -> bool {
+        self.resident.contains(&(surface, id))
+    }
+
     /// Whether this store holds *any* content for `(surface, id)` —
     /// resident, evicted-but-not-yet-confirmed-written, or paged out to
     /// the scratch disk — **without materializing it**.
@@ -1413,6 +1445,48 @@ mod tests {
             unreachable!("test-local scratch disk must accept the write: {err:?}");
         }
         assert!(store.contains_tile(s, a), "confirmed on the scratch disk");
+    }
+
+    #[test]
+    // `is_resident` exists precisely because `contains_tile` is *not* a
+    // substitute for it: the two disagree exactly on the paged-out case,
+    // which is the one where the resident `Tile`'s dirty rectangle has
+    // been silently reconstructed as clean by `Tile::from_texels`. A
+    // caller that skips re-marking a tile dirty on "its bytes are
+    // unchanged" grounds has to be able to see that difference.
+    fn is_resident_is_false_for_a_paged_out_tile_contains_tile_still_holds() {
+        let (_dir, mut store) = store(1);
+        let s = surface();
+        let a = TileId { x: 0, y: 0 };
+        let b = TileId { x: 1, y: 0 };
+
+        if store.get(s, a).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(store.is_resident(s, a), "a `get` makes a tile resident");
+        assert!(store.contains_tile(s, a));
+
+        // Budget of 1, so touching `b` evicts `a`. `contains_tile` still
+        // finds it (its bytes survive in `pending`/`paged_out`), but it
+        // is no longer in memory -- and its dirty rectangle is gone with
+        // the `Tile` that held it.
+        if store.get(s, b).is_err() {
+            unreachable!("a fresh store must serve this tile");
+        }
+        assert!(
+            !store.is_resident(s, a),
+            "evicted to make room for `b`, so no longer in memory"
+        );
+        assert!(
+            store.contains_tile(s, a),
+            "still held, which is why `contains_tile` cannot stand in for `is_resident`"
+        );
+        assert!(store.is_resident(s, b), "the tile that took the slot");
+
+        // And forgetting it drops it from both views at once.
+        assert!(store.forget_tile(s, a));
+        assert!(!store.is_resident(s, a));
+        assert!(!store.contains_tile(s, a));
     }
 
     #[test]

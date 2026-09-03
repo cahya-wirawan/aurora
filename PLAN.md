@@ -18214,13 +18214,213 @@ severity choice.
     which 15–19 are provably all-zero. That candidate *removes* the work
     instead of making it faster and remains the larger prize; 0.89.0
     makes a loop ~2–5% faster that that change would let us skip
-    outright for most tiles.
+    outright for most tiles. **Update: done in 0.90.0, see below** — and
+    it was indeed the larger prize by a wide margin.
 
   Same disclosed limitations as the rest of this entry: one adapter, one
   platform (Linux/Vulkan/RTX 3090), no Metal, no DX12; and both
   benchmarks still call `CompositeCache::bump()` once per frame, so the
   stage shares they report are a property of this fixture, not a general
   result (correction 3 above).
+
+  **0.90.0 — the second diagnostic-round candidate, and the largest
+  single frame-time reduction this milestone has measured: skip the
+  composite tile's dirty mark (and so its ~512 KB serialize-and-upload)
+  when it recomputes to byte-identical content.** `recomposite_visible_tiles`'s
+  `write_composited` helper (`crates/aurora-app/src/lib.rs`) used to
+  `copy_from_slice` and `mark_dirty(full_tile)` unconditionally on every
+  tile it wrote. Most tiles of most frames recompute to *exactly* the
+  bytes already stored — very often all-transparent, since the visible
+  grid extends well past whatever has been painted — so the dirty mark
+  was pure waste: it is what makes `aurora_gpu::TileResidency::sync`
+  serialize the tile through its scalar `f16 → premultiply → le_bytes`
+  loop and hand half a megabyte to `queue.write_texture`. This *removes*
+  the work rather than making it faster, which is why 0.89.0's entry
+  above already named it the larger prize. `cache.mark_current` still
+  runs on both branches: whether the bytes moved has nothing to do with
+  whether the tile is computed for this invalidation generation.
+
+  **The residency guard, and why a bare byte-equality check would have
+  been an outright correctness bug.** New `aurora_tile::TileStore::is_resident`
+  (a single peeking `LruCache` lookup, no I/O, no LRU bump) gates the
+  skip: it is taken only when the tile was *continuously resident in
+  memory* since its last write **and** every sample is bitwise identical.
+  An equal comparison only proves the atlas is current if the tile in
+  hand is the same in-memory `Tile` the last upload read, and two real,
+  reachable paths break that:
+
+  1. **Document open.** `replace_document_pixels` calls
+     `store.forget_surface(composite_surface_id())`, after which
+     `get_mut` hands back a brand-new `Tile::blank()`. A new document
+     whose composite is transparent at that tile compares equal to that
+     blank — while the GPU atlas still holds the **previous document's
+     pixels** for the same tile id. Skipping would leave them on screen.
+  2. **Evict, then page back in.** `Tile::from_texels`, which is how a
+     tile paged out to the scratch disk comes back, always starts
+     `dirty: None`. So dirty → evicted → paged back in silently loses
+     the flag, and nothing in the reconstructed tile records that an
+     upload was still owed.
+
+  `contains_tile` is **not** a substitute — it is also `true` for a
+  paged-out tile, i.e. for case 2 exactly. `is_resident` is asked
+  *before* `get_mut`, which would otherwise page the tile in (or
+  materialize it blank) and make every tile look resident. The
+  comparison is over `f16::to_bits`, deliberately not `==`: `-0.0 ==
+  0.0` is `true` while the bit patterns differ, and `NaN != NaN` would
+  report an unchanged tile as changed forever.
+
+  Four new tests, all passing on a real adapter (`AURORA_REQUIRE_GPU=1`,
+  NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu):
+  `aurora-tile`'s `is_resident_is_false_for_a_paged_out_tile_contains_tile_still_holds`
+  (the two methods disagree exactly on the paged-out case) and three in
+  `aurora-app`, each driving two real recomposite passes with a
+  `residency.sync` between them (the sync matters — it is what *consumes*
+  the dirty flags, exactly as `App::redraw` does):
+  `recomposite_visible_tiles_skips_the_dirty_mark_when_a_tile_recomposites_byte_identically`,
+  `recomposite_visible_tiles_still_dirties_a_tile_whose_content_really_changed`,
+  and the correctness regression guard
+  `a_forgotten_composite_tile_is_dirtied_again_even_though_its_content_is_unchanged`,
+  which does exactly what a document open does (`forget_surface`,
+  changing nothing else) and requires the write to be taken anyway. No
+  new dependency, no `unsafe`, no new lint exception; `TileResidency::sync`'s
+  loop structure, budget checks and dirty-flag semantics are untouched,
+  and neither benchmark's `BUDGET_MS` or `total` definition moved.
+
+  **Two skip points, two different numbers — do not conflate them.**
+  This round adds a test-only three-bucket counter
+  (`COMPOSITE_WRITE_OUTCOMES`: `skipped` / `changed` / `not_resident`)
+  measured *inside* `write_composited`. It counts that function's own
+  decisions, **not uploads**, so `skipped` is an **upper bound** on the
+  uploads removed: the upload decision is a separate skip point one layer
+  down in `TileResidency::sync`, which declines a tile only when it is
+  *also* already resident in the atlas. `SyncStats`'s
+  `uploaded`/`bytes_uploaded` is the **realized** figure. Both are now
+  printed side by side by `report_frame_stages`, with that distinction
+  stated in the output itself.
+
+  On these two fixtures the two happened to coincide exactly, which is
+  worth recording as an observation rather than a general rule: GPU path
+  `changed` 1.3 + `not_resident` 5.5 = **6.8**, and `SyncStats` reports
+  exactly 6.8 tiles/frame; CPU fallback 1.2 + 3.7 = **4.9**, and
+  `SyncStats` reports 4.9. So the atlas-residency second skip point
+  removed *nothing additional* here — every tile `write_composited`
+  dirtied was in fact uploaded.
+
+  *Measured on the real GPU, three runs each side, ranges not single
+  figures (this file's own convention). Baseline captured on the
+  unmodified tree before any edit landed.* Adapter line on all six runs:
+  `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`.
+
+  | test | metric | before | after |
+  |---|---|---|---|
+  | GPU path (n=40) | `SyncStats` tiles/frame | 20.0 (min 20, max 20) | **6.8 (min 2, max 20)** |
+  | GPU path | `SyncStats` MB/frame | 10.00 | **3.41** |
+  | GPU path | `upload_sync` mean | 14.17–14.48 ms | **4.87–4.90 ms** |
+  | GPU path | `upload_sync` p50 | 14.01–14.13 ms | **4.22–4.25 ms** |
+  | GPU path | `upload_sync` p99 | 16.10–20.16 ms | 16.07–16.67 ms |
+  | GPU path | `recomposite` mean | 11.21–11.56 ms | 13.00–13.04 ms (*slower*) |
+  | GPU path | whole-frame mean | 26.36–27.07 ms | **18.57–18.65 ms** |
+  | GPU path | whole-frame p50 | 26.07–26.36 ms | **17.98–18.32 ms** |
+  | GPU path | whole-frame p99 | 36.21–45.16 ms | 39.03–40.50 ms |
+  | CPU fallback (n=12) | `SyncStats` tiles/frame | 9.0 (min 9, max 9) | **4.9 (min 2, max 9)** |
+  | CPU fallback | `SyncStats` MB/frame | 4.50 | **2.46** |
+  | CPU fallback | `upload_sync` mean | 6.53–7.11 ms | **3.54–3.66 ms** |
+  | CPU fallback | `upload_sync` p50 | 6.34–7.07 ms | **3.54–3.66 ms** |
+  | CPU fallback | `recomposite` mean | 9.01–9.73 ms | 9.52–9.85 ms (*slower*) |
+  | CPU fallback | whole-frame mean | 16.34–17.56 ms | **13.74–14.19 ms** |
+  | CPU fallback | whole-frame p50 | 16.37–17.59 ms | **13.58–14.17 ms** |
+  | CPU fallback | whole-frame p99 | 18.61–22.57 ms | 16.41–18.57 ms |
+
+  Counter buckets, per frame (identical in all three runs each side —
+  the workload is deterministic): GPU path `skipped` 13.2 (min 0, max
+  18), `changed` 1.3, `not_resident` 5.5; CPU fallback `skipped` 4.1
+  (min 0, max 7), `changed` 1.2, `not_resident` 3.7. The three buckets
+  sum to 20.0 and 9.0 respectively — exactly the per-frame upload counts
+  the *before* side reported, which is the cleanest confirmation that
+  every recomputed tile used to be uploaded.
+
+  **Honest reading.** Unlike 0.89.0, this is not a marginal result, but
+  it is not uniform either:
+
+  - **Both benchmarks show a large, non-overlapping reduction in
+    realized upload volume** — the one metric that is not a timing at
+    all and so not noise-sensitive: 20.0 → 6.8 tiles/frame (**−66%**) on
+    the GPU path and 9.0 → 4.9 (**−45%**) on the CPU fallback, identical
+    in all three runs on each side. **Both benchmarks demonstrated a
+    real reduction here.** The `not_resident` buckets (5.5 and 3.7) are
+    the expected, legitimate consequence of each fixture's
+    `real_tile_store()` budget (16 tiles) being smaller than its
+    per-frame working set, so composite tiles are evicted and re-paged
+    between frames and the guard correctly refuses to compare them. That
+    is a fixture property, not a defect, and it is why the skip rate is
+    not higher; neither fixture was altered to make the number look
+    better.
+  - **`upload_sync` mean and p50 fall by ~2.9–3.3× (GPU) and ~1.8–2×
+    (CPU fallback)**, with ranges nowhere near overlapping, and the
+    stage's share of the mean frame drops from 53.1–53.9% to 26.2–26.3%
+    (GPU) and 38.6–40.5% to 25.7–26.0% (CPU). This is the stage 0.89.0
+    bought ~1–5% of; the same stage is now less than half its former
+    cost, by removing the work instead.
+  - **The trade is real and is paid in `recomposite`:** that stage got
+    *slower* by 1.5–1.8 ms (GPU) and 0.3–0.5 ms (CPU), because a skipped
+    tile still pays a full ~512 KB bitwise comparison. It is a good
+    trade — comparing is much cheaper than serializing, premultiplying
+    and DMA-ing — but it is a cost, not free, and a workload where most
+    tiles genuinely change every frame would pay it for nothing.
+  - **Whole-frame `mean` and `p50` improve well outside noise**: GPU
+    26.36–27.07 → 18.57–18.65 ms mean (**~31%**), CPU fallback
+    16.34–17.56 → 13.74–14.19 ms (**~16%**). Non-overlapping on both,
+    and in the same direction in all six runs.
+  - **p99 supports no claim.** The GPU path's whole-frame p99 did **not**
+    improve (36.21–45.16 → 39.03–40.50 ms — the after range sits inside
+    the before range), and this entry's own earlier noise finding — a
+    34% p99 spread across three *identical* n=40 runs — fully contains
+    both. The CPU fallback's p99 ranges (18.61–22.57 → 16.41–18.57)
+    merely touch at the edges on n=12, which is suggestive at best.
+    Whatever produces these tails is not upload volume.
+  - **The 60 FPS verdict does not move.** Both benchmarks are still over
+    the 16.7 ms budget. The GPU path went from ~1.58× to ~1.11× the
+    budget at the mean but is still ~2.3× at p99; the CPU fallback's
+    *mean* (13.74–14.19 ms) is now under budget for the first time, but
+    its p99 (16.41–18.57 ms) is not, and a p50-under-budget frame path
+    with a 2.3× tail is not a 60 FPS canvas. This is the largest single
+    step toward that gate so far and it does not close it.
+
+  **Disclosed residual (checked, real, and not mitigated here).**
+  `is_resident` is `true` for a tile some *other* caller materialized
+  blank, and `sample_pixel` — the Eyedropper, via `eyedropper_sample` —
+  reaches the composite surface through `TileStore::get`, which does
+  exactly that. So: open a document (`forget_surface`), then let a
+  pointer event carrying an Eyedropper pick reach `App` *before* the next
+  redraw, and that one sampled tile is resident-blank; if the new
+  document's composite is transparent there too, the write is skipped and
+  the atlas keeps the old document's pixels for that tile. **The
+  Planner's argument that this is unreachable does not hold**: it rested
+  on `replace_document_pixels` always being followed by
+  `composite_cache.bump()` before any redraw, and while that is true (both
+  are in the same synchronous open handler), a bump forces a *recompute*
+  and says nothing about *residency*, so it does not prevent the skip.
+  What makes it narrow is different and weaker: one tool, one event
+  ordering, one tile, and an open usually changes canvas size or pan
+  enough to re-slot the atlas and force a re-upload anyway. Carried as a
+  disclosed residual rather than argued away.
+
+  **Deferred follow-on that would let the guard be dropped entirely:**
+  make `TileStore`/`Tile::from_texels` preserve dirtiness across
+  page-out/page-in (persist the dirty rectangle with the paged tile), and
+  give `forget_surface` a way to tell the atlas that surface's slots are
+  stale. Both correctness scenarios above disappear, `is_resident`'s
+  gating becomes unnecessary, and the skip rate rises by whatever the
+  `not_resident` buckets currently hold (5.5 and 3.7 tiles/frame here).
+  Not attempted in this round.
+
+  Same platform limitations as the rest of this entry: one adapter, one
+  platform (Linux/Vulkan/RTX 3090), **no Metal, no DX12** — and this
+  change alters what gets uploaded on every frame of every document, so
+  the unverified backends matter more here than for a pure
+  micro-optimization. Both benchmarks still call `CompositeCache::bump()`
+  once per frame, so the stage shares are a property of these fixtures
+  rather than a general result.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

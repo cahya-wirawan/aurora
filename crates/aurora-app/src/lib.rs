@@ -7224,6 +7224,91 @@ fn note_gpu_composite_submit() {
 #[cfg(not(test))]
 fn note_gpu_composite_submit() {}
 
+/// Test-only tally of [`recomposite_visible_tiles`]'s `write_composited`
+/// decisions, in three buckets:
+///
+/// - `[0]` **skipped** — the tile was continuously resident *and* every
+///   sample recomputed bitwise identically, so neither the
+///   `copy_from_slice` nor the `mark_dirty` happened.
+/// - `[1]` **changed** — the tile was resident but at least one sample
+///   differs, so it was copied and dirtied, exactly as before 0.90.0.
+/// - `[2]` **`not_resident`** — the tile was *not* resident when asked
+///   (never written, evicted and paged out, or its whole surface
+///   `forget_surface`d), so the content comparison is not trustworthy and
+///   the write is taken unconditionally. This is the correctness guard,
+///   not an optimization miss.
+///
+/// # What this counts, and what it does not
+///
+/// It counts **`write_composited`'s own decisions, not GPU uploads.**
+/// The upload decision is one layer down, in
+/// `aurora_gpu::TileResidency::sync`, which skips a tile only when it is
+/// *also* already resident in that atlas — a tile absent from the atlas
+/// is re-uploaded whether or not it is dirty. So bucket `[0]` is an
+/// **upper bound** on the uploads this change removes and never the
+/// measurement of them. `SyncStats`'s own `uploaded` / `bytes_uploaded`
+/// (already reported by `report_frame_counters`) is the realized number.
+/// The two are separate skip points and must not be quoted as one figure.
+///
+/// Same soundness argument as [`GPU_COMPOSITE_SUBMITS`] and
+/// [`RECOMPOSITE_PHASE_NANOS`]: process-global and `Relaxed`, which is
+/// fine because a GPU caller reaches it only via `real_gpu_context`'s
+/// `GPU_TEST_LOCK`. A CPU-only caller of `recomposite_visible_tiles`
+/// holds no such lock and also accumulates here, which is exactly why
+/// `take_composite_write_outcomes` reads-and-zeroes and why its callers
+/// zero it once before their own measurement.
+///
+/// Nothing about *timing* is asserted on these numbers; the three tests
+/// added in 0.90.0 do assert on the bucket a specific, deliberately
+/// constructed tile lands in, since that is the behaviour under test.
+#[cfg(test)]
+static COMPOSITE_WRITE_OUTCOMES: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Credits one [`COMPOSITE_WRITE_OUTCOMES`] bucket. An out-of-range
+/// `slot` is silently dropped rather than panicking — `indexing_slicing`
+/// is denied workspace-wide, and this is instrumentation, which must
+/// never be able to cost a user their work.
+#[cfg(test)]
+fn note_composite_write(slot: usize) {
+    if let Some(counter) = COMPOSITE_WRITE_OUTCOMES.get(slot) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Bucket `[0]`: resident and bitwise unchanged, so the write was skipped.
+#[cfg(test)]
+fn note_composite_write_skipped() {
+    note_composite_write(0);
+}
+
+/// Bucket `[1]`: resident, but the content really changed.
+#[cfg(test)]
+fn note_composite_write_changed() {
+    note_composite_write(1);
+}
+
+/// Bucket `[2]`: not resident, so the write was taken unconditionally.
+#[cfg(test)]
+fn note_composite_write_not_resident() {
+    note_composite_write(2);
+}
+
+/// The shipping build's versions: nothing at all, exactly as with
+/// [`note_gpu_composite_submit`] above. The counter itself does not
+/// exist outside `cfg(test)`.
+#[cfg(not(test))]
+fn note_composite_write_skipped() {}
+/// See [`note_composite_write_skipped`].
+#[cfg(not(test))]
+fn note_composite_write_changed() {}
+/// See [`note_composite_write_skipped`].
+#[cfg(not(test))]
+fn note_composite_write_not_resident() {}
+
 /// Test-only wall-clock accumulator for [`recomposite_visible_tiles`]'s
 /// own three internal phases, in nanoseconds: `[0]` phase 1 (the
 /// per-tile loop that either issues a GPU composite or composites on the
@@ -8141,10 +8226,77 @@ fn recomposite_visible_tiles(
     // of checking a length itself rather than trusting one. Skipping
     // leaves the tile un-cached, exactly as a `get_mut` failure does, so
     // a later redraw retries it.
+    //
+    // # Skipping the write when nothing changed (0.90.0)
+    //
+    // Most tiles of most frames recomposite to *exactly* the result
+    // already stored -- very often an all-transparent one, since the
+    // visible grid extends well past whatever the user has painted. Both
+    // the `copy_from_slice` and, far more expensively, the `mark_dirty`
+    // that follows it are then pure waste: the dirty flag is what makes
+    // `aurora_gpu::TileResidency::sync` serialize the tile through its
+    // scalar `f16 -> premultiply -> le_bytes` loop and hand ~512 KB to
+    // `queue.write_texture`. So this removes work rather than speeding it
+    // up. `cache.mark_current` still happens on both branches: whether
+    // the bytes moved has nothing to do with whether the tile is now
+    // computed for this invalidation generation.
+    //
+    // **The residency guard is a correctness requirement, not a
+    // heuristic.** A bare byte-equality test is unsound, in two real and
+    // reachable ways, both of which share one root cause: an equal
+    // comparison only proves the atlas is current *if* the tile in hand
+    // is the same in-memory `Tile` that the last upload read.
+    //
+    // 1. `replace_document_pixels` calls
+    //    `store.forget_surface(composite_surface_id())` on every document
+    //    open, so the next `get_mut` here materializes a brand-new
+    //    `Tile::blank()`. A new document whose composite at that tile is
+    //    transparent compares equal to that blank -- while the GPU atlas
+    //    still holds the *previous* document's pixels for the same tile
+    //    id. Skipping would leave them on screen.
+    // 2. `Tile::from_texels`, which is how a tile paged out to the scratch
+    //    disk comes back, always starts `dirty: None`. So dirty ->
+    //    evicted -> paged back in loses the flag, and nothing in the
+    //    reconstructed tile records that an upload was still owed.
+    //
+    // `TileStore::is_resident` is exactly the "same in-memory `Tile`
+    // throughout" condition, and it is asked *before* `get_mut`, which
+    // would otherwise page the tile in (or materialize it blank) and make
+    // every tile look resident. `contains_tile` would not do: it is also
+    // `true` for a paged-out tile, i.e. for case 2.
+    //
+    // **One residual the guard does not close, stated rather than
+    // argued away.** `is_resident` is `true` for a tile that some *other*
+    // caller materialized blank, and `sample_pixel` (the Eyedropper, via
+    // `eyedropper_sample`) reaches the composite surface through
+    // `TileStore::get`, which does exactly that. So: open a document
+    // (`forget_surface`), then let a pointer event carrying an Eyedropper
+    // pick reach `App` *before* the next redraw -- winit is free to
+    // deliver one there, and the `composite_cache.bump()` in the open
+    // handler does not prevent it, since a bump forces a recompute and
+    // says nothing about residency -- and that one sampled tile is now
+    // resident-blank. If the new document's composite is also transparent
+    // there, this skips, and the atlas keeps the old document's pixels
+    // for that one tile. Narrow (one tool, one event ordering, one tile,
+    // and a pan/size change on open usually re-slots the atlas and forces
+    // a re-upload anyway) but **not proven unreachable**; PLAN.md's M1.10
+    // 0.90.0 entry carries it as a disclosed residual with the fix
+    // (preserve dirtiness across page-out/page-in, then this whole guard
+    // can go).
+    //
+    // The comparison is over `f16::to_bits`, deliberately not `==`:
+    // `-0.0 == 0.0` is `true` while the two have different bit patterns
+    // the GPU can distinguish, and `NaN != NaN` would report an unchanged
+    // tile as changed forever. Bitwise identity is both the cheaper and
+    // the correct predicate for "the bytes an upload would produce are
+    // the bytes it already produced".
     let write_composited = |store: &mut aurora_tile::TileStore,
                             cache: &mut CompositeCache,
                             tile_id: aurora_tile::TileId,
                             composited: &[half::f16]| {
+        // Asked *before* `get_mut`, which pages the tile in (or
+        // materializes it blank) and would make every tile look resident.
+        let was_resident = store.is_resident(composite_surface_id(), tile_id);
         let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
             return;
         };
@@ -8157,8 +8309,23 @@ fn recomposite_visible_tiles(
             );
             return;
         }
-        dest.texels_mut().copy_from_slice(composited);
-        dest.mark_dirty(full_tile);
+        let unchanged = was_resident
+            && dest
+                .texels()
+                .iter()
+                .zip(composited)
+                .all(|(have, want)| have.to_bits() == want.to_bits());
+        if unchanged {
+            note_composite_write_skipped();
+        } else {
+            dest.texels_mut().copy_from_slice(composited);
+            dest.mark_dirty(full_tile);
+            if was_resident {
+                note_composite_write_changed();
+            } else {
+                note_composite_write_not_resident();
+            }
+        }
         cache.mark_current(tile_id);
     };
     let composite_tile_cpu_path = |layers: &aurora_doc::LayerTree,
@@ -13180,40 +13347,40 @@ mod tests {
         ActivatedCommand, AppCommand, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_LAYERS,
         COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
-        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, CRASH_RECOVERY_CONTINUE,
-        ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
-        DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess,
-        GPU_COMPOSITE_SUBMITS, Key, KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
-        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_PHASE_NANOS, RailResize, RecoveredDocument,
-        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
-        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
-        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
-        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
-        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
-        composite_roots_into_tile, composite_surface_id, continue_drag,
-        crash_recovery_dialog_actions, crash_recovery_dialog_message,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
-        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
-        load_document_view, load_scales, load_theme, logical_point, logical_size,
-        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
-        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
-        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
-        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
-        resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
-        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
-        tile_overlaps_doc_rect, tile_store_scratch_dir, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, COMPOSITE_WRITE_OUTCOMES,
+        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeBudget, CompositeCache,
+        CompositeInvalidation, DARK_THEME_TOML, DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS,
+        EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS, Key, KeyChord,
+        MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey,
+        PALETTE_TOML, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE,
+        RECOMPOSITE_PHASE_NANOS, RailResize, RecoveredDocument, ShutdownState, UndoKind, UndoOrder,
+        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
+        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
+        begin_drag, begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
+        composite_document, composite_reference_origin, composite_roots_into_tile,
+        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
+        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
+        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
+        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
+        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
+        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
+        move_refused_dialog_actions, move_refused_message, open_command_palette,
+        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
+        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
+        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
+        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
+        skipped_tiles_message, skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect,
+        tile_store_scratch_dir, toggle_command_palette, topmost_pixel_layer, translate_key,
+        translate_modifiers, translate_pointer_button, unwarned_failures, verify_aur,
+        write_autosave, write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -18241,6 +18408,23 @@ mod tests {
             {
                 *dest = nanos as f64 / 1_000_000.0;
             }
+        }
+        out
+    }
+
+    /// Reads [`COMPOSITE_WRITE_OUTCOMES`] and resets it to zero, in the
+    /// same read-and-zero shape as the counters above:
+    /// `[skipped, changed, not_resident]`.
+    ///
+    /// Bucket 0 is an **upper bound** on the GPU uploads 0.90.0's skip
+    /// removes, never the measurement of them — the upload decision is a
+    /// separate skip point inside `aurora_gpu::TileResidency::sync`, whose
+    /// own `SyncStats` is the realized figure. See
+    /// [`COMPOSITE_WRITE_OUTCOMES`] for the full statement.
+    fn take_composite_write_outcomes() -> [u64; 3] {
+        let mut out = [0_u64; 3];
+        for (slot, dest) in COMPOSITE_WRITE_OUTCOMES.iter().zip(out.iter_mut()) {
+            *dest = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
         }
         out
     }
@@ -23429,6 +23613,260 @@ mod tests {
         );
     }
 
+    // -- `write_composited`'s unchanged-tile skip and its residency
+    // guard (0.90.0). All three share one fixture: a single solid
+    // pixel layer, one real GPU context, and *two* recomposite passes
+    // with a `residency.sync` in between -- the sync matters, because it
+    // is what consumes the dirty flags `recomposite_visible_tiles` sets,
+    // exactly as `App::redraw` does. Without it the second pass would be
+    // comparing against a tile that is still dirty from the first, and
+    // the assertions below would not mean what they say.
+
+    /// The fixture all three 0.90.0 tests build: a `256x256`-viewport
+    /// residency (a 3x3 visible grid), one solid red pixel layer, and a
+    /// composite cache. Returns everything the caller needs to drive two
+    /// passes by hand.
+    ///
+    /// The layer surface is filled at tile `(0, 0)` only, so of the nine
+    /// visible tiles exactly one has real content and the other eight
+    /// recomposite to transparent — which is the shape the real frame
+    /// path has too, and the reason the skip is worth anything.
+    fn unchanged_skip_fixture() -> (
+        tempfile::TempDir,
+        aurora_tile::TileStore,
+        aurora_doc::LayerTree,
+        aurora_tile::SurfaceId,
+        aurora_tile::TileId,
+    ) {
+        let (dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let id = match layers.add_pixel_layer("a", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        fill_solid(&mut store, surface, tile_id, [1.0, 0.0, 0.0, 1.0]);
+        (dir, store, layers, surface, tile_id)
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_skips_the_dirty_mark_when_a_tile_recomposites_byte_identically() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store, layers, _surface, tile_id) = unchanged_skip_fixture();
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        // What `App::redraw` does next, and the reason it is here: `sync`
+        // is what *consumes* the dirty flags the pass above set.
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+        let first = take_composite_write_outcomes();
+        assert_eq!(
+            first[0], 0,
+            "the very first pass has no resident composite tile to compare against, so nothing \
+             can be skipped: {first:?}"
+        );
+
+        cache.bump();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let second = take_composite_write_outcomes();
+        assert!(
+            second[0] >= 1,
+            "a tile recomposited from unchanged layer content must land in the skipped bucket: \
+             {second:?}"
+        );
+        assert_eq!(
+            second[1], 0,
+            "nothing about the document changed between the two passes, so no tile may be \
+             reported as changed: {second:?}"
+        );
+        assert!(
+            !store.is_dirty(composite_surface_id(), tile_id),
+            "the skip's whole point: the tile must not be re-marked dirty, so \
+             TileResidency::sync has nothing to serialize and upload for it"
+        );
+        // And the skip must not have corrupted what is stored: the tile
+        // still reads back as the layer's own content.
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), tile_id),
+            (1.0, 0.0, 0.0, 1.0),
+            "skipping the write must leave the already-correct content in place"
+        );
+    }
+
+    #[test]
+    fn recomposite_visible_tiles_still_dirties_a_tile_whose_content_really_changed() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store, layers, surface, tile_id) = unchanged_skip_fixture();
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+        let _ = take_composite_write_outcomes();
+
+        // Repaint the *layer*, not the composite surface: this is the
+        // ordinary "the user painted something" case, and the one the
+        // skip must never swallow.
+        fill_solid(&mut store, surface, tile_id, [0.0, 0.0, 1.0, 1.0]);
+        cache.bump();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let second = take_composite_write_outcomes();
+        assert!(
+            second[1] >= 1,
+            "the repainted tile must be reported as changed, not skipped: {second:?}"
+        );
+        assert!(
+            store.is_dirty(composite_surface_id(), tile_id),
+            "a tile whose content really changed must still be marked dirty, or the atlas keeps \
+             showing the old pixels"
+        );
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), tile_id),
+            (0.0, 0.0, 1.0, 1.0),
+            "and the new content must be what got written"
+        );
+    }
+
+    #[test]
+    // The correctness regression guard for the residency guard itself.
+    // `replace_document_pixels` calls
+    // `store.forget_surface(composite_surface_id())` on every document
+    // open, after which `get_mut` hands back a brand-new `Tile::blank()`
+    // -- while the GPU atlas still holds the *previous* document's pixels
+    // for the same tile id. A bare byte-equality skip would compare a
+    // freshly composited transparent tile against that blank, find them
+    // equal, skip the dirty mark, and leave the old document on screen.
+    // This test constructs exactly that: forget the surface, change
+    // nothing else, and require the write to be taken anyway.
+    fn a_forgotten_composite_tile_is_dirtied_again_even_though_its_content_is_unchanged() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store, layers, _surface, tile_id) = unchanged_skip_fixture();
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+        let _ = take_composite_write_outcomes();
+
+        // Exactly what `replace_document_pixels` does on a document open.
+        // The layer content is left completely alone, so every tile
+        // recomposites to the same bytes it already held.
+        let forgotten = store.forget_surface(composite_surface_id());
+        assert!(
+            forgotten > 0,
+            "the first pass must have written at least one composite tile to forget"
+        );
+        cache.bump();
+        recomposite_visible_tiles(
+            &residency,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let second = take_composite_write_outcomes();
+        assert!(
+            second[2] >= 1,
+            "a forgotten tile is not resident, so the write must be taken unconditionally rather \
+             than compared: {second:?}"
+        );
+        assert_eq!(
+            second[0], 0,
+            "and none of the forgotten surface's tiles may be skipped -- that is the stale-pixel \
+             bug the residency guard exists to prevent: {second:?}"
+        );
+        assert!(
+            store.is_dirty(composite_surface_id(), tile_id),
+            "the tile must be dirty again so TileResidency::sync re-uploads it over whatever the \
+             atlas still holds from the previous document"
+        );
+    }
+
     // -- `CompositeCache::invalidate_doc_rect` and the narrowed
     // undo/redo invalidation it backs (0.73.0). These are pure,
     // headless tests: no GPU adapter, no `App`. The differential
@@ -27017,13 +27455,7 @@ mod tests {
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut stages = FrameStages::with_capacity(frames as usize);
-        // Zero both process-global test counters once, before the loop, so
-        // the numbers below describe only this loop's own work and not
-        // whatever GPU test ran earlier in the same binary -- the exact
-        // precedent `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack`
-        // sets at its own call site.
-        let _ = take_gpu_composite_submit_count();
-        let _ = take_recomposite_phase_ms();
+        zero_frame_counters();
         for step in 0..frames {
             let x = start.0 + step * pan_step_px.0;
             let y = start.1 + step * pan_step_px.1;
@@ -27140,9 +27572,24 @@ mod tests {
                 take_gpu_composite_submit_count(),
                 take_recomposite_phase_ms(),
                 sync_stats,
+                take_composite_write_outcomes(),
             );
         }
         stages
+    }
+
+    /// Zeroes every process-global test counter
+    /// [`measure_pan_and_paint_frames`] reports, once before its loop, so
+    /// the numbers describe only that loop's own work and not whatever GPU
+    /// test ran earlier in the same binary -- the exact precedent
+    /// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_and_multiply_stack`
+    /// sets at its own call site. Extracted from the loop's preamble in
+    /// 0.90.0 only to keep that function under `clippy::too_many_lines`
+    /// once a third counter joined it.
+    fn zero_frame_counters() {
+        let _ = take_gpu_composite_submit_count();
+        let _ = take_recomposite_phase_ms();
+        let _ = take_composite_write_outcomes();
     }
 
     /// Per-frame, per-stage timings collected by
@@ -27243,15 +27690,36 @@ mod tests {
         /// Tiles `TileResidency::sync` actually serialized and uploaded
         /// this frame, from the `SyncStats` `sync` already returns and
         /// 0.88.0 discarded. Reported because it is what makes
-        /// [`Self::upload_sync`]'s cost interpretable: this loop calls
+        /// [`Self::upload_sync`]'s cost interpretable.
+        ///
+        /// **This stopped being a fixed floor in 0.90.0, and this comment
+        /// used to say it was.** Until then it was: this loop calls
         /// `CompositeCache::bump()` every frame, which invalidates the
-        /// *whole* grid, so this number is a fixed floor rather than a
-        /// function of what was painted.
+        /// *whole* grid, and `write_composited` re-dirtied every tile it
+        /// recomputed, so `min` equalled `max` on both benchmarks (20/20
+        /// tiles on the GPU path, 9/9 on the CPU fallback). 0.90.0's
+        /// unchanged-tile skip makes the number genuinely
+        /// content-dependent: measured on an RTX 3090 the GPU path now
+        /// reports mean 6.8 (min 2, max 20) and the CPU fallback mean 4.9
+        /// (min 2, max 9). A `bump()` still invalidates the whole grid —
+        /// what changed is that recomputing a tile no longer implies
+        /// re-uploading it.
         uploaded: Vec<u32>,
         /// Bytes uploaded this frame, same source as [`Self::uploaded`].
         /// Independently checkable against `spike/FINDINGS.md`'s own
         /// "~18 MB per screenful" upload-bandwidth figure.
         bytes_uploaded: Vec<u64>,
+        /// `write_composited`'s own per-frame decisions,
+        /// `[skipped, changed, not_resident]`, from
+        /// [`COMPOSITE_WRITE_OUTCOMES`] (0.90.0).
+        ///
+        /// **Not an upload count.** Bucket 0 is an upper bound on the
+        /// uploads the unchanged-tile skip removes; [`Self::uploaded`] and
+        /// [`Self::bytes_uploaded`] are the realized figures, decided at a
+        /// *different* skip point one layer down inside
+        /// `TileResidency::sync`. Reported side by side so the two can be
+        /// compared, never conflated.
+        composite_writes: Vec<[u64; 3]>,
     }
 
     impl FrameStages {
@@ -27268,6 +27736,7 @@ mod tests {
                 recomposite_phases: Vec::with_capacity(frames),
                 uploaded: Vec::with_capacity(frames),
                 bytes_uploaded: Vec::with_capacity(frames),
+                composite_writes: Vec::with_capacity(frames),
             }
         }
 
@@ -27289,6 +27758,7 @@ mod tests {
             gpu_tiles: u64,
             recomposite_phases: [f64; 3],
             sync_stats: aurora_gpu::SyncStats,
+            composite_writes: [u64; 3],
         ) {
             let [
                 t0,
@@ -27315,6 +27785,7 @@ mod tests {
             self.recomposite_phases.push(recomposite_phases);
             self.uploaded.push(sync_stats.uploaded);
             self.bytes_uploaded.push(sync_stats.bytes_uploaded);
+            self.composite_writes.push(composite_writes);
         }
     }
 
@@ -27551,6 +28022,56 @@ mod tests {
              screenful. A min equal to the max means this is a content-independent floor: \
              CompositeCache::bump() invalidates the whole grid every frame here, unlike \
              App::paint_dab, which invalidates only the tiles the dab actually painted"
+        );
+
+        report_composite_write_outcomes(label, stages, frames);
+    }
+
+    /// The 0.90.0 `write_composited` bucket line, split out of
+    /// [`report_frame_counters`] only to keep it under
+    /// `clippy::too_many_lines`.
+    ///
+    /// Prints per-frame mean/min/max of each of the three buckets, and
+    /// states in the output itself what the numbers do and do not mean:
+    /// **bucket 0 is an upper bound on the uploads the skip removes**,
+    /// because `TileResidency::sync` is a second, independent skip point
+    /// that declines a tile only when it is *also* already resident in the
+    /// atlas. The realized change is the `upload_sync moved ...` line
+    /// above (`SyncStats`'s `uploaded` / `bytes_uploaded`). Quoting bucket
+    /// 0 as an upload saving would be wrong.
+    fn report_composite_write_outcomes(label: &str, stages: &FrameStages, frames: usize) {
+        let bucket = |slot: usize| -> (f64, u64, u64) {
+            let values = stages
+                .composite_writes
+                .iter()
+                .filter_map(|frame| frame.get(slot).copied());
+            let (sum, min, max) = values.fold((0_u64, u64::MAX, 0_u64), |(sum, min, max), v| {
+                (
+                    sum.saturating_add(v),
+                    std::cmp::min(min, v),
+                    std::cmp::max(max, v),
+                )
+            });
+            #[allow(clippy::cast_precision_loss)]
+            let mean = sum as f64 / frames as f64;
+            (mean, if min == u64::MAX { 0 } else { min }, max)
+        };
+        let (skipped_mean, skipped_min, skipped_max) = bucket(0);
+        let (changed_mean, changed_min, changed_max) = bucket(1);
+        let (absent_mean, absent_min, absent_max) = bucket(2);
+        println!(
+            "{label}:   composite writes/frame: skipped mean={skipped_mean:.1} \
+             (min={skipped_min} max={skipped_max}) changed mean={changed_mean:.1} \
+             (min={changed_min} max={changed_max}) not_resident mean={absent_mean:.1} \
+             (min={absent_min} max={absent_max}) -- these are write_composited's own \
+             decisions, NOT uploads: `skipped` is an UPPER BOUND on the uploads 0.90.0's \
+             unchanged-tile skip removes, because TileResidency::sync is a second, \
+             independent skip point that declines a tile only when it is also already \
+             resident in the atlas. The realized number is the `upload_sync moved ...` line \
+             above (SyncStats uploaded/bytes_uploaded). A large `not_resident` bucket means \
+             this fixture's TileStore budget is smaller than its per-frame working set, so \
+             composite tiles are evicted and re-paged between frames and the guard \
+             correctly refuses to compare them"
         );
     }
 
