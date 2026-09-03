@@ -940,35 +940,34 @@ impl History {
 
     /// Same as [`LayerTree::add_mask`], recorded for undo — **and, unlike
     /// it, this clears any coverage a previous mask on the same layer
-    /// left behind**, which is why it needs the store.
+    /// left behind** (via [`crate::mask::forget_mask_coverage`]), which
+    /// is why it needs the store. Mask surface ids are derived rather
+    /// than allocated, so without the clear a fresh mask would open
+    /// wearing a deleted one's pixels; **[`crate::mask`]'s lifecycle
+    /// notes are the canonical account** of why the clear belongs here
+    /// and not in [`Self::remove_mask`], and are the one place that
+    /// reasoning is kept.
     ///
-    /// A mask surface id is *derived* from its layer's id rather than
-    /// allocated ([`LayerTree::mask_surface_id`]), so removing a mask and
-    /// adding a new one to the same layer lands the new mask on the exact
-    /// same surface — and [`Self::remove_mask`] deliberately leaves that
-    /// surface's tiles alone (see its own doc comment). Without this
-    /// clear, a fresh mask would open wearing the deleted mask's painted
-    /// pixels, shifted by the offset between the two masks' `bounds`
-    /// origins, since coverage is addressed relative to the mask's own
-    /// origin (see [`crate::mask`]'s "The addressing convention").
+    /// Two things that follow from it, both stated in full there:
     ///
-    /// [`LayerTree::add_pixel_layer`] gets "fresh means fresh" for free
-    /// by allocating a new id; this is what buys the same guarantee for
-    /// a mask, which cannot.
-    ///
-    /// **The accepted consequence**, tested rather than left to be
-    /// discovered: once a new mask is committed here, undoing back past
-    /// it restores the *old* mask's struct but not its coverage — that
-    /// is gone for good. Holding both would need a surface per mask
-    /// instance, i.e. allocated rather than derived ids, which is a
-    /// separate decision.
+    /// - **Undoing back past this does not restore the old mask's
+    ///   coverage, and can leave the restored old mask reading the
+    ///   *newer* mask's coverage, shifted** — the same defect shape
+    ///   this call fixes going forward, still present going backward,
+    ///   for the same reason. Accepted and tested, not lost silently.
+    /// - **[`crate::mask::forget_mask_coverage`] is a whole-store scan,
+    ///   and this runs it on every successful mask add** — including
+    ///   the common case of a layer that never had a mask, where it
+    ///   matches nothing. See that function's own "Cost" section for
+    ///   what that means and the named follow-on it would need.
     ///
     /// # Errors
     ///
     /// Same as [`LayerTree::add_mask`]. Nothing in the store is touched
     /// when it refuses — in particular a
     /// [`DocError::MaskAlreadyExists`] refusal leaves the live mask's
-    /// coverage entirely alone.
+    /// coverage entirely alone, and so does an out-of-range rectangle
+    /// on a maskless layer still carrying residue from a prior removal.
     pub fn add_mask(
         &mut self,
         tree: &mut LayerTree,
@@ -1000,24 +999,15 @@ impl History {
     ///
     /// # Why this does *not* free the mask's tiles
     ///
-    /// It takes no store, deliberately. The obvious place to clear a
-    /// stale mask surface looks like right here — and it is the wrong
-    /// place, for the same reason deleting a *layer* keeps its pixel
-    /// tiles ([`crate::mask`]'s lifecycle notes, and
-    /// `history.rs`'s own
-    /// `undo_of_a_remove_still_finds_the_removed_layers_painted_pixels`).
-    /// This removal is undoable: the undo step is a
-    /// `LayerOp::RestoreMask` carrying the exact [`LayerMask`] that was
-    /// taken, and it restores that struct onto the same derived surface.
-    /// Freeing the coverage here would make Ctrl+Z bring the mask back
-    /// blank, with the user's painted coverage already destroyed —
-    /// strictly worse than holding it.
-    ///
-    /// So the residue this leaves is on purpose, and it is cleared at
-    /// the two points where it really is unreachable: by
-    /// [`Self::add_mask`], when a genuinely new mask takes the surface
-    /// over, and by [`crate::forget_document_surfaces`], when the whole
-    /// document is discarded.
+    /// It takes no store, deliberately: this removal is undoable via
+    /// `LayerOp::RestoreMask`, so freeing the coverage here would make
+    /// Ctrl+Z bring the mask back blank. The residue is on purpose, and
+    /// is cleared instead by [`Self::add_mask`] and by
+    /// [`crate::forget_document_surfaces`], the two points where it
+    /// really is unreachable. **[`crate::mask`]'s lifecycle notes carry
+    /// the full reasoning**; `history.rs`'s own
+    /// `undo_of_a_remove_mask_still_finds_its_painted_coverage` is what
+    /// keeps it true.
     ///
     /// # Errors
     ///
@@ -3574,6 +3564,12 @@ mod tests {
     /// a read-back comparison is genuinely exact rather than close.
     const PAINTED: f32 = 0.25;
 
+    /// What a *second* mask on the same layer paints, where a fixture
+    /// needs to tell the two apart. Same exactness as [`PAINTED`], and
+    /// deliberately neither that value nor the unpainted `1.0` default,
+    /// so an assertion naming it cannot pass by accident.
+    const REPAINTED: f32 = 0.75;
+
     /// Exact float equality expressed as bit equality -- the same shape
     /// (and the same reason) `mask.rs`'s own tests use: this workspace
     /// denies `clippy::float_cmp`, and these round trips really are
@@ -3786,6 +3782,14 @@ mod tests {
     /// there. Holding both would need a surface per mask *instance*,
     /// i.e. allocated rather than derived ids, which is a separate
     /// decision and deliberately not taken here.
+    ///
+    /// **This fixture leaves the replacement mask unpainted, and that
+    /// makes it the mild half of the consequence.** Read alone it
+    /// suggests the restored mask merely reads the unpainted default;
+    /// paint the replacement first and it reads the *replacement's*
+    /// coverage instead, shifted. `add_mask_undone_leaves_the_old_mask_reading_the_new_masks_coverage`
+    /// below is that sibling, and is the honest statement of this
+    /// residual's real shape.
     fn add_mask_makes_the_removed_masks_coverage_unrecoverable_by_undo() {
         let (_dir, mut store) = real_tile_store();
         let mut tree = LayerTree::new();
@@ -3861,6 +3865,135 @@ mod tests {
             texels(&mut store, mask),
             before,
             "and must leave its coverage byte-exact"
+        );
+        assert!(exactly(coverage_at(&mut store, mask, 3, 4), PAINTED));
+    }
+
+    #[test]
+    /// The residual above, at full strength: undoing past an `add_mask`
+    /// can restore an old mask that now reads a **newer** mask's
+    /// coverage, shifted by the offset between the two `bounds` origins.
+    ///
+    /// This is character-for-character the defect shape 0.81.0 fixes
+    /// going *forward* — one derived surface, two masks, coverage
+    /// addressed relative to whichever origin is currently attached —
+    /// still reachable going *backward* through undo, and reachable
+    /// entirely through the ordinary [`History`] API
+    /// (add → paint → remove → add → paint → undo → undo), with no
+    /// `LayerTree::add_mask` bypass involved. There is no fix for it
+    /// short of allocating a surface id per mask *instance* rather than
+    /// deriving it from the layer id, which is a separate decision (see
+    /// [`crate::mask`]'s lifecycle notes), so this test exists to pin
+    /// the behaviour honestly rather than to assert it is desirable.
+    ///
+    /// The `1.0` an unpainted mask reads is not asserted here on
+    /// purpose: the point is precisely that the restored mask does
+    /// *not* read the default.
+    fn add_mask_undone_leaves_the_old_mask_reading_the_new_masks_coverage() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(id) = history.add_pixel_layer(&mut tree, "Masked", bounds(), None) else {
+            unreachable!("an empty tree accepts a root layer");
+        };
+        if let Err(err) = history.add_mask(&mut tree, &mut store, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        let mask = mask_surface(&tree, id);
+        paint_coverage(&mut store, mask, 3, 4, PAINTED);
+
+        if let Err(err) = history.remove_mask(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        // A *different* rectangle, so the two masks address this one
+        // texel at two different document positions -- the shift is the
+        // whole point, not incidental.
+        if let Err(err) = history.add_mask(&mut tree, &mut store, id, other_bounds()) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            exactly(coverage_at(&mut store, mask, 3, 4), 1.0),
+            "the fixture starts the replacement mask unpainted, as 0.81.0 guarantees"
+        );
+        paint_coverage(&mut store, mask, 3, 4, REPAINTED);
+
+        // Undo the add, then the remove: mask A's struct comes back.
+        for _ in 0..2 {
+            if let Err(err) = history.undo(&mut tree) {
+                unreachable!("{err:?}");
+            }
+        }
+
+        let Some(restored) = tree.mask(id) else {
+            unreachable!("two undos must put the original mask back");
+        };
+        assert_eq!(
+            restored.bounds,
+            bounds(),
+            "the struct restored is the *original* mask, not the replacement"
+        );
+        assert!(
+            exactly(coverage_at(&mut store, mask, 3, 4), REPAINTED),
+            "and it reads the *replacement's* coverage -- not its own, and not the \
+             unpainted default -- interpreted against its own, different origin"
+        );
+    }
+
+    #[test]
+    // The ordering's third named refusal branch, which the
+    // `MaskAlreadyExists` test above does not reach: an out-of-range
+    // rectangle. Here the layer is *maskless* and carrying residual
+    // coverage from a prior removal -- coverage a later successful add
+    // is entitled to free, and a refused one is not. Clearing before
+    // validating would destroy it on a call that changed nothing else,
+    // and would take the undo of that removal down with it.
+    fn add_mask_refused_for_an_out_of_range_rectangle_leaves_residual_coverage_alone() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let Ok(id) = history.add_pixel_layer(&mut tree, "Masked", bounds(), None) else {
+            unreachable!("an empty tree accepts a root layer");
+        };
+        if let Err(err) = history.add_mask(&mut tree, &mut store, id, bounds()) {
+            unreachable!("{err:?}");
+        }
+        let mask = mask_surface(&tree, id);
+        paint_coverage(&mut store, mask, 3, 4, PAINTED);
+        if let Err(err) = history.remove_mask(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        let before = texels(&mut store, mask);
+
+        // The same origin bar `tree.rs`'s
+        // `add_mask_rejects_an_origin_past_the_document_range_and_leaves_the_layer_maskless`
+        // drives, reached here through `History` and with tiles at stake.
+        let far = Rect {
+            x: -aurora_core::MAX_DOCUMENT_ORIGIN - 1,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        match history.add_mask(&mut tree, &mut store, id, far) {
+            Err(DocError::LayerOriginOutOfRange { x, y, max }) => {
+                assert_eq!(x, -aurora_core::MAX_DOCUMENT_ORIGIN - 1);
+                assert_eq!(y, 0);
+                assert_eq!(max, aurora_core::MAX_DOCUMENT_ORIGIN);
+            }
+            other => unreachable!("expected LayerOriginOutOfRange, got {other:?}"),
+        }
+
+        assert!(
+            tree.mask(id).is_none(),
+            "a refused add must leave the layer maskless, not half-masked"
+        );
+        assert!(
+            store.contains_tile(mask, tile()),
+            "a refused add must not free the residual coverage undo still needs"
+        );
+        assert_eq!(
+            texels(&mut store, mask),
+            before,
+            "and must leave it byte-exact"
         );
         assert!(exactly(coverage_at(&mut store, mask, 3, 4), PAINTED));
     }

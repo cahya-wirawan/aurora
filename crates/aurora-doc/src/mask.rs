@@ -159,15 +159,35 @@
 //!         [`forget_mask_coverage`] itself. Same documented, accepted
 //!         bypass shape as [`crate::forget_document_surfaces`]'s own
 //!         "a removal that bypassed `History` entirely" gap.
-//!      2. **Once a new mask is actually committed, the old one's
-//!         coverage cannot be brought back by undo.** Undoing past the
-//!         add restores the previous `LayerMask` struct exactly, but
-//!         its pixels are gone: one derived surface can hold only one
-//!         mask's tiles. Accepted and tested
-//!         (`add_mask_makes_the_removed_masks_coverage_unrecoverable_by_undo`),
-//!         not silently lost. Holding both would need a surface per
-//!         mask *instance* — allocated rather than derived ids — which
-//!         is a separate decision.
+//!      2. **Undo does not travel backwards through this, and the
+//!         failure is not merely that the old coverage is missing —
+//!         the restored old mask reads the *newer* mask's coverage,
+//!         shifted.** Undoing past the add restores the previous
+//!         `LayerMask` struct exactly (bounds, `enabled`, `inverted`),
+//!         but coverage does not come with it: one derived surface can
+//!         hold only one mask's tiles, and the tiles now under it
+//!         belong to whichever mask painted most recently. So if the
+//!         replacement was painted before the undo, the restored
+//!         original opens wearing *those* pixels, interpreted against
+//!         its own different origin — which is character-for-character
+//!         the same defect shape 0.81.0 fixes going forward, for the
+//!         same underlying reason (derived, not allocated, surface
+//!         ids), still present going backward through undo. It is
+//!         reachable entirely through [`crate::History`]
+//!         (add → paint → remove → add → paint → undo → undo); no
+//!         [`crate::LayerTree::add_mask`] bypass is needed. If the
+//!         replacement was never painted, the milder reading applies
+//!         and the restored mask simply reads the unpainted default.
+//!
+//!         Both halves are accepted and tested rather than silently
+//!         lost —
+//!         `add_mask_makes_the_removed_masks_coverage_unrecoverable_by_undo`
+//!         pins the mild one and
+//!         `add_mask_undone_leaves_the_old_mask_reading_the_new_masks_coverage`
+//!         pins the real one. Fixing it, rather than disclosing it,
+//!         needs a surface per mask *instance* — allocated rather than
+//!         derived ids — which is a separate decision, deliberately not
+//!         taken in 0.81.0 or 0.81.1.
 //!    - **Coverage written outside the mask's own grid is dropped on
 //!      save.** [`write_mask_coverage`] does not check the `TileId` it
 //!      is given against the grid `crate::LayerMask::bounds` spans, and
@@ -408,6 +428,36 @@ pub fn write_mask_coverage(
 /// The narrower blast radius is what makes that safe: this touches
 /// exactly one layer's mask surface, never its pixel content and never
 /// another layer's anything.
+///
+/// # Cost: this is a whole-store scan, on a per-user-action path
+///
+/// The blast radius is narrow; the *cost* is not, and the two are
+/// unrelated. `aurora_tile::TileStore::forget_surface` walks every tile
+/// the store currently holds — resident, paged out, and pending — to
+/// find the ones belonging to one surface, and allocates a `HashSet` to
+/// do it. It is O(tiles in the store), not O(tiles of this surface).
+///
+/// That cost was justified where it came from and is **not** obviously
+/// justified here, which is why this says so plainly rather than
+/// inheriting the earlier reasoning silently. Its previous only caller
+/// was [`crate::forget_document_surfaces`], where the scan runs once,
+/// at document discard, at exactly the moment the store is fullest —
+/// so a full pass is proportionate and unavoidable. This function's
+/// caller, [`crate::History::add_mask`], runs on **every successful
+/// mask creation**: a routine click once the mask-painting UI (item 1
+/// above) lands, and overwhelmingly often on a layer that never had a
+/// mask at all, where the scan matches nothing and every bit of the
+/// work is waste. At the 300,000 × 300,000 px ceiling the store side of
+/// that is unbounded.
+///
+/// It is still correct, and it is still the right call to make here —
+/// the alternative is a mask that opens wearing a deleted mask's
+/// pixels. What it needs, when the UI makes this path hot, is a cheaper
+/// way to ask the question: a per-surface tile-count index, or an
+/// early-out `has_any_tiles(surface) -> bool` that lets the common
+/// never-had-a-mask case return before allocating anything. Both are
+/// new `aurora_tile::TileStore` API decisions and neither is taken
+/// here; this is a named follow-on, not a plan.
 pub fn forget_mask_coverage(
     layers: &crate::LayerTree,
     store: &mut aurora_tile::TileStore,

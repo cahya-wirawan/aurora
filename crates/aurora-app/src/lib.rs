@@ -21125,9 +21125,8 @@ mod tests {
     // Real integration test for `LayerMask` aggregation on a plain
     // `Pixel` layer, mirroring the shape of every prior aggregation
     // round's own `composite_document_*` test. `top` is opaque blue,
-    // covering the full 10x10 document, with a real mask
-    // (`LayerTree::add_mask`, the same API the Layers panel would use)
-    // covering only its left half (x in [0, 5)). `bottom` is opaque red,
+    // covering the full 10x10 document, with a real mask covering only
+    // its left half (x in [0, 5)). `bottom` is opaque red,
     // full coverage, no mask. Expected: left half shows `top`'s own
     // blue (inside the mask), right half shows `bottom`'s red through
     // (outside the mask, `top` contributes nothing there) -- a hard
@@ -21137,6 +21136,19 @@ mod tests {
     // never painted, so `mask.bounds` is the only thing deciding
     // anything. `composite_document_shows_and_hides_a_pixel_layer_by_real_mask_coverage`
     // is the counterpart that paints one.
+    //
+    // On the API this and the other mask fixtures below call: they use
+    // `LayerTree::add_mask` directly, and **a future Layers-panel
+    // "add mask" action must not**. `aurora_doc::History::add_mask` is
+    // the one to reach for -- it records the add for undo *and*, since
+    // 0.81.0, clears any coverage a previous mask on that layer left
+    // behind on the same derived surface. The bare `LayerTree` call
+    // does neither, so a panel wired to it would ship a mask that opens
+    // wearing a deleted mask's pixels, shifted. These fixtures are
+    // unaffected only because none of them removes a mask, and the ones
+    // that paint coverage paint it onto a surface no earlier mask
+    // touched -- an accident of the fixtures, not a property of the
+    // API. See `aurora_doc::mask`'s lifecycle notes.
     fn composite_document_clips_a_masked_pixel_layer_to_its_mask_bounds() {
         let (_dir, mut store) = real_tile_store();
         let mut layers = aurora_doc::LayerTree::new();

@@ -15448,16 +15448,15 @@ severity choice.
     updated; `LayerTree::add_mask`/`remove_mask` stay store-agnostic.
 
   **The seam is `add_mask`, not `remove_mask` — deliberately, and this
-  is the whole design decision.** The obvious shape is to free the tiles
-  when the mask is removed, and it is wrong for exactly the reason the
-  layer-removal bullet above already gives: `remove_mask` is undoable
-  via `LayerOp::RestoreMask`, so freeing there would make Ctrl+Z restore
-  a blank mask with the user's painted coverage already destroyed. It
-  would also directly invert 0.80.0's own
-  `forget_document_surfaces_frees_both_content_and_mask_tiles`, which
-  asserts the coverage survives a `remove_mask`. `History::remove_mask`
-  is therefore unchanged in behaviour; only its doc comment grew, to say
-  why.
+  is the whole design decision.** Freeing the tiles at removal would
+  make Ctrl+Z restore a blank mask, and would directly invert 0.80.0's
+  own `forget_document_surfaces_frees_both_content_and_mask_tiles`.
+  `History::remove_mask` is therefore unchanged in behaviour; only its
+  doc comment grew, to say why. **`aurora-doc`'s `mask` module docs are
+  the canonical, full statement** of this rule — as of 0.81.1 the other
+  four places that used to restate it (both `History` methods,
+  `LayerTree::add_mask`, and this addendum) carry a one-line summary and
+  a pointer instead, so there is one copy to keep true rather than five.
 
   **What this does *not* fix, stated plainly:**
 
@@ -15473,13 +15472,41 @@ severity choice.
     function's own doc comment. `aurora-io`'s and `aurora-app`'s tests
     are the direct callers today, and they paint no coverage.
   - **Once a new mask is committed, the old one's coverage is
-    unrecoverable by undo.** Undoing past the add restores the previous
-    `LayerMask` struct exactly — bounds, `enabled`, `inverted` — but not
-    its pixels: one derived surface holds one mask's tiles. Accepted,
-    and pinned by a test named for it rather than left to be discovered.
-    Holding both would need a surface per mask *instance* (allocated,
-    not derived, ids) — a separate decision, along with the still-absent
+    unrecoverable by undo — and (corrected in 0.81.1) the failure is
+    worse than "the old pixels are gone".** Undoing past the add
+    restores the previous `LayerMask` struct exactly — bounds,
+    `enabled`, `inverted` — but coverage does not travel with it: one
+    derived surface holds one mask's tiles, whichever mask painted them
+    last. So if the replacement mask was painted before the undo, the
+    restored *original* opens reading the **replacement's** coverage,
+    shifted by the offset between the two `bounds` origins — which is
+    character-for-character the defect shape this round fixes going
+    forward, still present going backward through undo, for the same
+    reason (derived, not allocated, surface ids). It is reachable
+    entirely through the ordinary `History` API (add → paint → remove →
+    add → paint → undo → undo); the `LayerTree::add_mask` bypass above
+    is not needed to hit it. 0.81.0 pinned only the mild reading (the
+    replacement left unpainted, so the restored mask reads the `1.0`
+    default), which understated it; 0.81.1 adds the sibling test that
+    pins the real one. Accepted rather than fixed: holding both masks'
+    pixels would need a surface per mask *instance* (allocated, not
+    derived, ids) — a separate decision, along with the still-absent
     `set_mask_bounds`, and neither is taken here.
+  - **`forget_mask_coverage` inherited document-discard's cost profile
+    on a much hotter path (disclosed in 0.81.1, not fixed).**
+    `TileStore::forget_surface` is O(tiles the store currently holds) —
+    a full scan of `resident`/`paged_out`/`pending` plus a `HashSet`
+    allocation — and its previous only caller, `forget_document_surfaces`,
+    justified that by running once, at discard, when the store is
+    fullest. `History::add_mask` runs it on *every* successful mask
+    creation, including the common case of a layer that never had a mask,
+    where it matches nothing and the whole scan is waste; at the
+    300,000 × 300,000 ceiling that is unbounded, on what becomes a
+    routine click once the mask-painting UI lands. Correct but
+    disproportionate. The named follow-on is a cheaper question — a
+    per-surface tile-count index, or an early-out
+    `has_any_tiles(surface) -> bool` — both new `TileStore` API
+    decisions, deliberately not taken in 0.81.1.
 
   Tests: five in `history.rs` —
   `add_mask_after_a_remove_starts_from_unpainted_coverage` (re-adds with
@@ -15516,6 +15543,61 @@ severity choice.
   notes it exists to close. Library-only; no GPU or interactive
   verification, and none is applicable — nothing in the app reaches this
   path yet.
+
+  **Addendum 2026-09-03 (0.81.1) — review follow-ups to 0.81.0. No
+  behaviour change; the fix itself survived both independent reviews
+  unchanged.** Neither reviewer found a critical or high issue, and the
+  central design decision (clear at `add_mask`, never `remove_mask`;
+  the ordering; `LayerTree` staying store-agnostic) survived every
+  mutation either tried. What 0.81.1 changes is what the round *said*
+  about itself, plus two tests:
+
+  - **The unrecoverable-by-undo disclosure was understated, and its
+    test's fixture is what hid that.** 0.81.0's
+    `add_mask_makes_the_removed_masks_coverage_unrecoverable_by_undo`
+    never paints the *replacement* mask before undoing, so it could
+    only ever show the restored mask reading the unpainted `1.0`
+    default. Paint the replacement first and the restored mask reads
+    the replacement's coverage instead — see the corrected bullet
+    above. New sibling test
+    `add_mask_undone_leaves_the_old_mask_reading_the_new_masks_coverage`
+    pins that, and the disclosures in `mask.rs`, `History::add_mask`
+    and this addendum now state it plainly. No code fix is available
+    without allocated per-instance mask surface ids, which stays out of
+    scope.
+  - **The `forget_surface` cost is now disclosed** rather than silently
+    inherited from document discard — see the new bullet above.
+    Disclosure only; the optimization it names is not implemented.
+  - **The ordering comment names three refusal branches; only two had
+    tests.** New `add_mask_refused_for_an_out_of_range_rectangle_leaves_residual_coverage_alone`
+    covers the third, pairing an out-of-range rectangle with a maskless
+    layer that is still carrying residue from a prior removal — the
+    case where a reordering really would destroy something. Verified
+    non-vacuous by a scratch mutation that guards only
+    `MaskAlreadyExists` before clearing: the 0.81.0 refusal test still
+    passes, the new one fails. Reverted.
+  - **A stale comment in `aurora-app`** described `LayerTree::add_mask`
+    as "the same API the Layers panel would use". After 0.81.0 that is
+    exactly the bypass — no undo, no stale-coverage clear. Corrected to
+    point at `History::add_mask`, and to say why the existing fixtures
+    are unaffected.
+  - **Five near-full copies of the same seam reasoning collapsed to
+    one.** See the seam paragraph above.
+
+  What 0.81.1 deliberately does *not* do: implement the `TileStore`
+  cost optimization, change the seam, plumb a store into `LayerTree`,
+  weaken any existing assertion, or investigate the `.aur` round trip
+  (add → paint → remove → `write_aur` → `read_aur` → add), which
+  remains an open follow-up nothing here covers.
+
+  **Verified (0.81.1)**: `cargo fmt --all --check`,
+  `check_layering.py`, `check_no_hardcoded_style.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `cargo test --workspace` (1,568
+  passing), `cargo test --workspace --doc`, and `RUSTDOCFLAGS=-D
+  warnings cargo doc --workspace --no-deps --all-features` all clean
+  locally. Library-only, same as 0.81.0; no GPU or interactive
+  verification, and none applicable.
 
   **Review found three real defects, all fixed by 0.70.4**: a
   cross-layer `SurfaceId` collision reachable through a crafted/
@@ -17531,8 +17613,10 @@ tooling-gated, fall into one of four buckets:
    mask's spatially-shifted coverage, because `History::add_mask` now
    clears that derived surface via the new
    `aurora_doc::mask::forget_mask_coverage` — at *add* time, not remove
-   time, since undo of a removal still needs those tiles. See M1.9's own
-   0.80.0 and 0.81.0 addenda for what is and is not fixed in each. The
+   time, since undo of a removal still needs those tiles. Going
+   *backward* through undo the same shape survives, disclosed rather
+   than fixed (0.81.1). See M1.9's own 0.80.0, 0.81.0 and 0.81.1
+   addenda for what is and is not fixed in each. The
    first is what still keeps
    every other slice, persistence included, from ever running end to
    end through the editor. Asked Cahya which of these two to
