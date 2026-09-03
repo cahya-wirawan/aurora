@@ -263,6 +263,17 @@
 //! samples the merged document directly at `doc_point`, matching
 //! `Drag::Eyedropper` itself, which never had that precondition.
 //!
+//! **And gated on `contains_tile`, 0.90.1**: reading the composite
+//! surface through `TileStore::get` *materialized* a blank tile there
+//! when none existed, which after 0.90.0's unchanged-tile upload skip
+//! became a real stale-pixel bug — an Eyedropper pick handled between a
+//! document open and the next redraw could leave the previous document's
+//! pixels in the GPU atlas indefinitely. `sample_pixel` now asks whether
+//! the tile was ever written before reading it, and returns `None` if
+//! not. No visible change to what the tool picks (a never-composited
+//! tile is transparent, i.e. already "nothing to pick"); see
+//! `sample_pixel`'s own doc comment for the full argument.
+//!
 //! **Undo/Redo** (PLAN.md's Undo/Redo bullet): `App` now keeps a live
 //! `history: aurora_doc::History` alongside `layers` (previously built
 //! once in `App::new`, used only to populate the History panel and
@@ -8265,24 +8276,25 @@ fn recomposite_visible_tiles(
     // every tile look resident. `contains_tile` would not do: it is also
     // `true` for a paged-out tile, i.e. for case 2.
     //
-    // **One residual the guard does not close, stated rather than
-    // argued away.** `is_resident` is `true` for a tile that some *other*
-    // caller materialized blank, and `sample_pixel` (the Eyedropper, via
-    // `eyedropper_sample`) reaches the composite surface through
-    // `TileStore::get`, which does exactly that. So: open a document
-    // (`forget_surface`), then let a pointer event carrying an Eyedropper
-    // pick reach `App` *before* the next redraw -- winit is free to
-    // deliver one there, and the `composite_cache.bump()` in the open
-    // handler does not prevent it, since a bump forces a recompute and
-    // says nothing about residency -- and that one sampled tile is now
-    // resident-blank. If the new document's composite is also transparent
-    // there, this skips, and the atlas keeps the old document's pixels
-    // for that one tile. Narrow (one tool, one event ordering, one tile,
-    // and a pan/size change on open usually re-slots the atlas and forces
-    // a re-upload anyway) but **not proven unreachable**; PLAN.md's M1.10
-    // 0.90.0 entry carries it as a disclosed residual with the fix
-    // (preserve dirtiness across page-out/page-in, then this whole guard
-    // can go).
+    // **The guard is only sound because this is the composite surface's
+    // sole materializer (0.90.1).** `is_resident` is `true` for a tile
+    // that some *other* caller materialized blank, so a second reader of
+    // `composite_surface_id()` reaching it through `TileStore::get`
+    // reintroduces case 1 wholesale: open a document (`forget_surface`),
+    // let an Eyedropper pick be handled before the next redraw (`rfd`'s
+    // dialog blocks the UI thread and redraws are only requested from
+    // `about_to_wait`, so a press queued during the dialog is; and
+    // `begin_drag` samples on a *fresh* press, no surviving drag needed),
+    // and that one tile is resident-blank -- whereupon this skips and the
+    // atlas keeps the previous document's pixels there. 0.90.0 shipped
+    // that as a disclosed residual and it was then reproduced end to end
+    // against a real atlas readback. It is closed in `sample_pixel`, the
+    // only such reader, by asking `contains_tile` before `get`; see that
+    // function's own doc comment. **So: a new reader of
+    // `composite_surface_id()` must not use `TileStore::get` without the
+    // same gate** -- the alternative, and the real fix that would let this
+    // whole guard go, is preserving dirtiness across page-out/page-in
+    // (PLAN.md, M1.10, still deferred).
     //
     // The comparison is over `f16::to_bits`, deliberately not `==`:
     // `-0.0 == 0.0` is `true` while the two have different bit patterns
@@ -9936,8 +9948,45 @@ fn layer_local_point(bounds: aurora_core::Rect, doc_point: (f32, f32)) -> (f32, 
 /// needs to pick a real, already-painted colour. `None` for a negative
 /// coordinate (`TileId`'s own fields are unsigned, so there is no tile
 /// there — the same "outside the surface" case
-/// [`aurora_gpu::TileResidency::set_origin`]'s own doc comment names) or
-/// if paging the touched tile in fails.
+/// [`aurora_gpu::TileResidency::set_origin`]'s own doc comment names),
+/// if the touched tile was never written at all, or if paging it in
+/// fails.
+///
+/// # Why the `contains_tile` gate is a correctness requirement (0.90.1)
+///
+/// [`aurora_tile::TileStore::get`] *materializes* a never-written tile:
+/// it hands back a brand-new `Tile::blank()` and makes it resident. For
+/// this function's own answer that is merely wasteful — a blank reads
+/// back as fully transparent, which is the same "nothing to pick"
+/// [`eyedropper_sample`] already turns into `None` for `a == 0.0`. For
+/// the *composite* surface it was a live stale-pixel bug, reproduced
+/// end to end against a real GPU atlas:
+///
+/// `replace_document_pixels` calls
+/// `store.forget_surface(composite_surface_id())` on every document
+/// open, so no composite tile is resident afterwards. `rfd`'s file
+/// dialog blocks the UI thread while it is open and a redraw is only
+/// requested from `about_to_wait`, so a primary-button press queued
+/// during the dialog is handled *before* the next redraw — and on the
+/// Eyedropper tool `begin_drag` samples immediately, on a fresh press,
+/// with no surviving drag needed. That one `get` then leaves a
+/// resident-blank composite tile behind. When the new document
+/// recomposites transparent at the same tile, `write_composited`'s
+/// residency-guarded byte comparison finds "resident and byte-identical"
+/// and skips the dirty mark — so `aurora_gpu::TileResidency::sync` never
+/// re-uploads it and the atlas keeps showing the *previous* document's
+/// pixels there until something else happens to re-dirty that tile.
+/// (Panning does not: `TileResidency::set_origin` never touches its slot
+/// bookkeeping, and slot addressing is `id % grid`, independent of
+/// origin.)
+///
+/// Asking first closes that: this is the only non-test reader of
+/// [`composite_surface_id`] outside `write_composited`, so with the gate
+/// in place `write_composited` is the sole materializer of that surface
+/// and its residency guard's "resident implies the bytes an upload read"
+/// inference holds again. See also
+/// [`aurora_tile::TileStore::is_resident`]'s own doc comment, which
+/// records that residency alone cannot carry that guarantee.
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 // x/y/r/g/b/a are the clearest names for "one pixel coordinate, one
@@ -9957,6 +10006,12 @@ fn sample_pixel(
         x: px / aurora_tile::TILE,
         y: py / aurora_tile::TILE,
     };
+    // Asked *before* `get`, which would materialize a blank tile and make
+    // it resident -- see this function's own doc comment for why that is a
+    // correctness problem for the composite surface and not just waste.
+    if !store.contains_tile(surface, tile_id) {
+        return None;
+    }
     let tile = store.get(surface, tile_id).ok()?;
     let (lx, ly) = (px % aurora_tile::TILE, py % aurora_tile::TILE);
     let index = (ly * aurora_tile::TILE + lx) as usize * aurora_tile::CHANNELS;
@@ -9979,8 +10034,12 @@ fn sample_pixel(
 /// layer's own surface), then reads the already-composited RGB back via
 /// [`sample_pixel`]. `None` — "nothing to pick" — for a fully
 /// transparent texel (no visible layer painted there) exactly as before,
-/// and for the same out-of-bounds/paging-failure cases [`sample_pixel`]
-/// itself already returns `None` for.
+/// and for the same out-of-bounds, never-composited, and paging-failure
+/// cases [`sample_pixel`] itself already returns `None` for. The
+/// never-composited case reaches the same answer a materialized blank
+/// would have (transparent, so nothing to pick) without materializing
+/// one — which is a correctness requirement, not a saving; see
+/// [`sample_pixel`]'s own doc comment.
 #[must_use]
 fn eyedropper_sample(
     store: &mut aurora_tile::TileStore,
@@ -19088,15 +19147,21 @@ mod tests {
         fill_solid(&mut store, above_surface, tile_id, [0.0, 1.0, 0.0, 1.0]);
 
         // Sanity check: `active`'s own surface really is transparent at
-        // this point -- never painted at all.
+        // this point -- never painted at all. Since 0.90.1 `sample_pixel`
+        // says that as `None` rather than `Some([0.0; 4])`: it asks
+        // `contains_tile` first instead of materializing a blank tile to
+        // read zeros out of (see its own doc comment -- on the composite
+        // surface that side effect was a real bug). `None` is the
+        // *stronger* statement of what this check wants, since a tile
+        // that was written all-zero would still be `Some`.
         let Some(active_surface) = layers.surface_id(active) else {
             unreachable!("just created as a pixel layer");
         };
-        let actives_own = sample_pixel(&mut store, active_surface, (5.0, 5.0)).unwrap_or([-1.0; 4]);
-        #[allow(clippy::float_cmp)]
-        {
-            assert_eq!(actives_own, [0.0, 0.0, 0.0, 0.0]);
-        }
+        assert_eq!(
+            sample_pixel(&mut store, active_surface, (5.0, 5.0)),
+            None,
+            "the active layer must never have been painted at this point"
+        );
 
         let residency =
             aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
@@ -23860,10 +23925,305 @@ mod tests {
             "and none of the forgotten surface's tiles may be skipped -- that is the stale-pixel \
              bug the residency guard exists to prevent: {second:?}"
         );
+        // The tile that actually exercises the residency guard. `tile_id`
+        // is (0, 0), the one tile `unchanged_skip_fixture` fills solid
+        // red, so a blank there differs from the recomposite regardless of
+        // the guard and asserting on it is tautological -- it would pass
+        // with the guard deleted. At a 256x256 residency the visible grid
+        // is 2x2 (`aurora-gpu`'s own
+        // `visible_tiles_covers_exactly_the_grid_from_the_current_origin`),
+        // and the fixture's layer is 10x10, so (1, 1) recomposites fully
+        // transparent -- byte-identical to the blank `get_mut` hands back
+        // after `forget_surface`. *That* is the comparison only residency
+        // can break, and the one whose skip would leave the previous
+        // document's pixels in the atlas.
+        let transparent_tile = aurora_tile::TileId { x: 1, y: 1 };
+        assert_eq!(
+            read_first_texel(&mut store, composite_surface_id(), transparent_tile),
+            (0.0, 0.0, 0.0, 0.0),
+            "the fixture's 10x10 layer cannot reach tile (1, 1), so its recomposite must be \
+             transparent -- i.e. byte-identical to a blank, which is what makes the next assertion \
+             mean something"
+        );
+        assert!(
+            store.is_dirty(composite_surface_id(), transparent_tile),
+            "a tile that recomposites byte-identically to the blank left by forget_surface must \
+             still be dirtied, or TileResidency::sync never re-uploads it and the atlas keeps the \
+             previous document's pixels there"
+        );
         assert!(
             store.is_dirty(composite_surface_id(), tile_id),
-            "the tile must be dirty again so TileResidency::sync re-uploads it over whatever the \
-             atlas still holds from the previous document"
+            "and the filled tile too, for the same reason"
+        );
+    }
+
+    /// Reads one texel straight out of the GPU atlas slot `id` currently
+    /// occupies — `TileResidency`'s own toroidal addressing (`id % grid`,
+    /// the same arithmetic `sync` uses), so this is the *uploaded* pixel
+    /// rather than whatever the tile store happens to hold. The ground
+    /// truth for "did `sync` actually replace what the previous document
+    /// left on screen", which no store-side or counter-side assertion can
+    /// answer.
+    ///
+    /// Kept next to its one caller rather than beside
+    /// [`render_and_sample_pixel`]: that helper renders the atlas
+    /// *through* `CanvasPipeline` and answers a different question (what
+    /// the canvas samples at a screen pixel, blend state and zoom
+    /// included). This one deliberately skips all of that.
+    fn atlas_texel(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        residency: &aurora_gpu::TileResidency,
+        id: aurora_tile::TileId,
+    ) -> [f32; 4] {
+        let texture = residency.texture();
+        let grid = (
+            texture.width() / aurora_tile::TILE,
+            texture.height() / aurora_tile::TILE,
+        );
+        assert!(
+            grid.0 > 0 && grid.1 > 0,
+            "the atlas is at least one tile on each axis"
+        );
+        let slot = (id.x % grid.0, id.y % grid.1);
+        // 8 bytes per texel: the atlas is `Rgba16Float`. At TILE = 256
+        // that is 2048, already a multiple of wgpu's 256-byte row
+        // alignment, so no padding arithmetic is needed.
+        let bytes_per_row = aurora_tile::TILE * 8;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atlas-texel-readback"),
+            size: u64::from(bytes_per_row) * u64::from(aurora_tile::TILE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("atlas-texel-readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: slot.0 * aurora_tile::TILE,
+                    y: slot.1 * aurora_tile::TILE,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(aurora_tile::TILE),
+                },
+            },
+            wgpu::Extent3d {
+                width: aurora_tile::TILE,
+                height: aurora_tile::TILE,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let Ok(Ok(())) = rx.recv() else {
+            unreachable!("map_async must complete once the device has been polled to idle");
+        };
+        let Ok(data) = slice.get_mapped_range() else {
+            unreachable!("the buffer was just confirmed mapped successfully above");
+        };
+        let mut out = [0.0_f32; 4];
+        for (channel, dest) in out.iter_mut().enumerate() {
+            let Some(&[lo, hi]) = data.get(channel * 2..channel * 2 + 2) else {
+                unreachable!("one whole tile was copied, so its first 8 bytes exist");
+            };
+            *dest = half::f16::from_bits(u16::from(lo) | (u16::from(hi) << 8)).to_f32();
+        }
+        drop(data);
+        readback.unmap();
+        out
+    }
+
+    #[test]
+    /// The end-to-end regression guard for the stale-pixel bug 0.90.0
+    /// disclosed as a residual and 0.90.1 fixed: an Eyedropper pick
+    /// handled between a document open and the next redraw used to
+    /// materialize a blank-but-*resident* composite tile, which made
+    /// `write_composited`'s residency-guarded byte comparison skip a
+    /// dirty mark the GPU atlas genuinely still needed.
+    ///
+    /// Why the event ordering is ordinary rather than exotic:
+    /// `rfd::FileDialog::pick_file` blocks the UI thread while the dialog
+    /// is open, redraws are only requested from `about_to_wait` (after the
+    /// current event batch drains), and on the Eyedropper tool
+    /// `begin_drag` samples on a *fresh* primary press — no surviving drag
+    /// needed. So a click queued during the dialog is handled first.
+    ///
+    /// This asserts the fix at both ends: the sample must not make the
+    /// tile resident, and the atlas must really stop showing the previous
+    /// document's red. Read back from the atlas itself, because the whole
+    /// failure mode is a store that looks right while the GPU shows
+    /// something else.
+    // 111 lines against a 100-line lint. One strictly ordered sequence —
+    // build and upload document A, open document B, sample, redraw,
+    // read back — where every step is meaningless without the ones
+    // before it; the ordering *is* what the test asserts, so splitting
+    // it would either duplicate the whole two-document fixture or let a
+    // later edit reorder the steps without any single test failing. Same
+    // trade the surrounding real-GPU tests already make.
+    #[allow(clippy::too_many_lines)]
+    fn an_eyedropper_pick_between_a_document_open_and_the_next_redraw_cannot_strand_stale_atlas_pixels()
+     {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        // `real_tile_store`'s own 16-tile budget would page across this
+        // 2x2 visible grid plus two documents' layer surfaces, and
+        // eviction is a *separate*, still-open hole (PLAN.md's M1.10
+        // 0.90.0 entry) that would confuse what this test is measuring.
+        let (_scratch, mut store) = diff_tile_store();
+
+        // The outgoing document: 512x512 solid red, which at TILE = 256
+        // covers every tile of the 2x2 visible grid completely.
+        let outgoing_image = filled_image(512, 512, [1.0, 0.0, 0.0, 1.0]);
+        let (outgoing_layers, outgoing_history, outgoing_layer) =
+            document_from_image("outgoing", &outgoing_image);
+        let Some(outgoing_surface) = outgoing_layers.surface_id(outgoing_layer) else {
+            unreachable!("document_from_image always builds a pixel layer");
+        };
+        if let Err(err) = aurora_io::write_into_store(&outgoing_image, &mut store, outgoing_surface)
+        {
+            unreachable!("{err:?}");
+        }
+
+        let mut residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+
+        // Frame 1, exactly as `redraw` runs it: composite, then sync.
+        recomposite_visible_tiles(
+            &residency,
+            &outgoing_layers,
+            Some(outgoing_layer),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let _ = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+
+        // The victim: a tile inside the visible grid that the *outgoing*
+        // document covers and the incoming one cannot reach.
+        let victim = aurora_tile::TileId { x: 1, y: 1 };
+        let before = atlas_texel(context.device(), context.queue(), &residency, victim);
+        assert!(
+            (before[0] - 1.0).abs() < 0.01 && before[3] > 0.99,
+            "the outgoing document's red must really be in the atlas, or this test proves nothing: \
+             {before:?}"
+        );
+
+        // The document open: 100x100 blue, which only ever reaches tile
+        // (0, 0). `replace_document_pixels` is the real store-side step
+        // `App::open_file` delegates to, and its
+        // `forget_surface(composite_surface_id())` is the whole setup.
+        let incoming_image = filled_image(100, 100, [0.0, 0.0, 1.0, 1.0]);
+        let (incoming_layers, _incoming_history, incoming_layer) =
+            document_from_image("incoming", &incoming_image);
+        let _freed = replace_document_pixels(
+            &mut store,
+            outgoing_layers,
+            outgoing_history,
+            &incoming_layers,
+            incoming_layer,
+            &incoming_image,
+        );
+        // What `App::open_file` does right after. A bump forces a
+        // recompute and says nothing about residency, which is precisely
+        // why it never prevented this bug.
+        cache.bump();
+        assert!(
+            !store.contains_tile(composite_surface_id(), victim),
+            "forget_surface must really have dropped the composite surface"
+        );
+
+        // The attack: one Eyedropper pick, before the next redraw, at a
+        // document point inside the victim tile. Both documents sit at
+        // (0, 0), so `active_layer_origin` is (0, 0) either way.
+        let picked = eyedropper_sample(&mut store, (0.0, 0.0), (300.0, 300.0));
+        assert_eq!(
+            picked, None,
+            "a never-composited tile has no colour to pick -- the same answer a materialized blank \
+             would have given, reached without materializing one"
+        );
+        assert!(
+            !store.is_resident(composite_surface_id(), victim),
+            "and the sample must not have made the tile resident: that resident blank is exactly \
+             what write_composited's residency guard would then mistake for the bytes of a real \
+             upload"
+        );
+        assert!(
+            !store.contains_tile(composite_surface_id(), victim),
+            "nor materialized it at all"
+        );
+
+        // Frame 2: the next redraw, now for the new document.
+        let _ = take_composite_write_outcomes();
+        recomposite_visible_tiles(
+            &residency,
+            &incoming_layers,
+            Some(incoming_layer),
+            &mut store,
+            &mut cache,
+            Some(&context),
+            Some(&mut compositor),
+        );
+        let outcomes = take_composite_write_outcomes();
+        assert_eq!(
+            outcomes[0], 0,
+            "no tile of a just-forgotten composite surface may be skipped: {outcomes:?}"
+        );
+        assert!(
+            store.is_dirty(composite_surface_id(), victim),
+            "the victim must be dirty, or sync has no reason to overwrite the previous document's \
+             pixels in its atlas slot"
+        );
+        let stats = residency.sync(
+            context.queue(),
+            &mut store,
+            composite_surface_id(),
+            false,
+            usize::MAX,
+        );
+        assert!(
+            stats.uploaded >= 1,
+            "and sync must actually upload it: {stats:?}"
+        );
+
+        // The proof, from the atlas rather than the store: the incoming
+        // document is transparent at this tile, so the outgoing one's red
+        // must be gone.
+        let after = atlas_texel(context.device(), context.queue(), &residency, victim);
+        assert!(
+            after[3] < 0.01 && after[0] < 0.01,
+            "the atlas must show the incoming document's transparency, not the outgoing \
+             document's pixels (before {before:?}, after {after:?}, write_composited outcomes \
+             {outcomes:?}, sync {stats:?})"
         );
     }
 
@@ -28585,12 +28945,27 @@ mod tests {
     }
 
     #[test]
-    fn sample_pixel_of_an_untouched_surface_reads_transparent() {
+    /// A never-written tile reads as "nothing to pick" *without being
+    /// materialized* (0.90.1). Before that it returned
+    /// `Some([0.0; 4])` — the same answer as far as
+    /// `eyedropper_sample`'s own `a > 0.0` test is concerned, since a
+    /// blank is fully transparent, but it got there by allocating a
+    /// whole tile and making it resident. On the composite surface that
+    /// side effect was a live stale-pixel bug; see `sample_pixel`'s own
+    /// doc comment. The store-side half of the contract is asserted
+    /// here, not just the return value.
+    fn sample_pixel_of_an_untouched_surface_reads_nothing_without_materializing_a_tile() {
         let (_dir, mut store) = real_tile_store();
         let surface = aurora_tile::SurfaceId::from_raw(0);
-        assert_eq!(
-            sample_pixel(&mut store, surface, (5.0, 5.0)),
-            Some([0.0, 0.0, 0.0, 0.0])
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        assert_eq!(sample_pixel(&mut store, surface, (5.0, 5.0)), None);
+        assert!(
+            !store.contains_tile(surface, tile),
+            "the sample must not have materialized the tile it looked at"
+        );
+        assert!(
+            !store.is_resident(surface, tile),
+            "nor made one resident, which is the half write_composited's residency guard reads"
         );
     }
 

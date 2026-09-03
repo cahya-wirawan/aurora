@@ -18298,13 +18298,25 @@ severity choice.
   printed side by side by `report_frame_stages`, with that distinction
   stated in the output itself.
 
-  On these two fixtures the two happened to coincide exactly, which is
-  worth recording as an observation rather than a general rule: GPU path
-  `changed` 1.3 + `not_resident` 5.5 = **6.8**, and `SyncStats` reports
-  exactly 6.8 tiles/frame; CPU fallback 1.2 + 3.7 = **4.9**, and
-  `SyncStats` reports 4.9. So the atlas-residency second skip point
-  removed *nothing additional* here — every tile `write_composited`
-  dirtied was in fact uploaded.
+  On these two fixtures the two coincided exactly: GPU path `changed` 1.3
+  + `not_resident` 5.5 = **6.8**, and `SyncStats` reports exactly 6.8
+  tiles/frame; CPU fallback 1.2 + 3.7 = **4.9**, and `SyncStats` reports
+  4.9. So the atlas-residency second skip point removed *nothing
+  additional* here — every tile `write_composited` dirtied was in fact
+  uploaded.
+
+  **That equality is an observation on these two fixtures, not a rule,
+  and this entry originally overstated it (corrected 0.90.1).** The
+  in-code doc comment always had it right — "upper bound", "a separate
+  skip point" — and this paragraph should be read the same way. `sync`
+  has an **independent upload trigger** the `write_composited` buckets
+  cannot see: a tile whose atlas *slot* no longer matches its id is
+  uploaded regardless of dirtiness (that is what makes toroidal
+  addressing correct after a pan). Neither fixture pans, so no slot ever
+  went stale and the two numbers had no way to diverge; a large pan is
+  enough to break the equality in either direction. Do not use it as an
+  identity, and do not infer from it that `SyncStats` can be predicted
+  from these buckets.
 
   *Measured on the real GPU, three runs each side, ranges not single
   figures (this file's own convention). Baseline captured on the
@@ -18339,6 +18351,25 @@ severity choice.
   the *before* side reported, which is the cleanest confirmation that
   every recomputed tile used to be uploaded.
 
+  **Re-run after 0.90.1's correctness fix** (same adapter, same three-runs
+  -per-side protocol), to confirm the fix did not eat the win. **Every
+  volume metric came back bit-identical** — the metrics that are not
+  timings and so not noise-sensitive: GPU 6.8 tiles/frame and 3.41
+  MB/frame, CPU fallback 4.9 and 2.46, and all six counter buckets
+  unchanged to the decimal (13.2 / 1.3 / 5.5 and 4.1 / 1.2 / 3.7). That is
+  the expected result: the fix touches the Eyedropper's own read path, not
+  the frame path. Timings moved only within this entry's own documented
+  noise: GPU whole-frame mean 18.63–19.17 ms (was 18.57–18.65), p50
+  17.99–18.50 (was 17.98–18.32), `upload_sync` mean 4.97–5.15 (was
+  4.87–4.90); CPU fallback whole-frame mean 14.06–14.66 (was 13.74–14.19),
+  p50 13.94–14.11 (was 13.58–14.17), `upload_sync` mean 3.59–3.62 (was
+  3.54–3.66). Ranges overlap or sit adjacent on every line, one CPU run
+  was a visible outlier (p99 23.35 ms against 17.06/17.01 on the other
+  two, n=12), and none of it is separable from the ~34% p99 spread this
+  entry already measured across three *identical* runs. **No claim of
+  either improvement or regression from the re-run**, only that the
+  0.90.0 win is intact.
+
   **Honest reading.** Unlike 0.89.0, this is not a marginal result, but
   it is not uniform either:
 
@@ -18348,13 +18379,38 @@ severity choice.
     the GPU path and 9.0 → 4.9 (**−45%**) on the CPU fallback, identical
     in all three runs on each side. **Both benchmarks demonstrated a
     real reduction here.** The `not_resident` buckets (5.5 and 3.7) are
-    the expected, legitimate consequence of each fixture's
-    `real_tile_store()` budget (16 tiles) being smaller than its
-    per-frame working set, so composite tiles are evicted and re-paged
-    between frames and the guard correctly refuses to compare them. That
-    is a fixture property, not a defect, and it is why the skip rate is
-    not higher; neither fixture was altered to make the number look
-    better.
+    the consequence of each fixture's `real_tile_store()` budget (16
+    tiles) being smaller than its per-frame working set, so composite
+    tiles are evicted and re-paged between frames and the guard correctly
+    refuses to compare them. That is why the skip rate is not higher;
+    neither fixture was altered to make the number look better.
+
+    **Correction (0.90.1): calling those buckets "a fixture property, not
+    a defect" understated what they are evidence of.** The guard's own
+    refusal to compare is indeed correct behaviour. But the same
+    budget-pressure that produces those buckets also drives a
+    *pre-existing*, still-open hole one layer down, and **these are the
+    first direct measurements showing that path is hot rather than
+    merely possible**: a composite tile marked dirty by
+    `write_composited` can be evicted *later in the same recomposite
+    pass*, by a subsequent tile's own `get_mut`/`get`. It comes back
+    through `Tile::from_texels`, which starts clean, so the dirty flag is
+    gone — and `TileResidency::sync` (`crates/aurora-gpu/src/residency.rs`,
+    the `is_dirty` peek around lines 890–893) can then decline to upload
+    fresh content whose atlas slot still nominally matches. At 5.5
+    (GPU) and 3.7 (CPU) tiles per frame, this is firing constantly on
+    these fixtures, not occasionally.
+
+    The uncomfortable part is that it is **not** a fixture quirk in the
+    way "budget 16" makes it sound. "Store budget smaller than the
+    per-frame working set" is the *design assumption* at the
+    300,000 × 300,000 px ceiling (invariant §7.3.1: nothing assumes a
+    document fits in memory) — a real document at that size is
+    permanently in this regime. A larger fixture budget would hide the
+    measurement, not the hole. Not introduced by 0.90.0, not fixed by
+    0.90.1, and deliberately out of scope for both: the real fix is
+    persisting dirty state across page-out/page-in, named as the deferred
+    follow-on below.
   - **`upload_sync` mean and p50 fall by ~2.9–3.3× (GPU) and ~1.8–2×
     (CPU fallback)**, with ranges nowhere near overlapping, and the
     stage's share of the mean frame drops from 53.1–53.9% to 26.2–26.3%
@@ -18386,33 +18442,55 @@ severity choice.
     with a 2.3× tail is not a 60 FPS canvas. This is the largest single
     step toward that gate so far and it does not close it.
 
-  **Disclosed residual (checked, real, and not mitigated here).**
-  `is_resident` is `true` for a tile some *other* caller materialized
-  blank, and `sample_pixel` — the Eyedropper, via `eyedropper_sample` —
-  reaches the composite surface through `TileStore::get`, which does
-  exactly that. So: open a document (`forget_surface`), then let a
-  pointer event carrying an Eyedropper pick reach `App` *before* the next
-  redraw, and that one sampled tile is resident-blank; if the new
-  document's composite is transparent there too, the write is skipped and
-  the atlas keeps the old document's pixels for that tile. **The
-  Planner's argument that this is unreachable does not hold**: it rested
-  on `replace_document_pixels` always being followed by
-  `composite_cache.bump()` before any redraw, and while that is true (both
-  are in the same synchronous open handler), a bump forces a *recompute*
-  and says nothing about *residency*, so it does not prevent the skip.
-  What makes it narrow is different and weaker: one tool, one event
-  ordering, one tile, and an open usually changes canvas size or pan
-  enough to re-slot the atlas and force a re-upload anyway. Carried as a
-  disclosed residual rather than argued away.
+  **Disclosed residual — since reproduced as a live bug and fixed in
+  0.90.1. See that entry below; what follows is what 0.90.0 shipped
+  knowing, kept for the record.** `is_resident` is `true` for a tile some
+  *other* caller materialized blank, and `sample_pixel` — the Eyedropper,
+  via `eyedropper_sample` — reaches the composite surface through
+  `TileStore::get`, which does exactly that. So: open a document
+  (`forget_surface`), then let a pointer event carrying an Eyedropper pick
+  reach `App` *before* the next redraw, and that one sampled tile is
+  resident-blank; if the new document's composite is transparent there
+  too, the write is skipped and the atlas keeps the old document's pixels
+  for that tile. **The Planner's argument that this is unreachable does
+  not hold**: it rested on `replace_document_pixels` always being followed
+  by `composite_cache.bump()` before any redraw, and while that is true
+  (both are in the same synchronous open handler), a bump forces a
+  *recompute* and says nothing about *residency*, so it does not prevent
+  the skip.
+
+  **Both of this entry's own "what makes it narrow" claims were then shown
+  false**, which is why it stopped being a residual and became a patch:
+
+  - *"An open usually changes canvas size or pan enough to re-slot the
+    atlas and force a re-upload anyway"* — **false for panning.**
+    `TileResidency::set_origin` never touches `self.slots` (only `resize`
+    does), and slot addressing is `id % grid`, independent of origin. An
+    open does not resize the window, and both documents load at origin
+    (0, 0), so the slot bookkeeping survives intact and nothing forces a
+    re-upload.
+  - *"One event ordering"*, implying something exotic — **false.**
+    `rfd::FileDialog::pick_file` blocks the UI thread while the dialog is
+    open, and a redraw is only requested from `about_to_wait`, i.e. after
+    the current event batch drains. A `MouseInput::Pressed` queued during
+    the dialog is therefore handled *before* the next redraw, and on the
+    Eyedropper tool `begin_drag` samples on a **fresh primary press** — no
+    surviving drag needed. That is ordinary event ordering.
+
+  What *was* accurate is the reachability bound: `sample_pixel` is the
+  only non-test reader of `composite_surface_id()` outside
+  `write_composited`, and `open_aur_file` is immune because it
+  deliberately does not sweep surfaces.
 
   **Deferred follow-on that would let the guard be dropped entirely:**
   make `TileStore`/`Tile::from_texels` preserve dirtiness across
   page-out/page-in (persist the dirty rectangle with the paged tile), and
   give `forget_surface` a way to tell the atlas that surface's slots are
   stale. Both correctness scenarios above disappear, `is_resident`'s
-  gating becomes unnecessary, and the skip rate rises by whatever the
-  `not_resident` buckets currently hold (5.5 and 3.7 tiles/frame here).
-  Not attempted in this round.
+  gating becomes unnecessary, the separate mid-pass eviction hole
+  documented under "Honest reading" above closes with them, and the skip
+  rate rises by whatever the `not_resident` buckets currently hold (5.5
+  and 3.7 tiles/frame here). Not attempted in this round or in 0.90.1.
 
   Same platform limitations as the rest of this entry: one adapter, one
   platform (Linux/Vulkan/RTX 3090), **no Metal, no DX12** — and this
@@ -18421,6 +18499,91 @@ severity choice.
   micro-optimization. Both benchmarks still call `CompositeCache::bump()`
   once per frame, so the stage shares are a property of these fixtures
   rather than a general result.
+
+  **0.90.1 — the residual above was reproduced as a live stale-pixel bug
+  and closed.** Independent review took 0.90.0's disclosed residual apart,
+  found both of its "what makes it narrow" mitigations false (see the
+  corrected list above), and then *reproduced the bug end to end against a
+  real GPU atlas readback*: after the sequence fires, the atlas literally
+  still shows the previous document's red pixels for the affected tile.
+  Silent visual corruption showing a different document's pixels is not
+  something this project ships as a disclosure when a three-line fix
+  exists, so it did not.
+
+  **The fix, in `sample_pixel` (`crates/aurora-app/src/lib.rs`) rather
+  than in the guard:** ask `store.contains_tile(surface, tile_id)` *before*
+  `store.get(...)` and return `None` if the tile was never written. That
+  removes the only blank-materializer for the composite surface outside
+  `write_composited` itself, which is exactly what the residency guard's
+  "resident implies these are the bytes an upload read" inference needs to
+  hold. `write_composited`, the residency guard, and
+  `TileResidency::sync` are all untouched.
+
+  It is also correct on its own terms rather than a workaround: an
+  Eyedropper on a never-composited tile has nothing to pick, which is
+  already what `eyedropper_sample` answers for `a == 0.0`. The gate just
+  reaches that same answer without allocating a `SAMPLES`-long buffer of
+  zeros and making it resident — the identical argument
+  `TileStore::contains_tile`'s own doc comment already records for mask
+  compositing. The one visible contract change is that `sample_pixel`
+  itself now returns `None` instead of `Some([0.0; 4])` for a
+  never-written tile; `eyedropper_sample`, its only non-test caller, maps
+  both to the same "nothing to pick".
+
+  **Reproduction, both directions, on a real adapter** (`AURORA_REQUIRE_GPU=1`,
+  NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu). New test
+  `an_eyedropper_pick_between_a_document_open_and_the_next_redraw_cannot_strand_stale_atlas_pixels`
+  drives the real sequence — 512×512 red document composited and synced,
+  `replace_document_pixels` to a 100×100 blue one, `cache.bump()`, one
+  `eyedropper_sample` inside tile (1, 1), then the next frame's
+  recomposite and sync — and reads the answer back out of the **atlas
+  texture slot**, not the tile store, because the whole failure mode is a
+  store that looks right while the GPU shows something else. With the
+  `contains_tile` gate temporarily removed it fails exactly as predicted:
+
+  ```
+  picked=None  resident=true
+  write_composited outcomes [skipped, changed, not_resident] = [1, 0, 3]
+  victim dirty = false
+  sync = SyncStats { uploaded: 3, bytes_uploaded: 1572864, remaining: 0, errors: 0 }
+  atlas at victim: before [1.0, 0.0, 0.0, 1.0]  after [1.0, 0.0, 0.0, 1.0]
+  ```
+
+  One tile skipped, never dirtied, only 3 of 4 uploaded, and the atlas
+  still holding the *outgoing* document's opaque red. With the gate in
+  place the tile is never materialized, `skipped` is 0, the tile is
+  dirtied, `sync` uploads it, and the atlas reads back transparent.
+
+  **Two review-found accuracy fixes landed with it**, both cheap and both
+  about not misleading the next reader:
+
+  - `TileStore::is_resident`'s doc comment claimed residency "is also the
+    condition that separates 'this tile's bytes are the bytes somebody
+    wrote' from a brand-new blank" — **the exact inference this bug
+    disproves**, since a blank materialized by any `get` is resident the
+    instant it exists. Rewritten to state the one guarantee residency
+    does carry (the same in-memory `Tile` has existed continuously since
+    the caller last looked, so no dirty flag was silently dropped) and to
+    point at the caller-side gate as the other half of the argument.
+  - `a_forgotten_composite_tile_is_dirtied_again_even_though_its_content_is_unchanged`
+    asserted `is_dirty` on tile (0, 0) — the one tile its fixture fills
+    solid red, so a blank differs from it regardless of the guard and the
+    assertion was **tautological**. Verified by mutation: with
+    `was_resident` forced true, tile (0, 0) is still dirty while
+    transparent tile (1, 1) is not. The assertion now covers (1, 1), the
+    tile that recomposites byte-identically to the blank and so is the
+    one the residency check is actually protecting, with the tautological
+    one kept alongside it and labelled. (Review suggested tile (2, 2);
+    that tile is outside this fixture's 2×2 visible grid at a 256×256
+    residency and is never composited at all, so (1, 1) is the right
+    tile.)
+
+  **No performance change intended or measured.** One `contains_tile`
+  lookup on the Eyedropper's own path — three `HashMap`/`LruCache`
+  lookups, no I/O, no allocation, and not on the frame path at all. The
+  0.90.0 benchmark table above was re-run after the fix to confirm the
+  measured win survives; see the re-run note under that table.
+  2 tests changed, 1 added.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

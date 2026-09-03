@@ -556,11 +556,28 @@ impl TileStore {
     /// precisely that condition. `aurora-app`'s `write_composited` is
     /// that caller.
     ///
-    /// It is also the condition that separates "this tile's bytes are
-    /// the bytes somebody wrote" from "[`Self::get`] would hand back a
-    /// brand-new `Tile::blank()`": a surface just dropped by
-    /// [`Self::forget_surface`] has no resident tile, so a blank
-    /// materialized after it compares equal to nothing anybody uploaded.
+    /// # What it does *not* mean
+    ///
+    /// It is **not** the condition "this tile's bytes are bytes somebody
+    /// wrote". A blank materialized by *any* [`Self::get`] is resident
+    /// the instant it exists, so residency cannot distinguish a real
+    /// upload's tile from a brand-new `Tile::blank()` some unrelated
+    /// caller happened to touch. An earlier version of this comment
+    /// claimed otherwise, and the claim was wrong: it was reproduced as
+    /// a live stale-pixel bug in 0.90.0 — `aurora-app`'s `sample_pixel`
+    /// (the Eyedropper) materialized a blank composite tile between a
+    /// document open's [`Self::forget_surface`] and the next redraw, and
+    /// `write_composited` then found it "resident and byte-identical" to
+    /// a transparent recomposite and skipped an upload the GPU atlas
+    /// genuinely still needed.
+    ///
+    /// So residency carries exactly one guarantee — *the same in-memory
+    /// [`Tile`] has existed continuously since the caller last looked*,
+    /// hence no dirty flag was silently dropped. Any caller wanting the
+    /// stronger "somebody wrote these bytes" property needs that on the
+    /// *writer* side too: every other reader of the surface must avoid
+    /// materializing blanks (ask [`Self::contains_tile`] before
+    /// [`Self::get`]), which is what closed the bug above in 0.90.1.
     ///
     /// One `LruCache` lookup, no I/O, no allocation. Peeks rather than
     /// gets, for [`Self::is_dirty`]'s reason: asking is not an access
