@@ -15337,34 +15337,100 @@ severity choice.
   reasoning, as 0.84.1's removal of 0.84.0's two unfireable index
   guards.
 
-- [ ] **Empty-tile GPU composite work: a blank tile still pays a full
-  per-layer GPU round trip.** Found and disclosed in 0.86.1 while
+- [x] **Empty-tile GPU composite work: a blank tile no longer pays a
+  full per-layer GPU round trip — done 2026-09-03 (0.87.0).** Found and
+  disclosed in 0.86.1 while
   correcting `begin_gpu_composite_tile`'s doc comments, which had
   described its "nothing resolved" bail as reachable whenever "no root
-  layer resolved to real content at this tile". It is not.
+  layer resolved to real content at this tile". It was not.
   `TileStore::get`/`ensure_resident` answer *any* tile coordinate ever
   asked for with `Ok(`a blank tile`)` rather than signalling absence —
   core to their lazy-paging design, and the same class of thing PLAN.md
   already records as "a layer's declared `bounds` is a position hint,
   not an enforced clip on its real painted content". So `resolve_tile`
-  returns `Some` for every visible layer at every coordinate, and the
-  bail is reachable **only when every layer in the tree is invisible**.
+  returned `Some` for every visible layer at every coordinate, and the
+  bail was reachable **only when every layer in the tree was invisible**.
 
-  The cost is real and lands squarely on the already-failing 60 FPS
-  gate: panning into blank canvas at the 300,000 × 300,000 px ceiling
-  currently issues, per tile, one `TILE × TILE × 8` byte upload
+  The cost was real: panning into blank canvas at the
+  300,000 × 300,000 px ceiling issued, per tile, one `TILE × TILE × 8`
+  byte upload
   (512 KiB at `TILE` = 256) plus a blend pass **per visible layer**, then
   one submit and a full 512 KiB GPU→CPU readback — to produce
-  transparent pixels. A document with ten visible layers pays ten
+  transparent pixels. A document with ten visible layers paid ten
   uploads, 5 MiB of PCIe traffic, per empty tile.
 
-  **Deliberately not attempted in 0.86.1**, which was a
-  correction round. Fixing it means giving the tile store (or this
-  function) a way to distinguish "blank because nothing was ever
-  painted there" from "blank because it is transparent there" — a real
-  API and design decision inside `aurora-tile`'s lazy-paging core, not a
-  local change in `aurora-app`. Both doc comments now state the true
-  reachability and point here.
+  **Deliberately not attempted in 0.86.1**, which was a correction
+  round. Both doc comments there stated the true reachability and
+  pointed here.
+
+  **The fix, and the premise 0.86.1 got wrong.** 0.86.1 wrote that this
+  needed "a real API and design decision inside `aurora-tile`'s
+  lazy-paging core, not a local change in `aurora-app`". That was
+  **wrong**, and planning this round found it: the primitive that
+  distinguishes "nothing was ever stored here" from "stored, and
+  transparent" already existed. `TileStore::contains_tile`
+  (`crates/aurora-tile/src/store.rs`) was added for the mask-coverage
+  round and consults `resident`/`pending`/`paged_out` — residency, never
+  tile contents — and `aurora-app`'s own `read_layer_window` had been
+  using it since 0.80.0 to skip each of its up-to-four source-tile reads,
+  along with `LayerWindow::is_blank()` for the whole-window case. The
+  only places missing the check were `resolve_tile`'s own two `Pixel`
+  branches, which asked for texels unconditionally. **0.87.0 changed
+  `aurora-app` only; not one line of `aurora-tile`.**
+
+  Both branches now bail before the read: `contains_tile` in the
+  same-origin branch, `LayerWindow::is_blank()` in the windowed one
+  (`is_blank`, deliberately, not `texels.is_none()` alone — the latter is
+  also true when the overlapping tiles *existed and failed to read*,
+  which must keep taking the ordinary path so `read_layer_window`'s
+  `note_store_error` charging, and the export refusal built on it, is not
+  quietly dropped). `resolve_tile` returns `None`, so
+  `begin_gpu_composite_tile`'s `current?` bail is reached with nothing
+  uploaded, nothing recorded and no command buffer submitted, and
+  `composite_roots_into_tile` simply skips the contributor.
+
+  Bit-identical, not approximately: `aurora_render::composite_layer_into`
+  scales every source texel by `as = src_a * opacity`, zero throughout a
+  blank tile, so every mode's fold reduces to `Co = Cb`/`result_a =
+  dst_a`. Pinned across `Normal`/`Multiply`/`Darken`/`Dissolve` **and
+  `Screen`** — the last one having no GPU arm at all, so the property is
+  demonstrably the fold's and not special-cased per mode — plus GPU/CPU
+  differentials on real hardware (NVIDIA RTX 3090, Vulkan) for the four
+  expressible modes, and `queue.submit`/`DARKEN_GPU_DISPATCHES` counter
+  assertions for the work itself. Seven new tests; each guard was
+  temporarily disabled to confirm the tests that should fail do.
+
+  **The distinction that keeps this honest**: "never stored" is skipped,
+  "stored and fully transparent" is **not**. A tile painted and then
+  erased to `(0, 0, 0, 0)` has `contains_tile == true` and still
+  composites for real, on both paths — two tests exist only to pin that,
+  because a guard written against texel values instead of residency would
+  pass every other test in the group and silently change what an eraser
+  stroke means.
+
+  **Residuals, stated plainly:**
+
+  - **This is not a 60 FPS fix.** It removes real GPU/PCIe work while
+    panning into blank canvas, which is a different path from the one
+    CLAUDE.md's measured table covers — those p50/p99 numbers were taken
+    while *painting*, on tiles with real content, and are unchanged. No
+    re-measurement was done this round, and none of the numbers in that
+    table should be read as having moved.
+  - **What replaces the GPU work still costs something.** The tile falls
+    to the CPU path, whose own blank-tile handling allocates a
+    transparent tile, un-premultiplies it and writes it into the
+    composite surface. Far less than an upload + blend + submit +
+    readback per layer, but not free.
+  - **`resolve_tile`'s `Group` arm is deliberately unchanged.** A group
+    could in principle bail the same way once every child resolves to
+    `None`, but groups never reach the GPU compositing path at all
+    (`document_qualifies_for_gpu_compositing` rejects a visible group), so
+    there is no GPU work to save — only the CPU path's own cheaper
+    blank-tile handling, on a path that also has existing callers written
+    against "a group always resolves" (the assertion inside
+    `resolve_tile_drops_the_branch_it_has_no_budget_left_for`, for one, is
+    an `unreachable!` on exactly that). Named as a follow-on rather than
+    silently dropped.
 
   **A third site missed the correction (fixed in 0.86.2).** The
   accumulator-pair doc comment (`begin_gpu_composite_tile`'s body,

@@ -6215,6 +6215,24 @@ impl CompositeBudget {
 /// the caller simply omits this contributor from its own composite
 /// rather than propagating the error further.
 ///
+/// Also `None` — new in 0.87.0, and the ordinary case rather than an
+/// error one — for a **visible** [`aurora_doc::LayerKind::Pixel`] layer
+/// with *nothing ever stored* on its surface overlapping this tile:
+/// `aurora_tile::TileStore::contains_tile` for the same-origin branch,
+/// [`LayerWindow::is_blank`] for the windowed one. Before this, both
+/// branches asked the store for the tile unconditionally and got
+/// `Some(`all-zero texels`)` back, because the store's lazy paging
+/// answers a coordinate nothing was ever painted at by *materializing* a
+/// blank tile rather than by signalling absence — so every caller then
+/// paid a full contributor's worth of compositing work (on the GPU path,
+/// a tile-sized upload, a blend pass and a readback) to add nothing.
+/// `None` is bit-identical output: `aurora_render::composite_layer_into`
+/// scales every texel by `src_a * opacity`, which is zero throughout a
+/// blank tile, leaving the destination exactly as it was. See the
+/// branch's own comment for why "never stored" must stay distinct from
+/// "stored, and fully transparent" (an erased tile is real content and
+/// still resolves), and PLAN.md's M1.10 "Empty-tile GPU composite work".
+///
 /// **Origin handling doesn't get any harder with nesting**:
 /// [`aurora_doc::LayerKind::Group`] has no `bounds`/offset of its own —
 /// every [`aurora_doc::LayerKind::Pixel`] layer's own `bounds` is
@@ -6292,6 +6310,42 @@ fn resolve_tile(
             let surface = layers.surface_id(id)?;
             let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
             let texels = if origin == reference_origin {
+                // **Nothing was ever stored here, so there is nothing to
+                // composite** (0.87.0). `TileStore::get` *materializes* an
+                // untouched tile -- allocates it, makes it resident,
+                // promotes it in the LRU and (residency being capped) can
+                // evict a real tile to make room, paying a synchronous
+                // encode and scratch-disk write -- purely to hand back
+                // zeros. `contains_tile` answers the same question in
+                // three hash lookups, and this is exactly the guard
+                // `read_layer_window` (the windowed sibling below) already
+                // applies to each of its up-to-four source tiles.
+                //
+                // Returning `None` is **bit-identical** to the
+                // `Some(`all-zero texels`)` it replaces, for every blend
+                // mode: `aurora_render::composite_layer_into` derives
+                // `as = src_a * opacity`, which is `0.0` at every texel of
+                // a blank tile, and every mode's fold then reduces to
+                // `Co = Cb` and `result_a = dst_a` -- the destination
+                // untouched. The mask and `Dissolve` tails below are
+                // skipped for the same reason: masking can only *reduce*
+                // an already-zero alpha, and `dissolve_gate` weights each
+                // texel's gate by `texel_alpha * opacity`, so it too
+                // yields a fully transparent buffer.
+                //
+                // **"Never stored" is not "transparent."** The two look
+                // the same in the texels and are different facts, and only
+                // the first one is safe to skip. A tile that was painted
+                // and then erased to `(0, 0, 0, 0)` has
+                // `contains_tile == true` -- the check consults
+                // `resident`/`pending`/`paged_out`, never tile content --
+                // so it still takes the full path below, which is what
+                // keeps this from quietly changing the meaning of an
+                // eraser stroke. See
+                // `resolve_tile_still_resolves_a_tile_written_to_full_transparency`.
+                if !store.contains_tile(surface, tile_id) {
+                    return None;
+                }
                 match store.get(surface, tile_id) {
                     Ok(tile) => tile.texels().to_vec(),
                     Err(err) => {
@@ -6321,15 +6375,34 @@ fn resolve_tile(
                     }
                 }
             } else {
-                read_layer_window(
+                let window = read_layer_window(
                     store,
                     surface,
                     origin,
                     doc_origin,
                     budget,
                     WindowKind::LayerPixels,
-                )
-                .into_texels()
+                );
+                // The windowed half of the same-origin guard above, and
+                // the same bit-identical reasoning: a window with nothing
+                // stored under any of the up-to-four source tiles it
+                // overlaps contributes no texel to this composite, so skip
+                // it rather than materializing the all-zero buffer
+                // `into_texels` would.
+                //
+                // [`LayerWindow::is_blank`], deliberately, and **not**
+                // `texels.is_none()` alone: the latter is also true when
+                // every overlapping source tile existed but *failed to
+                // read*, which must keep going down the ordinary path so
+                // `read_layer_window`'s own error charging
+                // (`CompositeBudget::note_store_error`, which the export
+                // refusal is built on) is not quietly dropped. `is_blank`
+                // is "blank *and known to be*" -- nothing stored and
+                // nothing unread.
+                if window.is_blank() {
+                    return None;
+                }
+                window.into_texels()
             };
             // Masking runs first, ahead of `Dissolve` below: it
             // restricts which pixels are even in play, and by how much,
@@ -7258,7 +7331,15 @@ fn note_gpu_composite_submit() {}
 ///   zero GPU work. The loop resolved nothing, so nothing was recorded
 ///   and nothing was uploaded either. Where before 0.86.0 this bail had
 ///   already submitted a clear pass no one would read, it now issues
-///   literally nothing.
+///   literally nothing. **Reachable for an ordinary blank tile of an
+///   ordinary visible document as of 0.87.0**, which is the whole point
+///   of that change: [`resolve_tile`] now returns `None` for a visible
+///   layer with nothing *stored* at this tile, so panning into blank
+///   canvas takes this bail instead of uploading, blending, submitting
+///   and reading back transparency per layer per tile. It used to need
+///   every layer in the document to be invisible or unreadable — an edge
+///   case, which is why the cost above was worth spelling out and is now
+///   worth even less.
 /// - **An inexpressible blend mode** (the `other_mode` arm): the
 ///   recorded command buffer is discarded, but the uploads already
 ///   issued are **not** undone. `queue.write_texture` is a queue-level
@@ -7314,21 +7395,35 @@ fn note_gpu_composite_submit() {}
 /// CPU-only, a one-shot operation where this isn't latency-critical the
 /// way the live canvas is.
 ///
-/// `None` if there are no visible root-level layers at all — cheaper
-/// handled by the CPU path's own "empty `layers` → transparent black"
-/// default than by a real, empty GPU round trip. The caller falls back
+/// `None` if no visible root-level layer has any **stored** content
+/// overlapping this tile — either because there is no visible root layer
+/// at all, or (as of 0.87.0) because not one of them has ever had a pixel
+/// stored at the tile being composited. Cheaper
+/// handled by the CPU path's own blank-tile handling
+/// than by a real, empty GPU round trip. The caller falls back
 /// to the CPU path for this one tile
 /// immediately, without anything to batch, the same "one bad tile
 /// shouldn't abort the rest" discipline [`resolve_tile`]'s own callers
-/// already use. Note that "no visible layers" is the whole of it, and
-/// **not** "this tile has no painted content": a visible layer resolves
+/// already use.
+///
+/// The second half of that is new in 0.87.0. Before it, a visible layer
+/// resolved
 /// at *every* tile coordinate, because the tile store answers an
-/// unpainted coordinate with a blank tile rather than with absence, so a
-/// blank region of a document with any visible layer still takes the
-/// full GPU path and composites transparency for real. That was
-/// overstated here before 0.86.1; see the lazily-built accumulators'
+/// unpainted coordinate by materializing a blank tile rather than by
+/// signalling absence, so a
+/// blank region of a document with any visible layer still took the
+/// full GPU path and composited transparency for real.
+/// [`resolve_tile`] now asks
+/// `aurora_tile::TileStore::contains_tile` (same-origin branch) and
+/// [`LayerWindow::is_blank`] (windowed branch) first and answers `None`
+/// for such a layer, so this bail is reachable for an ordinary blank tile
+/// of an ordinary visible document. What it deliberately does **not**
+/// cover is a tile painted and then erased to full transparency: that is
+/// real stored content, `contains_tile` reports it as present, and it
+/// still takes the whole path — only "never stored" is safe to treat as
+/// absence. See the lazily-built accumulators'
 /// own comment in the body, and PLAN.md's M1.10 "Empty-tile GPU
-/// composite work" follow-on. Also `None` for the one defensive case above — a
+/// composite work". Also `None` for the one defensive case above — a
 /// resolved blend mode outside `{Normal, Multiply, Darken}` — logged,
 /// falling
 /// this one tile back to the CPU path, and not reachable through the
@@ -7399,25 +7494,32 @@ fn begin_gpu_composite_tile(
     // `None`, exactly as the collect-then-check-empty shape this
     // replaces did.
     //
-    // **How often "none does" actually happens, honestly** (corrected in
-    // 0.86.1; 0.86.0's wording here said "a tile with no touched layer
-    // anywhere", which reads as "this tile is empty" and is wrong).
-    // `resolve_tile` only yields `None` for a layer that is *invisible*
-    // or unreadable -- not for one that simply has no painted content
-    // near this tile. `TileStore::get`/`ensure_resident` answer any tile
-    // coordinate ever asked for with `Ok(`a blank tile`)` rather than
-    // signalling absence, which is core to their lazy-paging design, so
-    // a visible layer whose real pixels are a thousand tiles away still
-    // resolves *here*, to transparent texels. This bail is therefore
-    // reachable only when every layer in the tree is invisible -- not
-    // when the tile is merely empty. The consequence is real and
-    // measurable: panning into blank canvas costs a full upload, blend,
+    // **How often "none does" actually happens, honestly** (rewritten in
+    // 0.87.0, which changed the answer; 0.86.1's own correction of
+    // 0.86.0 described the behaviour accurately as it then stood).
+    // `resolve_tile` now yields `None` **per layer** whenever that layer
+    // has nothing *stored* at this tile -- not only when it is invisible
+    // or unreadable. It used to be the latter: `TileStore::get`/
+    // `ensure_resident` answer any tile coordinate ever asked for with
+    // `Ok(`a blank tile`)` rather than signalling absence, which is core
+    // to their lazy-paging design, so a visible layer whose real pixels
+    // were a thousand tiles away still resolved *here*, to transparent
+    // texels, and panning into blank canvas cost a full upload, blend,
     // submit and readback per visible layer per tile to produce
-    // transparent output. Fixing that means teaching the tile store (or
-    // this function) to distinguish "blank because nothing was ever
-    // painted" from "blank because it is transparent there", which is a
-    // separate, larger change -- see PLAN.md, M1.10, "Empty-tile GPU
-    // composite work".
+    // transparent output. `resolve_tile` asks
+    // `TileStore::contains_tile` (same-origin) and
+    // `LayerWindow::is_blank` (windowed) before it asks for texels, so
+    // that work is no longer paid: a tile no visible layer has ever
+    // painted resolves nothing, records nothing, uploads nothing, and
+    // takes the `current?` bail below.
+    //
+    // What it does *not* claim: this is not "the tile looks
+    // transparent". A tile painted and then erased to `(0, 0, 0, 0)` is
+    // stored content -- `contains_tile` consults residency, not texel
+    // values -- and still goes through the full path here. Only "never
+    // stored" is treated as absence, which is the one form of blankness
+    // that is provably bit-identical to skipping. See PLAN.md, M1.10,
+    // "Empty-tile GPU composite work".
     //
     // **Peak GPU memory is O(N) in this tile's visible root layers**
     // (corrected in 0.86.1; the 0.86.0 wording below claimed O(1),
@@ -7652,14 +7754,18 @@ fn begin_gpu_composite_tile(
     // one tile back to the CPU path, which handles "no visible layers"
     // as transparent black for free.
     //
-    // **When this fires** (corrected in 0.86.1, which previously said
-    // "no root layer resolved to real content at this tile"): only when
-    // every layer in the tree is invisible or unreadable, *not* when
-    // this tile happens to be blank. A visible layer resolves at every
-    // tile coordinate, because the tile store answers an unpainted one
-    // with a blank tile rather than with absence -- so a document with
-    // one visible layer never reaches this line, however far the
-    // viewport pans from that layer's painted pixels. See the
+    // **When this fires** (rewritten in 0.87.0): whenever no visible
+    // root layer has any *stored* content at this tile -- because the
+    // tree is entirely invisible or unreadable, or simply because this
+    // tile is one nobody has ever painted. Until 0.87.0 only the first
+    // of those reached here: a visible layer resolved at every tile
+    // coordinate, because the tile store answers an unpainted one with a
+    // blank tile rather than with absence, so a document with one
+    // visible layer never reached this line however far the viewport
+    // panned from that layer's painted pixels. `resolve_tile`'s own
+    // `contains_tile`/`is_blank` guards changed that. A tile written and
+    // then erased to full transparency is *not* one of these cases --
+    // that is stored content and composites for real. See the
     // accumulators' own comment above and PLAN.md's M1.10 "Empty-tile
     // GPU composite work".
     //
@@ -7815,8 +7921,9 @@ fn begin_gpu_composite_tile(
 /// pending tile's result ([`finish_tile_readback`], whose own `rx.recv()`
 /// now returns immediately since the single poll above already resolved
 /// it). A tile that doesn't qualify for the GPU path at all — a
-/// disqualified document, no GPU/compositor this session, or a tile with
-/// no visible layers of its own — is composited via the CPU path
+/// disqualified document, no GPU/compositor this session, or a tile no
+/// visible layer has any stored content at (0.87.0; before that, a tile
+/// with no visible layers at all) — is composited via the CPU path
 /// immediately, inline in the same first pass, since the CPU path never
 /// blocks on the GPU and so has nothing to batch; only genuinely
 /// GPU-issued tiles wait for the one shared poll. **What this changes and
@@ -7937,7 +8044,9 @@ fn recomposite_visible_tiles(
     // into one command buffer is separate, deliberately unattempted work.
     // A tile with nothing to batch -- the document
     // doesn't qualify, `gpu`/`compositor` aren't available this session,
-    // or this specific tile has no visible layers at all -- is
+    // or no visible layer has ever stored a pixel at this specific tile
+    // (0.87.0; that last case used to require the layers themselves to be
+    // invisible) -- is
     // composited on the CPU path immediately, right here, since that
     // path never blocks on the GPU.
     let mut pending_gpu: Vec<PendingGpuReadback> = Vec::new();
@@ -12908,8 +13017,9 @@ mod tests {
         canvas_area_logical_size, canvas_area_physical_rect, canvas_area_physical_size,
         canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer, clean_shutdown_cleanup,
         clear_session_marker, close_command_palette, close_dialog, collect_widget_paints,
-        commit_ending_drag, composite_document, composite_reference_origin, composite_surface_id,
-        continue_drag, crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        commit_ending_drag, composite_document, composite_reference_origin,
+        composite_roots_into_tile, composite_surface_id, continue_drag,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
         create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
         document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
         effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
@@ -24879,7 +24989,12 @@ mod tests {
     /// resolve first never mattered structurally. This is the specific
     /// case the streaming rewrite must get right: the *bottom* root has
     /// no content at this tile at all (never filled, so `resolve_tile`
-    /// returns `None` and the loop `continue`s past it), so the
+    /// returns `None` and the loop `continue`s past it — true as of
+    /// 0.87.0's `contains_tile` guard; when this test was written that
+    /// root in fact resolved to `Some(`all-zero texels`)` and *did*
+    /// create the destination texture, so the fixture only ever tested
+    /// the lazily-created reference surviving further iterations, not the
+    /// skip it describes), so the
     /// destination texture is only created on the *middle* root, the
     /// first one that actually has something to composite — not on the
     /// first root in iteration order. A bug that created the
@@ -26085,23 +26200,31 @@ mod tests {
         // else's.
         let _ = take_darken_gpu_dispatch_count();
         let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
-        // Eight = this stack's two `Darken` layers, dispatched once each
-        // for every one of the four tiles `gpu_and_cpu_first_texel`'s
-        // 256x256 residency viewport marks visible at `TILE` = 256. The
-        // second, CPU-only run inside that helper adds none, which is
-        // itself part of what this pins. **A count of 0 is the failure
-        // this assertion exists for**: it means no `Darken` tile reached
-        // the GPU at all and every assertion below is being satisfied by
-        // the CPU fallback compared against itself. A count that is
-        // non-zero but not 8 means the viewport or tile geometry moved
-        // under this fixture -- re-derive it rather than loosening the
-        // assertion.
+        // Two = this stack's two `Darken` layers, dispatched once each for
+        // the single tile they actually have content at. `solid_root_stack`
+        // fills only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // as of 0.87.0 the other three resolve nothing at all --
+        // `resolve_tile` answers `None` for a visible layer with nothing
+        // *stored* at the tile, so those three take
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. **This count was 8 until 0.87.0**, and the
+        // six that went away were exactly the wasted work that change
+        // removes: three tiles' worth of upload, blend and readback to
+        // composite transparency. The second, CPU-only run inside that
+        // helper adds none, which is itself part of what this pins. **A
+        // count of 0 is the failure this assertion exists for**: it means
+        // no `Darken` tile reached the GPU at all and every assertion
+        // below is being satisfied by the CPU fallback compared against
+        // itself. A count that is non-zero but not 2 means the viewport or
+        // tile geometry moved under this fixture -- re-derive it rather
+        // than loosening the assertion.
         assert_eq!(
             take_darken_gpu_dispatch_count(),
-            8,
-            "both Darken layers must have dispatched a real GPU blend pass on each of the four \
-             visible tiles -- 0 means the dispatch arm is gone and every assertion below is \
-             being satisfied by the CPU fallback running twice"
+            2,
+            "both Darken layers must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
         );
         assert_gpu_matches_cpu(
             gpu_result,
@@ -26429,7 +26552,15 @@ mod tests {
     /// only its single `(0, 0)` tile ever has real layer content — every
     /// other visible tile in its 2×2 grid has none, so
     /// `begin_gpu_composite_tile` returns `None` for them and they never
-    /// reach `pending_gpu` at all. That test alone would pass even if
+    /// reach `pending_gpu` at all. (That last claim is true only as of
+    /// 0.87.0, which is when `resolve_tile` started answering `None` for a
+    /// visible layer with nothing *stored* at a tile; when this comment was
+    /// written those tiles did reach `pending_gpu`, each paying a full
+    /// upload/blend/submit/readback to composite transparency, and the
+    /// argument below — that this fixture cannot detect a tile-identity
+    /// mixup — held for a different reason: all three of those tiles
+    /// composited to identical transparent black.) That test alone would
+    /// pass even if
     /// phase 3's drain mixed up which decoded result belongs to which
     /// tile (a real risk this restructuring introduces: `PendingGpuReadback`
     /// now travels through a `Vec` between issue and resolve, so a bug
@@ -26445,9 +26576,9 @@ mod tests {
     /// `device.poll` — exactly the batching this round's fix introduces.
     /// The remaining five visible tiles (row/column index 2) fall
     /// entirely outside the 512×512 layer bounds, so they still exercise
-    /// the immediate-CPU-fallback branch of phase 1 (no visible layers to
-    /// batch) in the same call, confirming the two branches coexist
-    /// correctly.
+    /// the immediate-CPU-fallback branch of phase 1 (nothing stored at
+    /// those tiles, so nothing to batch) in the same call, confirming the
+    /// two branches coexist correctly.
     ///
     /// Each of the four populated tiles is checked against its own
     /// distinct expected colour (not just "some tile has some colour"),
@@ -32873,6 +33004,601 @@ mod tests {
         assert!(
             fed_back.x > real_bounds.x && fed_back.y > real_bounds.y,
             "and it diverges by running away from the pointer: {fed_back:?} vs {real_bounds:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 0.87.0: a visible layer with nothing *stored* at a tile resolves
+    // to `None`, so no composite work is paid for it.
+    // ---------------------------------------------------------------
+
+    /// A tile coordinate no fixture below ever paints. Every fixture here
+    /// fills tile `(0, 0)` only, and a layer's window is at most one tile
+    /// wide, so nothing on any surface can overlap this one.
+    const UNPAINTED_TILE: aurora_tile::TileId = aurora_tile::TileId { x: 5, y: 5 };
+
+    /// [`UNPAINTED_TILE`]'s own document-space origin, derived from
+    /// `aurora_tile::TILE` rather than written out as a pixel constant —
+    /// what [`resolve_tile`]/[`begin_gpu_composite_tile`] want as
+    /// `doc_origin` for that tile.
+    fn unpainted_tile_origin() -> (i64, i64) {
+        let tile = i64::from(aurora_tile::TILE);
+        (
+            i64::from(UNPAINTED_TILE.x) * tile,
+            i64::from(UNPAINTED_TILE.y) * tile,
+        )
+    }
+
+    /// The 10×10 rect at the document origin every fixture here uses for
+    /// a layer that shares the composite's own reference origin, matching
+    /// [`solid_root_stack`]'s own.
+    fn origin_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        }
+    }
+
+    /// The same rect displaced half a tile to the right, so a layer using
+    /// it has an origin *different* from the composite's reference origin
+    /// and therefore takes [`resolve_tile`]'s windowed branch (and lands
+    /// on a fractional tile boundary, so the window really does straddle
+    /// two of the surface's own tile columns).
+    fn half_tile_offset_bounds() -> aurora_core::Rect {
+        aurora_core::Rect {
+            x: i64::from(aurora_tile::TILE) / 2,
+            ..origin_bounds()
+        }
+    }
+
+    /// Adds a root-level pixel layer at `bounds` and returns
+    /// `(id, surface)`, leaving its surface completely unwritten — the
+    /// "never painted" half of every fixture below.
+    fn add_unpainted_root(
+        layers: &mut aurora_doc::LayerTree,
+        name: &str,
+        bounds: aurora_core::Rect,
+    ) -> (aurora_doc::LayerId, aurora_tile::SurfaceId) {
+        let id = match layers.add_pixel_layer(name, bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        (id, surface)
+    }
+
+    /// Both of [`resolve_tile`]'s own `Pixel` branches, at a tile their
+    /// layer has never stored anything at (0.87.0).
+    ///
+    /// Before this, both asked the store for texels unconditionally and
+    /// got `Some(`all-zero texels`)` back — the tile store's lazy paging
+    /// *materializes* a tile for any coordinate ever asked for rather
+    /// than signalling absence — so every caller then paid a full
+    /// contributor's worth of compositing work to add nothing. Each
+    /// branch now checks first: `aurora_tile::TileStore::contains_tile`
+    /// for the same-origin one, [`LayerWindow::is_blank`] for the
+    /// windowed one.
+    ///
+    /// Both directions are asserted per branch, because "returns `None`"
+    /// is trivially satisfiable by a guard that fires always: each layer
+    /// is also queried at the tile it *does* have content at, and must
+    /// still resolve there. The `contains_tile` assertions at the end are
+    /// the other half of the point — the guard must *avoid the work*, not
+    /// merely discard its result, and a `TileStore::get` would have left
+    /// the tile behind as resident.
+    #[test]
+    fn resolve_tile_returns_none_for_a_visible_layer_with_nothing_stored_at_the_tile() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let painted_tile = aurora_tile::TileId { x: 0, y: 0 };
+
+        let (same_origin, same_surface) =
+            add_unpainted_root(&mut layers, "same-origin", origin_bounds());
+        fill_solid(&mut store, same_surface, painted_tile, [1.0, 0.0, 0.0, 1.0]);
+        let (windowed, windowed_surface) =
+            add_unpainted_root(&mut layers, "windowed", half_tile_offset_bounds());
+        fill_solid(
+            &mut store,
+            windowed_surface,
+            painted_tile,
+            [0.0, 0.0, 1.0, 1.0],
+        );
+
+        // A fresh budget per call: `CompositeBudget::for_pass` sizes its
+        // node allowance to the document, and four calls against one
+        // budget would exhaust it and start returning `None` for the
+        // wrong reason entirely.
+        let resolve = |store: &mut aurora_tile::TileStore,
+                       id: aurora_doc::LayerId,
+                       tile_id: aurora_tile::TileId,
+                       doc_origin: (i64, i64)| {
+            let mut budget = CompositeBudget::for_pass(&layers);
+            resolve_tile(
+                id,
+                &layers,
+                store,
+                tile_id,
+                doc_origin,
+                (0, 0),
+                1,
+                &mut budget,
+            )
+        };
+
+        // --- the same-origin branch (`origin == reference_origin`) ---
+        assert!(
+            resolve(&mut store, same_origin, painted_tile, (0, 0)).is_some(),
+            "setup: the same-origin layer must still resolve at the tile it really was painted \
+             at -- without this the `None` below would be satisfied by a guard that fires \
+             unconditionally"
+        );
+        assert!(
+            resolve(
+                &mut store,
+                same_origin,
+                UNPAINTED_TILE,
+                unpainted_tile_origin()
+            )
+            .is_none(),
+            "a visible layer with nothing stored at this tile must resolve to None, not to a \
+             tile-sized buffer of zeros the caller then composites for real"
+        );
+
+        // --- the windowed branch (`origin != reference_origin`) ---
+        assert!(
+            resolve(&mut store, windowed, painted_tile, (0, 0)).is_some(),
+            "setup: the moved layer's window over composite tile (0, 0) really does overlap its \
+             own stored source tile, so this must resolve -- the same non-vacuity guard as above"
+        );
+        assert!(
+            resolve(
+                &mut store,
+                windowed,
+                UNPAINTED_TILE,
+                unpainted_tile_origin()
+            )
+            .is_none(),
+            "a moved layer whose window overlaps no stored source tile at all must resolve to \
+             None (LayerWindow::is_blank), not materialize the all-zero buffer into_texels would"
+        );
+
+        // Nothing above may have *created* a tile to learn it was blank.
+        // The unpainted composite tile's own coordinate for the
+        // same-origin layer, and all four source tiles its window can
+        // straddle for the moved one.
+        assert!(
+            !store.contains_tile(same_surface, UNPAINTED_TILE),
+            "the guard must skip the read, not discard its result: TileStore::get would have \
+             allocated this tile, made it resident and possibly evicted a real one"
+        );
+        for (x, y) in [
+            (UNPAINTED_TILE.x - 1, UNPAINTED_TILE.y),
+            (UNPAINTED_TILE.x, UNPAINTED_TILE.y),
+            (UNPAINTED_TILE.x - 1, UNPAINTED_TILE.y + 1),
+            (UNPAINTED_TILE.x, UNPAINTED_TILE.y + 1),
+        ] {
+            let tile_id = aurora_tile::TileId { x, y };
+            assert!(
+                !store.contains_tile(windowed_surface, tile_id),
+                "read_layer_window must not have materialized source tile {tile_id:?} either"
+            );
+        }
+    }
+
+    /// The distinction the guard above is only safe *because* of: "never
+    /// stored" is not "stored, and fully transparent."
+    ///
+    /// A tile painted and then erased to `(0, 0, 0, 0)` is real content —
+    /// it is what an eraser stroke produces — and
+    /// `aurora_tile::TileStore::contains_tile` reports it as present,
+    /// because it consults residency (`resident`/`pending`/`paged_out`)
+    /// and never tile *contents*. So it must keep going through the whole
+    /// ordinary path. A guard written against texel values instead of
+    /// residency would pass every other test in this group and fail this
+    /// one.
+    #[test]
+    fn resolve_tile_still_resolves_a_tile_written_to_full_transparency() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let (erased, surface) = add_unpainted_root(&mut layers, "erased", origin_bounds());
+        fill_solid(&mut store, surface, tile_id, [0.0, 0.0, 0.0, 0.0]);
+
+        assert!(
+            store.contains_tile(surface, tile_id),
+            "setup: a tile written to full transparency is stored content -- if contains_tile \
+             ever stops saying so, this whole round's guard changes meaning"
+        );
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let resolved = resolve_tile(
+            erased,
+            &layers,
+            &mut store,
+            tile_id,
+            (0, 0),
+            (0, 0),
+            1,
+            &mut budget,
+        );
+        let Some((texels, _, _)) = resolved else {
+            unreachable!("an erased tile is stored content and must still resolve");
+        };
+        assert_eq!(
+            texels.len(),
+            aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS,
+            "a resolved tile is always a full tile-sized buffer"
+        );
+        assert!(
+            texels.iter().all(|sample| sample.to_f32() <= 0.0),
+            "and its texels really are the fully transparent ones that were written"
+        );
+    }
+
+    /// Why `None` is a *bit-identical* substitute for
+    /// `Some(`all-zero texels`)` rather than merely a close one, checked
+    /// rather than argued.
+    ///
+    /// `aurora_render::composite_layer_into` scales every source texel by
+    /// `as = src_a * opacity`, which is zero throughout a blank tile, so
+    /// every blend mode's fold reduces to `Co = Cb` and
+    /// `result_a = dst_a` — the destination untouched. That is a property
+    /// of the fold, not of any one formula, so this loops over five
+    /// modes: the three the GPU path can express (`Normal`, `Multiply`,
+    /// `Darken`), `Dissolve` (resolved to `Normal` on the CPU before any
+    /// blend), and `Screen` — which no GPU arm exists for at all, and is
+    /// here precisely to show the property is the fold's and not
+    /// something special-cased per mode.
+    ///
+    /// `assert_eq!` on the raw `half::f16` buffers, not a tolerance: the
+    /// claim is that adding the layer changes *nothing*, and a tolerance
+    /// would hide a real one-bit difference.
+    #[test]
+    fn a_never_painted_visible_layer_changes_no_composited_texel_whatever_its_blend_mode() {
+        let (_dir, mut store) = real_tile_store();
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let rgba = [0.25, 0.5, 0.75, 0.8];
+
+        let painted_only = solid_root_stack(
+            &mut store,
+            &[("painted", aurora_doc::BlendMode::Normal, 1.0, rgba)],
+        );
+        let mut budget = CompositeBudget::for_pass(&painted_only);
+        let baseline = composite_roots_into_tile(
+            &painted_only,
+            &mut store,
+            tile_id,
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            baseline.iter().any(|sample| sample.to_f32() > 0.0),
+            "setup: the painted baseline must composite to something -- two all-zero buffers \
+             would agree vacuously"
+        );
+
+        for mode in [
+            aurora_doc::BlendMode::Normal,
+            aurora_doc::BlendMode::Multiply,
+            aurora_doc::BlendMode::Darken,
+            aurora_doc::BlendMode::Dissolve,
+            aurora_doc::BlendMode::Screen,
+        ] {
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("painted", aurora_doc::BlendMode::Normal, 1.0, rgba)],
+            );
+            // Added last, so it is composited last: on top of the painted
+            // layer, where a stray contribution would be most visible.
+            let (ghost, _) = add_unpainted_root(&mut layers, "never-painted", origin_bounds());
+            if let Err(err) = layers.set_blend_mode(ghost, mode) {
+                unreachable!("{err:?}");
+            }
+
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let with_ghost = composite_roots_into_tile(
+                &layers,
+                &mut store,
+                tile_id,
+                (0, 0),
+                (0, 0),
+                &mut budget,
+            );
+            assert_eq!(
+                with_ghost, baseline,
+                "adding a never-painted layer at {mode:?} changed the composite -- skipping it \
+                 has to be bit-identical to compositing its blank texels, or 0.87.0's guard is \
+                 not a pure optimization"
+            );
+        }
+    }
+
+    /// The GPU half of the same claim, and the one that measures the
+    /// *work* rather than the pixels: a tile no visible layer has ever
+    /// painted must cost zero `queue.submit` calls and create no per-layer
+    /// source texture, even though every layer's declared `bounds`
+    /// overlaps it (all three are 10×10 at the document origin, which the
+    /// tile at [`UNPAINTED_TILE`] does not contain — and `bounds` is a
+    /// position hint the compositing path deliberately does not treat as
+    /// a clip, so it is `contains_tile` and nothing else that makes this
+    /// bail fire).
+    ///
+    /// Both counters, because they fail differently: a submit count above
+    /// zero means the encoder was finished and real GPU work executed,
+    /// while the `Darken` dispatch count is the one signal that
+    /// distinguishes "the blend arm ran" from "it silently fell back",
+    /// which is the gap `DARKEN_GPU_DISPATCHES` exists for.
+    #[test]
+    fn begin_gpu_composite_tile_issues_no_submit_for_a_tile_no_visible_layer_has_ever_painted() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    1.0,
+                    [0.5, 0.5, 0.5, 1.0],
+                ),
+                (
+                    "l3",
+                    aurora_doc::BlendMode::Darken,
+                    1.0,
+                    [0.75, 0.5, 0.25, 1.0],
+                ),
+            ],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "setup: this stack must qualify for the GPU path, or this would be measuring a case \
+             the real caller never takes"
+        );
+
+        // Zeroed inside `real_gpu_context`'s own lock, so what is read
+        // below is this call's work and nothing else's.
+        let _ = take_gpu_composite_submit_count();
+        let _ = take_darken_gpu_dispatch_count();
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let pending = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            UNPAINTED_TILE,
+            unpainted_tile_origin(),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            pending.is_none(),
+            "no layer has stored content at this tile, so no accumulator may be created and the \
+             caller must fall this one tile back to the CPU path"
+        );
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            0,
+            "a tile nobody has painted must cost zero queue.submit calls -- before 0.87.0 it \
+             cost one, having uploaded, blended and read back a whole tile of transparency per \
+             visible layer"
+        );
+        assert_eq!(
+            take_darken_gpu_dispatch_count(),
+            0,
+            "and no blend pass may be recorded for it either -- the Darken layer's own arm is \
+             the one that can be observed directly"
+        );
+    }
+
+    /// The windowed branch's own work assertion, structured to prove
+    /// itself non-vacuous: the *same* moved layer is composited twice,
+    /// first at the composite tile its window really does overlap stored
+    /// content at (one submit, real work), then at one where it overlaps
+    /// none (no submit at all). A guard that bailed unconditionally would
+    /// fail the first half; the pre-0.87.0 behaviour fails the second.
+    #[test]
+    fn begin_gpu_composite_tile_issues_no_submit_for_a_moved_layer_whose_window_is_unstored() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let (_moved, surface) = add_unpainted_root(&mut layers, "moved", half_tile_offset_bounds());
+        fill_solid(
+            &mut store,
+            surface,
+            aurora_tile::TileId { x: 0, y: 0 },
+            [0.25, 0.5, 0.75, 1.0],
+        );
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "setup: one Normal-blend pixel layer must qualify for the GPU path"
+        );
+
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let _ = take_gpu_composite_submit_count();
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let overlapping = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            aurora_tile::TileId { x: 0, y: 0 },
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            overlapping.is_some(),
+            "setup: this composite tile's window really does overlap the layer's own stored \
+             source tile, so it must composite for real"
+        );
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            1,
+            "setup: and that costs exactly one submit -- without this half, the zero below would \
+             be satisfied by a guard that never lets anything through"
+        );
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let unstored = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            UNPAINTED_TILE,
+            unpainted_tile_origin(),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            unstored.is_none(),
+            "a window overlapping no stored source tile must bail before any GPU work"
+        );
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            0,
+            "and cost zero queue.submit calls"
+        );
+    }
+
+    /// End to end through the real caller, on real hardware: a
+    /// never-painted layer must be invisible to the *composited output*
+    /// too, on the GPU path as well as the CPU one, at every blend mode
+    /// `document_qualifies_for_gpu_compositing` admits.
+    ///
+    /// Three comparisons per mode, each catching something different:
+    /// the two paths must agree with each other (bit for bit — both fold
+    /// the same single opaque layer, so there is no arithmetic to differ
+    /// on), and each must agree with the *painted layer composited
+    /// alone*, which is what "the ghost contributes nothing" actually
+    /// means.
+    #[test]
+    fn recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode()
+     {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let rgba = [0.5, 0.75, 0.25, 1.0];
+
+        let painted_only = solid_root_stack(
+            &mut store,
+            &[("painted", aurora_doc::BlendMode::Normal, 1.0, rgba)],
+        );
+        let (alone_gpu, alone_cpu) = gpu_and_cpu_all_texels(&context, &mut store, &painted_only);
+        assert_eq!(
+            alone_gpu, alone_cpu,
+            "setup: the painted layer alone must composite identically on both paths"
+        );
+        assert!(
+            alone_gpu.iter().any(|channel| *channel > 0.0),
+            "setup: and to something non-zero -- otherwise every comparison below is vacuous"
+        );
+
+        for mode in [
+            aurora_doc::BlendMode::Normal,
+            aurora_doc::BlendMode::Multiply,
+            aurora_doc::BlendMode::Darken,
+            aurora_doc::BlendMode::Dissolve,
+        ] {
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("painted", aurora_doc::BlendMode::Normal, 1.0, rgba)],
+            );
+            let (ghost, _) = add_unpainted_root(&mut layers, "never-painted", origin_bounds());
+            if let Err(err) = layers.set_blend_mode(ghost, mode) {
+                unreachable!("{err:?}");
+            }
+            assert!(
+                document_qualifies_for_gpu_compositing(&layers),
+                "setup: a painted Normal layer under a never-painted {mode:?} one must still \
+                 qualify for the GPU path"
+            );
+
+            let (gpu, cpu) = gpu_and_cpu_all_texels(&context, &mut store, &layers);
+            assert_eq!(
+                gpu, cpu,
+                "the GPU and CPU paths disagreed with a never-painted {mode:?} layer in the stack"
+            );
+            assert_eq!(
+                gpu, alone_gpu,
+                "a never-painted {mode:?} layer changed the GPU path's composited output -- it \
+                 must contribute exactly nothing"
+            );
+            assert_eq!(
+                cpu, alone_cpu,
+                "a never-painted {mode:?} layer changed the CPU path's composited output"
+            );
+        }
+    }
+
+    /// [`resolve_tile_still_resolves_a_tile_written_to_full_transparency`]'s
+    /// GPU counterpart, and the one that pins the *cost* side of that
+    /// distinction: an erased tile is real content, so it must still be
+    /// uploaded, blended, submitted and read back. One submit, not zero.
+    #[test]
+    fn begin_gpu_composite_tile_still_composites_a_tile_written_to_full_transparency() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+        let layers = solid_root_stack(
+            &mut store,
+            &[(
+                "erased",
+                aurora_doc::BlendMode::Normal,
+                1.0,
+                [0.0, 0.0, 0.0, 0.0],
+            )],
+        );
+        let Some(surface) = layers.roots().first().and_then(|&id| layers.surface_id(id)) else {
+            unreachable!("the fixture has exactly one root pixel layer");
+        };
+        assert!(
+            store.contains_tile(surface, tile_id),
+            "setup: the erased tile must be stored content -- that is the whole premise"
+        );
+
+        let _ = take_gpu_composite_submit_count();
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let pending = begin_gpu_composite_tile(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            tile_id,
+            (0, 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert!(
+            pending.is_some(),
+            "a tile written to full transparency is real content and must still composite -- \
+             skipping it would silently change what an eraser stroke means"
+        );
+        assert_eq!(
+            take_gpu_composite_submit_count(),
+            1,
+            "and it must cost the ordinary one submit, exactly like any other stored tile"
         );
     }
 }
