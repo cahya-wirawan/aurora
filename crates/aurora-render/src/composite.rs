@@ -414,6 +414,37 @@ fn sat(c: [f32; 3]) -> f32 {
 /// `x` are each computed once from the original input before either
 /// branch runs; only the three channel values themselves carry forward
 /// from the first branch into the second.
+///
+/// **Both divisions are guarded against a zero denominator** (0.87.1),
+/// the same way [`set_sat`]'s own `max > min` check below already is,
+/// and for the same underlying reason. [`lum`]'s weights sum to exactly
+/// `1.0`, so `n <= l <= x` always holds — with equality on *both* sides
+/// precisely when every channel is equal. An achromatic input therefore
+/// makes `l - n` and `x - l` both exactly `0.0`, while the numerators
+/// `(r - l) * …` are exactly `0.0` too, so the division was `0.0 / 0.0`
+/// — NaN — for any achromatic colour with a channel outside
+/// `0.0..=1.0`, which is exactly the case that makes a branch fire at
+/// all. That was reachable from ordinary content: [`blend_color`] is
+/// `SetLum(Cs, Lum(Cb))`, so any achromatic *source* (grey, white,
+/// black) over a backdrop whose luminance falls outside `[0,1]` — an
+/// unclamped HDR import, which invariant §7.3.1b's `f16` pipeline
+/// deliberately permits — produced NaN, as did `Hue`/`Saturation` over
+/// any achromatic HDR backdrop for *any* source, since [`set_sat`]
+/// collapses an achromatic input to `[0, 0, 0]` whatever `s` is. And
+/// NaN does not get absorbed downstream: [`composite_layer_into`]
+/// scales the blend result by `alpha`, and `0.0 * NaN` is NaN in
+/// IEEE-754, so even a fully transparent layer in one of those modes
+/// poisoned the entire composited tile.
+///
+/// When a denominator is zero the guard clamps each channel into
+/// `0.0..=1.0` instead of dividing. That gives up this function's
+/// luminance-preserving property, unavoidably: the target luminance is
+/// out of gamut and an achromatic colour has no chromatic direction to
+/// redistribute along, so the closest in-gamut colour is the clamp. It
+/// is unreachable for any input that was already well-defined — the
+/// guard fires only where the old code produced NaN — which
+/// `clip_color_leaves_an_in_gamut_achromatic_input_exactly_alone` pins
+/// directly.
 #[must_use]
 #[allow(clippy::many_single_char_names)]
 fn clip_color(c: [f32; 3]) -> [f32; 3] {
@@ -421,21 +452,32 @@ fn clip_color(c: [f32; 3]) -> [f32; 3] {
     let [r, g, b] = c;
     let n = r.min(g).min(b);
     let x = r.max(g).max(b);
+    let clamped = |[r, g, b]: [f32; 3]| [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
     let [r, g, b] = if n < 0.0 {
-        [
-            l + (r - l) * l / (l - n),
-            l + (g - l) * l / (l - n),
-            l + (b - l) * l / (l - n),
-        ]
+        let d = l - n;
+        if d > 0.0 {
+            [
+                l + (r - l) * l / d,
+                l + (g - l) * l / d,
+                l + (b - l) * l / d,
+            ]
+        } else {
+            clamped([r, g, b])
+        }
     } else {
         [r, g, b]
     };
     if x > 1.0 {
-        [
-            l + (r - l) * (1.0 - l) / (x - l),
-            l + (g - l) * (1.0 - l) / (x - l),
-            l + (b - l) * (1.0 - l) / (x - l),
-        ]
+        let d = x - l;
+        if d > 0.0 {
+            [
+                l + (r - l) * (1.0 - l) / d,
+                l + (g - l) * (1.0 - l) / d,
+                l + (b - l) * (1.0 - l) / d,
+            ]
+        } else {
+            clamped([r, g, b])
+        }
     } else {
         [r, g, b]
     }
@@ -5494,6 +5536,146 @@ mod tests {
         let result = clip_color(c);
         assert_close(result, [0.202_577, 0.642_022, 0.767_578], 1e-3);
         assert!((lum(result) - lum(c)).abs() < 1e-3);
+    }
+
+    // -- The achromatic-denominator regression (0.87.1). ------------
+    //
+    // `clip_color` divides by `l - n` and by `x - l`. `lum`'s own
+    // weights sum to exactly 1.0, so `n <= l <= x` always, with
+    // equality on *both* sides precisely when every channel is equal.
+    // An achromatic input therefore makes both denominators exactly
+    // `0.0`, and the numerators `(r - l) * ...` are exactly `0.0` too
+    // -- so the division was `0.0 / 0.0`, i.e. NaN, whenever an
+    // achromatic input also had a channel outside `0.0..=1.0` (which
+    // is what makes one of the two branches fire in the first place).
+    //
+    // That is reachable from ordinary content, not just a contrived
+    // one: `blend_color` is `SetLum(Cs, Lum(Cb))`, so any achromatic
+    // *source* -- grey, white, black -- over a backdrop whose
+    // luminance is outside `[0,1]` (an HDR TIFF import, which
+    // `aurora-io` deliberately does not clamp, per invariant §7.3.1b)
+    // hit it; and `set_sat` returns an achromatic triple for *any*
+    // achromatic backdrop, so `blend_hue`/`blend_saturation` hit it
+    // for any source at all over such a backdrop. A NaN there is not
+    // absorbed downstream either: `composite_layer_into` scales the
+    // blend result by `alpha`, and `0.0 * NaN` is NaN in IEEE-754, so
+    // even a fully transparent layer poisoned the whole tile -- which
+    // then survives un-premultiplication, export and the eyedropper
+    // with no error surfaced anywhere.
+
+    #[test]
+    fn clip_color_stays_finite_for_an_out_of_gamut_achromatic_input() {
+        for (c, expected) in [
+            ([1.5f32, 1.5, 1.5], [1.0f32, 1.0, 1.0]),
+            ([-0.5, -0.5, -0.5], [0.0, 0.0, 0.0]),
+            ([2.0, 2.0, 2.0], [1.0, 1.0, 1.0]),
+        ] {
+            let result = clip_color(c);
+            assert!(
+                result.iter().all(|channel| channel.is_finite()),
+                "clip_color({c:?}) must not produce NaN/inf, got {result:?}"
+            );
+            // Luminance cannot be preserved here -- the target is
+            // outside the gamut and the colour has no chromatic
+            // direction to redistribute along -- so the guard clamps
+            // instead, which is the closest in-gamut colour.
+            assert_close(result, expected, 1e-6);
+        }
+    }
+
+    #[test]
+    // An in-gamut achromatic input fires neither branch, so the guard
+    // must be invisible to it: this pins that the fix did not start
+    // clamping (or otherwise touching) colours that were always fine.
+    fn clip_color_leaves_an_in_gamut_achromatic_input_exactly_alone() {
+        for c in [[0.0f32, 0.0, 0.0], [0.5, 0.5, 0.5], [1.0, 1.0, 1.0]] {
+            let result = clip_color(c);
+            // Compared as bit patterns rather than by `==` on the
+            // arrays: the claim really is "exactly unchanged, not merely
+            // close", and `clippy::float_cmp` rightly refuses a direct
+            // float equality that is not against a literal.
+            assert_eq!(
+                result.map(f32::to_bits),
+                c.map(f32::to_bits),
+                "clip_color({c:?}) must be exactly unchanged, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    // The same regression one level up, at the entry point every
+    // non-separable mode actually calls.
+    fn set_lum_stays_finite_for_an_achromatic_input_with_an_out_of_gamut_target() {
+        for (c, l) in [
+            ([0.0f32, 0.0, 0.0], 1.5f32),
+            ([0.5, 0.5, 0.5], 2.0),
+            ([0.0, 0.0, 0.0], -0.5),
+            ([1.0, 1.0, 1.0], -1.0),
+            ([2.0, 2.0, 2.0], 3.0),
+            ([0.5, 0.5, 0.5], f32::from(half::f16::MAX)),
+        ] {
+            let result = set_lum(c, l);
+            assert!(
+                result.iter().all(|channel| channel.is_finite()),
+                "set_lum({c:?}, {l}) must not produce NaN/inf, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    // The three modes the bug was actually reachable through, at the
+    // two realistic shapes: an HDR (out-of-`[0,1]`) achromatic
+    // backdrop under any source (`Hue`/`Saturation`, via `set_sat`'s
+    // achromatic collapse), and an achromatic source over an HDR
+    // backdrop (`Color`, via `SetLum(Cs, Lum(Cb))`).
+    // `Luminosity` never exhibited it and is included to keep all four
+    // non-separable modes covered by one test.
+    fn every_non_separable_mode_stays_finite_for_hdr_and_achromatic_inputs() {
+        let cases: [([f32; 3], [f32; 3]); 6] = [
+            ([4.0, 4.0, 4.0], [0.2, 0.5, 0.9]),
+            ([4.0, 4.0, 4.0], [0.5, 0.5, 0.5]),
+            ([-2.0, -2.0, -2.0], [0.2, 0.5, 0.9]),
+            ([2.0, 3.0, 4.0], [0.5, 0.5, 0.5]),
+            ([2.0, 3.0, 4.0], [1.0, 1.0, 1.0]),
+            ([0.6, 0.3, 0.1], [0.0, 0.0, 0.0]),
+        ];
+        for (cb, cs) in cases {
+            for (name, result) in [
+                ("hue", blend_hue(cb, cs)),
+                ("saturation", blend_saturation(cb, cs)),
+                ("color", blend_color(cb, cs)),
+                ("luminosity", blend_luminosity(cb, cs)),
+            ] {
+                assert!(
+                    result.iter().all(|channel| channel.is_finite()),
+                    "blend_{name}(Cb={cb:?}, Cs={cs:?}) must not produce NaN/inf, got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    // End to end through the real compositing path, and the part that
+    // makes this a *silent corruption* bug rather than a cosmetic one:
+    // the offending layer here is fully transparent, so it must change
+    // nothing at all -- but `alpha * NaN` is NaN, so before the fix it
+    // replaced the whole backdrop with NaN.
+    fn a_fully_transparent_color_layer_over_an_hdr_backdrop_leaves_it_untouched() {
+        let backdrop = solid_texels([4.0, 4.0, 4.0, 1.0]);
+        let ghost = solid_texels([0.0, 0.0, 0.0, 0.0]);
+        let out = composite_tile_cpu(&[
+            (&backdrop, 1.0, BlendMode::Normal),
+            (&ghost, 1.0, BlendMode::Color),
+        ]);
+        let (r, g, b, a) = first_texel(&out);
+        for (channel, value) in [("r", r), ("g", g), ("b", b), ("a", a)] {
+            assert!(
+                value.is_finite(),
+                "channel {channel} of an HDR backdrop under a fully transparent Color layer \
+                 must stay finite, got {value}"
+            );
+        }
+        assert_texel_close((r, g, b, a), (4.0, 4.0, 4.0, 1.0), 1e-2);
     }
 
     #[test]

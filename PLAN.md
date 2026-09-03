@@ -15391,7 +15391,7 @@ severity choice.
 
   Bit-identical, not approximately: `aurora_render::composite_layer_into`
   scales every source texel by `as = src_a * opacity`, zero throughout a
-  blank tile, so every mode's fold reduces to `Co = Cb`/`result_a =
+  blank tile, so the fold reduces to `Co = Cb`/`result_a =
   dst_a`. Pinned across `Normal`/`Multiply`/`Darken`/`Dissolve` **and
   `Screen`** — the last one having no GPU arm at all, so the property is
   demonstrably the fold's and not special-cased per mode — plus GPU/CPU
@@ -15399,6 +15399,13 @@ severity choice.
   expressible modes, and `queue.submit`/`DARKEN_GPU_DISPATCHES` counter
   assertions for the work itself. Seven new tests; each guard was
   temporarily disabled to confirm the tests that should fail do.
+
+  **That paragraph overclaimed, and 0.87.1 corrected both the claim and
+  the bug the claim was hiding** — see the 0.87.1 addendum at the end of
+  this entry. The identity is *not* mode-independent unconditionally: it
+  holds for any mode whose blend function returns a **finite** value,
+  because `0.0 * NaN` is NaN in IEEE-754 rather than `0.0`. Three modes
+  did not satisfy that when 0.87.0 landed.
 
   **The distinction that keeps this honest**: "never stored" is skipped,
   "stored and fully transparent" is **not**. A tile painted and then
@@ -15444,6 +15451,131 @@ severity choice.
   a test by a stale name (`composite.rs`, the record-without-submitting
   test's doc cross-reference had not been updated when the test itself
   was renamed in 0.86.0).
+
+  **0.87.1 — a real NaN bug found by checking 0.87.0's own claim
+  literally, plus four disclosure fixes.** Independent review took the
+  "bit-identical for every blend mode" claim above at its word and
+  checked it across all 26 blend functions instead of the five 0.87.0
+  tested. It is **false for three of them**, and the reason is a
+  pre-existing bug in `aurora-render`, not anything 0.87.0 changed:
+
+  - **The bug.** `composite.rs`'s `clip_color` (the W3C `ClipColor`
+    gamut-remapping step every non-separable mode reaches through
+    `set_lum`) divides by `l - n` and by `x - l`. `lum`'s weights sum to
+    exactly `1.0`, so `n <= l <= x` always, with equality on both sides
+    precisely when every channel is equal — so an **achromatic** input
+    makes both denominators exactly `0.0`, with numerators exactly `0.0`
+    too. `0.0 / 0.0` is NaN. It fired whenever an achromatic colour also
+    had a channel outside `0.0..=1.0`, which is exactly the condition
+    that makes one of the two clip branches run.
+  - **Reachable from ordinary content, not a contrived input.**
+    `blend_color` is `SetLum(Cs, Lum(Cb))`, so *any* achromatic source —
+    grey, white, black — over a backdrop whose luminance is outside
+    `[0,1]` produced NaN; and `set_sat` collapses an achromatic input to
+    `[0,0,0]` whatever `s` is, so `Hue`/`Saturation` produced NaN over
+    any achromatic out-of-`[0,1]` backdrop for *any* source at all.
+    Out-of-`[0,1]` samples are not exotic: `aurora-io`'s 32-bit float
+    TIFF path (`tiff.rs`) promotes samples via `f16::from_f32` with **no
+    clamping**, deliberately, because invariant §7.3.1b's `f16` pipeline
+    is supposed to carry HDR. `blend_luminosity` never exhibited it.
+  - **Why it was silent corruption rather than a visible glitch.**
+    `composite_layer_into` multiplies the blend result by `alpha`, and
+    `0.0 * NaN` is NaN — so even a **fully transparent** layer in one of
+    those three modes replaced the whole tile with NaN, which then
+    survives un-premultiplication, export and the eyedropper with no
+    error surfaced anywhere.
+  - **The fix**, in `clip_color` itself rather than as a blank-layer
+    special case, since the bug is reachable through ordinary painted and
+    *erased* content too: both divisions are now guarded on a positive
+    denominator — the same shape `set_sat`'s own long-standing
+    `max > min` guard already had — and clamp each channel into
+    `0.0..=1.0` when it is zero. Luminance preservation is given up only
+    there, unavoidably: the target is out of gamut and an achromatic
+    colour has no chromatic direction to redistribute along, so the
+    clamp is the closest in-gamut colour. The guard is unreachable for
+    any input that was previously well-defined, pinned directly by
+    `clip_color_leaves_an_in_gamut_achromatic_input_exactly_alone`.
+  - **Tests.** Five new in `aurora-render` (`clip_color`/`set_lum`
+    finiteness for out-of-gamut achromatic inputs, all four
+    non-separable modes across six HDR/achromatic `(Cb, Cs)` pairs, and
+    one end-to-end `composite_tile_cpu` case proving a fully transparent
+    `Color` layer leaves an HDR backdrop untouched). All four
+    NaN-detecting ones were confirmed to fail against the unfixed
+    `clip_color` before it was changed.
+  - **The differential test the claim needed all along.**
+    `a_never_painted_visible_layer_changes_no_composited_texel_whatever_its_blend_mode`
+    went from 5 modes and one in-`[0,1]` backdrop to **all 27 modes ×
+    three backdrops × two kinds of blank layer**, the backdrops
+    including an achromatic HDR one (`[4.0, 4.0, 4.0, 1.0]`) and a
+    chromatic HDR one. The second "kind of blank layer" is the
+    load-bearing addition: an **erased** ghost (`contains_tile == true`)
+    takes the full path and really evaluates each mode's formula, which
+    is what makes the never-painted arm's justification testable instead
+    of merely asserted. Verified to catch the bug: with the `clip_color`
+    guard temporarily neutered it fails at `Hue` over the achromatic HDR
+    backdrop with an all-NaN buffer.
+  - **The claim, restated precisely** in `resolve_tile`'s doc comment,
+    its inline branch comment, and the paragraph above. Finiteness of the
+    blend function is the real precondition a future mode must satisfy;
+    `clip_color`'s fix is what makes the three HSL modes satisfy it.
+
+  Four disclosure fixes in the same commit:
+
+  - **A stale near-duplicate doc site, the exact failure mode 0.86.2
+    already needed a patch for.** `begin_gpu_composite_tile`'s
+    accumulator-pair comment still carried the *pre*-0.87.0 claim ("a
+    visible layer resolves at every tile coordinate, so only a tile with
+    no *visible* layer anywhere still does zero GPU work"),
+    contradicting the corrected "What a bailed tile actually costs"
+    paragraph ~90 lines below it in the same function. Reworded as
+    history ("until 0.87.0 … as of 0.87.0 …"), and both stale phrases
+    grepped to zero hits across the workspace and PLAN.md.
+  - **A narrowed export refusal.** Both new guards return before
+    `apply_mask` runs, so a layer with nothing stored at a tile never
+    attempts its mask-coverage read — meaning a broken mask scratch tile
+    under an unpainted region no longer charges `note_store_error` and no
+    longer makes `composite_document` refuse the export.
+    `WindowKind::MaskCoverage`'s doc comment stated that contract in
+    absolute terms; the exception is now recorded there and in
+    `resolve_tile`'s own paragraph. Pixel output is unaffected, and it is
+    accepted rather than worked around: that layer contributes nothing at
+    that tile either way, so no export is degraded.
+  - **A blank tile of a GPU-qualifying document resolves its root stack
+    twice** — once for the GPU attempt, which bails, and again in the CPU
+    fallback, double-charging `budget.next_tile`. Individually cheap now
+    (three hash lookups per resolve rather than a tile materialization),
+    but a real new steady-state cost on exactly the path this round
+    exists to make cheap. Accepted residual, documented at the fallback
+    site. A structural fix means giving `begin_gpu_composite_tile` a
+    return type that separates "nothing resolved, tile genuinely empty"
+    from "bailed, fall back" — deliberately **not** attempted in a
+    correction round; named as a follow-on here.
+  - **`resolve_tile`'s summary line** did not list the new (and now most
+    frequent) `None` case, which was introduced only in a later
+    paragraph — so an IDE hover or rustdoc synopsis showed an incomplete
+    enumeration. Added to the summary itself.
+
+  **Follow-on recorded, deliberately not fixed here: `SurfaceId` aliasing
+  across `LayerTree`s.** `aurora_doc::tree`'s `surface_id(id)` is
+  `SurfaceId::from_raw(layer_id.to_raw())`, and `LayerId`s restart per
+  `LayerTree`, so two trees sharing one `TileStore` alias each other's
+  surfaces — a "never painted" layer in one tree can read another tree's
+  pixels at the same raw id. Pre-existing, and 0.87.0 did not create it
+  (`store.get` would have returned the other tree's tile just as
+  happily), but 0.87.0 **raises the stakes**: tile-store residency is now
+  a semantic correctness gate ("has this layer ever been painted here")
+  rather than a pure performance detail. Nothing shipped opens two
+  `LayerTree`s against one `TileStore`, so it is latent today; it would
+  bite any future multi-document or preview-tree work. This is the same
+  derived-surface-id root cause already disclosed for masks — see M1.9's
+  0.81.0/0.81.1 addenda and the "removed-then-re-added mask" residual in
+  the M1.9 mask entry — and the fix is the same ordering/namespace
+  decision those are blocked on, not a local change. **Encountered
+  concretely this round**, which is why it is written down: the extended
+  differential test above failed its own setup assertion when it shared
+  one store across cases, because the erased ghost's write was still
+  sitting on the next tree's ghost surface. Worked around in the test
+  with a fresh `TileStore` per case, and commented there.
 
 - [x] **Real per-pixel grayscale mask coverage — done 2026-09-02
   (0.70.0), closing the "rectangular clip only" limitation the

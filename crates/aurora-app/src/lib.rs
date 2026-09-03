@@ -6208,12 +6208,14 @@ impl CompositeBudget {
 /// `composite_document_blends_two_group_children_via_a_non_normal_blend_mode_against_a_translucent_backdrop`
 /// below for this fix verified end to end through a real group.
 ///
-/// `None` if `id` doesn't exist, isn't visible, or (for a
+/// `None` if `id` doesn't exist, isn't visible, (for a
 /// [`aurora_doc::LayerKind::Pixel`]) its tile fails to load — the same
 /// "one bad tile shouldn't abort the rest" discipline
 /// [`recomposite_visible_tiles`]/[`composite_document`] already use:
 /// the caller simply omits this contributor from its own composite
-/// rather than propagating the error further.
+/// rather than propagating the error further — or it has *nothing
+/// stored* at this tile (the most frequent case of the four; see
+/// below).
 ///
 /// Also `None` — new in 0.87.0, and the ordinary case rather than an
 /// error one — for a **visible** [`aurora_doc::LayerKind::Pixel`] layer
@@ -6226,12 +6228,40 @@ impl CompositeBudget {
 /// blank tile rather than by signalling absence — so every caller then
 /// paid a full contributor's worth of compositing work (on the GPU path,
 /// a tile-sized upload, a blend pass and a readback) to add nothing.
-/// `None` is bit-identical output: `aurora_render::composite_layer_into`
-/// scales every texel by `src_a * opacity`, which is zero throughout a
-/// blank tile, leaving the destination exactly as it was. See the
-/// branch's own comment for why "never stored" must stay distinct from
-/// "stored, and fully transparent" (an erased tile is real content and
-/// still resolves), and PLAN.md's M1.10 "Empty-tile GPU composite work".
+///
+/// **Why that's output-preserving, stated as the precondition it
+/// actually is** (0.87.0 claimed "bit-identical for every blend mode",
+/// which overclaimed a mode-independent identity; corrected in 0.87.1).
+/// The identity is a property of one multiply in
+/// `aurora_render::composite_layer_into`, not of any blend formula: it
+/// scales the *whole* per-mode blend result by `alpha = src_a *
+/// opacity`, which is `0.0` at every texel of a blank tile, so the fold
+/// reduces to `Co = Cb` and `result_a = dst_a` — the destination
+/// untouched — for any mode **whose blend function returns a finite
+/// value**. Finiteness is the real precondition, and it is not free:
+/// `0.0 * NaN` is NaN in IEEE-754, not `0.0`, so a mode that can return
+/// NaN would corrupt the destination rather than leave it alone, and
+/// skipping it would then *differ* from compositing it. All 26 modes
+/// satisfy it as of 0.87.1 — `Hue`/`Saturation`/`Color` did **not**
+/// before that, via a NaN in `aurora_render`'s own `clip_color`, fixed
+/// in the same commit as this paragraph. A future mode must satisfy it
+/// too; see `clip_color`'s doc comment for the trap.
+///
+/// See the branch's own comment for why "never stored" must stay
+/// distinct from "stored, and fully transparent" (an erased tile is real
+/// content and still resolves), and PLAN.md's M1.10 "Empty-tile GPU
+/// composite work".
+///
+/// **One disclosed narrowing** (0.87.1, from review): both guards return
+/// *before* [`apply_mask`] runs, so a layer with nothing stored at this
+/// tile never attempts its mask-coverage read. A broken or unreadable
+/// mask scratch tile under an unpainted region therefore no longer
+/// charges `CompositeBudget::note_store_error`, so
+/// [`composite_document`] no longer refuses an export for it. Pixel
+/// output is unaffected — that layer contributes nothing there either
+/// way — but [`WindowKind::MaskCoverage`]'s doc comment states the
+/// export-refusal contract in absolute terms, so the exception is
+/// recorded in both places rather than left to be discovered.
 ///
 /// **Origin handling doesn't get any harder with nesting**:
 /// [`aurora_doc::LayerKind::Group`] has no `bounds`/offset of its own —
@@ -6322,12 +6352,22 @@ fn resolve_tile(
                 // applies to each of its up-to-four source tiles.
                 //
                 // Returning `None` is **bit-identical** to the
-                // `Some(`all-zero texels`)` it replaces, for every blend
-                // mode: `aurora_render::composite_layer_into` derives
+                // `Some(`all-zero texels`)` it replaces:
+                // `aurora_render::composite_layer_into` derives
                 // `as = src_a * opacity`, which is `0.0` at every texel of
-                // a blank tile, and every mode's fold then reduces to
+                // a blank tile, and the fold then reduces to
                 // `Co = Cb` and `result_a = dst_a` -- the destination
-                // untouched. The mask and `Dissolve` tails below are
+                // untouched.
+                //
+                // That holds for a mode whose blend function returns a
+                // *finite* value, which is the precondition, not "for
+                // every mode unconditionally" (0.87.0's own wording; see
+                // this function's doc comment for the correction). Every
+                // mode satisfies it as of 0.87.1; three did not before,
+                // because `0.0 * NaN` is NaN rather than `0.0` and
+                // `aurora_render`'s `clip_color` could return NaN.
+                //
+                // The mask and `Dissolve` tails below are
                 // skipped for the same reason: masking can only *reduce*
                 // an already-zero alpha, and `dissolve_gate` weights each
                 // texel's gate by `texel_alpha * opacity`, so it too
@@ -7235,11 +7275,16 @@ fn note_gpu_composite_submit() {}
 ///   accumulators an all-`Multiply` stack would.
 ///
 /// **Each is created separately and lazily** (0.84.1). `current` is
-/// created by the first root layer that resolves — which, per the
-/// lazy-paging correction below (0.86.1), is not the same as "this tile
-/// has painted content": a visible layer resolves at every tile
-/// coordinate, so only a tile with no *visible* layer anywhere still
-/// does zero GPU work. `spare` is created by the first blend-math layer
+/// created by the first root layer that resolves. Until 0.87.0 that was
+/// not the same as "this tile has painted content" — the lazy-paging
+/// correction below (0.86.1) spelled out that a visible layer resolved
+/// at *every* tile coordinate, so only a tile with no visible layer
+/// anywhere did zero GPU work. As of 0.87.0 a visible layer resolves
+/// only where it has content *stored* ([`resolve_tile`] returns `None`
+/// otherwise), so an ordinary blank tile of an ordinary visible document
+/// now creates no accumulator and does zero GPU work too — see "What a
+/// bailed tile actually costs" below, which is the same statement from
+/// the cost side. `spare` is created by the first blend-math layer
 /// of *any* expressible mode that actually
 /// reaches this tile — never before, and never a second time for a
 /// second mode — so an all-`Normal` document (every
@@ -8085,6 +8130,25 @@ fn recomposite_visible_tiles(
         if let Some(pending) = issued {
             pending_gpu.push(pending);
         } else {
+            // **A blank tile of a GPU-qualifying document resolves its
+            // whole root stack twice** (disclosed 0.87.1, accepted as a
+            // residual). `begin_gpu_composite_tile` above walks every
+            // root, has each one bail in `resolve_tile`, creates no
+            // accumulator and returns `None` -- indistinguishable here
+            // from "the GPU path declined for some other reason" -- so
+            // this fallback walks the same roots again, and
+            // `budget.next_tile` is charged twice for the one tile.
+            //
+            // Cheap in absolute terms after 0.87.0 (each of those
+            // resolves is now three hash lookups, not a tile
+            // materialization), but it is a real new steady-state cost
+            // on exactly the path 0.87.0 exists to make cheap, so it is
+            // stated rather than left implicit. Fixing it properly means
+            // giving `begin_gpu_composite_tile` a return type that
+            // separates "nothing resolved, and the tile is genuinely
+            // empty" from "bailed, fall back" -- a larger change than
+            // this correction round should carry. See PLAN.md, M1.10,
+            // "Empty-tile GPU composite work".
             let composited =
                 composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget);
             write_composited(store, cache, tile_id, &composited);
@@ -8520,6 +8584,19 @@ enum WindowKind {
     /// [`Self::LayerPixels`] does. It is a real behaviour change from
     /// before mask pixels existed (a mask could not fail to read at
     /// all then), stated here rather than left to be discovered.
+    ///
+    /// **One exception, deliberate** (0.87.0, disclosed in 0.87.1):
+    /// [`resolve_tile`] now returns before [`apply_mask`] is ever
+    /// reached for a layer with nothing *stored* at the tile being
+    /// composited, so that layer's mask is not read there and an
+    /// unreadable mask tile under an unpainted region charges nothing
+    /// and forces no export refusal. The refusal above is therefore
+    /// "wherever the mask is actually consulted", not literally every
+    /// tile the mask surface spans. Accepted rather than worked around:
+    /// a layer with no stored pixels at that tile contributes nothing to
+    /// the export either way, masked or not, so no output is degraded by
+    /// letting the export proceed — which is the harm the refusal exists
+    /// to prevent.
     MaskCoverage,
 }
 
@@ -33239,82 +33316,177 @@ mod tests {
         );
     }
 
+    /// Every `aurora_doc::BlendMode` there is, in the order
+    /// `aurora-doc` declares them — all 27, so no mode can be added
+    /// without deciding whether it belongs in the exhaustive
+    /// differential test below.
+    const EVERY_BLEND_MODE: [aurora_doc::BlendMode; 27] = [
+        aurora_doc::BlendMode::Normal,
+        aurora_doc::BlendMode::Dissolve,
+        aurora_doc::BlendMode::Darken,
+        aurora_doc::BlendMode::Multiply,
+        aurora_doc::BlendMode::ColorBurn,
+        aurora_doc::BlendMode::LinearBurn,
+        aurora_doc::BlendMode::DarkerColor,
+        aurora_doc::BlendMode::Lighten,
+        aurora_doc::BlendMode::Screen,
+        aurora_doc::BlendMode::ColorDodge,
+        aurora_doc::BlendMode::LinearDodge,
+        aurora_doc::BlendMode::LighterColor,
+        aurora_doc::BlendMode::Overlay,
+        aurora_doc::BlendMode::SoftLight,
+        aurora_doc::BlendMode::HardLight,
+        aurora_doc::BlendMode::VividLight,
+        aurora_doc::BlendMode::LinearLight,
+        aurora_doc::BlendMode::PinLight,
+        aurora_doc::BlendMode::HardMix,
+        aurora_doc::BlendMode::Difference,
+        aurora_doc::BlendMode::Exclusion,
+        aurora_doc::BlendMode::Subtract,
+        aurora_doc::BlendMode::Divide,
+        aurora_doc::BlendMode::Hue,
+        aurora_doc::BlendMode::Saturation,
+        aurora_doc::BlendMode::Color,
+        aurora_doc::BlendMode::Luminosity,
+    ];
+
     /// Why `None` is a *bit-identical* substitute for
     /// `Some(`all-zero texels`)` rather than merely a close one, checked
-    /// rather than argued.
+    /// rather than argued — and checked against **both** kinds of blank
+    /// layer, because only one of them takes the 0.87.0 shortcut:
     ///
-    /// `aurora_render::composite_layer_into` scales every source texel by
-    /// `as = src_a * opacity`, which is zero throughout a blank tile, so
-    /// every blend mode's fold reduces to `Co = Cb` and
-    /// `result_a = dst_a` — the destination untouched. That is a property
-    /// of the fold, not of any one formula, so this loops over five
-    /// modes: the three the GPU path can express (`Normal`, `Multiply`,
-    /// `Darken`), `Dissolve` (resolved to `Normal` on the CPU before any
-    /// blend), and `Screen` — which no GPU arm exists for at all, and is
-    /// here precisely to show the property is the fold's and not
-    /// something special-cased per mode.
+    /// - a **never-painted** layer, which [`resolve_tile`] now skips
+    ///   outright, and
+    /// - an **erased** layer, painted and then written to
+    ///   `(0, 0, 0, 0)`, which deliberately still goes down the full
+    ///   path and really does run every mode's blend math over blank
+    ///   texels.
+    ///
+    /// Both must leave the baseline composite untouched, and the second
+    /// is what makes the first's justification testable rather than
+    /// merely asserted: it is the arm that actually evaluates the per-mode
+    /// formula the skip is claimed to be equivalent to.
+    ///
+    /// `aurora_render::composite_layer_into` scales the whole per-mode
+    /// blend result by `as = src_a * opacity`, which is zero throughout a
+    /// blank tile, so the fold reduces to `Co = Cb` and
+    /// `result_a = dst_a`. That is a property of the fold rather than of
+    /// any one formula — **given a finite blend result**, which is the
+    /// real precondition and was not universally true before 0.87.1:
+    /// `0.0 * NaN` is NaN, not `0.0`, so a mode that can return NaN
+    /// corrupts the destination instead of leaving it alone. 0.87.0's
+    /// own version of this test looped over five modes and a single
+    /// in-`[0,1]` backdrop, and missed exactly that. It now covers
+    /// [`EVERY_BLEND_MODE`] against three backdrops, including an
+    /// achromatic **HDR** one (channels at `4.0`, a legitimate unclamped
+    /// float-TIFF import under invariant §7.3.1b) — the fixture the NaN
+    /// in `aurora_render`'s `clip_color` needed, which made
+    /// `Hue`/`Saturation`/`Color` fail the erased arm below until that
+    /// bug was fixed in the same commit as this comment.
     ///
     /// `assert_eq!` on the raw `half::f16` buffers, not a tolerance: the
     /// claim is that adding the layer changes *nothing*, and a tolerance
-    /// would hide a real one-bit difference.
+    /// would hide a real one-bit difference. NaN would also make
+    /// `assert_eq!` fail all by itself (`NaN != NaN`), but the finiteness
+    /// of the *baseline* is asserted separately so a NaN backdrop cannot
+    /// make the comparison fail for the wrong reason.
     #[test]
     fn a_never_painted_visible_layer_changes_no_composited_texel_whatever_its_blend_mode() {
-        let (_dir, mut store) = real_tile_store();
         let tile_id = aurora_tile::TileId { x: 0, y: 0 };
-        let rgba = [0.25, 0.5, 0.75, 0.8];
 
-        let painted_only = solid_root_stack(
-            &mut store,
-            &[("painted", aurora_doc::BlendMode::Normal, 1.0, rgba)],
-        );
-        let mut budget = CompositeBudget::for_pass(&painted_only);
-        let baseline = composite_roots_into_tile(
-            &painted_only,
-            &mut store,
-            tile_id,
-            (0, 0),
-            (0, 0),
-            &mut budget,
-        );
-        assert!(
-            baseline.iter().any(|sample| sample.to_f32() > 0.0),
-            "setup: the painted baseline must composite to something -- two all-zero buffers \
-             would agree vacuously"
-        );
-
-        for mode in [
-            aurora_doc::BlendMode::Normal,
-            aurora_doc::BlendMode::Multiply,
-            aurora_doc::BlendMode::Darken,
-            aurora_doc::BlendMode::Dissolve,
-            aurora_doc::BlendMode::Screen,
+        for backdrop in [
+            // An ordinary in-gamut, translucent backdrop.
+            [0.25, 0.5, 0.75, 0.8],
+            // Achromatic and out of `[0,1]`: the pair of properties the
+            // non-separable modes' `clip_color` NaN needed.
+            [4.0, 4.0, 4.0, 1.0],
+            // Chromatic and out of `[0,1]`, so `set_sat` does not
+            // collapse and the HDR range is still exercised.
+            [2.0, 3.0, 4.0, 1.0],
         ] {
-            let mut layers = solid_root_stack(
-                &mut store,
-                &[("painted", aurora_doc::BlendMode::Normal, 1.0, rgba)],
-            );
-            // Added last, so it is composited last: on top of the painted
-            // layer, where a stray contribution would be most visible.
-            let (ghost, _) = add_unpainted_root(&mut layers, "never-painted", origin_bounds());
-            if let Err(err) = layers.set_blend_mode(ghost, mode) {
-                unreachable!("{err:?}");
-            }
+            // `ghost_is_erased == false` is the never-painted layer
+            // 0.87.0's guard skips; `true` writes it to full
+            // transparency first, so `contains_tile` reports it present
+            // and it takes the ordinary path through the real blend
+            // math instead.
+            //
+            // **A fresh `TileStore` per case, deliberately.** A layer's
+            // `SurfaceId` is derived from its `LayerId`, and `LayerId`s
+            // restart per `LayerTree`, so the erased case's write would
+            // otherwise still be sitting on the *next* tree's ghost
+            // surface and quietly turn the never-painted case into a
+            // second erased one. Caught by this test's own
+            // `contains_tile` setup assertion below when the store was
+            // shared -- a live demonstration of the derived-surface-id
+            // aliasing recorded as a follow-on in PLAN.md's M1.10
+            // "Empty-tile GPU composite work" residuals.
+            for ghost_is_erased in [false, true] {
+                let (_dir, mut store) = real_tile_store();
+                let painted_only = solid_root_stack(
+                    &mut store,
+                    &[("painted", aurora_doc::BlendMode::Normal, 1.0, backdrop)],
+                );
+                let mut budget = CompositeBudget::for_pass(&painted_only);
+                let baseline = composite_roots_into_tile(
+                    &painted_only,
+                    &mut store,
+                    tile_id,
+                    (0, 0),
+                    (0, 0),
+                    &mut budget,
+                );
+                assert!(
+                    baseline.iter().any(|sample| sample.to_f32() > 0.0),
+                    "setup: the {backdrop:?} baseline must composite to something -- two \
+                     all-zero buffers would agree vacuously"
+                );
+                assert!(
+                    baseline.iter().all(|sample| sample.to_f32().is_finite()),
+                    "setup: the {backdrop:?} baseline itself must be finite, or every \
+                     comparison below fails for the wrong reason"
+                );
 
-            let mut budget = CompositeBudget::for_pass(&layers);
-            let with_ghost = composite_roots_into_tile(
-                &layers,
-                &mut store,
-                tile_id,
-                (0, 0),
-                (0, 0),
-                &mut budget,
-            );
-            assert_eq!(
-                with_ghost, baseline,
-                "adding a never-painted layer at {mode:?} changed the composite -- skipping it \
-                 has to be bit-identical to compositing its blank texels, or 0.87.0's guard is \
-                 not a pure optimization"
-            );
+                let mut layers = solid_root_stack(
+                    &mut store,
+                    &[("painted", aurora_doc::BlendMode::Normal, 1.0, backdrop)],
+                );
+                // Added last, so it is composited last: on top of the
+                // painted layer, where a stray contribution would be
+                // most visible.
+                let (ghost, ghost_surface) =
+                    add_unpainted_root(&mut layers, "blank", origin_bounds());
+                if ghost_is_erased {
+                    fill_solid(&mut store, ghost_surface, tile_id, [0.0, 0.0, 0.0, 0.0]);
+                }
+                assert_eq!(
+                    store.contains_tile(ghost_surface, tile_id),
+                    ghost_is_erased,
+                    "setup: only the erased ghost may be stored content, or this loop is \
+                     testing the same path twice"
+                );
+
+                for mode in EVERY_BLEND_MODE {
+                    if let Err(err) = layers.set_blend_mode(ghost, mode) {
+                        unreachable!("{err:?}");
+                    }
+                    let mut budget = CompositeBudget::for_pass(&layers);
+                    let with_ghost = composite_roots_into_tile(
+                        &layers,
+                        &mut store,
+                        tile_id,
+                        (0, 0),
+                        (0, 0),
+                        &mut budget,
+                    );
+                    assert_eq!(
+                        with_ghost, baseline,
+                        "adding a blank layer (erased: {ghost_is_erased}) at {mode:?} over a \
+                         {backdrop:?} backdrop changed the composite -- a fully transparent \
+                         contributor has to leave every texel exactly as it was, whether it is \
+                         skipped (0.87.0's guard) or actually composited"
+                    );
+                }
+            }
         }
     }
 
