@@ -17863,7 +17863,7 @@ severity choice.
      probes placed inside `TileResidency::sync` itself
      (`crates/aurora-gpu/src/residency.rs`) break that ~15 ms interval
      down as **87.1% `extend_premultiplied_le_bytes`**
-     (`crates/aurora-gpu/src/residency.rs:141-152` — a single-threaded,
+     (`crates/aurora-gpu/src/residency.rs:173-185` — a single-threaded,
      scalar `f16 → f32 → premultiply → f16 → le_bytes` loop over every
      texel of every dirty tile; no `rayon`, no SIMD), **12.7%
      `queue.write_texture`'s CPU-side staging `memcpy`**, and **~0%**
@@ -17908,14 +17908,38 @@ severity choice.
   **The two next-round candidates this actually justifies**, in place of
   0.88.0's implied "optimize GPU upload":
 
-  - **Parallelize or vectorize `extend_premultiplied_le_bytes`**
-    (`crates/aurora-gpu/src/residency.rs:141-152`). Measured at ~12.4 ms
+  - **Make `extend_premultiplied_le_bytes` cheaper**
+    (`crates/aurora-gpu/src/residency.rs:173-185`). Measured at ~12.4 ms
     of the ~14.3 ms `upload_sync` stage in the probe run (that stage means
     14.9–16.1 ms across the unprobed runs, so read this as "~87% of
     whichever figure", not as a fourth decimal place), i.e. **~44% of the
-    whole GPU-path frame**, in a scalar single-threaded loop with `rayon`
-    already in the dependency tree for exactly this kind of per-tile
-    work. This is the largest single measured hot spot in the frame.
+    whole GPU-path frame**, in a scalar single-threaded loop. This is the
+    largest single measured hot spot in the frame. Three separate things
+    were bundled under this one bullet; they are now split, because only
+    the first is done:
+    - **Batching the four per-channel byte appends into one — done in
+      0.89.0**, measured below.
+    - **Parallelizing per tile with `rayon` — NOT done, and not merely a
+      code change.** 0.88.1 asserted `rayon` was "already in the
+      dependency tree for exactly this kind of per-tile work". **That
+      claim was false and is withdrawn.** `rayon` is not a direct or
+      transitive dependency of `aurora-gpu`, or of any other real
+      workspace crate; it appears in `Cargo.lock` only as a transitive
+      *dev*-dependency of `aurora-tile`, pulled in by `criterion`. Using
+      it on this path would mean adding a genuine new runtime dependency
+      — its own licence review under `cargo deny`, its own thread-pool
+      behaviour on the frame path — which is a decision to raise, not a
+      build detail. On top of that, `TileResidency::sync` deliberately
+      shares one reused `Vec<u8>` across every tile it uploads while
+      interleaving store mutation and upload-budget bookkeeping between
+      tiles, so that loop would need restructuring before per-tile
+      parallelism could be sound at all.
+    - **SIMD / vectorizing the `f16 → f32 → premultiply → f16`
+      conversion — NOT done.** Untouched and unmeasured. The 0.89.0
+      measurement below is in fact the argument *for* looking here next:
+      batching the appends moved the stage only slightly, which points at
+      the per-texel arithmetic rather than the append bookkeeping as
+      where the time actually goes.
   - **Stop re-dirtying and re-uploading an unchanged, already-transparent
     composite tile.** `write_composited`'s unconditional
     `mark_dirty(full_tile)` is what forces the re-upload. Not doing it
@@ -17925,7 +17949,9 @@ severity choice.
     Note this one interacts with correction 3: its benefit on a real
     document depends on how much of the grid is genuinely blank.
 
-  Neither candidate is implemented here. 0.88.1 changes no compositing,
+  Neither candidate is implemented as of 0.88.1 (the first candidate's
+  batching sub-item landed later, in 0.89.0 — see below). 0.88.1 changes
+  no compositing,
   upload, or render-pass behaviour either — it corrects doc comments and
   this entry, adds `gpu_tiles` min/max and the `SyncStats`
   tiles/bytes-per-frame line to `report_frame_stages` (both print-only,
@@ -17943,7 +17969,7 @@ severity choice.
   round. (2) A duplicated, dangling clause in this entry's own
   `gpu_tiles` paragraph above ("The remaining ~17 tiles — the other ~17
   have nothing stored..."). (3) `extend_premultiplied_le_bytes`'s own
-  doc comment (`residency.rs:141-152`, the candidate this entry names
+  doc comment (`residency.rs:173-185`, the candidate this entry names
   as the largest measured hot spot) still only carried the *old*
   "bandwidth-bound" attribution from `spike/FINDINGS.md`; it now points
   at this measurement and states plainly that the function itself, not
@@ -18036,6 +18062,112 @@ severity choice.
     `cargo clippy -p aurora-app -- -D warnings` (lib target only, i.e.
     `cfg(not(test))`) are both clean, which is what confirms the
     shipping build carries none of it.
+
+  **0.89.0 — the first of the two candidates above, actually
+  implemented and measured: batch the four per-channel byte appends.**
+  2026-09-03, same sandbox, same real `NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)`, `AURORA_REQUIRE_GPU=1`, `--release`, three runs per
+  side.
+
+  *What changed, and only this.* The body of
+  `extend_premultiplied_le_bytes`
+  (`crates/aurora-gpu/src/residency.rs:173-185`) previously issued **four
+  separate 2-byte `out.extend_from_slice` calls per texel**, one per
+  channel. It now destructures each channel's `to_le_bytes()` into named
+  low/high bytes, concatenates all four pairs into **one 8-byte array**,
+  and appends that with **a single `extend_from_slice` per texel**. Each
+  append re-checks the `Vec`'s spare capacity and performs its own small
+  `memcpy`, so for a 256×256×4-channel tile this drops **262,144 append
+  calls to 65,536** — and at the GPU-path benchmark's measured 20 tiles
+  per frame, **~5.24M calls per frame to ~1.31M**. The arithmetic, the
+  `f16::from_f32`/`to_le_bytes` calls and the R/G/B/A order are
+  untouched, so the output is bit-for-bit what the four-append version
+  produced. Both pre-existing fused-serializer tests pass **unchanged**,
+  assertions included, and a third test now pins the byte layout
+  *absolutely* — against hand-derived IEEE 754 half-precision patterns
+  (`0.5 -> 0x3800`, `0.25 -> 0x3400`, `0.125 -> 0x3000`,
+  `0.0625 -> 0x2C00`, low byte first), not merely cross-checked against
+  the other implementation in the same file, plus a clear-then-refill
+  pass matching `sync`'s actual buffer reuse. `TileResidency::sync`'s
+  loop structure, budget checks, dirty-flag handling and reused-buffer
+  design are all untouched, as is `upload_mip`'s separate path. No new
+  dependency; no new lint exception; no assertion added or tightened
+  anywhere against any of the numbers below.
+
+  *`upload_sync` stage, before → after* (ranges over the three runs each
+  side, this file's own convention):
+
+  | test | metric | before | after |
+  |---|---|---|---|
+  | GPU path (n=40) | mean | 14.79–15.78 ms | 14.18–15.50 ms |
+  | GPU path | p50 | 14.63–14.76 ms | **14.03–14.50 ms** |
+  | GPU path | p99 | 16.67–20.00 ms | 15.88–22.15 ms |
+  | GPU path | share of frame | 54.0–55.6% | 53.6–54.4% |
+  | CPU fallback (n=12) | mean | 6.71–7.10 ms | **6.43–6.48 ms** |
+  | CPU fallback | p50 | 6.65–6.67 ms | **6.30–6.40 ms** |
+  | CPU fallback | p99 | 7.51–10.44 ms | 7.25–7.58 ms |
+  | CPU fallback | share of frame | 39.7–41.3% | 39.8–40.0% |
+
+  Whole-frame `total` over the same runs: GPU path mean 27.08–28.39 →
+  26.38–28.50 ms, p99 40.16–45.85 → 37.83–38.01 ms; CPU fallback mean
+  16.26–17.32 → 16.15–16.23 ms, p99 18.65–30.50 → 18.78–19.20 ms.
+
+  **Honest reading: a small, probably-real improvement that does not
+  clear noise on every metric, and nowhere near what the 4× call-count
+  reduction might suggest.** Stated precisely, because the distinction
+  matters:
+
+  - **p50 is the one metric where the before/after ranges do not
+    overlap on either benchmark** (GPU 14.63–14.76 → 14.03–14.50; CPU
+    6.65–6.67 → 6.30–6.40), and the direction is the same in all six
+    runs. That is the strongest signal here: roughly **0.13–0.73 ms
+    (~1–5%) off the GPU-path stage and 0.25–0.37 ms (~4–6%) off the CPU
+    fallback's**, i.e. about **0.5–2.5% of the whole frame**.
+  - **The GPU-path `mean` ranges overlap** (14.79–15.78 → 14.18–15.50):
+    the noisiest after-run is slower than the quietest before-run. On
+    that metric alone this change is **inside run-to-run noise** and
+    should not be claimed as an improvement. The CPU fallback's mean
+    ranges do not overlap, but that benchmark is n=12.
+  - **p99 is noise-dominated on both sides and supports no claim in
+    either direction** — the after-side GPU p99 range (15.88–22.15 ms)
+    is *wider* than the before-side's. This entry's own noise bullet
+    above (34% p99 spread on n=40) is exactly the trap; three runs per
+    side is a small sample and does not escape it.
+  - **The 60 FPS verdict does not move.** Both benchmarks remain over
+    the 16.7 ms budget by the same factors as before.
+  - **The interesting negative result:** cutting 3-of-4 append calls per
+    texel bought only a couple of percent of a stage that is ~87% this
+    one loop. So the `Vec` capacity checks and small `memcpy`s were
+    *not* where the loop's time goes — the per-texel
+    `f16 → f32 → multiply → f16` arithmetic is. That redirects the next
+    attempt at this function toward vectorizing the conversion, and is
+    a better-evidenced reason to look there than the original bullet
+    had.
+
+  **Explicitly NOT done in 0.89.0**, so no reader mistakes this for the
+  hot spot being closed:
+
+  - **`rayon` parallelization of this loop** — see the withdrawn
+    dependency-tree claim above. Not a code change: a new runtime
+    dependency plus a restructuring of `sync`'s shared-buffer loop.
+  - **SIMD / vectorization of the `f16 ↔ f32` conversion** — untouched,
+    unmeasured, and by the negative result above the most promising
+    remaining lever on this function.
+  - **The second diagnostic-round candidate — stop re-dirtying and
+    re-uploading unchanged, already-transparent composite tiles** —
+    entirely untouched. `write_composited`'s unconditional
+    `mark_dirty(full_tile)` still forces all 20 tiles / 10 MB per frame
+    (GPU path) and 9 tiles / 4.5 MB (CPU fallback), min equal to max, of
+    which 15–19 are provably all-zero. That candidate *removes* the work
+    instead of making it faster and remains the larger prize; 0.89.0
+    makes a loop ~2–5% faster that that change would let us skip
+    outright for most tiles.
+
+  Same disclosed limitations as the rest of this entry: one adapter, one
+  platform (Linux/Vulkan/RTX 3090), no Metal, no DX12; and both
+  benchmarks still call `CompositeCache::bump()` once per frame, so the
+  stage shares they report are a property of this fixture, not a general
+  result (correction 3 above).
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

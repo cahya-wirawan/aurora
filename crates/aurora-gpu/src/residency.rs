@@ -143,9 +143,29 @@ fn premultiply_rgba(texels: &mut [f16]) {
 /// actual GPU DMA of the bytes this produces happens later, at the next
 /// `queue.submit`, and measures near line-rate there. Before optimizing
 /// this as a *bandwidth* problem (fewer bytes, mip streaming), check
-/// whether it's cheaper to fix as a *throughput* problem first (batch the
-/// four channel writes, or parallelize per tile with `rayon`) — see the
+/// whether it's cheaper to fix as a *throughput* problem first — see the
 /// PLAN.md entry for the measured numbers.
+///
+/// **Batching the four channel writes is done (0.89.0)**: the loop body
+/// concatenates the four `to_le_bytes()` pairs into one 8-byte array and
+/// appends that with a single `extend_from_slice`, instead of four
+/// separate 2-byte appends. Each append re-checks the `Vec`'s capacity
+/// and performs its own small `memcpy`, so this cuts a 256×256 tile from
+/// 262,144 append calls to 65,536. The arithmetic, the `to_le_bytes()`
+/// calls and the R/G/B/A order are unchanged, so the output is
+/// bit-for-bit what the four-append version produced.
+///
+/// **Parallelizing per tile with `rayon` is NOT done**, and is not merely
+/// a code change. `rayon` is not a dependency of this crate, nor of any
+/// other real workspace crate — it appears in `Cargo.lock` only as a
+/// transitive *dev*-dependency of `aurora-tile` (via `criterion`), so
+/// using it here would mean adding a genuine new runtime dependency,
+/// with the licence and review that implies. Beyond that,
+/// [`TileResidency::sync`]'s loop deliberately shares one reused
+/// `Vec<u8>` across every tile it uploads while interleaving store
+/// mutation and upload-budget bookkeeping between tiles; that structure
+/// would have to be reworked before any per-tile parallelism could be
+/// sound. Treat it as a separate, unmade decision.
 ///
 /// Same trailing-partial-chunk contract as [`premultiply_rgba`]: a slice
 /// whose length is not a multiple of [`CHANNELS`] contributes nothing for
@@ -156,10 +176,11 @@ fn extend_premultiplied_le_bytes(texels: &[f16], out: &mut Vec<u8>) {
             continue;
         };
         let alpha = f32::from(*a);
-        out.extend_from_slice(&f16::from_f32(f32::from(*r) * alpha).to_le_bytes());
-        out.extend_from_slice(&f16::from_f32(f32::from(*g) * alpha).to_le_bytes());
-        out.extend_from_slice(&f16::from_f32(f32::from(*b) * alpha).to_le_bytes());
-        out.extend_from_slice(&a.to_le_bytes());
+        let [r_lo, r_hi] = f16::from_f32(f32::from(*r) * alpha).to_le_bytes();
+        let [g_lo, g_hi] = f16::from_f32(f32::from(*g) * alpha).to_le_bytes();
+        let [b_lo, b_hi] = f16::from_f32(f32::from(*b) * alpha).to_le_bytes();
+        let [a_lo, a_hi] = a.to_le_bytes();
+        out.extend_from_slice(&[r_lo, r_hi, g_lo, g_hi, b_lo, b_hi, a_lo, a_hi]);
     }
 }
 
@@ -1974,6 +1995,57 @@ mod tests {
         );
         assert_eq!(out.first(), Some(&0xAA));
         assert_eq!(out.get(1), Some(&0xBB));
+    }
+
+    /// The batched write (0.89.0 replaced four 2-byte appends per texel
+    /// with one 8-byte append) must lay the bytes down in exactly the
+    /// same order and encoding as before. Both tests above pin that
+    /// *relative* to another implementation in this file; this one pins
+    /// it *absolutely*, against hand-derived IEEE 754 half-precision bit
+    /// patterns, so a matching mistake in both implementations still
+    /// fails here.
+    ///
+    /// Every value is a power of two and every premultiplied product is
+    /// too, so both the `f32 -> f16` conversions and the multiplies are
+    /// exact and no tolerance is needed. Expected encodings (sign 0, then
+    /// 5 exponent bits biased by 15, then 10 zero mantissa bits), stored
+    /// low byte first: `0.5 = 2^-1 -> 0x3800`, `0.25 = 2^-2 -> 0x3400`,
+    /// `0.125 = 2^-3 -> 0x3000`, `0.0625 = 2^-4 -> 0x2C00`.
+    ///
+    /// It also repeats the call after `out.clear()`, which is the reuse
+    /// pattern [`TileResidency::sync`] actually uses: one buffer, cleared
+    /// and refilled per tile. A batched write that carried any state
+    /// between calls would diverge on the second fill.
+    #[test]
+    fn the_fused_serializer_writes_each_texel_as_eight_little_endian_bytes_in_rgba_order() {
+        // Texel 0: alpha 0.5, so the premultiplied RGB is 0.25, 0.125,
+        // 0.0625 and alpha stays 0.5.
+        // Texel 1: alpha 0.25, so the premultiplied RGB is 0.25, 0.125,
+        // 0.0625 again and alpha stays 0.25 — same colour bytes, a
+        // different alpha byte, which is what catches a swapped channel.
+        let texels: Vec<f16> = [[0.5f32, 0.25, 0.125, 0.5], [1.0, 0.5, 0.25, 0.25]]
+            .iter()
+            .flatten()
+            .map(|&channel| f16::from_f32(channel))
+            .collect();
+
+        let mut out = Vec::new();
+        extend_premultiplied_le_bytes(&texels, &mut out);
+
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x34, 0x00, 0x30, 0x00, 0x2C, 0x00, 0x38, //
+                0x00, 0x34, 0x00, 0x30, 0x00, 0x2C, 0x00, 0x34,
+            ],
+            "two texels, eight little-endian bytes each, in R G B A order"
+        );
+        assert_eq!(out.len(), 2 * CHANNELS * 2);
+
+        let first = out.clone();
+        out.clear();
+        extend_premultiplied_le_bytes(&texels, &mut out);
+        assert_eq!(first, out, "clear-then-refill must be byte-identical");
     }
 
     /// The whole arithmetic contract, on one texel at a time — no GPU
