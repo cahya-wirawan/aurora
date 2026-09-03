@@ -16522,6 +16522,23 @@ severity choice.
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
   --all-features`), all clean.
 
+  **Retroactive note (0.85.2), on what "Verified" above actually
+  established.** The Darken round (0.85.0/0.85.1) found that no test in
+  this whole GPU-blend-mode epic can distinguish "the GPU dispatch arm
+  genuinely ran" from "it silently fell through to the CPU path, which
+  computed the same correct pixels" — every test here is a GPU-vs-CPU
+  differential or a predicate assertion, neither of which can see that.
+  That gap applies to `Multiply`, unchanged, since this round: the
+  claim "`Multiply` composites correctly on the GPU" is still true (the
+  `aurora-render` unit tests prove the formula independently of the
+  app-level wiring, and no round in this epic has ever produced a wrong
+  pixel from it), but "a test would notice if `Multiply` silently
+  stopped being GPU-composited" was never true, including when this
+  entry was written. Not a reversal of the round's own PASS — a
+  correction to what its own test suite actually established.
+  Instrumenting `Multiply` the same way 0.85.1 instrumented `Darken`
+  (`DARKEN_GPU_DISPATCHES`) is the named follow-on; see that entry.
+
 - [x] **GPU blend-mode math, slice 2 follow-ups: the ping-pong pair made
   lazy, the swap made unrepresentably-wrong-proof, and the disclosure
   corrected — done 2026-09-03 (0.84.1).** A patch round over 0.84.0,
@@ -16667,6 +16684,19 @@ severity choice.
   --all-targets --all-features -- -D warnings`, `cargo test
   --workspace`, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
   warnings" cargo doc --workspace --no-deps --all-features`), all clean.
+
+  **Retroactive note (0.85.2), on `Dissolve` specifically.** The same
+  gap named at 0.84.0's entry above applies to `Dissolve`, admitted in
+  this entry: no test here can distinguish "`Dissolve` genuinely
+  resolved to `Normal` and composited on the GPU" from "it silently
+  fell back to the CPU path, which computes the identical answer
+  because `resolve_tile`'s gating runs on the CPU regardless of which
+  path composites the result." The formula-level claim stands — this
+  entry's own reasoning about `resolve_tile`'s interception is still
+  correct, and no round has produced a wrong `Dissolve` pixel — but the
+  test-coverage claim implicit in "Verified" above is narrower than it
+  reads: it verifies the math agrees, not that the GPU arm ran. Same
+  named follow-on as `Multiply`'s note.
 
   **Addendum (0.84.2): the Judge's PASS at 0.921 named two cheap gaps,
   both closed.** The round's mandatory criteria were all satisfied and
@@ -17004,6 +17034,78 @@ severity choice.
   --workspace`, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
   warnings" cargo doc --workspace --no-deps --all-features`), all
   clean.
+
+  **Addendum (0.85.2): the Judge's one required fix, plus a retroactive
+  note the Judge asked for on two earlier entries.** The round passed
+  at 0.906 with no blocking issue, but one real, mechanical defect:
+  **`begin_gpu_composite_tile`'s own doc comment — the largest and most
+  load-bearing one in this whole epic (the ping-pong pair, the lazy
+  accumulator creation, the premultiplied-accumulator contract, the
+  batched-readback phases) — had been silently orphaned onto
+  `DARKEN_GPU_DISPATCHES` instead.** The 0.85.1 edit inserted the new
+  static's doc paragraphs directly after the function's own closing
+  line with no blank line or intervening item between them, so Rust's
+  doc-comment attachment rule (a contiguous run of `///` lines attaches
+  to the *next real item*, blank lines notwithstanding) silently gave
+  the entire ~150-line block to the `static` a few lines below, leaving
+  `begin_gpu_composite_tile` itself with no doc comment at all — just
+  the plain `// too_many_lines` note and its `#[allow]`. Nothing caught
+  this: the function is private, so the normal `cargo doc
+  --workspace --no-deps --all-features` gate never resolves its
+  intra-doc links either way, and the item still compiles identically
+  regardless of which doc comment (if any) is attached to it — a
+  misattached doc comment is invisible to every check this project
+  runs except a human, or a Judge, actually reading the function.
+
+  Fixed by physically moving the original ~150-line block back to sit
+  directly above `fn begin_gpu_composite_tile(` (before the
+  `too_many_lines` comment and `#[allow]`, matching this file's own
+  established doc-comment-then-plain-comment-then-attribute-then-item
+  convention), leaving `DARKEN_GPU_DISPATCHES`'s own three paragraphs
+  in the position the block used to occupy, correctly attached to it
+  alone. Verified two ways: `cargo check -p aurora-app` (no compile
+  regression — moving a doc comment cannot change behavior, but this
+  confirms nothing else was disturbed), and
+  `RUSTDOCFLAGS="-D warnings" cargo doc -p aurora-app --no-deps
+  --document-private-items` — before the fix, 9 unresolved intra-doc
+  links (some genuinely unrelated, pre-existing staleness elsewhere in
+  the file); after, 3 remain, all in an unrelated part of the file,
+  none introduced by this fix. The reduction from 9 to 3 is itself
+  evidence the move corrected real, previously-misattached links, not
+  just prose position.
+
+  **The retroactive note the Judge asked for.** This round's own
+  finding — no test can distinguish "the GPU dispatch arm ran" from
+  "it silently fell back to the CPU, which computed the same correct
+  answer" — is not new to `Darken`. It applies identically to
+  `Multiply` (0.84.0) and `Dissolve` (0.84.1), and did the whole time
+  those rounds' own Judge passes were recorded. That does **not**
+  retroactively invalidate either PASS: "Multiply and Dissolve
+  composite correctly on the GPU" was, and remains, independently true
+  (the `aurora-render` unit tests establish the math regardless of
+  wiring, and no round in this whole epic — including this one's own
+  adversarial mutation testing — ever produced a wrong pixel from
+  either). What was true only in a narrower sense than stated is "a
+  test would notice if Multiply or Dissolve stopped being
+  GPU-composited" — that was false at 0.84.0 and 0.84.1 too, and
+  their own differential-only test suites could not have caught a
+  silent regression back to CPU-only. Recorded here, at those two
+  entries' own place in this file (see the 0.84.0 and 0.84.1 addenda
+  above), as a correction to what their tests actually established,
+  not a reversal of their verdicts. Instrumenting `Multiply` and
+  `Dissolve` with the same `_GPU_DISPATCHES`-style counter (or a
+  single `[AtomicU64; N]` indexed by mode, rather than three bespoke
+  statics) remains the named, not-yet-attempted follow-on.
+
+  **Verified (0.85.2)**: `cargo check -p aurora-app`; `RUSTDOCFLAGS="-D
+  warnings" cargo doc -p aurora-app --no-deps --document-private-items`
+  (9 → 3 unresolved links, none introduced by this fix); then the full
+  gate (`fmt --check`, `check_layering.py`, `check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` at 1,601 passing, `cargo test --workspace
+  --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`), all clean.
 
 ### M1.10 — Phase 1 gate
 

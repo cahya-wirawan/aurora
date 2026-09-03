@@ -6963,6 +6963,55 @@ fn create_composite_accumulator(
     (texture, view)
 }
 
+/// Test-only count of the times [`begin_gpu_composite_tile`]'s `Darken`
+/// arm has actually dispatched a real GPU blend pass.
+///
+/// **The gap this closes** (0.85.1). Every `Darken` test before this was
+/// either a differential ("the GPU path's texel equals the CPU path's")
+/// or a predicate assertion ("this document qualifies for the GPU
+/// path"). Neither can see whether the GPU arm *ran*: delete the whole
+/// `Darken` arm from the `match` below and every `Darken` tile falls
+/// through the defensive `_` arm to the CPU path, which computes the
+/// same correct answer — so the differential compares the CPU path
+/// against itself and still passes, and the predicate still holds
+/// because the predicate is a different function. That mutation was
+/// performed against 0.85.0 and the entire suite stayed green. A
+/// refactor could therefore drop `Darken` off the GPU path silently.
+///
+/// So the arm reports itself, and
+/// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack`
+/// asserts the count it expects. Reads and writes are `Relaxed` and the
+/// counter is process-global, which is sound only because every caller
+/// of `begin_gpu_composite_tile` needs a real `GpuContext` and this
+/// module's `real_gpu_context` hands one out only under
+/// `GPU_TEST_LOCK` — so no two GPU tests are ever inside this counter at
+/// once.
+///
+/// **Named follow-on: `Multiply` and `Dissolve` still have this exact
+/// gap.** Both are admitted by `document_qualifies_for_gpu_compositing`,
+/// both are covered only by GPU-vs-CPU differentials, and deleting
+/// either one's dispatch (for `Dissolve`, the `Normal` arm it is reduced
+/// to) would likewise leave the suite green. Instrumenting them is
+/// deliberately *not* done here — it would mean touching two arms this
+/// round did not otherwise change — and is left as its own round.
+#[cfg(test)]
+static DARKEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Increments [`DARKEN_GPU_DISPATCHES`]. Called from the `Darken` arm
+/// once per tile per `Darken` layer, immediately after the compositor
+/// call it is reporting.
+#[cfg(test)]
+fn note_darken_gpu_dispatch() {
+    DARKEN_GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The shipping build's version: nothing at all. The instrumentation
+/// exists to make a test non-vacuous, not to be carried by the editor —
+/// so the counter itself is `#[cfg(test)]` and this no-op is what the
+/// dispatch arm compiles down to everywhere else.
+#[cfg(not(test))]
+fn note_darken_gpu_dispatch() {}
+
 /// GPU-accelerated compositing for one visible composite tile, for the
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
 /// the whole document: every visible top-level layer is an
@@ -7115,55 +7164,6 @@ fn create_composite_accumulator(
 /// GPU-side failure (a lost device, a bad map) can no
 /// longer be detected here — resolving the map is [`finish_tile_readback`]'s
 /// job now, in phase 3, once this function has already returned.
-/// Test-only count of the times [`begin_gpu_composite_tile`]'s `Darken`
-/// arm has actually dispatched a real GPU blend pass.
-///
-/// **The gap this closes** (0.85.1). Every `Darken` test before this was
-/// either a differential ("the GPU path's texel equals the CPU path's")
-/// or a predicate assertion ("this document qualifies for the GPU
-/// path"). Neither can see whether the GPU arm *ran*: delete the whole
-/// `Darken` arm from the `match` below and every `Darken` tile falls
-/// through the defensive `_` arm to the CPU path, which computes the
-/// same correct answer — so the differential compares the CPU path
-/// against itself and still passes, and the predicate still holds
-/// because the predicate is a different function. That mutation was
-/// performed against 0.85.0 and the entire suite stayed green. A
-/// refactor could therefore drop `Darken` off the GPU path silently.
-///
-/// So the arm reports itself, and
-/// `recomposite_visible_tiles_gpu_path_composites_a_mixed_normal_multiply_and_darken_stack`
-/// asserts the count it expects. Reads and writes are `Relaxed` and the
-/// counter is process-global, which is sound only because every caller
-/// of `begin_gpu_composite_tile` needs a real `GpuContext` and this
-/// module's `real_gpu_context` hands one out only under
-/// `GPU_TEST_LOCK` — so no two GPU tests are ever inside this counter at
-/// once.
-///
-/// **Named follow-on: `Multiply` and `Dissolve` still have this exact
-/// gap.** Both are admitted by `document_qualifies_for_gpu_compositing`,
-/// both are covered only by GPU-vs-CPU differentials, and deleting
-/// either one's dispatch (for `Dissolve`, the `Normal` arm it is reduced
-/// to) would likewise leave the suite green. Instrumenting them is
-/// deliberately *not* done here — it would mean touching two arms this
-/// round did not otherwise change — and is left as its own round.
-#[cfg(test)]
-static DARKEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Increments [`DARKEN_GPU_DISPATCHES`]. Called from the `Darken` arm
-/// once per tile per `Darken` layer, immediately after the compositor
-/// call it is reporting.
-#[cfg(test)]
-fn note_darken_gpu_dispatch() {
-    DARKEN_GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The shipping build's version: nothing at all. The instrumentation
-/// exists to make a test non-vacuous, not to be carried by the editor —
-/// so the counter itself is `#[cfg(test)]` and this no-op is what the
-/// dispatch arm compiles down to everywhere else.
-#[cfg(not(test))]
-fn note_darken_gpu_dispatch() {}
-
 // `too_many_lines`: 107, against a 100 limit, as of the second ported
 // blend mode (0.85.0) -- the body is one loop whose `match` gains a
 // fixed ~13-line arm per mode, so it crossed the threshold on `Darken`
