@@ -27076,7 +27076,15 @@ mod tests {
                 Some(&mut compositor),
             );
             let t_recomposite = std::time::Instant::now();
-            let _ = residency.sync(queue, store, composite_surface_id(), false, usize::MAX);
+            // `SyncStats` is already computed by `sync` itself, and 0.88.0
+            // threw it away with a `let _`. Capturing it is free and it is
+            // the only direct evidence of *what* the `upload_sync` stage
+            // spent its time on: how many tiles were serialized and
+            // re-uploaded this frame, and how many bytes. Both numbers turn
+            // out to be fixed and content-independent here -- see
+            // [`report_frame_stages`].
+            let sync_stats =
+                residency.sync(queue, store, composite_surface_id(), false, usize::MAX);
             let t_upload_sync = std::time::Instant::now();
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -27131,6 +27139,7 @@ mod tests {
                 ],
                 take_gpu_composite_submit_count(),
                 take_recomposite_phase_ms(),
+                sync_stats,
             );
         }
         stages
@@ -27144,10 +27153,20 @@ mod tests {
     /// numbers. `total` is defined exactly as it always was --
     /// `t0.elapsed()` across the whole frame body -- so introducing the
     /// per-stage split cannot move either caller's CI-safety budget
-    /// assertion. The per-stage vectors will not sum exactly to `total`:
-    /// the marks are taken between statements, so the handful of
-    /// microseconds spent in the pushes and in `Instant::now` itself lands
-    /// nowhere, and `total` is read before the pushes happen.
+    /// assertion.
+    ///
+    /// **How exactly the stages sum to `total`** (0.88.1 corrected an
+    /// earlier, vaguer claim here that they differ by "well under a
+    /// percent"): the marks are taken between statements, so the
+    /// microseconds spent in the pushes and in `Instant::now` itself land
+    /// nowhere, and `total` is read before the pushes happen -- but
+    /// measured, the residual is **a single clock read, tens of
+    /// nanoseconds**: on a real 40-frame run the per-frame
+    /// `total - sum(stages)` gap was 0.0000 ms for 39 frames and
+    /// 0.0001 ms for one, i.e. on the order of 0.0001%, not 0.1-1%. Any
+    /// larger-looking gap in a *range* table (PLAN.md's own, for one) is
+    /// an artifact of quoting each stage's min and max across several
+    /// different runs, not an unmeasured slice of frame time.
     ///
     /// Added 0.88.0 for a single purpose: three consecutive earlier rounds
     /// each optimized one plausible-sounding stage of this frame without
@@ -27165,15 +27184,38 @@ mod tests {
         /// `recomposite_visible_tiles` in full; `recomposite_phases`
         /// breaks this one down further.
         recomposite: Vec<f64>,
-        /// `TileResidency::sync` -- staging and uploading the composite
-        /// surface's dirty tiles to the GPU.
+        /// `TileResidency::sync` -- **CPU-side preparation for the GPU
+        /// upload, not the GPU upload itself.** 0.88.0 labelled this
+        /// stage "the GPU texture upload" and PLAN.md called it "GPU
+        /// upload bandwidth"; both were wrong, and 0.88.1 corrected them
+        /// against finer probes placed inside `sync` itself. The measured
+        /// breakdown of this interval:
+        ///
+        /// - **87.1%** `aurora_gpu::residency`'s
+        ///   `extend_premultiplied_le_bytes` -- a single-threaded, scalar
+        ///   `f16 -> f32 -> premultiply -> f16 -> le_bytes` loop over
+        ///   every texel of every dirty tile. No `rayon`, no SIMD.
+        /// - **12.7%** `queue.write_texture`'s own CPU-side staging
+        ///   `memcpy`.
+        /// - **~0%** `TileStore::get` (the tile-store read).
+        ///
+        /// The actual GPU DMA copy does **not** execute in this interval:
+        /// `write_texture` only records it, and it runs at the later
+        /// `queue.submit`, which lands in [`Self::submit_poll`] -- where
+        /// 0.51-0.61 ms for 10 MB works out to ~17 GB/s, consistent with
+        /// real PCIe/GPU bandwidth. So "`upload_sync` dominates the
+        /// frame" is true as an *interval*, but it is not an upload-
+        /// bandwidth finding: it is a scalar CPU serialization loop.
         upload_sync: Vec<f64>,
         /// Building the command encoder, bind group, pipeline and the
         /// one render pass. Records commands; runs nothing.
         record_pass: Vec<f64>,
         /// `queue.submit` plus the blocking `device.poll(Wait)` -- the
         /// closest thing here to "the GPU actually ran", though it is
-        /// still wall-clock stall, not a timestamp query.
+        /// still wall-clock stall, not a timestamp query. **This is also
+        /// where the frame's real GPU texture DMA executes**, since
+        /// `queue.write_texture` during [`Self::upload_sync`] only stages
+        /// and records it.
         submit_poll: Vec<f64>,
         /// `begin_gpu_composite_tile`'s own submit count for this frame,
         /// i.e. how many tiles genuinely took the GPU compositing path.
@@ -27187,6 +27229,18 @@ mod tests {
         /// [`RECOMPOSITE_PHASE_NANOS`], and note that phase 2 is
         /// wall-clock stall on the poll rather than GPU execution time.
         recomposite_phases: Vec<[f64; 3]>,
+        /// Tiles `TileResidency::sync` actually serialized and uploaded
+        /// this frame, from the `SyncStats` `sync` already returns and
+        /// 0.88.0 discarded. Reported because it is what makes
+        /// [`Self::upload_sync`]'s cost interpretable: this loop calls
+        /// `CompositeCache::bump()` every frame, which invalidates the
+        /// *whole* grid, so this number is a fixed floor rather than a
+        /// function of what was painted.
+        uploaded: Vec<u32>,
+        /// Bytes uploaded this frame, same source as [`Self::uploaded`].
+        /// Independently checkable against `spike/FINDINGS.md`'s own
+        /// "~18 MB per screenful" upload-bandwidth figure.
+        bytes_uploaded: Vec<u64>,
     }
 
     impl FrameStages {
@@ -27201,6 +27255,8 @@ mod tests {
                 submit_poll: Vec::with_capacity(frames),
                 gpu_tiles: Vec::with_capacity(frames),
                 recomposite_phases: Vec::with_capacity(frames),
+                uploaded: Vec::with_capacity(frames),
+                bytes_uploaded: Vec::with_capacity(frames),
             }
         }
 
@@ -27221,6 +27277,7 @@ mod tests {
             marks: [std::time::Instant; 7],
             gpu_tiles: u64,
             recomposite_phases: [f64; 3],
+            sync_stats: aurora_gpu::SyncStats,
         ) {
             let [
                 t0,
@@ -27245,6 +27302,8 @@ mod tests {
                 .push(ms(submit_poll.duration_since(record_pass)));
             self.gpu_tiles.push(gpu_tiles);
             self.recomposite_phases.push(recomposite_phases);
+            self.uploaded.push(sync_stats.uploaded);
+            self.bytes_uploaded.push(sync_stats.bytes_uploaded);
         }
     }
 
@@ -27324,11 +27383,21 @@ mod tests {
     ///    total's own p99. That is exactly why item 1 above is reported
     ///    separately: it is the one row where every number is from one
     ///    real frame.
-    /// 3. **GPU tiles composited per frame** (`gpu_tiles`), and the
-    ///    `recomposite_visible_tiles` sub-phase means. A GPU-path test
-    ///    reporting `gpu_tiles mean=0.0` would mean the path under test
-    ///    never ran and every number above describes the CPU fallback --
-    ///    a finding, not a footnote.
+    /// 3. **GPU tiles composited per frame** (`gpu_tiles`, mean plus min
+    ///    and max), and the `recomposite_visible_tiles` sub-phase means. A
+    ///    GPU-path test reporting `gpu_tiles mean=0.0` would mean the path
+    ///    under test never ran and every number above describes the CPU
+    ///    fallback -- a finding, not a footnote. The min and max are
+    ///    0.88.1's addition: 0.88.0 printed the mean alone, which was then
+    ///    read as "a steady 3.0 per frame" -- a claim a mean cannot
+    ///    support and that the worst-frame row above already contradicted.
+    /// 4. **What `upload_sync` actually moved**: tiles and MB uploaded per
+    ///    frame, mean/min/max, taken straight from the `SyncStats`
+    ///    `TileResidency::sync` already returns (0.88.0 discarded it with
+    ///    a `let _`). This is what turns "`upload_sync` dominates" into a
+    ///    checkable figure, and it is how the fixed, content-independent
+    ///    upload floor in these fixtures was found: min equals max, so
+    ///    the volume does not depend on what was painted at all.
     fn report_frame_stages(label: &str, stages: &mut FrameStages) {
         let frames = stages.total.len();
         if frames == 0 {
@@ -27392,8 +27461,31 @@ mod tests {
             );
         }
 
+        report_frame_counters(label, stages, frames);
+    }
+
+    /// The per-frame *counter* half of [`report_frame_stages`]'s output:
+    /// `gpu_tiles` (mean/min/max), the `recomposite_visible_tiles`
+    /// sub-phase means, and what `TileResidency::sync` actually uploaded
+    /// (tiles and MB per frame, mean/min/max).
+    ///
+    /// Split out of [`report_frame_stages`] in 0.88.1 purely to keep that
+    /// function under `clippy::too_many_lines` once the `SyncStats` line
+    /// was added -- no behaviour of either differs from inlining it, and
+    /// it is still called unconditionally at the end of that function.
+    /// `frames` is passed rather than recomputed so both halves divide by
+    /// the same denominator.
+    fn report_frame_counters(label: &str, stages: &FrameStages, frames: usize) {
         #[allow(clippy::cast_precision_loss)]
         let gpu_tiles_mean = stages.gpu_tiles.iter().copied().sum::<u64>() as f64 / frames as f64;
+        // min/max as well as the mean (0.88.1). 0.88.0 printed the mean
+        // alone, and PLAN.md then described "a steady 3.0 GPU-composited
+        // tiles per frame" -- a claim the mean cannot support, and which
+        // the one per-frame sample that *was* printed (the worst-total
+        // frame, `gpu_tiles=1`) contradicted outright. Measured on a real
+        // 40-frame RTX 3090 run: mean 3.0, but min 1 and max 5.
+        let gpu_tiles_min = stages.gpu_tiles.iter().copied().min().unwrap_or_default();
+        let gpu_tiles_max = stages.gpu_tiles.iter().copied().max().unwrap_or_default();
         let mut phase_means = [0.0_f64; 3];
         for phases in &stages.recomposite_phases {
             for (src, dest) in phases.iter().zip(phase_means.iter_mut()) {
@@ -27408,11 +27500,46 @@ mod tests {
         }
         let [phase1, phase2, phase3] = phase_means;
         println!(
-            "{label}:   gpu_tiles mean={gpu_tiles_mean:.1}/frame (0 would mean the GPU \
-             compositing path never ran); recomposite sub-phase means: phase1 \
+            "{label}:   gpu_tiles mean={gpu_tiles_mean:.1}/frame min={gpu_tiles_min} \
+             max={gpu_tiles_max} (0 would mean the GPU compositing path never ran; a min \
+             below the mean means it is not steady); recomposite sub-phase means: phase1 \
              issue/cpu-composite={phase1:.2}ms phase2 poll-wait={phase2:.2}ms phase3 \
              readback+write={phase3:.2}ms (phase2 is wall-clock stall, not GPU execution time \
              -- no timestamp queries)"
+        );
+
+        // What `upload_sync` actually moved, from the `SyncStats` `sync`
+        // already returns. Reported next to `gpu_tiles` because the two
+        // together are what make the `upload_sync` stage interpretable:
+        // this loop bumps the whole composite cache every frame, so if
+        // `uploaded` never varies, the stage's cost is a fixed floor and
+        // not a function of what the brush actually painted.
+        #[allow(clippy::cast_precision_loss)]
+        let uploaded_mean = f64::from(stages.uploaded.iter().copied().sum::<u32>()) / frames as f64;
+        let uploaded_min = stages.uploaded.iter().copied().min().unwrap_or_default();
+        let uploaded_max = stages.uploaded.iter().copied().max().unwrap_or_default();
+        #[allow(clippy::cast_precision_loss)]
+        let mb_mean =
+            stages.bytes_uploaded.iter().copied().sum::<u64>() as f64 / frames as f64 / 1_048_576.0;
+        let bytes_min = stages
+            .bytes_uploaded
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or_default();
+        let bytes_max = stages
+            .bytes_uploaded
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default();
+        println!(
+            "{label}:   upload_sync moved mean={uploaded_mean:.1} tiles/frame \
+             (min={uploaded_min} max={uploaded_max}), mean={mb_mean:.2} MB/frame \
+             (min={bytes_min}B max={bytes_max}B) -- compare spike/FINDINGS.md's ~18 MB per \
+             screenful. A min equal to the max means this is a content-independent floor: \
+             CompositeCache::bump() invalidates the whole grid every frame here, unlike \
+             App::paint_dab, which invalidates only the tiles the dab actually painted"
         );
     }
 
@@ -27448,12 +27575,22 @@ mod tests {
     /// **Real path exercised, per frame, end to end**: see
     /// [`measure_pan_and_paint_frames`]'s own doc comment.
     ///
-    /// **Compositing path taken: GPU.** The document is a single, visible,
-    /// `Normal`-blend, full-bounds `Pixel` layer -- confirmed directly
-    /// below via `document_qualifies_for_gpu_compositing`, not assumed --
-    /// so every tile recomposited here goes through the batched GPU path
-    /// (`begin_gpu_composite_tile`/`finish_tile_readback`).
-    /// The CPU fallback is exercised separately, by
+    /// **Compositing path taken: GPU, at the document level -- but only
+    /// for a minority of tiles.** The document is a single, visible,
+    /// `Normal`-blend, full-bounds `Pixel` layer, so it *qualifies* for
+    /// the batched GPU path -- confirmed directly below via
+    /// `document_qualifies_for_gpu_compositing`, not assumed. Per tile,
+    /// though, qualifying is not the same as taking it: only tiles with
+    /// actual stored content reach
+    /// `begin_gpu_composite_tile`/`finish_tile_readback`; the rest hit
+    /// 0.87.0's never-stored bail and are composited on the CPU. Measured
+    /// on this fixture (0.88.0's own `gpu_tiles` counter, corrected here in
+    /// 0.88.1 -- the sentence this replaces claimed "every tile", wrong by
+    /// roughly 7x): a mean of **3.0 of ~20 visible tiles per frame** take
+    /// the GPU path, and it is *not* steady at 3 -- the min/max this run
+    /// now prints came back **min=1, max=5** on a real 40-frame run. The
+    /// CPU fallback is exercised separately *as a
+    /// whole-document control*, by
     /// [`recomposite_and_present_loop_exercises_the_cpu_fallback_path`]
     /// below.
     ///
@@ -27484,6 +27621,28 @@ mod tests {
     /// real trip-wire against a multiples-worse algorithmic regression.
     /// See PLAN.md's M1.10 section for this same number recorded with an
     /// honest verdict (over budget, not passing).
+    ///
+    /// **Those 53.30/53.26/59.29 figures are 0.86.0-era and no longer
+    /// reproduce; the cause is confirmed, not guessed.** Fresh runs on
+    /// 2026-09-03, same adapter, give roughly half. 0.88.0 called
+    /// 0.87.0's blank-tile skip "the plausible but unconfirmed cause";
+    /// 0.88.1 confirmed it by actually bisecting, building and running
+    /// each commit in a disposable `git worktree` on the same hardware
+    /// (mean whole-frame time, this test):
+    ///
+    /// | commit | version | this test | CPU-fallback sibling |
+    /// |---|---|---|---|
+    /// | `033bbe7` | 0.86.0 | 54.26 ms | ~31 ms |
+    /// | `83f7a84` | 0.86.2 | 54.48 ms | ~31 ms |
+    /// | `8f3ff5d` | 0.87.0 | **27.93 ms** | **~18 ms** |
+    /// | HEAD | 0.88.0 | 27.53 ms | ~18 ms |
+    ///
+    /// The drop lands exactly on 0.87.0 and nowhere else, and diffing
+    /// `Cargo.lock` across the whole range shows only Aurora's own version
+    /// bumps -- zero third-party dependency changes -- so it is not a
+    /// toolchain or dependency effect. The CPU-fallback sibling halves in
+    /// the same step because `resolve_tile`, where the skip lives, is
+    /// shared by both compositing paths.
     ///
     /// **0.86.0's per-tile submit batching did not move this number.**
     /// This is the benchmark that change was measured against, and the
@@ -27578,10 +27737,36 @@ mod tests {
     /// between them; everything else is under 4.5% combined. Inside
     /// `recomposite_visible_tiles` the poll-wait sub-phase is
     /// 0.03–0.04 ms, i.e. this path does not stall on the GPU, and
-    /// `gpu_tiles` is a steady 3.0/frame against ~20 visible tiles.
+    /// `gpu_tiles` averages 3.0/frame (min 1, max 5) against ~20 visible
+    /// tiles.
+    ///
+    /// **0.88.1 corrected how those numbers were read**, without changing
+    /// them. Three things that entry got wrong and that matter for
+    /// picking the next optimization target:
+    ///
+    /// - `upload_sync` is **not** GPU upload bandwidth. It is ~87%
+    ///   `aurora_gpu::residency`'s scalar, single-threaded
+    ///   `extend_premultiplied_le_bytes` serialize loop and ~13%
+    ///   `write_texture`'s staging `memcpy`; the real GPU DMA runs later,
+    ///   at `queue.submit`, inside `submit_poll`. See [`FrameStages`]'s
+    ///   own `upload_sync` field doc.
+    /// - The ~17 tiles per frame that do *not* take the GPU path are not
+    ///   cheap and are not skipped: each is materialized as a full
+    ///   transparent tile, written back, marked fully dirty, and then
+    ///   re-serialized and re-uploaded. This run prints the volume
+    ///   directly now (`upload_sync moved ... tiles/frame ... MB/frame`):
+    ///   20 tiles / 10 MB every frame, min equal to max.
+    /// - That volume is **fixed by this fixture**, not by the workload:
+    ///   [`measure_pan_and_paint_frames`] calls `CompositeCache::bump()`
+    ///   every frame, invalidating the whole grid, where the real
+    ///   `App::paint_dab` invalidates only `outcome.painted()`. So the
+    ///   54%/42% split is a property of this benchmark and should not be
+    ///   assumed to carry over to a real, mostly-painted document.
+    ///
     /// See PLAN.md's M1.10 "Per-stage frame breakdown" addendum for the
     /// full tables, the fresh whole-frame numbers (which no longer match
-    /// the 0.86.0-era figures quoted elsewhere in this file), and the
+    /// the 0.86.0-era figures quoted elsewhere in this file, for a cause
+    /// now confirmed by bisect rather than hypothesized), and the
     /// disclosed limitations — chiefly that the poll-wait number is
     /// wall-clock stall, not GPU execution time.
     #[test]
@@ -27702,18 +27887,37 @@ mod tests {
     /// untouched, and `total` keeps its exact pre-existing definition.
     /// The finding for this test: `recomposite` (51.8–53.9% of the mean
     /// frame) and `upload_sync` (39.8–41.8%) hold 93.6–95.7% of it
-    /// between them, with `gpu_tiles` a steady 0.0/frame — which is the
-    /// intended control, confirming this test genuinely never enters
-    /// `begin_gpu_composite_tile`. See PLAN.md's M1.10 "Per-stage frame
-    /// breakdown" addendum for the full tables and limitations.
+    /// between them, with `gpu_tiles` 0/frame on every frame (min and max
+    /// both 0, printed since 0.88.1) — which is the intended control,
+    /// confirming this test genuinely never enters
+    /// `begin_gpu_composite_tile`. Note that this is a *document-level*
+    /// control: the claim it supports is "this document never qualifies
+    /// for the GPU path", and it says nothing about the sibling test,
+    /// where qualifying at the document level still leaves most tiles on
+    /// the CPU. As in the sibling test, `upload_sync` here is CPU-side
+    /// premultiply/serialize/staging work rather than GPU upload
+    /// bandwidth — see [`FrameStages`]'s own `upload_sync` field doc — and
+    /// its volume is fixed by this fixture's `CompositeCache::bump()`
+    /// every frame, not by what was painted: measured **9 tiles /
+    /// 4,718,592 bytes uploaded on every single frame**, min equal to max
+    /// (the 512x512 viewport's whole 3x3 grid). See PLAN.md's M1.10
+    /// "Per-stage frame breakdown" addendum for the full tables and
+    /// limitations.
     ///
     /// **The 30.34/29.98/32.95 figures quoted just below are 0.86.0-era
     /// and no longer reproduce**: three fresh runs on 2026-09-03, same
     /// adapter, gave mean 16.10–16.89 ms, p50 16.01–16.51 ms, p99
-    /// 18.44–23.14 ms. 0.87.0's blank-tile skip landing in between is
-    /// the plausible but unconfirmed cause. Left in place rather than
-    /// silently overwritten — see the same PLAN.md addendum, which
-    /// flags this discrepancy rather than resolving it.
+    /// 18.44–23.14 ms. 0.88.0 called 0.87.0's blank-tile skip "the
+    /// plausible but unconfirmed cause"; **0.88.1 confirmed it by
+    /// bisect** — building and running 0.86.0 (`033bbe7`), 0.86.2
+    /// (`83f7a84`), 0.87.0 (`8f3ff5d`) and HEAD in disposable
+    /// `git worktree`s on the same hardware. This test's mean goes
+    /// ~31 ms → ~31 ms → **~18 ms** → ~18 ms, stepping exactly at
+    /// 0.87.0, with `Cargo.lock` showing no third-party dependency change
+    /// across the range. It halves alongside the GPU-path sibling because
+    /// `resolve_tile`, where the skip lives, is shared by both paths. The
+    /// stale figures are left in place below rather than silently
+    /// overwritten; see the sibling test's own doc for the full table.
     ///
     /// **Measured locally (release build, `AURORA_REQUIRE_GPU=1`, on
     /// this sandbox's real adapter as printed by the run itself:

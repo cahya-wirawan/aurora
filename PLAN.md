@@ -17818,27 +17818,119 @@ severity choice.
   pair: every worst frame recorded above is `recomposite` + `upload_sync`
   plus noise.
 
+  **Read that split with the 0.88.1 correction below before acting on
+  it.** Two things about it are not what they look like: `upload_sync` is
+  a CPU serialize loop rather than GPU upload bandwidth, and this
+  specific 54%/42% share is a property of this fixture's
+  invalidate-everything-every-frame behaviour, not a general result.
+
   Two sub-findings that follow directly, and that no prior round had
   visibility into:
 
   - **`upload_sync` was never the target of any of the three prior
     optimization rounds**, and it is the single largest stage on the GPU
-    path. This is the atlas-upload bandwidth cost `spike/FINDINGS.md`
-    already named ("Upload bandwidth caps pan speed", ~18 MB per
-    screenful) showing up in the real app, on the real path, for the
-    first time.
+    path. **What it is is not what 0.88.0 called it** — see the
+    correction immediately below, which supersedes that entry's own
+    "atlas-upload bandwidth" reading.
   - **The GPU is not what the GPU path waits on.** Inside
     `recomposite_visible_tiles`, the sub-phase means are phase 1
     (per-tile issue / immediate CPU composite) 9.49–10.17 ms, phase 2
     (the single per-frame `device.poll(Wait)`) **0.03–0.04 ms**, phase 3
     (readback drain + composite-surface write) 1.68–1.79 ms. Phase 2 is
-    free; the cost is CPU-side. Consistent with `gpu_tiles` measuring a
-    steady **3.0 GPU-composited tiles per frame** against an 800×600
-    viewport's ~20 visible tiles — the other ~17 are blank and take
-    0.87.0's CPU blank-tile path, so most of phase 1 is a CPU walk over
-    tiles that produce nothing. On the CPU-fallback test `gpu_tiles` is
-    a steady **0.0/frame**, which is the intended control and confirms
-    that test genuinely never enters `begin_gpu_composite_tile`.
+    free; the cost is CPU-side. `gpu_tiles` means **3.0 GPU-composited
+    tiles per frame** against an 800×600 viewport's ~20 visible tiles.
+    0.88.0 called that "a steady 3.0", which its own output could not
+    support: `report_frame_stages` printed the *mean* alone, and the one
+    per-frame sample it did print (the worst-total frame) showed
+    `gpu_tiles=1`. 0.88.1 added min/max, and it is **not** steady —
+    measured **min 1, max 5** over 40 frames. The remaining ~17 tiles —
+    the other ~17 have nothing stored and take 0.87.0's CPU path, so
+    most of phase 1 is a CPU walk over tiles that produce no visible
+    pixels. On the CPU-fallback test `gpu_tiles` is **0/frame on every
+    frame**, which is the intended control and confirms that test
+    genuinely never enters `begin_gpu_composite_tile`.
+
+  **Correction, 2026-09-03 (0.88.1) — what `upload_sync` actually is,
+  and why the ~17 "blank" tiles are not cheap.** Two independent reviews
+  of the entry above converged on the same objection: read literally, it
+  would send the next optimization round after *GPU upload bandwidth*,
+  which is not where this frame's time goes. Both objections were then
+  re-measured on the same real RTX 3090, and both hold. The mechanics of
+  0.88.0 are fine — mark placement is correct, the shipping build is
+  untouched, the stages sum to `total` — and none of the tables above
+  change. Only their interpretation does. Three corrections:
+
+  1. **`upload_sync` is a CPU serialize loop, not a GPU upload.** Finer
+     probes placed inside `TileResidency::sync` itself
+     (`crates/aurora-gpu/src/residency.rs`) break that ~15 ms interval
+     down as **87.1% `extend_premultiplied_le_bytes`**
+     (`crates/aurora-gpu/src/residency.rs:141-152` — a single-threaded,
+     scalar `f16 → f32 → premultiply → f16 → le_bytes` loop over every
+     texel of every dirty tile; no `rayon`, no SIMD), **12.7%
+     `queue.write_texture`'s CPU-side staging `memcpy`**, and **~0%**
+     `TileStore::get`. The actual GPU DMA copy does not execute in this
+     stage at all: `write_texture` records it, and it runs at the later
+     `queue.submit` — which is in the **`submit_poll`** stage, measured
+     0.51–0.61 ms for 10 MB, i.e. ~17 GB/s, entirely consistent with
+     real hardware bandwidth. So "`upload_sync` dominates" is true as an
+     interval and **false as a bandwidth attribution**. This supersedes
+     0.88.0's own "This is the atlas-upload bandwidth cost
+     `spike/FINDINGS.md` already named" sentence, and the `upload_sync`
+     doc comment that called it "the GPU texture upload".
+  2. **The ~17 non-GPU tiles are materialized, stored, dirtied and
+     re-uploaded every frame — 0.88.0 implied they were cheap.** They are
+     not skipped anywhere on this path. `composite_roots_into_tile`
+     materializes each one via `aurora_render::transparent_tile()` (a
+     512 KB allocate-and-zero), `write_composited` then writes it into
+     the store and calls `mark_dirty(full_tile)` unconditionally — even
+     when nothing about it changed — and `sync` re-serializes and
+     re-uploads it. Measured directly, from the `SyncStats` this
+     benchmark had been discarding and now reports: **20 tiles /
+     10,485,760 bytes uploaded on every single frame, min equal to max**
+     (GPU-path test), and **9 tiles / 4,718,592 bytes every frame, min
+     equal to max** (CPU-fallback test, 512×512 viewport). A second
+     probe confirmed 15–19 of those 20 tiles are provably all-zero. So
+     roughly **85% of this benchmark's 10 MB/frame upload volume is spent
+     manufacturing and uploading fully transparent pixels**, and the
+     `upload_sync` stage's cost is content-independent: a fixed floor,
+     not a function of what the brush painted.
+  3. **The 54%/42% split is a property of this fixture, not a general
+     result.** `measure_pan_and_paint_frames` calls
+     `CompositeCache::bump()` once per frame, which invalidates the
+     *whole* grid. The real paint path does not: `App::paint_dab`
+     (`crates/aurora-app/src/lib.rs`, the `outcome.painted()`
+     invalidation) dirties only the tiles the dab actually touched. The
+     benchmark therefore uploads its full grid every frame where a real
+     user painting a real document would upload a handful of tiles. **Do
+     not pick the next optimization target from the share alone** — on a
+     mostly-painted, multi-layer document both the volume and the split
+     could look quite different.
+
+  **The two next-round candidates this actually justifies**, in place of
+  0.88.0's implied "optimize GPU upload":
+
+  - **Parallelize or vectorize `extend_premultiplied_le_bytes`**
+    (`crates/aurora-gpu/src/residency.rs:141-152`). Measured at ~12.4 ms
+    of the ~14.3 ms `upload_sync` stage in the probe run (that stage means
+    14.9–16.1 ms across the unprobed runs, so read this as "~87% of
+    whichever figure", not as a fourth decimal place), i.e. **~44% of the
+    whole GPU-path frame**, in a scalar single-threaded loop with `rayon`
+    already in the dependency tree for exactly this kind of per-tile
+    work. This is the largest single measured hot spot in the frame.
+  - **Stop re-dirtying and re-uploading an unchanged, already-transparent
+    composite tile.** `write_composited`'s unconditional
+    `mark_dirty(full_tile)` is what forces the re-upload. Not doing it
+    for a tile whose content did not change would cut ~85% of this
+    benchmark's 10 MB/frame upload volume outright — and unlike the
+    first candidate, it removes the work rather than making it faster.
+    Note this one interacts with correction 3: its benefit on a real
+    document depends on how much of the grid is genuinely blank.
+
+  Neither candidate is implemented here. 0.88.1 changes no compositing,
+  upload, or render-pass behaviour either — it corrects doc comments and
+  this entry, adds `gpu_tiles` min/max and the `SyncStats`
+  tiles/bytes-per-frame line to `report_frame_stages` (both print-only,
+  in `#[cfg(test)]` code), and asserts on none of it.
 
   **A baseline discrepancy, flagged not fixed.** The 98.75 ms / 54.10 ms
   p99 figures in this entry above — and the identical pair in
@@ -17851,12 +17943,31 @@ severity choice.
   own real-RTX-3090 figures either (mean ~53.30 ms / p99 ~59.29 ms GPU
   path; mean ~30.34 ms / p99 ~32.95 ms CPU fallback): three runs today
   give mean 27.14–29.09 / p99 37.05–49.66 and mean 16.10–16.89 / p99
-  18.44–23.14 respectively, roughly half. The most plausible cause is
-  0.87.0's own blank-tile skip, which landed *after* those 0.86.0
-  measurements and which the `gpu_tiles`=3-of-~20 finding above shows is
-  active on 85% of this fixture's tiles every frame — but that is an
-  untested hypothesis, not a measured attribution, and nobody has
-  re-run 0.86.0's exact commit to confirm it. **`CLAUDE.md`'s table is
+  18.44–23.14 respectively, roughly half.
+
+  **That halving is now a confirmed attribution, not a hypothesis
+  (0.88.1).** 0.88.0 called 0.87.0's blank-tile skip "the most plausible
+  cause … an untested hypothesis", and noted nobody had re-run 0.86.0's
+  exact commit. Someone has now: each commit was checked out into a
+  disposable `git worktree`, built in release, and run on this same real
+  RTX 3090. Mean whole-frame time:
+
+  | commit | version | GPU-path test | CPU-fallback test |
+  |---|---|---|---|
+  | `033bbe7` | 0.86.0 | 54.26 ms | ~31 ms |
+  | `83f7a84` | 0.86.2 | 54.48 ms | ~31 ms |
+  | `8f3ff5d` | **0.87.0** | **27.93 ms** | **~18 ms** |
+  | `182d14d` | 0.88.0 (HEAD) | 27.53 ms | ~18 ms |
+
+  The drop lands **exactly at 0.87.0** and nowhere else in the range, and
+  `Cargo.lock` diffed across all four commits shows only Aurora's own
+  version bumps — **zero third-party dependency changes** — so this is
+  not a toolchain or dependency effect. The CPU-fallback test halves in
+  the same step because `resolve_tile`, where 0.87.0's skip lives, is
+  shared by the GPU *and* CPU compositing paths. So 0.87.0 really did buy
+  a ~2× improvement on both benchmarks; it simply landed after the
+  numbers still quoted in the older doc comments, which is why they no
+  longer reproduce. **`CLAUDE.md`'s table is
   deliberately left alone in this round** — correcting it is its own
   work with its own before/after evidence, not a side effect of a
   diagnostic commit.
@@ -17884,11 +17995,17 @@ severity choice.
     otherwise identical runs — a 34% spread on n=40. Any future claim of
     an improvement on this benchmark needs to clear that spread, which
     is exactly the trap 0.86.0's own null result documented.
-  - **The stages do not sum exactly to `total`.** Marks are taken
-    between statements, so the microseconds in the pushes and in
-    `Instant::now` itself land nowhere, and `total` is read before the
-    pushes happen. Shares are therefore approximate to well under a
-    percent, which does not affect any conclusion drawn above.
+  - **The stages sum to `total` to within a single clock read** —
+    corrected in 0.88.1, which found this bullet's original wording
+    ("approximate to well under a percent") an *understatement* of how
+    exact it is. Marks are taken between statements, so the time spent in
+    the pushes and in `Instant::now` itself lands nowhere, and `total` is
+    read before the pushes happen; measured per frame, that residual is
+    **0.0000 ms on 39 of 40 frames and 0.0001 ms on one** — tens of
+    nanoseconds, on the order of 0.0001%, not the 0.1–1% "sub-percent"
+    suggests. The ~0.1 ms gaps that *look* present in the range tables
+    above are an artifact of quoting each stage's min and max drawn from
+    different runs, not an unmeasured slice of frame time.
   - **Per-stage p99s are independent order statistics** and need not
     come from the same frame; they will not add to the total's own p99.
     That is why a single worst-frame breakdown is reported separately
