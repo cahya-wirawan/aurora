@@ -17537,6 +17537,214 @@ severity choice.
   --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
   --all-features`), all clean.
 
+- [x] **GPU blend-mode math, slice 4 of the epic: `BlendMode::Lighten`
+  ported and wired — done 2026-09-04 (0.95.0).** The third real blend
+  mode on the GPU path, and the first one that cost a `const` and a
+  wrapper and nothing else — which is precisely what 0.85.1's merge
+  predicted a third mode would cost.
+
+  What landed:
+
+  - **`fs_composite_lighten`** in
+    `crates/aurora-render/src/shaders/composite.wgsl`, the exact mirror
+    image of `fs_composite_darken`: one intrinsic differs, `max(cb,
+    s.rgb)` where that one has `min(cb, s.rgb)`. `Lighten` is a
+    *separable* mode (`blend_channel`'s `cb.max(cs)`, no guards, no
+    branches, no division) and WGSL's `max()` on a `vec3<f32>` is
+    componentwise, so one intrinsic is exactly the three independent
+    per-channel maxima. Deliberately **not** `LighterColor`, which
+    selects one whole `(R, G, B)` triple by luminosity and stays
+    CPU-only. Shares `backdrop_tex` (binding 3), the `Opacity` uniform
+    (binding 2) and `TileCompositor::bind_group_layout_blend` with the
+    two entry points above it — **no new binding, no new bind group
+    layout, no new uniform**.
+  - **`TileCompositor::composite_lighten_over_with_opacity`**, a
+    one-line delegation to the existing private
+    `composite_blend_over_with_opacity`, parameterized by a new
+    `BLEND_PASS_LIGHTEN` const and four new `wgpu` debug labels
+    (`composite.lighten{,.opacity,.bind_group,.pass}`). The shared
+    helper needed **zero** changes to take a third caller. That is the
+    concrete payoff of 0.85.1's extraction, and it is worth stating as
+    a measured outcome rather than a prediction: the whole render-side
+    diff for this mode is one WGSL function, five `&'static str`s and a
+    wrapper.
+  - **`aurora-app` wiring, the same shape `Multiply` and `Darken`
+    have.** `document_qualifies_for_gpu_compositing` gains `Lighten` as
+    a fifth admitted mode, and `begin_gpu_composite_tile` gains a
+    `Lighten` arm immediately after the `Darken` one, using the *same
+    single* `spare` ping-pong accumulator through
+    `accumulator_or_create` — a shared scratch target the arms take
+    turns rendering into, not a per-mode resource. (As 0.85.1
+    established, "shared versus per-mode spare" is a memory-footprint
+    property with **no** pixel-observable consequence, so nothing here
+    claims a test proves it; `accumulator_or_create`'s single `spare`
+    binding is what holds it.)
+  - **A dispatch counter in this mode's *first* round, not its
+    second.** `LIGHTEN_GPU_DISPATCHES` + `note_lighten_gpu_dispatch()`
+    + the `#[cfg(not(test))]` no-op twin + `take_lighten_gpu_dispatch_
+    count()`, mirroring `DARKEN_GPU_DISPATCHES` exactly. The
+    `Multiply` (0.84.0) and `Darken` (0.85.0) rounds each shipped
+    without one and had to retrofit it (`Darken`) or defer it
+    (`Multiply`, `Dissolve` — still deferred, still named). Doing it
+    up front is the one process correction this round makes, and it
+    paid off immediately: mutation check 1 below is only possible
+    because of it.
+
+  **Mode accounting, and why two different numbers are both right.**
+  At the `aurora-app` level five of 27 `aurora_doc::BlendMode` variants
+  are now admitted (`Normal`, `Multiply`, `Darken`, `Lighten`,
+  `Dissolve`), so **22 of 27 remain** without a GPU fast path. At the
+  `aurora-render` shader level the denominator is 26, not 27 — this
+  crate's own `BlendMode` excludes `Dissolve`, which `resolve_tile`
+  reduces to `Normal` on the CPU before any GPU dispatch sees it — and
+  three have WGSL entry points, so **23 of 26 remain** without one.
+  These count different things (admitted documents vs. ported
+  formulas), exactly as the 0.84.1 addendum first spelled out; they are
+  not a disagreement. Every stale count in both crates was swept and
+  re-derived, not find-and-replaced: `24 → 23` in `aurora-render`'s
+  `TileCompositor` and `composite_darken_*` docs, `23 → 22` at five
+  sites in `aurora-app` (the undo/redo compositing-path guard, the
+  predicate's own doc, and three test doc comments), and the
+  `{Normal, Multiply, Darken, Dissolve}` set literals at eight further
+  sites.
+
+  **Tests: five in `aurora-render`, not the `Darken` suite's seven —
+  a disclosed reduction, with a reason.** The two omitted are its
+  unclamped-source-alpha-above-1.0 and clamped-out-of-range-opacity
+  cases. Since 0.85.1's merge both properties live in a *single* shared
+  line — `composite_blend_over_with_opacity`'s own `let opacity =
+  opacity.clamp(0.0, 1.0)`, which every mode's wrapper reaches through
+  — and the `Multiply` and `Darken` suites already pin it on real
+  hardware. Re-asserting one shared line once per ported mode grows
+  linearly in modes while covering nothing new. The five kept each
+  exercise something that genuinely is per-entry-point: this mode's own
+  arithmetic against a hand-derived golden cross-checked against
+  `composite_tile_cpu` (`(0.5, 0.75, 0.5, 1.0)`, a value the `Normal`,
+  `Darken`, `Multiply` and transposed-binding wrong answers all miss);
+  its own un-premultiply branch against a translucent accumulator; its
+  own spatial addressing across a whole `patterned_texels` tile
+  (V-flip, transpose, UV offset, binding transpose); its own
+  opacity-scaled fold at `0.5`; and its own separately-compiled
+  `ab > 0.0` guard, where `max(NaN, x)` is a *different* expression
+  from the `min(NaN, x)` the `Darken` sibling covers. Fixtures are not
+  copied from the `Darken` suite: `Lighten` degenerates whenever the
+  source is lighter (or darker) than the backdrop in every channel, so
+  each fixture takes its maximum from the backdrop in at least one
+  channel and the source in at least one other.
+
+  In `aurora-app`, two tests:
+  `document_qualifies_for_gpu_compositing_admits_a_lighten_blend_mode`
+  (headless, pins the fifth `matches!` alternative) and
+  `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_blend_document`
+  — a three-layer `Normal`/`Multiply`/`Lighten` stack, the smallest that
+  makes the `Lighten` layer sample a backdrop a *different* blend-math
+  pipeline last wrote and render into the `spare` that pipeline
+  created. It carries four independent guards: the GPU-vs-CPU
+  differential, an absolute golden `(0.25, 0.375, 0.75, 1.0)` (whose
+  maximum is genuinely two-sided — red and blue from the source, green
+  from the backdrop), the `LIGHTEN_GPU_DISPATCHES == 1` assertion, and
+  an `assert_ne!` vacuity guard substituting `Darken` for `Lighten` on a
+  CPU-only re-run (`(0.125, 0.25, 0.25)` — all three channels differ).
+  The existing `recomposite_visible_tiles_gpu_path_ignores_a_never_
+  painted_layer_across_every_expressible_mode` loop gained `Lighten`
+  too, since leaving it out would have made that test's own name a
+  stale claim. **7 new tests, 0 changed, 0 removed** (1,639 → 1,646
+  workspace-wide; `aurora-render` 132 → 137, `aurora-app` 385 → 387).
+
+  **Mutation-tested, three ways, each run for real and reverted.**
+
+  1. **Deleted the `Lighten` arm** from `begin_gpu_composite_tile`'s
+     `match`. It still compiled (the defensive `_` arm swallows it) and
+     the CPU fallback computed the same correct pixels — so the
+     differential and the absolute golden both still passed, and only
+     the counter caught it: `left: 0, right: 1`. This is the exact gap
+     `DARKEN_GPU_DISPATCHES` was retrofitted for, demonstrated live on
+     a mode that shipped with the instrumentation instead.
+  2. **Swapped `max` for `min`** in `fs_composite_lighten`. 4 of the 5
+     `aurora-render` tests failed (the fifth, the fully-transparent
+     backdrop, legitimately cannot distinguish them: with `ab == 0` the
+     blend term is multiplied by zero — that is a property of the
+     fixture, disclosed, not a hole in the mutation). The `aurora-app`
+     test failed at the GPU-vs-CPU differential, which sits *before* the
+     absolute golden and so aborts first; re-run with that call
+     temporarily removed, the absolute golden failed too, with exactly
+     the predicted `Darken` value `(0.125, 0.25, 0.25, 1.0)`. Both
+     assertions catch it; only the ordering hides one.
+  3. **Pointed `BLEND_PASS_LIGHTEN.fragment_entry` at
+     `"fs_composite_darken"`** — the realistic copy-paste bug. Caught by
+     real pixel assertions, not by a label mismatch: the same 4 render
+     tests plus the `aurora-app` test failed, and the dispatch counter
+     still read 1 (the arm *did* run — it ran the wrong shader), so the
+     failure is genuinely arithmetic.
+
+  After each, the file was restored and the clean state re-verified
+  green before the next. (Worth recording as a lesson: restoring a
+  mutated file with `mv` from a backup preserves the *older* mtime, and
+  `cargo` then skips the rebuild and re-runs the mutated binary — one
+  revert silently didn't take until the files were `touch`ed.)
+
+  **What is *not* done, re-confirmed by fresh grep this round, not
+  carried forward on faith:**
+
+  - **Accumulator-pair caching across tiles or frames**: still absent.
+    `begin_gpu_composite_tile` creates (and drops) its pair per tile;
+    `grep -rn "accumulator_cache\|cached_accumulator" crates/` → 0
+    hits, and the doc comment's own "Neither is cached across tiles or
+    frames" still stands at `lib.rs`.
+  - **Group support on the GPU path**: still absent. The predicate
+    still requires `aurora_doc::LayerKind::Pixel { .. }` at every root
+    (3 occurrences of that pattern in `lib.rs`, none of them relaxed),
+    and there is no group-aware GPU arm.
+  - **`wgpu` error-scope handling**: still absent workspace-wide.
+    `grep -rn "push_error_scope\|on_uncaptured_error\|pop_error_scope"
+    crates/` → **1** hit, and it is the *doc comment in
+    `composite.rs` saying they appear nowhere*. An aliasing or
+    validation failure still reaches the user as `wgpu`'s default panic
+    in a workspace whose lints deny `panic!`. Inherited, not
+    introduced, not fixed.
+
+  Also unchanged: `Multiply` and `Dissolve` still have no dispatch
+  counter (the named follow-on from 0.85.1/0.85.2), and no public
+  `mode: BlendMode` dispatching method exists — with 23 modes still
+  lacking WGSL, that parameter would still have no answerable
+  behaviour. No new dependency, no new `unsafe`, no new lint exception,
+  no `unwrap`/`expect`/`panic`/`indexing_slicing`. `aurora-tile`
+  untouched, `aurora-doc` untouched (the `Lighten` variant, its CPU
+  formula and `translate_blend_mode`'s mapping all already existed —
+  this round is GPU-fast-path wiring only).
+  `begin_gpu_composite_tile`'s `clippy::too_many_lines` allow now
+  documents a **re-measured** 143 (was 124 at 0.86.1), obtained by
+  temporarily removing the allow and reading clippy's own number rather
+  than estimating it.
+
+  **Verified (0.95.0), on this box's real discrete GPU**:
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render -- composite_lighten
+  --nocapture` (**5 passed**) and `AURORA_REQUIRE_GPU=1 cargo test -p
+  aurora-app -- lighten --nocapture` (**2 passed**), every GPU-gated
+  test printing `GPU adapter: NVIDIA GeForce RTX 3090 (Vulkan,
+  DiscreteGpu)`. No regression in the existing rounds:
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render -- composite_`
+  (**79 passed**), `-p aurora-app -- multiply` (**6**), `-- darken`
+  (**3**), `-- dissolve` (**10**). Then the full gate: `cargo fmt --all
+  --check`, `python3 scripts/check_layering.py` (20 crates),
+  `python3 scripts/check_no_hardcoded_style.py` (28 files), `cargo
+  check --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1 cargo test
+  --workspace` (**1,646 passed, 0 failed**), `cargo test --workspace
+  --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features` — all clean.
+
+  **Scope of that verification, stated plainly**: one backend, one
+  vendor. Vulkan on an NVIDIA RTX 3090. **Metal and DX12 are unverified
+  for `fs_composite_lighten`**, and that is not academic — whether a
+  shader compiler flattens the `if (ab > 0.0)` guard and evaluates
+  `0.0 / 0.0` on the untaken side is a backend property, and
+  `max(NaN, x)` is exactly the kind of expression whose NaN handling
+  differs between them. Nothing here was measured for *performance*
+  either: this round adds a fast path for a mode that previously took
+  the CPU fallback, and no before/after frame timing was taken, so it
+  makes no claim about the 60 FPS gate.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG

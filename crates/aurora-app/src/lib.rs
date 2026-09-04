@@ -5211,11 +5211,11 @@ fn perform_undo_redo(
     // path or the CPU fallback **for the whole document**, and several
     // undoable structural steps flip it: `SetBlendMode` on a root-level
     // pixel layer across the GPU-expressible boundary (`Normal`/
-    // `Multiply`/`Darken`/`Dissolve` on one side, the other 23 modes on
-    // the other), and
+    // `Multiply`/`Darken`/`Lighten`/`Dissolve` on one side, the other 22
+    // modes on the other), and
     // `SetVisible`, `Reparent`, `RemoveById` or `Restore` of a
     // root-level layer that is itself disqualifying (a group, or a
-    // pixel layer at one of those other 23 modes). When it flips, every
+    // pixel layer at one of those other 22 modes). When it flips, every
     // visible tile's compositing *path*
     // changes while a per-layer `Rect` names only one layer's own
     // region -- a quantity no `Rect` can express.
@@ -6810,9 +6810,9 @@ fn composite_roots_into_tile(
 }
 
 /// Whether every visible root-level layer in `layers` is an
-/// [`aurora_doc::LayerKind::Pixel`] layer at one of the four
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the five
 /// `aurora_doc::BlendMode`s [`begin_gpu_composite_tile`] can express —
-/// no groups, no fifth mode. The four are:
+/// no groups, no sixth mode. The five are:
 ///
 /// - [`aurora_doc::BlendMode::Normal`] (and a layer with no explicit
 ///   `blend_mode` recorded, which *is* `Normal`), composited by
@@ -6835,6 +6835,17 @@ fn composite_roots_into_tile(
 ///   needing one of its own. Not to be confused with
 ///   `aurora_doc::BlendMode::DarkerColor`, which picks one whole
 ///   `(R, G, B)` triple by luminosity and is still CPU-only.
+/// - [`aurora_doc::BlendMode::Lighten`] (0.95.0), composited by
+///   `aurora_render::TileCompositor::composite_lighten_over_with_opacity`,
+///   the third mode ported to WGSL and the exact mirror of the `Darken`
+///   entry above — the same whole-composite-in-the-shader shape, with a
+///   per-channel `max(Cb, Cs)` where that one has a `min`. It too
+///   reaches [`begin_gpu_composite_tile`]'s blend dispatch as its own
+///   arm and shares the *same single* `spare` ping-pong accumulator, and
+///   its arm is the first to carry a dispatch counter
+///   ([`LIGHTEN_GPU_DISPATCHES`]) from its own first round. Not to be
+///   confused with `aurora_doc::BlendMode::LighterColor`, which picks one
+///   whole `(R, G, B)` triple by luminosity and is still CPU-only.
 /// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
 ///   GPU-side support at all and never reaches
 ///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
@@ -6855,7 +6866,7 @@ fn composite_roots_into_tile(
 ///   hardware.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
-/// layer at any of the other 23 blend modes) routes the *whole document*
+/// layer at any of the other 22 blend modes) routes the *whole document*
 /// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
 /// already composites every one of those cases correctly — this only
 /// exists to find a faster path for the common cases, never to replace
@@ -6882,6 +6893,7 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                         aurora_doc::BlendMode::Normal
                             | aurora_doc::BlendMode::Multiply
                             | aurora_doc::BlendMode::Darken
+                            | aurora_doc::BlendMode::Lighten
                             | aurora_doc::BlendMode::Dissolve
                     ) | None
                 )
@@ -7117,7 +7129,8 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// accumulator pair: a tile-sized `Rgba16Float` texture cleared to fully
 /// transparent black, plus its default view. Called at most twice per
 /// tile, and each call is separately lazy — the second member only
-/// exists once a `Multiply` or `Darken` layer has actually reached that
+/// exists once a `Multiply`, `Darken` or `Lighten` layer has actually
+/// reached that
 /// tile. There is exactly **one** second member however many such layers
 /// (or however many distinct modes) the stack holds: the ping-pong needs
 /// a place to render that is not the backdrop, and one spare texture
@@ -7127,8 +7140,9 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// `RENDER_ATTACHMENT` because every blend pass renders into one of the
 /// pair; `COPY_SRC` because the final readback copies out of whichever
 /// one ended up holding the fold; and `TEXTURE_BINDING` because
-/// `composite_multiply_over_with_opacity` and
-/// `composite_darken_over_with_opacity` *sample* their backdrop, and
+/// `composite_multiply_over_with_opacity`,
+/// `composite_darken_over_with_opacity` and
+/// `composite_lighten_over_with_opacity` *sample* their backdrop, and
 /// which member is the backdrop is not known until the layer stack has
 /// been walked — so both must be bindable. No `COPY_DST`: nothing ever
 /// reaches these through `queue.write_texture`, only through render
@@ -7274,6 +7288,10 @@ fn accumulator_or_create<'slot>(
 /// to) would likewise leave the suite green. Instrumenting them is
 /// deliberately *not* done here — it would mean touching two arms this
 /// round did not otherwise change — and is left as its own round.
+/// `Lighten`, the third ported mode, does **not** share the gap: it
+/// arrived with [`LIGHTEN_GPU_DISPATCHES`] in its own first round
+/// (0.95.0) rather than one round later, which is what this static's own
+/// history argues for.
 #[cfg(test)]
 static DARKEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -7291,6 +7309,43 @@ fn note_darken_gpu_dispatch() {
 /// dispatch arm compiles down to everywhere else.
 #[cfg(not(test))]
 fn note_darken_gpu_dispatch() {}
+
+/// Test-only count of the times [`begin_gpu_composite_tile`]'s
+/// `Lighten` arm has actually dispatched a real GPU blend pass — the
+/// same instrumentation [`DARKEN_GPU_DISPATCHES`] carries, and for the
+/// same reason, but present from this mode's **first** round rather
+/// than added after the fact (0.95.0).
+///
+/// The gap is identical and worth restating rather than cross-
+/// referencing: delete the `Lighten` arm from the `match` and every
+/// `Lighten` tile falls through the defensive `_` arm to the CPU path,
+/// which computes the same correct pixels — so every differential
+/// compares the CPU path against itself and still passes, and the
+/// predicate still holds because the predicate is a different function.
+///
+/// Reads and writes are `Relaxed` and the counter is process-global,
+/// sound for exactly the reason [`DARKEN_GPU_DISPATCHES`] documents:
+/// every caller of [`begin_gpu_composite_tile`] needs a real
+/// `GpuContext`, and `real_gpu_context` hands one out only under
+/// `GPU_TEST_LOCK`.
+///
+/// **Named follow-on, unchanged:** `Multiply` and `Dissolve` still have
+/// no such counter.
+#[cfg(test)]
+static LIGHTEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Increments [`LIGHTEN_GPU_DISPATCHES`]. Called from the `Lighten` arm
+/// once per tile per `Lighten` layer, immediately after the compositor
+/// call it is reporting.
+#[cfg(test)]
+fn note_lighten_gpu_dispatch() {
+    LIGHTEN_GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The shipping build's version: nothing at all, exactly as with
+/// [`note_darken_gpu_dispatch`] above.
+#[cfg(not(test))]
+fn note_lighten_gpu_dispatch() {}
 
 /// Test-only count of the `queue.submit` calls
 /// [`begin_gpu_composite_tile`] itself has issued — the whole point of
@@ -7913,7 +7968,8 @@ impl RecompositeTileCosts {
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
 /// the whole document: every visible top-level layer is an
 /// [`aurora_doc::LayerKind::Pixel`] layer at `Normal`, `Multiply`,
-/// `Darken` or `Dissolve`, no groups. Callers must check that first —
+/// `Darken`, `Lighten` or `Dissolve`, no groups. Callers must check that
+/// first —
 /// this function does not re-check it itself, beyond one defensive bail
 /// (below).
 ///
@@ -7924,12 +7980,13 @@ impl RecompositeTileCosts {
 /// `Pixel` branch already establishes, not reimplemented here. Since
 /// [`document_qualifies_for_gpu_compositing`] has already ruled out every
 /// group and every blend mode outside `{Normal, Multiply, Darken,
-/// Dissolve}` for
+/// Lighten, Dissolve}` for
 /// this document — and `resolve_tile` itself turns a `Dissolve` layer
 /// into an already-gated buffer at `Normal` before returning —
 /// `resolve_tile`'s own returned `aurora_render::BlendMode` is one of
-/// `{Normal, Multiply, Darken}` for every entry this collects, and the
-/// `match` below dispatches on it. A fourth mode reaching here would
+/// `{Normal, Multiply, Darken, Lighten}` for every entry this collects,
+/// and the
+/// `match` below dispatches on it. A fifth mode reaching here would
 /// mean the predicate
 /// and this function had drifted apart, so that arm logs and returns
 /// `None` (falling this tile back to the CPU path) rather than
@@ -7940,7 +7997,8 @@ impl RecompositeTileCosts {
 /// both the backdrop it loads and the target it stores, so `Normal`
 /// needs only one texture. A real blend-math pass
 /// (`composite_multiply_over_with_opacity`,
-/// `composite_darken_over_with_opacity`)
+/// `composite_darken_over_with_opacity`,
+/// `composite_lighten_over_with_opacity`)
 /// cannot — it *samples* the backdrop to compute `B(Cb, Cs)`, and
 /// sampling the texture a pass renders into is undefined, so its `dst`
 /// must be a different view from its `backdrop` (those methods' own
@@ -7951,12 +8009,13 @@ impl RecompositeTileCosts {
 ///
 /// - `Normal` blends in place onto `current`; nothing moves, and no
 ///   second texture is touched or even created.
-/// - Every *other* expressible mode — `Multiply` (0.84.0) and `Darken`
-///   (0.85.0) — reads `current` as the backdrop and writes the finished
+/// - Every *other* expressible mode — `Multiply` (0.84.0), `Darken`
+///   (0.85.0) and `Lighten` (0.95.0) — reads `current` as the backdrop
+///   and writes the finished
 ///   composite into `spare`, then the two swap places. This is one
 ///   mechanism, not one per mode: `spare` is a single shared texture
 ///   that whichever arm needs it takes a turn with, so a stack mixing
-///   `Multiply` and `Darken` ping-pongs between exactly the same two
+///   all three ping-pongs between exactly the same two
 ///   accumulators an all-`Multiply` stack would.
 ///
 /// **Each is created separately and lazily** (0.84.1). `current` is
@@ -8011,8 +8070,8 @@ impl RecompositeTileCosts {
 /// the straight `(1.0, 1.0, 1.0, 0.5)`), which is
 /// `composite_over_with_opacity`'s own correct and unchanged contract.
 /// Both blend-math methods write premultiplied texels
-/// too, so a `Multiply` or `Darken` layer in the stack does not change
-/// this.
+/// too, so a `Multiply`, `Darken` or `Lighten` layer in the stack does
+/// not change this.
 /// Converting that back to the straight alpha the tile store and
 /// everything downstream of it expect is
 /// [`finish_tile_readback`]'s job, on the CPU, on the `Vec<half::f16>`
@@ -8036,7 +8095,7 @@ impl RecompositeTileCosts {
 /// `queue.submit` of their own; they are pure recorders now. The
 /// simplest real case — one `Normal` layer — went from **three**
 /// submits per tile (clear, layer, readback) to one; an N-layer tile
-/// from N + 2 (or N + 3 once a `Multiply`/`Darken` layer forces the
+/// from N + 2 (or N + 3 once a blend-math layer forces the
 /// `spare` accumulator's clear) to one.
 ///
 /// This is safe precisely because ordering inside a command buffer is
@@ -8151,7 +8210,8 @@ impl RecompositeTileCosts {
 /// accumulators' own comment in the body, and PLAN.md's M1.10
 /// "Empty-tile GPU composite work". Also `None` for the one defensive
 /// case above — a resolved blend mode outside `{Normal, Multiply,
-/// Darken}` — logged, falling this one tile back to the CPU path, and
+/// Darken, Lighten}` — logged, falling this one tile back to the CPU
+/// path, and
 /// not reachable through the real caller while the predicate and this
 /// function agree (it *is* reachable by calling this function directly,
 /// which is what
@@ -8160,10 +8220,12 @@ impl RecompositeTileCosts {
 /// real GPU-side failure (a lost device, a bad map) can no longer be
 /// detected here — resolving the map is [`finish_tile_readback`]'s job
 /// now, in phase 3, once this function has already returned.
-// `too_many_lines`: 124, against a 100 limit, measured at 0.86.1. It
+// `too_many_lines`: 143, against a 100 limit, measured at 0.95.0 (it was
+// 124 at 0.86.1). It
 // first crossed on the second ported blend mode (0.85.0, at 107) -- the
 // body is one loop whose `match` gains a fixed ~13-line arm per mode, so
-// it will keep drifting as more land -- and 0.86.0's single-encoder
+// it will keep drifting as more land, and `Lighten` (0.95.0) is the
+// third to prove that -- and 0.86.0's single-encoder
 // batching added the rest. Splitting the arms out would
 // mean handing each a `&mut` borrow of both accumulator `Option`s plus
 // `device`/`queue`/`tile_extent`, which is exactly the shape the swap
@@ -8272,14 +8334,14 @@ fn begin_gpu_composite_tile(
     // `current` always holds the fold so far and is created by the first
     // layer that resolves at all; `spare` is the second member the
     // ping-pong needs, and it is created only by the first blend-math
-    // layer -- `Multiply` or `Darken` -- that actually reaches this
-    // tile. Neither can blend
+    // layer -- `Multiply`, `Darken` or `Lighten` -- that actually
+    // reaches this tile. None of them can blend
     // in place (each samples its backdrop, and sampling the render
     // target is undefined -- see those methods' own
     // aliasing rule), so they, and only they, need a second texture to
-    // render into. One `spare` serves both: it is a shared scratch
-    // target the arms take turns rendering into, not a per-mode
-    // resource, so a stack mixing the two allocates no more than a
+    // render into. One `spare` serves all of them: it is a shared
+    // scratch target the arms take turns rendering into, not a per-mode
+    // resource, so a stack mixing them allocates no more than a
     // single-mode one does.
     // An all-`Normal` document -- every plain imported
     // PNG/JPEG/TIFF -- therefore allocates and clears exactly one
@@ -8395,9 +8457,10 @@ fn begin_gpu_composite_tile(
             // texture exists, and why it is created right here, on the
             // first blend-math layer that actually reaches this tile,
             // rather than alongside the first accumulator. `spare` is
-            // shared with the `Darken` arm below rather than owned by
+            // shared with the `Darken` and `Lighten` arms below rather
+            // than owned by
             // this one: `accumulator_or_create` creates it once,
-            // whichever arm gets there first. The written
+            // whichever of the three blend-math arms gets there first. The written
             // one is now the fold, so the two swap places: what was
             // `spare` becomes `current`, and the exhausted backdrop
             // becomes the next blend-math pass's render target.
@@ -8451,9 +8514,36 @@ fn begin_gpu_composite_tile(
                 note_darken_gpu_dispatch();
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
+            // The third ported mode (0.95.0), through the *same*
+            // mechanism as the two arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `max(Cb, Cs)` per channel. Instrumented from its first
+            // round rather than retrofitted -- see
+            // `LIGHTEN_GPU_DISPATCHES`.
+            aurora_render::BlendMode::Lighten => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_lighten_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_lighten_gpu_dispatch();
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
             // Unreachable through the real caller: `document_qualifies_
             // for_gpu_compositing` admits only `Normal`, `Multiply`,
-            // `Darken` and
+            // `Darken`, `Lighten` and
             // `Dissolve` (which `resolve_tile` has already reduced to
             // `Normal` by the time it gets here), and
             // `recomposite_visible_tiles` checks it before calling this.
@@ -8514,8 +8604,8 @@ fn begin_gpu_composite_tile(
     // lone opaque-white layer at 50% opacity gives (0.5, 0.5, 0.5, 0.5),
     // not the straight (1.0, 1.0, 1.0, 0.5)), and both blend-math
     // methods write premultiplied texels
-    // too, so a `Multiply` or `Darken` layer in the stack does not
-    // change this. That
+    // too, so a `Multiply`, `Darken` or `Lighten` layer in the stack does
+    // not change this. That
     // is left as it is: `finish_tile_readback` straightens the decoded
     // samples on the CPU, in the one shared
     // `aurora_render::un_premultiply_in_place` the CPU path also goes
@@ -8644,14 +8734,16 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
 /// [`document_qualifies_for_gpu_compositing`] confirms the whole document
 /// is GPU-tractable (every visible root-level layer an
 /// [`aurora_doc::LayerKind::Pixel`] layer at `Normal`, `Multiply`,
-/// `Darken` or
+/// `Darken`, `Lighten` or
 /// `Dissolve`, no groups), each tile is
 /// composited via [`begin_gpu_composite_tile`]/[`finish_tile_readback`] —
 /// `aurora_render::TileCompositor::composite_over_with_opacity`'s real
 /// fixed-function blend unit for `Normal`, and
-/// `composite_multiply_over_with_opacity`'s (0.84.0) and
-/// `composite_darken_over_with_opacity`'s (0.85.0) real WGSL blend math
-/// for `Multiply` and `Darken`, not the CPU loop — closing the exact gap
+/// `composite_multiply_over_with_opacity`'s (0.84.0),
+/// `composite_darken_over_with_opacity`'s (0.85.0) and
+/// `composite_lighten_over_with_opacity`'s (0.95.0) real WGSL blend math
+/// for `Multiply`, `Darken` and `Lighten`, not the CPU loop — closing the
+/// exact gap
 /// `spike/FINDINGS.md`'s own ~20ms "merging whole tiles" finding named as
 /// the reason `aurora_render::TileCompositor` exists at all. A tile whose
 /// document doesn't qualify, or whose own GPU work fails
@@ -8661,9 +8753,10 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
 /// (`resolve_tile`/`composite_tile_cpu`) this function always used before
 /// — every blend mode, every group, un-premultiplied isolation, all of
 /// it, unchanged. **Explicitly still CPU-only, by design, not by gap**:
-/// the *other 24* blend modes and group isolation on the GPU (would need
-/// the remaining 23 blend formulas ported to WGSL — `Multiply` and
-/// `Darken` are the two that are — plus a stochastic `Dissolve` path
+/// the *other 23* blend modes and group isolation on the GPU (would need
+/// the remaining 23 blend formulas ported to WGSL — `Multiply`,
+/// `Darken` and `Lighten` are the three that are — plus a stochastic
+/// `Dissolve` path
 /// and per-group
 /// isolated GPU passes; separate, much bigger follow-on work), and
 /// export (`composite_document`, a one-shot operation, not
@@ -14014,17 +14107,17 @@ mod tests {
         COMPOSITE_STRAIGHTEN_PASSES, COMPOSITE_WRITE_OUTCOMES, CRASH_RECOVERY_CONTINUE,
         ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
         DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess,
-        GPU_COMPOSITE_SUBMITS, Key, KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
-        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds, PointerButton,
-        RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS,
-        RECOMPOSITE_TILE_COST_NANOS, RailResize, RecoveredDocument, ShutdownState, UndoKind,
-        UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
-        apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
-        background_color_from_theme, begin_drag, begin_gpu_composite_tile, brush_stroke_mut,
-        canvas_area_logical_size, canvas_area_physical_rect, canvas_area_physical_size,
-        canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer, clean_shutdown_cleanup,
-        clear_session_marker, close_command_palette, close_dialog, collect_widget_paints,
-        commit_ending_drag, composite_document, composite_reference_origin,
+        GPU_COMPOSITE_SUBMITS, Key, KeyChord, LIGHTEN_GPU_DISPATCHES, MIN_WINDOW_HEIGHT,
+        MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
+        PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_MARK_IMBALANCE,
+        RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS, RailResize, RecoveredDocument,
+        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
+        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
+        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
+        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
+        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
+        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
+        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
         composite_roots_into_tile, composite_surface_id, continue_drag,
         crash_recovery_dialog_actions, crash_recovery_dialog_message,
         create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
@@ -16688,8 +16781,8 @@ mod tests {
     /// predicate: it chooses the GPU fast path or the CPU fallback for
     /// every visible tile at once. Undoing a `SetBlendMode` on a
     /// root-level pixel layer across the GPU-expressible boundary
-    /// (`Normal`/`Multiply`/`Darken`/`Dissolve` on one side, the other
-    /// 23 modes on the
+    /// (`Normal`/`Multiply`/`Darken`/`Lighten`/`Dissolve` on one side,
+    /// the other 22 modes on the
     /// other) flips it, so
     /// the whole document's compositing path changes while the step's own
     /// reported rect names one layer's region. This pins both halves:
@@ -19045,6 +19138,13 @@ mod tests {
     /// the ordering.
     fn take_darken_gpu_dispatch_count() -> u64 {
         DARKEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`take_darken_gpu_dispatch_count`]'s sibling for
+    /// [`LIGHTEN_GPU_DISPATCHES`], same read-and-zero shape, same
+    /// `Relaxed`-under-`GPU_TEST_LOCK` reasoning.
+    fn take_lighten_gpu_dispatch_count() -> u64 {
+        LIGHTEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Reads [`GPU_COMPOSITE_SUBMITS`] and resets it to zero in one
@@ -26757,9 +26857,10 @@ mod tests {
         );
     }
 
-    /// `Screen` stands in for "one of the 23 modes the GPU path still
+    /// `Screen` stands in for "one of the 22 modes the GPU path still
     /// cannot express" (27 `aurora_doc::BlendMode` variants minus the
-    /// four admitted as of 0.85.0: `Normal`, `Multiply`, `Darken` and
+    /// five admitted as of 0.95.0: `Normal`, `Multiply`, `Darken`,
+    /// `Lighten` and
     /// `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
     /// mapping and a real CPU formula, so it is a genuine blend mode
     /// being rejected, not an unimplemented one. This used to use
@@ -26857,6 +26958,43 @@ mod tests {
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
             "a root-level Darken pixel layer must qualify for the GPU path as of 0.85.0"
+        );
+    }
+
+    /// The third ported mode (0.95.0): `Lighten` is expressible on the
+    /// GPU path (`composite_lighten_over_with_opacity`), so a root-level
+    /// `Lighten` pixel layer must *not* disqualify the document. Pins the
+    /// fifth `matches!` alternative directly, headlessly — the GPU-vs-CPU
+    /// differential test below proves the resulting composite is actually
+    /// right.
+    ///
+    /// Deliberately `Lighten`, not `LighterColor`: the latter picks one
+    /// whole `(R, G, B)` triple by luminosity, has no WGSL entry point,
+    /// and must stay disqualified. Nothing here asserts that directly,
+    /// but `document_qualifies_for_gpu_compositing_is_false_for_a_non_
+    /// normal_blend_mode` covers the general case with `Screen`.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_lighten_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Lighten) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Lighten pixel layer must qualify for the GPU path as of 0.95.0"
         );
     }
 
@@ -28171,6 +28309,158 @@ mod tests {
         );
     }
 
+    /// **`Lighten` end to end through the app's own GPU path** (0.95.0),
+    /// the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_darken_blend_document`
+    /// above and the third such test. `aurora-render`'s own
+    /// `composite_lighten_*` tests already prove the shader math in
+    /// isolation; what this adds is that setting `BlendMode::Lighten` on
+    /// a real `LayerTree` layer actually reaches
+    /// `composite_lighten_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// **Three layers, not two, and the middle one is a `Multiply`.**
+    /// That makes the `Lighten` layer sample a backdrop a *different*
+    /// blend-math pipeline last wrote, and renders it into the `spare`
+    /// accumulator that pipeline created — the same shared-ping-pong
+    /// property the `Darken` round's five-layer fixture pins, reached
+    /// here in the smallest stack that can reach it at all:
+    ///
+    /// | # | mode       | rgba                     | fold after           |
+    /// |---|------------|--------------------------|----------------------|
+    /// | 1 | `Normal`   | `(0.25, 0.75, 0.5, 1)`   | `(0.25, 0.75, 0.5)`  |
+    /// | 2 | `Multiply` | `(0.5, 0.5, 0.5, 1)`     | `(0.125, 0.375, 0.25)` |
+    /// | 3 | `Lighten`  | `(0.25, 0.25, 0.75, 1)`  | `(0.25, 0.375, 0.75)`  |
+    ///
+    /// Every layer is fully opaque at opacity `1.0`, so the whole fold is
+    /// exact binary fractions and the golden below is asserted
+    /// absolutely, not merely differentially. The maximum is genuinely
+    /// two-sided: red comes from the *source* (`0.25` over `0.125`),
+    /// green from the *backdrop* (`0.375` over `0.25`), and blue from the
+    /// source (`0.75` over `0.25`) — so neither layer's own colour, and
+    /// no other wired arm, can produce this texel.
+    ///
+    /// Three independent guards, the same set the `Darken` five-layer
+    /// test carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`LIGHTEN_GPU_DISPATCHES`] count, which is what distinguishes
+    ///   "the `Lighten` arm ran on the GPU" from "it silently fell back to
+    ///   the CPU, which computes the same correct pixels";
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `Lighten` replaced by `Darken` must composite to something
+    ///   *different* (`(0.125, 0.25, 0.25)` against
+    ///   `(0.25, 0.375, 0.75)` — all three channels differ).
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack: [(&str, aurora_doc::BlendMode, f32, [f32; 4]); 3] = [
+            (
+                "l1",
+                aurora_doc::BlendMode::Normal,
+                1.0,
+                [0.25, 0.75, 0.5, 1.0],
+            ),
+            (
+                "l2",
+                aurora_doc::BlendMode::Multiply,
+                1.0,
+                [0.5, 0.5, 0.5, 1.0],
+            ),
+            (
+                "l3",
+                aurora_doc::BlendMode::Lighten,
+                1.0,
+                [0.25, 0.25, 0.75, 1.0],
+            ),
+        ];
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Lighten root stack must qualify for the GPU path as of \
+             0.95.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_lighten_gpu_dispatch_count();
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `Lighten` layer, dispatched once for
+        // the one tile it actually has content at. `solid_root_stack`
+        // fills only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all -- `resolve_tile` answers
+        // `None` for a visible layer with nothing *stored* at the tile
+        // (0.87.0), so those three take `begin_gpu_composite_tile`'s
+        // `current?` bail before any blend pass is recorded. The second,
+        // CPU-only run inside that helper adds none. **A count of 0 is the
+        // failure this assertion exists for**: it means no `Lighten` tile
+        // reached the GPU at all and every assertion below is being
+        // satisfied by the CPU fallback compared against itself. A count
+        // that is non-zero but not 1 means the viewport or tile geometry
+        // moved under this fixture -- re-derive it rather than loosening
+        // the assertion.
+        assert_eq!(
+            take_lighten_gpu_dispatch_count(),
+            1,
+            "the Lighten layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/Lighten document (the Lighten layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.375, 0.75, 1.0),
+            "the per-channel maximum must come out of the GPU path itself -- (0.125, 0.25, 0.25, \
+             1.0) would mean the Darken arm ran, (0.25, 0.25, 0.75, 1.0) the Normal arm, and \
+             (0.03125, 0.09375, 0.1875, 1.0) the Multiply arm"
+        );
+
+        // The vacuity guard: the same stack with its `Lighten` layer
+        // turned into a `Darken` one, composited on the CPU path only. If
+        // that produced the same texel, every assertion above would hold
+        // just as well with the wrong arm dispatched.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Lighten {
+                entry.1 = aurora_doc::BlendMode::Darken;
+            }
+        }
+        let with_darken = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_darken,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_lighten_were_darken = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_lighten_were_darken,
+            "setup: this fixture must distinguish its Lighten layer from a Darken one, or the \
+             differential above would pass with the wrong dispatch arm running"
+        );
+    }
+
     /// **The test this whole round exists to make possible** (0.85.0):
     /// three *different* expressible modes in one stack, proving the
     /// ping-pong mechanism generalises past a single blend mode.
@@ -28788,9 +29078,10 @@ mod tests {
     }
 
     /// The fallback's own correctness proof, not just that it was taken:
-    /// a document with one `Screen`-blend layer (one of the 23 modes the
-    /// GPU path still cannot express — `Normal`, `Multiply`, `Darken` and
-    /// `Dissolve` are the four admitted as of 0.85.0) must still
+    /// a document with one `Screen`-blend layer (one of the 22 modes the
+    /// GPU path still cannot express — `Normal`, `Multiply`, `Darken`,
+    /// `Lighten` and
+    /// `Dissolve` are the five admitted as of 0.95.0) must still
     /// composite to `Screen`'s own real result, not to
     /// whatever `Normal` would have produced for the same inputs — which
     /// would be a different, wrong value here, so this genuinely
@@ -30035,7 +30326,7 @@ mod tests {
     /// A second, smaller measurement, exercising the CPU compositing
     /// fallback specifically -- `document_qualifies_for_gpu_compositing`
     /// returns `false` here (the single root layer's own blend mode is
-    /// `Screen`, one of the 23 modes the GPU path still cannot express;
+    /// `Screen`, one of the 22 modes the GPU path still cannot express;
     /// it was `Multiply` until 0.84.0 wired that mode onto the GPU path,
     /// which would have quietly turned this into a second GPU-path
     /// measurement), so every tile in this loop goes through
@@ -36511,6 +36802,7 @@ mod tests {
             aurora_doc::BlendMode::Normal,
             aurora_doc::BlendMode::Multiply,
             aurora_doc::BlendMode::Darken,
+            aurora_doc::BlendMode::Lighten,
             aurora_doc::BlendMode::Dissolve,
         ] {
             let mut layers = solid_root_stack(
