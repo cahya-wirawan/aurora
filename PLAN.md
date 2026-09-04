@@ -19878,18 +19878,18 @@ severity choice.
     reading the test as evidence about bounds clipping.
 
   0.94.0's own non-vacuity claim is corrected too: the always-skip mutation
-  fails **5** tests, not the 2 it named (re-run by hand; full list in that
-  entry). Coverage is stronger than claimed — recorded because the claim
-  should be accurate either way.
-
-  1 new test (386 → 1,639 workspace-wide; `aurora-app` 384 → 385), 0
-  changed, 0 removed. No new dependency, no `unsafe`, no new lint
-  exception, no behavioural change to any compositing path.
+  fails **6** tests against the tree as actually committed here, not the
+  2 it originally named — full list, and why the count is 6 and not the
+  5 this same 0.94.1 pass said a paragraph earlier before its own
+  regression-guard test existed in the tree, is above. Coverage is
+  stronger than either prior claim — recorded because the claim should be
+  accurate either way.
 
   No new dependency (`half` was already a workspace dependency of
   `aurora-app`), **no new `unsafe`** (`reinterpret_cast` is a safe
   method), no new lint exception, no `unwrap`/`expect`/`panic`/
-  `indexing_slicing`. `aurora-tile` untouched.
+  `indexing_slicing`. `aurora-tile` untouched. 1 new test (1,638 → 1,639
+  workspace-wide; `aurora-app` 384 → 385), 0 changed, 0 removed.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
