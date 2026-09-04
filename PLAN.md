@@ -21854,7 +21854,10 @@ severity choice.
   does add is the fixture that work would need to prove itself against:
   a `later`-fold-dominated frame whose cost is now a known number on known
   hardware. **(0.101.0 measured it against that fixture and closed it
-  NO-GO — see the 0.101.0 entry below.)**
+  NO-GO for fold-across-roots and shared-store fold-across-tiles;
+  0.101.1 narrowed that further — Normal/Multiply only, and the
+  hoisted-store tile-level candidate is left genuinely open, not
+  closed — see the 0.101.0/0.101.1 entries below.)**
 
   **0.100.1 (2026-09-04) — correction round on the entry above. Four of its
   claims were overstated and one of its assertions was nearly vacuous;
@@ -22036,10 +22039,13 @@ severity choice.
   sequentially — worth doing? Four gates, all fixed now:
 
   - **P1 — soundness, binary.** Whatever target is proposed must be sound
-    *without* assuming blend-mode composition is associative (0.97.0's own
-    worked counterexample above) and *without* changing
-    `aurora_tile::TileStore`'s concurrency contract. Failing P1 is a NO-GO
-    on its own, regardless of P2/P2b/P3, and no measurement can buy it back.
+    *without* assuming blend-mode composition is associative
+    (~~0.97.0's own worked counterexample above~~ **corrected 0.101.1**:
+    that counterexample shows blend modes don't *commute*, not that they
+    aren't associative — see item 3 below for the argument that actually
+    holds) and *without* changing `aurora_tile::TileStore`'s concurrency
+    contract. Failing P1 is a NO-GO on its own, regardless of P2/P2b/P3,
+    and no measurement can buy it back.
   - **P2 — magnitude. ≥ 8.0 ms/frame mean** of measured cost attributable to
     whatever sound target survives P1, on 0.100.0's two-root fixture.
     Reasoning: that fixture's whole frame is ~40.5 ms, so 8.0 ms is ~20% of
@@ -22407,8 +22413,14 @@ severity choice.
      Different pixel, identical inputs. Both `f16` values check by hand —
      the ulp at that magnitude is 2⁻¹¹, and `0.84 / 2⁻¹¹ = 1720.32 → 1720`
      (`= 0.83984375`), `0.88 / 2⁻¹¹ = 1802.24 → 1802` (`= 0.8798828125`).
-     So reassociation *does* diverge; 0.101.0 simply had no argument for
-     that and asserted it from an example about ordering.
+     So the *representable grouping* a tree reduction can express diverges
+     from the real fold — not because function composition itself is
+     non-associative (it isn't), but because folding roots *n* and *n+1*
+     into one `(texels, opacity, mode)` triple is not the same operation as
+     `fₙ₊₁ ∘ fₙ`, and no such triple exists for the non-`Normal` modes this
+     path exists to serve. 0.101.0 asserted the conclusion from an example
+     about ordering, which doesn't reach it; this is the argument that
+     does.
 
   2. **"Parallelizing across tiles is blocked at the type level" is
      over-broad, and it closed a candidate that is sound (Critic G-03 =
@@ -22447,12 +22459,18 @@ severity choice.
      built" paragraph above uses *this very argument* ("touches no
      `TileStore` inside the parallel region") to justify a **different**
      candidate, and supplies the aggregated per-tile fold figure —
-     **3.40 ms** — that clears P2b's 2.0 ms bar for the hoisted-store
-     tile-level design too, since its dispatch unit is the same one (all
-     roots of one tile, joined once per tile; see the unit clarification
-     in item G-07 above). So 0.101.0 ruled out on *soundness* (P1) a
-     candidate that its own arithmetic shows clearing the *measurement*
-     gate (P2b). That is backwards.
+     **3.40 ms** — as that candidate's whole per-tile synchronous region.
+     For *this* design the unit is not the same quantity under the same
+     name: parallelism here is *across* the ~9 tiles, so one tile's whole
+     fold (**3.40 ms**) is the per-worker dispatch chunk, and the region as
+     a whole is ~9 of those (~30.6 ms, the modelled blend-math total
+     above) — not "joined once per tile" in G-07's sense, which describes
+     the *other* candidate's parallelism *within* one tile. Both readings
+     clear the 2.0 ms bar regardless, so the conclusion is unaffected, but
+     the two candidates' units should not be read as interchangeable. So
+     0.101.0 ruled out on *soundness* (P1) a candidate that its own
+     arithmetic shows clearing the *measurement* gate (P2b) under either
+     unit. That is backwards.
 
      **Status of that candidate, stated plainly: OPEN.** It was not
      measured for P2 (whole-frame magnitude at scale), not measured for P3
@@ -22461,9 +22479,16 @@ severity choice.
      Real open questions remain — the hoist means holding every root's
      resolved buffer for every in-flight tile live at once rather than one
      tile's at a time, which is a memory-shape claim against invariant
-     §7.3.1's 300,000² ceiling and needs its own bound — and it may still
-     die on any of them. But it dies on evidence in a future round, not
-     on this one's P1. **Deliberately not built here**: 0.101.1 is a
+     §7.3.1's 300,000² ceiling and needs its own bound. The shape also
+     needs a third leg this sketch omitted: `write_composited`
+     (`lib.rs:9029`, called from the per-tile loop at `:9185`/`:9222`) is
+     itself a `&mut TileStore` closure, so it must stay sequential too —
+     resolve (sequential) → fold (parallel) → write-back (sequential).
+     That third leg caps the achievable win below the ~78% blend-math
+     share this fixture measured, since resolve and write-back never
+     parallelize. It may still die on any of these. But it dies on
+     evidence in a future round, not on this one's P1. **Deliberately not
+     built here**: 0.101.1 is a
      correction round on what was written, not new implementation and not
      new measurement.
 
@@ -22829,9 +22854,12 @@ separate estimate and deliberately does not ratio-match; mutation A's
 "116 pass" was stale (**143 pass**, of 144); and four doc-comment claims
 in `composite.rs` were overstated. **Next actual decision is unchanged
 and still Cahya's**: ~~the multi-root-only parallelization GO is open but
-low-value~~ **— closed NO-GO at 0.101.0, on the `fold_onto_opaque` numbers
-0.98.0 itself produced; see that entry** — and nothing here advances the
-60 FPS gate.
+low-value~~ **— closed NO-GO at 0.101.0 for Normal/Multiply
+fold-across-roots and shared-store fold-across-tiles, on the
+`fold_onto_opaque` numbers 0.98.0 itself produced; 0.101.1 found this was
+over-broad — 6 of 7 other tested blend modes still clear the bar, and a
+hoisted-store tile-level design remains open and unmeasured; see the
+0.101.0/0.101.1 entries** — and nothing here advances the 60 FPS gate.
 
 **Addendum 2026-09-04 (0.97.1) — 0.97.0's GO verdict is WITHDRAWN: T1 was
 read from a condition the round's own corroborating fixture never
