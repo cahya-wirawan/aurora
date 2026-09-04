@@ -52,6 +52,8 @@ cargo run -p aurora-app                 # the application
 cargo run -p aurora-cli                 # headless binary
 ```
 
+**Before a full-workspace build or gate run, check free disk space** — `df -h /home` (or wherever this checkout lives). Three separate rounds (0.102.1, 0.103.0, 0.103.1) hit `/home` at or near 100% full mid-gate, each recovered the same way: `rm -rf target/debug/incremental` (a pure build cache, regenerates automatically; nothing else under `target/` needs touching). If free space is under ~20G, run that first rather than discovering the failure mid-`cargo test`.
+
 The spikes are separate crates, deliberately outside the workspace (root `Cargo.toml` `exclude`s them) so they can never become dependencies of real code:
 
 ```sh
