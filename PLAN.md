@@ -21692,6 +21692,14 @@ severity choice.
   frame.** Diagnostic/measurement round; one new test, one test-only
   return value, no shipping-code change of any kind.
 
+  > **Read the 0.100.1 correction at the end of this entry before quoting
+  > anything here.** Four claims below are corrected there and one
+  > assertion was tightened: the word "separable" in this headline does not
+  > survive re-measurement (the effect and its direction do), "proof" of
+  > the `fold_onto_opaque` *arm* is downgraded to an inference from a
+  > now-verified precondition, the "3 divisions" mechanism is the wrong
+  > attribution, and the control arm's "no win" is withdrawn.
+
   New test:
   `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
   (`aurora-app`). Two root-level pixel layers at **identical** bounds
@@ -21709,9 +21717,12 @@ severity choice.
   every visible tile goes through `composite_roots_into_tile`. The timed
   loop is `measure_pan_and_paint_frames`, **reused byte for byte**.
 
-  **Fold-census proof, not inference** (0.97.1's counter, now *returned*
-  by `report_frame_stages` rather than only printed, so the test asserts on
-  it):
+  **Fold-census proof, not inference** — *overstated; see the 0.100.1
+  correction. The census proves a structural second fold; that the fold
+  takes `fold_onto_opaque`'s dividing arm is an inference from the
+  backdrop's stored alpha, which 0.100.1 makes the test verify* (0.97.1's
+  counter, now *returned* by `report_frame_stages` rather than only
+  printed, so the test asserts on it):
 
   | arm | folds | first (cheap, transparent backdrop) | later (`fold_onto_opaque`, 3 divisions/texel) |
   |---|---|---|---|
@@ -21719,14 +21730,19 @@ severity choice.
   | control, backdrop hidden | 108 | 108 | 0 |
 
   108 = 9 tiles × 12 frames, exactly, on every one of 12 runs. So the main
-  arm reaches the dividing arm on *every texel of every visible tile of
-  every frame*, and the control — the same fixture with one
-  `set_visible(false)` — reaches it never. The test asserts
-  `later >= frames`; the control's `later == 0` is **reported, not
-  asserted**, because `RECOMPOSITE_FOLD_COUNTS` is process-global and a
-  concurrent CPU-only test can add to it (pollution can only add, which is
-  what makes the main arm's lower bound sound and an equality assertion on
-  the control a latent flake).
+  arm folds twice on *every visible tile of every frame*, and the control —
+  the same fixture with one `set_visible(false)` — folds once. ~~The test
+  asserts `later >= frames`~~ **superseded 0.100.1: the test now asserts
+  `later == first`, exactly. The old floor was 12 against a real,
+  deterministic 108 — 9× slack, which Red-team demonstrated passing a
+  degraded fixture that pre-seeded 8 tiles instead of ~64.** The control's
+  `later == 0` is still **reported, not asserted**, because
+  `RECOMPOSITE_FOLD_COUNTS` is process-global (0.100.1 narrows *why* that
+  matters: every increment site does in fact run under `GPU_TEST_LOCK`
+  today, so pollution is not currently possible — the control stays
+  unasserted because a zero is the one shape a future lock-free increment
+  site could silently turn into a flake, not because pollution is happening
+  now).
 
   **The cross-version A/B — obtained, not skipped.** `composite.rs` keeps
   a verbatim copy of the pre-0.98.0 scalar body as
@@ -21741,31 +21757,43 @@ severity choice.
 
   | arm | vectorized (this tree) | scalar (pre-0.98.0 body) | separable? |
   |---|---|---|---|
-  | two roots, `later=108` | 42.51 / 40.59 / 40.48 / 40.65 / 40.48 / 40.30 | 45.60 / 44.58 / 44.87 / 45.53 / 44.99 / 47.25 | **yes** — ranges do not overlap (worst vectorized 42.51 < best scalar 44.58) |
-  | control, `later=0` | 26.17 / 24.72 / 24.87 / 24.90 / 24.84 / 25.18 | 30.35 / 26.56 / 25.81 / 30.43 / 25.77 / 25.80 | **no** — ranges overlap (25.77–30.43 vs 24.72–26.17) |
+  | two roots, `later=108` | 42.51 / 40.59 / 40.48 / 40.65 / 40.48 / 40.30 | 45.60 / 44.58 / 44.87 / 45.53 / 44.99 / 47.25 | ~~**yes** — ranges do not overlap (worst vectorized 42.51 < best scalar 44.58)~~ **withdrawn 0.100.1** — an n=6 sampling artifact; medians differ, ranges do overlap on reruns |
+  | control, `later=0` | 26.17 / 24.72 / 24.87 / 24.90 / 24.84 / 25.18 | 30.35 / 26.56 / 25.81 / 30.43 / 25.77 / 25.80 | ~~**no** — ranges overlap (25.77–30.43 vs 24.72–26.17)~~ **withdrawn 0.100.1** — reruns show a real small win here too |
 
   Same shape in p50 on the two-root arm (vectorized 40.42–42.89, scalar
-  44.60–45.55, also non-overlapping). Run-median difference on that arm:
+  44.60–45.55, also non-overlapping *on these six runs — see the 0.100.1
+  correction*). Run-median difference on that arm:
   **40.53 → 45.26 ms, i.e. ~4.7 ms/frame, ~10.5% of the scalar frame.**
 
-  **Verdict, stated plainly: a win.** On a fixture that genuinely reaches
-  `composite_layer_into`'s `fold_onto_opaque` arm, 0.98.x's vectorization
-  is worth ~4.7 ms of a ~45 ms frame, and the two trees' 6-run ranges do
-  not overlap — this is not noise. On the *same* fixture with the backdrop
-  hidden, so that every fold is a first fold, the ranges do overlap and no
-  difference is separable. That is 0.99.0's structural explanation
-  confirmed by direct measurement rather than by reasoning: the win lives
-  in later folds, 0.99.0's two fixtures had none, and this one has one per
-  tile per frame.
+  **Verdict, stated plainly: a win.** *(The "a win" half stands; the
+  separability and mechanism halves are corrected at 0.100.1 — read this
+  paragraph with that correction in hand.)* On a fixture whose every tile
+  folds twice, 0.98.x's vectorization is worth ~4.7 ms of a ~45 ms frame.
+  ~~and the two trees' 6-run ranges do not overlap — this is not noise. On
+  the *same* fixture with the backdrop hidden, so that every fold is a
+  first fold, the ranges do overlap and no difference is separable.~~ That
+  is 0.99.0's structural explanation confirmed by direct measurement rather
+  than by reasoning: **the win scales with the number of folds** (0.100.1
+  correction — *not* "the win lives in the dividing arm's three
+  divisions"), 0.99.0's two fixtures had one fold per tile, and this one
+  has two.
 
   Derived, and flagged as derived: isolating the later-fold cost as
   (main − control) run-medians gives 15.66 ms/frame vectorized vs
   19.07 ms/frame scalar for 9 later folds, i.e. ~1.74 vs ~2.12 ms per
-  whole-tile later fold, ~18% cheaper. That lands inside the 10–32% band
-  `benches/composite.rs`'s own `fold_onto_opaque` column reported at
-  0.98.0–0.98.3, which is a consistency check and **not** a second
-  independent measurement — it is a difference of two noisy means and
-  should not be quoted as a per-call figure.
+  whole-tile later fold, ~18% cheaper. The directly comparable per-call row
+  is `benches/composite.rs`'s **`Screen`** `fold_onto_opaque` figure,
+  **−17.5%** at 0.98.0 — this fixture's own upper layer *is* `Screen`, so
+  that single row, not the 10–32% band across all 26 modes, is the
+  consistency check (0.100.1, Critic G-06; the band was the original
+  comparison and was needlessly wide). It remains a consistency check and
+  **not** a second independent measurement — it is a difference of two
+  noisy means and should not be quoted as a per-call figure. **And it is
+  biased upward by a confound** (0.100.1, Critic G-01): the control arm
+  skips more than the later fold's blend math — it also skips that layer's
+  whole `resolve_tile` call, its store `get`, and the 512 KiB `Vec`
+  allocation that goes with it. Direction only, magnitude not measured, but
+  it means "per later fold" reads high.
 
   **Caveats, all real:**
 
@@ -21806,6 +21834,156 @@ severity choice.
   does add is the fixture that work would need to prove itself against:
   a `later`-fold-dominated frame whose cost is now a known number on known
   hardware.
+
+  **0.100.1 (2026-09-04) — correction round on the entry above. Four of its
+  claims were overstated and one of its assertions was nearly vacuous;
+  independent Critic and Red-team review reproduced every one of these on
+  the same hardware. The fixture and its ~4.7 ms median effect stand; the
+  words around them did not.** Test-only changes plus this entry; no
+  shipping-code change, and the `rayon` work named above is still not
+  started.
+
+  1. **The census assertion had 9× slack (Critic G-02, Red-team RT-100-03).**
+     `assert!(later_folds >= u64::from(TWO_ROOT_FRAMES))` — a floor of 12 —
+     against a real, deterministic value of **108** on every run. Red-team
+     showed the gap was not theoretical: pre-seeding the backdrop on 8 tiles
+     instead of ~64 (an **89 % coverage collapse**, so the benchmark spends
+     almost all its time measuring *single* folds) still cleared the floor
+     and still passed. Now
+     **`assert_eq!(later_folds, first_folds)`** — exact, not a tightened
+     heuristic: every tile this fixture composites has content on both
+     roots, so a tile that folds at all folds exactly twice, and
+     `later == first` is the fixture's construction restated. Confirmed by
+     re-running Red-team's degradation mode on this hardware: with the
+     pre-seed restricted to the first 8 tiles, the census came back
+     `folds=59 first=42 later=17` and the tightened assertion **failed**
+     (`left: 17, right: 42`) — while the old floor of 12 would have passed
+     that same run, since `17 >= 12`. Mutation reverted immediately; it is
+     not in the tree.
+  2. **"Fold-census proof, not inference" overclaimed (Red-team
+     RT-100-01).** The census counts folds *structurally*. `fold_texel`
+     picks its arm **per texel**, on `backdrop_alpha > 0.0`, inside
+     `aurora-render` — invisible to any counter in `aurora-app`. Red-team's
+     demonstration: set the pre-seeded backdrop's alpha to `0.0` and the
+     census, the printed "later=108", and the pass/fail outcome are all
+     **identical**, while every texel now takes the cheap arm. So the
+     honest chain is: *the census proves a second fold happened; the
+     backdrop's stored alpha is verified opaque; the dividing arm follows
+     from those two plus `fold_texel`'s documented predicate.* The middle
+     link was the one entirely missing — the test never checked its own
+     premise — and it now exists: before the timed loop, the test reads a
+     pre-seeded backdrop tile back out of the store and asserts **every**
+     texel's alpha is `1.0`. The test name, the printed labels, the census
+     line's own text, and the doc comments were all reworded to say this
+     rather than "proven". **Possible future strengthening, deliberately
+     not built here**: a real branch-taken counter inside
+     `aurora-render`'s `fold_texel`, the same shape as
+     `DARKEN_GPU_DISPATCHES` — that, and only that, would make the arm an
+     observation instead of an inference.
+  3. **The mechanism was misattributed to "the 3 divisions" (Red-team
+     RT-100-02).** A 2×2 {vectorized, scalar} × {opaque, transparent
+     backdrop} cross, reproduced on this same box, puts the **divide arm's
+     own cost at ~0.25 ms vectorized vs ~2.55 ms scalar**, and of the
+     ~4.2 ms whole-frame delta with the arm active, **~1.9 ms remains
+     without it**. Roughly half of what the entry above framed as
+     arm-specific is therefore just *one more fold's worth of work*. The
+     corrected causal statement: **the win scales with total folds, and
+     hence with total converted samples; the larger component of the
+     arm-specific part is the redundant per-sample `f16` <-> `f32`
+     conversions the pre-0.98.0 scalar loop repeated, not division cost.**
+     This is also the mechanism 0.98.0's own entry already named ("the
+     opaque arm pays three extra `f16` widenings"), i.e. the conversions
+     were always the story and 0.100.0's summary lost it.
+  4. **The n=6 "ranges do not overlap" claim does not survive
+     re-measurement (Red-team RT-100-04).** Twelve consecutive reruns of
+     the vectorized main arm are **bimodal**: 2 of 12 land above the
+     originally-quoted vectorized maximum, within ~1 ms of the quoted
+     scalar floor. Non-overlap at n=6 was a sampling artifact. What is
+     robust is the **median difference and its direction** (~40.5 vs
+     ~45.3 ms, ~4.7 ms, ~10 %). Quote medians with dispersion; do not quote
+     range-separability, and do not call the effect "separable" as the
+     0.100.0 headline did.
+  5. **The control arm's "no win" is withdrawn (Red-team RT-100-05).**
+     Reruns (9 vectorized, 8 scalar) show a real, small win there too:
+     **median 24.85 vs 25.83 ms**, non-overlapping on those runs. So the
+     original "every fold is a first fold, therefore nothing is separable"
+     read was wrong in both directions — a single-fold frame still converts
+     a whole tile's samples per fold, so a fold-count-proportional win is
+     exactly what fix 3's corrected mechanism predicts. The two arms differ
+     in **how much** win, not in whether there is one.
+  6. **Derived per-fold figure: confound disclosed (Critic G-01), and the
+     consistency check narrowed (Critic G-06).** See the amended
+     "Derived, and flagged as derived" paragraph above: the control arm
+     skips the second layer's whole `resolve_tile` + store `get` +
+     512 KiB `Vec` allocation, not just its blend math, so (main − control)
+     **biases the per-later-fold figure upward** (direction only,
+     magnitude unmeasured); and the comparison row is now `Screen`'s own
+     `fold_onto_opaque` **−17.5 %** from 0.98.0 — this fixture's upper
+     layer *is* `Screen` — rather than the 10–32 % band across all 26
+     modes.
+  7. **Peak-memory bound corrected (Critic G-04).** `TWO_ROOT_STORE_BUDGET`'s
+     doc claimed the test's peak resident cost is `256 × 512 KiB =
+     128 MiB`. That is the bound for **one** store; the test builds two
+     fixtures and the main arm's is still alive when the control's is
+     created, so the real bound is **~256 MiB**. Doc corrected rather than
+     dropping the main arm early: an early drop would put a store teardown
+     (writer-thread shutdown + scratch-directory removal) between the two
+     timed arms whose difference is the whole comparison, and would no
+     longer be the configuration the numbers above were taken under.
+  8. **Small cleanups.** `preseed_full_tiles` is now a thin loop over the
+     existing `fill_solid` helper it had duplicated (Critic G-03); the
+     `[folds, real_fold_tiles]` / `[folds, first_folds]` naming hop is
+     stated at both ends instead of left to the reader (Critic G-07); and
+     CLAUDE.md's performance section now says *why* 0.96.2 is still the
+     real-hardware record for the two gate fixtures despite 0.99.0 and
+     0.100.0 both re-measuring since — 0.99.0 found no detectable change on
+     those same two, and 0.100.0 measured a different, non-comparable
+     fixture (Critic G-08).
+
+  **How to redo the cross-version A/B (Red-team RT-100-06).** The scalar
+  reference lives in `crates/aurora-render/src/composite.rs`'s private
+  `#[cfg(test)] mod tests` as `composite_layer_into_scalar`, so it is not
+  reachable from outside that crate and the A/B needs a hand-edit — worth
+  writing down rather than rediscovering. Recipe: in a throwaway
+  `git worktree`, replace the **body** of the `pub fn
+  composite_layer_into` (the vectorized chunk loop plus its scalar
+  remainder) with the body of `composite_layer_into_scalar` verbatim,
+  leaving the signature and doc comment alone; then run
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-app --release --
+  recomposite_and_present_loop --nocapture` in each tree, interleaved, on
+  an idle box. Nothing else changes. **Exposing that reference properly**
+  (an `aurora-render` `test-support` feature, the shape `aurora-gpu`
+  already uses) is real future scope and was deliberately not built here.
+
+  **Test-count delta and gate, for 0.100.0 and this correction together**
+  (0.100.0 recorded neither, unlike every neighbouring entry — Critic
+  G-05). 0.100.0 added exactly **1 test** (`aurora-app` 387 → 388;
+  workspace 1,661 → 1,662, and `#[test]` attributes in `aurora-app` 391 →
+  392, checked against the parent commit); 0.100.1 adds none and changes
+  one test plus several doc comments. `cargo test --workspace --release`
+  counts **1,662 passing, 0 failing** across 42 result lines. Gate run at
+  this commit, all green:
+  `cargo fmt --all --check`, `python3 scripts/check_layering.py`
+  (20 crates), `python3 scripts/check_no_hardcoded_style.py` (28 files),
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace
+  --release` **and** `cargo test --workspace` (both profiles, since the
+  changed assertion is in a release-measured test), `cargo test --workspace
+  --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`, `cargo deny check all`. Plus
+  the fixture and both its siblings re-run on the real adapter
+  (`AURORA_REQUIRE_GPU=1 cargo test -p aurora-app --release --
+  recomposite_and_present_loop --nocapture`, `NVIDIA GeForce RTX 3090
+  (Vulkan, DiscreteGpu)`): **3 passed**, twice, with the tightened
+  assertion in place. Main arm whole-frame mean **40.95 ms** then
+  **42.01 ms**, census `folds=216 first=108 later=108` both times; control
+  **25.01 ms** then **26.09 ms**, census `folds=108 first=108 later=0`;
+  siblings unchanged in outcome (CPU-fallback 9.47 ms, GPU path 8.56 ms
+  over 40 frames — both inside 0.99.0's own ranges). That ~1 ms of
+  run-to-run drift on the main arm across two consecutive runs is itself a
+  small illustration of correction 4: it is a meaningful fraction of the
+  ~4.7 ms effect, which is why medians-with-dispersion is the honest way to
+  quote this fixture and range-separability at n=6 was not.
 
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks

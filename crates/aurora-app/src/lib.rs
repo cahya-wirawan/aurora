@@ -7814,10 +7814,22 @@ static RECOMPOSITE_TILE_COST_NANOS: [std::sync::atomic::AtomicU64; 5] = [
 /// [`aurora_render::transparent_tile`], so a tile's **first** fold always
 /// takes [`aurora_render::composite_layer_into`]'s
 /// `backdrop_alpha == 0.0` arm (the benchmark's `fold_onto_transparent`
-/// condition) and only its second and later folds take the dividing arm
-/// (`fold_onto_opaque`). The split is therefore exactly
+/// condition) and only its second and later folds *can* take the dividing
+/// arm (`fold_onto_opaque`). The split is therefore exactly
 /// `first_folds = slot[1]` and `later_folds = slot[0] - slot[1]`, which is
 /// what says which benchmark column a document's cost should be read from.
+///
+/// **"Can", not "does" (0.100.1, Red-team RT-100-01).** The arm is chosen
+/// **per texel**, inside `aurora-render`, on the accumulator's own alpha at
+/// that texel. So `later_folds` is a structural count of folds onto a
+/// non-empty *fold sequence*, and it is an upper bound on the dividing-arm
+/// folds, exact only where the layers already folded actually left alpha
+/// behind — a second fold over an all-transparent first layer counts here
+/// and takes the cheap arm at every texel. No counter in this crate can
+/// tell those apart; a caller that needs the distinction has to establish
+/// the backdrop's stored alpha itself, as
+/// `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
+/// now does by reading a pre-seeded tile back.
 /// Both slots come from `folded`, the value
 /// [`RecompositeTileCosts::mark_cpu_fallback`] is already handed, so
 /// nothing new is computed on the frame path and no shipping build gains a
@@ -19297,14 +19309,28 @@ mod tests {
 
     /// Reads [`RECOMPOSITE_FOLD_COUNTS`] and resets it to zero, same
     /// read-and-zero shape as the counters above (0.97.1):
-    /// `[folds, real_fold_tiles]`.
+    /// `[folds, real_fold_tiles]` — slot 1 is the one callers name
+    /// `first_folds`, because one fold per real-fold tile is a first fold
+    /// and the two counts are therefore the same number under two names
+    /// (0.100.1, Critic G-07: the naming hop is stated at both ends now
+    /// rather than left to the reader).
     ///
-    /// Diagnostic only, and nothing asserts a magnitude on it. See that
-    /// counter's own doc comment for why the *pair* rather than the fold
-    /// total is the load-bearing number: `real_fold_tiles` is exactly the
-    /// count of folds that took `composite_layer_into`'s cheap
-    /// `backdrop_alpha == 0.0` arm, and `folds - real_fold_tiles` is
-    /// exactly the count that took the dividing arm.
+    /// Diagnostic only, and no *timing* magnitude is asserted on it.
+    /// See that counter's own doc comment for why the *pair* rather than
+    /// the fold total is the load-bearing number: `real_fold_tiles` is
+    /// exactly the count of folds onto a transparent accumulator, and
+    /// `folds - real_fold_tiles` is exactly the count of folds onto a
+    /// non-empty one.
+    ///
+    /// **What that second number is not (0.100.1, Red-team RT-100-01).**
+    /// It is a *structural* count, not a branch-taken count. Which arm
+    /// `aurora_render`'s `fold_texel` took is decided per texel on
+    /// `backdrop_alpha > 0.0` inside `aurora-render`, and nothing in this
+    /// crate can see it: a later fold onto a fully *transparent*
+    /// accumulator would be counted here identically while taking the
+    /// cheap arm at every texel. Earlier wording here ("exactly the count
+    /// that took the dividing arm") claimed more than the counter can
+    /// support.
     fn take_recomposite_fold_counts() -> [u64; 2] {
         let mut out = [0_u64; 2];
         for (slot, dest) in RECOMPOSITE_FOLD_COUNTS.iter().zip(out.iter_mut()) {
@@ -30159,13 +30185,16 @@ mod tests {
         println!(
             "{label}:   fold census: {folds} roots folded over {real_fold_tiles} real-fold \
              tiles in {frames} frames = {per_frame:.3} folds/frame, of which \
-             first-fold(cheap/transparent-backdrop)={real_fold_tiles} and \
-             later-fold(pays 3 divisions/opaque-backdrop)={later} -- read the blend-math \
+             first-fold(onto-the-transparent-seed)={real_fold_tiles} and \
+             later-fold(onto-a-non-empty-accumulator)={later} -- read the blend-math \
              per-call cost off benches/composite.rs's fold_onto_transparent column for the \
-             first group and fold_onto_opaque for the second. later=0 is the correct, expected \
-             value for a single-root document and is not a missing measurement: \
-             composite_roots_into_tile always seeds its accumulator with transparent_tile, so \
-             every root's first fold takes the backdrop_alpha == 0.0 arm"
+             first group and fold_onto_opaque for the second, noting (0.100.1) that this is a \
+             STRUCTURAL count: fold_texel picks its arm per texel on backdrop_alpha > 0.0 \
+             inside aurora-render, so `later` is an upper bound on dividing-arm folds and is \
+             exact only where the already-folded layers left alpha behind. later=0 is the \
+             correct, expected value for a single-root document and is not a missing \
+             measurement: composite_roots_into_tile always seeds its accumulator with \
+             transparent_tile, so every root's first fold takes the backdrop_alpha == 0.0 arm"
         );
         counts
     }
@@ -30731,10 +30760,21 @@ mod tests {
     /// (a second surface with content everywhere). 256 holds the whole
     /// fixture (128 layer tiles + at most ~64 composite tiles) with room
     /// to spare, i.e. this fixture measures compositing arithmetic and
-    /// deliberately **not** tile paging. Peak resident cost is bounded by
-    /// `256 * 512 KiB = 128 MiB`, allocated only after
-    /// `real_gpu_context()` has already confirmed a real adapter, so a
-    /// no-GPU CI runner never pays it.
+    /// deliberately **not** tile paging.
+    ///
+    /// **Peak resident cost, corrected (0.100.1, Critic G-04).** One such
+    /// store is bounded by `256 * 512 KiB = 128 MiB`, but the test builds
+    /// **two** fixtures — main arm and control — and the main arm's is
+    /// still alive when the control's is created, so the real bound for the
+    /// test is **~256 MiB**, not 128. The original comment quoted the
+    /// per-store figure as if it were the test's peak. The main arm is
+    /// deliberately *not* dropped early: that would put a store teardown
+    /// (writer-thread shutdown plus scratch-directory removal) between the
+    /// two timed arms whose difference is the entire point of the
+    /// comparison, and would no longer be the configuration PLAN.md's
+    /// 0.100.0 numbers were taken under. Either way both stores are
+    /// allocated only after `real_gpu_context()` has already confirmed a
+    /// real adapter, so a no-GPU CI runner never pays either 128 MiB.
     const TWO_ROOT_STORE_BUDGET: usize = 256;
 
     /// Every tile [`measure_pan_and_paint_frames`] can ask
@@ -30811,43 +30851,34 @@ mod tests {
     /// composite, not on layer content), so callers must pass
     /// `rgb <= a`.
     ///
+    /// **What the caller can and cannot check afterwards (0.100.1,
+    /// Red-team RT-100-01).** That the stored alpha really came out `1.0`
+    /// at every texel of a pre-seeded tile *is* checkable, and the caller
+    /// now checks it by reading the tile back rather than trusting this
+    /// write. Which per-texel arm `fold_texel` then took is **not**
+    /// checkable from this crate: the branch lives inside `aurora-render`
+    /// and no counter here can see it. The chain is "verified stored
+    /// precondition + `fold_texel`'s documented `backdrop_alpha > 0.0`
+    /// predicate", not a runtime branch-taken proof.
+    ///
     /// Runs entirely *before* the timed loop, so its own cost — and the
     /// evictions it causes if it ever outgrows
     /// [`TWO_ROOT_STORE_BUDGET`] — is not in any reported number.
+    ///
+    /// **A thin loop over [`fill_solid`] (0.100.1, Critic G-03)**, which
+    /// already did exactly this for one tile: same whole-tile write, same
+    /// channel order, same full-tile `mark_dirty`. The first cut here
+    /// hand-rolled a second copy of that body; this function is now only
+    /// the multi-tile wrapper plus the doc comment above, which is the
+    /// part that carries information `fill_solid`'s own name does not.
     fn preseed_full_tiles(
         store: &mut aurora_tile::TileStore,
         surface: aurora_tile::SurfaceId,
         tiles: &[aurora_tile::TileId],
         premultiplied: [f32; aurora_tile::CHANNELS],
     ) {
-        let full_tile = aurora_core::Rect {
-            x: 0,
-            y: 0,
-            width: aurora_tile::TILE,
-            height: aurora_tile::TILE,
-        };
-        let [sr, sg, sb, sa] = premultiplied.map(half::f16::from_f32);
         for &tile_id in tiles {
-            let tile = match store.get_mut(surface, tile_id) {
-                Ok(tile) => tile,
-                Err(err) => {
-                    unreachable!("a scratch store this test just created must be writable: {err:?}")
-                }
-            };
-            // Destructured rather than `copy_from_slice`d: this crate
-            // holds a professional's unsaved work and `copy_from_slice`
-            // panics on a length mismatch, so the whole file avoids it
-            // without a length guard in front. `chunks_exact_mut` cannot
-            // yield a short chunk, so the `else` arm is unreachable —
-            // it exists only because the pattern is refutable.
-            for texel in tile.texels_mut().chunks_exact_mut(aurora_tile::CHANNELS) {
-                let [r, g, b, a] = texel else { continue };
-                *r = sr;
-                *g = sg;
-                *b = sb;
-                *a = sa;
-            }
-            tile.mark_dirty(full_tile);
+            fill_solid(store, surface, tile_id, premultiplied);
         }
     }
 
@@ -30865,6 +30896,18 @@ mod tests {
         /// full-tile opaque, which is what puts the *second* fold on the
         /// `fold_onto_opaque` arm.
         backdrop: aurora_doc::LayerId,
+        /// The backdrop's own surface, carried out of the builder (0.100.1)
+        /// so the test can read the pre-seeded content back and *verify*
+        /// the opaque-backdrop precondition instead of assuming the write
+        /// stuck — see [`preseed_full_tiles`]' own note on what that does
+        /// and does not establish.
+        backdrop_surface: aurora_tile::SurfaceId,
+        /// Every tile both layers were pre-seeded on, in first-visited
+        /// order — [`panned_tile_superset`]'s own return value. Carried out
+        /// (0.100.1) for the same readback check: element 0 is frame 0's
+        /// own top-left visible tile, so it is certainly walked by the
+        /// timed loop.
+        preseeded: Vec<aurora_tile::TileId>,
         /// Folds **second**, onto the now-opaque accumulator, and is the
         /// active layer the timed loop stamps its per-frame dab into.
         canvas: aurora_doc::LayerId,
@@ -30983,6 +31026,8 @@ mod tests {
             store,
             layers,
             backdrop,
+            backdrop_surface,
+            preseeded: tiles,
             canvas,
             canvas_surface,
         }
@@ -30990,38 +31035,72 @@ mod tests {
 
     /// The whole-frame measurement PLAN.md's 0.99.0 entry said this suite
     /// could not take: **two real, overlapping root pixel layers on the
-    /// CPU-fallback compositing path, with `composite_layer_into`'s
-    /// `fold_onto_opaque` arm genuinely reached** — proven by the 0.97.1
-    /// fold census, not inferred from the fixture's shape.
+    /// CPU-fallback compositing path, with a second fold onto an
+    /// already-opaque accumulator at every visited tile of every frame.**
+    ///
+    /// **What that last clause rests on, stated precisely (0.100.1
+    /// correction, Red-team RT-100-01).** The first cut of this test said
+    /// `fold_onto_opaque` was "genuinely reached — proven by the 0.97.1
+    /// fold census, not inferred". That overclaimed, and the demonstration
+    /// was concrete: setting the pre-seeded backdrop's alpha to `0.0`
+    /// produces a byte-identical census and still passes, because the
+    /// census counts folds *structurally* and has no visibility into which
+    /// per-texel arm `aurora_render`'s own `fold_texel` took. Three
+    /// separate things, kept separate:
+    ///
+    /// 1. **A second fold really happened** at every visited tile of every
+    ///    frame — this the census does prove, and the assertion below is
+    ///    exact about it (`later == first`).
+    /// 2. **The backdrop this fold lands on really is stored opaque** —
+    ///    verified in-test by reading a pre-seeded tile back and checking
+    ///    every texel's alpha, not by trusting the write.
+    /// 3. **That this fold therefore takes `fold_texel`'s dividing arm**
+    ///    follows from 1 + 2 plus that function's documented
+    ///    `backdrop_alpha > 0.0` predicate. It is *not* independently
+    ///    observed here. Proving it would need branch-taken instrumentation
+    ///    inside `aurora-render` itself, the same shape as
+    ///    `DARKEN_GPU_DISPATCHES`; deliberately not built in this round,
+    ///    and named as possible future strengthening in PLAN.md's 0.100.1
+    ///    correction.
     ///
     /// Two arms, same store budget, same pan, same blend modes, same
     /// pre-seeded store contents, differing in exactly one document flag:
     ///
     /// - **main**: backdrop visible. Two roots fold at every visited tile,
-    ///   so every tile contributes one `first` fold (cheap
-    ///   `backdrop_alpha == 0.0` arm) *and* one `later` fold (the arm that
-    ///   pays three divisions per texel).
+    ///   so every tile contributes one `first` fold (onto the transparent
+    ///   accumulator) *and* one `later` fold (onto the now-opaque one).
     /// - **control**: backdrop hidden. `resolve_tile` declines it on
     ///   visibility, one root folds per tile, and `later` folds are zero
     ///   *by construction*.
     ///
     /// **The control's `later == 0` is reported, not asserted**, and the
     /// reason is worth stating: `RECOMPOSITE_FOLD_COUNTS` is
-    /// process-global, and while this test holds `GPU_TEST_LOCK` (so no
-    /// other *GPU* test is inside the counter), a CPU-only test in the
-    /// same binary can composite a multi-root document concurrently and
-    /// add to it. Pollution can only *add*, which is why the main arm's
-    /// lower-bound assertion is sound and an equality assertion on the
-    /// control arm would be a flake waiting to happen. For the same
-    /// reason, read the printed census as "at least this much happened".
+    /// process-global, so nothing structurally stops another test's folds
+    /// landing in this test's window. In practice the only increment site
+    /// is `RecompositeTileCosts::mark_cpu_fallback`, reached only from
+    /// `recomposite_visible_tiles`, which needs an `aurora_gpu`
+    /// `TileResidency` and therefore a `GpuContext` — and `real_gpu_context`
+    /// is the only way to get one here, so every increment happens under
+    /// `GPU_TEST_LOCK`, which this test holds for its whole body. That is
+    /// what makes the main arm's *equality* assertion sound (0.100.1; it
+    /// was a `>= frames` floor with 9× slack before, see below). The
+    /// control arm stays reported-only anyway: it asserts nothing that a
+    /// future CPU-only increment site could not silently invalidate, and a
+    /// zero is the wrong thing to build a flake on.
     ///
     /// **What is asserted**: that the document really does fail
     /// `document_qualifies_for_gpu_compositing` (AC: CPU fallback, not the
     /// GPU path), that the backdrop really is the root that folds first
     /// (`roots().last()`, since `composite_roots_into_tile` walks
-    /// `.rev()`), that the main arm's `later` fold count clears a floor of
-    /// one per frame, and the same generous CI-safety frame budget the two
-    /// older whole-frame tests use. Nothing asserts a *magnitude* on any
+    /// `.rev()`), that a pre-seeded backdrop tile really did come back
+    /// fully opaque at every texel, that the main arm's `later` fold count
+    /// is **exactly** its `first` count (0.100.1, Critic G-02 /
+    /// Red-team RT-100-03: every real-fold tile here folds exactly twice by
+    /// construction, so the honest assertion is an equality, and the
+    /// original `later >= TWO_ROOT_FRAMES` floor of 12 against a real,
+    /// every-run value of 108 let an 89 % coverage collapse pass silently),
+    /// and the same generous CI-safety frame budget the two older
+    /// whole-frame tests use. Nothing asserts a *magnitude* on any
     /// timing — this is a diagnostic, exactly as its two siblings are.
     ///
     /// **Measured, real hardware (`NVIDIA GeForce RTX 3090, Vulkan,
@@ -31037,14 +31116,36 @@ mod tests {
     /// **And the cross-version answer 0.99.0 could not give**: with
     /// `composite_layer_into`'s body swapped for its verbatim pre-0.98.0
     /// scalar text in a throwaway worktree, the same two-root arm measured
-    /// **44.58–47.25 ms** — non-overlapping with this tree's range, i.e.
-    /// 0.98.x's vectorization is worth ~4.7 ms of a ~45 ms frame *here*,
-    /// a real and separable whole-frame win. On the control arm, where
-    /// every fold is a first fold, the two trees' ranges overlap and
-    /// nothing is separable. PLAN.md's 0.100.0 entry has the full tables,
-    /// the derived-and-flagged per-fold figures, and every caveat
-    /// (one adapter, idle only, absolute numbers not comparable to
-    /// 0.99.0's rows).
+    /// a run-median **45.26 ms against this tree's 40.53 ms** — ~4.7 ms of
+    /// a ~45 ms frame, a real whole-frame win.
+    ///
+    /// **Two corrections to how that was first written up (0.100.1,
+    /// Red-team RT-100-02/04/05), because they change what a reader should
+    /// take from it:**
+    ///
+    /// - **The n=6 "ranges do not overlap" claim did not survive
+    ///   re-measurement.** Twelve consecutive reruns are bimodal, with
+    ///   2/12 vectorized runs above the originally-quoted vectorized
+    ///   maximum and within ~1 ms of the quoted scalar floor. Read the
+    ///   medians and the direction, which are stable; do not read clean
+    ///   separability. The control arm's original "no win, ranges overlap"
+    ///   verdict did not survive either — on reruns it shows a small but
+    ///   consistent win of its own (median 24.85 vs 25.83 ms).
+    /// - **The mechanism is not "the three divisions".** A vectorized ×
+    ///   scalar by opaque × transparent-backdrop cross puts the
+    ///   divide-arm's own share at ~0.25 ms vectorized vs ~2.55 ms scalar,
+    ///   and of the ~4.2 ms delta with the arm active, ~1.9 ms remains
+    ///   without it. So the win scales with **total folds and therefore
+    ///   total converted samples**, and the larger part of the
+    ///   arm-specific delta is the redundant per-sample `f16` <-> `f32`
+    ///   conversions the old scalar loop repeated — not division cost. A
+    ///   second fold's worth of conversions is most of what this fixture
+    ///   added.
+    ///
+    /// PLAN.md's 0.100.0 entry and its 0.100.1 correction have the full
+    /// tables, the derived-and-flagged per-fold figures, the A/B's own
+    /// substitution recipe, and every caveat (one adapter, idle only,
+    /// absolute numbers not comparable to 0.99.0's rows).
     #[test]
     #[allow(clippy::too_many_lines)]
     fn recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path() {
@@ -31053,8 +31154,13 @@ mod tests {
         // it exists so a real regression fails rather than to assert 60
         // FPS, which this path does not meet. See that test's own comment.
         const BUDGET_MS: f64 = 1500.0;
+        // 0.100.1: "fold_onto_opaque reached" used to sit in this label as
+        // a flat claim. It is now stated as what the census can actually
+        // establish -- a second fold onto a verified-opaque backdrop --
+        // per this test's own doc comment and Red-team RT-100-01.
         const MAIN_LABEL: &str = "recomposite_and_present_loop (CPU fallback, TWO overlapping \
-                                  roots, fold_onto_opaque reached, 300,000px ceiling, pan+paint)";
+                                  roots, 2nd fold onto a verified-opaque backdrop, 300,000px \
+                                  ceiling, pan+paint)";
         const CONTROL_LABEL: &str = "recomposite_and_present_loop (CPU fallback, control: same \
                                      fixture, backdrop hidden, single fold, 300,000px ceiling, \
                                      pan+paint)";
@@ -31081,8 +31187,39 @@ mod tests {
             fixture.layers.roots().first().copied(),
             Some(fixture.canvas),
             "and the active, Screen-blend canvas layer must be the one that folds second, onto \
-             the now-opaque accumulator: that fold is the fold_onto_opaque arm this fixture \
-             exists to reach"
+             the now-opaque accumulator: that second fold is what this fixture exists to reach"
+        );
+
+        // The precondition `fold_texel`'s dividing arm is selected on,
+        // *verified* rather than assumed (0.100.1, Red-team RT-100-01):
+        // read one pre-seeded backdrop tile back out of the store and
+        // check every texel's alpha, before a single frame is timed.
+        // Element 0 of `preseeded` is frame 0's own top-left visible tile,
+        // so it is certainly one of the tiles the loop below composites.
+        //
+        // This does NOT observe the branch -- that lives inside
+        // `aurora-render` -- it closes the smaller, real gap Red-team
+        // demonstrated: with the backdrop's alpha set to 0.0 the first cut
+        // of this test produced a byte-identical census and still passed,
+        // i.e. it never checked its own premise at all.
+        let Some(&probe_tile) = fixture.preseeded.first() else {
+            unreachable!("panned_tile_superset always yields at least frame 0's own grid");
+        };
+        let mut min_backdrop_alpha = f32::INFINITY;
+        for texel in read_all_texels(&mut fixture.store, fixture.backdrop_surface, probe_tile)
+            .chunks_exact(aurora_tile::CHANNELS)
+        {
+            let [_, _, _, a] = texel else { continue };
+            min_backdrop_alpha = min_backdrop_alpha.min(*a);
+        }
+        assert!(
+            min_backdrop_alpha >= 1.0,
+            "the pre-seeded backdrop tile {probe_tile:?} must read back FULLY opaque at every one \
+             of its texels, or the second fold lands on a transparent-in-places accumulator and \
+             fold_texel takes its cheap arm exactly where this fixture claims it does not: \
+             minimum alpha read back was {min_backdrop_alpha}. fold_texel's own predicate is \
+             backdrop_alpha > 0.0, so this check is deliberately stricter than the branch needs -- \
+             it is the whole-tile coverage claim being checked, not just non-emptiness"
         );
 
         let mut stages = measure_pan_and_paint_frames(
@@ -31097,8 +31234,12 @@ mod tests {
             TWO_ROOT_PAN_STEP,
         );
         // `report_frame_stages` returns the census it prints (0.100.0)
-        // precisely so this assertion can exist. `first_folds` is slot 1
-        // (`real_fold_tiles`) and `later = folds - first_folds`; see
+        // precisely so this assertion can exist. Slot 1 is
+        // `real_fold_tiles` -- the count of *tiles* that folded at least
+        // once, which is therefore also the count of folds onto a
+        // transparent accumulator, hence the local name `first_folds`
+        // (0.100.1, Critic G-07: same slot, two names, said once here) --
+        // and `later = folds - first_folds`; see
         // `RECOMPOSITE_FOLD_COUNTS`' own doc comment for why that
         // subtraction is exact rather than an estimate.
         let [folds, first_folds] = report_frame_stages(MAIN_LABEL, &mut stages);
@@ -31108,22 +31249,35 @@ mod tests {
         println!(
             "{MAIN_LABEL}: n={} mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms \
              (nominal budget 16.7ms) | fold census: folds={folds} first={first_folds} \
-             later={later_folds} -- `later` is the count that took \
-             composite_layer_into's dividing arm, and a run with later=0 measured the wrong \
-             thing however good its timings look",
+             later={later_folds} -- `later` counts folds onto an already-non-empty accumulator; \
+             that they take composite_layer_into's dividing arm follows from the verified-opaque \
+             backdrop above plus fold_texel's documented backdrop_alpha > 0.0 predicate, and is \
+             NOT observed here (no branch-taken counter exists inside aurora-render). A run with \
+             later=0 measured the wrong thing however good its timings look",
             timings.len()
         );
 
-        assert!(
-            later_folds >= u64::from(TWO_ROOT_FRAMES),
-            "this fixture exists to reach composite_layer_into's fold_onto_opaque arm, and the \
-             fold census says it barely did or did not: folds={folds} first={first_folds} \
-             later={later_folds}, floor {} (one per frame). Check, in this order: both layers' \
+        // Exact, not a floor (0.100.1, Critic G-02 / Red-team RT-100-03).
+        // Every tile this fixture composites has real content on BOTH
+        // roots, so a tile that folds at all folds exactly twice: one
+        // first fold, one later fold. `later == first` is therefore the
+        // fixture's own construction restated, not a tolerance -- and it
+        // is what the previous `later >= TWO_ROOT_FRAMES` floor of 12
+        // failed to say, with the real value 108 on every run. Red-team
+        // demonstrated that slack passing a fixture whose backdrop was
+        // pre-seeded on 8 tiles instead of all ~64, i.e. mostly measuring
+        // single folds while the assertion stayed green.
+        assert_eq!(
+            later_folds, first_folds,
+            "every tile this fixture composites has content on BOTH roots, so it must fold \
+             exactly twice: one fold onto the transparent accumulator and one onto the opaque \
+             one. The census says otherwise (folds={folds} first={first_folds} \
+             later={later_folds}), which means some tiles folded once -- the fixture is measuring \
+             single folds where it claims double ones. Check, in this order: both layers' \
              bounds/origins still identical (resolve_tile's cheap arm is gated on \
-             origin == reference_origin); the backdrop still the LAST root; the pre-seeded tile \
-             superset still covering what visible_tiles actually walks; the store budget still \
-             above the fixture's working set",
-            u64::from(TWO_ROOT_FRAMES)
+             origin == reference_origin); the backdrop still the LAST root and still visible; the \
+             pre-seeded tile superset still covering what visible_tiles actually walks; the store \
+             budget still above the fixture's working set"
         );
         assert!(
             p99 < BUDGET_MS,
@@ -31163,7 +31317,8 @@ mod tests {
              first={control_first} later={control_later} -- later is 0 by construction here \
              (one visible root, and composite_roots_into_tile always seeds a transparent \
              accumulator); reported, NOT asserted, because RECOMPOSITE_FOLD_COUNTS is \
-             process-global and a concurrent CPU-only test can add to it",
+             process-global and asserting a zero on it would be the one shape a future \
+             lock-free increment site could silently turn into a flake",
             control_timings.len()
         );
         assert!(

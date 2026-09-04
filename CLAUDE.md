@@ -230,8 +230,14 @@ mean roughly doubles, to ~15–18 ms, i.e. at or over the 16.7 ms budget; and
 0.96.0/0.96.1's parallel tile-upload serializer pushed it to ~34–37 ms, which
 is why 0.96.2 routed the frame path back to the sequential serializer. Quote
 the contended figure alongside the idle one or the claim is misleading.
-PLAN.md's **0.96.2** entry is the current real-hardware record (its 0.96.1
-entry has the full contended tables), and its 0.94.1 entry explains why a "p99"
+PLAN.md's **0.96.2** entry is still the current real-hardware record **for the
+two standing gate fixtures** (its 0.96.1 entry has the full contended tables).
+0.99.0 and 0.100.0/0.100.1 re-measured on the same hardware since and did *not*
+displace it, deliberately: 0.99.0 re-ran those same two fixtures and found no
+detectable change (overlapping ranges), and 0.100.0 measured a **different,
+new** fixture (two overlapping roots, a 256-tile store, ~40 ms/frame) whose
+absolute numbers are not comparable to the gate rows at all — read its 0.100.1
+correction before quoting any of it. Its 0.94.1 entry explains why a "p99"
 from these
 n=40 benchmarks is a single-sample order statistic that must not be quoted as
 a ratio; read those, not this row, for where the numbers stand. The gate is
