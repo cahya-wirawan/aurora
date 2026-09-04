@@ -7336,6 +7336,40 @@ enum GpuBlendDispatch {
     Dissolve,
 }
 
+#[cfg(test)]
+impl GpuBlendDispatch {
+    /// Every variant, once, adjacent to the enum it enumerates (0.104.1).
+    ///
+    /// `GpuBlendDispatches::counter`'s `match` is exhaustive, so a variant
+    /// added without an arm is a compile error there. Nothing makes a
+    /// variant missing from the *test* a compile error, and
+    /// `every_gpu_blend_dispatch_mode_gets_its_own_counter` is the only
+    /// assertion in either crate that can see a counter mis-wire at all —
+    /// 0.104.0's mutation (g) killed on that one test and nothing else,
+    /// out of 394. Before this constant existed the test kept its own
+    /// hand-written copy of the variant list, so the enum and its only
+    /// real coverage could drift apart in two independent places.
+    ///
+    /// This does not close the gap — `ALL` is still hand-maintained, and
+    /// no stable API counts an enum's variants — but it collapses the two
+    /// driftable lists into one, sitting directly under the definition a
+    /// new variant is added to. The fixed `[Self; 6]` length is part of
+    /// that signal: a seventh variant cannot be appended here without the
+    /// author also editing the count, and the test asserts the same `6`
+    /// as a literal so the expectation is stated in both places.
+    ///
+    /// `cfg(test)` because `Dissolve` is: see the enum's own comment for
+    /// why that one variant is test-only.
+    const ALL: [Self; 6] = [
+        Self::Multiply,
+        Self::Darken,
+        Self::Lighten,
+        Self::Screen,
+        Self::Difference,
+        Self::Dissolve,
+    ];
+}
+
 /// Test-only counts of the times [`begin_gpu_composite_tile`] has
 /// actually dispatched a real GPU blend pass for each non-`Normal` blend
 /// mode the GPU path admits.
@@ -28659,18 +28693,20 @@ mod tests {
     /// static the dispatch arms increment.
     #[test]
     fn every_gpu_blend_dispatch_mode_gets_its_own_counter() {
-        // Every variant, listed by hand. The `match` in `counter` is what
-        // makes a *missing* variant a compile error; this list is what
-        // makes a variant missing from the test itself visible, so keep
-        // the two in step when a mode is added.
-        let modes = [
-            GpuBlendDispatch::Multiply,
-            GpuBlendDispatch::Darken,
-            GpuBlendDispatch::Lighten,
-            GpuBlendDispatch::Screen,
-            GpuBlendDispatch::Difference,
-            GpuBlendDispatch::Dissolve,
-        ];
+        // Every variant, from `GpuBlendDispatch::ALL` rather than a second
+        // hand-written copy of the same list (0.104.1): the `match` in
+        // `counter` is what makes a *missing* variant a compile error, and
+        // `ALL` is what a new mode's author has to touch anyway, sitting
+        // directly under the enum definition they just edited.
+        let modes = GpuBlendDispatch::ALL;
+        assert_eq!(
+            modes.len(),
+            6,
+            "GpuBlendDispatch::ALL no longer has the six variants this test was written against \
+             -- if a mode was added, that is expected: bump this literal. If a mode was added to \
+             the enum but *not* to ALL, this assertion cannot see it, and the new variant is \
+             silently uncovered by the only test in this crate that can catch a counter mis-wire."
+        );
         let dispatches = GpuBlendDispatches::new();
 
         for &mode in &modes {
@@ -29298,18 +29334,33 @@ mod tests {
     /// fractions, so it is asserted absolutely and not merely
     /// differentially.
     ///
-    /// **The `Screen` sibling's top layer could not be reused unchanged.**
-    /// Its `(0.25, 0.25, 0.75)` source against this backdrop
-    /// `(0.125, 0.375, 0.25)` would put `Cb < Cs` in *every* channel, so a
-    /// shader that dropped the `abs()` entirely (`Cb - Cs`, all three
-    /// channels negative) and one that used `Subtract`'s
-    /// `max(Cb - Cs, 0)` (all three channels zero) would each be
-    /// distinguishable — but only uniformly, and the mode's whole point is
-    /// the sign change. This top layer's `(0.5, 0.125, 0.75)` instead
-    /// straddles it: `Cb < Cs` in red and blue, `Cb > Cs` in green. So the
-    /// golden's green channel is the one an `abs()`-less shader still gets
-    /// right, and red and blue are the ones it gets wrong — a genuinely
-    /// mixed-sign fixture rather than a uniformly-signed one.
+    /// **The `Screen` sibling's top layer could not be reused unchanged —
+    /// on *magnitude* grounds, not sign grounds.** (0.104.1 corrected this
+    /// paragraph; the original claimed a sign pattern that is false when
+    /// actually computed. No golden or assertion changed.) The `Screen`
+    /// source `(0.25, 0.25, 0.75)` against this backdrop
+    /// `(0.125, 0.375, 0.25)` gives `Cb < Cs` in red (`0.125 < 0.25`),
+    /// `Cb > Cs` in green (`0.375 > 0.25`) and `Cb < Cs` in blue
+    /// (`0.25 < 0.75`) — the *same* `(<, >, <)` pattern this layer's
+    /// `(0.5, 0.125, 0.75)` gives, so the inherited source is exactly as
+    /// mixed-sign as the chosen one and neither is better on that axis.
+    ///
+    /// What actually ruled it out is the fourth consideration
+    /// `aurora-render`'s `Difference` section header spells out: this
+    /// mode's blend term *is* the magnitude `|Cb - Cs|`, so two channels
+    /// sharing a magnitude blend to the same value from different
+    /// operands, and a swizzle between those two is invisible in `B`. The
+    /// `Screen` source's magnitudes against this backdrop are
+    /// `(0.125, 0.125, 0.5)` — red and green repeat. This one's are
+    /// `(0.375, 0.25, 0.5)`, three distinct values, which is the whole
+    /// advantage.
+    ///
+    /// The wrong-arm consequences are the same for either source, and hold
+    /// for the one actually used: green is the single channel with
+    /// `Cb > Cs`, so it is the channel an `abs()`-less `Cb - Cs`
+    /// (`(-0.375, +0.25, -0.5)`) and `Subtract`'s `max(Cb - Cs, 0)`
+    /// (`(0.0, 0.25, 0.0)`) both still get right, and red and blue are the
+    /// two each of them gets wrong.
     ///
     /// **Four** independent guards, the same four the `Screen` sibling
     /// carries:

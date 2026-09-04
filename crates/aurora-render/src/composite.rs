@@ -7676,9 +7676,32 @@ mod tests {
     //      two wrong shaders are observable at all. Several have channels
     //      on *both* sides of the sign change, which is stronger.
     //   3. `Difference(0, Cs) = Cs` -- indistinguishable from `Normal` --
-    //      and `Difference(1, Cs) = 1 - Cs`. So every operand in every
-    //      fixture is strictly inside `(0, 1)` in every channel, as the
-    //      `Screen` suite's already were for its own two degeneracies.
+    //      and `Difference(1, Cs) = 1 - Cs`. So every operand in the four
+    //      *solid-colour* fixtures below is strictly inside `(0, 1)` in
+    //      every channel, as the `Screen` suite's already were for its own
+    //      two degeneracies, and so is every operand in the opaque half of
+    //      the half-transparent fixture. **Two disclosed exceptions, both
+    //      in fixtures that are not solid colours** (0.104.1 added the
+    //      first of them; the header previously stated the "strictly
+    //      inside" rule as absolute, which it is not):
+    //
+    //      - the spatial test's `patterned_texels` emits exactly `0.0` in
+    //        red wherever `(x + seed) % 4 == 0` and in green wherever
+    //        `(y + seed) % 4 == 0`, so roughly a quarter of that tile's
+    //        columns and a quarter of its rows sit on
+    //        `Difference(0, Cs) = Cs` in one channel. (Its blue is `0.0`
+    //        throughout the top-left quadrant too, though blue there is
+    //        already the degeneracy-1 exception below.) The test still
+    //        discriminates the formula on the three-in-four columns and
+    //        rows where the operand is nonzero, and it compares the whole
+    //        tile rather than one texel -- it is a confirmed mutation kill
+    //        for the formula mutations either way (PLAN.md's 0.104.0
+    //        table, rows b/c/e/f).
+    //      - the half-transparent test's zero-alpha half is `(0, 0, 0, 0)`
+    //        by construction. That one is the *point* of the test -- it
+    //        exercises the `ab > 0.0` guard's untaken branch -- and its
+    //        opaque half is what carries the formula discrimination; its
+    //        own doc comment says so.
     //
     // A fourth consideration, weaker than a degeneracy but worth stating
     // because it is what actually ruled out inheriting the `Screen` suite's
@@ -7711,12 +7734,21 @@ mod tests {
     /// `0.5 * Cb + 0.5 * B` per channel, giving
     /// `(0.4375, 0.625, 0.3125)` at alpha `1.0`.
     ///
-    /// **The fixture straddles the sign change**: `Cb < Cs` in red,
-    /// `Cb > Cs` in green *and* blue. That is what makes the two closest
-    /// wrong shaders observable — an `abs()`-less `Cb - Cs` and
-    /// `Subtract`'s `max(Cb - Cs, 0)` both agree with `Difference` in green
-    /// and blue and differ only in red, which they would not do at all if
-    /// every channel had `Cb > Cs`.
+    /// **The fixture straddles the sign change**: `Cb < Cs` in red *and*
+    /// blue (`0.25 < 0.875` and `0.5 < 0.625`), `Cb > Cs` in green alone
+    /// (`0.75 > 0.25`). That is what makes the two closest wrong shaders
+    /// observable — an `abs()`-less `Cb - Cs` and `Subtract`'s
+    /// `max(Cb - Cs, 0)` agree with `Difference` only in green, the one
+    /// channel where `Cb >= Cs`, and differ in red *and* blue; neither
+    /// would differ anywhere if every channel had `Cb > Cs`.
+    ///
+    /// (0.104.1 corrected this paragraph, which previously put blue on the
+    /// wrong side of the sign change and so claimed one failing channel
+    /// where there are two. The fixture is more discriminating than the
+    /// old wording said, not less: the wrong-arm values listed below were
+    /// and are correct, and both `Subtract`'s `(0.125, 0.625, 0.25)` and
+    /// the dropped `abs()`'s `(-0.1875, 0.625, 0.1875)` differ from the
+    /// golden `(0.4375, 0.625, 0.3125)` in exactly red and blue.)
     ///
     /// **Every plausible wrong answer is a different value here**, which
     /// is why the colours are per-channel distinct, none of them is `0.0`
@@ -7842,8 +7874,9 @@ mod tests {
     /// The backdrop is `(0.25, 0.75, 0.5)` at half opacity and the source
     /// `(0.875, 0.25, 0.625)` — per-channel distinct on both sides, no
     /// channel at `0.0` or `1.0`, no channel with `Cb == Cs`, and `Cb < Cs`
-    /// in red against `Cb > Cs` in green and blue, so none of
-    /// `Difference`'s three degeneracies is in play.
+    /// in red *and* blue against `Cb > Cs` in green alone (0.104.1: this
+    /// last clause previously misnamed blue), so none of `Difference`'s
+    /// three degeneracies is in play.
     ///
     /// A missing un-premultiply fails loudly in **all three** channels
     /// here, not just one: the raw premultiplied accumulator is
@@ -7970,8 +8003,11 @@ mod tests {
     /// against [`composite_tile_cpu`]'s own output via [`read_rgba8`] and
     /// its CPU twin [`rgba8_of`].
     ///
-    /// **Two disclosures specific to this mode, neither of them a claim
-    /// that all three channels discriminate here.**
+    /// **Three disclosures specific to this mode, none of them a claim
+    /// that all three channels discriminate at every texel.** (The third
+    /// was added in 0.104.1; the suite header had stated its
+    /// "every operand strictly inside `(0, 1)`" rule as absolute, and this
+    /// test is the fixture that does not obey it.)
     ///
     /// 1. **[`patterned_texels`]' blue channel is seed-independent** — it
     ///    is a pure function of the texel's quadrant
@@ -7995,6 +8031,19 @@ mod tests {
     ///    both sides occur — which is exactly what a dropped `abs()` or a
     ///    `Subtract`-shaped `max(…, 0)` fails on, in three of every four
     ///    columns and rows.
+    /// 3. **A zero operand does occur here, in red and green** — the
+    ///    suite header's third degeneracy, `Difference(0, Cs) = Cs`.
+    ///    `quarters` returns exactly `0.0` at `n % 4 == 0`, so the
+    ///    accumulator's red is `0.0` in one column of every four
+    ///    (`x % 4 == 0` at seed `0`) and its green is `0.0` in one row of
+    ///    every four. In those texels that channel's blend term is
+    ///    indistinguishable from `Normal`'s. This is the same three-of-four
+    ///    fraction disclosure 2 already turns on, from the other side: the
+    ///    columns and rows that discriminate the sign change are the ones
+    ///    with a nonzero operand, and the whole-tile comparison covers all
+    ///    of them at once. It is why this test is a real kill for the
+    ///    formula mutations (PLAN.md's 0.104.0 table, rows b/c/e/f) despite
+    ///    the degeneracy, not in spite of an undisclosed one.
     ///
     /// Tolerance is `1` out of 255, the same reasoning
     /// `composite_over_matches_the_golden_image` documents.
@@ -8363,15 +8412,23 @@ mod tests {
     ///   and `Screen` `(0.78125, 0.8125, 0.9375)` — every one of them
     ///   differing in all three channels.
     ///
-    /// **The source was chosen, not inherited.** The `Screen` sibling's
-    /// `(0.25, 0.5, 0.75)` against this fixture's opaque `(0.75, 0.25,
-    /// 0.5)` has `Cb > Cs` in red *and* blue and `Cb < Cs` only in green,
-    /// and its differences `(0.5, 0.25, 0.25)` repeat a magnitude. This
-    /// source gives distinct magnitudes `(0.625, 0.5, 0.375)` and still
-    /// straddles the sign change (`Cb > Cs` in red, `Cb < Cs` in green and
-    /// blue), so a dropped `abs()` — `(0.625, -0.5, -0.375)` — and
-    /// `Subtract`'s `max(…, 0)` — `(0.625, 0.0, 0.0)` — each fail in two
-    /// channels of the opaque half.
+    /// **The source was chosen, not inherited — on magnitude grounds, not
+    /// sign grounds.** (0.104.1 corrected the sign clause here, which was
+    /// wrong on computation; the magnitude argument, which is the load-
+    /// bearing one, was and is right.) The `Screen` sibling's
+    /// `(0.25, 0.5, 0.75)` against this fixture's opaque
+    /// `(0.75, 0.25, 0.5)` has `Cb > Cs` in red (`0.75 > 0.25`) and
+    /// `Cb < Cs` in green *and* blue (`0.25 < 0.5`, `0.5 < 0.75`) — the
+    /// same `(>, <, <)` pattern this source's `(0.125, 0.75, 0.875)`
+    /// gives, so neither source is better than the other on sign grounds.
+    /// What separates them is that the inherited source's differences
+    /// `(0.5, 0.25, 0.25)` repeat a magnitude, and this mode's blend term
+    /// *is* that magnitude, so a green/blue swizzle inside the blend line
+    /// would survive it. This source's `(0.625, 0.5, 0.375)` are three
+    /// distinct values. It straddles the sign change either way
+    /// (`Cb > Cs` in red, `Cb < Cs` in green and blue), so a dropped
+    /// `abs()` — `(0.625, -0.5, -0.375)` — and `Subtract`'s `max(…, 0)` —
+    /// `(0.625, 0.0, 0.0)` — each fail in two channels of the opaque half.
     ///
     /// A `NaN` in the left half is still caught by the whole-tile
     /// comparison as well as by the explicit finiteness check on texel 0:

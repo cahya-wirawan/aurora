@@ -18558,8 +18558,20 @@ severity choice.
      every fixture has at least one channel with `Cb < Cs`, and most
      straddle the sign change.
   3. `Difference(0, Cs) = Cs` (indistinguishable from `Normal`) and
-     `Difference(1, Cs) = 1 - Cs` — so every operand is strictly inside
-     `(0, 1)`.
+     `Difference(1, Cs) = 1 - Cs` — so every operand in the four
+     *solid-colour* fixtures, and in the opaque half of the
+     half-transparent one, is strictly inside `(0, 1)`. **Two disclosed
+     exceptions**, both outside those fixtures: the spatial test's
+     `patterned_texels` emits exactly `0.0` in red where
+     `(x + seed) % 4 == 0` and in green where `(y + seed) % 4 == 0`, so a
+     quarter of its columns and a quarter of its rows sit on that
+     degeneracy in one channel (it still discriminates on the other three
+     in four, over the whole tile, and is a real kill for mutations b, c,
+     e and f); and the half-transparent test's zero-alpha half is
+     `(0, 0, 0, 0)` by construction, which is the point of that test
+     rather than a weakness. **0.104.1 added the first of these** — this
+     bullet and the suite header both previously stated the rule as
+     absolute, which it is not.
 
   **Mutation testing: seven mutations planned, seven killed.** Each was
   applied for real, both crates' full `--lib` suites re-run under
@@ -23578,6 +23590,81 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.104.1) — 0.104.0's review follow-ups: four
+doc-comment corrections of one repeated reasoning error, one incomplete
+disclosure completed, and one hand-maintained list collapsed into the enum
+it describes.** Independent Critic and Red-team review of 0.104.0 found
+**no functional or correctness defect** — every shader formula, wrapper,
+dispatch-counter arm, predicate change, golden value and mutation-test
+claim was independently re-derived and held. What both found, separately,
+was the same *writing* mistake repeated in four places, plus two
+maintainability gaps. No composited pixel, no shader, no blend formula, no
+`BlendPass` const and no numeric golden changed; test counts are unchanged
+at 394 (`aurora-app`) and 156 (`aurora-render`).
+
+- **Four doc comments claimed a per-channel `Cb`/`Cs` sign pattern that is
+  false when computed.** In each case a paragraph justifying "why this
+  fixture rather than the `Screen` sibling's" named the wrong channel as
+  the one on the far side of the sign change. Corrected in
+  `crates/aurora-app/src/lib.rs`'s `Difference` integration test (the
+  `Screen` source `(0.25, 0.25, 0.75)` against backdrop
+  `(0.125, 0.375, 0.25)` is `(<, >, <)`, not `<` in every channel) and in
+  three places in `crates/aurora-render/src/composite.rs` — the
+  per-channel golden test and the translucent-accumulator test (fixture
+  `Cb = (0.25, 0.75, 0.5)`, `Cs = (0.875, 0.25, 0.625)` is `Cb < Cs` in
+  red **and blue**, `Cb > Cs` in green alone), and the
+  transparent-backdrop test (the `Screen` source `(0.25, 0.5, 0.75)`
+  against `(0.75, 0.25, 0.5)` is `(>, <, <)`, not `>` in red and blue).
+- **The dependent "which wrong arm fails where" claims were wrong in the
+  same direction, and the correction makes the fixtures *more*
+  discriminating than the old prose said, not less.** For the per-channel
+  golden test, an `abs()`-less `Cb - Cs` and `Subtract`'s
+  `max(Cb - Cs, 0)` agree with `Difference` only in green and differ in
+  red **and** blue — two failing channels, where the comment claimed one.
+  The already-listed wrong-arm values in that same comment
+  (`(-0.1875, 0.625, 0.1875)` and `(0.125, 0.625, 0.25)` against the
+  golden `(0.4375, 0.625, 0.3125)`) were correct all along and are what
+  the correction was checked against.
+- **The real reason the `Screen` suite's fixtures could not be inherited
+  is *magnitude*, not sign** — which the `aurora-render` section header
+  already stated correctly as its "fourth consideration", and which the
+  two rejected-source paragraphs had restated wrongly. `Difference`'s
+  blend term *is* `|Cb - Cs|`, so two channels sharing a magnitude blend
+  to the same value and a swizzle between them is invisible. Both
+  inherited candidates repeat a magnitude; both chosen sources give three
+  distinct ones. Both rejected candidates were, in fact, exactly as
+  mixed-sign as the sources that replaced them.
+- **The suite header's "every operand strictly inside `(0, 1)`" rule was
+  stated as absolute with one exception, and had two.** See the corrected
+  degeneracy-3 bullet in the 0.104.0 M1.10 entry above: `patterned_texels`
+  emits exactly `0.0` in red and green at a quarter of the spatial test's
+  columns and rows, hitting `Difference(0, Cs) = Cs` there. Not a
+  correctness bug — that test compares the whole tile and still
+  discriminates on the other three in four, and it is a confirmed kill for
+  mutations b, c, e and f — but an incomplete disclosure in a list that
+  claims to enumerate its own exceptions. Now a third named disclosure on
+  that test, and mirrored here.
+- **`GpuBlendDispatch::ALL` replaces the distinctness test's own copy of
+  the variant list.** `counter()`'s exhaustive `match` makes a *missing*
+  arm a compile error, but nothing made a variant missing from
+  `every_gpu_blend_dispatch_mode_gets_its_own_counter`'s hand-written
+  array an error — and that test is the only assertion in either crate
+  that can see a counter mis-wire at all (0.104.0's mutation (g) killed on
+  it and on nothing else, out of 394). Two independently driftable lists
+  are now one `const ALL: [Self; 6]` sitting directly under the enum a new
+  variant gets added to. **This does not close the gap** — `ALL` is still
+  hand-maintained and no stable API counts an enum's variants — so the
+  test also asserts `ALL.len() == 6` against a spelled-out literal, as a
+  clear if not compiler-enforced signal to a future round. Re-verified by
+  re-running 0.104.0's mutation (g) (`counter()`'s `Difference` arm →
+  `&self.screen`) against the rewired test: still killed, with the same
+  message, then reverted and the file `touch`ed.
+- **Full local gate re-run green at 0.104.1**, including
+  `AURORA_REQUIRE_GPU=1 cargo test --workspace` on this box's **NVIDIA
+  GeForce RTX 3090 (Vulkan, DiscreteGpu)** — nothing self-skipped. Metal
+  and DX12 remain unverified for the `Difference` entry point, exactly as
+  0.104.0 disclosed.
 
 **Addendum 2026-09-04 (0.104.0) — `BlendMode::Difference` is on the GPU
 path; the fifth WGSL blend-math entry point, and the first mode added
