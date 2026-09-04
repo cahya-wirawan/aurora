@@ -20819,6 +20819,44 @@ severity choice.
   criterion benchmark lands, both pre-registered thresholds PASS, and the
   implementation is deliberately *not* in this commit.**
 
+  **Correction (0.97.1): T1 was read from a condition the round's own
+  corroborating evidence never exercises, and in the condition that
+  evidence *does* exercise, T1 FAILS. The "GO" verdict below is
+  withdrawn.** Read this box before anything else in this entry; the
+  original text is left standing underneath, corrected in place, so the
+  mistake stays visible rather than being edited away.
+
+  - `composite_roots_into_tile` (`crates/aurora-app/src/lib.rs`) seeds
+    every tile with `aurora_render::transparent_tile()` and folds roots
+    in. So a tile's **first** fold always takes
+    `composite_layer_into`'s `backdrop_alpha > 0.0` **false** arm — the
+    benchmark's `fold_onto_transparent` condition. A **single-root
+    document can never reach `fold_onto_opaque` at all**, and that is the
+    common, realistic shape, not an edge case.
+  - The T2 corroborating fixture,
+    `recomposite_and_present_loop_exercises_the_cpu_fallback_path`, has
+    **exactly one root** (one `Screen`-blend pixel layer). Every one of
+    its 31 counted folds is therefore a first fold. T1's `fold_onto_opaque`
+    numbers describe a condition that fixture never enters.
+  - **Re-measured independently at 0.97.1**, same box, same bench, same
+    profile — `cargo bench -p aurora-render --bench composite --
+    '^fold_onto_(transparent|opaque)/(Normal|Multiply)$'`:
+
+    | mode | `fold_onto_transparent` (single-root: the real condition) | `fold_onto_opaque` (needs a 2nd root) |
+    |---|---|---|
+    | **`Normal`** | [1.7837 **1.7983** 1.8161] ms — **FAIL, −10.1 %** | [2.0602 **2.0758** 2.0930] ms — pass, +3.8 % |
+    | **`Multiply`** | [1.7618 **1.7876** 1.8181] ms — **FAIL, −10.6 %** | [2.0311 **2.0485** 2.0692] ms — pass, +2.4 % |
+
+    Both re-run medians land within noise of 0.97.0's own (1.7947 /
+    1.7721 transparent, 2.0846 / 2.0572 opaque), so this is a reading
+    error, not a measurement error: the numbers were right and the wrong
+    column was used.
+  - **Corrected verdict, in one line: NO-GO for the common single-root
+    case; a conditional, second-choice GO for multi-root documents
+    only.** Full reasoning in "Verdict" below, and see "Alternatives
+    considered" — added at 0.97.1 — for the cheaper fix that should be
+    measured *before* any parallelization round starts.
+
   Round A (0.96.0–0.96.2 above) parallelized `TileResidency::sync`'s
   serialize loop, shipped a `panic = "abort"` crash path, shipped a ~2x
   contended whole-frame regression, and ended with the frame-critical
@@ -20859,14 +20897,28 @@ severity choice.
   `Dissolve`, is resolved to `Normal` in `aurora-app` before this crate
   sees it), each in two conditions, because `composite_layer_into`
   branches on `backdrop_alpha > 0.0` and folding onto a transparent
-  accumulator takes a short-circuit that skips the straightening division
-  entirely:
+  accumulator takes a short-circuit that skips the straightening
+  divisions entirely:
 
   - `fold_onto_transparent` — the real *first*-root fold, onto
-    `transparent_tile()`.
+    `transparent_tile()`. **Corrected 0.97.1: this is the only condition a
+    single-root document ever reaches, so it is the one a single-root
+    verdict must be read from.**
   - `fold_onto_opaque` — the real *second-root-onward* fold, which pays
-    the division and the full `blend_rgb` dispatch. **The thresholds are
-    read from this condition only.**
+    the divisions. 0.97.0 read the thresholds from this condition only;
+    **that was the error the correction box above records.**
+
+  **What actually differs between the two conditions (corrected 0.97.1):
+  the division arm alone — three divisions, one each for `r`, `g`, `b`**
+  (`crates/aurora-render/src/composite.rs`, the `straight_backdrop`
+  `if`/`else`). 0.97.0 said the opaque condition pays "the division and
+  the full `blend_rgb` dispatch"; both halves were wrong. `blend_rgb` is
+  called **unconditionally, outside that `if`**, so it is paid identically
+  on both arms and cannot be what separates them — and the count is three
+  divisions, not one. The measured gap is ~0.28 ms per 65,536-texel tile,
+  i.e. ~4.3 ns/texel for three `f32` divides plus three extra `f16`→`f32`
+  widenings, which is the right order for that arm and not for a whole
+  blend dispatch.
 
   Deterministic xorshift64 input (the generator shape
   `crates/aurora-tile/benches/tile_store.rs` already established), the
@@ -20884,7 +20936,12 @@ severity choice.
     **and** `Multiply` — the two modes that dominate real documents,
     including Aurora's own default startup document; deliberately *not*
     an exotic mode like `Color` or `HardMix` — in `fold_onto_opaque`, on
-    one 256×256 tile, must each be **≥ 2.0 ms**. Justification: 2.0 ms is
+    one 256×256 tile, must each be **≥ 2.0 ms**. **The choice of
+    `fold_onto_opaque` here is the round's mistake** (see the correction
+    box): the *bar* (2.0 ms) was legitimately pre-registered, but the
+    *condition* it was registered against is one the corroborating fixture
+    cannot reach, so the pre-registration bound the wrong cell.
+    Justification: 2.0 ms is
     ~8x Round A's measured-insufficient dispatch unit of ~0.25 ms/tile,
     which won idle and lost badly under contention. Anything below that is
     even less likely to survive contention than Round A's already-marginal
@@ -20894,22 +20951,36 @@ severity choice.
     stage mean. If the blend math is not where `recomposite`'s time goes,
     parallelizing it cannot help however expensive each call is.
 
-  **T1: PASS, but thinly — 2.0846 ms and 2.0572 ms against a 2.0 ms bar.**
-  RTX 3090 / Vulkan / DiscreteGpu box, i3-10100 (4 physical / 8 logical),
-  idle, release bench profile. Criterion's `[lower median upper]` for the
-  two deciding cells:
+  **T1 as 0.97.0 read it: PASS, but thinly — 2.0846 ms and 2.0572 ms
+  against a 2.0 ms bar. Corrected at 0.97.1: that reading is FAIL for a
+  single-root document, which is the case that matters** — the pass below
+  belongs to the right-hand column, and only a document with a second root
+  layer ever gets there. RTX 3090 / Vulkan / DiscreteGpu box, i3-10100
+  (4 physical / 8 logical), idle, release bench profile. Criterion's
+  `[lower median upper]` for the two deciding cells:
 
   | mode | `fold_onto_transparent` | `fold_onto_opaque` |
   |---|---|---|
   | **`Normal`** | [1.7828 **1.7947** 1.8107] ms | [2.0608 **2.0846** 2.1124] ms |
   | **`Multiply`** | [1.7569 **1.7721** 1.7903] ms | [2.0372 **2.0572** 2.0807] ms |
 
-  Both confidence intervals sit entirely above 2.0 ms, so the pass is not
-  an artifact of reading the point estimate — but **the margin is 2–4 %**,
-  and that is the single most important caveat on this verdict. A slightly
-  slower machine, a build without F16C, or a future cheaper `blend_rgb`
-  would move `Multiply` under the bar. Do not re-quote "T1 passed" without
-  this sentence.
+  Both `fold_onto_opaque` confidence intervals sit entirely above 2.0 ms,
+  so *that* column's pass is not an artifact of reading the point estimate
+  — but **the margin is 2–4 %**, and 0.97.0 called that the single most
+  important caveat on the verdict. A slightly slower machine, a build
+  without F16C, or a future cheaper `blend_rgb` would move `Multiply`
+  under the bar.
+
+  **The thin margin was not the important caveat (0.97.1).** The
+  `fold_onto_transparent` column — left in the table above from the first
+  commit, and the column a single-root document actually pays — is
+  [1.7828 **1.7947** 1.8107] ms for `Normal` and
+  [1.7569 **1.7721** 1.7903] ms for `Multiply`, with *both* confidence
+  intervals sitting entirely **below** 2.0 ms. That is a **9–12 % FAIL**,
+  not a thin pass, and it was legible in this very table before the verdict
+  was written. The independent 0.97.1 re-run in the correction box
+  reproduces all four cells within noise. Do not re-quote "T1 passed"
+  without naming the condition it came from.
 
   Context from the other 24 modes (`fold_onto_opaque` medians, ms):
   `Subtract` 2.0349 and `Exclusion` 2.0446 are the cheapest; the
@@ -20919,8 +20990,12 @@ severity choice.
   expensive mode is ~1.8x the cheapest. So mode choice moves the cost by
   under 2x while the whole-tile scale (65,536 texels, ~31 ns/texel at
   `Normal`) sets it. The per-texel cost is dominated by twelve
-  `half::f16` ↔ `f32` conversions plus one division, not by the blend
-  formula.
+  `half::f16` ↔ `f32` conversions (eight `to_f32`, four `from_f32`), not
+  by the blend formula — plus, in the `fold_onto_opaque` condition only,
+  **three** divisions (`r`, `g`, `b`; 0.97.0 said "one", corrected
+  0.97.1). **This diagnosis is the most durable thing this round
+  produced, and it points at a different fix than the one the round went
+  looking for — see "Alternatives considered" below.**
 
   **T2: PASS, and by a wide margin — ~81 % against a 20 % bar.** Measured
   on the same box with `AURORA_REQUIRE_GPU=1 cargo test --release
@@ -20943,30 +21018,195 @@ severity choice.
     produced the stage numbers above, so the instrumented run's own
     printing cost never entered a quoted timing.
 
-  T1 × folds/frame = 2.0846 × 2.583 = **5.386 ms/frame** (`Normal`) and
-  2.0572 × 2.583 = **5.314 ms/frame** (`Multiply`), i.e. **81.9 %** and
-  **80.8 %** of the 6.58 ms `recomposite` mean. Both far over 20 %.
+    **Made reproducible at 0.97.1**, because a number no future reader can
+    re-derive is a number they have to take on trust: `RECOMPOSITE_FOLD_COUNTS`
+    (`crates/aurora-app/src/lib.rs`) is now a permanent `#[cfg(test)]`
+    two-slot counter fed by the same `folded` value `mark_cpu_fallback`
+    was already handed, zeroed by `zero_frame_counters` with the other
+    frame counters, and printed as a `fold census:` line next to the
+    `phase1 split` line. Its first real run reproduces **31 roots folded
+    over 31 real-fold tiles in 12 frames = 2.583 folds/frame** — the same
+    figure, now derivable from the tree.
+
+    **And it settles the question the bare fold count could not.** The
+    counter's second slot splits folds into first-folds (cheap
+    `backdrop_alpha == 0.0` arm, `fold_onto_transparent`) and later folds
+    (the dividing arm, `fold_onto_opaque`). Measured:
+    **first-fold = 31, later-fold = 0.** Not one fold in this fixture ever
+    reached the condition T1 was read from. That is the correction box's
+    claim, verified by instrumentation rather than by reading the code.
+
+  T1 × folds/frame, **as 0.97.0 computed it** (opaque column):
+  2.0846 × 2.583 = **5.385 ms/frame** (`Normal`) and 2.0572 × 2.583 =
+  **5.314 ms/frame** (`Multiply`), i.e. **81.8 %** and **80.8 %** of the
+  6.58 ms `recomposite` mean. (0.97.0 wrote 5.386 and 81.9 %; the product
+  is 5.3845, so the rounding was wrong in the last digit too.)
+
+  **T2 re-derived on the fixture-matched column (0.97.1).** Since every
+  one of the 31 folds is a first fold, the honest multiplier is the
+  `fold_onto_transparent` median, not the opaque one:
+  1.7947 × 2.583 = **4.635 ms/frame** (`Normal`) and 1.7721 × 2.583 =
+  **4.577 ms/frame** (`Multiply`), i.e. **70.4 %** and **69.6 %** of the
+  6.58 ms stage mean. Using the 0.97.1 re-run's own medians and its own
+  freshly measured stage mean (6.69 ms) instead gives 69.4 % and 69.0 %.
+  So **T2 is ~70 %, not the ~81 % originally reported** — and it still
+  clears its 20 % bar by more than 3x on its own. **T2's verdict does not
+  change: PASS, wide.** The blend loop really is where this fixture's
+  `recomposite` time goes; that half of the round stands.
 
   **An independent cross-check that the T2 arithmetic is not circular.**
   The instrumentation's own `cpu_fallback_real` slot — measured, not
-  derived — is 5.47 ms/frame, and the modelled blend-math cost above is
-  5.31–5.39 ms/frame from a completely separate benchmark process. Using
-  the mode this fixture actually runs (`Screen`) and the condition it
-  actually hits (one root folded onto a transparent accumulator:
-  1.7910 ms) gives 4.63 ms/frame, leaving ~0.84 ms/frame for
+  derived — is 5.47 ms/frame. Model it with the mode this fixture actually
+  runs (`Screen`) in the condition it actually hits (one root folded onto
+  a transparent accumulator: 1.7910 ms): 1.7910 × 2.583 =
+  **4.63 ms/frame**, leaving a **residual of ~0.84 ms/frame** for
   `un_premultiply_in_place` plus `write_composited`'s residency check and
-  whole-tile compare. Both readings agree that **the blend loop is
-  essentially all of the real-fold CPU compositing cost**, which is the
-  substantive claim T2 was asked to test.
+  whole-tile compare. That is the cross-check: an ~85 % match between two
+  independent processes, with the unexplained 15 % accounted for by two
+  named passes the model deliberately omits. The blend loop is **most of**
+  the real-fold CPU compositing cost.
 
-  **Verdict: GO on both limbs, with the T1 margin disclosed as thin.**
+  **Rewritten at 0.97.1, because the original paragraph was
+  unfalsifiable.** It ran the comparison *twice* with different models —
+  5.47 vs 5.386 (residual ~0.08 ms) and then, two sentences later, 5.47 vs
+  4.63 (residual ~0.84 ms) — and called both "agreement". Two residuals a
+  factor of ten apart cannot both corroborate the same claim; a paragraph
+  that accepts either outcome tests nothing. The 5.386 comparison is the
+  one that had to go: it multiplies by the `fold_onto_opaque` median, which
+  per the correction box this fixture never pays, so its tighter-looking
+  residual was an artifact of the same wrong-column error and not a better
+  fit. One comparison, one residual, one number to falsify — the ~0.84 ms
+  above. It also weakens the conclusion honestly, from 0.97.0's "the blend
+  loop is *essentially all* of the cost" to "most of it".
 
-  **What this commit deliberately does *not* contain.** No `rayon` in
-  `aurora-render`'s `[dependencies]` (it is a `[dev-dependencies]` entry
-  for the bench only), no block-size constant, no splitter, no thread
-  pool, no dispatch seam, no feature flag. Phase 2's implementation is a
+  **Verdict (0.97.0, WITHDRAWN): GO on both limbs, with the T1 margin
+  disclosed as thin.**
+
+  **Verdict (0.97.1, and this is the one that stands): T1 FAILS for the
+  common single-root case, T2 passes wide, so the round's own
+  pre-registered rule — "both limbs must hold; either one failing is a
+  NO-GO" — yields NO-GO as the round framed the question.** Stated with the
+  nuance the corrected numbers actually support, because "NO-GO" alone
+  would also throw away a real finding:
+
+  - **For a single-root document — the common, realistic case, and the
+    only shape this round's own corroborating fixture has — per-call cost
+    is ~1.79–1.80 ms, ~10 % under the 2.0 ms bar. NO-GO.** The bar was set
+    at ~8x Round A's measured-insufficient ~0.25 ms/tile dispatch unit
+    precisely so that a marginal case would be refused rather than
+    attempted. A parallelized `composite_layer_into` on this path would
+    walk into the exact failure Round A hit and had to revert: coarse work
+    too cheap to amortize synchronous dispatch, winning idle and losing
+    badly under contention. The 2–4 % margin 0.97.0 flagged as the
+    verdict's weakness turned out to be a red herring — the real problem
+    was ~10 % on the other side of the bar, in a different column.
+  - **For a multi-root / multi-layer document, T1 passes — by 2–4 %,
+    which is thin — on second-and-later folds only.** So the finding is
+    not "parallelization is worthless", it is "the cost is *conditional on
+    document shape*, and the condition is not the one anybody would guess
+    from the frame path". A future round that pursues this at all must
+    therefore design for that reality: **a per-call guard that takes the
+    parallel path only when a document genuinely has multiple root layers
+    being folded** (equivalently: only on a tile's second and later folds),
+    with the sequential path kept for every first fold. Parallelizing every
+    call unconditionally is now measured to be wrong for the majority of
+    calls, which is a stronger and more useful statement than 0.97.0's
+    unconditional GO.
+  - **And it should not be the first thing tried.** See "Alternatives
+    considered" immediately below: the round's own cost diagnosis points at
+    a cheaper, already-proven fix that this entry never compared against.
+
+  **What the correction cost, methodologically.** Pre-registration worked
+  exactly as intended on the *bar* and failed completely on the
+  *condition*: fixing "≥ 2.0 ms" in advance was real discipline, and it
+  bought nothing because the cell that number was compared against was
+  chosen by an unexamined assumption about which branch the real caller
+  takes. The lesson for the next pre-registered threshold is one line:
+  **name the fixture that will corroborate the threshold, and verify by
+  instrumentation that the fixture reaches the condition the threshold is
+  registered against, in the same commit that registers it.** 0.97.1's
+  `fold census:` line is that verification, built for real rather than
+  written down as advice.
+
+  **Alternatives considered (added 0.97.1 — 0.97.0 considered none, and
+  that is the second real defect in this entry).** The round asked "is this
+  loop worth parallelizing?" and never asked "is parallelizing the best way
+  to make this loop cheaper?", even though its own measurement answers the
+  second question better than the first.
+
+  - **Vectorization: batch `f16` ↔ `f32` conversion via
+    `half::slice::HalfFloatSliceExt`. Try this FIRST.** The round's own
+    conclusion is that the per-texel cost is dominated by twelve
+    `half::f16` ↔ `f32` conversions, **not** by the blend formula — and
+    that is the *same class of overhead 0.92.0 already removed elsewhere in
+    this workspace*, in `crates/aurora-gpu/src/residency.rs`, for a
+    measured **~2.4x** win on the `upload_sync` stage. Read that file's
+    "Vectorizing the conversion (0.92.0): the crate evaluation" doc comment
+    before starting: scalar `f16::from_f32` / `f32::from` already reach the
+    F16C instructions, so the cost is not the arithmetic, it is the
+    per-call `is_x86_feature_detected!("f16c")` check plus a
+    `#[target_feature]` call that cannot inline — paid *per sample*.
+    `convert_to_f32_slice` / `convert_from_f32_slice` reach the same
+    instructions eight lanes at a time behind **one** feature check for the
+    whole slice. `composite_layer_into` pays 12 such calls per texel across
+    65,536 texels, i.e. ~786,000 non-inlinable calls per tile — an even
+    larger version of the 458,752 that 0.92.0's 2.4x came from.
+  - **Why it should go first, not second.** It is strictly cheaper and
+    strictly safer on every axis this project has already measured:
+    **zero new dependencies** (`half` is already in `aurora-render`),
+    **zero contention risk** (no threads, so no idle-win/loaded-loss
+    reversal — the failure that killed Round A), **zero panic/abort risk**
+    (no pool `build()` to fail — the failure 0.96.1 had to fix), no block
+    divisibility invariant, no dispatch seam, no API change to thread a
+    flag down through `composite_roots_into_tile`/`resolve_tile`, and it
+    helps **every** call including the single-root first folds where T1
+    fails, rather than only the second-and-later folds where it passes. It
+    also composes with parallelization rather than competing with it.
+  - **Recommendation.** Whatever round picks up Phase 2 should measure
+    vectorization against this same benchmark first — it is re-runnable and
+    unchanged, so the comparison is direct. Pursue parallelization only if
+    vectorization leaves a real gap, and then only behind the multi-root
+    guard the verdict above describes.
+  - **What is *not* being claimed.** No number here. Vectorizing this loop
+    is harder than vectorizing `residency`'s serializer, because
+    `composite_layer_into` interleaves its conversions with per-texel
+    branching and a `blend_rgb` dispatch rather than doing one straight
+    widening pass, so it likely needs a restructure into
+    widen-batch → blend → narrow-batch, with a scratch buffer. 0.92.0's
+    2.4x is a precedent and an upper-bound intuition, **not a prediction**.
+    It is also the same one configuration (`x86_64` + F16C) — `half` falls
+    back to software conversion elsewhere, correct but not faster.
+
+  **What this commit deliberately does *not* contain.** No `rayon` **use in
+  `aurora-render`'s own code** — verified at 0.97.1 by
+  `grep -rn rayon crates/aurora-render/`, which returns exactly one hit, a
+  doc-comment mention in the new bench. No block-size constant, no
+  splitter, no thread pool, no dispatch seam, no feature flag.
+
+  **Corrected 0.97.1: 0.97.0 wrote "No `rayon` in `aurora-render`'s
+  `[dependencies]` (it is a `[dev-dependencies]` entry for the bench
+  only)", and that sentence is checkably false in two ways.**
+  `cargo tree -p aurora-render -e normal -i rayon` reports
+  `rayon v1.12.0 → aurora-gpu → aurora-render`: `rayon` has been a
+  **transitive normal (non-dev) dependency** of this crate since Round A
+  put it in `aurora-gpu` at 0.96.0, so it is already in the shipping
+  dependency graph and this commit could not have kept it out. And the
+  `[dev-dependencies]` entry this commit actually adds is **`criterion`**,
+  not `rayon` — `crates/aurora-render/Cargo.toml` has no `rayon` line at
+  all, in either table. The claim worth making is the one restated above:
+  no `rayon` *code* in this crate. What that buys is real (nothing in this
+  crate can dispatch to a thread pool, so the round genuinely ships no
+  parallel behaviour) but it is not dependency-graph purity, and it should
+  not have been described as if it were. Phase 2's implementation is a
   **separate, still-open round** and must not be read as done because the
-  gate opened. What that round owes, in order, and none of it is optional:
+  gate opened. **0.97.1: the gate did not open** — T1 fails for the common
+  case, so the list below is now conditional on a future round deciding to
+  pursue parallelization *at all*, which per "Alternatives considered" it
+  should not do until vectorization has been measured. Read it as "what
+  that round would owe if it happens", and add a step 0: **prove the
+  document shape reaches `fold_onto_opaque` before assuming the per-call
+  cost is there**, which the new `fold census:` line now makes a one-line
+  check. The rest, in order, and none of it optional:
 
   1. An owned, bounded `rayon` pool built with a `Result`-checked
      `.build()` and a fallback-to-sequential arm — Round A's abort path
@@ -20992,8 +21232,11 @@ severity choice.
      a maintenance liability, not a hedge.
 
   **What the measurement does and does not license.** It establishes that
-  the blend loop is (a) expensive per call and (b) where this fixture's
-  `recomposite` time actually goes. It establishes **nothing** about
+  the blend loop is (a) expensive per call — **corrected 0.97.1: expensive,
+  but ~10 % *below* this round's own pre-registered bar for the common
+  single-root shape, and above it only for second-and-later folds** — and
+  (b) where this fixture's `recomposite` time actually goes (~70 %, not the
+  ~81 % first reported). It establishes **nothing** about
   whether splitting it across threads is a net win: Round A's per-call
   cost also looked sufficient idle and still lost ~2x under contention,
   and this round's dispatch unit, while ~8x Round A's, is still a
@@ -21024,6 +21267,46 @@ severity choice.
   --all-targets --all-features -- -D warnings`, `cargo test --workspace`,
   `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc
   --workspace --no-deps --all-features`, `cargo deny check all`.
+
+  **0.97.1 (2026-09-04) — the correction commit for everything above.**
+  A review of 0.97.0 found, and independent re-measurement confirmed, that
+  its T1 pass was read from `fold_onto_opaque` while its own corroborating
+  T2 fixture is single-root and therefore only ever reaches
+  `fold_onto_transparent`, where T1 fails by 9–12 %. This patch corrects
+  the entry in place — correction box at the top, T1 and T2 sections, the
+  cross-check paragraph, the verdict, the follow-on list — rather than
+  rewriting it, and adds the "Alternatives considered" section naming
+  vectorization (`half::slice::HalfFloatSliceExt`, 0.92.0's approach) as
+  the cheaper fix to measure first. It also fixes three smaller factual
+  errors: the two conditions differ by three divisions, not by
+  `blend_rgb` dispatch presence; `rayon` *is* already a transitive normal
+  dependency of `aurora-render` via `aurora-gpu`, and the dev-dependency
+  added was `criterion`; and 2.0846 × 2.583 is 5.385, not 5.386.
+
+  **Code changed, not just prose**, in two places, both measurement-only —
+  **no `rayon` added anywhere, no parallel/splitter/pool code, no
+  production dependency, no new `unsafe`, no new lint exception, no
+  `unwrap`/`expect`/`panic`/`indexing_slicing`:**
+
+  - `crates/aurora-app/src/lib.rs`: `RECOMPOSITE_FOLD_COUNTS`, a permanent
+    `#[cfg(test)]` two-slot fold census fed by the `folded` value
+    `RecompositeTileCosts::mark_cpu_fallback` already receives, read by
+    `take_recomposite_fold_counts`, zeroed by `zero_frame_counters`, and
+    printed by `report_recomposite_fold_census` as a `fold census:` line.
+    This replaces the reverted `eprintln!` (making 2.583 folds/frame
+    re-derivable) **and** proves the correction: measured
+    `first-fold = 31, later-fold = 0` on the T2 fixture.
+  - `crates/aurora-render/benches/composite.rs`: doc comments only. The
+    measured code, the modes, the input generator and the two conditions
+    are untouched, so every number above and below remains comparable to
+    0.97.0's.
+
+  **0 new tests** (a census print is not a test; a criterion bench is not
+  either). `cargo test --workspace` counts **1,655 passing, 0 failing**,
+  unchanged from 0.97.0.
+
+  Gate re-run at this commit, all green: the same nine steps listed
+  directly above.
 
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
@@ -21177,30 +21460,50 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**Addendum 2026-09-04 (0.97.0) — the CPU blend-math loop is measured, both
-pre-registered thresholds passed, and the implementation is the open
-follow-on.** `crates/aurora-render/benches/composite.rs` now measures
-`composite_layer_into` for real. **T1** (per-call median ≥ 2.0 ms in the
-`fold_onto_opaque` condition): `Normal` 2.0846 ms, `Multiply` 2.0572 ms —
-**PASS, by 2–4 %, and that thin margin is the headline caveat, not a
-footnote**. **T2** (per-frame aggregate ≥ 20 % of the `recomposite` stage
-mean): 2.583 folds/frame × T1 = 5.31–5.39 ms against a 6.58 ms stage mean,
-**~81 % — PASS wide**, and independently corroborated by the fixture's own
-`cpu_fallback_real` slot at 5.47 ms/frame. **Verdict: GO** — but this
-commit contains *no* parallel code, no `rayon` production dependency and no
-dispatch seam, deliberately, so that "the bar was set before the number
-existed" is checkable from `git log`. **The next round owes, in this order:
-an owned bounded pool with a `Result`-checked fallback (Round A's abort
-path came from skipping exactly this), a block size that divides a tile
-evenly, and — before wiring anything — the contended re-measurement.** If
-the contended whole-frame mean regresses at all, the two frame-path call
-sites stay sequential exactly as 0.96.2 left `sync`, and the only honest
-remaining home is `composite_document` (the export path), which shares
-`composite_roots_into_tile` with the frame path and so needs a flag
-threaded down — a real API change. If that is not worth its cost, the
-round ships nothing and reports a modified NO-GO. See the 0.97.0 entry in
-M1.10 for the full tables and every caveat. **None of this advances the
-60 FPS gate.**
+**Addendum 2026-09-04 (0.97.1) — 0.97.0's GO verdict is WITHDRAWN: T1 was
+read from a condition the round's own corroborating fixture never
+reaches, and in the condition it does reach, T1 fails.**
+`composite_roots_into_tile` seeds every tile with `transparent_tile()`, so
+a tile's **first** fold always takes `composite_layer_into`'s
+`backdrop_alpha == 0.0` arm — the benchmark's `fold_onto_transparent`
+condition. A **single-root document therefore never reaches
+`fold_onto_opaque` at all**, and the T2 fixture
+(`recomposite_and_present_loop_exercises_the_cpu_fallback_path`) has
+exactly one root. Now verified by instrumentation, not just by reading the
+code: 0.97.1's new permanent `fold census:` line measures
+**first-fold = 31, later-fold = 0** over its 12 frames (and reproduces
+0.97.0's 2.583 folds/frame, which had come from a reverted `eprintln!`).
+
+**Corrected numbers**, re-measured independently at 0.97.1 on the same box
+and reproducing 0.97.0's own cells within noise. **T1**, single-root
+condition: `Normal` **1.7983 ms**, `Multiply` **1.7876 ms** — **FAIL, by
+10–11 %**, with both confidence intervals entirely below the 2.0 ms bar.
+T1 passes (by a thin 2–4 %) only in `fold_onto_opaque`, i.e. only on a
+multi-root document's second-and-later folds. **T2**, re-derived on the
+fixture-matched column: 2.583 × 1.79 = **~4.6 ms/frame against a 6.58 ms
+stage mean = ~70 %**, not the ~81 % first reported — **still PASS, wide**,
+so that limb stands and the blend loop really is where this fixture's
+`recomposite` time goes.
+
+**Corrected verdict: NO-GO for the common single-root case** (a
+parallelized `composite_layer_into` there would hit the exact
+"work too cheap to amortize synchronous dispatch" failure Round A had to
+revert off the frame path), **and a conditional, second-choice GO for
+multi-root documents only** — which means any future round must gate the
+parallel path on a document genuinely having multiple roots being folded,
+never parallelize every call.
+
+**And parallelization should not be tried first.** 0.97.0's most durable
+finding is that the per-texel cost is dominated by twelve `f16` ↔ `f32`
+conversions, not the blend formula — the same overhead **0.92.0 already
+removed in `crates/aurora-gpu/src/residency.rs` for a measured ~2.4x**,
+using `half::slice::HalfFloatSliceExt`'s batch conversion: zero new
+dependencies, zero contention risk, zero pool-`build()` panic risk, and it
+helps the single-root first folds where T1 fails. **Measure vectorization
+against this same benchmark before committing to `rayon` here.** See the
+0.97.0 entry's "Alternatives considered" and corrected verdict in M1.10
+for the full tables and every caveat. **None of this advances the 60 FPS
+gate.**
 
 **Addendum 2026-09-04 (0.96.2) — the `rayon` tile-upload experiment is
 settled: the panic fix stays, the parallel arm comes off the frame path.**

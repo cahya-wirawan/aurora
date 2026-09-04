@@ -7798,6 +7798,65 @@ static RECOMPOSITE_TILE_COST_NANOS: [std::sync::atomic::AtomicU64; 5] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Test-only fold census for the CPU-fallback compositing arm, in two
+/// slots (0.97.1):
+///
+/// - `[0]` **folds**: how many roots [`composite_roots_into_tile`] actually
+///   blended, summed over every tile that took the CPU fallback.
+/// - `[1]` **real-fold tiles**: how many tiles folded *at least one* root,
+///   i.e. how many `cpu_fallback_real` classifications happened.
+///
+/// **Why these two and not one.** 0.97.0's PLAN.md entry quoted
+/// "2.583 folds/frame" from a throwaway `eprintln!` that was reverted
+/// before committing, so the figure could not be re-derived from the tree
+/// — and worse, the bare fold count is not even the number the verdict
+/// needed. `composite_roots_into_tile` seeds its accumulator with
+/// [`aurora_render::transparent_tile`], so a tile's **first** fold always
+/// takes [`aurora_render::composite_layer_into`]'s
+/// `backdrop_alpha == 0.0` arm (the benchmark's `fold_onto_transparent`
+/// condition) and only its second and later folds take the dividing arm
+/// (`fold_onto_opaque`). The split is therefore exactly
+/// `first_folds = slot[1]` and `later_folds = slot[0] - slot[1]`, which is
+/// what says which benchmark column a document's cost should be read from.
+/// Both slots come from `folded`, the value
+/// [`RecompositeTileCosts::mark_cpu_fallback`] is already handed, so
+/// nothing new is computed on the frame path and no shipping build gains a
+/// counter at all.
+///
+/// Same process-global `Relaxed` soundness argument as
+/// [`RECOMPOSITE_TILE_COST_NANOS`] above, and the same consequence: a
+/// CPU-only caller that does not hold `GPU_TEST_LOCK` also accumulates
+/// here, which is why [`RecompositeTileCosts`]'s reader zeroes it before
+/// its own measurement loop.
+#[cfg(test)]
+static RECOMPOSITE_FOLD_COUNTS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Credits one CPU-fallback tile's `folded` count to
+/// [`RECOMPOSITE_FOLD_COUNTS`]. A zero-fold tile contributes to neither
+/// slot: it ran no blend math at all, so counting it as a "real-fold tile"
+/// would make `later_folds` come out negative-shaped.
+///
+/// Needs no `cfg(not(test))` twin, for exactly
+/// [`note_recomposite_mark_imbalance`]'s reason: its only caller is
+/// [`RecompositeTileCosts::mark_cpu_fallback`], whose shipping-build body
+/// is an empty no-op, so nothing outside `cfg(test)` names it.
+#[cfg(test)]
+fn note_recomposite_folds(folded: usize) {
+    if folded == 0 {
+        return;
+    }
+    let folded = u64::try_from(folded).unwrap_or(u64::MAX);
+    if let Some(total) = RECOMPOSITE_FOLD_COUNTS.first() {
+        total.fetch_add(folded, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(tiles) = RECOMPOSITE_FOLD_COUNTS.get(1) {
+        tiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Test-only per-branch stopwatch feeding [`RECOMPOSITE_TILE_COST_NANOS`].
 /// Built once at the top of [`recomposite_visible_tiles`], alongside
 /// [`RecompositePhases`]; the `mark_*` methods are called at each branch
@@ -7901,7 +7960,13 @@ impl RecompositeTileCosts {
     /// rather than read off a process-global counter (0.93.1) so a
     /// concurrent [`composite_document`] on another thread cannot
     /// reclassify an empty tile as real.
+    ///
+    /// The same `folded` also feeds [`RECOMPOSITE_FOLD_COUNTS`] (0.97.1),
+    /// which is what makes the folds-per-frame figure — and, more to the
+    /// point, its first-fold / later-fold split — re-derivable from the
+    /// tree instead of from a reverted `eprintln!`.
     fn mark_cpu_fallback(&mut self, folded: usize) {
+        note_recomposite_folds(folded);
         let slot = if folded == 0 {
             Self::CPU_EMPTY
         } else {
@@ -14111,36 +14176,37 @@ mod tests {
         DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess,
         GPU_COMPOSITE_SUBMITS, Key, KeyChord, LIGHTEN_GPU_DISPATCHES, MIN_WINDOW_HEIGHT,
         MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
-        PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_MARK_IMBALANCE,
-        RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS, RailResize, RecoveredDocument,
-        ShutdownState, UndoKind, UndoOrder, activate_command, active_layer_origin, after_undo_redo,
-        apply_canvas_min_zoom, apply_mask, apply_scroll_zoom, aur_verify_scratch_dir,
-        autosave_path, background_color_from_theme, begin_drag, begin_gpu_composite_tile,
-        brush_stroke_mut, canvas_area_logical_size, canvas_area_physical_rect,
-        canvas_area_physical_size, canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer,
-        clean_shutdown_cleanup, clear_session_marker, close_command_palette, close_dialog,
-        collect_widget_paints, commit_ending_drag, composite_document, composite_reference_origin,
-        composite_roots_into_tile, composite_surface_id, continue_drag,
-        crash_recovery_dialog_actions, crash_recovery_dialog_message,
-        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
-        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
-        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
-        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
-        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
-        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
-        load_document_view, load_scales, load_theme, logical_point, logical_size,
-        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
-        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
-        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
-        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
-        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
-        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
-        resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
-        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
-        tile_overlaps_doc_rect, tile_store_scratch_dir, tiles_are_bitwise_identical,
-        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
-        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
+        RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
+        RailResize, RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
+        active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
+        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
+        begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
+        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
+        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
+        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
+        composite_document, composite_reference_origin, composite_roots_into_tile,
+        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
+        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
+        demo_document, dissolve_gate, document_canvas_size, document_from_image,
+        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
+        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
+        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
+        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
+        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
+        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
+        move_refused_dialog_actions, move_refused_message, open_command_palette,
+        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
+        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
+        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
+        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
+        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
+        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
+        skipped_tiles_message, skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect,
+        tile_store_scratch_dir, tiles_are_bitwise_identical, toggle_command_palette,
+        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
+        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
+        zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -19227,6 +19293,24 @@ mod tests {
     /// bookkeeping check.
     fn take_recomposite_mark_imbalance() -> u64 {
         RECOMPOSITE_MARK_IMBALANCE.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reads [`RECOMPOSITE_FOLD_COUNTS`] and resets it to zero, same
+    /// read-and-zero shape as the counters above (0.97.1):
+    /// `[folds, real_fold_tiles]`.
+    ///
+    /// Diagnostic only, and nothing asserts a magnitude on it. See that
+    /// counter's own doc comment for why the *pair* rather than the fold
+    /// total is the load-bearing number: `real_fold_tiles` is exactly the
+    /// count of folds that took `composite_layer_into`'s cheap
+    /// `backdrop_alpha == 0.0` arm, and `folds - real_fold_tiles` is
+    /// exactly the count that took the dividing arm.
+    fn take_recomposite_fold_counts() -> [u64; 2] {
+        let mut out = [0_u64; 2];
+        for (slot, dest) in RECOMPOSITE_FOLD_COUNTS.iter().zip(out.iter_mut()) {
+            *dest = slot.swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        out
     }
 
     /// Reads [`COMPOSITE_WRITE_OUTCOMES`] and resets it to zero, in the
@@ -29363,14 +29447,16 @@ mod tests {
     /// Zeroes, in order: `GPU_COMPOSITE_SUBMITS`,
     /// [`RECOMPOSITE_PHASE_NANOS`], [`RECOMPOSITE_TILE_COST_NANOS`]
     /// (0.93.0's five-way phase-1 split), [`RECOMPOSITE_MARK_IMBALANCE`]
-    /// (0.93.1's real bookkeeping check on that split) and
-    /// [`COMPOSITE_WRITE_OUTCOMES`].
+    /// (0.93.1's real bookkeeping check on that split),
+    /// [`COMPOSITE_WRITE_OUTCOMES`] and [`RECOMPOSITE_FOLD_COUNTS`]
+    /// (0.97.1's fold census).
     fn zero_frame_counters() {
         let _ = take_gpu_composite_submit_count();
         let _ = take_recomposite_phase_ms();
         let _ = take_recomposite_tile_cost_ms();
         let _ = take_recomposite_mark_imbalance();
         let _ = take_composite_write_outcomes();
+        let _ = take_recomposite_fold_counts();
     }
 
     /// Per-frame, per-stage timings collected by
@@ -30002,6 +30088,45 @@ mod tests {
              arm was ever entered -- that is correct, not a missing measurement. \
              cpu_fallback_empty vs cpu_fallback_real is decided by the fold count \
              composite_roots_into_tile returns, never by inspecting the resulting texels"
+        );
+
+        report_recomposite_fold_census(label, frames);
+    }
+
+    /// The 0.97.1 fold census line, printed right after the `phase1 split`
+    /// line it interprets. Split into its own function only to keep
+    /// [`report_recomposite_tile_costs`] under `clippy::too_many_lines`.
+    ///
+    /// **What this line exists to make checkable.** 0.97.0's PLAN.md entry
+    /// quoted a folds-per-frame figure obtained from a throwaway
+    /// `eprintln!` that was reverted before committing, and then read its
+    /// per-call cost off the wrong benchmark column. Both halves of that
+    /// are re-derivable from this line: `folds/frame` replaces the reverted
+    /// print, and the `first`/`later` split says which column applies.
+    /// `first` folds take [`aurora_render::composite_layer_into`]'s cheap
+    /// `backdrop_alpha == 0.0` arm (benchmark condition
+    /// `fold_onto_transparent`), `later` folds take the arm that pays three
+    /// divisions (`fold_onto_opaque`). A single-root document has
+    /// `later=0` by construction, because
+    /// [`composite_roots_into_tile`] always starts from
+    /// [`aurora_render::transparent_tile`].
+    ///
+    /// Diagnostic only; nothing asserts on it.
+    fn report_recomposite_fold_census(label: &str, frames: usize) {
+        let [folds, real_fold_tiles] = take_recomposite_fold_counts();
+        let later = folds.saturating_sub(real_fold_tiles);
+        #[allow(clippy::cast_precision_loss)]
+        let per_frame = folds as f64 / frames as f64;
+        println!(
+            "{label}:   fold census: {folds} roots folded over {real_fold_tiles} real-fold \
+             tiles in {frames} frames = {per_frame:.3} folds/frame, of which \
+             first-fold(cheap/transparent-backdrop)={real_fold_tiles} and \
+             later-fold(pays 3 divisions/opaque-backdrop)={later} -- read the blend-math \
+             per-call cost off benches/composite.rs's fold_onto_transparent column for the \
+             first group and fold_onto_opaque for the second. later=0 is the correct, expected \
+             value for a single-root document and is not a missing measurement: \
+             composite_roots_into_tile always seeds its accumulator with transparent_tile, so \
+             every root's first fold takes the backdrop_alpha == 0.0 arm"
         );
     }
 
