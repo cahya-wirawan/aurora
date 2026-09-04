@@ -19430,13 +19430,17 @@ severity choice.
     survives: green is still the only channel where `Cb > Cs`, and both
     wrong formulas still agree with the golden in green **only**.
 
-  **No other test affected.** Each of the three fixtures is a local
+  ~~**No other test affected.** Each of the three fixtures is a local
   `let stack: [...; 3]` inside its own `#[test]` fn — no shared mutable
   state, no helper reads them — confirmed by inspecting every `let stack`
-  binding in the file. The workspace suite's pass/fail counts are
-  identical before and after: **1,688 passed, 0 failed, 10 ignored** both
-  times, with the three touched tests passing in both (on their old and
-  new goldens respectively).
+  binding in the file.~~ **Superseded in 0.105.3**: all six blend-math
+  fixtures (including these three) were hoisted into shared `const`
+  tables so the new transpose-coverage guard test could read the same
+  data the tests composite, closing exactly the "no helper reads them"
+  gap this sentence once relied on as a safety property. The workspace
+  suite's pass/fail counts are identical before and after: **1,688
+  passed, 0 failed, 10 ignored** both times, with the three touched
+  tests passing in both (on their old and new goldens respectively).
 
   **Hardware scoping, explicit.** Every measurement above was taken on one
   adapter: `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`, printed by
