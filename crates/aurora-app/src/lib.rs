@@ -7471,9 +7471,10 @@ impl GpuBlendDispatch {
 ///   predate the convention and had no counter at all until the three
 ///   per-mode statics were merged into this one indexed struct, at which
 ///   point retrofitting them cost a field and an arm each rather than a
-///   copied block each. `Multiply` matters most of the six: the app's
-///   own default startup document carries a `Multiply` layer, so it is
-///   the arm every user's first frame takes.
+///   copied block each. `Multiply` matters most of the five ("the five"
+///   was the 0.103.0 count; eight are counted as of 0.106.1, see below):
+///   the app's own default startup document carries a `Multiply` layer,
+///   so it is the arm every user's first frame takes.
 /// - `Difference` (0.104.0): instrumented in its own first round, and the
 ///   first mode to be added *after* the merge — which cost exactly what
 ///   the merge predicted, one variant, one field and one `counter` arm,
@@ -8458,9 +8459,12 @@ impl RecompositeTileCosts {
 /// opaque-white layer at 50% opacity gives `(0.5, 0.5, 0.5, 0.5)`, not
 /// the straight `(1.0, 1.0, 1.0, 0.5)`), which is
 /// `composite_over_with_opacity`'s own correct and unchanged contract.
-/// All four blend-math methods write premultiplied texels
-/// too, so a `Multiply`, `Darken`, `Lighten` or `Screen` layer in the
-/// stack does not change this.
+/// Every blend-math method writes premultiplied texels too (named as a
+/// family rather than enumerated, per the same reasoning at this
+/// function's own `all six … methods` fix, 0.106.1 — the list grows by
+/// one every time a mode is ported, and this was the duplicate of that
+/// same stale sentence it missed), so no blend-mode layer in the stack
+/// changes this.
 /// Converting that back to the straight alpha the tile store and
 /// everything downstream of it expect is
 /// [`finish_tile_readback`]'s job, on the CPU, on the `Vec<half::f16>`
