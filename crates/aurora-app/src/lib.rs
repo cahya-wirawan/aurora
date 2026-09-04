@@ -8221,17 +8221,15 @@ impl RecompositeTileCosts {
 /// detected here — resolving the map is [`finish_tile_readback`]'s job
 /// now, in phase 3, once this function has already returned.
 // `too_many_lines`: 143, against a 100 limit, measured at 0.95.0 (it was
-// 124 at 0.86.1). It
-// first crossed on the second ported blend mode (0.85.0, at 107) -- the
-// body is one loop whose `match` gains a fixed ~19-line arm per mode
-// (including its dispatch counter), so
-// it will keep drifting as more land, and `Lighten` (0.95.0) is the
-// third to prove that. The ~13 this comment predicted through 0.95.0
-// was the pre-counter arm; the `Lighten` arm measures 19 non-comment
-// lines, and every mode from here on is expected to carry a counter
-// from its first round, per this round's own precedent -- and 0.86.0's single-encoder
-// batching added the rest. Splitting the arms out would
-// mean handing each a `&mut` borrow of both accumulator `Option`s plus
+// 124 at 0.86.1, and first crossed the limit on the second ported blend
+// mode, 0.85.0, at 107). The body is one loop whose `match` gains a
+// fixed ~19-line arm per mode (including its dispatch counter -- the
+// ~13 this comment predicted through 0.94.x was the pre-counter arm;
+// `Lighten`'s own arm, added in 0.95.0, measures 19 non-comment lines,
+// and every mode from here on is expected to carry a counter from its
+// first round, per this round's own precedent), so it will keep
+// drifting as more modes land. Splitting the arms out would mean
+// handing each a `&mut` borrow of both accumulator `Option`s plus
 // `device`/`queue`/`tile_extent`, which is exactly the shape the swap
 // exists to keep local. The same allow `recomposite_visible_tiles` just
 // below and several sibling tests in this module already carry.
