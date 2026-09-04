@@ -5211,11 +5211,11 @@ fn perform_undo_redo(
     // path or the CPU fallback **for the whole document**, and several
     // undoable structural steps flip it: `SetBlendMode` on a root-level
     // pixel layer across the GPU-expressible boundary (`Normal`/
-    // `Multiply`/`Darken`/`Lighten`/`Dissolve` on one side, the other 22
-    // modes on the other), and
+    // `Multiply`/`Darken`/`Lighten`/`Screen`/`Dissolve` on one side, the
+    // other 21 modes on the other), and
     // `SetVisible`, `Reparent`, `RemoveById` or `Restore` of a
     // root-level layer that is itself disqualifying (a group, or a
-    // pixel layer at one of those other 22 modes). When it flips, every
+    // pixel layer at one of those other 21 modes). When it flips, every
     // visible tile's compositing *path*
     // changes while a per-layer `Rect` names only one layer's own
     // region -- a quantity no `Rect` can express.
@@ -7142,8 +7142,8 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// accumulator pair: a tile-sized `Rgba16Float` texture cleared to fully
 /// transparent black, plus its default view. Called at most twice per
 /// tile, and each call is separately lazy — the second member only
-/// exists once a `Multiply`, `Darken` or `Lighten` layer has actually
-/// reached that
+/// exists once a `Multiply`, `Darken`, `Lighten` or `Screen` layer has
+/// actually reached that
 /// tile. There is exactly **one** second member however many such layers
 /// (or however many distinct modes) the stack holds: the ping-pong needs
 /// a place to render that is not the backdrop, and one spare texture
@@ -7154,8 +7154,9 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
 /// pair; `COPY_SRC` because the final readback copies out of whichever
 /// one ended up holding the fold; and `TEXTURE_BINDING` because
 /// `composite_multiply_over_with_opacity`,
-/// `composite_darken_over_with_opacity` and
-/// `composite_lighten_over_with_opacity` *sample* their backdrop, and
+/// `composite_darken_over_with_opacity`,
+/// `composite_lighten_over_with_opacity` and
+/// `composite_screen_over_with_opacity` *sample* their backdrop, and
 /// which member is the backdrop is not known until the layer stack has
 /// been walked — so both must be bindable. No `COPY_DST`: nothing ever
 /// reaches these through `queue.write_texture`, only through render
@@ -8102,8 +8103,8 @@ impl RecompositeTileCosts {
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
 /// the whole document: every visible top-level layer is an
 /// [`aurora_doc::LayerKind::Pixel`] layer at `Normal`, `Multiply`,
-/// `Darken`, `Lighten` or `Dissolve`, no groups. Callers must check that
-/// first —
+/// `Darken`, `Lighten`, `Screen` or `Dissolve`, no groups. Callers must
+/// check that first —
 /// this function does not re-check it itself, beyond one defensive bail
 /// (below).
 ///
@@ -8145,12 +8146,13 @@ impl RecompositeTileCosts {
 /// - `Normal` blends in place onto `current`; nothing moves, and no
 ///   second texture is touched or even created.
 /// - Every *other* expressible mode — `Multiply` (0.84.0), `Darken`
-///   (0.85.0) and `Lighten` (0.95.0) — reads `current` as the backdrop
+///   (0.85.0), `Lighten` (0.95.0) and `Screen` (0.102.0) — reads
+///   `current` as the backdrop
 ///   and writes the finished
 ///   composite into `spare`, then the two swap places. This is one
 ///   mechanism, not one per mode: `spare` is a single shared texture
 ///   that whichever arm needs it takes a turn with, so a stack mixing
-///   all three ping-pongs between exactly the same two
+///   all four ping-pongs between exactly the same two
 ///   accumulators an all-`Multiply` stack would.
 ///
 /// **Each is created separately and lazily** (0.84.1). `current` is
@@ -8204,9 +8206,9 @@ impl RecompositeTileCosts {
 /// opaque-white layer at 50% opacity gives `(0.5, 0.5, 0.5, 0.5)`, not
 /// the straight `(1.0, 1.0, 1.0, 0.5)`), which is
 /// `composite_over_with_opacity`'s own correct and unchanged contract.
-/// Both blend-math methods write premultiplied texels
-/// too, so a `Multiply`, `Darken` or `Lighten` layer in the stack does
-/// not change this.
+/// All four blend-math methods write premultiplied texels
+/// too, so a `Multiply`, `Darken`, `Lighten` or `Screen` layer in the
+/// stack does not change this.
 /// Converting that back to the straight alpha the tile store and
 /// everything downstream of it expect is
 /// [`finish_tile_readback`]'s job, on the CPU, on the `Vec<half::f16>`
@@ -8471,8 +8473,8 @@ fn begin_gpu_composite_tile(
     // `current` always holds the fold so far and is created by the first
     // layer that resolves at all; `spare` is the second member the
     // ping-pong needs, and it is created only by the first blend-math
-    // layer -- `Multiply`, `Darken` or `Lighten` -- that actually
-    // reaches this tile. None of them can blend
+    // layer -- `Multiply`, `Darken`, `Lighten` or `Screen` -- that
+    // actually reaches this tile. None of them can blend
     // in place (each samples its backdrop, and sampling the render
     // target is undefined -- see those methods' own
     // aliasing rule), so they, and only they, need a second texture to
@@ -8594,10 +8596,10 @@ fn begin_gpu_composite_tile(
             // texture exists, and why it is created right here, on the
             // first blend-math layer that actually reaches this tile,
             // rather than alongside the first accumulator. `spare` is
-            // shared with the `Darken` and `Lighten` arms below rather
-            // than owned by
+            // shared with the `Darken`, `Lighten` and `Screen` arms
+            // below rather than owned by
             // this one: `accumulator_or_create` creates it once,
-            // whichever of the three blend-math arms gets there first. The written
+            // whichever of the four blend-math arms gets there first. The written
             // one is now the fold, so the two swap places: what was
             // `spare` becomes `current`, and the exhausted backdrop
             // becomes the next blend-math pass's render target.
@@ -8767,10 +8769,10 @@ fn begin_gpu_composite_tile(
     // fully transparent target leaves exactly the state
     // `aurora_render::composite_layer_into` leaves on the CPU side (a
     // lone opaque-white layer at 50% opacity gives (0.5, 0.5, 0.5, 0.5),
-    // not the straight (1.0, 1.0, 1.0, 0.5)), and both blend-math
+    // not the straight (1.0, 1.0, 1.0, 0.5)), and all four blend-math
     // methods write premultiplied texels
-    // too, so a `Multiply`, `Darken` or `Lighten` layer in the stack does
-    // not change this. That
+    // too, so a `Multiply`, `Darken`, `Lighten` or `Screen` layer in the
+    // stack does not change this. That
     // is left as it is: `finish_tile_readback` straightens the decoded
     // samples on the CPU, in the one shared
     // `aurora_render::un_premultiply_in_place` the CPU path also goes
@@ -8899,15 +8901,17 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
 /// [`document_qualifies_for_gpu_compositing`] confirms the whole document
 /// is GPU-tractable (every visible root-level layer an
 /// [`aurora_doc::LayerKind::Pixel`] layer at `Normal`, `Multiply`,
-/// `Darken`, `Lighten` or
+/// `Darken`, `Lighten`, `Screen` or
 /// `Dissolve`, no groups), each tile is
 /// composited via [`begin_gpu_composite_tile`]/[`finish_tile_readback`] —
 /// `aurora_render::TileCompositor::composite_over_with_opacity`'s real
 /// fixed-function blend unit for `Normal`, and
 /// `composite_multiply_over_with_opacity`'s (0.84.0),
-/// `composite_darken_over_with_opacity`'s (0.85.0) and
-/// `composite_lighten_over_with_opacity`'s (0.95.0) real WGSL blend math
-/// for `Multiply`, `Darken` and `Lighten`, not the CPU loop — closing the
+/// `composite_darken_over_with_opacity`'s (0.85.0),
+/// `composite_lighten_over_with_opacity`'s (0.95.0) and
+/// `composite_screen_over_with_opacity`'s (0.102.0) real WGSL blend math
+/// for `Multiply`, `Darken`, `Lighten` and `Screen`, not the CPU loop —
+/// closing the
 /// exact gap
 /// `spike/FINDINGS.md`'s own ~20ms "merging whole tiles" finding named as
 /// the reason `aurora_render::TileCompositor` exists at all. A tile whose
@@ -8918,11 +8922,11 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
 /// (`resolve_tile`/`composite_tile_cpu`) this function always used before
 /// — every blend mode, every group, un-premultiplied isolation, all of
 /// it, unchanged. **Explicitly still CPU-only, by design, not by gap**:
-/// the *other 23* blend modes and group isolation on the GPU (would need
-/// the remaining 23 blend formulas ported to WGSL — `Multiply`,
-/// `Darken` and `Lighten` are the three that are — plus a stochastic
-/// `Dissolve` path
-/// and per-group
+/// the *other 21* blend modes and group isolation on the GPU (would need
+/// the remaining 21 blend formulas ported to WGSL — `Multiply`,
+/// `Darken`, `Lighten` and `Screen` are the four that are, and
+/// `Dissolve` needs none, since [`resolve_tile`] gates it to `Normal`
+/// before any GPU dispatch sees it — plus per-group
 /// isolated GPU passes; separate, much bigger follow-on work), and
 /// export (`composite_document`, a one-shot operation, not
 /// latency-critical the way the live canvas is).
@@ -17011,8 +17015,8 @@ mod tests {
     /// predicate: it chooses the GPU fast path or the CPU fallback for
     /// every visible tile at once. Undoing a `SetBlendMode` on a
     /// root-level pixel layer across the GPU-expressible boundary
-    /// (`Normal`/`Multiply`/`Darken`/`Lighten`/`Dissolve` on one side,
-    /// the other 22 modes on the
+    /// (`Normal`/`Multiply`/`Darken`/`Lighten`/`Screen`/`Dissolve` on one
+    /// side, the other 21 modes on the
     /// other) flips it, so
     /// the whole document's compositing path changes while the step's own
     /// reported rect names one layer's region. This pins both halves:

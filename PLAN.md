@@ -17995,10 +17995,18 @@ severity choice.
   remain** without a GPU fast path. At the `aurora-render` shader level
   the denominator is 26 — that crate's own `BlendMode` excludes
   `Dissolve`, which `resolve_tile` reduces to `Normal` on the CPU before
-  any GPU dispatch sees it — and four have WGSL entry points, so **22 of
-  26 remain** without one. These count different things (admitted
-  documents vs. ported formulas), exactly as the 0.84.1 addendum
-  spelled out. Stale counts swept and re-derived in both crates plus
+  any GPU dispatch sees it — and four have *blend-math* WGSL entry
+  points, so **22 of 26 remain** without one. These count different
+  things (admitted documents vs. ported formulas), exactly as the 0.84.1
+  addendum spelled out. **The one mode between the two figures is
+  `Normal`, not `Dissolve`** — it is inside the 22 (it has no blend-math
+  shader) and outside the 21 (it composites on the GPU anyway, through
+  `composite_over_with_opacity`'s fixed-function `Blend::AlphaBlending`
+  unit), so "22" must be read as "no blend-math entry point" and never as
+  "CPU-only"; `Dissolve` is in neither set. That distinction was left
+  implicit here and stated imprecisely in `aurora-render`'s own doc
+  comments until the 0.102.1 addendum below. Stale counts swept and
+  re-derived in both crates plus
   `CLAUDE.md` and `README.md`, not find-and-replaced.
 
   **Tests: 9 new, 7 changed, 0 removed** (`aurora-render` 144 → 150,
@@ -18103,7 +18111,8 @@ severity choice.
   - **No public `mode: BlendMode`-dispatching method.** Still four named
     methods; the deferral recorded at 0.85.0 stands, since a `mode`
     parameter would have to answer what happens for the 22 modes with no
-    WGSL entry point behind them.
+    *blend-math* WGSL entry point behind them (`Normal` among them, which
+    needs none — the fixed-function unit expresses it).
   - **No other blend mode ported**, and **groups still route to the CPU
     path entirely**.
   - **No performance work.** Nothing here was measured *for*
@@ -18134,6 +18143,80 @@ severity choice.
   here was verified by a human looking at the running app; `Screen` is
   not in the default startup document, so unlike `Multiply` this does not
   change what every user's first frame does.
+
+  **Addendum 2026-09-04 (0.102.1) — the doc/count sweep this entry
+  claimed was not complete, and three disclosed observations that stay
+  open.** A doc/comment-only correction round; no shipping behaviour, no
+  logic, no test expectation changed. Independent review of 0.102.0 found
+  that the sentence above — "stale counts swept and re-derived in both
+  crates … not find-and-replaced" — was itself overstated, the same way
+  0.95.1 had to correct 0.85.0's version of it. What was actually stale:
+
+  - **`begin_gpu_composite_tile`'s own doc comment contradicted itself**,
+    listing the admitted set as five modes (`Normal`, `Multiply`,
+    `Darken`, `Lighten`, `Dissolve`) in its opening sentence and the
+    correct six (`Screen` included) twelve lines later. The `match` block
+    itself was right; only the prose was wrong.
+  - **Nine further `aurora-app` sites** still said "22"/"three"/"both"
+    where the code now means "21"/"four"/"all four": the undo/redo
+    compositing-path guard (both its set literal and its two "other 22
+    modes"), `create_composite_accumulator`'s lazy-`spare` paragraph and
+    its `TEXTURE_BINDING` rationale, the ping-pong "every *other*
+    expressible mode" bullet and its "all three ping-pongs",
+    the premultiplied-accumulator paragraph and its
+    implementation-comment twin, the `spare`-creation comment inside
+    `begin_gpu_composite_tile`'s own `Multiply` arm ("shared with the
+    `Darken` and `Lighten` arms below … whichever of the three
+    blend-math arms gets there first"), `recomposite_visible_tiles`'s
+    own GPU-path paragraph and its "*other 23* blend modes" (stale since
+    0.95.0, not just this round), and one test doc comment.
+  - **`aurora-render`'s "the remaining 22 modes stay CPU-only" was
+    imprecise, not just stale.** `Normal` is one of those 22 and is *not*
+    CPU-only — it composites on the GPU through the fixed-function unit
+    — so the figure now reads "have no dedicated blend-math WGSL entry
+    point", with the 22-vs-21 reconciliation spelled out (the mode
+    between them is `Normal`; `Dissolve` is in neither set). The same
+    doc comment previously attributed that difference to `Dissolve`,
+    which was wrong. `composite_darken_over_with_opacity`'s "still two
+    named methods" and `composite_multiply_over_with_opacity`'s "the
+    three ported modes are still three public entry points" were fixed
+    to four in the same pass.
+
+  Three observations from the same review are **disclosed and
+  deliberately not acted on here**, each named so the next round inherits
+  them rather than rediscovering them:
+
+  - **The three dispatch-counter blocks are near-duplicates**
+    (`DARKEN_GPU_DISPATCHES`, `LIGHTEN_GPU_DISPATCHES`,
+    `SCREEN_GPU_DISPATCHES`, each with its `note_*`/`take_*` pair and a
+    `#[cfg(not(test))]` no-op). That is a real future-maintainability
+    observation, not a bug: a fifth mode makes it four copies. Merging
+    them into one array or macro belongs with whichever round ports the
+    fifth mode — it is a code change, and doing it inside a doc-fix round
+    would be scope creep on top of a correction.
+  - **A pre-existing GPU/CPU divergence on non-finite samples, confirmed
+    by a real differential on this box's RTX 3090** (RT-2026-0904-01). An
+    infinite `f16` sample in a layer makes the GPU path clamp to
+    `f16::MAX` where `composite_tile_cpu` produces `NaN`. It lives in the
+    **fixed-function `Normal`/`Multiply` pass and predates this round** —
+    `fs_composite_screen` was separately shown byte-faithful to whatever
+    the accumulator already held, so `Screen`'s own arithmetic does not
+    introduce it. It is still this round's business to name, because
+    admitting `Screen` *widens the set of documents that take the GPU
+    path at all*, and so widens the set that can meet it. **Real,
+    disclosed, unfixed**: deciding which of the two answers is correct
+    (invariant §7.3.1b says nothing about infinities) and making both
+    paths agree is its own round, on both paths, not a doc correction.
+  - **`Multiply` and `Dissolve` still have no dispatch counter — and the
+    cost of that gap is now measured, not argued** (RT-2026-0904-02). The
+    same review deleted this round's `Screen` arm and re-ran
+    `aurora-app`: `SCREEN_GPU_DISPATCHES`'s assertion was the **only**
+    failure; **0 of the other ~390 tests noticed**, because every one of
+    them is a differential the CPU fallback satisfies identically. That
+    is concrete evidence for the named follow-on above rather than a new
+    finding, and it is why "instrument from the mode's first round" is
+    now the established precedent. Still not built here: it means
+    modifying two arms this round did not otherwise change.
 
 ### M1.10 — Phase 1 gate
 
@@ -22977,6 +23060,35 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.102.1) — 0.102.0's "stale counts swept and
+re-derived … not find-and-replaced" claim was overstated; the sweep is now
+actually done, and three observations are disclosed rather than fixed.**
+Doc/comment-only: no shipping behaviour, no logic, no test expectation
+changed. `begin_gpu_composite_tile`'s own doc comment had been
+self-contradictory since this round landed (five admitted modes in its
+opening sentence, the correct six twelve lines later), and nine further
+`aurora-app` sites plus three in `aurora-render` still read
+"22"/"three"/"both" where the code means "21"/"four"/"all four" — including
+two implementation comments inside the very `match` block 0.102.0 edited,
+and a `recomposite_visible_tiles` count ("*other 23* blend modes") stale
+since 0.95.0. `aurora-render`'s "the remaining 22 modes stay CPU-only" was
+**imprecise as well as stale**: `Normal` is one of those 22 and composites
+on the GPU through the fixed-function unit, so that figure now reads "no
+dedicated blend-math WGSL entry point", with the 22-vs-21 reconciliation
+(the mode between them is `Normal`; `Dissolve` is in neither set) spelled
+out where a reader meets both numbers. **Disclosed, not fixed, and inherited
+by whoever ports mode five**: the three near-duplicate dispatch-counter
+blocks (a fifth mode makes four copies — merge them there, not in a doc
+round); a **pre-existing, real GPU/CPU divergence on non-finite samples**,
+confirmed by a differential on this box's RTX 3090 — an infinite `f16`
+sample makes the GPU path clamp to `f16::MAX` where `composite_tile_cpu`
+gives `NaN`, in the fixed-function `Normal`/`Multiply` pass, *not* in
+`fs_composite_screen`, though admitting `Screen` widens the set of
+documents that can meet it; and the `Multiply`/`Dissolve` counter gap, whose
+cost is now **measured** — deleting the `Screen` arm was caught by
+`SCREEN_GPU_DISPATCHES` and by **0 of the other ~390 `aurora-app` tests**.
+See the 0.102.0 M1.10 entry's own 0.102.1 addendum for the full accounting.
 
 **Addendum 2026-09-04 (0.102.0) — `BlendMode::Screen` is on the GPU path;
 the blend-mode epic stands at 6 of 27 admitted (21 remain), 4 of 26 ported

@@ -1365,16 +1365,28 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// [`Self::composite_lighten_over_with_opacity`] (0.95.0) the third, and
 /// [`Self::composite_screen_over_with_opacity`] (0.102.0) the fourth,
 /// each built to exactly the same shape.
-/// The remaining 22 modes stay CPU-only (`composite_tile_cpu`) until
-/// their own formulas are ported — this crate's own `BlendMode` enum
+/// The remaining 22 modes have no dedicated blend-math WGSL entry point
+/// of their own, and wait on one — this crate's own `BlendMode` enum
 /// has 26 variants (it excludes `Dissolve`, which is a pre-composite
 /// gate, never a per-pixel formula this crate would need to port), so
 /// 22 is "26 minus the four, `Multiply`, `Darken`, `Lighten` and
 /// `Screen`, done so far."
-/// `aurora-app`'s own
-/// count of what its GPU predicate still rejects is 21, one lower,
-/// because `Dissolve` is *admitted* there (0.84.1) without ever needing
-/// a formula here — see PLAN.md's 0.84.1 addendum if the two numbers
+///
+/// **`Normal` is one of those 22 and is *not* CPU-only**, so read the
+/// figure as "no blend-math shader", never as "no GPU path":
+/// [`Self::composite_over_with_opacity`]'s fixed-function
+/// `Blend::AlphaBlending` unit already expresses `Normal` on the GPU,
+/// which is exactly why it needs no formula in
+/// `shaders/composite.wgsl`. The modes genuinely left to
+/// `composite_tile_cpu` are therefore the other **21**, and that is
+/// precisely `aurora-app`'s own count of what its GPU predicate
+/// rejects: 27 real `aurora_doc::BlendMode` variants minus the six it
+/// admits (`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen` and
+/// `Dissolve`). The two figures — 22 here, 21 there — count different
+/// things, and the one mode between them is `Normal`. `Dissolve` is in
+/// neither set: absent from this crate's enum altogether, and *admitted*
+/// at the app's predicate (0.84.1) without ever needing a formula here.
+/// See PLAN.md's 0.84.1 addendum if the two numbers
 /// look inconsistent side by side; they're counting different things,
 /// not disagreeing. See `aurora-app`'s own
 /// `begin_gpu_composite_tile`/`document_qualifies_for_gpu_compositing`
@@ -1868,7 +1880,7 @@ impl TileCompositor {
     /// name and nothing else: the body is
     /// `composite_blend_over_with_opacity` applied to
     /// `BLEND_PASS_MULTIPLY`. Read *that* method's doc comment for the
-    /// current reasoning on why the three ported modes are still three
+    /// current reasoning on why the four ported modes are still four
     /// public
     /// entry points rather than one taking a `mode` argument. (Until
     /// 0.85.1 this paragraph said "exactly one mode is ported, so there
@@ -1981,10 +1993,14 @@ impl TileCompositor {
     /// no changes at all to take a second mode. The merge landed in
     /// 0.85.1 as a pure extraction instead.
     ///
-    /// The *public* shape is still two named methods rather than one
+    /// The *public* shape is still four named methods rather than one
     /// `mode: BlendMode` parameter, and that part is a real deferral: a
     /// `mode` parameter would have to say what happens for the 22 modes
-    /// with no WGSL entry point behind them (panic — denied here; return
+    /// with no *blend-math* WGSL entry point behind them — `Normal`
+    /// among them, which needs none, since it composites through the
+    /// fixed-function unit
+    /// ([`Self::composite_over_with_opacity`]) rather than through a
+    /// shader formula (panic — denied here; return
     /// a `Result` no caller can act on; silently do `Normal`), and the
     /// answer belongs with whatever ports enough of them to make the
     /// question concrete. Two total functions per mode is the cost until
