@@ -6810,9 +6810,9 @@ fn composite_roots_into_tile(
 }
 
 /// Whether every visible root-level layer in `layers` is an
-/// [`aurora_doc::LayerKind::Pixel`] layer at one of the five
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the six
 /// `aurora_doc::BlendMode`s [`begin_gpu_composite_tile`] can express —
-/// no groups, no sixth mode. The five are:
+/// no groups, no seventh mode. The six are:
 ///
 /// - [`aurora_doc::BlendMode::Normal`] (and a layer with no explicit
 ///   `blend_mode` recorded, which *is* `Normal`), composited by
@@ -6846,6 +6846,18 @@ fn composite_roots_into_tile(
 ///   ([`LIGHTEN_GPU_DISPATCHES`]) from its own first round. Not to be
 ///   confused with `aurora_doc::BlendMode::LighterColor`, which picks one
 ///   whole `(R, G, B)` triple by luminosity and is still CPU-only.
+/// - [`aurora_doc::BlendMode::Screen`] (0.102.0), composited by
+///   `aurora_render::TileCompositor::composite_screen_over_with_opacity`,
+///   the fourth mode ported to WGSL and built to the same
+///   whole-composite-in-the-shader shape as the three entries above. Its
+///   blend line is the first that is real arithmetic on both operands
+///   rather than a single intrinsic — `Cb + Cs - Cb*Cs` per channel,
+///   written as that literal sum in `fs_composite_screen` so it stays
+///   line-for-line comparable against `aurora_render`'s own
+///   `blend_channel` arm. It too reaches [`begin_gpu_composite_tile`]'s
+///   blend dispatch as its own arm and shares the *same single* `spare`
+///   ping-pong accumulator, and it carries a dispatch counter
+///   ([`SCREEN_GPU_DISPATCHES`]) from its own first round.
 /// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
 ///   GPU-side support at all and never reaches
 ///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
@@ -6866,7 +6878,7 @@ fn composite_roots_into_tile(
 ///   hardware.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
-/// layer at any of the other 22 blend modes) routes the *whole document*
+/// layer at any of the other 21 blend modes) routes the *whole document*
 /// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
 /// already composites every one of those cases correctly — this only
 /// exists to find a faster path for the common cases, never to replace
@@ -6894,6 +6906,7 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                             | aurora_doc::BlendMode::Multiply
                             | aurora_doc::BlendMode::Darken
                             | aurora_doc::BlendMode::Lighten
+                            | aurora_doc::BlendMode::Screen
                             | aurora_doc::BlendMode::Dissolve
                     ) | None
                 )
@@ -7346,6 +7359,50 @@ fn note_lighten_gpu_dispatch() {
 /// [`note_darken_gpu_dispatch`] above.
 #[cfg(not(test))]
 fn note_lighten_gpu_dispatch() {}
+
+/// Test-only count of the times [`begin_gpu_composite_tile`]'s `Screen`
+/// arm has actually dispatched a real GPU blend pass — the same
+/// instrumentation [`DARKEN_GPU_DISPATCHES`] and
+/// [`LIGHTEN_GPU_DISPATCHES`] carry, present from this mode's **first**
+/// round (0.102.0), which is now the established precedent rather than
+/// the exception it was at 0.95.0.
+///
+/// The gap is identical and worth restating rather than cross-
+/// referencing: delete the `Screen` arm from the `match` and every
+/// `Screen` tile falls through the defensive `_` arm to the CPU path,
+/// which computes the same correct pixels — so every differential
+/// compares the CPU path against itself and still passes, and the
+/// predicate still holds because the predicate is a different function.
+/// That mutation was performed for real against this round's own diff and
+/// is recorded in PLAN.md's 0.102.0 entry: this counter was the only
+/// assertion that caught it.
+///
+/// Reads and writes are `Relaxed` and the counter is process-global,
+/// sound for exactly the reason [`DARKEN_GPU_DISPATCHES`] documents:
+/// every caller of [`begin_gpu_composite_tile`] needs a real
+/// `GpuContext`, and `real_gpu_context` hands one out only under
+/// `GPU_TEST_LOCK`, so no two GPU tests are ever inside this counter at
+/// once.
+///
+/// **Named follow-on, unchanged:** `Multiply` and `Dissolve` still have
+/// no such counter. Deliberately not built here — it would mean touching
+/// two arms this round did not otherwise change — and left as its own
+/// round.
+#[cfg(test)]
+static SCREEN_GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Increments [`SCREEN_GPU_DISPATCHES`]. Called from the `Screen` arm
+/// once per tile per `Screen` layer, immediately after the compositor
+/// call it is reporting.
+#[cfg(test)]
+fn note_screen_gpu_dispatch() {
+    SCREEN_GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The shipping build's version: nothing at all, exactly as with
+/// [`note_darken_gpu_dispatch`] above.
+#[cfg(not(test))]
+fn note_screen_gpu_dispatch() {}
 
 /// Test-only count of the `queue.submit` calls
 /// [`begin_gpu_composite_tile`] itself has issued — the whole point of
@@ -8057,13 +8114,13 @@ impl RecompositeTileCosts {
 /// `Pixel` branch already establishes, not reimplemented here. Since
 /// [`document_qualifies_for_gpu_compositing`] has already ruled out every
 /// group and every blend mode outside `{Normal, Multiply, Darken,
-/// Lighten, Dissolve}` for
+/// Lighten, Screen, Dissolve}` for
 /// this document — and `resolve_tile` itself turns a `Dissolve` layer
 /// into an already-gated buffer at `Normal` before returning —
 /// `resolve_tile`'s own returned `aurora_render::BlendMode` is one of
-/// `{Normal, Multiply, Darken, Lighten}` for every entry this collects,
-/// and the
-/// `match` below dispatches on it. A fifth mode reaching here would
+/// `{Normal, Multiply, Darken, Lighten, Screen}` for every entry this
+/// collects, and the
+/// `match` below dispatches on it. A sixth mode reaching here would
 /// mean the predicate
 /// and this function had drifted apart, so that arm logs and returns
 /// `None` (falling this tile back to the CPU path) rather than
@@ -8075,7 +8132,8 @@ impl RecompositeTileCosts {
 /// needs only one texture. A real blend-math pass
 /// (`composite_multiply_over_with_opacity`,
 /// `composite_darken_over_with_opacity`,
-/// `composite_lighten_over_with_opacity`)
+/// `composite_lighten_over_with_opacity`,
+/// `composite_screen_over_with_opacity`)
 /// cannot — it *samples* the backdrop to compute `B(Cb, Cs)`, and
 /// sampling the texture a pass renders into is undefined, so its `dst`
 /// must be a different view from its `backdrop` (those methods' own
@@ -8287,7 +8345,8 @@ impl RecompositeTileCosts {
 /// accumulators' own comment in the body, and PLAN.md's M1.10
 /// "Empty-tile GPU composite work". Also `None` for the one defensive
 /// case above — a resolved blend mode outside `{Normal, Multiply,
-/// Darken, Lighten}` — logged, falling this one tile back to the CPU
+/// Darken, Lighten, Screen}` — logged, falling this one tile back to the
+/// CPU
 /// path, and
 /// not reachable through the real caller while the predicate and this
 /// function agree (it *is* reachable by calling this function directly,
@@ -8297,15 +8356,14 @@ impl RecompositeTileCosts {
 /// real GPU-side failure (a lost device, a bad map) can no longer be
 /// detected here — resolving the map is [`finish_tile_readback`]'s job
 /// now, in phase 3, once this function has already returned.
-// `too_many_lines`: 143, against a 100 limit, measured at 0.95.0 (it was
-// 124 at 0.86.1, and first crossed the limit on the second ported blend
-// mode, 0.85.0, at 107). The body is one loop whose `match` gains a
-// fixed ~19-line arm per mode (including its dispatch counter -- the
-// ~13 this comment predicted through 0.94.x was the pre-counter arm;
-// `Lighten`'s own arm, added in 0.95.0, measures 19 non-comment lines,
-// and every mode from here on is expected to carry a counter from its
-// first round, per this round's own precedent), so it will keep
-// drifting as more modes land. Splitting the arms out would mean
+// `too_many_lines`: 162, against a 100 limit, re-measured at 0.102.0 by
+// temporarily removing this allow (it was 143 at 0.95.0 and 124 at
+// 0.86.1, and first crossed the limit on the second ported blend mode,
+// 0.85.0, at 107). The body is one loop whose `match` gains a fixed
+// 19-line arm per mode, including its dispatch counter -- `Screen`'s own
+// arm, added in 0.102.0, cost exactly the 19 the 0.95.0 figure predicted
+// (143 + 19 = 162), which is now a measured regularity rather than an
+// estimate. It will keep drifting by that much as more modes land. Splitting the arms out would mean
 // handing each a `&mut` borrow of both accumulator `Option`s plus
 // `device`/`queue`/`tile_extent`, which is exactly the shape the swap
 // exists to keep local. The same allow `recomposite_visible_tiles` just
@@ -8620,9 +8678,37 @@ fn begin_gpu_composite_tile(
                 note_lighten_gpu_dispatch();
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
+            // The fourth ported mode (0.102.0), through the *same*
+            // mechanism as the three arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `Cb + Cs - Cb*Cs` per channel, the first ported formula
+            // that is arithmetic on both operands rather than one
+            // intrinsic. Instrumented from its first round -- see
+            // `SCREEN_GPU_DISPATCHES`.
+            aurora_render::BlendMode::Screen => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_screen_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_screen_gpu_dispatch();
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
             // Unreachable through the real caller: `document_qualifies_
             // for_gpu_compositing` admits only `Normal`, `Multiply`,
-            // `Darken`, `Lighten` and
+            // `Darken`, `Lighten`, `Screen` and
             // `Dissolve` (which `resolve_tile` has already reduced to
             // `Normal` by the time it gets here), and
             // `recomposite_visible_tiles` checks it before calling this.
@@ -14190,10 +14276,10 @@ mod tests {
         MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds,
         PointerButton, RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_FOLD_COUNTS,
         RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
-        RailResize, RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
-        active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
-        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
-        begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
+        RailResize, RecoveredDocument, SCREEN_GPU_DISPATCHES, ShutdownState, UndoKind, UndoOrder,
+        activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask,
+        apply_scroll_zoom, aur_verify_scratch_dir, autosave_path, background_color_from_theme,
+        begin_drag, begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
         canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
         clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
         close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
@@ -14233,6 +14319,70 @@ mod tests {
     use aurora_widgets::widgets::{insert_button, new_tree};
     use aurora_widgets::{FocusManager, WidgetId};
     use std::path::PathBuf;
+
+    /// The blend mode every fixture uses when what it needs is "a mode
+    /// `document_qualifies_for_gpu_compositing` still rejects" — not
+    /// `Screen` specifically.
+    ///
+    /// **Why this const exists at all** (0.102.0). Six fixtures below used
+    /// `aurora_doc::BlendMode::Screen` purely as a stand-in for "not
+    /// GPU-expressible", each written when `Screen` happened to be on the
+    /// rejected side of the predicate. Porting `Screen` to the GPU path
+    /// broke all six loudly (their own `assert!(!document_qualifies_for_
+    /// gpu_compositing(...))` setup asserts fired), and two of them are
+    /// PLAN.md-tracked *performance benchmarks* whose whole subject is the
+    /// CPU fallback path — those would have gone on "passing" while
+    /// silently measuring the GPU path instead, which is the worse
+    /// failure. Naming the intent once means the next ported mode moves
+    /// this one line rather than re-auditing every fixture.
+    ///
+    /// **Why `Exclusion` specifically.** It is separable and branch-free
+    /// (`cb + cs - 2*cb*cs`, arithmetically the nearest neighbour of
+    /// `Screen`'s own `cb + cs - cb*cs`), so a fixture retargeted onto it
+    /// exercises the same *kind* of CPU formula it exercised before; and
+    /// it has both a real `aurora_render::blend_channel` arm and a real
+    /// `translate_blend_mode` mapping, so it is a *genuinely rejected*
+    /// mode rather than an unimplemented one that would degrade to
+    /// `Normal` at the translation boundary and quietly change what the
+    /// fixture composites.
+    ///
+    /// `a_single_layer_at_the_cpu_only_blend_mode_does_not_qualify_for_gpu_compositing`
+    /// is what keeps the choice honest: if a later round ports
+    /// `Exclusion` too, that test fails and this const has to move, rather
+    /// than every fixture that leans on it silently changing meaning.
+    const CPU_ONLY_BLEND_MODE: aurora_doc::BlendMode = aurora_doc::BlendMode::Exclusion;
+
+    /// The guard behind [`CPU_ONLY_BLEND_MODE`]: the one property every
+    /// fixture using that const actually depends on, asserted in exactly
+    /// one place instead of implied in six.
+    ///
+    /// Headless — `document_qualifies_for_gpu_compositing` is a pure
+    /// predicate over an `aurora_doc::LayerTree` and needs no GPU adapter.
+    #[test]
+    fn a_single_layer_at_the_cpu_only_blend_mode_does_not_qualify_for_gpu_compositing() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 256,
+        };
+        let id = match layers.add_pixel_layer("cpu-only", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(id, CPU_ONLY_BLEND_MODE) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            !document_qualifies_for_gpu_compositing(&layers),
+            "CPU_ONLY_BLEND_MODE ({CPU_ONLY_BLEND_MODE:?}) must still be rejected by \
+             document_qualifies_for_gpu_compositing -- every fixture that uses it as a \
+             stand-in for \"not GPU-expressible\" is silently measuring the wrong path \
+             otherwise. If this mode has just been ported to the GPU, move the const to \
+             another still-CPU-only mode rather than deleting this assertion."
+        );
+    }
 
     /// Only `*.tile` files, never a bare directory-entry count: since
     /// 0.67.0 a scratch directory also holds
@@ -16916,20 +17066,22 @@ mod tests {
             "setup: two Normal-blend root pixel layers must qualify for the GPU path"
         );
 
-        // `Screen`, not `Multiply`: 0.84.0 moved `Multiply` onto the
-        // *admitted* side of the predicate, so setting it here would no
-        // longer flip the path and this test would prove nothing. The
-        // `assert!(!before, ...)` below is what catches that if the
-        // boundary moves again.
-        if let Err(err) = history.set_blend_mode(&mut layers, other, aurora_doc::BlendMode::Screen)
-        {
+        // [`CPU_ONLY_BLEND_MODE`], not `Multiply`: 0.84.0 moved `Multiply`
+        // onto the *admitted* side of the predicate, so setting it here
+        // would no longer flip the path and this test would prove
+        // nothing. It read `Screen` literally until 0.102.0 ported that
+        // mode too, which is exactly the drift the const now names in one
+        // place. The `assert!(!before, ...)` below is what catches it if
+        // the boundary moves again.
+        if let Err(err) = history.set_blend_mode(&mut layers, other, CPU_ONLY_BLEND_MODE) {
             unreachable!("{err:?}");
         }
         undo_order.record(UndoKind::Structural, &mut history, &mut pixel_history);
         let before = document_qualifies_for_gpu_compositing(&layers);
         assert!(
             !before,
-            "setup: a root-level Screen layer must route the whole document to the CPU path"
+            "setup: a root-level {CPU_ONLY_BLEND_MODE:?} layer must route the whole document \
+             to the CPU path"
         );
 
         let invalidation = perform_undo_redo(
@@ -19225,6 +19377,13 @@ mod tests {
     /// `Relaxed`-under-`GPU_TEST_LOCK` reasoning.
     fn take_lighten_gpu_dispatch_count() -> u64 {
         LIGHTEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`take_darken_gpu_dispatch_count`]'s sibling for
+    /// [`SCREEN_GPU_DISPATCHES`], same read-and-zero shape, same
+    /// `Relaxed`-under-`GPU_TEST_LOCK` reasoning (0.102.0).
+    fn take_screen_gpu_dispatch_count() -> u64 {
+        SCREEN_GPU_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Reads [`GPU_COMPOSITE_SUBMITS`] and resets it to zero in one
@@ -26969,15 +27128,17 @@ mod tests {
         );
     }
 
-    /// `Screen` stands in for "one of the 22 modes the GPU path still
-    /// cannot express" (27 `aurora_doc::BlendMode` variants minus the
-    /// five admitted as of 0.95.0: `Normal`, `Multiply`, `Darken`,
-    /// `Lighten` and
+    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 21 modes the GPU
+    /// path still cannot express" (27 `aurora_doc::BlendMode` variants
+    /// minus the six admitted as of 0.102.0: `Normal`, `Multiply`,
+    /// `Darken`, `Lighten`, `Screen` and
     /// `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
     /// mapping and a real CPU formula, so it is a genuine blend mode
     /// being rejected, not an unimplemented one. This used to use
-    /// `Multiply`, which 0.84.0 moved to the *admitted* side; the
-    /// sibling test below pins that direction.
+    /// `Multiply`, which 0.84.0 moved to the *admitted* side, and then
+    /// `Screen`, which 0.102.0 moved there too; the sibling tests below
+    /// pin that direction. Going through the const rather than naming a
+    /// mode literally is what makes the next such move one edit.
     #[test]
     fn document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_blend_mode() {
         let mut layers = aurora_doc::LayerTree::new();
@@ -26994,7 +27155,7 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Screen) {
+        if let Err(err) = layers.set_blend_mode(top, CPU_ONLY_BLEND_MODE) {
             unreachable!("{err:?}");
         }
         assert!(
@@ -27047,7 +27208,8 @@ mod tests {
     /// whole `(R, G, B)` triple by luminosity, has no WGSL entry point,
     /// and must stay disqualified. Nothing here asserts that directly,
     /// but `document_qualifies_for_gpu_compositing_is_false_for_a_non_
-    /// normal_blend_mode` covers the general case with `Screen`.
+    /// normal_blend_mode` covers the general case with
+    /// [`CPU_ONLY_BLEND_MODE`].
     #[test]
     fn document_qualifies_for_gpu_compositing_admits_a_darken_blend_mode() {
         let mut layers = aurora_doc::LayerTree::new();
@@ -27084,7 +27246,8 @@ mod tests {
     /// whole `(R, G, B)` triple by luminosity, has no WGSL entry point,
     /// and must stay disqualified. Nothing here asserts that directly,
     /// but `document_qualifies_for_gpu_compositing_is_false_for_a_non_
-    /// normal_blend_mode` covers the general case with `Screen`.
+    /// normal_blend_mode` covers the general case with
+    /// [`CPU_ONLY_BLEND_MODE`].
     #[test]
     fn document_qualifies_for_gpu_compositing_admits_a_lighten_blend_mode() {
         let mut layers = aurora_doc::LayerTree::new();
@@ -27107,6 +27270,42 @@ mod tests {
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
             "a root-level Lighten pixel layer must qualify for the GPU path as of 0.95.0"
+        );
+    }
+
+    /// The fourth ported mode (0.102.0): `Screen` is expressible on the
+    /// GPU path (`composite_screen_over_with_opacity`), so a root-level
+    /// `Screen` pixel layer must *not* disqualify the document. Pins the
+    /// sixth `matches!` alternative directly, headlessly — the GPU-vs-CPU
+    /// differential test below proves the resulting composite is actually
+    /// right.
+    ///
+    /// This is the assertion that inverts what six fixtures in this module
+    /// used to rely on: `Screen` was this suite's own stand-in for "a mode
+    /// the GPU path rejects" until this round, which is why they now go
+    /// through [`CPU_ONLY_BLEND_MODE`] instead. See that const.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_screen_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Screen) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level Screen pixel layer must qualify for the GPU path as of 0.102.0"
         );
     }
 
@@ -28577,6 +28776,163 @@ mod tests {
         );
     }
 
+    /// **`Screen` end to end through the app's own GPU path** (0.102.0),
+    /// the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_blend_document`
+    /// above and the fourth such test. `aurora-render`'s own
+    /// `composite_screen_*` tests already prove the shader math in
+    /// isolation; what this adds is that setting `BlendMode::Screen` on
+    /// a real `LayerTree` layer actually reaches
+    /// `composite_screen_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// **Three layers, not two, and the middle one is a `Multiply`** —
+    /// the same shape as the `Lighten` sibling, and for the same reason:
+    /// it makes the `Screen` layer sample a backdrop a *different*
+    /// blend-math pipeline last wrote, and render into the `spare`
+    /// accumulator that pipeline created, which is the shared-ping-pong
+    /// property no single-blend-mode fixture can reach:
+    ///
+    /// | # | mode       | rgba                     | fold after               |
+    /// |---|------------|--------------------------|--------------------------|
+    /// | 1 | `Normal`   | `(0.25, 0.75, 0.5, 1)`   | `(0.25, 0.75, 0.5)`      |
+    /// | 2 | `Multiply` | `(0.5, 0.5, 0.5, 1)`     | `(0.125, 0.375, 0.25)`   |
+    /// | 3 | `Screen`   | `(0.25, 0.25, 0.75, 1)`  | `(0.34375, 0.53125, 0.8125)` |
+    ///
+    /// Every layer is fully opaque at opacity `1.0`, so the accumulator's
+    /// alpha is `1.0` when the `Screen` pass runs and the whole "over"
+    /// reduces to `B` itself — the golden below *is*
+    /// `Screen((0.125, 0.375, 0.25), (0.25, 0.25, 0.75))`, all exact
+    /// binary fractions, so it is asserted absolutely and not merely
+    /// differentially.
+    ///
+    /// Note the fixture's operands are the `Lighten` sibling's, unchanged,
+    /// and they suit `Screen` as they stand: no channel of either operand
+    /// is `0.0` or `1.0`, the two values at which `Screen` degenerates (to
+    /// `Normal` and to a constant `1.0`).
+    ///
+    /// **Four** independent guards, the same four the `Lighten` sibling
+    /// carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`SCREEN_GPU_DISPATCHES`] count, which is what distinguishes
+    ///   "the `Screen` arm ran on the GPU" from "it silently fell back to
+    ///   the CPU, which computes the same correct pixels" — the one
+    ///   mutation in this round's own set that nothing else caught;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `Screen` replaced by `Lighten` must composite to something
+    ///   *different* (`(0.25, 0.375, 0.75)` against
+    ///   `(0.34375, 0.53125, 0.8125)` — all three channels differ).
+    ///   `Lighten` is chosen as the substitute deliberately: it is the
+    ///   entry point `fs_composite_screen` was written from, so it is the
+    ///   realistic copy-paste failure.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_screen_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack: [(&str, aurora_doc::BlendMode, f32, [f32; 4]); 3] = [
+            (
+                "l1",
+                aurora_doc::BlendMode::Normal,
+                1.0,
+                [0.25, 0.75, 0.5, 1.0],
+            ),
+            (
+                "l2",
+                aurora_doc::BlendMode::Multiply,
+                1.0,
+                [0.5, 0.5, 0.5, 1.0],
+            ),
+            (
+                "l3",
+                aurora_doc::BlendMode::Screen,
+                1.0,
+                [0.25, 0.25, 0.75, 1.0],
+            ),
+        ];
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/Screen root stack must qualify for the GPU path as of \
+             0.102.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_screen_gpu_dispatch_count();
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `Screen` layer, dispatched once for the
+        // one tile it actually has content at. `solid_root_stack` fills
+        // only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all, taking
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. The second, CPU-only run inside that helper
+        // adds none. **A count of 0 is the failure this assertion exists
+        // for** -- see `SCREEN_GPU_DISPATCHES`, and PLAN.md's 0.102.0
+        // mutation-testing record, where deleting the dispatch arm left
+        // every other assertion in this test green.
+        assert_eq!(
+            take_screen_gpu_dispatch_count(),
+            1,
+            "the Screen layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/Screen document (the Screen layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.34375, 0.53125, 0.8125, 1.0),
+            "Cb + Cs - Cb*Cs must come out of the GPU path itself -- (0.25, 0.375, 0.75, 1.0) \
+             would mean the Lighten arm ran, (0.125, 0.25, 0.25, 1.0) the Darken arm, \
+             (0.25, 0.25, 0.75, 1.0) the Normal arm, and (0.03125, 0.09375, 0.1875, 1.0) the \
+             Multiply arm"
+        );
+
+        // The vacuity guard: the same stack with its `Screen` layer turned
+        // into a `Lighten` one, composited on the CPU path only. If that
+        // produced the same texel, every assertion above would hold just
+        // as well with the wrong arm dispatched.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::Screen {
+                entry.1 = aurora_doc::BlendMode::Lighten;
+            }
+        }
+        let with_lighten = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_lighten,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_screen_were_lighten = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_screen_were_lighten,
+            "setup: this fixture must distinguish its Screen layer from a Lighten one, or the \
+             differential above would pass with the wrong dispatch arm running"
+        );
+    }
+
     /// **The test this whole round exists to make possible** (0.85.0):
     /// three *different* expressible modes in one stack, proving the
     /// ping-pong mechanism generalises past a single blend mode.
@@ -28999,11 +29355,12 @@ mod tests {
     ///
     /// So call the private function directly, bypassing the gate the
     /// same way a drifted predicate one day might: a two-layer document
-    /// whose top layer is `Screen`, which the predicate rejects (asserted
-    /// here, so this test fails loudly if `Screen` is ever admitted and
-    /// this fixture stops probing the arm it is named for). The assertion
-    /// is that this fails *safe* — `None`, not a panic, not a partial
-    /// composite of the wrong formula.
+    /// whose top layer is at [`CPU_ONLY_BLEND_MODE`], which the predicate
+    /// rejects (asserted here, so this test fails loudly if that mode is
+    /// ever admitted and this fixture stops probing the arm it is named
+    /// for — which is exactly what happened to its previous literal
+    /// `Screen` in 0.102.0). The assertion is that this fails *safe* —
+    /// `None`, not a panic, not a partial composite of the wrong formula.
     #[test]
     fn begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode() {
         let Some(context) = real_gpu_context() else {
@@ -29020,8 +29377,8 @@ mod tests {
                     [0.5, 0.5, 0.5, 1.0],
                 ),
                 (
-                    "screened",
-                    aurora_doc::BlendMode::Screen,
+                    "inexpressible",
+                    CPU_ONLY_BLEND_MODE,
                     1.0,
                     [0.5, 0.5, 0.5, 1.0],
                 ),
@@ -29029,9 +29386,9 @@ mod tests {
         );
         assert!(
             !document_qualifies_for_gpu_compositing(&layers),
-            "setup: Screen must still disqualify the document -- if it is ever admitted, this \
-             test needs a different mode, not deleting: its whole point is to reach the arm the \
-             real caller cannot"
+            "setup: {CPU_ONLY_BLEND_MODE:?} must still disqualify the document -- if it is ever \
+             admitted, this test needs a different mode, not deleting: its whole point is to \
+             reach the arm the real caller cannot"
         );
 
         let mut compositor = aurora_render::TileCompositor::new(context.device());
@@ -29194,11 +29551,11 @@ mod tests {
     }
 
     /// The fallback's own correctness proof, not just that it was taken:
-    /// a document with one `Screen`-blend layer (one of the 22 modes the
-    /// GPU path still cannot express — `Normal`, `Multiply`, `Darken`,
-    /// `Lighten` and
-    /// `Dissolve` are the five admitted as of 0.95.0) must still
-    /// composite to `Screen`'s own real result, not to
+    /// a document with one layer at [`CPU_ONLY_BLEND_MODE`] (one of the 21
+    /// modes the GPU path still cannot express — `Normal`, `Multiply`,
+    /// `Darken`, `Lighten`, `Screen` and
+    /// `Dissolve` are the six admitted as of 0.102.0) must still
+    /// composite to that mode's own real result, not to
     /// whatever `Normal` would have produced for the same inputs — which
     /// would be a different, wrong value here, so this genuinely
     /// distinguishes "fell back and composited correctly" from "silently
@@ -29206,9 +29563,18 @@ mod tests {
     ///
     /// This used `Multiply` until 0.84.0 wired that mode onto the GPU
     /// path, at which point the fixture would have stopped exercising
-    /// the fallback at all. `Screen` replaces it for the same reason it
-    /// replaces it in the predicate test above: a real, 1:1-translated,
-    /// still-CPU-only mode.
+    /// the fallback at all; then `Screen` until 0.102.0 did the same to
+    /// that one. It now names [`CPU_ONLY_BLEND_MODE`] instead, so the
+    /// next such move is one edit rather than an audit.
+    ///
+    /// **The fixture's two colours changed with that retarget** (0.102.0),
+    /// and had to. It used two mid-greys, which suited `Screen`
+    /// (`Screen(0.5, 0.5) = 0.75`) but degenerates completely for
+    /// `Exclusion`: `Exclusion(0.5, cs) = 0.5 + cs - cs = 0.5` for *any*
+    /// `cs`, so a mid-grey backdrop makes the mode indistinguishable from
+    /// several others and the "not vacuous against the GPU's own
+    /// formulas" argument below would have been false. `0.25`/`0.75`
+    /// separates every candidate — see the body's own enumeration.
     #[test]
     fn recomposite_visible_tiles_falls_back_to_the_cpu_path_for_a_non_normal_blend_mode() {
         let Some(context) = real_gpu_context() else {
@@ -29231,25 +29597,45 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::Screen) {
+        if let Err(err) = layers.set_blend_mode(top, CPU_ONLY_BLEND_MODE) {
             unreachable!("{err:?}");
         }
         assert!(
             !document_qualifies_for_gpu_compositing(&layers),
-            "a Screen-blend layer must disqualify the document"
+            "a {CPU_ONLY_BLEND_MODE:?}-blend layer must disqualify the document"
         );
 
         let tile_id = aurora_tile::TileId { x: 0, y: 0 };
-        // Two mid-greys: Screen(0.5, 0.5) = 0.5 + 0.5 - 0.5*0.5 = 0.75,
-        // an exact binary fraction, so no rounding latitude is in play.
-        // If the GPU path were mistakenly used here anyway -- treating
-        // `Screen` as `Normal` (opaque top over opaque bottom at full
-        // opacity gives the top layer's own colour unchanged, 0.5) or as
-        // `Multiply` (0.25, the one other formula that path can now
-        // compute) -- the result would differ from 0.75 either way, so
-        // this stays non-vacuous against both of the GPU path's own
-        // modes, not just against `Normal`.
-        for (id, rgba) in [(bottom, [0.5, 0.5, 0.5, 1.0]), (top, [0.5, 0.5, 0.5, 1.0])] {
+        // `cb = 0.25` (bottom) and `cs = 0.75` (top), both exact binary
+        // fractions, so no rounding latitude is in play anywhere in this
+        // fixture. `Exclusion(0.25, 0.75) = 0.25 + 0.75 - 2*0.25*0.75 =
+        // 0.625`, likewise exact.
+        //
+        // **The non-vacuity enumeration**, which is the whole reason these
+        // two numbers are not both `0.5`. If the GPU path were mistakenly
+        // taken here anyway, the layer's mode would have to be composited
+        // by one of the formulas that path *can* express, and every one of
+        // them gives a different answer than 0.625:
+        //
+        //   Normal   -> 0.75    (opaque over opaque at full opacity is
+        //                        just the top layer's own colour)
+        //   Multiply -> 0.1875
+        //   Darken   -> 0.25
+        //   Lighten  -> 0.75
+        //   Screen   -> 0.8125  (admitted to the GPU path in 0.102.0 --
+        //                        newly a wrong answer this fixture must
+        //                        be able to distinguish, which the old
+        //                        two-mid-grey fixture could not have,
+        //                        since `Exclusion(0.5, x) = 0.5` for
+        //                        every `x`)
+        //
+        // `Dissolve`, the sixth admitted mode, never reaches a blend
+        // formula at all (`resolve_tile` reduces it to `Normal`), so it is
+        // covered by the `Normal` row.
+        for (id, rgba) in [
+            (bottom, [0.25, 0.25, 0.25, 1.0]),
+            (top, [0.75, 0.75, 0.75, 1.0]),
+        ] {
             let Some(surface) = layers.surface_id(id) else {
                 unreachable!("just created as a pixel layer");
             };
@@ -29278,8 +29664,9 @@ mod tests {
         let result = read_first_texel(&mut store, composite_surface_id(), tile_id);
         assert_eq!(
             result,
-            (0.75, 0.75, 0.75, 1.0),
-            "Screen's own real math must run via the CPU fallback, not Normal's or Multiply's"
+            (0.625, 0.625, 0.625, 1.0),
+            "{CPU_ONLY_BLEND_MODE:?}'s own real math must run via the CPU fallback, not the \
+             formula of any mode the GPU path can express (see the enumeration above)"
         );
     }
 
@@ -30548,8 +30935,9 @@ mod tests {
     /// A second, smaller measurement, exercising the CPU compositing
     /// fallback specifically -- `document_qualifies_for_gpu_compositing`
     /// returns `false` here (the single root layer's own blend mode is
-    /// `Screen`, one of the 22 modes the GPU path still cannot express;
-    /// it was `Multiply` until 0.84.0 wired that mode onto the GPU path,
+    /// [`CPU_ONLY_BLEND_MODE`], one of the 21 modes the GPU path still
+    /// cannot express; it was `Multiply` until 0.84.0 wired that mode onto
+    /// the GPU path, then `Screen` until 0.102.0 did the same, either of
     /// which would have quietly turned this into a second GPU-path
     /// measurement), so every tile in this loop goes through
     /// `resolve_tile`/`aurora_render::composite_tile_cpu`, not
@@ -30615,6 +31003,20 @@ mod tests {
     /// general -- the two tests use different viewport sizes on purpose
     /// (see above) and are not a controlled GPU-vs-CPU comparison.
     ///
+    /// **The fixture's blend mode changed in 0.102.0, so the figures above
+    /// are not comparable across that boundary.** It was a literal
+    /// `Screen` layer; porting `Screen` to the GPU path would have turned
+    /// this control into a second GPU-path measurement, so it now uses
+    /// [`CPU_ONLY_BLEND_MODE`] (`Exclusion`) instead. Both are separable,
+    /// branch-free per-channel formulas of the same shape, and both sets
+    /// of numbers land in the same range — measured on this box
+    /// immediately before and after the retarget, three runs each:
+    /// `Screen` mean 9.37–10.82 / p50 9.10–10.25 / p99 12.17–16.74, then
+    /// `Exclusion` mean 8.95–9.65 / p50 8.63–9.26 / p99 12.32–16.00. But
+    /// the *quantity being measured* changed, so do not read a delta
+    /// against a pre-0.102.0 number as a performance result. PLAN.md's
+    /// 0.102.0 entry states both sets and this caveat.
+    ///
     /// **This test is an unmoved control for 0.86.0's per-tile submit
     /// batching, not a second measurement of it.** Its document is
     /// deliberately at a blend mode the GPU path cannot express, so every
@@ -30657,7 +31059,14 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = layers.set_blend_mode(layer_id, aurora_doc::BlendMode::Screen) {
+        // [`CPU_ONLY_BLEND_MODE`], not a literal mode name: this
+        // benchmark's entire subject is the CPU fallback path, so it must
+        // stay on a mode the GPU predicate rejects. It read `Screen`
+        // literally until 0.102.0 ported that mode to the GPU, at which
+        // point the `assert!` below is what stopped this from silently
+        // becoming a *second* measurement of the GPU path while still
+        // calling itself the fallback control.
+        if let Err(err) = layers.set_blend_mode(layer_id, CPU_ONLY_BLEND_MODE) {
             unreachable!("{err:?}");
         }
         let Some(surface) = layers.surface_id(layer_id) else {
@@ -30665,7 +31074,9 @@ mod tests {
         };
         assert!(
             !document_qualifies_for_gpu_compositing(&layers),
-            "a Screen-blend root layer must disqualify the document from the GPU path"
+            "a {CPU_ONLY_BLEND_MODE:?}-blend root layer must disqualify the document from the \
+             GPU path -- the `gpu_tiles mean=0.0` line this test reports is the other half of \
+             the same claim"
         );
 
         let mut stages = measure_pan_and_paint_frames(
@@ -30935,13 +31346,22 @@ mod tests {
     ///    so the layer added *first* folds first. The backdrop is
     ///    therefore added first. The test asserts this via
     ///    `roots().last()` rather than trusting the comment.
-    /// 3. **`Screen` on the active layer.** One of the 22 blend modes the
-    ///    GPU path still cannot express, so
+    /// 3. **[`CPU_ONLY_BLEND_MODE`] on the active layer.** One of the 21
+    ///    blend modes the GPU path still cannot express, so
     ///    `document_qualifies_for_gpu_compositing` is `false` and every
     ///    tile goes through `composite_roots_into_tile` — the same lever,
     ///    and for the same reason, as the single-root CPU-fallback
     ///    sibling. The backdrop stays `Normal`: it is the accumulator's
     ///    first fold and its mode is not what this measures.
+    ///
+    ///    This read a literal `Screen` until 0.102.0 ported that mode to
+    ///    the GPU path. Left literal, this fixture would have kept
+    ///    reporting timings under the name "CPU fallback" while actually
+    ///    measuring the GPU path — the worst shape of failure available to
+    ///    a benchmark, since nothing about it looks red. The caller's own
+    ///    `assert!(!document_qualifies_for_gpu_compositing(...))` is what
+    ///    made it fail loudly instead; the const is what keeps the next
+    ///    ported mode from re-running that experiment.
     /// 4. **Both layers pre-seeded, both arms.** `backdrop_visible`
     ///    controls *only* `set_visible`. The control arm has byte-identical
     ///    store contents and differs from the main arm in exactly one
@@ -30982,7 +31402,7 @@ mod tests {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
-        if let Err(err) = layers.set_blend_mode(canvas, aurora_doc::BlendMode::Screen) {
+        if let Err(err) = layers.set_blend_mode(canvas, CPU_ONLY_BLEND_MODE) {
             unreachable!("{err:?}");
         }
         if let Err(err) = layers.set_visible(backdrop, backdrop_visible) {
@@ -31172,8 +31592,8 @@ mod tests {
         let mut fixture = two_root_cpu_fallback_fixture(true);
         assert!(
             !document_qualifies_for_gpu_compositing(&fixture.layers),
-            "a Screen-blend root must disqualify the document from the GPU path, so that every \
-             visible tile goes through composite_roots_into_tile"
+            "a {CPU_ONLY_BLEND_MODE:?}-blend root must disqualify the document from the GPU path, so \
+             that every visible tile goes through composite_roots_into_tile"
         );
         assert_eq!(
             fixture.layers.roots().last().copied(),
@@ -31186,8 +31606,9 @@ mod tests {
         assert_eq!(
             fixture.layers.roots().first().copied(),
             Some(fixture.canvas),
-            "and the active, Screen-blend canvas layer must be the one that folds second, onto \
-             the now-opaque accumulator: that second fold is what this fixture exists to reach"
+            "and the active, {CPU_ONLY_BLEND_MODE:?}-blend canvas layer must be the one that folds \
+             second, onto the now-opaque accumulator: that second fold is what this fixture \
+             exists to reach"
         );
 
         // The precondition `fold_texel`'s dividing arm is selected on,
@@ -31293,7 +31714,7 @@ mod tests {
         assert!(
             !document_qualifies_for_gpu_compositing(&control.layers),
             "hiding the backdrop must not accidentally re-qualify the document for the GPU \
-             path -- the active layer is still Screen-blended"
+             path -- the active layer is still {CPU_ONLY_BLEND_MODE:?}-blended"
         );
         let mut control_stages = measure_pan_and_paint_frames(
             &context,
@@ -37649,11 +38070,18 @@ mod tests {
             "setup: and to something non-zero -- otherwise every comparison below is vacuous"
         );
 
+        // **All six modes `document_qualifies_for_gpu_compositing`
+        // admits, and this list has to keep pace with it** -- the test's
+        // own name says "every expressible mode", so a mode ported to the
+        // GPU path but not added here turns that name into a false claim
+        // without anything going red. `Screen` was added in 0.102.0, the
+        // round that ported it.
         for mode in [
             aurora_doc::BlendMode::Normal,
             aurora_doc::BlendMode::Multiply,
             aurora_doc::BlendMode::Darken,
             aurora_doc::BlendMode::Lighten,
+            aurora_doc::BlendMode::Screen,
             aurora_doc::BlendMode::Dissolve,
         ] {
             let mut layers = solid_root_stack(

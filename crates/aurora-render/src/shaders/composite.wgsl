@@ -69,16 +69,17 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // than reached through the fixed-function blend unit. Binding 3 is the
 // next free slot after src_tex (0), src_smp (1) and the opacity uniform
 // (2) declared above; only the real blend-math entry points below --
-// fs_composite_multiply, fs_composite_darken and fs_composite_lighten --
-// use it, through the
+// fs_composite_multiply, fs_composite_darken, fs_composite_lighten and
+// fs_composite_screen -- use it, through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
 // fixed-function entry point's own layout gains an entry.
 //
 // Named `backdrop_tex` after the Rust parameter it is actually bound to
 // (`TileCompositor::composite_multiply_over_with_opacity`'s,
-// `composite_darken_over_with_opacity`'s and
-// `composite_lighten_over_with_opacity`'s `backdrop`),
+// `composite_darken_over_with_opacity`'s,
+// `composite_lighten_over_with_opacity`'s and
+// `composite_screen_over_with_opacity`'s `backdrop`),
 // deliberately *not* `dst_tex`: `dst` on the Rust side is the render
 // target this entry point writes to, which is a different texture
 // entirely and must never alias this one. Calling the sampled backdrop
@@ -86,9 +87,9 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // against, so the name was corrected in 0.83.1, while `Multiply` was
 // still the only ported mode and the 25 then-unported ones had yet to be
 // written against this file. That "25" is the 0.83.1 count and is not
-// maintained here; `Darken` (0.85.0) and `Lighten` (0.95.0) have since
-// landed, and the live numbers live in `TileCompositor`'s own doc
-// comment.
+// maintained here; `Darken` (0.85.0), `Lighten` (0.95.0) and `Screen`
+// (0.102.0) have since landed, and the live numbers live in
+// `TileCompositor`'s own doc comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -222,6 +223,53 @@ fn fs_composite_lighten(in: VsOut) -> @location(0) vec4<f32> {
         cb = bd.rgb / ab;
     }
     let b = max(cb, s.rgb);                   // blend_rgb(Lighten, cb, cs)
+    let blended = ab_inv * s.rgb + ab * b;
+    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+}
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
+// exactly, for `BlendMode::Screen` only -- the fourth blend mode ported
+// to the GPU, and structurally identical to the three entry points above
+// in every line but one.
+//
+// Read `fs_composite_multiply`'s own comment for the full derivation of
+// the surrounding "over": the alpha compositing around `B(Cb, Cs)` is
+// blend-mode-independent, so only the `b = ...` line below differs.
+//
+// `blend_rgb(Screen, cb, cs)` is `blend_channel`'s `cb + cs - cb * cs`
+// applied per channel, through `blend_rgb`'s own generic per-channel arm
+// (a separable mode, not one of the six whole-triple ones). It is the
+// first ported mode whose formula is real *arithmetic* on both operands
+// rather than a single intrinsic: `Multiply` is one `*`, `Darken` one
+// `min()`, `Lighten` one `max()`.
+//
+// **Written as the literal sum, not as `1.0 - (1.0 - cb) * (1.0 - s.rgb)`.**
+// The two are algebraically equal and the inverse-multiply form is the
+// more familiar statement of what `Screen` *means*, but `blend_channel`'s
+// own Rust arm is `cb + cs - cb * cs`, and every entry point in this file
+// is checked by reading it against that function line for line. A form
+// that has to be re-derived before it can be compared is a worse
+// comment than a form that matches. (They are not bit-identical in
+// floating point either, which would put the `assert_eq!`-based
+// differentials in this crate's test module at the mercy of which one
+// was written.)
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2)
+// and `TileCompositor::bind_group_layout_blend` with the three entry
+// points above; no new binding, no new layout.
+@fragment
+fn fs_composite_screen(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let a = s.a * opacity.value;
+    let inv = 1.0 - a;
+    let ab = bd.a;
+    let ab_inv = 1.0 - ab;
+    var cb = vec3<f32>(0.0, 0.0, 0.0);
+    if (ab > 0.0) {
+        cb = bd.rgb / ab;
+    }
+    let b = cb + s.rgb - cb * s.rgb;          // blend_rgb(Screen, cb, cs)
     let blended = ab_inv * s.rgb + ab * b;
     return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
 }

@@ -17884,6 +17884,257 @@ severity choice.
   measured for performance, and nothing here changes any composited
   pixel — the blend math 0.95.0 shipped is untouched.
 
+- [x] **GPU blend-mode math, slice 5 of the epic: `BlendMode::Screen`
+  ported and wired — done 2026-09-04 (0.102.0).** The fourth real blend
+  mode on the GPU path, at exactly the cost 0.95.0 predicted for the
+  ones after it: one WGSL entry point, one `BlendPass` const, one
+  wrapper, one dispatch arm, one counter, and **no change to
+  `composite_blend_over_with_opacity`'s signature or body**.
+
+  What landed:
+
+  - **`fs_composite_screen`** in
+    `crates/aurora-render/src/shaders/composite.wgsl`, structurally
+    identical to the three entry points above it in every line but one:
+    `let b = cb + s.rgb - cb * s.rgb;`. **This is the first ported mode
+    whose formula is real arithmetic on both operands** rather than a
+    single WGSL intrinsic (`Multiply` is one `*`, `Darken` one `min()`,
+    `Lighten` one `max()`), which is the only genuinely new thing about
+    this slice. Written as that literal sum and deliberately **not** as
+    the algebraically-equal `1.0 - (1.0 - cb) * (1.0 - s.rgb)`: the
+    inverse-multiply form is the more familiar statement of what
+    `Screen` means, but `blend_channel`'s own Rust arm is
+    `cb + cs - cb * cs`, and every entry point in that file is reviewed
+    by reading it against that function line for line. The two forms are
+    also not bit-identical in floating point, which would have put this
+    crate's `assert_eq!`-based differentials at the mercy of which one
+    was written. Shares `backdrop_tex` (binding 3), the `Opacity`
+    uniform (binding 2) and `TileCompositor::bind_group_layout_blend`
+    with the three entry points above it — **no new binding, no new bind
+    group layout, no new uniform**.
+  - **`TileCompositor::composite_screen_over_with_opacity`** plus
+    `BLEND_PASS_SCREEN` and its four `wgpu` debug labels
+    (`composite.screen{,.opacity,.bind_group,.pass}`) in
+    `crates/aurora-render/src/composite.rs`. The method body is exactly
+    one delegating call. The shared helper 0.85.1 extracted took a
+    fourth caller without a line of change, as it took the third.
+  - **`aurora_doc::BlendMode::Screen` admitted by
+    `document_qualifies_for_gpu_compositing`**, and a `Screen` arm in
+    `begin_gpu_composite_tile` using the *same single* `spare` ping-pong
+    accumulator the other three blend-math arms share.
+  - **`SCREEN_GPU_DISPATCHES` + `note_screen_gpu_dispatch()` +
+    `take_screen_gpu_dispatch_count()`**, from this mode's first round.
+    That is now the established precedent rather than the exception it
+    was at 0.95.0, and it earned itself again here: mutation 1 below was
+    caught by this counter and by **nothing else**.
+
+  **AC-7, the retarget — the substantive risk in this round, and it was
+  real.** Six fixtures in `aurora-app` used `BlendMode::Screen`
+  specifically *because* it disqualified GPU compositing, not because
+  they cared about `Screen`. Admitting `Screen` breaks all six. They
+  were found by execution, not by reading: `Screen` was temporarily
+  added to the predicate with no dispatch arm, the full `aurora-app`
+  suite run, and the failures recorded — **exactly six, and every one
+  failed loudly on its own `assert!(!document_qualifies_for_gpu_
+  compositing(...))` setup assert**, never silently. The probe was then
+  reverted and the retarget landed as its own step, with the full suite
+  green (**389 passed**) *before* `Screen` was admitted anywhere — which
+  is what makes the retarget provably behaviour-preserving rather than
+  compensation for an admission not yet made. The six:
+
+  1. `undoing_a_blend_mode_change_that_flips_the_compositing_path_invalidates_everything`
+  2. `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_blend_mode`
+  3. `begin_gpu_composite_tile_falls_back_for_an_inexpressible_blend_mode`
+  4. `recomposite_visible_tiles_falls_back_to_the_cpu_path_for_a_non_normal_blend_mode`
+  5. `recomposite_and_present_loop_exercises_the_cpu_fallback_path`
+     — **PLAN.md-tracked performance benchmark**
+  6. `two_root_cpu_fallback_fixture`, feeding
+     `recomposite_and_present_loop_measures_two_overlapping_roots_on_the_cpu_fallback_path`
+     — **PLAN.md-tracked performance benchmark**
+
+  Plus one non-test site: `crates/aurora-render/benches/composite.rs`'s
+  module doc, which describes fixture 5 as "one `Screen` root" in the
+  argument that settles the `rayon` NO-GO. And three stale prose
+  cross-references in `aurora-app` that named `Screen` as the
+  general-case rejected mode.
+
+  **Entries 5 and 6 are why this mattered.** Left alone they would not
+  have gone red for long — they would have kept *passing* while silently
+  measuring the GPU path under the name "CPU fallback", which is the
+  worst failure shape available to a benchmark. Their own setup asserts
+  are what caught it.
+
+  All six now go through one named test-module const,
+  `CPU_ONLY_BLEND_MODE = aurora_doc::BlendMode::Exclusion`, so the next
+  ported mode moves one line instead of re-auditing every fixture.
+  `Exclusion` was chosen because it is separable and branch-free
+  (`cb + cs - 2*cb*cs`, the nearest arithmetic neighbour of `Screen`'s
+  own formula) *and* has both a real `blend_channel` arm and a real
+  `translate_blend_mode` mapping — a genuinely rejected mode, not an
+  unimplemented one that would degrade to `Normal` at the translation
+  boundary and quietly change what the fixture composites. A new guard
+  test, `a_single_layer_at_the_cpu_only_blend_mode_does_not_qualify_for_
+  gpu_compositing`, asserts the one property all six depend on, in one
+  place instead of implied in six.
+
+  **Fixture 4 needed its colours changed, and that is a real finding.**
+  It used two mid-greys, which suited `Screen`
+  (`Screen(0.5, 0.5) = 0.75`) but degenerates completely for
+  `Exclusion`: `Exclusion(0.5, cs) = 0.5` for *any* `cs`, so a mid-grey
+  backdrop makes that mode indistinguishable from several others and the
+  test's own "not vacuous against the GPU's own formulas" argument would
+  have become false while the test still passed. Retargeted to
+  `0.25`/`0.75`, giving `0.625` — distinct from `Normal` `0.75`,
+  `Multiply` `0.1875`, `Darken` `0.25`, `Lighten` `0.75`, and `Screen`
+  `0.8125`, which had to be *added* to that enumeration since it is now
+  a GPU-expressible wrong answer.
+
+  **Mode accounting, both denominators.** At the `aurora-app` level six
+  of 27 `aurora_doc::BlendMode` variants are now admitted (`Normal`,
+  `Multiply`, `Darken`, `Lighten`, `Screen`, `Dissolve`), so **21 of 27
+  remain** without a GPU fast path. At the `aurora-render` shader level
+  the denominator is 26 — that crate's own `BlendMode` excludes
+  `Dissolve`, which `resolve_tile` reduces to `Normal` on the CPU before
+  any GPU dispatch sees it — and four have WGSL entry points, so **22 of
+  26 remain** without one. These count different things (admitted
+  documents vs. ported formulas), exactly as the 0.84.1 addendum
+  spelled out. Stale counts swept and re-derived in both crates plus
+  `CLAUDE.md` and `README.md`, not find-and-replaced.
+
+  **Tests: 9 new, 7 changed, 0 removed** (`aurora-render` 144 → 150,
+  `aurora-app` 388 → 391; workspace 1,662 → 1,671). The 9 new are the six
+  `aurora-render` `composite_screen_*` tests plus three in `aurora-app`:
+  the `CPU_ONLY_BLEND_MODE` guard, the `Screen` admission test, and the
+  GPU-vs-CPU integration test. The 7 changed are the six retarget sites
+  and the `..._across_every_expressible_mode` mode loop. The six `aurora-render` tests mirror the
+  `Lighten` suite one for one — per-channel arithmetic against a
+  hand-derived golden, translucent accumulator (the `ab > 0.0` taken
+  branch), spatially-varying whole-tile comparison, half opacity,
+  unclamped `s.a * opacity` above one, and half-transparent backdrop
+  (the `ab > 0.0` *untaken* branch). The out-of-range-**opacity** case is
+  legitimately omitted and said so in a comment: since 0.85.1's merge
+  that property is one shared Rust line every mode reaches through, and
+  the `Multiply`/`Darken` suites already pin it. The unclamped
+  *source-alpha* case is **not** omitted — that one is a line inside
+  this entry point, which is exactly the distinction 0.95.1 had to
+  correct 0.95.0 on.
+
+  **Fixture values were chosen against `Screen`'s own two degeneracies,
+  which no prior ported mode has.** `Screen(0, Cs) = Cs` is
+  indistinguishable from `Normal`, and `Screen(Cb, 1) = 1` is
+  indistinguishable from a saturating bug — so every operand in every
+  new fixture is strictly inside `(0, 1)` in every channel. That ruled
+  out reusing the `Lighten` half-opacity fixture verbatim (its source
+  has a `1.0` blue channel); it uses `0.75` instead.
+
+  **Mutation-tested four times, each applied for real, run, and reverted
+  (`touch`ed after restoring, so no stale-mtime skip). Four kills, zero
+  survivors:**
+
+  1. **Deleted the whole `Screen` arm from
+     `begin_gpu_composite_tile`.** Killed by **exactly one assertion in
+     exactly one test** — `take_screen_gpu_dispatch_count()` reading 0
+     instead of 1. The other 390 `aurora-app` tests stayed green,
+     *including this round's own pixel-value assertions*, because the
+     `_` arm falls the tile back to the CPU path, which computes the
+     same correct pixels. This is the gap `DARKEN_GPU_DISPATCHES`
+     documents, demonstrated live for a fourth time.
+  2. **`cb + s.rgb - cb * s.rgb` → `cb * s.rgb`** (Multiply's formula)
+     in `fs_composite_screen`. **6 of 6 `aurora-render` tests failed,
+     plus the `aurora-app` integration test.** No survivor — notably
+     including the half-transparent test, which is the one that
+     survived the equivalent mutation in the `Lighten` suite until
+     0.95.1 reshaped its fixture; building this suite's version
+     half-transparent from the start avoided inheriting that hole.
+  3. **`BLEND_PASS_SCREEN.fragment_entry` → `"fs_composite_lighten"`.**
+     6 of 6 `aurora-render` tests plus the `aurora-app` test failed on
+     pixel comparison **with the dispatch counter still reading 1** —
+     the dispatch happened, the wrong shader ran — and the observed
+     wrong texel was `(0.25, 0.375, 0.75, 1.0)`, exactly the `Lighten`
+     value derived by hand for that fixture. Counter and pixels are
+     genuinely independent observables.
+  4. **Removed `Screen` from
+     `document_qualifies_for_gpu_compositing`'s matched set.** Killed by
+     **three** tests: the new admission test, the new integration test's
+     own setup assert, and
+     `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode`
+     — which only catches it because `Screen` was added to that test's
+     mode loop this round. Without that one-line addition the test's own
+     name ("every expressible mode") would have become a false claim
+     with nothing going red; 0.95.0's history records making exactly
+     that mistake and having to fix it.
+
+  Clean state re-verified after all four (`git diff` empty on the three
+  mutated files, `aurora-render` 6 of 6 and `aurora-app` 391 of 391
+  green).
+
+  **The two tracked benchmarks, before and after — and the mode changed,
+  so these are NOT comparable to each other or to prior rounds'
+  numbers.** Both measured on this box's real discrete GPU
+  (`NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`), release build,
+  `AURORA_REQUIRE_GPU=1`, three runs each, n=12 per run. The
+  load-bearing check is the `gpu_tiles` line, which read
+  `mean=0.0/frame min=0 max=0` in **all twelve** runs — before and after
+  — which is the proof both fixtures are still genuinely on the CPU
+  fallback and not quietly measuring the GPU path:
+
+  | benchmark | before (`Screen`) | after (`Exclusion`) |
+  |---|---|---|
+  | `..._exercises_the_cpu_fallback_path` | mean 9.37–10.82, p50 9.10–10.25, p99 12.17–16.74 | mean 8.95–9.65, p50 8.63–9.26, p99 12.32–16.00 |
+  | `..._measures_two_overlapping_roots...` (main arm) | mean 40.80–41.06, p50 40.82–41.19, p99 43.97–43.99 | mean 40.80–41.65, p50 40.65–40.77, p99 43.91–50.45 |
+  | same, control arm (backdrop hidden) | mean 25.02–27.95, p50 25.03–27.57, p99 27.52–31.12 | mean 24.78–25.84, p50 24.81–25.56, p99 27.15–30.10 |
+
+  **Read no performance result off this table.** The blend mode the
+  fixtures composite changed, so the quantity measured changed; the
+  ranges overlap and both modes are separable branch-free per-channel
+  formulas of the same shape, which is the *reason* the retarget was
+  safe, not evidence about the code. The two-root fold census is
+  unchanged (`folds=216 first=108 later=108` main, `108/108/0` control),
+  which is the other half of "the same fixture shape is still being
+  measured". Per 0.94.1, these n=12 "p99"s are single-sample order
+  statistics and must not be quoted as ratios. Both benchmarks remain
+  far over the 16.7 ms budget, as before.
+
+  **Not done, deliberately:**
+
+  - **`Multiply` and `Dissolve` still have no dispatch counter.** Named
+    follow-on, unchanged, and untouched here — it would mean modifying
+    two arms this round did not otherwise change.
+  - **No public `mode: BlendMode`-dispatching method.** Still four named
+    methods; the deferral recorded at 0.85.0 stands, since a `mode`
+    parameter would have to answer what happens for the 22 modes with no
+    WGSL entry point behind them.
+  - **No other blend mode ported**, and **groups still route to the CPU
+    path entirely**.
+  - **No performance work.** Nothing here was measured *for*
+    performance, and `recomposite` remains ~73% of the GPU-path frame
+    mean.
+
+  **Verified (0.102.0), on this box's real discrete GPU**:
+  `AURORA_REQUIRE_GPU=1 cargo test -p aurora-render -- composite_screen
+  --nocapture` (**6 passed**, each printing `GPU adapter: NVIDIA GeForce
+  RTX 3090 (Vulkan, DiscreteGpu)`); the same for `composite_` (**86
+  passed**, no sibling regression); `-p aurora-app` filtered on `screen`,
+  `multiply`, `darken`, `lighten` and `dissolve` (all green); both
+  tracked benchmarks 3× in release. Then the full gate in CI order:
+  `cargo fmt --all --check`, `python3 scripts/check_layering.py`,
+  `python3 scripts/check_no_hardcoded_style.py`, `cargo check
+  --workspace --locked`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1 cargo test
+  --workspace`, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
+  warnings" cargo doc --workspace --no-deps --all-features`, `cargo deny
+  check all`.
+
+  **Scope, stated plainly**: still one backend on one vendor.
+  **Metal and DX12 remain entirely unverified for `fs_composite_screen`**,
+  including its `ab > 0.0` branch — and that branch matters more for this
+  entry point than for the three before it, because its blend line is
+  arithmetic on `cb` rather than a `min`/`max` intrinsic, so a flattened
+  branch would *propagate* a `NaN` rather than select it away. Nothing
+  here was verified by a human looking at the running app; `Screen` is
+  not in the default startup document, so unlike `Multiply` this does not
+  change what every user's first frame does.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
@@ -17926,7 +18177,9 @@ severity choice.
   (512×512 viewport, 12 frames, a non-GPU-expressible blend layer so
   `document_qualifies_for_gpu_compositing` is `false` and every tile
   takes the CPU fallback instead — `Multiply` when measured, retargeted
-  to `Screen` in 0.84.0 once `Multiply` moved onto the GPU path),
+  to `Screen` in 0.84.0 once `Multiply` moved onto the GPU path, and to
+  `Exclusion` in 0.102.0 once `Screen` did too; see that entry, whose
+  numbers are not comparable across the mode change),
   measured mean 25.08 ms, p50 22.57 ms,
   p99 54.10 ms, max 54.10 ms — also over budget, roughly 3.2× at p99
   (smaller than the GPU-path numbers because of its smaller viewport, not
@@ -22724,6 +22977,36 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.102.0) — `BlendMode::Screen` is on the GPU path;
+the blend-mode epic stands at 6 of 27 admitted (21 remain), 4 of 26 ported
+at the shader level (22 remain).** Fourth mode, same template, same cost as
+0.95.0 predicted: one WGSL entry point, one `BlendPass` const, one wrapper,
+one dispatch arm, one counter, no change to the shared
+`composite_blend_over_with_opacity`. The one genuinely new thing is that
+`Screen`'s formula is arithmetic on both operands rather than a single WGSL
+intrinsic, which is also why its `ab > 0.0` untaken branch matters more
+than its predecessors' (a flattened branch would *propagate* a `NaN` here,
+not select it away). Four mutations run for real, four kills, zero
+survivors — and mutation 1 (deleting the dispatch arm) was caught by
+`SCREEN_GPU_DISPATCHES` and by nothing else, for the fourth round running.
+
+**The part worth carrying forward is not the port.** Six `aurora-app`
+fixtures used `Screen` as a stand-in for "a mode the GPU predicate
+rejects", **two of them PLAN.md-tracked CPU-fallback performance
+benchmarks**. Admitting `Screen` would have left those two passing while
+silently measuring the GPU path under the name "CPU fallback". Their own
+setup asserts caught it, and all six now route through one named const
+(`CPU_ONLY_BLEND_MODE = Exclusion`) with a guard test, so the *next* mode
+moves one line. **Anyone porting mode five should check that const first.**
+One fixture also needed its colours changed — two mid-greys are degenerate
+for `Exclusion` (`Exclusion(0.5, x) = 0.5` for all `x`) where they suited
+`Screen`. Both benchmarks were re-measured 3× before and after; every one
+of the twelve runs still reports `gpu_tiles mean=0.0 min=0 max=0`, but the
+mode they composite changed, so **no timing delta across 0.102.0 is a
+performance result**. See the 0.102.0 M1.10 entry for the tables and the
+full disclosure. Still Vulkan/NVIDIA only; Metal and DX12 unverified for
+`fs_composite_screen`.
 
 **Addendum 2026-09-04 (0.101.0, scope-corrected 0.101.1) — the
 `rayon`-in-`composite_layer_into` question is CLOSED, NO-GO, for the two

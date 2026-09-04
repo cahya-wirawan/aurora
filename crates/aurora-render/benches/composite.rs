@@ -24,7 +24,11 @@
 //! A **single-root** document — the common case, and the only shape
 //! 0.97.0's own corroborating T2 fixture
 //! (`recomposite_and_present_loop_exercises_the_cpu_fallback_path`, one
-//! `Screen` root) has — therefore never reaches `fold_onto_opaque` at
+//! `Exclusion` root — it was one `Screen` root when this paragraph was
+//! written, and 0.102.0 retargeted it when `Screen` was ported to the GPU
+//! path; the fixture's *shape*, a single non-GPU-expressible root, is
+//! what this argument turns on and that is unchanged) has — therefore
+//! never reaches `fold_onto_opaque` at
 //! all. Read against `fold_onto_transparent`, the condition that fixture
 //! actually exercises, `Normal` (~1.80 ms) and `Multiply` (~1.79 ms)
 //! both **fail** the 2.0 ms bar by ~10%. ~~T1 passes only for

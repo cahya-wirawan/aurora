@@ -46,9 +46,9 @@ const LABEL_DARKEN_PASS: &str = "composite.darken.pass";
 /// The pipeline layout and render pipeline behind
 /// [`TileCompositor::composite_lighten_over_with_opacity`] (0.95.0) —
 /// the same four-label set `Multiply` and `Darken` above each carry, for
-/// the same reason: three blend-math pipelines sharing one `"composite"`
-/// label would leave a `wgpu` validation message or a frame capture
-/// unable to say which blend mode is at fault.
+/// the same reason: several blend-math pipelines sharing one
+/// `"composite"` label would leave a `wgpu` validation message or a frame
+/// capture unable to say which blend mode is at fault.
 const LABEL_LIGHTEN: &str = "composite.lighten";
 /// That method's own per-call uniform buffer.
 const LABEL_LIGHTEN_UNIFORM: &str = "composite.lighten.opacity";
@@ -57,6 +57,20 @@ const LABEL_LIGHTEN_BIND_GROUP: &str = "composite.lighten.bind_group";
 /// That method's own render pass — the label a `wgpu` validation error
 /// or a frame capture actually names.
 const LABEL_LIGHTEN_PASS: &str = "composite.lighten.pass";
+/// The pipeline layout and render pipeline behind
+/// [`TileCompositor::composite_screen_over_with_opacity`] (0.102.0) —
+/// the same four-label set `Multiply`, `Darken` and `Lighten` above each
+/// carry, for the same reason: four blend-math pipelines sharing one
+/// `"composite"` label would leave a `wgpu` validation message or a frame
+/// capture unable to say which blend mode is at fault.
+const LABEL_SCREEN: &str = "composite.screen";
+/// That method's own per-call uniform buffer.
+const LABEL_SCREEN_UNIFORM: &str = "composite.screen.opacity";
+/// That method's own per-call bind group.
+const LABEL_SCREEN_BIND_GROUP: &str = "composite.screen.bind_group";
+/// That method's own render pass — the label a `wgpu` validation error
+/// or a frame capture actually names.
+const LABEL_SCREEN_PASS: &str = "composite.screen.pass";
 
 /// Everything that differs between one shader-computed blend mode's
 /// composite pass and another's: the `shaders/composite.wgsl` fragment
@@ -65,13 +79,15 @@ const LABEL_LIGHTEN_PASS: &str = "composite.lighten.pass";
 ///
 /// This is the whole variation between
 /// [`TileCompositor::composite_multiply_over_with_opacity`],
-/// [`TileCompositor::composite_darken_over_with_opacity`] and
-/// [`TileCompositor::composite_lighten_over_with_opacity`] — five
-/// `&'static str`s. Everything else those three methods do is
+/// [`TileCompositor::composite_darken_over_with_opacity`],
+/// [`TileCompositor::composite_lighten_over_with_opacity`] and
+/// [`TileCompositor::composite_screen_over_with_opacity`] — five
+/// `&'static str`s. Everything else those four methods do is
 /// `composite_blend_over_with_opacity`, which they all
 /// delegate to; see that method for why the collapse was safe to
 /// make at two modes rather than deferred to a third. (`Lighten`, the
-/// third, landed in 0.95.0 as one `BlendPass` const and one wrapper —
+/// third, landed in 0.95.0 as one `BlendPass` const and one wrapper, and
+/// `Screen`, the fourth, in 0.102.0 as exactly the same two additions —
 /// which is what the collapse was betting on.)
 ///
 /// There is deliberately **no encoder label here any more** (0.86.0).
@@ -133,6 +149,15 @@ const BLEND_PASS_LIGHTEN: BlendPass = BlendPass {
     uniform: LABEL_LIGHTEN_UNIFORM,
     bind_group: LABEL_LIGHTEN_BIND_GROUP,
     pass: LABEL_LIGHTEN_PASS,
+};
+
+/// [`BlendMode::Screen`]'s, likewise (0.102.0).
+const BLEND_PASS_SCREEN: BlendPass = BlendPass {
+    fragment_entry: "fs_composite_screen",
+    pipeline: LABEL_SCREEN,
+    uniform: LABEL_SCREEN_UNIFORM,
+    bind_group: LABEL_SCREEN_BIND_GROUP,
+    pass: LABEL_SCREEN_PASS,
 };
 
 /// The byte size of `composite_over_with_opacity`'s own uniform buffer —
@@ -1337,16 +1362,17 @@ pub fn composite_tile_cpu(layers: &[(&[f16], f32, BlendMode)]) -> Vec<f16> {
 /// `aurora_doc::BlendMode::Multiply`, computed in WGSL against a
 /// separately-sampled backdrop rather than by the fixed-function unit.
 /// [`Self::composite_darken_over_with_opacity`] (0.85.0) is the second,
-/// and [`Self::composite_lighten_over_with_opacity`] (0.95.0) the third,
+/// [`Self::composite_lighten_over_with_opacity`] (0.95.0) the third, and
+/// [`Self::composite_screen_over_with_opacity`] (0.102.0) the fourth,
 /// each built to exactly the same shape.
-/// The remaining 23 modes stay CPU-only (`composite_tile_cpu`) until
+/// The remaining 22 modes stay CPU-only (`composite_tile_cpu`) until
 /// their own formulas are ported — this crate's own `BlendMode` enum
 /// has 26 variants (it excludes `Dissolve`, which is a pre-composite
 /// gate, never a per-pixel formula this crate would need to port), so
-/// 23 is "26 minus the three, `Multiply`, `Darken` and `Lighten`, done
-/// so far."
+/// 22 is "26 minus the four, `Multiply`, `Darken`, `Lighten` and
+/// `Screen`, done so far."
 /// `aurora-app`'s own
-/// count of what its GPU predicate still rejects is 22, one lower,
+/// count of what its GPU predicate still rejects is 21, one lower,
 /// because `Dissolve` is *admitted* there (0.84.1) without ever needing
 /// a formula here — see PLAN.md's 0.84.1 addendum if the two numbers
 /// look inconsistent side by side; they're counting different things,
@@ -1368,8 +1394,9 @@ pub struct TileCompositor {
     /// The blend-math sibling of
     /// `bind_group_layout_opacity` above, shared by
     /// [`Self::composite_multiply_over_with_opacity`],
-    /// [`Self::composite_darken_over_with_opacity`] and
-    /// [`Self::composite_lighten_over_with_opacity`]: the same texture +
+    /// [`Self::composite_darken_over_with_opacity`],
+    /// [`Self::composite_lighten_over_with_opacity`] and
+    /// [`Self::composite_screen_over_with_opacity`]: the same texture +
     /// sampler +
     /// opacity-uniform triple, plus a fourth binding for the *backdrop*
     /// texture the shader samples instead of reaching it through the
@@ -1389,7 +1416,8 @@ pub struct TileCompositor {
 /// fixed-function blend unit never hands a shader the backdrop's colour.
 /// Shared, unchanged, by every such entry point in
 /// `shaders/composite.wgsl`: `fs_composite_multiply` (0.83.0),
-/// `fs_composite_darken` (0.85.0) and `fs_composite_lighten` (0.95.0) so
+/// `fs_composite_darken` (0.85.0), `fs_composite_lighten` (0.95.0) and
+/// `fs_composite_screen` (0.102.0) so
 /// far. A newly ported mode needs its
 /// own entry point and its own `PipelineKey`, but no new layout.
 ///
@@ -1453,8 +1481,8 @@ fn blend_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 /// *Historical:* extracted in 0.83.1, back when this file had three call
 /// sites and only `Multiply` was ported — the bet being that each later
 /// blend mode would add a `PipelineKey` rather than another copy of this
-/// descriptor. It has held so far (`Darken`, 0.85.0, and `Lighten`,
-/// 0.95.0, each added exactly
+/// descriptor. It has held so far (`Darken`, 0.85.0, `Lighten`, 0.95.0,
+/// and `Screen`, 0.102.0, each added exactly
 /// that). Those counts are the 0.83.1 ones and are not maintained here;
 /// the live numbers are [`TileCompositor`]'s own doc comment and
 /// `aurora-app`'s `document_qualifies_for_gpu_compositing`.
@@ -1955,7 +1983,7 @@ impl TileCompositor {
     ///
     /// The *public* shape is still two named methods rather than one
     /// `mode: BlendMode` parameter, and that part is a real deferral: a
-    /// `mode` parameter would have to say what happens for the 23 modes
+    /// `mode` parameter would have to say what happens for the 22 modes
     /// with no WGSL entry point behind them (panic — denied here; return
     /// a `Result` no caller can act on; silently do `Normal`), and the
     /// answer belongs with whatever ports enough of them to make the
@@ -2057,6 +2085,67 @@ impl TileCompositor {
         );
     }
 
+    /// Composites `src` over `backdrop` with **`BlendMode::Screen`**
+    /// math computed in the shader, writing the finished result into
+    /// `dst` — a *different* view from `backdrop`.
+    ///
+    /// The fourth blend mode ported to the GPU, and built to exactly the
+    /// shape of the three above: same `bind_group_layout_blend`, same
+    /// `Blend::None` replace, same `Opacity` uniform, same
+    /// `(src, backdrop, dst)` parameter order, same clamp, same
+    /// caller-supplied encoder. Read
+    /// [`Self::composite_multiply_over_with_opacity`]'s doc comment for
+    /// all of the shared "why" — the aliasing rule, why the
+    /// accumulator must arrive as a sampled texture, and why the
+    /// `sa * opacity` product is deliberately left unclamped while
+    /// `opacity` itself is clamped. None of it is mode-specific.
+    ///
+    /// What is specific to this method is one line of WGSL:
+    /// `blend_rgb(Screen, Cb, Cs)` is `blend_channel`'s
+    /// `cb + cs - cb * cs` per channel — the first ported mode whose
+    /// formula is real arithmetic on both operands rather than one
+    /// intrinsic (`Multiply` is a `*`, `Darken` a `min()`, `Lighten` a
+    /// `max()`). `fs_composite_screen` writes that sum literally rather
+    /// than the algebraically-equal `1 - (1 - Cb)(1 - Cs)`, so it stays
+    /// line-for-line comparable against `blend_channel`'s own arm; see
+    /// the entry point's own comment.
+    ///
+    /// **The application calls this** (0.102.0): `aurora-app`'s
+    /// `document_qualifies_for_gpu_compositing` admits `Screen` and
+    /// `begin_gpu_composite_tile` dispatches to this method for every
+    /// `Screen` root layer, through the *same* single ping-pong spare
+    /// accumulator a `Multiply`, `Darken` or `Lighten` layer would use.
+    /// Like `Lighten` and unlike `Multiply`, its dispatch arm is
+    /// instrumented from day one (`SCREEN_GPU_DISPATCHES` in that crate),
+    /// so no test here can be satisfied by a silent CPU fallback.
+    ///
+    /// All three views must be `Rgba16Float` and the same size; `dst`'s
+    /// owning texture must include `RENDER_ATTACHMENT` usage, and both
+    /// `src`'s and `backdrop`'s must include `TEXTURE_BINDING`.
+    /// `opacity` is clamped to `0.0..=1.0`.
+    ///
+    /// **Records into `encoder`; does not submit** (0.86.0) — see
+    /// [`Self::composite_over_with_opacity`] for the full account.
+    pub fn composite_screen_over_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+    ) {
+        self.composite_blend_over_with_opacity(
+            context,
+            encoder,
+            src,
+            backdrop,
+            dst,
+            opacity,
+            &BLEND_PASS_SCREEN,
+        );
+    }
+
     /// The one body behind every shader-computed blend mode: build (or
     /// reuse) `pass.fragment_entry`'s pipeline, upload the clamped
     /// opacity, bind `src`/backdrop/uniform, and draw one fullscreen
@@ -2083,13 +2172,14 @@ impl TileCompositor {
     /// comparing it against the struct's five fields is not left
     /// guessing which one is wrong —
     /// and it took `composite_lighten_over_with_opacity` (0.95.0, the
-    /// third caller) without a line of change, which is the bet that
+    /// third caller) and `composite_screen_over_with_opacity` (0.102.0,
+    /// the fourth) without a line of change, which is the bet that
     /// extraction was making — the
     /// same discipline, and the same "no existing test needed to change"
     /// bar, 0.83.1 used when it extracted [`composite_pipeline`] and
     /// [`opacity_uniform_buffer`] out from under those same callers. The
-    /// `composite_multiply_*`, `composite_darken_*` and
-    /// `composite_lighten_*` differentials in
+    /// `composite_multiply_*`, `composite_darken_*`,
+    /// `composite_lighten_*` and `composite_screen_*` differentials in
     /// this module's tests, each checking the shader's output against
     /// [`composite_tile_cpu`]'s own on real hardware, are what makes that
     /// checkable rather than asserted.
@@ -6471,13 +6561,19 @@ mod tests {
     /// A `SAMPLES`-length tile that is fully transparent in its left half
     /// and opaque `(0.75, 0.25, 0.5)` in its right — the fixture
     /// `composite_lighten_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
-    /// needs to exercise the `ab > 0.0` guard's untaken branch *and* stay
-    /// sensitive to the blend intrinsic in the same tile.
+    /// and its `Screen` counterpart
+    /// `composite_screen_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
+    /// both need, to exercise the `ab > 0.0` guard's untaken branch *and*
+    /// stay sensitive to the blend formula in the same tile.
     ///
     /// The opaque colour is chosen so `Lighten` takes red from the
     /// backdrop and green and blue from the source (this section's
     /// two-sided-maximum rule), and so that `min` and `max` disagree in
-    /// every channel there.
+    /// every channel there. It suits `Screen` unchanged: no channel of it
+    /// is `0.0` or `1.0`, the two values at which `Screen` degenerates
+    /// (to `Normal` and to a constant `1.0` respectively), so its own
+    /// answer in the opaque half is distinct from every other ported
+    /// mode's — see that test's own enumeration.
     fn half_transparent_texels() -> Vec<f16> {
         let mut out = Vec::with_capacity(SAMPLES);
         for _y in 0..TILE {
@@ -6668,6 +6764,750 @@ mod tests {
             "the in-shader Lighten path and composite_tile_cpu disagree across a half-transparent \
              backdrop. In the opaque half a min/max swap shows up here; in the transparent half a \
              NaN out of the untaken `ab > 0.0` branch does.",
+        );
+    }
+
+    // -- Real in-shader blend-mode math on the GPU, slice 4 of the
+    // blend-mode port: `Screen`, via
+    // `TileCompositor::composite_screen_over_with_opacity` and the
+    // `fs_composite_screen` entry point (0.102.0).
+    //
+    // **Six tests, mirroring the `Lighten` suite's own six**, and
+    // omitting the same one the `Darken` suite has: an
+    // out-of-range-*opacity* case. Since 0.85.1's merge that property
+    // lives in a single shared Rust line -- `composite_blend_over_with_
+    // opacity`'s own `let opacity = opacity.clamp(0.0, 1.0)`, which every
+    // mode's wrapper reaches through -- and the `Multiply` and `Darken`
+    // suites already pin it on real hardware. Re-asserting one shared
+    // line once per ported mode grows linearly in the number of modes
+    // while covering nothing new. That is a disclosed reduction in
+    // coverage, not an equivalence claim.
+    //
+    // The unclamped *source-alpha* case is emphatically **not** omitted:
+    // that one tests `fs_composite_screen`'s own `let a = s.a *
+    // opacity.value` line, each WGSL fragment function is separately
+    // compiled, and 0.95.0 dropping it for `Lighten` on the opacity-clamp
+    // argument was the mistake 0.95.1 had to correct. See the `Lighten`
+    // section header above for that account.
+    //
+    // The six each exercise something genuinely per-entry-point: this
+    // mode's own arithmetic, its own un-premultiply branch, its own
+    // spatial addressing, its own opacity-scaled fold, its own unclamped
+    // `s.a * opacity` product, and its own separately-compiled
+    // `ab > 0.0` guard.
+    //
+    // **Fixture values are chosen against `Screen`'s own two degeneracies,
+    // which are different from every prior mode's.** `Screen(0, Cs) = Cs`
+    // -- indistinguishable from `Normal` -- and `Screen(Cb, 1) =
+    // Screen(1, Cs) = 1` -- indistinguishable from a saturating bug. So
+    // every operand in every fixture below is strictly inside `(0, 1)` in
+    // every channel. That rules out reusing the `Lighten` half-opacity
+    // fixture verbatim, whose source has a `1.0` blue channel.
+    //
+    // All of them ran on real hardware (`AURORA_REQUIRE_GPU=1`,
+    // NVIDIA GeForce RTX 3090, Vulkan, DiscreteGpu). That is one backend
+    // on one vendor: Metal and DX12 remain unverified for this path --
+    // see PLAN.md's 0.102.0 entry.
+
+    #[test]
+    /// The plain-arithmetic case, and the `Screen` counterpart of
+    /// `composite_lighten_over_with_opacity_takes_the_per_channel_maximum_of_backdrop_and_source`.
+    ///
+    /// An opaque `(0.25, 0.75, 0.5)` accumulator under a
+    /// `(0.75, 0.25, 0.5)` source at its own `0.5` alpha. The blend is
+    /// `Cb + Cs - Cb*Cs` per channel — `(0.8125, 0.8125, 0.75)` — and the
+    /// "over" then folds that in at the source's effective alpha:
+    /// `0.5 * Cb + 0.5 * B` per channel, giving
+    /// `(0.53125, 0.78125, 0.625)` at alpha `1.0`.
+    ///
+    /// **Every plausible wrong answer is a different value here**, which
+    /// is why the colours are per-channel distinct, none of them is `0.0`
+    /// or `1.0`, and the source's alpha is `0.5` rather than `1.0`:
+    ///
+    /// - the `Normal` arm dispatched by mistake: `(0.5, 0.5, 0.5)`;
+    /// - the `Lighten` arm — the realistic copy-paste, since this entry
+    ///   point was written from that one: `(0.5, 0.75, 0.5)`;
+    /// - the `Darken` arm: `(0.25, 0.5, 0.5)`;
+    /// - the `Multiply` arm: `(0.21875, 0.46875, 0.375)`;
+    /// - bindings 0 and 3 transposed in a copy-pasted bind group:
+    ///   `(0.8125, 0.8125, 0.75)`. (That it coincides with `B` itself is
+    ///   an arithmetic accident of this fixture — `Screen` is commutative
+    ///   in `Cb`/`Cs` — and it is still distinct from the golden, which
+    ///   is what the assertion needs.)
+    ///
+    /// The golden is asserted *and* cross-checked against the real
+    /// [`composite_tile_cpu`] for the same two layers, so a stale
+    /// literal cannot outlive a change to either implementation. Every
+    /// value is an exact binary fraction, so both are bit-exact
+    /// `assert_eq!`s rather than tolerance comparisons.
+    ///
+    /// `dst` is seeded opaque red first, so a pass that silently wrote
+    /// nothing would fail rather than accidentally read as a pass.
+    fn composite_screen_over_with_opacity_takes_the_per_channel_inverse_multiply() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.25, 0.75, 0.5, 1.0];
+        let top_rgba = [0.75, 0.25, 0.5, 0.5];
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_screen_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            accumulator,
+            (0.25, 0.75, 0.5, 1.0),
+            "setup: the first pass must really have produced the accumulator the second pass \
+             then samples"
+        );
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::Screen),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.53125, 0.78125, 0.625, 1.0),
+            "setup: the hand-derived golden below must be what composite_tile_cpu itself \
+             computes for these two layers -- if this fails, the literal is stale, not the GPU"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        assert_eq!(
+            gpu_result,
+            (0.53125, 0.78125, 0.625, 1.0),
+            "Screen(Cb, Cs) = Cb + Cs - Cb*Cs per channel = (0.8125, 0.8125, 0.75), folded in \
+             at the source's own 0.5 alpha. The Normal arm would give (0.5, 0.5, 0.5), the \
+             Lighten arm (0.5, 0.75, 0.5), the Darken arm (0.25, 0.5, 0.5), the Multiply arm \
+             (0.21875, 0.46875, 0.375), and a transposed src/backdrop binding \
+             (0.8125, 0.8125, 0.75)."
+        );
+    }
+
+    #[test]
+    /// The fractional-accumulator-alpha case: the `Screen` counterpart of
+    /// `composite_lighten_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator`,
+    /// exercising this entry point's own backdrop-recovery branch
+    /// (`if (ab > 0.0) { cb = bd.rgb / ab; }`).
+    ///
+    /// The backdrop is `(0.25, 0.75, 0.5)` at half opacity and the source
+    /// `(0.75, 0.25, 0.5)` — per-channel distinct on both sides, and no
+    /// channel at `0.0` or `1.0`, so neither of `Screen`'s degeneracies
+    /// is in play.
+    ///
+    /// A missing un-premultiply fails loudly in **all three** channels
+    /// here, not just one: the raw premultiplied accumulator is
+    /// `(0.125, 0.375, 0.25)`, and screening against *that* rather than
+    /// the recovered straight `(0.25, 0.75, 0.5)` gives
+    /// `B = (0.78125, 0.53125, 0.625)` where the correct `B` is
+    /// `(0.8125, 0.8125, 0.75)`.
+    ///
+    /// The expected value is **not hand-derived**: it comes from calling
+    /// the real [`composite_tile_cpu`] with the same two layers.
+    /// Compared within `2 * f16::EPSILON`, the same tolerance and the
+    /// same reasoning the `Darken` and `Lighten` siblings document.
+    fn composite_screen_over_with_opacity_matches_the_cpu_against_a_translucent_accumulator() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.25, 0.75, 0.5, 1.0];
+        let top_rgba = [0.75, 0.25, 0.5, 1.0];
+        let bottom_opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        // A half-opacity bottom layer leaves a *premultiplied*
+        // accumulator whose alpha is 0.5 -- exactly the state whose raw
+        // colour is not its straight colour.
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                bottom_opacity,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_screen_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_accumulator = first_texel(&composite_tile_cpu(&[(
+            &bottom_texels,
+            bottom_opacity,
+            BlendMode::Normal,
+        )]));
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, bottom_opacity, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::Screen),
+        ]));
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator, cpu_accumulator,
+            "setup: the accumulator the second pass samples must be the premultiplied, \
+             fractional-alpha state the CPU path also reaches"
+        );
+        assert!(
+            gpu_accumulator.3 > 0.0 && gpu_accumulator.3 < 1.0,
+            "setup: this test is only meaningful with a fractional accumulator alpha, got \
+             {gpu_accumulator:?}"
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader Screen path and composite_tile_cpu diverged \
+                 by more than {tolerance} against a translucent accumulator ({gpu} vs {cpu}) -- \
+                 that is a real finding to report, not a reason to loosen this assertion. Full \
+                 texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// **The spatial-addressing test for the `Screen` entry point**, the
+    /// counterpart of
+    /// `composite_lighten_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile`
+    /// and the only `Screen` test here that can catch a V-flip, a
+    /// transposed axis, a half-texel UV offset, or a bind-group
+    /// transpose: every other one composites uniform tiles and reads
+    /// back texel 0.
+    ///
+    /// Both layers are [`patterned_texels`] with *different* seeds, so
+    /// red varies with `x`, green with `y`, and blue with the quadrant,
+    /// and the result genuinely varies texel to texel. The accumulator is
+    /// built by a real `composite_over_with_opacity` render pass rather
+    /// than seeded, and the **whole** `TILE`x`TILE` result is compared
+    /// against [`composite_tile_cpu`]'s own output via [`read_rgba8`] and
+    /// its CPU twin [`rgba8_of`].
+    ///
+    /// A bind-group transpose is worth calling out for this mode in
+    /// particular: `Screen`'s own `B` is symmetric in `Cb`/`Cs`, so a
+    /// transpose is *not* caught by the blend term alone — it is caught
+    /// by the surrounding "over", which is not symmetric, and by the
+    /// per-texel spatial comparison here. That is why this test matters
+    /// more for `Screen` than the commutativity might suggest.
+    ///
+    /// Tolerance is `1` out of 255, the same reasoning
+    /// `composite_over_matches_the_golden_image` documents.
+    fn composite_screen_over_with_opacity_matches_the_cpu_across_a_spatially_varying_tile() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_texels = patterned_texels(0, 1.0);
+        let top_texels = patterned_texels(1, 0.75);
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = tile_from_texels(device, queue, &top_texels, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_screen_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        // The accumulator itself must have survived its render pass
+        // texel-for-texel first, or a spatial failure downstream would
+        // be ambiguous between the two passes.
+        let gpu_accumulator = read_rgba8(device, queue, &backdrop);
+        let expected_accumulator = rgba8_of(&bottom_texels);
+        assert_whole_tile_matches(
+            &gpu_accumulator,
+            &expected_accumulator,
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             patterned bottom layer texel for texel, or the Screen comparison below cannot \
+             attribute a spatial failure",
+        );
+
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::Screen),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader Screen path and composite_tile_cpu disagree somewhere on a \
+             spatially-varying tile. A whole-tile disagreement of this kind is a wrong-texel \
+             bug (V-flip, transpose, UV offset, transposed binding), not precision.",
+        );
+    }
+
+    #[test]
+    /// A non-`1.0` opacity on the `Screen` path, exercising the
+    /// `s.a * opacity.value` scale the shader relies on the Rust caller
+    /// to have clamped. The counterpart of
+    /// `composite_lighten_over_with_opacity_at_half_opacity_matches_the_cpu`.
+    ///
+    /// The expected value comes from the real [`composite_tile_cpu`]
+    /// with the same two layers and the same `0.5`. Non-grey,
+    /// per-channel-distinct colours are used so a channel swizzle
+    /// anywhere in the path fails here too.
+    ///
+    /// **The `Lighten` sibling's fixture could not be reused.** Its
+    /// source is `(0.25, 0.5, 1.0)`, and `Screen(Cb, 1.0) = 1.0` for
+    /// every `Cb` — the blue channel would have gone constant and stopped
+    /// discriminating anything. The source's blue is `0.75` here instead,
+    /// which keeps all three channels inside `(0, 1)`. The resulting
+    /// golden `(0.5625, 0.8125, 0.53125)` differs from `Normal`'s
+    /// `(0.375, 0.625, 0.5)`, `Multiply`'s `(0.3125, 0.5625, 0.21875)`,
+    /// `Darken`'s `(0.375, 0.625, 0.25)` and `Lighten`'s
+    /// `(0.5, 0.75, 0.5)` in every channel.
+    fn composite_screen_over_with_opacity_at_half_opacity_matches_the_cpu() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.5, 0.75, 0.25, 1.0];
+        let top_rgba = [0.25, 0.5, 0.75, 1.0];
+        let opacity = 0.5;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_screen_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::Screen),
+        ]));
+        assert_eq!(
+            cpu_result,
+            (0.5625, 0.8125, 0.53125, 1.0),
+            "setup: the golden named in this test's doc comment must be what composite_tile_cpu \
+             itself computes -- if this fails, the literal is stale, not the GPU"
+        );
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: the in-shader Screen path and composite_tile_cpu diverged \
+                 by more than {tolerance} at opacity {opacity} ({gpu} vs {cpu}). Full texels: \
+                 {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// **`fs_composite_screen` deliberately does not clamp
+    /// `s.a * opacity.value`** — only `opacity` itself is clamped, and it
+    /// is clamped Rust-side in `composite_blend_over_with_opacity`,
+    /// mirroring `composite_layer_into`'s own `let opacity =
+    /// opacity.clamp(0.0, 1.0)` followed by an unclamped `sa * opacity`.
+    /// `f16` can legally hold a source alpha above `1.0` (invariant
+    /// §7.3.1b), so this is a real input, not a synthetic one. The
+    /// counterpart of
+    /// `composite_lighten_over_with_opacity_does_not_clamp_a_source_alpha_above_one`,
+    /// kept for the reason 0.95.1 had to restore that one: this asserts a
+    /// line *inside this entry point*, and each WGSL fragment function is
+    /// separately compiled, so no other mode's suite covers it.
+    ///
+    /// **Why the fixture separates all three channels.** With a source
+    /// alpha of `2.0` the fold's `inv = 1.0 - a` goes negative, so the
+    /// clamped and unclamped answers differ by exactly `b - cb` per
+    /// channel. For `Screen` that difference is `Cs * (1 - Cb)`, which
+    /// vanishes only where `Cs == 0` or `Cb == 1` — so unlike `Lighten`,
+    /// where the backdrop winning a channel silently zeroed the
+    /// difference there, any fixture strictly inside `(0, 1)` separates
+    /// every channel. This one does:
+    ///
+    /// - `cb = (0.5, 0.25, 0.375)`, `Cs = (0.25, 0.75, 0.5)`, so
+    ///   `b = Cb + Cs - Cb*Cs = (0.625, 0.8125, 0.6875)`;
+    /// - unclamped (`a = 2.0`, `inv = -1.0`):
+    ///   `-cb + 2b = (0.75, 1.375, 1.0)` at alpha `2.0 - 1.0 = 1.0`;
+    /// - clamped (`a = 1.0`, `inv = 0.0`): `b = (0.625, 0.8125, 0.6875)`,
+    ///   at the same alpha `1.0` — so **alpha alone cannot catch this**,
+    ///   and the colour channels are what the assertion rests on.
+    ///
+    /// Every value is an exact binary fraction, and the absolute golden
+    /// is asserted alongside the [`composite_tile_cpu`] differential so a
+    /// clamp added to *both* implementations could not pass either.
+    fn composite_screen_over_with_opacity_does_not_clamp_a_source_alpha_above_one() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        let bottom_rgba = [0.5, 0.25, 0.375, 1.0];
+        let top_rgba = [0.25, 0.75, 0.5, 2.0]; // alpha > 1.0, legal in f16
+        let opacity = 1.0;
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = solid_tile(device, queue, bottom_rgba, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_screen_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                opacity,
+            );
+        });
+
+        let bottom_texels = solid_texels(bottom_rgba);
+        let top_texels = solid_texels(top_rgba);
+        let cpu_result = first_texel(&composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, opacity, BlendMode::Screen),
+        ]));
+        let gpu_result = read_first_texel(device, queue, &dst);
+
+        let tolerance = 2.0 * f32::from(f16::EPSILON);
+        let (gr, gg, gb, ga) = gpu_result;
+        let (cr, cg, cb, ca) = cpu_result;
+        for (gpu, cpu, channel) in [(gr, cr, "r"), (gg, cg, "g"), (gb, cb, "b"), (ga, ca, "a")] {
+            assert!(
+                (gpu - cpu).abs() <= tolerance,
+                "channel {channel}: a source alpha above 1.0 must reach composite_tile_cpu's \
+                 own formula unclamped, not silently clamped to 1.0 first ({gpu} vs {cpu}). \
+                 Full texels: {gpu_result:?} vs {cpu_result:?}"
+            );
+        }
+
+        // The absolute golden, hand-derived in the doc comment above.
+        // A `min(s.a * opacity.value, 1.0)` in `fs_composite_screen`
+        // yields (0.625, 0.8125, 0.6875, 1.0) instead -- alpha agrees,
+        // which is why this is asserted per channel rather than as a
+        // single texel comparison whose message would not say where.
+        for (gpu, expected, channel) in [
+            (gr, 0.75, "r"),
+            (gg, 1.375, "g"),
+            (gb, 1.0, "b"),
+            (ga, 1.0, "a"),
+        ] {
+            assert!(
+                (gpu - expected).abs() <= tolerance,
+                "channel {channel}: expected {expected} from the unclamped fold; got {gpu}. \
+                 (0.625, 0.8125, 0.6875, 1.0) would mean fs_composite_screen clamped the \
+                 s.a * opacity product. Full texel: {gpu_result:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// The `if (ab > 0.0)` guard's **untaken** branch in
+    /// `fs_composite_screen`, on real hardware — the counterpart of
+    /// `composite_lighten_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`.
+    ///
+    /// Whether a shader compiler flattens that branch and evaluates the
+    /// `0.0 / 0.0` on both sides is a property of the *backend*, not of
+    /// the entry point, so proving it for `fs_composite_lighten` does not
+    /// prove it here: this is a fourth, separately-compiled function, and
+    /// its blend line is *arithmetic* on `cb` rather than a `min`/`max`
+    /// intrinsic — `NaN + x - NaN * x` propagates rather than being
+    /// selected away, which if anything makes this the most likely of the
+    /// four entry points to leak a `NaN` if the branch is flattened.
+    ///
+    /// Where `ab == 0.0` the whole composite reduces to the source alone,
+    /// so that half of the tile is asserted to be exactly that — a `NaN`
+    /// leaking out of the untaken divide would fail both the finiteness
+    /// check and the value check, and (`NaN != NaN`) could not be
+    /// mistaken for a pass.
+    ///
+    /// **The backdrop is deliberately half transparent, not uniformly so**
+    /// — the reason 0.95.1 gives for the `Lighten` sibling applies
+    /// verbatim: with `ab == 0` everywhere, the mode-dependent term `b`
+    /// is multiplied by zero in every texel, so a uniform fixture cannot
+    /// distinguish this entry point's formula from any other's. With
+    /// [`half_transparent_texels`]'s opaque half at `(0.75, 0.25, 0.5)`
+    /// and a `(0.25, 0.5, 0.75)` source:
+    ///
+    /// - left half (`ab == 0`): `blended = Cs`, `out = Cs` — the untaken
+    ///   branch, `(0.25, 0.5, 0.75, 1.0)`;
+    /// - right half (`ab == 1`): `out = Cb + Cs - Cb*Cs =
+    ///   (0.8125, 0.625, 0.875)`, where `Normal` gives
+    ///   `(0.25, 0.5, 0.75)`, `Multiply` `(0.1875, 0.125, 0.375)`,
+    ///   `Darken` `(0.25, 0.25, 0.5)` and `Lighten` `(0.75, 0.5, 0.75)` —
+    ///   every one of them differing in all three channels.
+    ///
+    /// A `NaN` in the left half is still caught by the whole-tile
+    /// comparison as well as by the explicit finiteness check on texel 0:
+    /// [`read_rgba8`]'s `clamp` maps `NaN` to `0`, which cannot match the
+    /// CPU reference's real value there.
+    ///
+    /// Verified on Vulkan/NVIDIA only. Metal's and DX12's own shader
+    /// compilers are unverified for this specific branch.
+    fn composite_screen_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+
+        // Deliberately non-symmetric across channels, so a contaminated
+        // channel cannot hide behind an equal one, and strictly inside
+        // (0, 1) so neither of Screen's degeneracies is in play.
+        let top_rgba = [0.25, 0.5, 0.75, 1.0];
+        let bottom_texels = half_transparent_texels();
+
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        // A real render pass builds the accumulator, rather than seeding
+        // it: the zero-alpha half is produced by the same mechanism under
+        // test, not written directly.
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = solid_tile(device, queue, top_rgba, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_screen_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+
+        // Texel 0 is in the transparent half, and `f16` equality pins its
+        // alpha at exactly zero -- something the 8-bit whole-tile
+        // comparison below cannot do, since a tiny non-zero alpha would
+        // quantise to 0 there.
+        let gpu_accumulator = read_first_texel(device, queue, &backdrop);
+        assert_eq!(
+            gpu_accumulator,
+            (0.0, 0.0, 0.0, 0.0),
+            "setup: this test is only meaningful if the accumulator's left half is genuinely \
+             zero-alpha"
+        );
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &backdrop),
+            &rgba8_of(&bottom_texels),
+            "setup: the Normal-blend pass that builds the accumulator must reproduce the \
+             half-transparent bottom layer texel for texel, or neither half's assertion below \
+             means what it claims",
+        );
+
+        let gpu_result = read_first_texel(device, queue, &dst);
+        let (r, g, b, a) = gpu_result;
+        assert!(
+            r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite(),
+            "a NaN or infinity escaped the untaken `ab > 0.0` branch: {gpu_result:?}. That is a \
+             real finding about this backend's shader compiler, not a reason to relax this test."
+        );
+        assert_eq!(
+            gpu_result,
+            (0.25, 0.5, 0.75, 1.0),
+            "where the accumulator is empty the composite is the source alone"
+        );
+
+        let top_texels = solid_texels(top_rgba);
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::Screen),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader Screen path and composite_tile_cpu disagree across a half-transparent \
+             backdrop. In the opaque half a wrong blend formula shows up here; in the \
+             transparent half a NaN out of the untaken `ab > 0.0` branch does.",
         );
     }
 
