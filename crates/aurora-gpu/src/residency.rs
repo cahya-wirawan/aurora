@@ -1764,6 +1764,18 @@ impl TileResidency {
     /// `lod_max_clamp`, and what wiring progressive rendering would
     /// actually take.
     ///
+    /// **This call reaches the `rayon`-parallel serializer path
+    /// [`Self::sync`]'s own frame-path call deliberately does not, as of
+    /// 0.96.2** — see that method's own doc for the measured whole-frame
+    /// regression under CPU contention that decision is based on. Fine
+    /// today because `upload_mip` has no `aurora-app` call site (nothing
+    /// calls it on a real frame yet). Whoever wires up progressive
+    /// rendering and puts a real per-frame caller behind this method
+    /// inherits that same regression risk silently, without a new
+    /// decision being forced — re-read `sync`'s comment and re-measure
+    /// under contention before shipping that wiring, rather than
+    /// assuming this path is exempt because it once was.
+    ///
     /// # Errors
     ///
     /// Returns [`GpuError::InvalidMipLevel`] if `mip_level` is not in
