@@ -106,14 +106,13 @@ const LABEL_LINEAR_DODGE_PASS: &str = "composite.linear_dodge.pass";
 /// entry point, and the four `wgpu` debug labels that name its pipeline,
 /// uniform buffer, bind group and render pass.
 ///
-/// This is the whole variation between
-/// [`TileCompositor::composite_multiply_over_with_opacity`],
-/// [`TileCompositor::composite_darken_over_with_opacity`],
-/// [`TileCompositor::composite_lighten_over_with_opacity`],
-/// [`TileCompositor::composite_screen_over_with_opacity`] and
-/// [`TileCompositor::composite_difference_over_with_opacity`] and
-/// [`TileCompositor::composite_linear_dodge_over_with_opacity`] — five
-/// `&'static str`s. Everything else those six methods do is
+/// This is the whole variation between every one of
+/// [`TileCompositor`]'s blend-math `composite_*_over_with_opacity`
+/// methods — `composite_multiply_over_with_opacity` and its
+/// `darken`/`lighten`/`screen`/`difference`/`linear_dodge` siblings,
+/// deliberately named as a family rather than relisted here, since the
+/// list grows by one every time a mode is ported — five
+/// `&'static str`s. Everything else those methods do is
 /// `composite_blend_over_with_opacity`, which they all
 /// delegate to; see that method for why the collapse was safe to
 /// make at two modes rather than deferred to a third. (`Lighten`, the
@@ -1459,14 +1458,13 @@ pub struct TileCompositor {
     /// addition.
     bind_group_layout_opacity: wgpu::BindGroupLayout,
     /// The blend-math sibling of
-    /// `bind_group_layout_opacity` above, shared by
-    /// [`Self::composite_multiply_over_with_opacity`],
-    /// [`Self::composite_darken_over_with_opacity`],
-    /// [`Self::composite_lighten_over_with_opacity`],
-    /// [`Self::composite_screen_over_with_opacity`] and
-    /// [`Self::composite_difference_over_with_opacity`] and
-    /// [`Self::composite_linear_dodge_over_with_opacity`]: the same texture +
-    /// sampler +
+    /// `bind_group_layout_opacity` above, shared by every
+    /// `composite_*_over_with_opacity` blend-math method — as of 0.105.0
+    /// [`Self::composite_multiply_over_with_opacity`] and its
+    /// `darken`/`lighten`/`screen`/`difference`/`linear_dodge` siblings,
+    /// named as a family rather than relisted, because a new mode joins
+    /// the list every time one is ported and this layout is untouched by
+    /// that: the same texture + sampler +
     /// opacity-uniform triple, plus a fourth binding for the *backdrop*
     /// texture the shader samples instead of reaching it through the
     /// fixed-function blend unit. Kept entirely separate from both

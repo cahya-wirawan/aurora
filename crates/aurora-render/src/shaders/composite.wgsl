@@ -77,12 +77,12 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // fixed-function entry point's own layout gains an entry.
 //
 // Named `backdrop_tex` after the Rust parameter it is actually bound to
-// (`TileCompositor::composite_multiply_over_with_opacity`'s,
-// `composite_darken_over_with_opacity`'s,
-// `composite_lighten_over_with_opacity`'s,
-// `composite_screen_over_with_opacity`'s and
-// `composite_difference_over_with_opacity`'s and
-// `composite_linear_dodge_over_with_opacity`'s `backdrop`),
+// -- the `backdrop` of every `TileCompositor::composite_*_over_with_
+// opacity` blend-math method (as of 0.105.0
+// `composite_multiply_over_with_opacity` and its
+// `darken`/`lighten`/`screen`/`difference`/`linear_dodge` siblings, named
+// as a family rather than relisted, since one more joins them every time
+// a mode is ported) --
 // deliberately *not* `dst_tex`: `dst` on the Rust side is the render
 // target this entry point writes to, which is a different texture
 // entirely and must never alias this one. Calling the sampled backdrop
@@ -91,9 +91,9 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // still the only ported mode and the 25 then-unported ones had yet to be
 // written against this file. That "25" is the 0.83.1 count and is not
 // maintained here; `Darken` (0.85.0), `Lighten` (0.95.0), `Screen`
-// (0.102.0) and `Difference` (0.104.0) have since landed, and the live
-// numbers live in `TileCompositor`'s own doc comment. `LinearDodge`
-// (0.105.0) landed after that list was written and is included above.
+// (0.102.0), `Difference` (0.104.0) and `LinearDodge` (0.105.0) have
+// since landed, and the live numbers live in `TileCompositor`'s own doc
+// comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)

@@ -19131,7 +19131,8 @@ severity choice.
   paragraph is a hand-maintained prose summary whose own header says
   PLAN.md wins on any disagreement, and rewriting it is a separate,
   reviewable decision rather than a silent side effect of a blend-mode
-  round. Flagged for the maintainer.
+  round. Flagged for the maintainer. **Done in 0.105.1** (below), which
+  also closed the transpose gap this entry deferred, for `LinearDodge`.
 
   **Disk-space check, per 0.102.1's named follow-on** and 0.104.1's
   promotion of it to a hard precondition. Checked before starting:
@@ -19140,6 +19141,117 @@ severity choice.
   Comfortably above the threshold, so nothing was cleaned mid-round.
   Performed by hand again rather than automated — still a candidate
   follow-on, still not built.
+
+- [x] **0.105.0's review follow-ups: the `LinearDodge` dispatch-arm
+  transpose gap actually closed, and five documentation corrections —
+  done 2026-09-04 (0.105.1).** A correction round on top of 0.105.0's
+  landed work. No behavioural change: the only non-comment edits are one
+  test fixture's opacity, that test's golden, and the version.
+
+  **The one real fix, and it is a coverage fix, not a prose one.** 0.105.0
+  disclosed that transposing the `src`/`backdrop` arguments in
+  `begin_gpu_composite_tile`'s `LinearDodge` arm was a total test
+  survivor, and named the closing fix as a follow-on. It is now done, by
+  the exact mechanism that entry predicted: the `LinearDodge` layer in
+  `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document`
+  moved from opacity `1.0` to `0.5`. With `a = 0.5` the outer fold
+  `out = (1 - a) * bd + a * blended` is no longer the identity on
+  `blended`, so the *asymmetry* of the fold exposes the swap even though
+  `min(Cb + Cs, 1)` itself is symmetric. Hand-derived golden:
+  `B = min((0.125, 0.375, 0.25) + (0.25, 0.875, 0.5), 1) =
+  (0.375, 1.0, 0.75)`, so `out = 0.5 * (0.125, 0.375, 0.25) + 0.5 * B =
+  **(0.25, 0.6875, 0.5)**, alpha `0.5 + 1.0 * 0.5 = 1.0`. Every value is
+  an exact binary fraction, so the assertion stays absolute. The fixture
+  still straddles the clamp (green's pre-clamp sum is `1.25`), so the
+  clamp discriminator that motivated 0.105.0's operand choice survives
+  the change — a clampless shader now writes `0.8125` in green instead of
+  `1.25`, still well clear of `0.6875`.
+
+  **Mutation-run proof, really run on real hardware** (RTX 3090, Vulkan,
+  `DiscreteGpu`; `AURORA_REQUIRE_GPU=1`), not reasoned about:
+
+  | state | result |
+  |---|---|
+  | fixture fixed, arm correct | 2 passed, 0 failed |
+  | fixture fixed, arm transposed | **1 failed** — `(0.3125, 0.9375, 0.625, 1.0)` vs `(0.25, 0.6875, 0.5, 1.0)`, diverging in all three channels |
+  | arm reverted | 2 passed, 0 failed |
+
+  The transposed value matched the hand-derivation exactly before the run,
+  and the differential (`assert_gpu_matches_cpu`) is what reported it —
+  the CPU path is untouched by an app-side GPU dispatch arm, so it
+  genuinely diverges rather than moving in step.
+
+  **Escalated to all six blend-math arms, one at a time, which corrected
+  the reviewers' own account of the gap.** Review reported the survivors
+  as `Screen`, `Difference` and `LinearDodge`. Transposing each arm
+  individually and running `aurora-app`'s whole test binary each time
+  measured otherwise:
+
+  | arm transposed alone | outcome |
+  |---|---|
+  | `Multiply` | killed — 2 tests |
+  | `Darken` | killed — 1 test |
+  | `Lighten` | **survived** — 396 passed, 0 failed |
+  | `Screen` | **survived** — 396 passed, 0 failed |
+  | `Difference` | **survived** — 396 passed, 0 failed |
+  | `LinearDodge` | killed — 1 test (after this round's fixture fix) |
+
+  So `Lighten` (0.95.0) is a third uncovered arm nobody had named, and
+  `Darken`'s coverage is genuinely its own rather than an artefact of the
+  `Multiply` layer sharing its fixture. **Named, open follow-on**: three
+  arms — `Lighten`, `Screen`, `Difference` — still have no dispatch-arm
+  transpose coverage. The fix is now proven rather than hypothesised (set
+  that mode's own layer non-opaque, re-derive the golden), and is
+  deliberately left to a future round rather than retrofitted into three
+  already-shipped, already-reviewed ones.
+
+  **Five documentation corrections**, each a factual error rather than a
+  wording preference:
+
+  - `recomposite_visible_tiles`' own doc comment listed four ported
+    blend-math modes, omitting `Difference` (0.104.0) and `LinearDodge`
+    (0.105.0), and stated the CPU-only counts as 20 and 21 where the
+    crates' own maintained counts are **19** and **20**. It now points at
+    `document_qualifies_for_gpu_compositing`'s maintained list instead of
+    duplicating it, since duplicating it is what drifted twice.
+  - The `LinearDodge` test's own transpose note claimed the fixture
+    "structurally cannot see" the transpose (it was a fixture *choice*,
+    now changed) and that `aurora-render`'s spatial differential "covers"
+    the dispatch arm (it structurally cannot — `aurora-render` cannot
+    depend on `aurora-app`, PRD §7.2, so no test there reaches that
+    `match`). Both corrected, with the measured survivor table above
+    recorded alongside.
+  - The Finding-1 disclosure said the drift cost "a year of false
+    coverage" → **a round**, matching its own sentence three lines
+    earlier. This project's versions are not calendar-dated.
+  - The same comment said the loop "claimed eight modes and covered six"
+    between 0.104.0 and 0.105.0 → **seven**; the predicate admitted seven
+    in that window, and eight is only the count after `LinearDodge`.
+  - `CLAUDE.md`'s status line and M1.10 counts, the deferral recorded
+    directly above: now "As of `0.105.1`", **19 of 27** / **20 of 26**,
+    1,688 tests (measured, not estimated), ~120,400 lines.
+
+  Plus two cosmetic ones: three enumerations that had accumulated a
+  duplicated "and" from serial per-round insertion now name the
+  `composite_*_over_with_opacity` methods as a family, so they stop
+  needing a per-round edit; and two ordinals in
+  `document_qualifies_for_gpu_compositing`'s doc block that collided with
+  a different ordinal system 56 lines above (counter-acquisition order vs.
+  port order, which disagree by one because `Normal` is ported but
+  uncounted) are gone, with the collision itself explained.
+
+  **Full local gate green** in CI's own order: `cargo fmt --all --check`,
+  `scripts/check_layering.py`, `scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` (**1,688 passed, 0 failed, 10 ignored**),
+  `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc
+  --workspace --no-deps --all-features`, `cargo deny check all`
+  (advisories, bans, licenses, sources all ok).
+
+  **Disk-space check**, per 0.104.1's hard precondition. `/home` at 77%
+  used, **93G free** of 403G before starting. Above threshold, so nothing
+  was cleaned.
 
 ### M1.10 — Phase 1 gate
 
@@ -23984,6 +24096,34 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-04 (0.105.1) — 0.105.0's review follow-ups: the
+`LinearDodge` dispatch-arm transpose gap is closed for real, and the
+survivor set turned out to be larger than review reported.** A correction
+round. The counts below are unchanged from 0.105.0 — no mode was ported.
+
+The substantive change is one fixture: the `LinearDodge` layer in
+`recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document`
+now sits at opacity `0.5` rather than `1.0`, which makes the outer "over"
+fold asymmetric and so makes a transposed `src`/`backdrop` binding in
+`begin_gpu_composite_tile`'s own dispatch arm observable. New hand-derived
+golden `(0.25, 0.6875, 0.5, 1.0)`; the transpose yields
+`(0.3125, 0.9375, 0.625, 1.0)`, diverging in all three channels.
+**Proved by really running the mutation** on an RTX 3090 under
+`AURORA_REQUIRE_GPU=1`: correct arm 2 passed, transposed arm 1 failed with
+exactly the predicted texel, reverted arm 2 passed.
+
+Escalating that one mutation to each of the six blend-math arms in turn
+**corrected review's own account of the gap**: the survivors are `Lighten`,
+`Screen` and `Difference` — not `Screen`, `Difference` and `LinearDodge` as
+reported. `Lighten` (0.95.0) is a third uncovered arm nobody had named, and
+`Darken`'s coverage is its own rather than an artefact of the `Multiply`
+layer in its fixture. Those three arms are a **named, open follow-on** with
+a now-proven fix, deliberately not retrofitted into three already-shipped
+rounds. See the 0.105.1 M1.10 entry for both tables and the five
+documentation corrections (two stale mode lists, two arithmetic/scale
+errors in the Finding-1 disclosure, and `CLAUDE.md`'s counts, which
+0.105.0 deferred).
+
 **Addendum 2026-09-04 (0.105.0) — `BlendMode::LinearDodge` is on the GPU
 path; the sixth WGSL blend-math entry point, and the round that found a
 real drift bug left behind by the fifth.** **8 of 27**
@@ -24007,8 +24147,11 @@ test names, and four findings this round is obliged to carry:
   `Difference` at the GPU predicate but never added it to
   `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode`,
   whose own comment states that the list must keep pace with the predicate.
-  For a full round that test's name claimed eight modes and its loop covered
-  six. Both `Difference` and `LinearDodge` were added. **No real failure
+  For a full round that test's name claimed seven modes and its loop covered
+  six (seven, not eight — the predicate admitted seven in the 0.104.0-to-
+  0.105.0 window; `LinearDodge` is what made it eight, and only in the round
+  that fixed this. Corrected in 0.105.1.). Both `Difference` and
+  `LinearDodge` were added. **No real failure
   surfaced** — the property genuinely holds for both — so the cost was a
   round of false coverage, not a shipped bug; but the fix is not cosmetic,
   since mutation (d) is now killed by that loop as one of three killers.
