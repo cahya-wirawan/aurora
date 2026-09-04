@@ -7,6 +7,7 @@
 use aurora_gpu::{Blend, GpuContext, PipelineCache, PipelineKey};
 use aurora_tile::{CHANNELS, SAMPLES};
 use half::f16;
+use half::slice::HalfFloatSliceExt;
 
 const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
 const LABEL: &str = "composite";
@@ -138,6 +139,28 @@ const BLEND_PASS_LIGHTEN: BlendPass = BlendPass {
 /// a real `f32` opacity value plus 12 bytes of padding, matching
 /// `shaders/composite.wgsl`'s own `Opacity` struct exactly.
 const OPACITY_UNIFORM_SIZE: u64 = 16;
+
+/// Texels converted per vectorized chunk in [`composite_layer_into`] —
+/// the same 64 `aurora_gpu::residency`'s own serializer chose in 0.92.0
+/// and for the same reason: 64 texels is [`CHUNK_SAMPLES`] = 256
+/// samples, so each of that function's two `f32` scratch arrays is 1 KiB
+/// and stays in L1, while [`SAMPLES`] `/ CHUNK_SAMPLES` is exactly 1,024
+/// — a real whole-tile fold never reaches the scalar remainder at all.
+/// Pinned by `the_chunk_constants_divide_a_whole_tile_evenly` rather
+/// than left implied.
+///
+/// Declared here rather than shared with `aurora_gpu::residency` because
+/// that crate's copy is private, and reaching into another crate's
+/// internals for a tuning constant would be worse than two documented
+/// declarations of the same number. (`aurora-render` does depend on
+/// `aurora-gpu`, so the *dependency* would be legal under PRD §7.2 —
+/// what makes it wrong is coupling this loop's cache tuning to an
+/// unrelated module's, not the layering.)
+const CHUNK_TEXELS: usize = 64;
+/// [`CHUNK_TEXELS`] texels' worth of `f16` samples — the length of both
+/// `f32` scratch arrays in [`composite_layer_into`], and the granularity
+/// its two input slices are split at.
+const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
 
 /// The subset of `aurora_doc::BlendMode`'s real 27-variant, PSD-
 /// round-trippable enum this crate actually implements blend math for.
@@ -685,6 +708,58 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
     }
 }
 
+/// One texel of [`composite_layer_into`]'s fold, in `f32` — the single
+/// spelling of the blend math. The vectorized chunk loop and the scalar
+/// remainder loop both call it, so they cannot drift apart the way two
+/// hand-written copies would (the same reason
+/// `aurora_gpu::residency`'s `write_texel_le_bytes` exists).
+///
+/// `opacity` is already clamped by the caller. Every expression below is
+/// verbatim what [`composite_layer_into`]'s pre-0.98.0 body computed,
+/// with the `to_f32()`/`from_f32()` calls lifted out to its callers —
+/// the arithmetic, its operand order, and the `backdrop_alpha > 0.0`
+/// branch are unchanged, which is what makes the vectorized path
+/// bit-exact with the scalar one it replaces. See
+/// [`composite_layer_into`]'s own "Vectorized conversion" section for
+/// the full bit-exactness argument and its one disclosed caveat.
+#[inline]
+fn fold_texel(
+    dst: [f32; CHANNELS],
+    src: [f32; CHANNELS],
+    opacity: f32,
+    mode: BlendMode,
+) -> [f32; CHANNELS] {
+    let [dr, dg, db, da] = dst;
+    let [sr, sg, sb, sa] = src;
+    let alpha = sa * opacity;
+    let inverse = 1.0 - alpha;
+    let backdrop_alpha = da;
+    let backdrop_inverse = 1.0 - backdrop_alpha;
+    // Recover the backdrop's true straight-alpha colour before handing
+    // it to `blend_rgb` as `Cb` -- see `composite_layer_into`'s own doc
+    // comment for why the raw accumulator state isn't always already
+    // straight alpha.
+    let straight_backdrop = if backdrop_alpha > 0.0 {
+        [
+            dr / backdrop_alpha,
+            dg / backdrop_alpha,
+            db / backdrop_alpha,
+        ]
+    } else {
+        [0.0, 0.0, 0.0]
+    };
+    let [br, bg, bb] = blend_rgb(mode, straight_backdrop, [sr, sg, sb]);
+    let blended_r = backdrop_inverse * sr + backdrop_alpha * br;
+    let blended_g = backdrop_inverse * sg + backdrop_alpha * bg;
+    let blended_b = backdrop_inverse * sb + backdrop_alpha * bb;
+    [
+        inverse * dr + alpha * blended_r,
+        inverse * dg + alpha * blended_g,
+        inverse * db + alpha * blended_b,
+        alpha + da * inverse,
+    ]
+}
+
 /// Folds exactly one layer into `out`, a running accumulator, **in
 /// place** — the per-layer step [`composite_tile_cpu`] runs once per
 /// layer, exposed as its own primitive so that a caller which resolves
@@ -809,43 +884,166 @@ fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// for a worked example, and `aurora-app`'s own `resolve_tile` doc
 /// comment for how this closes the gap that function's group-isolation
 /// path used to leave open.
+///
+/// # Vectorized conversion (0.98.0)
+///
+/// The blend math itself is unchanged and still scalar; what changed is
+/// how `f16` samples reach and leave it. The pre-0.98.0 body called
+/// `f16::to_f32` once per *use* and `f16::from_f32` once per written
+/// channel, so a single texel paid on the order of nineteen scalar
+/// `vcvtph2ps`/`vcvtps2ph` instructions on the `backdrop_alpha > 0.0`
+/// arm (sixteen on the transparent arm) — eight distinct inputs, several
+/// read more than once, plus four narrowing writes. Those are now done a
+/// chunk at a time through [`half::slice::HalfFloatSliceExt`]'s
+/// `convert_to_f32_slice`/`convert_from_f32_slice`, which reach the same
+/// F16C instructions eight lanes at a time behind one feature-detection
+/// check per call rather than per sample. This is the exact precedent
+/// `aurora_gpu::residency`'s own serializer set in 0.92.0 (see
+/// `serialize_premultiplied_le_bytes`), applied to the other CPU-side
+/// `f16` hot loop in the workspace.
+///
+/// **This is not progress against the 60 FPS gate.** It shrinks a
+/// constant factor on the CPU compositing *fallback* path; it does not
+/// change the measured pan-while-painting numbers in CLAUDE.md, and it
+/// composes with — rather than replaces — the still-open conditional-
+/// parallelization question 0.97.1 left registered. Read the real
+/// before/after numbers off PLAN.md's own 0.98.0 entry, not off this
+/// comment.
+///
+/// **Why the two slices are split at one shared offset, not chunked
+/// independently.** `aurora_gpu::residency`'s serializer chunks *one*
+/// input slice and zips a separately-derived output sink, so it can take
+/// that single slice's own `chunks_exact(..).remainder()` for its tail.
+/// This function chunks *two* slices that must stay in lockstep, and
+/// `out` and `texels` are not guaranteed to be the same length (see the
+/// length-mismatch section above — five separate producers, not one
+/// invariant). Taking each side's own `remainder()` would start the two
+/// tails at *different* offsets whenever the two slices have different
+/// whole-chunk counts, silently compositing texel *i* of one slice
+/// against texel *j* of the other and processing a different number of
+/// texels than the original single `zip` did. So the split point is
+/// computed once, from `min(out.len(), texels.len())` rounded down to a
+/// whole chunk, and applied to both slices.
+/// `mismatched_length_folds_match_the_scalar_reference` pins that
+/// against a verbatim copy of the pre-0.98.0 loop.
+///
+/// **Bit-exactness.** `convert_to_f32_slice`/`convert_from_f32_slice`
+/// are the same `half` conversions `to_f32`/`from_f32` perform, batched;
+/// the private `fold_texel` below holds the arithmetic verbatim, in the same operand
+/// order; and no sample is ever round-tripped `f16` → `f32` → `f16`
+/// without being computed, because all four of a processed texel's
+/// channels are computed values. (That last point is where the 0.92.0
+/// "take alpha from the original chunk, never the round-tripped scratch
+/// buffer" rule does *not* transfer: there is no passthrough channel
+/// inside a texel here. Its real analogue is the region *outside* the
+/// fold — nothing past `min(out.len(), texels.len())` may be read or
+/// written, which the shared split point gives for free and
+/// `an_over_long_accumulator_keeps_its_tail_bits_untouched` pins.)
+/// `vectorized_fold_is_bit_identical_to_the_scalar_reference` asserts
+/// `to_bits()` equality against that verbatim scalar copy across every
+/// [`BlendMode`], six opacities including two that exercise the clamp,
+/// and fixtures carrying both signed zeros, both infinities, both
+/// subnormal extremes, and a quiet and a signalling NaN.
+///
+/// **Carried-forward caveat, not chased here.** 0.92.1 measured that two
+/// different auto-vectorizations of the same `f32` arithmetic can pick a
+/// different operand's payload when *both* operands of an operation are
+/// NaN, and that which one wins is release-profile-dependent. That risk
+/// applies to this loop for the same reason and is disclosed rather than
+/// closed: the bit-exactness test above is run in both profiles, and any
+/// divergence found is expected to be narrowed at the specific assertion
+/// with a named reason, exactly as 0.92.1 did — not papered over by
+/// weakening the test.
+///
+/// **Panics: none, by construction.**
+///
+/// * The `let [dr, dg, db, da] = dst else { continue }` slice patterns
+///   are matched against chunks yielded by `chunks_exact(CHANNELS)` /
+///   `chunks_exact_mut(CHANNELS)`, which by definition yields slices of
+///   exactly [`CHANNELS`] elements — the `else { continue }` arm is
+///   unreachable and exists only because the workspace denies
+///   `indexing_slicing` and `unwrap`, so a refutable pattern needs a
+///   fallback. This is the same shape the pre-0.98.0 loop already used.
+/// * `convert_to_f32_slice`/`convert_from_f32_slice`'s only failure mode
+///   is a length-mismatch assertion. Both operands of every call below
+///   are a `CHUNK_SAMPLES`-length chunk from
+///   `chunks_exact(CHUNK_SAMPLES)` and a fixed-size
+///   `[f32; CHUNK_SAMPLES]` array, so the lengths are equal by
+///   construction and that assertion is unreachable.
+/// * `split_at_checked`/`split_at_mut_checked` are used instead of the
+///   panicking `split_at`/`split_at_mut`: the split point is
+///   `min(len, len)` rounded down, so it is always in bounds, but the
+///   checked API means there is no panic path to reason about at all —
+///   which matters more than usual given the release profile's
+///   `panic = "abort"`.
 pub fn composite_layer_into(out: &mut [f16], texels: &[f16], opacity: f32, mode: BlendMode) {
     let opacity = opacity.clamp(0.0, 1.0);
-    for (dst, src) in out
+    // One split point for *both* slices, so the two tails begin at the
+    // same offset and exactly as many texels are folded as the
+    // pre-0.98.0 `zip` folded. See this function's "Why the two slices
+    // are split at one shared offset" section: each side's own
+    // `chunks_exact(..).remainder()` -- the spelling
+    // `aurora_gpu::residency`'s single-input serializer can use -- would
+    // misalign the tail whenever the two chunk counts differ.
+    let vectorized = (out.len().min(texels.len()) / CHUNK_SAMPLES) * CHUNK_SAMPLES;
+    let Some((head_src, tail_src)) = texels.split_at_checked(vectorized) else {
+        return;
+    };
+    let Some((head_out, tail_out)) = out.split_at_mut_checked(vectorized) else {
+        return;
+    };
+
+    // `wide` names the sample width: these hold one chunk's `f16`
+    // samples widened to `f32` for the duration of that chunk's fold.
+    let mut dst_wide = [0f32; CHUNK_SAMPLES];
+    let mut src_wide = [0f32; CHUNK_SAMPLES];
+    for (dst_chunk, src_chunk) in head_out
+        .chunks_exact_mut(CHUNK_SAMPLES)
+        .zip(head_src.chunks_exact(CHUNK_SAMPLES))
+    {
+        // Two vectorized f16 -> f32 passes: 8 lanes per `vcvtph2ps`, one
+        // feature-detection check per slice rather than per sample.
+        dst_chunk.convert_to_f32_slice(&mut dst_wide);
+        src_chunk.convert_to_f32_slice(&mut src_wide);
+        for (dst, src) in dst_wide
+            .chunks_exact_mut(CHANNELS)
+            .zip(src_wide.chunks_exact(CHANNELS))
+        {
+            let [dr, dg, db, da] = dst else { continue };
+            let [sr, sg, sb, sa] = src else { continue };
+            let [nr, ng, nb, na] =
+                fold_texel([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, mode);
+            *dr = nr;
+            *dg = ng;
+            *db = nb;
+            *da = na;
+        }
+        // One vectorized f32 -> f16 pass: 8 lanes per `vcvtps2ph`. Every
+        // sample written back is a computed value, so unlike 0.92.0's
+        // serializer there is no channel that must come from the
+        // original `f16` chunk instead.
+        dst_chunk.convert_from_f32_slice(&dst_wide);
+    }
+
+    // The scalar tail. Unreachable for a real whole-tile fold
+    // (`SAMPLES % CHUNK_SAMPLES == 0`); it exists for the defensive and
+    // test-only lengths the length-mismatch section above describes.
+    for (dst, src) in tail_out
         .chunks_exact_mut(CHANNELS)
-        .zip(texels.chunks_exact(CHANNELS))
+        .zip(tail_src.chunks_exact(CHANNELS))
     {
         let [dr, dg, db, da] = dst else { continue };
         let [sr, sg, sb, sa] = src else { continue };
-        let alpha = sa.to_f32() * opacity;
-        let inverse = 1.0 - alpha;
-        let backdrop_alpha = da.to_f32();
-        let backdrop_inverse = 1.0 - backdrop_alpha;
-        // Recover the backdrop's true straight-alpha colour before
-        // handing it to `blend_rgb` as `Cb` -- see this function's
-        // own doc comment above for why the raw accumulator state
-        // isn't always already straight alpha.
-        let straight_backdrop = if backdrop_alpha > 0.0 {
-            [
-                dr.to_f32() / backdrop_alpha,
-                dg.to_f32() / backdrop_alpha,
-                db.to_f32() / backdrop_alpha,
-            ]
-        } else {
-            [0.0, 0.0, 0.0]
-        };
-        let [br, bg, bb] = blend_rgb(
+        let [nr, ng, nb, na] = fold_texel(
+            [dr.to_f32(), dg.to_f32(), db.to_f32(), da.to_f32()],
+            [sr.to_f32(), sg.to_f32(), sb.to_f32(), sa.to_f32()],
+            opacity,
             mode,
-            straight_backdrop,
-            [sr.to_f32(), sg.to_f32(), sb.to_f32()],
         );
-        let blended_r = backdrop_inverse * sr.to_f32() + backdrop_alpha * br;
-        let blended_g = backdrop_inverse * sg.to_f32() + backdrop_alpha * bg;
-        let blended_b = backdrop_inverse * sb.to_f32() + backdrop_alpha * bb;
-        *dr = f16::from_f32(inverse * dr.to_f32() + alpha * blended_r);
-        *dg = f16::from_f32(inverse * dg.to_f32() + alpha * blended_g);
-        *db = f16::from_f32(inverse * db.to_f32() + alpha * blended_b);
-        *da = f16::from_f32(alpha + da.to_f32() * inverse);
+        *dr = f16::from_f32(nr);
+        *dg = f16::from_f32(ng);
+        *db = f16::from_f32(nb);
+        *da = f16::from_f32(na);
     }
 }
 
@@ -1971,10 +2169,10 @@ impl std::fmt::Debug for TileCompositor {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlendMode, TileCompositor, blend_channel, blend_color, blend_darker_color, blend_hue,
-        blend_lighter_color, blend_luminosity, blend_saturation, clip_color, composite_layer_into,
-        composite_tile_cpu, lum, sat, set_lum, set_sat, soft_light_d, transparent_tile,
-        un_premultiply_in_place,
+        BlendMode, CHUNK_SAMPLES, CHUNK_TEXELS, TileCompositor, blend_channel, blend_color,
+        blend_darker_color, blend_hue, blend_lighter_color, blend_luminosity, blend_rgb,
+        blend_saturation, clip_color, composite_layer_into, composite_tile_cpu, lum, sat, set_lum,
+        set_sat, soft_light_d, transparent_tile, un_premultiply_in_place,
     };
     use crate::test_support::real_context;
     use aurora_tile::{CHANNELS, SAMPLES, TILE};
@@ -7105,5 +7303,535 @@ mod tests {
             (&top, 1.0, BlendMode::LighterColor),
         ]);
         assert_texel_close(first_texel(&out), (0.4, 0.4, 0.4, 1.0), 1e-3);
+    }
+
+    // ---------------------------------------------------------------
+    // 0.98.0: `composite_layer_into`'s batched `f16` <-> `f32`
+    // conversion. Everything below compares the real function against a
+    // *verbatim copy of its own pre-0.98.0 body* (`composite_layer_into_scalar`,
+    // immediately below) rather than against hand-derived values: the
+    // change claims to be a pure restructuring of how samples reach the
+    // blend math, so the only assertion that means anything is
+    // bit-for-bit agreement with the loop it replaced.
+    // ---------------------------------------------------------------
+
+    /// A literal copy of `composite_layer_into`'s pre-0.98.0 body — the
+    /// scalar, per-sample-conversion loop, kept here as the reference
+    /// every test below measures the vectorized implementation against.
+    ///
+    /// Copied verbatim on purpose rather than re-derived from the
+    /// formula: a re-derivation could drift toward whatever the new
+    /// implementation happens to do, and then agree with it for the
+    /// wrong reason. Do not "tidy" this function — its value is that it
+    /// is the old code.
+    fn composite_layer_into_scalar(out: &mut [f16], texels: &[f16], opacity: f32, mode: BlendMode) {
+        let opacity = opacity.clamp(0.0, 1.0);
+        for (dst, src) in out
+            .chunks_exact_mut(CHANNELS)
+            .zip(texels.chunks_exact(CHANNELS))
+        {
+            let [dr, dg, db, da] = dst else { continue };
+            let [sr, sg, sb, sa] = src else { continue };
+            let alpha = sa.to_f32() * opacity;
+            let inverse = 1.0 - alpha;
+            let backdrop_alpha = da.to_f32();
+            let backdrop_inverse = 1.0 - backdrop_alpha;
+            let straight_backdrop = if backdrop_alpha > 0.0 {
+                [
+                    dr.to_f32() / backdrop_alpha,
+                    dg.to_f32() / backdrop_alpha,
+                    db.to_f32() / backdrop_alpha,
+                ]
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            let [br, bg, bb] = blend_rgb(
+                mode,
+                straight_backdrop,
+                [sr.to_f32(), sg.to_f32(), sb.to_f32()],
+            );
+            let blended_r = backdrop_inverse * sr.to_f32() + backdrop_alpha * br;
+            let blended_g = backdrop_inverse * sg.to_f32() + backdrop_alpha * bg;
+            let blended_b = backdrop_inverse * sb.to_f32() + backdrop_alpha * bb;
+            *dr = f16::from_f32(inverse * dr.to_f32() + alpha * blended_r);
+            *dg = f16::from_f32(inverse * dg.to_f32() + alpha * blended_g);
+            *db = f16::from_f32(inverse * db.to_f32() + alpha * blended_b);
+            *da = f16::from_f32(alpha + da.to_f32() * inverse);
+        }
+    }
+
+    /// Every real [`BlendMode`] variant — the same 26 the benchmark
+    /// enumerates. Spelled out rather than derived so that adding a
+    /// variant to the enum without adding it here is at least a visible
+    /// omission in one place, and so that the bit-exactness test below
+    /// genuinely covers the division- and NaN-prone modes (`Divide`,
+    /// `ColorDodge`, `ColorBurn`, `HardMix`) and the whole non-separable
+    /// HSL family, not just `Normal`.
+    const ALL_MODES: [BlendMode; 26] = [
+        BlendMode::Normal,
+        BlendMode::Darken,
+        BlendMode::Multiply,
+        BlendMode::Lighten,
+        BlendMode::Screen,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Subtract,
+        BlendMode::Divide,
+        BlendMode::ColorDodge,
+        BlendMode::LinearDodge,
+        BlendMode::ColorBurn,
+        BlendMode::LinearBurn,
+        BlendMode::Overlay,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+        BlendMode::VividLight,
+        BlendMode::LinearLight,
+        BlendMode::PinLight,
+        BlendMode::HardMix,
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
+        BlendMode::DarkerColor,
+        BlendMode::LighterColor,
+    ];
+
+    /// Opacities the fold is checked at. `1.5` and `-0.5` are there to
+    /// exercise the `clamp` — which lives in the *caller*, not in
+    /// `fold_texel`, so a restructuring that dropped or moved it would
+    /// show up here.
+    const OPACITIES: [f32; 6] = [1.0, 0.75, 0.5, 0.0, 1.5, -0.5];
+
+    /// The `f16` bit patterns a conversion bug hides in that are still
+    /// **finite**: both signed zeros, both subnormal extremes, the
+    /// largest finite value, and `0.5` as an ordinary anchor. Used by
+    /// the unqualified bit-exactness test, which holds with no
+    /// exceptions whatsoever — measured in both the dev and the release
+    /// profile.
+    const FINITE_EXTREMES: [u16; 6] = [
+        0x0000, // +0
+        0x8000, // -0
+        0x0001, // smallest subnormal
+        0x03ff, // largest subnormal
+        0x7bff, // largest finite (65504)
+        0x3800, // 0.5, an ordinary anchor
+    ];
+
+    /// [`FINITE_EXTREMES`] plus both infinities, a quiet NaN and a
+    /// **signalling** NaN — the adversarial fixture, reachable in
+    /// practice because `aurora-io`'s 16-bit-float TIFF reader takes raw
+    /// `f16` samples verbatim with no NaN filtering. Used by the
+    /// NaN-tolerant test and by the untouched-tail tests.
+    ///
+    /// The signalling NaN matters specifically: `f16` -> `f32` -> `f16`
+    /// is not the identity for it (`0x7c01` quiets to `0x7e01`), which is
+    /// exactly the asymmetry 0.92.0's "take alpha from the original
+    /// chunk" rule existed to protect. Here every channel of a processed
+    /// texel is a *computed* value, so that rule has nothing to protect
+    /// inside the fold — but the untouched tail past the shorter slice's
+    /// end must still never be round-tripped, and these bits are what
+    /// prove it.
+    const EXTREMES: [u16; 10] = [
+        0x0000, // +0
+        0x8000, // -0
+        0x0001, // smallest subnormal
+        0x03ff, // largest subnormal
+        0x7bff, // largest finite (65504)
+        0x7c00, // +infinity
+        0xfc00, // -infinity
+        0x7e00, // quiet NaN
+        0x7c01, // signalling NaN — quieted by an f16 -> f32 -> f16 trip
+        0x3800, // 0.5, an ordinary anchor
+    ];
+
+    /// Ordinary values, so most texels take the arithmetically normal
+    /// path and a bug cannot hide behind an all-NaN fixture where every
+    /// result is NaN regardless.
+    const ORDINARY: [u16; 6] = [
+        0x3c00, // 1.0
+        0x3800, // 0.5
+        0x3400, // 0.25
+        0xbc00, // -1.0
+        0x3555, // ~0.3333
+        0x0000, // +0.0
+    ];
+
+    /// `samples` samples whose value varies per texel *and* per channel,
+    /// with every third texel drawn from `extremes` instead of
+    /// [`ORDINARY`]. Varying per channel is what makes a swapped
+    /// channel, a stale scratch-buffer lane carried between chunks, or a
+    /// chunk written at the wrong offset show up as a bit mismatch
+    /// rather than hiding behind uniform data.
+    fn varied_samples_from(extremes: &[u16], seed: usize, samples: usize) -> Vec<f16> {
+        let mut out = Vec::with_capacity(samples);
+        for index in 0..samples {
+            let texel = index / CHANNELS;
+            let pick = index + seed;
+            let bits = if (texel + seed).is_multiple_of(3) {
+                extremes.get(pick % extremes.len().max(1)).copied()
+            } else {
+                ORDINARY.get(pick % ORDINARY.len()).copied()
+            };
+            // A modulo of a non-empty slice's length is always in
+            // bounds; the fallback exists only because the workspace
+            // denies `unwrap` and `indexing_slicing`.
+            out.push(f16::from_bits(bits.unwrap_or(0x3800)));
+        }
+        out
+    }
+
+    /// [`varied_samples_from`] over the finite extremes — the fixture
+    /// every unqualified bit-exactness assertion uses.
+    fn varied_samples(seed: usize, samples: usize) -> Vec<f16> {
+        varied_samples_from(&FINITE_EXTREMES, seed, samples)
+    }
+
+    /// [`varied_samples_from`] over the full extremes, infinities and
+    /// NaNs included.
+    fn varied_hostile_samples(seed: usize, samples: usize) -> Vec<f16> {
+        varied_samples_from(&EXTREMES, seed, samples)
+    }
+
+    /// Two whole vectorized chunks plus a 3-texel remainder, so a single
+    /// fixture exercises the chunk loop, the chunk boundary, *and* the
+    /// scalar tail. (A real whole-tile fold has no tail at all — see
+    /// `the_chunk_constants_divide_a_whole_tile_evenly` — which is
+    /// precisely why the tail needs a fixture built for it.)
+    fn boundary_fixture(seed: usize) -> Vec<f16> {
+        varied_samples(seed, BOUNDARY_SAMPLES)
+    }
+
+    /// [`boundary_fixture`]'s adversarial sibling: same shape, infinities
+    /// and NaNs included.
+    fn hostile_boundary_fixture(seed: usize) -> Vec<f16> {
+        varied_hostile_samples(seed, BOUNDARY_SAMPLES)
+    }
+
+    /// Two whole chunks plus three texels, in samples.
+    const BOUNDARY_SAMPLES: usize = (CHUNK_TEXELS * 2 + 3) * CHANNELS;
+
+    /// Raw bits, not values: `f16: PartialEq` makes `NaN != NaN`, so
+    /// comparing `Vec<f16>` directly would be *vacuous* exactly on the
+    /// fixtures that matter most.
+    fn bits(texels: &[f16]) -> Vec<u16> {
+        texels.iter().map(|sample| sample.to_bits()).collect()
+    }
+
+    /// **The headline test for 0.98.0, and it is unqualified.** The
+    /// vectorized fold must be bit-for-bit identical to the scalar loop
+    /// it replaced — every sample, no exceptions, no tolerance — for
+    /// every blend mode, at every opacity including two that exercise
+    /// the clamp, on a fixture straddling the chunk boundary and
+    /// carrying both signed zeros, both subnormal extremes and the
+    /// largest finite `f16`, and on an all-transparent accumulator,
+    /// where every texel takes the `backdrop_alpha == 0.0` arm that
+    /// skips the straightening divisions (the *only* arm a real
+    /// single-root document ever takes, per 0.97.1's correction).
+    ///
+    /// Its fixture is deliberately **finite**: no infinity, no NaN. That
+    /// is not a fixture chosen to make the test pass — the
+    /// infinity-and-NaN case is covered, and covered adversarially, by
+    /// `a_hostile_fixture_folds_identically_except_for_the_nan_payload_operand`
+    /// immediately below, which documents exactly what it can and cannot
+    /// assert and why. Splitting them this way keeps *this* assertion
+    /// absolute rather than blanket-weakening one test to accommodate a
+    /// case that only affects NaN payloads.
+    #[test]
+    fn vectorized_fold_is_bit_identical_to_the_scalar_reference() {
+        let source = boundary_fixture(1);
+        let samples = source.len();
+        // Seed 0: a varied accumulator, so the `backdrop_alpha > 0.0`
+        // arm is reached. Seed 1: a genuinely transparent accumulator
+        // derived from the real `transparent_tile`, so it is not just
+        // "zeros I typed" but the same buffer every real accumulation
+        // starts from.
+        let mut transparent = transparent_tile();
+        transparent.truncate(samples);
+        assert_eq!(
+            transparent.len(),
+            samples,
+            "a whole tile is longer than this fixture, so the truncation is exact"
+        );
+        let accumulators = [varied_samples(0, samples), transparent];
+
+        for accumulator in &accumulators {
+            for mode in ALL_MODES {
+                for opacity in OPACITIES {
+                    let mut vectorized = accumulator.clone();
+                    let mut scalar = accumulator.clone();
+                    composite_layer_into(&mut vectorized, &source, opacity, mode);
+                    composite_layer_into_scalar(&mut scalar, &source, opacity, mode);
+                    assert_eq!(
+                        bits(&vectorized),
+                        bits(&scalar),
+                        "vectorized fold diverged from the scalar reference \
+                         for {mode:?} at opacity {opacity}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The adversarial half of the bit-exactness claim: the same sweep,
+    /// on a fixture that also carries both infinities, a quiet NaN and a
+    /// signalling NaN. Every sample must still agree bit-for-bit
+    /// **except** where the scalar reference itself produced a NaN, in
+    /// which case the vectorized path is required only to produce *a*
+    /// NaN, of any sign and payload.
+    ///
+    /// **That exception is a measured, disclosed limitation, not a
+    /// convenience.** It is the same class 0.92.1 found and documented
+    /// for `aurora_gpu::residency` (see that module's
+    /// `serialize_premultiplied_le_bytes` doc comment): when *both*
+    /// operands of a floating-point operation are NaN, which operand's
+    /// payload survives is an operand-order detail of whatever code LLVM
+    /// emits, pinned by neither IEEE 754 nor this source, and two
+    /// different auto-vectorizations of the same arithmetic can choose
+    /// differently. Measured here (this sandbox, `x86_64` with F16C,
+    /// over all 26 modes × 6 opacities × 2 accumulators):
+    ///
+    /// | profile | diverging samples | of which both-NaN | of which anything else |
+    /// |---|---|---|---|
+    /// | dev (`opt-level = 1`) | 96 | 96 | **0** |
+    /// | `--release` | 5,808 | 5,808 | **0** |
+    ///
+    /// So the divergence is *entirely* NaN-payload selection and never a
+    /// value: not one sample differed where either side was a number.
+    /// The dev-profile cases are all `Luminosity`, all on the red
+    /// channel, all where the source texel carries a NaN in R *and* the
+    /// blend result is NaN too — `sr + 0.0 * br`, both operands NaN. The
+    /// release profile simply auto-vectorizes more of the arithmetic and
+    /// so hits the same class far more often, including flipping the NaN
+    /// *sign* bit, which is equally unspecified.
+    ///
+    /// The two conversion routines are **not** the cause, checked
+    /// directly rather than assumed: `f16::to_f32` /
+    /// `half::slice::HalfFloatSliceExt::convert_to_f32_slice` and
+    /// `f16::from_f32` / `convert_from_f32_slice` were measured to agree
+    /// bit-for-bit on every NaN, infinity and subnormal pattern in
+    /// [`EXTREMES`], in both directions. Nothing about batching the
+    /// conversions changes what a conversion does.
+    ///
+    /// Consequence, bounded: the pixel was a NaN before and is a NaN
+    /// after, so this turns garbage into different garbage rather than
+    /// corrupting a good pixel. It is reachable — `aurora-io`'s
+    /// 16-bit-float TIFF reader takes raw `f16` samples verbatim with no
+    /// NaN filtering — and it is carried forward as a disclosed risk, not
+    /// chased, exactly as 0.92.1 decided for the same class.
+    #[test]
+    fn a_hostile_fixture_folds_identically_except_for_the_nan_payload_operand() {
+        let source = hostile_boundary_fixture(1);
+        let samples = source.len();
+        let mut transparent = transparent_tile();
+        transparent.truncate(samples);
+        let accumulators = [varied_hostile_samples(0, samples), transparent];
+
+        for accumulator in &accumulators {
+            for mode in ALL_MODES {
+                for opacity in OPACITIES {
+                    let mut vectorized = accumulator.clone();
+                    let mut scalar = accumulator.clone();
+                    composite_layer_into(&mut vectorized, &source, opacity, mode);
+                    composite_layer_into_scalar(&mut scalar, &source, opacity, mode);
+                    assert_eq!(vectorized.len(), scalar.len());
+                    for (index, (got, want)) in vectorized.iter().zip(scalar.iter()).enumerate() {
+                        if want.is_nan() {
+                            // The one documented exception, and it is
+                            // still an assertion: a NaN must stay a NaN.
+                            assert!(
+                                got.is_nan(),
+                                "sample {index} became {:#06x}, not a NaN, for {mode:?} \
+                                 at opacity {opacity} where the scalar reference gave \
+                                 {:#06x}",
+                                got.to_bits(),
+                                want.to_bits()
+                            );
+                        } else {
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "sample {index} diverged on a non-NaN value for {mode:?} \
+                                 at opacity {opacity} -- this is outside the documented \
+                                 NaN-payload exception and is a real regression"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An accumulator longer than the source: the composited prefix must
+    /// still match the scalar reference, **and** every sample past the
+    /// source's own length must keep its exact input bits. The tail is
+    /// seeded with a signalling NaN among other extremes precisely
+    /// because an `f16` -> `f32` -> `f16` round trip would quiet it — so
+    /// a version that widened the *whole* `out` slice instead of just
+    /// the vectorized head would be caught here even though the
+    /// arithmetic it performed was correct.
+    #[test]
+    fn an_over_long_accumulator_keeps_its_tail_bits_untouched() {
+        let source = boundary_fixture(1);
+        let extra = 7 * CHANNELS;
+        let mut accumulator = varied_samples(0, source.len());
+        // Deliberately extreme tail bits, cycled so the signalling NaN
+        // lands in it more than once.
+        accumulator.extend(
+            EXTREMES
+                .iter()
+                .cycle()
+                .take(extra)
+                .map(|sample| f16::from_bits(*sample)),
+        );
+        assert_eq!(accumulator.len(), source.len() + extra);
+        let original = bits(&accumulator);
+
+        let mut vectorized = accumulator.clone();
+        let mut scalar = accumulator.clone();
+        for mode in ALL_MODES {
+            vectorized.clone_from(&accumulator);
+            scalar.clone_from(&accumulator);
+            composite_layer_into(&mut vectorized, &source, 0.75, mode);
+            composite_layer_into_scalar(&mut scalar, &source, 0.75, mode);
+            assert_eq!(
+                bits(&vectorized),
+                bits(&scalar),
+                "over-long accumulator diverged from the scalar reference for {mode:?}"
+            );
+            let tail_start = source.len();
+            assert_eq!(
+                bits(&vectorized).get(tail_start..),
+                original.get(tail_start..),
+                "samples past the source's own length must be untouched for {mode:?}"
+            );
+        }
+    }
+
+    /// The mirror: a source longer than the accumulator composites only
+    /// the accumulator's own worth of texels, and reads nothing past it.
+    /// `out` is the shorter slice here, so there is no tail to check on
+    /// the output side — what this pins is that the extra *source*
+    /// samples cannot change the result.
+    #[test]
+    fn an_over_long_source_composites_only_the_shorter_prefix() {
+        let accumulator = boundary_fixture(0);
+        let mut source = varied_samples(1, accumulator.len());
+        let prefix = source.clone();
+        source.extend(EXTREMES.iter().map(|bits| f16::from_bits(*bits)));
+        source.extend(EXTREMES.iter().map(|bits| f16::from_bits(*bits)));
+        assert!(source.len() > accumulator.len());
+
+        for mode in ALL_MODES {
+            let mut vectorized = accumulator.clone();
+            let mut scalar = accumulator.clone();
+            let mut truncated = accumulator.clone();
+            composite_layer_into(&mut vectorized, &source, 0.75, mode);
+            composite_layer_into_scalar(&mut scalar, &source, 0.75, mode);
+            // The same fold against a source truncated to exactly the
+            // accumulator's length: the extra samples must make no
+            // difference at all.
+            composite_layer_into(&mut truncated, &prefix, 0.75, mode);
+            assert_eq!(
+                bits(&vectorized),
+                bits(&scalar),
+                "over-long source diverged from the scalar reference for {mode:?}"
+            );
+            assert_eq!(
+                bits(&vectorized),
+                bits(&truncated),
+                "source samples past the accumulator's length changed the result for {mode:?}"
+            );
+        }
+    }
+
+    /// **The test that catches the naive port.** Chunking `out` and
+    /// `texels` independently and taking each side's own
+    /// `chunks_exact(CHUNK_SAMPLES).remainder()` — the spelling
+    /// `aurora_gpu::residency`'s *single*-input serializer can legally
+    /// use — starts the two tails at different offsets whenever the two
+    /// slices have different whole-chunk counts. Every pair below is
+    /// chosen so that they do.
+    ///
+    /// Worked example, the first row: `out` is 3 whole chunks and
+    /// `texels` is 1 chunk plus 37 samples. `out`'s own remainder is
+    /// *empty* (768 is a multiple of 256) while `texels`' is 37 samples
+    /// starting at 256, so the naive version folds 64 texels and stops;
+    /// the correct answer, and what the pre-0.98.0 `zip` gave, is
+    /// `min(768, 293) = 293` samples, i.e. 73 texels. The third row is
+    /// worse than a short count: `out`'s tail would start at 256 while
+    /// `texels`' started at 512, compositing texel *i* against texel
+    /// *j*.
+    #[test]
+    fn mismatched_length_folds_match_the_scalar_reference() {
+        let lengths = [
+            // Different whole-chunk counts, `out` longer.
+            (CHUNK_SAMPLES * 3, CHUNK_SAMPLES + 37),
+            // The reverse.
+            (CHUNK_SAMPLES + 37, CHUNK_SAMPLES * 3),
+            // Both tails non-empty and at different offsets — the
+            // misaligned-tail case, not merely a short one.
+            (CHUNK_SAMPLES + 37, CHUNK_SAMPLES * 2 + 5),
+            (CHUNK_SAMPLES * 2 + 5, CHUNK_SAMPLES + 37),
+            // Lengths that are not multiples of `CHANNELS`, so a
+            // trailing partial texel is dropped on one or both sides.
+            (CHUNK_SAMPLES * 2 + 3, CHUNK_SAMPLES * 2 + 1),
+            (CHUNK_SAMPLES - 1, CHUNK_SAMPLES * 2),
+            // Wholly below one chunk: everything goes down the scalar
+            // tail, nothing is vectorized.
+            (CHUNK_SAMPLES - 1, CHUNK_SAMPLES - 3),
+            (CHANNELS, CHANNELS * 5),
+            // Degenerate: empty on either or both sides.
+            (0, CHUNK_SAMPLES),
+            (CHUNK_SAMPLES, 0),
+            (0, 0),
+            // Equal lengths, as a control that the interesting rows
+            // above are not the only ones passing.
+            (CHUNK_SAMPLES * 4, CHUNK_SAMPLES * 4),
+        ];
+
+        for (out_len, source_len) in lengths {
+            let accumulator = varied_samples(0, out_len);
+            let source = varied_samples(1, source_len);
+            for mode in [
+                BlendMode::Normal,
+                BlendMode::Multiply,
+                BlendMode::Divide,
+                BlendMode::HardMix,
+                BlendMode::Color,
+            ] {
+                let mut vectorized = accumulator.clone();
+                let mut scalar = accumulator.clone();
+                composite_layer_into(&mut vectorized, &source, 0.75, mode);
+                composite_layer_into_scalar(&mut scalar, &source, 0.75, mode);
+                assert_eq!(
+                    bits(&vectorized),
+                    bits(&scalar),
+                    "mismatched fold ({out_len} out samples, {source_len} source samples) \
+                     diverged from the scalar reference for {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// The chunk constants' load-bearing arithmetic, pinned rather than
+    /// left implied: a whole tile is an exact whole number of chunks, so
+    /// a real fold never touches the scalar remainder loop, and a chunk
+    /// is an exact whole number of texels, so the inner
+    /// `chunks_exact(CHANNELS)` never drops one.
+    #[test]
+    fn the_chunk_constants_divide_a_whole_tile_evenly() {
+        assert_ne!(CHUNK_SAMPLES, 0, "a zero-length chunk would divide by zero");
+        assert_eq!(CHUNK_SAMPLES, CHUNK_TEXELS * CHANNELS);
+        assert_eq!(
+            CHUNK_SAMPLES % CHANNELS,
+            0,
+            "a chunk must be a whole number of texels"
+        );
+        assert_eq!(
+            SAMPLES % CHUNK_SAMPLES,
+            0,
+            "a whole tile must be a whole number of chunks, or a real fold \
+             would reach the scalar remainder loop"
+        );
     }
 }

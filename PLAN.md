@@ -21308,6 +21308,226 @@ severity choice.
   Gate re-run at this commit, all green: the same nine steps listed
   directly above.
 
+  **0.98.0 (2026-09-04) — Round C: the cheaper fix 0.97.1 said to measure
+  first. Batching `composite_layer_into`'s `f16` <-> `f32` conversions is a
+  real, measured win — every mode faster in the multi-root condition, and
+  the three decision modes faster in the single-root one too.** 0.97.1's
+  "Alternatives considered" named this explicitly and ranked it ahead of
+  `rayon`: the per-texel cost is dominated by `f16` <-> `f32` conversions
+  rather than by the blend formula, and 0.92.0 had already removed exactly
+  that overhead in `crates/aurora-gpu/src/residency.rs` via
+  `half::slice::HalfFloatSliceExt`, for zero new dependencies and zero
+  contention risk. This round did that, **sequentially — no `rayon`, no
+  threads, no new dependency**.
+
+  **The measurement, and read the methodology note before the table.**
+  Same box, same `benches/composite.rs`, same two conditions, all 26
+  modes, criterion medians with the 95 % change interval. A **first
+  after-run was discarded**: it was launched in the background while
+  `cargo check --workspace`, `cargo clippy --workspace` and `cargo test
+  --workspace` were running on the same 4-core box (load average 6.08),
+  and it duly reported +17 % to +35 % *regressions*. Both halves were then
+  re-run back-to-back on an otherwise idle machine, baseline first from a
+  clean `git checkout HEAD --` of the two changed files, and it is those
+  numbers below. The discarded run is named here because a contaminated
+  benchmark that says the opposite of the clean one is exactly the kind of
+  thing a later reader should know was looked at rather than quietly
+  dropped.
+
+  | mode | `fold_onto_transparent` before -> after | change | `fold_onto_opaque` before -> after | change |
+  |---|---|---|---|---|
+  | **Normal** | 1.817 -> 1.681 ms | **-6.9 %** | 2.079 -> 1.699 ms | **-18.7 %** |
+  | **Multiply** | 1.765 -> 1.704 ms | **-5.2 %** | 2.049 -> 1.698 ms | **-17.2 %** |
+  | Darken | 1.832 -> 1.776 ms | -2.2 % | 2.101 -> 1.801 ms | -14.3 % |
+  | Screen | 1.762 -> 1.689 ms | -3.7 % | 2.059 -> 1.705 ms | -17.5 % |
+  | Divide | 1.880 -> 1.767 ms | -4.3 % | 2.174 -> 1.801 ms | -18.0 % |
+  | ColorBurn | 1.923 -> 1.958 ms | **+1.8 %** | 2.201 -> 1.972 ms | -10.4 % |
+  | LinearLight | 1.783 -> 1.812 ms | **+1.9 %** | 2.081 -> 1.818 ms | -12.6 % |
+  | Color | 2.622 -> 2.659 ms | **+1.4 %** | 2.970 -> 2.435 ms | -18.0 % |
+  | Luminosity | 2.152 -> 2.011 ms | -6.6 % | 2.808 -> 2.384 ms | -15.1 % |
+  | Hue | 3.239 -> 2.755 ms | -15.0 % | 3.769 -> 3.091 ms | -18.0 % |
+  | SoftLight | 2.627 -> 2.111 ms | -19.6 % | 3.027 -> 2.327 ms | -23.1 % |
+  | HardLight | 2.542 -> 1.875 ms | -26.2 % | 2.808 -> 1.901 ms | **-32.3 %** |
+  | HardMix | 2.684 -> 2.114 ms | -21.2 % | 3.002 -> 2.266 ms | -24.5 % |
+  | DarkerColor | 1.596 -> 1.467 ms | -7.0 % | 2.270 -> 1.723 ms | -24.3 % |
+
+  **Read across all 26 modes, not just the rows above.** In
+  `fold_onto_opaque`, **26 of 26 improved**, from -10.4 % (ColorBurn) to
+  -32.3 % (HardLight), every interval entirely below zero. In
+  `fold_onto_transparent`, **23 of 26 improved** (-1.7 % to -26.2 %) and
+  **three got slightly worse**: ColorBurn +1.8 %, LinearLight +1.9 %,
+  Color +1.4 %, each `p = 0.00` with the whole interval above zero, so
+  they are real and not noise — small, real losses, disclosed rather than
+  averaged away. The asymmetry has an obvious shape: the opaque arm pays
+  three extra `f16` widenings for the straightening divisions, so it has
+  more conversion overhead to remove, and it is where the batching pays
+  best.
+
+  **The round's honest expectation, revisited.** It was stated up front
+  that the win might be zero — `blend_rgb`'s 26-mode dispatch might
+  dominate, LLVM might already CSE the conversions, and the two new `f32`
+  scratch arrays add memory traffic the old code did not have. That third
+  effect is visible: it is almost certainly what the three
+  `fold_onto_transparent` regressions are, in the cheapest modes on the
+  arm with the least conversion work to amortize. The first two did not
+  hold — the win is real and, for the expensive non-separable modes, large.
+
+  **What this does *not* do: move T1, or the 60 FPS gate.** 0.97.1's T1
+  bar was "median >= 2.0 ms for both `Normal` and `Multiply` in the
+  condition the single-root T2 fixture actually exercises". Before:
+  1.817 / 1.765 ms — FAIL. After: 1.681 / 1.704 ms — **still FAIL, and
+  now further below the bar**, which makes parallelizing the common
+  single-root case *less* attractive than 0.97.1 already judged it, not
+  more. The conditional, multi-root-only GO 0.97.1 registered is
+  unchanged and still open; this composes with it rather than replacing
+  it. And the M1.10 tables above remain the standing 60 FPS numbers: this
+  is a constant-factor reduction on the CPU compositing *fallback* path,
+  measured per call on one tile, never re-measured end-to-end on a frame.
+
+  **The conversion count, corrected.** 0.97.0/0.97.1 both say the
+  per-texel cost is dominated by "twelve `f16` <-> `f32` conversions".
+  Twelve is the *deduplicated* count — eight distinct `f16` inputs widened
+  plus four narrowed writes — and is the right number only if LLVM
+  common-subexpression-eliminates every repeated `to_f32()`. Counted as
+  the pre-0.98.0 source is actually written, the `backdrop_alpha > 0.0`
+  arm calls `to_f32()` fifteen times and `from_f32` four (nineteen), and
+  the transparent arm twelve plus four (sixteen): `dr`/`dg`/`db` are read
+  twice on the opaque arm, `sr`/`sg`/`sb` twice on both. Both numbers are
+  defensible; they are different numbers, and 0.97.1 did not say which it
+  meant.
+
+  **What 0.92.0's "alpha from the original chunk, never the round-tripped
+  buffer" rule maps to here: nothing inside a texel.** That rule existed
+  because `premultiply_rgba` leaves alpha untouched while `f16 -> f32 ->
+  f16` quiets a signalling NaN, so a passthrough channel had to be copied
+  rather than round-tripped. In `composite_layer_into` all four channels
+  of a processed texel are *computed*, so there is no passthrough channel
+  to protect. The real analogue is the region *outside* the fold: nothing
+  past `min(out.len(), texels.len())` may be read or written. The shared
+  split point closes that, and
+  `an_over_long_accumulator_keeps_its_tail_bits_untouched` pins it — its
+  tail is seeded with a signalling NaN precisely so that a version
+  widening the whole `out` slice instead of just the head fails even
+  though its arithmetic is correct.
+
+  **The two-slice split, and the bug the obvious port would have shipped.**
+  `residency`'s serializer chunks *one* input slice and zips a separately
+  derived output sink, so it can legally take that slice's own
+  `chunks_exact(..).remainder()`. `composite_layer_into` chunks *two*
+  slices that must stay in lockstep, and `out` and `texels` are not
+  guaranteed equal in length — this function's own doc comment already
+  documents five independent producers, not one invariant. Taking each
+  side's own remainder starts the two tails at *different* offsets
+  whenever the whole-chunk counts differ. For `out` = 3 whole chunks and
+  `texels` = 1 chunk + 37 samples, `out`'s own remainder is empty, so the
+  naive version folds 64 texels where the pre-0.98.0 `zip` folded 73. For
+  `out` = 1 chunk + 37 and `texels` = 2 chunks + 5 it is worse than a
+  short count: the two tails start at offsets 256 and 512, compositing
+  texel *i* against texel *j*. The implementation instead computes one
+  split point, `(min(out.len(), texels.len()) / CHUNK_SAMPLES) *
+  CHUNK_SAMPLES`, and applies it to both slices via `split_at_checked` /
+  `split_at_mut_checked`.
+
+  **Mutation-checked, all three by hand, each reverted and re-confirmed
+  clean afterwards:**
+
+  - rewrite the body in the naive independent-remainder shape ->
+    `mismatched_length_folds_match_the_scalar_reference` FAILS, and it is
+    the **only** test that fails (116 pass).
+  - round-trip the full `out` slice instead of just the vectorized head ->
+    `an_over_long_accumulator_keeps_its_tail_bits_untouched` FAILS, and
+    only it.
+  - swap `fold_texel`'s `blended_g` and `blended_b` outputs ->
+    `vectorized_fold_is_bit_identical_to_the_scalar_reference` FAILS.
+
+  **Bit-exactness, and the one measured exception — this is the finding
+  worth carrying forward.** Every test above compares against
+  `composite_layer_into_scalar`, a *verbatim* `#[cfg(test)]` copy of the
+  pre-0.98.0 body, on `to_bits()` rather than on `f16` values (`f16:
+  PartialEq` makes `NaN != NaN`, which would make the assertion vacuous
+  exactly where it matters). On a fixture of finite values — both signed
+  zeros, both subnormal extremes, the largest finite `f16`, ordinary
+  values — across all 26 modes, six opacities including two that exercise
+  the `clamp`, and both a varied and a genuinely transparent accumulator,
+  the vectorized fold is **bit-identical with no exceptions, in both the
+  dev and the release profile**.
+
+  Add infinities and NaNs to the fixture and it is not, and the shape of
+  that was measured rather than assumed:
+
+  | profile | diverging samples | of which both-NaN | of which anything else |
+  |---|---|---|---|
+  | dev (`opt-level = 1`) | 96 | 96 | **0** |
+  | `--release` | 5,808 | 5,808 | **0** |
+
+  Not one sample differed where either side was a number. Every divergence
+  is NaN *payload* (and, in release, NaN *sign*) selection — the same class
+  0.92.1 found and documented for `residency`: when both operands of an
+  operation are NaN, which payload survives is an operand-order detail of
+  whatever LLVM emits, pinned by neither IEEE 754 nor this source, and two
+  auto-vectorizations of the same arithmetic can choose differently. The
+  dev-profile cases are all `Luminosity`, all on red, all where the source
+  texel's R is NaN *and* the blend result is NaN too (`sr + 0.0 * br`,
+  both operands NaN). **The two conversion routines were ruled out
+  directly, not assumed**: `to_f32` / `convert_to_f32_slice` and
+  `from_f32` / `convert_from_f32_slice` were measured to agree bit-for-bit
+  on every NaN, infinity and subnormal pattern in the fixture, in both
+  directions — batching a conversion does not change what it computes.
+
+  Rather than blanket-weakening one test, this is split in two:
+  `vectorized_fold_is_bit_identical_to_the_scalar_reference` stays
+  **absolute** on the finite fixture, and
+  `a_hostile_fixture_folds_identically_except_for_the_nan_payload_operand`
+  covers infinities and NaNs while asserting only that a NaN stays a NaN
+  where the scalar reference gave one — and still asserting full bit
+  equality everywhere else, so a genuine value regression on hostile input
+  fails. Reachable (`aurora-io`'s 16-bit-float TIFF reader takes raw `f16`
+  samples verbatim with no NaN filtering), bounded (garbage becomes
+  different garbage; a good pixel is never corrupted), and **carried
+  forward as a disclosed risk rather than chased**, exactly as 0.92.1
+  decided for the same class.
+
+  **Pure CPU, no GPU dependency.** `benches/composite.rs` calls
+  `composite_layer_into` directly; nothing here touches `wgpu`, no adapter
+  is created, and `AURORA_REQUIRE_GPU` is irrelevant to every number
+  above. Measured on this sandbox's **Intel Core i3-10100** (4 physical /
+  8 logical, 3.60 GHz), Linux, `x86_64`, with **F16C and AVX2 both present
+  in `/proc/cpuinfo`** — which is what makes `convert_to_f32_slice` /
+  `convert_from_f32_slice` reach `vcvtph2ps` / `vcvtps2ph` at all. A
+  machine without F16C takes `half`'s software fallback and these numbers
+  would not transfer. One configuration, one core count, one box.
+
+  **Code changed**: `crates/aurora-render/src/composite.rs` only.
+  `composite_layer_into`'s public signature is byte-identical, so neither
+  `aurora-app` call site (the group-isolation fold and the root-layer
+  fold) changed; `blend_rgb` and `blend_channel` are untouched. The blend
+  math moved verbatim into a new private `fold_texel`, called by both the
+  vectorized chunk loop and the scalar remainder loop so they cannot
+  drift.
+
+  No new dependency (`half` was already a workspace dependency and
+  `HalfFloatSliceExt` is in its default features), no `rayon` anywhere in
+  `aurora-render`'s own code, no new `unsafe`, no new lint exception, no
+  `unwrap`/`expect`/`panic`/`indexing_slicing` (the two destructurings use
+  `else { continue }`, and both splits use the `_checked` APIs so there is
+  no panic path to reason about), no `scripts/layering.json` edit, no
+  `deny.toml` edit. **6 new tests** in `aurora-render`'s lib: 144 tests,
+  was 138. `cargo test --workspace` counts **1,661 passing, 0 failing**
+  across 42 result lines, up from 0.97.1's 1,655 by exactly those six.
+
+  Gate run at this commit, all green: `cargo fmt --all --check`,
+  `python3 scripts/check_layering.py` (20 crates),
+  `python3 scripts/check_no_hardcoded_style.py` (28 files),
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo test --workspace`,
+  `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc
+  --workspace --no-deps --all-features`, `cargo deny check all`. Plus
+  **`cargo test -p aurora-render --release`: 144 passing** — run
+  specifically because 0.92.1's precedent found a release-only divergence
+  in an analogous vectorization, and it is what confirms the split
+  finite/hostile test design above holds in both profiles rather than only
+  in the one `cargo test` defaults to.
+
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
