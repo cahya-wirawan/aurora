@@ -21415,20 +21415,46 @@ severity choice.
 
   **So the honest statement is:** the *direction* is consistent across
   every run and every reviewer — these three modes are slightly slower —
-  and the magnitude is somewhere around **+0.5 % to +2 %**, but the effect
-  is **inside this benchmark's own noise floor at this sample size** and is
-  **not** established as a real regression by any run of it. It is
-  disclosed as a plausible small cost of the two new `f32` scratch arrays'
-  memory traffic, in the cheapest modes on the arm with the least
-  conversion work to amortize — which is the mechanism the round predicted
-  up front, and is why it is worth recording at all rather than deleting.
-  Establishing it as real would need a larger sample count or a lowered
-  `--noise-threshold`, neither of which was run. **Do not quote these
-  three as measured regressions.** The 23 improvements in this condition
-  and all 26 in `fold_onto_opaque` are unaffected: those are 5–32 %
-  effects, an order of magnitude clear of the same 2 % noise floor these
-  three sit inside, so nothing about this correction touches the round's
-  headline result.
+  and the magnitude is somewhere around **+0.5 % to +2 %**. For ColorBurn
+  and Color, the effect is **inside this benchmark's own noise floor at
+  this sample size**: every trial across both re-measurements above (and
+  a further independent one, below) printed criterion's *"Change within
+  noise threshold"* or *"No change in performance detected"* verdict, not
+  *"Performance has regressed."* Those two are **not** established as a
+  real regression by any run.
+
+  **Correction (0.98.2) — LinearLight does not get the same benefit of
+  the doubt.** A further independent re-measurement (4 trials: 2 against
+  the `b5a0f179` baseline above, 2 against an independently-rebuilt clean
+  baseline, on different hardware from either of the two runs already
+  quoted) found ColorBurn and Color reproduce the *within noise*/*no
+  change* verdict as claimed, but **LinearLight printed criterion's
+  `Performance has regressed.` line in all 4 of 4 trials** — never
+  *within noise*, never *no change* — at magnitudes of +2.0% to +3.1%,
+  consistently above this benchmark's own regression cutoff rather than
+  below it. This directly contradicts the "*Change within noise
+  threshold* (both)" cell this correction's own table gave LinearLight
+  above (row 21403), which should not have been read as representative
+  once a fourth-and-fifth trial disagreed with it.
+  **The corrected, honest statement for LinearLight specifically: it is
+  plausibly a real, small (~2-3%) regression in `fold_onto_transparent`
+  only**, not a noise-floor artifact — the other two modes' "not
+  established as real" conclusion does not extend to it. This still does
+  not touch the round's headline result (see below), and the same
+  scratch-buffer-memory-traffic mechanism remains the leading explanation,
+  but it should be read as a disclosed cost with some real evidence behind
+  it, not a probable non-issue. **Do not treat all three modes as
+  interchangeable — LinearLight is the one weaker claim among the three,
+  not the strongest.**
+
+  Establishing ColorBurn/Color as real would need a larger sample count or
+  a lowered `--noise-threshold`, neither of which was run. **Do not quote
+  ColorBurn or Color as measured regressions; do treat LinearLight as one,
+  cautiously.** The 23 improvements in this condition and all 26 in
+  `fold_onto_opaque` are unaffected: those are 5–32 % effects, an order of
+  magnitude clear of the noise floor this whole disclosure concerns itself
+  with, so nothing about this correction touches the round's headline
+  result.
 
   The asymmetry has an obvious shape: the opaque arm pays
   three extra `f16` widenings for the straightening divisions, so it has
@@ -21787,20 +21813,23 @@ M1.10 pan-while-painting tables remain the standing 60 FPS numbers.
 (5) **What 0.98.1 itself corrected**, all reporting accuracy on 0.98.0's
 already-verified code (no implementation change): the three slightly
 slower `fold_onto_transparent` modes (ColorBurn, LinearLight, Color) were
-claimed "real and not noise" on their `p` values alone, but criterion's
-own verdict line on every one of those rows is *Change within noise
-threshold* — re-measured twice at 0.98.1 against a clean `5a0f179`
-baseline (+1.2 % to +1.7 %, one row flipping to *No change in performance
-detected*), and independently at ~+0.8 % with p = 0.08–0.16, so they are
-now recorded as a **disclosed possible small cost, not a measured
-regression**; the before/after table was mislabelled "criterion medians"
-when it quotes criterion's `slope`-else-`mean` point estimate, with a
-`change` column that is a separate estimate and deliberately does not
-ratio-match; mutation A's "116 pass" was stale (**143 pass**, of 144); and
-four doc-comment claims in `composite.rs` were overstated. **Next actual
-decision is unchanged and still Cahya's**: the multi-root-only
-parallelization GO is open but low-value, and nothing here advances the
-60 FPS gate.
+claimed "real and not noise" on their `p` values alone. **0.98.1 found
+criterion's own verdict line on every one of those rows was *Change
+within noise threshold* — but 0.98.2 found that doesn't hold for all
+three**: ColorBurn and Color reproduce *within noise*/*no change* across
+every independent trial run against this, but **LinearLight printed
+`Performance has regressed.` in 4 of 4 further independent trials**
+(+2.0% to +3.1%), never *within noise*. Corrected verdict: ColorBurn and
+Color are a **disclosed possible small cost, not a measured regression**;
+LinearLight is **plausibly a real, small (~2-3%) regression**, the one of
+the three that should not be waved off. The before/after table was also
+mislabelled "criterion medians" when it quotes criterion's
+`slope`-else-`mean` point estimate, with a `change` column that is a
+separate estimate and deliberately does not ratio-match; mutation A's
+"116 pass" was stale (**143 pass**, of 144); and four doc-comment claims
+in `composite.rs` were overstated. **Next actual decision is unchanged
+and still Cahya's**: the multi-root-only parallelization GO is open but
+low-value, and nothing here advances the 60 FPS gate.
 
 **Addendum 2026-09-04 (0.97.1) — 0.97.0's GO verdict is WITHDRAWN: T1 was
 read from a condition the round's own corroborating fixture never
