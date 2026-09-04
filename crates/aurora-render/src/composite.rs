@@ -1981,6 +1981,16 @@ mod tests {
     /// A future change to the zero-alpha arm — writing a sentinel,
     /// normalizing `a`, anything at all — must therefore fail *here*,
     /// which is the point of the test living in this crate.
+    ///
+    /// **Do not read this more broadly than it is written** (0.94.1). The
+    /// claim is about [`transparent_tile`]'s own canonical all-`0x0000`
+    /// output, which is the only buffer `aurora-app`'s skip is ever applied
+    /// to — *not* "this function is a bitwise identity on any buffer whose
+    /// alpha is zero", which is false. Give a texel `r = -0.0` (bit pattern
+    /// `0x8000`) alongside `a = +0.0` and the else-arm canonicalizes the
+    /// sign bit away, so the bits change while the values do not. That is
+    /// why the test starts from `transparent_tile()` itself rather than a
+    /// synthetic zero-alpha stand-in.
     #[test]
     fn un_premultiply_in_place_is_a_bitwise_identity_on_a_transparent_tile() {
         let before = transparent_tile();

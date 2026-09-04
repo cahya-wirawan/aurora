@@ -6692,9 +6692,15 @@ fn resolve_tile(
 ///
 /// The finished straight-alpha texels **and how many roots were actually
 /// folded into them** — i.e. how many calls to
-/// `aurora_render::composite_layer_into` this tile cost. Zero means every
-/// root declined at this tile ([`resolve_tile`] returned `None` for all of
-/// them) and the returned buffer is `aurora_render::transparent_tile`'s
+/// `aurora_render::composite_layer_into` this tile cost. Zero means **no
+/// root contributed** — which arises three ways, not one: `layers.roots()`
+/// was empty so the loop body never ran at all (the case
+/// `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
+/// exercises); every root declined at this tile ([`resolve_tile`] returned
+/// `None` for all of them, e.g. nothing stored under the tile); or
+/// [`CompositeBudget`] refused further work before any root resolved
+/// (`charge_node`/depth refusals, which also return `None`). All three
+/// leave the returned buffer `aurora_render::transparent_tile`'s
 /// own untouched output — which since 0.94.0 is returned *without* the
 /// straightening pass running over it, since on that specific buffer the
 /// pass is a bitwise identity. So this count is now load-bearing for more
@@ -6786,8 +6792,19 @@ fn composite_roots_into_tile(
     // whole-buffer pass being removed, so it would spend the win to find
     // it. `folded` is already counted for `RecompositeTileCosts`, so this
     // condition costs nothing.
+    //
+    // **The skip has its own regression guard** as of 0.94.1, and needs
+    // one for the same reason `DARKEN_GPU_DISPATCHES` does: being
+    // output-identical is exactly what makes losing it invisible to every
+    // output assertion here. Mutating this condition to `true` (the
+    // pre-0.94.0 behaviour) left all 384 `aurora-app` tests green. So the
+    // call reports itself — see [`COMPOSITE_STRAIGHTEN_PASSES`] and
+    // `composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded`,
+    // which asserts zero calls for a zero-fold tile and one for a tile
+    // that folded a root.
     if folded > 0 {
         aurora_render::un_premultiply_in_place(&mut composited);
+        note_composite_straighten_pass();
     }
     (composited, folded)
 }
@@ -7314,6 +7331,53 @@ fn note_gpu_composite_submit() {
 #[cfg(not(test))]
 fn note_gpu_composite_submit() {}
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of the `aurora_render::un_premultiply_in_place` calls
+    /// [`composite_roots_into_tile`] has actually made on **this thread**.
+    ///
+    /// **Why this exists** (0.94.1). 0.94.0 made that call conditional on
+    /// `folded > 0`, and the whole argument for the skip is that it is
+    /// *output-identical* — which is precisely what makes its removal
+    /// invisible to every output assertion in this crate. Mutating the guard
+    /// back to `if true`, i.e. the pre-0.94.0 always-run behaviour, was
+    /// measured to leave all 384 `aurora-app` tests green, so nothing would
+    /// have caught a later refactor quietly handing the whole ~6.5 ms/frame
+    /// win back. This is the same gap, and the same remedy, as
+    /// [`DARKEN_GPU_DISPATCHES`]: the only observable that distinguishes
+    /// "skipped" from "ran and computed the identical bits" is whether the
+    /// call happened, so the call site reports itself and
+    /// `composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded`
+    /// asserts both directions.
+    ///
+    /// **Thread-local, deliberately not a process-global atomic.** This is
+    /// the counter shape 0.93.1 had to reach for the fold count: unlike
+    /// [`DARKEN_GPU_DISPATCHES`], whose every caller needs a `GpuContext` and
+    /// therefore holds `GPU_TEST_LOCK`, [`composite_roots_into_tile`] is
+    /// called by [`composite_document`] and by many of this crate's own tests
+    /// with no lock at all. A process-global would let one thread's
+    /// straightening pass land inside another thread's measurement window
+    /// under a threaded `cargo test` and make the assertion below flaky. The
+    /// pass runs synchronously on the calling thread, so a thread-local is
+    /// both immune to that and strictly cheaper.
+    static COMPOSITE_STRAIGHTEN_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Increments [`COMPOSITE_STRAIGHTEN_PASSES`]. Called from
+/// [`composite_roots_into_tile`] immediately after the one
+/// `aurora_render::un_premultiply_in_place` call it is reporting, inside
+/// the same `folded > 0` block — so it is unreachable exactly when that
+/// call is.
+#[cfg(test)]
+fn note_composite_straighten_pass() {
+    COMPOSITE_STRAIGHTEN_PASSES.with(|passes| passes.set(passes.get().saturating_add(1)));
+}
+
+/// The shipping build's version: nothing at all, exactly as with the two
+/// `note_*` pairs above.
+#[cfg(not(test))]
+fn note_composite_straighten_pass() {}
+
 /// Test-only tally of [`recomposite_visible_tiles`]'s `write_composited`
 /// decisions, in three buckets:
 ///
@@ -7596,9 +7660,11 @@ impl RecompositePhases {
 ///   measurement of that change, which is why 0.93.1's named follow-on of
 ///   adding sixth and seventh slots was not needed to land it.
 /// - `[3]` **`cpu_fallback_real`**: the CPU fallback ran and folded at
-///   least one root, i.e. it did genuine per-texel blend math. It contains
-///   the same un-premultiply and `write_composited` tail as `[2]` does, so
-///   it is not "blend math" on its own either: on the CPU-fallback
+///   least one root, i.e. it did genuine per-texel blend math. It **still
+///   contains the un-premultiply pass** — which `[2]` no longer does, since
+///   0.94.0 skips it for exactly the zero-fold tiles `[2]` times — plus the
+///   same `write_composited` tail, so it is not "blend math" on its own
+///   either: on the CPU-fallback
 ///   benchmark the same hand-split put real blending at ~4.51 ms of its
 ///   6.44 ms, with ~3.45 ms un-premultiply and ~1.50 ms write spread
 ///   across both CPU slots.
@@ -8477,9 +8543,19 @@ fn begin_gpu_composite_tile(
 /// different bit patterns the GPU can distinguish, and `NaN != NaN` would
 /// report an unchanged tile as changed forever. Bitwise identity is the
 /// correct predicate for "the bytes an upload would produce are the bytes
-/// it already produced", and it is what the hand-written
-/// `zip(..).all(|(have, want)| have.to_bits() == want.to_bits())` loop
-/// this replaced (0.94.0) computed too.
+/// it already produced".
+///
+/// **Relation to the hand-written
+/// `zip(..).all(|(have, want)| have.to_bits() == want.to_bits())` loop this
+/// replaced (0.94.0).** Identical to it on equal-length inputs — verified
+/// exhaustively over the whole `f16` bit-pattern space, zero disagreements
+/// (Red-team, 0.94.1) — and deliberately *stricter* on unequal ones: `zip`
+/// stops at the shorter side, so the old loop answered `true` for two
+/// buffers where one is a truncated prefix of the other, where this answers
+/// `false`. 0.94.0's own "same predicate, cheaper spelling" overstated that
+/// by claiming exact equivalence. The difference is unreachable in practice
+/// rather than merely unlikely: `write_composited`'s own length guard runs
+/// *before* this call and returns early on a mismatch.
 ///
 /// So this is an **implementation** change to a hot loop, not a change of
 /// meaning: `half::slice::HalfFloatSliceExt::reinterpret_cast` is a safe,
@@ -8488,7 +8564,7 @@ fn begin_gpu_composite_tile(
 /// equality — with a length check and a `memcmp`-shaped comparison the
 /// compiler can vectorize, instead of a per-sample `to_bits` round trip.
 ///
-/// A length mismatch answers `false`. Callers must still treat a wrongly
+/// A length mismatch therefore answers `false`. Callers must still treat a wrongly
 /// sized buffer as their own decision rather than reading `false` as
 /// "content changed" — `write_composited` has its own length guard ahead
 /// of this, and keeps it.
@@ -13934,42 +14010,42 @@ mod tests {
         ActivatedCommand, AppCommand, BRUSH_RADIUS, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_LAYERS,
         COMMAND_CLOSE_PROPERTIES, COMMAND_FILE_OPEN, COMMAND_FILE_SAVE, COMMAND_FOCUS_HISTORY,
         COMMAND_FOCUS_LAYERS, COMMAND_FOCUS_PROPERTIES, COMMAND_REDO, COMMAND_TOGGLE_HISTORY,
-        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO, COMPOSITE_WRITE_OUTCOMES,
-        CRASH_RECOVERY_CONTINUE, ClipboardAccess, CompositeBudget, CompositeCache,
-        CompositeInvalidation, DARK_THEME_TOML, DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS,
-        EXPORT_REFUSED_DISMISS, FileDialogAccess, GPU_COMPOSITE_SUBMITS, Key, KeyChord,
-        MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, MOVE_REFUSED_DISMISS, Modifiers, NamedKey,
-        PALETTE_TOML, PanBounds, PointerButton, RAIL_DIVIDER_HIT_TOLERANCE,
-        RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS, RECOMPOSITE_TILE_COST_NANOS,
-        RailResize, RecoveredDocument, ShutdownState, UndoKind, UndoOrder, activate_command,
-        active_layer_origin, after_undo_redo, apply_canvas_min_zoom, apply_mask, apply_scroll_zoom,
-        aur_verify_scratch_dir, autosave_path, background_color_from_theme, begin_drag,
-        begin_gpu_composite_tile, brush_stroke_mut, canvas_area_logical_size,
-        canvas_area_physical_rect, canvas_area_physical_size, canvas_local_origin, canvas_min_zoom,
-        clamp_pan_to_active_layer, clean_shutdown_cleanup, clear_session_marker,
-        close_command_palette, close_dialog, collect_widget_paints, commit_ending_drag,
-        composite_document, composite_reference_origin, composite_roots_into_tile,
-        composite_surface_id, continue_drag, crash_recovery_dialog_actions,
-        crash_recovery_dialog_message, create_tile_store_scratch_dir, default_shortcuts,
-        demo_document, dissolve_gate, document_canvas_size, document_from_image,
-        document_qualifies_for_gpu_compositing, effective_residency_zoom, eraser_stroke_mut,
-        export_refused_dialog_actions, eyedropper_sample, guarded_scale_factor, handle_dialog_key,
-        handle_dialog_pointer, handle_key, handle_palette_key, handle_zoom_tool_click,
-        hash_position, hash_to_unit_f32, incomplete_composite_message, is_aur_path,
-        layer_for_surface, layer_local_point, load_document_view, load_scales, load_theme,
-        logical_point, logical_size, mark_move_refusal_reported, move_refusal_unreported,
-        move_refused_dialog_actions, move_refused_message, open_command_palette,
-        open_crash_recovery_dialog, open_dialog, open_image, open_tile_store, palette_commands,
-        pan_bounds, partial_autosave_path, perform_undo_redo, pointer_in_canvas,
-        pointer_on_rail_divider, press_layer_row, previous_session_left_a_marker,
-        recomposite_visible_tiles, recover_document, replace_document, replace_document_pixels,
-        reset_canvas_view, resized_rail_width, resolve_tile, run_command, run_shutdown_cleanup,
-        sample_pixel, select_layer, shift_bounds, skipped_tiles_dialog_actions,
-        skipped_tiles_message, skipped_tiles_warning, splitmix64, tile_overlaps_doc_rect,
-        tile_store_scratch_dir, tiles_are_bitwise_identical, toggle_command_palette,
-        topmost_pixel_layer, translate_key, translate_modifiers, translate_pointer_button,
-        unwarned_failures, verify_aur, write_autosave, write_session_marker, write_verified,
-        zoom_steps_for_scroll,
+        COMMAND_TOGGLE_LAYERS, COMMAND_TOGGLE_PROPERTIES, COMMAND_UNDO,
+        COMPOSITE_STRAIGHTEN_PASSES, COMPOSITE_WRITE_OUTCOMES, CRASH_RECOVERY_CONTINUE,
+        ClipboardAccess, CompositeBudget, CompositeCache, CompositeInvalidation, DARK_THEME_TOML,
+        DARKEN_GPU_DISPATCHES, Drag, ERASER_RADIUS, EXPORT_REFUSED_DISMISS, FileDialogAccess,
+        GPU_COMPOSITE_SUBMITS, Key, KeyChord, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
+        MOVE_REFUSED_DISMISS, Modifiers, NamedKey, PALETTE_TOML, PanBounds, PointerButton,
+        RAIL_DIVIDER_HIT_TOLERANCE, RECOMPOSITE_MARK_IMBALANCE, RECOMPOSITE_PHASE_NANOS,
+        RECOMPOSITE_TILE_COST_NANOS, RailResize, RecoveredDocument, ShutdownState, UndoKind,
+        UndoOrder, activate_command, active_layer_origin, after_undo_redo, apply_canvas_min_zoom,
+        apply_mask, apply_scroll_zoom, aur_verify_scratch_dir, autosave_path,
+        background_color_from_theme, begin_drag, begin_gpu_composite_tile, brush_stroke_mut,
+        canvas_area_logical_size, canvas_area_physical_rect, canvas_area_physical_size,
+        canvas_local_origin, canvas_min_zoom, clamp_pan_to_active_layer, clean_shutdown_cleanup,
+        clear_session_marker, close_command_palette, close_dialog, collect_widget_paints,
+        commit_ending_drag, composite_document, composite_reference_origin,
+        composite_roots_into_tile, composite_surface_id, continue_drag,
+        crash_recovery_dialog_actions, crash_recovery_dialog_message,
+        create_tile_store_scratch_dir, default_shortcuts, demo_document, dissolve_gate,
+        document_canvas_size, document_from_image, document_qualifies_for_gpu_compositing,
+        effective_residency_zoom, eraser_stroke_mut, export_refused_dialog_actions,
+        eyedropper_sample, guarded_scale_factor, handle_dialog_key, handle_dialog_pointer,
+        handle_key, handle_palette_key, handle_zoom_tool_click, hash_position, hash_to_unit_f32,
+        incomplete_composite_message, is_aur_path, layer_for_surface, layer_local_point,
+        load_document_view, load_scales, load_theme, logical_point, logical_size,
+        mark_move_refusal_reported, move_refusal_unreported, move_refused_dialog_actions,
+        move_refused_message, open_command_palette, open_crash_recovery_dialog, open_dialog,
+        open_image, open_tile_store, palette_commands, pan_bounds, partial_autosave_path,
+        perform_undo_redo, pointer_in_canvas, pointer_on_rail_divider, press_layer_row,
+        previous_session_left_a_marker, recomposite_visible_tiles, recover_document,
+        replace_document, replace_document_pixels, reset_canvas_view, resized_rail_width,
+        resolve_tile, run_command, run_shutdown_cleanup, sample_pixel, select_layer, shift_bounds,
+        skipped_tiles_dialog_actions, skipped_tiles_message, skipped_tiles_warning, splitmix64,
+        tile_overlaps_doc_rect, tile_store_scratch_dir, tiles_are_bitwise_identical,
+        toggle_command_palette, topmost_pixel_layer, translate_key, translate_modifiers,
+        translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
+        write_session_marker, write_verified, zoom_steps_for_scroll,
     };
     // Only `create_dir_owner_only_refuses_a_symlink` below needs this, and
     // that test is itself `#[cfg(unix)]` -- `std::os::unix::fs::symlink`
@@ -18978,6 +19054,18 @@ mod tests {
     /// too.
     fn take_gpu_composite_submit_count() -> u64 {
         GPU_COMPOSITE_SUBMITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reads [`COMPOSITE_STRAIGHTEN_PASSES`] and resets it to zero, the
+    /// same read-and-zero shape as the two counters above.
+    ///
+    /// No lock and no atomic ordering to reason about: the counter is
+    /// thread-local, so what this returns is the calls *this* thread made
+    /// since its own last call — see [`COMPOSITE_STRAIGHTEN_PASSES`]'s own
+    /// doc comment for why a process-global would have been flaky here
+    /// where it is sound for [`DARKEN_GPU_DISPATCHES`].
+    fn take_composite_straighten_passes() -> u64 {
+        COMPOSITE_STRAIGHTEN_PASSES.with(|passes| passes.replace(0))
     }
 
     /// Reads [`RECOMPOSITE_PHASE_NANOS`] and resets it to zero in the
@@ -24171,7 +24259,16 @@ mod tests {
     fn composite_roots_into_tile_folds_nothing_at_a_tile_a_real_layer_never_painted() {
         let (_dir, mut store, layers, _surface, painted) = unchanged_skip_fixture();
         // Two tiles right of the one `unchanged_skip_fixture` filled, so
-        // the 10x10 layer's own content cannot reach it.
+        // the store has nothing at all under this tile. **That, and not
+        // the layer's `bounds`, is what makes `resolve_tile` decline**:
+        // the layer's own origin is `(0, 0)`, which equals the
+        // `reference_origin` passed below, so `resolve_tile` takes its
+        // same-origin arm and returns `None` on
+        // `!store.contains_tile(surface, tile_id)` — a tile this fixture
+        // never stored. No clipping against `bounds` happens on that arm
+        // at all (and the fixture's `fill_solid` fills a whole tile, not
+        // the declared 10x10 sub-rect), so a reader must not take this
+        // test as evidence about bounds clipping.
         let never_painted = aurora_tile::TileId {
             x: painted.x + 2,
             y: painted.y,
@@ -24193,6 +24290,69 @@ mod tests {
         assert!(
             composited.iter().all(|sample| sample.to_bits() == 0),
             "a zero-fold tile must be bitwise all-zero, not merely near-transparent"
+        );
+    }
+
+    /// **The skip's own regression guard** (0.94.1), and the one thing no
+    /// output assertion in this module can be: 0.94.0's whole argument is
+    /// that skipping `aurora_render::un_premultiply_in_place` for a
+    /// zero-fold tile is *output-identical*, which means every test that
+    /// checks texels passes whether the pass ran or not. Mutating
+    /// `composite_roots_into_tile`'s `folded > 0` to `true` — the exact
+    /// pre-0.94.0 behaviour — left all 384 tests in this crate green, so a
+    /// later refactor could hand the whole ~6.5 ms/frame win back with a
+    /// fully green gate.
+    ///
+    /// So this asserts on **calls**, via
+    /// [`COMPOSITE_STRAIGHTEN_PASSES`], in both directions from one
+    /// fixture: zero calls for the never-painted tile (which the mutation
+    /// above would turn into one, failing here), and at least one for the
+    /// tile the fixture really filled (which mutating the guard to `false`
+    /// would turn into zero — the direction
+    /// `composite_document_un_premultiplies_a_translucent_root_level_layer`
+    /// and four other tests already catch on output, and this one now
+    /// catches directly).
+    ///
+    /// The two calls each build their own `CompositeBudget`, exactly as
+    /// the per-tile loop does, so neither inherits the other's spend.
+    /// No GPU needed: this calls the CPU helper directly.
+    #[test]
+    fn composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded() {
+        let (_dir, mut store, layers, _surface, painted) = unchanged_skip_fixture();
+        let never_painted = aurora_tile::TileId {
+            x: painted.x + 2,
+            y: painted.y,
+        };
+
+        // Whatever ran on this thread before is not this test's business;
+        // the counter is thread-local, so this is the whole reset needed.
+        let _ = take_composite_straighten_passes();
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let (_zero_fold, folded) = composite_roots_into_tile(
+            &layers,
+            &mut store,
+            never_painted,
+            (i64::from(never_painted.x) * i64::from(aurora_tile::TILE), 0),
+            (0, 0),
+            &mut budget,
+        );
+        assert_eq!(folded, 0, "the fixture never stored this tile");
+        assert_eq!(
+            take_composite_straighten_passes(),
+            0,
+            "a zero-fold tile must skip the straightening pass entirely, not run it and get \
+             identical bits"
+        );
+
+        let mut budget = CompositeBudget::for_pass(&layers);
+        let (_real_fold, folded) =
+            composite_roots_into_tile(&layers, &mut store, painted, (0, 0), (0, 0), &mut budget);
+        assert_eq!(folded, 1, "the fixture filled exactly this tile");
+        assert!(
+            take_composite_straighten_passes() >= 1,
+            "a tile that folded a root must still run the straightening pass -- skipping it \
+             there would return premultiplied texels"
         );
     }
 

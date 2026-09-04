@@ -19612,6 +19612,21 @@ severity choice.
   | `COMPOSITE_WRITE_OUTCOMES` GPU path, `[skipped, changed, not_resident]` mean/frame | 13.2 / 1.3 / 5.5 | **13.2 / 1.3 / 5.5** |
   | `COMPOSITE_WRITE_OUTCOMES` CPU fallback | 4.1 / 1.2 / 3.7 | **4.1 / 1.2 / 3.7** |
 
+  **Read the two p99 rows as the weakest numbers in that table, not the
+  headline** (correction, 0.94.1). These benchmarks run **n = 40 frames**,
+  and `ms_stats`'s percentile is `round((len - 1) * p)` — at `len = 40`
+  that is `round(38.61) = 39`, the last index of the sorted slice. **The
+  reported p99 is literally `max(40 frames)`**: a single-sample order
+  statistic, dominated by whichever one frame was worst. A fresh three-run
+  reproduction of the *committed* code on the same RTX 3090 (0.94.1) got
+  GPU-path p99 = 23.62 / 25.76 / 23.79 ms — already outside the
+  23.29–23.72 ms band this entry claimed for it — and an independent
+  reproduction got one as high as **31.21 ms**, which lands inside the
+  "before" band above. So the `~1.4×` / `~1.7–2.2×` ratio framing below
+  overstates what a max-of-40 can support, and the mean is the metric that
+  actually separates the two builds. See 0.94.1's entry for the
+  mean-grounded restatement and for the re-measured numbers.
+
   **The write-outcome fingerprint is identical to the printed precision
   on both benchmarks, and so are the `upload_sync moved` tile/byte
   counts** — behavioural evidence that no write *decision* changed, only
@@ -19632,9 +19647,17 @@ severity choice.
   cheaper spelling of an unchanged predicate with a test pinning that
   predicate, not on a number — stated plainly rather than credited.
 
-  **Both benchmarks still miss the 16.7 ms p99 budget where it was
-  missed before, and the 60 FPS gate is still open.** The GPU path's p99
-  is **23.29–23.72 ms, ~1.4× the budget** (was ~1.7–2.2×). The
+  **That last claim was wrong, and is corrected in 0.94.1**: Step 3 *can*
+  be isolated, by reverting only its one-line predicate change and keeping
+  the `folded > 0` guard. Doing so measures it at **~0.8 ms/frame** on
+  non-overlapping ranges. See 0.94.1's entry for the numbers.
+
+  **Both benchmarks still miss the 16.7 ms budget where it was missed
+  before, and the 60 FPS gate is still open.** *(Ratio framing corrected
+  in 0.94.1 — the p99 figures below are a max-of-40, per the note under
+  the table; the gate being missed is not in doubt either way, since the
+  GPU path's **mean** alone is ~8.4 ms with a p99 well past 16.7 ms.)* The
+  GPU path's p99 is **23.29–23.72 ms, ~1.4× the budget** (was ~1.7–2.2×). The
   CPU-fallback benchmark's p99 (12.17–12.70 ms) is under 16.7 ms in this
   session — but it was *also* under it before this change (14.20–15.00
   ms), so that is this machine's baseline and not something this round
@@ -19694,18 +19717,167 @@ severity choice.
   **Two non-vacuity mutations, run by hand rather than assumed** — the
   check that the skip is actually tested in the direction that matters:
 
-  - `if folded > 0` → `if false` (always skip): both
-    `composite_document_un_premultiplies_a_translucent_root_level_layer`
-    and `recomposite_visible_tiles_un_premultiplies_a_translucent_root_level_layer`
-    **FAIL**, each reporting the premultiplied `(0.5, 0.5, 0.5, 0.5)`
+  - `if folded > 0` → `if false` (always skip): **5 tests FAIL**
+    (`379 passed; 5 failed`), reported here as 2 and re-run by hand in
+    0.94.1 — coverage is stronger than this entry claimed, but the claim
+    should still be accurate. The full list:
+    `composite_document_un_premultiplies_a_translucent_root_level_layer`,
+    `recomposite_visible_tiles_un_premultiplies_a_translucent_root_level_layer`,
+    `composite_document_straightens_a_fractional_group_and_a_fractional_root_fold_exactly_once`,
+    `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_fractional_final_alpha_document`,
+    and `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_an_arbitrary_opacity_document`.
+    The first two each report the premultiplied `(0.5, 0.5, 0.5, 0.5)`
     where straight `(1.0, 1.0, 1.0, 0.5)` is required. So the pass is
     genuinely load-bearing for a folded tile and the suite notices its
-    removal.
+    removal from several independent directions.
   - `if folded > 0` → `if true` (the exact pre-change behaviour):
     **384 passed, 0 failed** in `aurora-app`, including the three new
     tests. Then restored to `if folded > 0`: **384 passed, 0 failed**.
     Identical results either way is the byte-identity claim shown
     empirically, not just asserted.
+
+    **That green run is also a hole, and 0.94.1 closes it.** Being
+    output-identical is exactly what makes losing the skip invisible: a
+    refactor that dropped or inverted the guard would hand the whole
+    ~6.5 ms/frame win back with a fully green gate. 0.94.1 adds the
+    call-counter guard, the same remedy `DARKEN_GPU_DISPATCHES` already
+    is for its own arm.
+
+  **0.94.1 (2026-09-04) — correcting 0.94.0's measurement claims, and
+  giving its optimization a regression guard.** No compositing behaviour
+  changes: every edit here is a doc comment, a PLAN.md correction, or the
+  new call counter and its test. Independent Critic and Red-team reviews of
+  0.94.0 confirmed the skip is sound and found no correctness defect
+  anywhere in it; what they found was that the round's *claims about
+  itself* were partly unsupported, and that the optimization had no guard.
+  Both are addressed here, and 0.94.0's entry above is annotated rather
+  than rewritten so the correction is legible.
+
+  **Re-measured, three fresh runs per build, one session, one machine
+  state, real adapter printed on every run** (`NVIDIA GeForce RTX 3090
+  (Vulkan, DiscreteGpu)`; `AURORA_REQUIRE_GPU=1 cargo test --release -p
+  aurora-app -- --nocapture --test-threads=1 recomposite_and_present_loop`).
+  Three builds, not two, because Step 3 needed isolating:
+
+  | GPU-path metric (ms) | pre-0.94.0 (both reverted) | 0.94.0 with **only Step 3** reverted | 0.94.0 as committed |
+  |---|---|---|---|
+  | total **mean** | 15.20 / 15.22 / 15.27 | 9.49 / 9.33 / 9.76 | **9.48 / 8.37 / 8.35** |
+  | `cpu_fallback_empty` (mean/frame) | 8.96 / 9.00 / 9.03 | 3.09 / 3.00 / 3.20 | **2.47 / 2.20 / 2.22** |
+  | total p99 *(= max of n=40 — see below)* | 30.08 / 29.82 / 29.77 | 23.73 / 23.60 / 23.83 | 23.62 / **25.76** / 23.79 |
+
+  **The mean is the headline, and it is robust.** GPU-path total mean drops
+  from **15.20–15.27 ms to 8.35–9.48 ms** — non-overlapping ranges across
+  three runs each, a real **~5.8–6.9 ms/frame** improvement, and it is
+  matched almost exactly by the drop in `cpu_fallback_empty` (8.96–9.03 →
+  2.20–2.47, ~6.7 ms), which is where the change is. That is the claim
+  0.94.0 should have led with.
+
+  **The p99 in these benchmarks is `max(40 frames)` and should not carry a
+  ratio.** `ms_stats` computes `round((len - 1) * p)`, which at `len = 40`
+  is index 39 — the last element of the sorted slice. So the "p99" is one
+  frame, the worst one, and it moves accordingly: the committed build
+  measured 23.62 / 25.76 / 23.79 ms here (the middle run already above
+  0.94.0's claimed 23.29–23.72 ms band), and an independent three-run
+  reproduction of the same committed code saw **31.21 ms** — inside the
+  band 0.94.0 published as "before". 0.94.0's "~1.4× (was ~1.7–2.2×)" is
+  therefore two unstable point estimates divided by each other, and the
+  honest statement is the one above plus: **the 60 FPS gate remains missed,
+  and not marginally.** The GPU path's *mean* frame is ~8.4 ms with a worst
+  frame in the 23–31 ms range against a 16.7 ms budget, so the budget is
+  missed on the tail in every run of every build measured. Nothing about
+  that disclosure is softened by this correction; it is re-grounded on the
+  metric that can support it. Raising `n` well past 40 so a p99 stops being
+  an order statistic of one sample is a named follow-on, not done here (it
+  multiplies benchmark runtime, and it is a change to the benchmark rather
+  than to the claim it makes).
+
+  **Step 3 is isolable after all, at ~0.8 ms/frame.** 0.94.0 said its
+  standalone contribution "is not isolated" and that any excess over the
+  ~6.49 ms prediction was "inside run-to-run variance and is not a
+  measurement." Reverting *only* the `tiles_are_bitwise_identical` call
+  back to the old `zip(..).all(|(have, want)| have.to_bits() ==
+  want.to_bits())` loop while keeping the `folded > 0` guard — one line —
+  and re-running three times gives the middle column above:
+  `cpu_fallback_empty` 3.00–3.20 ms against 2.20–2.47 ms with both changes,
+  **non-overlapping**, so Step 3 alone is worth ~0.8 ms/frame here (an
+  independent reproduction put it at ~1.08 ms; call it ~0.8–1.1 ms). The
+  split is internally consistent: guard-alone ≈ 9.00 → 3.10 ≈ 5.9 ms, plus
+  Step 3's ~0.8 ms, reconstructs the ~6.7 ms joint drop. Step 3 is still
+  kept primarily for being a cheaper spelling of a pinned predicate — but
+  it is now credited with a number instead of a disclaimer.
+
+  **The skip now has a regression guard** (the Critic's finding, and the
+  most consequential fix here). Mutating `composite_roots_into_tile`'s
+  `if folded > 0` to `if true` — the pre-0.94.0 behaviour — left all 384
+  `aurora-app` tests green, because the skip is *output-identical*: no
+  assertion on texels can see it. That is the same shape as the
+  `Darken`-dispatch gap, so it gets the same remedy. New
+  `COMPOSITE_STRAIGHTEN_PASSES` counter, incremented inside the
+  `folded > 0` block immediately after the
+  `aurora_render::un_premultiply_in_place` call, plus new test
+  `composite_roots_into_tile_runs_the_straightening_pass_only_when_a_root_folded`,
+  which asserts **zero** calls for a zero-fold tile and **≥ 1** for a tile
+  that folded a root. Confirmed non-vacuous by re-running the mutation:
+  with `if true` the new test is the one failure (`384 passed; 1 failed`),
+  where before it was `384 passed; 0 failed`.
+
+  **Thread-local, not a process-global atomic** — the one design point
+  worth stating. `DARKEN_GPU_DISPATCHES` can be a global because every
+  caller of `begin_gpu_composite_tile` holds `GPU_TEST_LOCK`;
+  `composite_roots_into_tile` is called by `composite_document` and by many
+  tests with no lock at all, which is exactly why 0.93.1 had to demote its
+  fold count from a global to a return value. A `thread_local!
+  Cell<u64>` cannot be crossed by another thread's pass under a threaded
+  `cargo test`, and the pass runs synchronously on the calling thread, so
+  this is both sound and cheaper. `#[cfg(test)]` throughout, with a
+  `#[cfg(not(test))]` no-op `note_composite_straighten_pass` — nothing
+  ships.
+
+  **Five doc corrections, each a claim that was wrong or over-broad:**
+  - `RECOMPOSITE_TILE_COST_NANOS` slot `[3]`'s doc said it "contains the
+    same un-premultiply … tail as `[2]` does" while slot `[2]`'s doc six
+    lines above already said the pass "is no longer in this slot at all" —
+    self-contradicting instrumentation docs inside one commit, the same
+    class of bug 0.93.1 had to fix once. `[3]` now says it *still* contains
+    the pass, which is what makes it not-just-blend-math, and names `[2]`'s
+    difference.
+  - `tiles_are_bitwise_identical`'s doc claimed the new `[u16]` slice
+    equality is what the old `zip(..).all(..)` loop "computed too". It is
+    not, on unequal lengths: `zip` stops at the shorter side, so the old
+    loop answered `true` for a truncated prefix where slice equality
+    answers `false`. Identical on equal lengths (verified exhaustively over
+    the `f16` bit-pattern space), *stricter* otherwise, and the divergence
+    is unreachable because `write_composited`'s length guard runs first.
+    The doc now says that, instead of claiming an equivalence its own
+    next-but-one paragraph contradicted.
+  - `composite_roots_into_tile`'s `# Returns` said `folded == 0` means
+    "every root declined". It also means `roots()` was empty (the case the
+    round's own first new test exercises) and it also covers a
+    `CompositeBudget` refusal before any root resolves. All three are now
+    named.
+  - `un_premultiply_in_place_is_a_bitwise_identity_on_a_transparent_tile`
+    is correctly scoped but invites over-reading. Its doc now states
+    explicitly that the identity is about `transparent_tile`'s own
+    canonical all-`0x0000` output and **not** about an arbitrary
+    alpha-zero buffer, with the counterexample: `r = -0.0` (`0x8000`) with
+    `a = +0.0` has its sign bit canonicalized away, so the bits change.
+  - `composite_roots_into_tile_folds_nothing_at_a_tile_a_real_layer_never_painted`
+    attributed the decline to the fixture layer's 10×10 `bounds`. Wrong
+    mechanism: the layer's origin equals the `reference_origin` passed, so
+    `resolve_tile` takes its same-origin arm and declines on
+    `!store.contains_tile(...)` — a tile the fixture never stored — with no
+    `bounds` clipping involved at all (and `fill_solid` fills a whole tile,
+    not the 10×10 sub-rect). The comment now says so, and warns against
+    reading the test as evidence about bounds clipping.
+
+  0.94.0's own non-vacuity claim is corrected too: the always-skip mutation
+  fails **5** tests, not the 2 it named (re-run by hand; full list in that
+  entry). Coverage is stronger than claimed — recorded because the claim
+  should be accurate either way.
+
+  1 new test (386 → 1,639 workspace-wide; `aurora-app` 384 → 385), 0
+  changed, 0 removed. No new dependency, no `unsafe`, no new lint
+  exception, no behavioural change to any compositing path.
 
   No new dependency (`half` was already a workspace dependency of
   `aurora-app`), **no new `unsafe`** (`reinterpret_cast` is a safe
