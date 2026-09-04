@@ -18748,6 +18748,399 @@ severity choice.
   sets. Performed by hand again rather than automated — still a candidate
   follow-on, still not built.
 
+- [x] **GPU blend-mode math, slice 7 of the epic: `BlendMode::LinearDodge`
+  ported and wired — done 2026-09-04 (0.105.0).** The sixth real blend
+  mode on the GPU path, at exactly the cost 0.95.0 predicted and 0.102.0
+  and 0.104.0 each confirmed: one WGSL entry point, one `BlendPass` const,
+  one wrapper, one dispatch arm, one counter, and **no change to
+  `composite_blend_over_with_opacity`'s signature or body**. It is the
+  second mode added after 0.103.0's counter merge, and the first added
+  after 0.104.1 introduced `GpuBlendDispatch::ALL` — which did its job on
+  its first outing: the variant list went from `[Self; 6]` to `[Self; 7]`
+  in one edit, with the test's own literal the only other place to touch.
+
+  What landed:
+
+  - **`fs_composite_linear_dodge`** in
+    `crates/aurora-render/src/shaders/composite.wgsl`, structurally
+    identical to the five entry points above it in every line but one:
+    `let b = min(cb + s.rgb, vec3<f32>(1.0));`. That mirrors
+    `blend_channel`'s own `(cb + cs).min(1.0)` arm. The `vec3<f32>(1.0)`
+    splat rather than a bare scalar `1.0` is not cosmetic — WGSL's `min`
+    requires both operands to share a type, so the scalar form does not
+    type-check; confirmed by building. No new binding, no new bind group
+    layout: it shares `backdrop_tex` (binding 3), the `Opacity` uniform
+    (binding 2) and `TileCompositor::bind_group_layout_blend` with the
+    five before it.
+  - **`TileCompositor::composite_linear_dodge_over_with_opacity`** in
+    `crates/aurora-render/src/composite.rs` — a one-line delegation to the
+    unchanged shared helper with a new `BLEND_PASS_LINEAR_DODGE` const and
+    four new `wgpu` debug labels (`composite.linear_dodge{,.opacity,
+    .bind_group,.pass}`).
+  - **Predicate admission and a dispatch arm** in
+    `crates/aurora-app/src/lib.rs`:
+    `document_qualifies_for_gpu_compositing` gains
+    `| aurora_doc::BlendMode::LinearDodge`, and `begin_gpu_composite_tile`
+    gains a `LinearDodge` arm the shape of `Difference`'s, sharing the
+    *same single* `spare` ping-pong accumulator.
+  - **`GpuBlendDispatch::LinearDodge` + `GpuBlendDispatches::linear_dodge`**,
+    instrumented from this mode's first round. Deliberately **not**
+    `#[cfg(test)]`-gated, unlike `Dissolve`: real shipping code (the new
+    dispatch arm) constructs it, so the flagless `cargo check -p
+    aurora-app` is satisfied without an `allow`.
+  - **Eight new tests** — six in `aurora-render` (`composite_linear_dodge_*`,
+    mirroring the `Difference` suite one for one) and two in `aurora-app`
+    (the headless admission test and the three-layer end-to-end
+    differential) — plus `GpuBlendDispatch::LinearDodge` added to
+    `GpuBlendDispatch::ALL`, and **two modes added to the
+    every-expressible-mode loop** (see Finding 1 below).
+
+  **This mode's formula is the one with a clamp that is part of the mode,
+  not a guard.** `Cb + Cs` is unbounded above and `LinearDodge` is
+  *defined* as the clamped sum (Photoshop's "Add"), so dropping the `min`
+  computes a different function everywhere the sum exceeds `1.0` rather
+  than merely widening a range. That is what separates it from `Screen`,
+  its nearest arithmetic neighbour (`Cb + Cs - Cb*Cs`, the same sum with a
+  correction term instead of a clamp), and it is why every solid-colour
+  fixture in the suite carries **both** a channel whose sum stays strictly
+  under `1.0` and a channel whose sum exceeds it. Three near-neighbour
+  confusions are named explicitly in the WGSL comment, the Rust doc
+  comment and the app predicate's own bullet, because two of them are real
+  copy-paste hazards rather than hypothetical:
+  `max(Cb + Cs - 1, 0)` is **`LinearBurn`**, this mode's exact mirror
+  image (same sum, opposite offset, opposite clamp direction — the two
+  differ by three characters) and still CPU-only; `Cb + Cs - Cb*Cs` is
+  `Screen`; and `Cb / (1 - Cs)` is **`ColorDodge`**, the *other*
+  dodge-family mode, which shares half a name with this one and nothing
+  else, and is likewise still CPU-only.
+
+  **Mode accounting, stated exactly, and re-derived from source rather than
+  incremented.**
+
+  **8 of 27** `aurora_doc::BlendMode` variants are now admitted by
+  `document_qualifies_for_gpu_compositing` (`Normal`, `Multiply`,
+  `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`, `Dissolve`),
+  up from 7; **19 remain CPU-only** at the app's GPU predicate, down from
+  20.
+
+  **6 of 26** `aurora_render::BlendMode` variants now have a real WGSL
+  blend-math entry point (`Multiply`, `Darken`, `Lighten`, `Screen`,
+  `Difference`, `LinearDodge`), up from 5; **20 remain without one**, down
+  from 21. The denominator is 26, not 27, because this crate's own enum
+  excludes `Dissolve` — a pre-composite visibility gate, never a per-pixel
+  formula it would need to port. `Normal` is not counted among the six even
+  though it composites on the GPU, since its "blend" is the fixed-function
+  alpha unit (`Blend::AlphaBlending`) rather than a blend-math entry point,
+  which is exactly why it needs no formula in `composite.wgsl`.
+
+  **`Normal` is one of those 20 and is not CPU-only, so the two figures
+  reconcile at 19 — and that is worth spelling out, because "19" appearing
+  on both sides can read like a typo.** Read the shader-level figure as
+  "no blend-math shader", never as "no GPU path": of the 20 without an
+  entry point, `Normal` already composites on the GPU through the
+  fixed-function unit, so the modes genuinely left to `composite_tile_cpu`
+  are the other **19** — the same 19 the app predicate rejects
+  (27 − 8 = 19). The two sets are reached by different subtractions over
+  different enums and differ by `Normal` (in the shader-level denominator,
+  not CPU-only) and `Dissolve` (absent from the render crate's enum,
+  admitted at the predicate); those two differences cancel.
+
+  **A plan-arithmetic correction, recorded rather than quietly adopted.**
+  This round's own plan stated the shader-level figure as "**19** remain
+  without one (26 − 1 [`Normal`] − 6 = 19)". That subtracts `Normal` out of
+  the *without-an-entry-point* count, which contradicts how every prior
+  round has counted it — 0.104.0's entry says "5 of 26 … **21** remain
+  without one", i.e. 26 − 5, with `Normal` included among them. The
+  established convention is kept: **20** remain without an entry point,
+  and `Normal` is subtracted only when converting that to the CPU-only
+  figure of 19. Both figures were computed from the source this round
+  rather than incremented: `EVERY_BLEND_MODE` is declared
+  `[aurora_doc::BlendMode; 27]`, the render crate's enum was enumerated to
+  26 variants, and `composite.wgsl` has exactly six blend-math `@fragment`
+  entry points besides the fixed-function `fs_composite`/
+  `fs_composite_opacity` pair.
+
+  **Mutation testing: eleven mutations planned, ten killed, one survivor —
+  and the survivor was *not* the one the plan expected.** (k) was predicted
+  to kill 4-5 render tests and nothing at app level; it killed **nothing**,
+  for a structural reason the plan had not accounted for — see Finding 4.
+  Separately, one *test* was predicted to survive a killed mutation and did:
+  render 6 under (e), see Finding 3. Each mutation was applied for real, the
+  **whole workspace** suite re-run under `AURORA_REQUIRE_GPU=1
+  --no-fail-fast` (23 test binaries, the same 23 the baseline runs), then
+  reverted from a pristine snapshot and all three files `touch`ed to defeat
+  a stale-mtime skip. Baseline: **1,688 passed / 0 failed / 10 ignored,
+  zero self-skips** — `aurora-render` 162 passed (was 156),
+  `aurora-app` 396 passed (was 394).
+
+  | # | mutation | kills | killing test(s) |
+  |---|---|---|---|
+  | a | delete the whole `LinearDodge` arm from `begin_gpu_composite_tile` | **1** | `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document`, *and only via its dispatch-count assertion* (`0 != 1`) |
+  | b | shader formula → `Screen`'s `cb + s.rgb - cb * s.rgb` | **7** | all six `composite_linear_dodge_*` + the app differential |
+  | c | `BLEND_PASS_LINEAR_DODGE.fragment_entry` → `"fs_composite_difference"` | **7** | the same seven |
+  | d | remove `LinearDodge` from `document_qualifies_for_gpu_compositing` | **3** | `document_qualifies_for_gpu_compositing_admits_a_linear_dodge_blend_mode`; the app differential's *setup* qualification assert; `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode`'s setup assert |
+  | e | drop the clamp (`cb + s.rgb`) | **6** | render 1, 2, 3, 4, 5 + the app differential — **render 6 survives, as predicted** (see Finding 3) |
+  | f | clamp bound → `min(cb + s.rgb, vec3<f32>(0.5))` | **7** | all six + the app differential |
+  | g | clamp direction → `max(cb + s.rgb, vec3<f32>(1.0))` | **7** | all six + the app differential |
+  | g' | clamp shape → `max(cb + s.rgb - 1.0, vec3<f32>(0.0))` (`LinearBurn`) | **7** | all six + the app differential |
+  | h | `counter()`'s `LinearDodge` arm → `&self.screen` | **1** | `every_gpu_blend_dispatch_mode_gets_its_own_counter`, and nothing else |
+  | i | delete only the `note_gpu_blend_dispatch(...)` call, keep the compositor call | **1** | the app differential's dispatch-count assert (`0 != 1`) |
+  | k | transpose `src`/`backdrop` in the dispatch arm | **0** | **nothing — a real survivor.** See Finding 4 |
+
+  **Mutation (a) is the one worth reading twice, and it was measured, not
+  reasoned about.** With the arm deleted, `LinearDodge` falls through the
+  defensive `_` arm to the CPU path, which computes *the same correct
+  pixels* — and the whole of `aurora-render` stayed **162/162 green**,
+  because the shader is untouched and no render test can see the app's
+  dispatch arm at all. Within the app differential itself, the failure is
+  the count assertion and nothing else.
+
+  **And "nothing else" was measured by a sub-experiment rather than inferred
+  from that one run** — inferring it would have been wrong, because a Rust
+  test aborts at its first panic, so under (a) the differential, the
+  absolute golden and the vacuity guard were never *evaluated* at all. So
+  0.104.0's experiment was repeated: the arm still deleted, only the count
+  *expectation* neutralised (`1` → `0`) so the rest of the body runs.
+  **The test passed.** Every pixel assertion in it —
+  `assert_gpu_matches_cpu`, the absolute golden `(0.375, 1.0, 0.75, 1.0)`,
+  and the `assert_ne!` vacuity guard against `Screen` — stayed green with
+  the GPU arm gone, because the CPU fallback computes the same correct
+  pixels. The dispatch counter is the sole
+  thing standing between "this mode composites on the GPU" and a silent
+  regression to CPU — exactly as 0.102.0's RT-2026-0904-02 measured for
+  `Screen` and 0.104.0 confirmed for `Difference`, now a third time on a
+  third mode. That is the whole argument for instrumenting from a mode's
+  first round.
+
+  **(a) and (i) are deliberately separate rows, and they are not the same
+  experiment.** (a) removes the GPU work *and* the report; (i) removes only
+  the report, leaving the compositor call in place. Both kill exactly one
+  assertion — the same one — which is what makes the counter's failure mode
+  legible: it reports "the arm ran", not "the pixels are right", and
+  nothing else in either crate asserts that.
+
+  **Mutations (e), (f), (g) and (g') were each checked for non-vacuity
+  rather than assumed to be real kills**, since a clamp anywhere in the
+  readback could have masked them. (e) is the interesting one and is
+  written up as Finding 3 below. (f) (a mistyped bound), (g) (a reversed
+  direction) and (g') (`LinearBurn`'s shape) each kill the full seven,
+  which is what separates these fixtures from "anything with a clamp in
+  it" — they discriminate `min(Cb + Cs, 1)` from its three nearest wrong
+  spellings specifically, including the mirror-image mode the WGSL comment
+  names as the realistic copy-paste hazard.
+
+  **Every golden value was independently re-derived before it was written**,
+  in exact rational arithmetic against a transcription of
+  `composite_layer_into`'s own fold, and then cross-checked a second time
+  against the real `composite_tile_cpu` inside each test. Every absolute
+  golden this round asserts was also confirmed *empirically* by the
+  mutation runs, which printed the wrong answers this suite's doc comments
+  predict — bit for bit, in every case checked:
+
+  | mutation | test | actual GPU texel | predicted in the doc comment |
+  |---|---|---|---|
+  | b (→ `Screen`) | render 1 | `(0.4375, 0.8125, 0.921875, 1.0)` | "the `Screen` arm … `(0.4375, 0.8125, 0.921875)`" |
+  | b (→ `Screen`) | app differential | `(0.34375, 0.921875, 0.625, 1.0)` | the `assert_ne!` guard's `(0.34375, 0.921875, 0.625)` |
+  | e (clamp dropped) | render 1 | `(0.5, 1.0, 1.25, 1.0)` | "a dropped clamp `(0.5, 1.0, 1.25)`" |
+  | e (clamp dropped) | render 4 | `(0.5, 0.9375, 1.1875, 1.0)` | "a dropped clamp gives `(0.5, 0.9375, 1.1875)`" |
+  | e (clamp dropped) | render 5 | `(0.875, 1.5, 2.5, 1.0)` | "`2.5` in blue would mean the blend clamp was dropped" |
+  | e (clamp dropped) | app differential | `(0.375, 1.25, 0.75, 1.0)` | "a shader that dropped the clamp gives `(0.375, 1.25, 0.75, 1.0)`" |
+
+  **Two `> 1.0` goldens were confirmed on hardware rather than assumed.**
+  `composite_linear_dodge_over_with_opacity_does_not_clamp_a_source_alpha_above_one`
+  asserts `(0.875, 1.5, 1.25, 1.0)` — **two** channels above `1.0`, the
+  mirror image of the `Difference` round's single negative blue. This
+  mode's *blend term* is bounded above by `1.0` by construction, but the
+  *fold* around it is not: with a source alpha of `2.0`, `inv = 1 - a` goes
+  negative and the fold overshoots upward instead of undershooting below
+  zero. GPU and CPU **agree exactly**: `Rgba16Float` stores `1.5` and
+  `1.25`, neither path clamps its output, and `read_first_texel` does not
+  clamp on the way back. No discrepancy to report. The same was separately
+  verified for `aurora-app`'s own `read_first_texel` (a raw
+  `half::f16::to_f32`, no clamp), which is what makes the app
+  differential's own dropped-clamp kill possible — under mutation (e) it
+  really did read `1.25` back rather than a clamped `1.0`.
+
+  **Finding 1 — a real pre-existing bug in this round's own test file,
+  fixed and disclosed rather than quietly swept.**
+  `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode`
+  loops over "every mode `document_qualifies_for_gpu_compositing` admits",
+  and its own comment states the rule: "this list has to keep pace with
+  it," because a mode ported to the GPU path but not added here "turns that
+  name into a false claim without anything going red." **0.104.0 admitted
+  `Difference` at the predicate and did not add it to this loop** — so for
+  a full round the test's name claimed eight modes and the loop covered
+  six. This round added **both** `Difference` (fixing 0.104.0's drift) and
+  `LinearDodge`, and updated the comment to say which mode the rule failed
+  to catch and when.
+
+  **Adding `Difference` surfaced no real failure**: the loop is green with
+  both new modes present, in the baseline and in every mutation run where
+  the predicate is intact. The never-painted-layer property genuinely does
+  hold for both, so the cost of the drift was a round of *false coverage*,
+  not a bug in the shipped path. The fix is not cosmetic, though —
+  mutation (d) (removing `LinearDodge` from the predicate) is now killed by
+  this loop as one of its three killers, coverage that did not exist for
+  `Difference` before this round.
+
+  **Finding 2 — the mutation runner itself had to be corrected mid-round,
+  and the first pass's numbers were discarded.** The first attempt ran
+  plain `AURORA_REQUIRE_GPU=1 cargo test --workspace`, which **stops after
+  the first failing test binary**. `aurora-app` sorts before
+  `aurora-render`, so on every mutation that kills an app test, cargo never
+  ran the render suite at all — mutation (b) reported "1 failing test" when
+  the real answer is 7. The whole matrix was re-run from a restored
+  pristine tree with `--no-fail-fast`, and every number in the table above
+  is from that second pass (23 test binaries per run, the same 23 the
+  baseline runs). A mutation matrix that silently truncates its own
+  measurement is worse than none, so this is recorded rather than fixed
+  invisibly.
+
+  **Finding 3 — render test 6 cannot detect a dropped clamp, predicted and
+  then confirmed.** `composite_linear_dodge_over_with_opacity_is_the_source_alone_where_the_backdrop_is_transparent`
+  compares the whole tile in 8-bit, and **both** sides of that comparison
+  clamp to `[0, 1]` — `read_rgba8`'s on the GPU side, `rgba8_of`'s on the
+  CPU reference's. Its opaque half's red sum is `1.625`, so an unclamped
+  shader writes `1.625` where the correct answer is `1.0`, and both
+  quantise to `255`. Its `read_first_texel` assertion is no help either:
+  texel 0 is in the *transparent* half, where the blend term is multiplied
+  by zero. **Mutation (e) confirmed the prediction exactly** — that test
+  was the one survivor of the six, passing while the other five and the app
+  differential all failed. It is a real, accepted coverage gap, stated in
+  the test's own doc comment under a REQUIRED DISCLOSURE heading, and it is
+  *not* worked around: widening that test to catch a dropped clamp would
+  mean giving up either the whole-tile 8-bit comparison or the
+  transparent-half NaN check, which are the two things the test exists for.
+  The other five tests in the suite all kill it.
+
+  **Disclosed weaknesses, carried forward:**
+
+  - **A transposed `src`/`backdrop` binding is not caught by this mode's
+    blend term, and is not caught *at all* by the app-level differential.**
+    `Cb + Cs = Cs + Cb`, so `LinearDodge` is symmetric in its two operands,
+    exactly as `Screen` and `Difference` are — the third mode in a row to
+    carry this. Worse, the app fixture is fully opaque, so its fold reduces
+    to `out = B` and the transpose is *structurally* invisible there, not
+    merely unlikely to show. Mutation (k) measured this rather than
+    reasoning about it. What does catch a transpose is the surrounding,
+    *asymmetric* "over" and the per-texel spatial differential in
+    `aurora-render`'s own test 3. Disclosed in the WGSL comment, the Rust
+    doc comment, the app test's own doc comment and the mutation table
+    rather than claimed away.
+  - **`patterned_texels` is a shared helper and violates this suite's own
+    "strictly inside `(0, 1)`" rule.** It emits exactly `0.0` at
+    `n % 4 == 0`, so red and green each sit on `LinearDodge(0, Cs) = Cs`
+    in one column/row of four, and its blue is seed-independent
+    (`Cb == Cs` at every texel). Unlike `Difference`, whose blend term
+    *collapses* under that equality, this mode's stays informative —
+    blue is `min(2*Cb, 1)` and separates `LinearDodge` from `Screen` in
+    three of four quadrants, clamping for real in the bottom-right where
+    `0.75 + 0.75 = 1.5`. Red and green leave **two of every four**
+    columns/rows fully discriminating. The four solid-colour fixtures obey
+    the rule absolutely; this one cannot, and its doc comment says so in
+    three numbered disclosures rather than implying all three channels
+    discriminate everywhere.
+  - **The out-of-range-*opacity* test is omitted for this mode**, as it was
+    for `Darken`, `Screen` and `Difference`: since 0.85.1's merge that
+    property lives in one shared Rust line
+    (`composite_blend_over_with_opacity`'s own `opacity.clamp(0.0, 1.0)`)
+    which every mode's wrapper reaches through, and the `Multiply`/`Darken`
+    suites already pin it on real hardware. A disclosed reduction in
+    coverage, not an equivalence claim. The unclamped *source-alpha* test
+    is emphatically **not** omitted — that one asserts a line inside this
+    separately-compiled entry point, and 0.95.0 dropping it for `Lighten`
+    on the opacity-clamp argument was the mistake 0.95.1 had to correct.
+  - **Vulkan/NVIDIA only.** Every test above ran under
+    `AURORA_REQUIRE_GPU=1` against **NVIDIA GeForce RTX 3090 (Vulkan,
+    DiscreteGpu)**, printed by `real_context_or_skip` on each creation, with
+    **zero self-skips**. That is one backend on one vendor: **Metal and
+    DX12 remain unverified for `fs_composite_linear_dodge`**, including
+    whether their shader compilers flatten the `ab > 0.0` guard and
+    evaluate `0.0 / 0.0` on both sides. Each WGSL fragment function is
+    separately compiled, so proving that branch for
+    `fs_composite_difference` proves nothing here.
+
+  **Finding 4 — mutation (k) survived, and the reason is worse than the
+  round's own plan predicted. Reported as measured, not adjusted to
+  match.** The plan predicted "~4-5 render-test failures (2, 3, 5, 6,
+  likely 1) but **0 at app level**." The measured result is **0 failures
+  anywhere**: 162/162 `aurora-render`, 396/396 `aurora-app`, whole
+  workspace green with the mutation in place.
+
+  Two independent reasons stack, and the first makes the plan's own
+  prediction structurally impossible:
+
+  1. **The mutation is in `aurora-app`'s dispatch arm, and no
+     `aurora-render` test goes through it.** All six
+     `composite_linear_dodge_*` tests call
+     `TileCompositor::composite_linear_dodge_over_with_opacity` *directly*,
+     with arguments they construct themselves. `begin_gpu_composite_tile`
+     lives in a higher crate that `aurora-render` cannot even name in code
+     (PRD §7.2 layering — its 16 mentions there are all prose). So the
+     render suite cannot observe a transposition at that call site, however
+     asymmetric its own fixtures are. The plan's predicted render-test
+     kills were for a mutation *inside the shader's bindings*, which is a
+     different mutation than the one specified.
+  2. **The app differential is symmetric-blind, exactly as predicted.**
+     Every layer in its fixture is fully opaque at opacity `1.0`, so the
+     fold reduces to `out = B`, and `B = min(Cb + Cs, 1)` is commutative.
+     Re-derived in exact rational arithmetic: correct and transposed both
+     give `(0.375, 1.0, 0.75)` at alpha `1.0` — the mutation is not merely
+     hard to see there, it is *invisible*, and `cargo` confirmed it by
+     passing that test's absolute golden with the transposition live.
+
+  **The transposition is genuinely wrong code, not a no-op.** `src` and
+  `backdrop` have different roles: `src` binds at 0 and its `.a` drives
+  `a = s.a * opacity`; `backdrop` binds at 3 and its `.a` drives `ab` and
+  the un-premultiply. The same rational derivation shows real divergence as
+  soon as either operand is translucent — e.g. render test 2's fixture
+  would give `(0.375, 0.6875, 0.34375)` instead of `(0.5, 0.75, 0.4375)`,
+  and test 5's `(0.625, 0.875, 1.25)` instead of `(0.875, 1.5, 1.25)`. It
+  is only this *fixture* that cannot see it. (Test 6 could not see it
+  either, even at render level: with `ab == 0` in one half the blend term
+  is multiplied by zero, and its opaque half is fully opaque, so both
+  halves coincide under transposition.)
+
+  **What would close it, named and deliberately not built this round**: the
+  app differential needs a fixture whose `LinearDodge` layer or accumulator
+  is *translucent*, which breaks `out = B` and makes the two roles
+  distinguishable. That is a new test with a new hand-derived golden, and
+  this round's scope is exactly one blend mode plus the disclosed Finding 1
+  fix — so it is recorded as a follow-on rather than smuggled in. It would
+  apply equally to `Screen` and `Difference`, which carry the same gap from
+  their own rounds; this is the third round to disclose it and the first to
+  measure that it is total rather than partial.
+
+  **Full local gate green** in CI's own order: `cargo fmt --all --check`,
+  `scripts/check_layering.py`, `scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1 cargo
+  test --workspace`, `cargo test --workspace --doc`, `RUSTDOCFLAGS="-D
+  warnings" cargo doc --workspace --no-deps --all-features`, `cargo deny
+  check all`. `cargo check -p aurora-app` on its own (the flagless build,
+  which is what would catch a `dead_code` warning on an unconstructed enum
+  variant — the exact failure `GpuBlendDispatch::LinearDodge` would produce
+  if it were only ever named from tests) also passes.
+
+  **Named follow-on, not done here.** `CLAUDE.md`'s M1.10 paragraph states
+  the blend-mode counts inline ("**20 of 27** blend modes are still CPU-only
+  at the app's GPU predicate (21 of 26 at the `aurora-render` shader
+  level…)") and its status line reads "As of `0.104.0`". Both are stale by
+  exactly one mode after this round — they should read **19 of 27** and
+  **20 of 26**, at `0.105.0`. Deliberately **not** edited here: that
+  paragraph is a hand-maintained prose summary whose own header says
+  PLAN.md wins on any disagreement, and rewriting it is a separate,
+  reviewable decision rather than a silent side effect of a blend-mode
+  round. Flagged for the maintainer.
+
+  **Disk-space check, per 0.102.1's named follow-on** and 0.104.1's
+  promotion of it to a hard precondition. Checked before starting:
+  `/home` at 76% used, **95G free** (403G total) after the `cargo clean`
+  this round began with; `target/` back to 14G once the matrix had rebuilt.
+  Comfortably above the threshold, so nothing was cleaned mid-round.
+  Performed by hand again rather than automated — still a candidate
+  follow-on, still not built.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
@@ -23590,6 +23983,65 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.105.0) — `BlendMode::LinearDodge` is on the GPU
+path; the sixth WGSL blend-math entry point, and the round that found a
+real drift bug left behind by the fifth.** **8 of 27**
+`aurora_doc::BlendMode` variants are now admitted by
+`document_qualifies_for_gpu_compositing` (`Normal`, `Multiply`, `Darken`,
+`Lighten`, `Screen`, `Difference`, `LinearDodge`, `Dissolve`), up from 7;
+**19 remain CPU-only** at the app's GPU predicate, down from 20. **6 of 26**
+`aurora_render::BlendMode` variants now have a real WGSL blend-math entry
+point, up from 5; **20 remain without one**, down from 21 (that denominator
+excludes `Dissolve`, absent from the render crate's enum, and *includes*
+`Normal`, whose "blend" is the fixed-function alpha unit rather than a
+blend-math entry point — subtract `Normal` and the shader-level figure
+reconciles with the predicate's own 19).
+
+Eleven mutations planned, **ten killed and one survivor**, every count
+measured against the whole workspace suite under `AURORA_REQUIRE_GPU=1
+--no-fail-fast` — see the 0.105.0 M1.10 entry for the table, the killing
+test names, and four findings this round is obliged to carry:
+
+- **Finding 1, a real pre-existing bug, fixed here.** 0.104.0 admitted
+  `Difference` at the GPU predicate but never added it to
+  `recomposite_visible_tiles_gpu_path_ignores_a_never_painted_layer_across_every_expressible_mode`,
+  whose own comment states that the list must keep pace with the predicate.
+  For a full round that test's name claimed eight modes and its loop covered
+  six. Both `Difference` and `LinearDodge` were added. **No real failure
+  surfaced** — the property genuinely holds for both — so the cost was a
+  round of false coverage, not a shipped bug; but the fix is not cosmetic,
+  since mutation (d) is now killed by that loop as one of three killers.
+- **Finding 2, the measurement harness was wrong first.** The first matrix
+  pass used plain `cargo test --workspace`, which stops at the first failing
+  binary; `aurora-app` sorts before `aurora-render`, so mutation (b)
+  reported 1 kill when the true answer is 7. The whole matrix was re-run
+  from a restored pristine tree with `--no-fail-fast`. The discarded numbers
+  are recorded rather than quietly replaced.
+- **Finding 3, a predicted non-kill, confirmed.** Render test 6 cannot
+  detect a dropped clamp: both sides of its whole-tile 8-bit comparison
+  clamp to `[0, 1]`, so `1.625` and `1.0` both quantise to `255`. It was the
+  one survivor of mutation (e), exactly as predicted. Disclosed under a
+  REQUIRED DISCLOSURE heading in the test itself and deliberately not
+  "fixed", since widening it would cost either the whole-tile comparison or
+  the transparent-half NaN check. The other five tests kill it.
+- **Finding 4, the one unkilled mutation, and worse than predicted.**
+  Transposing `src`/`backdrop` in the app's dispatch arm (k) killed
+  **nothing at all** — not the predicted 4-5 render tests, because no
+  `aurora-render` test routes through `begin_gpu_composite_tile` in the
+  first place, and not the app differential, whose fully-opaque fixture
+  reduces to `out = B` where `min(Cb + Cs, 1)` is commutative. The
+  transposition is genuinely wrong code that this suite structurally cannot
+  see. `Screen` and `Difference` carry the same gap from their own rounds;
+  this is the first round to measure that it is total rather than partial.
+  A translucent-layer app fixture would close it and is named as a
+  follow-on, not built here.
+
+`CPU_ONLY_BLEND_MODE` stays `Exclusion` and was untouched, so nothing
+needed retargeting and both tracked CPU-fallback benchmarks remain
+comparable across this round. **Verified on Vulkan/NVIDIA only** (NVIDIA
+GeForce RTX 3090, Vulkan, DiscreteGpu; 1,688 tests, zero self-skips) —
+**Metal and DX12 remain unverified for `fs_composite_linear_dodge`**.
 
 **Addendum 2026-09-04 (0.104.1) — 0.104.0's review follow-ups: four
 doc-comment corrections of one repeated reasoning error, one incomplete

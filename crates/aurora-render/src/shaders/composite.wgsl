@@ -70,7 +70,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // next free slot after src_tex (0), src_smp (1) and the opacity uniform
 // (2) declared above; only the real blend-math entry points below --
 // fs_composite_multiply, fs_composite_darken, fs_composite_lighten,
-// fs_composite_screen and fs_composite_difference -- use it, through the
+// fs_composite_screen, fs_composite_difference and
+// fs_composite_linear_dodge -- use it, through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
 // fixed-function entry point's own layout gains an entry.
@@ -80,7 +81,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // `composite_darken_over_with_opacity`'s,
 // `composite_lighten_over_with_opacity`'s,
 // `composite_screen_over_with_opacity`'s and
-// `composite_difference_over_with_opacity`'s `backdrop`),
+// `composite_difference_over_with_opacity`'s and
+// `composite_linear_dodge_over_with_opacity`'s `backdrop`),
 // deliberately *not* `dst_tex`: `dst` on the Rust side is the render
 // target this entry point writes to, which is a different texture
 // entirely and must never alias this one. Calling the sampled backdrop
@@ -90,7 +92,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // written against this file. That "25" is the 0.83.1 count and is not
 // maintained here; `Darken` (0.85.0), `Lighten` (0.95.0), `Screen`
 // (0.102.0) and `Difference` (0.104.0) have since landed, and the live
-// numbers live in `TileCompositor`'s own doc comment.
+// numbers live in `TileCompositor`'s own doc comment. `LinearDodge`
+// (0.105.0) landed after that list was written and is included above.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -323,6 +326,92 @@ fn fs_composite_difference(in: VsOut) -> @location(0) vec4<f32> {
         cb = bd.rgb / ab;
     }
     let b = abs(cb - s.rgb);                  // blend_rgb(Difference, cb, cs)
+    let blended = ab_inv * s.rgb + ab * b;
+    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+}
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
+// exactly, for `BlendMode::LinearDodge` only -- the sixth blend mode
+// ported to the GPU, and structurally identical to the five entry points
+// above in every line but one.
+//
+// Read `fs_composite_multiply`'s own comment for the full derivation of
+// the surrounding "over": the alpha compositing around `B(Cb, Cs)` is
+// blend-mode-independent, so only the `b = ...` line below differs.
+//
+// `blend_rgb(LinearDodge, cb, cs)` is `blend_channel`'s
+// `(cb + cs).min(1.0)` applied per channel, through `blend_rgb`'s own
+// generic per-channel arm (a separable mode, not one of the six
+// whole-triple ones). WGSL's `min()` on two `vec3<f32>`s is
+// componentwise, so `min(cb + s.rgb, vec3<f32>(1.0))` is exactly those
+// three independent per-channel clamped sums. The `vec3<f32>(1.0)`
+// splat rather than a bare `1.0` is not cosmetic: WGSL's `min` requires
+// both operands to have the same type, so the scalar form does not
+// type-check here.
+//
+// **The clamp is part of the mode, not a defensive guard.** `Cb + Cs`
+// is unbounded above, and `LinearDodge` is *defined* as the clamped sum
+// -- Photoshop's "Add". Dropping the `min` would not merely widen a
+// range; it would compute a different function everywhere the sum
+// exceeds `1.0`, which is most of this mode's interesting domain. This
+// is the one ported entry point so far whose formula has an operation
+// that exists purely to bound the result.
+//
+// **Three things this is not, all near enough to be real copy-paste
+// risks:**
+//
+//   - **`max(cb + s.rgb - 1.0, 0.0)` is `LinearBurn`**, a different,
+//     still-CPU-only mode -- the exact mirror image of this one, same
+//     sum, opposite offset and opposite clamp direction. Written out
+//     side by side the two differ by three characters, which is why it
+//     is named here rather than left to be noticed.
+//   - **`cb + s.rgb - cb * s.rgb` is `Screen`** (fs_composite_screen
+//     above), this mode's nearest arithmetic neighbour: the same sum
+//     with a correction term instead of a clamp. The two agree only
+//     where `cb * cs == 0` or where the clamp bites at exactly `1.0`.
+//   - **`ColorDodge` is the other "dodge"** (`cb / (1 - cs)`), likewise
+//     still CPU-only. Sharing half a name is the whole risk there;
+//     nothing about the arithmetic is close.
+//
+// **Three degeneracies, disclosed because they constrain every fixture
+// in this crate's `composite_linear_dodge_*` tests:**
+//
+//   1. `LinearDodge(0, Cs) = Cs` -- identical to `Normal`, and to
+//      `Screen`, wherever the backdrop channel is zero.
+//   2. `LinearDodge(1, Cs) = 1` for every `Cs` -- a saturated backdrop
+//      channel erases the source entirely.
+//   3. A channel whose sum exceeds `1.0` is *clamped*, so it carries no
+//      information about how far past the boundary the operands were:
+//      `(0.5, 0.75)` and `(0.9, 0.9)` both give `1.0`. That is the mode
+//      working correctly, but it means a clamped channel cannot
+//      discriminate the operands, only the clamp.
+//
+// **Symmetry, disclosed rather than assumed.** `Cb + Cs = Cs + Cb`, so
+// this mode's blend term is symmetric in backdrop and source and a
+// transposed src/backdrop binding is **not** caught by the blend term
+// alone -- exactly the property `fs_composite_screen` and
+// `fs_composite_difference` above disclose for the same reason. What
+// catches a transpose is the surrounding "over", which is not
+// symmetric, and the per-texel spatial differential in
+// `composite_linear_dodge_over_with_opacity_matches_the_cpu_across_a_
+// spatially_varying_tile`.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2)
+// and `TileCompositor::bind_group_layout_blend` with the five entry
+// points above; no new binding, no new layout.
+@fragment
+fn fs_composite_linear_dodge(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let a = s.a * opacity.value;
+    let inv = 1.0 - a;
+    let ab = bd.a;
+    let ab_inv = 1.0 - ab;
+    var cb = vec3<f32>(0.0, 0.0, 0.0);
+    if (ab > 0.0) {
+        cb = bd.rgb / ab;
+    }
+    let b = min(cb + s.rgb, vec3<f32>(1.0)); // blend_rgb(LinearDodge, cb, cs)
     let blended = ab_inv * s.rgb + ab * b;
     return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
 }

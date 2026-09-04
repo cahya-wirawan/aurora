@@ -5211,11 +5211,12 @@ fn perform_undo_redo(
     // path or the CPU fallback **for the whole document**, and several
     // undoable structural steps flip it: `SetBlendMode` on a root-level
     // pixel layer across the GPU-expressible boundary (`Normal`/
-    // `Multiply`/`Darken`/`Lighten`/`Screen`/`Difference`/`Dissolve` on one
-    // side, the other 20 modes on the other), and
+    // `Multiply`/`Darken`/`Lighten`/`Screen`/`Difference`/`LinearDodge`/
+    // `Dissolve` on one
+    // side, the other 19 modes on the other), and
     // `SetVisible`, `Reparent`, `RemoveById` or `Restore` of a
     // root-level layer that is itself disqualifying (a group, or a
-    // pixel layer at one of those other 20 modes). When it flips, every
+    // pixel layer at one of those other 19 modes). When it flips, every
     // visible tile's compositing *path*
     // changes while a per-layer `Rect` names only one layer's own
     // region -- a quantity no `Rect` can express.
@@ -6810,9 +6811,9 @@ fn composite_roots_into_tile(
 }
 
 /// Whether every visible root-level layer in `layers` is an
-/// [`aurora_doc::LayerKind::Pixel`] layer at one of the seven
+/// [`aurora_doc::LayerKind::Pixel`] layer at one of the eight
 /// `aurora_doc::BlendMode`s [`begin_gpu_composite_tile`] can express —
-/// no groups, no eighth mode. The seven are:
+/// no groups, no ninth mode. The eight are:
 ///
 /// - [`aurora_doc::BlendMode::Normal`] (and a layer with no explicit
 ///   `blend_mode` recorded, which *is* `Normal`), composited by
@@ -6871,6 +6872,28 @@ fn composite_roots_into_tile(
 ///   backticks: that const is `cfg(test)`, so a link would dangle). It too
 ///   reaches [`begin_gpu_composite_tile`]'s blend dispatch as its own arm
 ///   and shares the *same single* `spare` ping-pong accumulator.
+/// - [`aurora_doc::BlendMode::LinearDodge`] (0.105.0), composited by
+///   `aurora_render::TileCompositor::composite_linear_dodge_over_with_opacity`,
+///   the sixth mode ported to WGSL and built to the same
+///   whole-composite-in-the-shader shape as the five entries above —
+///   `min(Cb + Cs, 1)` per channel, one componentwise `min` against a
+///   `vec3<f32>(1.0)` splat in `fs_composite_linear_dodge`. The second
+///   ported formula that is real arithmetic on both operands rather than a
+///   single intrinsic, and the first in which **the clamp is part of the
+///   mode rather than a defensive guard**: `Cb + Cs` is unbounded above
+///   and this mode is *defined* as the clamped sum (Photoshop's "Add").
+///   Deliberately **not** `max(Cb + Cs - 1, 0)`: that is
+///   `aurora_doc::BlendMode::LinearBurn`, this mode's exact mirror image
+///   (same sum, opposite offset, opposite clamp direction) and still
+///   CPU-only — the realistic copy-paste hazard, since the two differ by
+///   three characters. Its nearest *arithmetic* neighbour is
+///   `Screen` (`Cb + Cs - Cb*Cs`, the same sum with a correction term
+///   instead of a clamp), already admitted above. And not to be confused
+///   with `aurora_doc::BlendMode::ColorDodge`, the other dodge-family mode
+///   (`Cb / (1 - Cs)`), which is still CPU-only — the names share half a
+///   word and nothing else. It too reaches
+///   [`begin_gpu_composite_tile`]'s blend dispatch as its own arm and
+///   shares the *same single* `spare` ping-pong accumulator.
 /// - [`aurora_doc::BlendMode::Dissolve`] (0.84.1), which needs **no**
 ///   GPU-side support at all and never reaches
 ///   [`begin_gpu_composite_tile`]'s own blend dispatch as `Dissolve`.
@@ -6890,17 +6913,18 @@ fn composite_roots_into_tile(
 ///   paths_agree_on_a_dissolve_blend_document` pins that on real
 ///   hardware.
 ///
-/// **All six non-`Normal` modes above carry a GPU dispatch counter**, as
+/// **All seven non-`Normal` modes above carry a GPU dispatch counter**, as
 /// of 0.103.0 (and `Difference`, the sixth, from its own first round in
-/// 0.104.0) — the per-mode bullets deliberately no longer say so one at
+/// 0.104.0; `LinearDodge`, the seventh, from its own in 0.105.0) — the
+/// per-mode bullets deliberately no longer say so one at
 /// a time, because as of that round it is true of every one of them and
-/// repeating it six times only invites the list to drift out of step
+/// repeating it seven times only invites the list to drift out of step
 /// again. `GpuBlendDispatches` is the single place that convention, and
 /// the gap it closes, is documented. `Normal` itself is deliberately
 /// uncounted, for the reason [`GpuBlendDispatch`] gives.
 ///
 /// A single disqualifying layer (a visible group, or a visible pixel
-/// layer at any of the other 20 blend modes) routes the *whole document*
+/// layer at any of the other 19 blend modes) routes the *whole document*
 /// back to the CPU path ([`resolve_tile`]/`composite_tile_cpu`), which
 /// already composites every one of those cases correctly — this only
 /// exists to find a faster path for the common cases, never to replace
@@ -6930,6 +6954,7 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
                             | aurora_doc::BlendMode::Lighten
                             | aurora_doc::BlendMode::Screen
                             | aurora_doc::BlendMode::Difference
+                            | aurora_doc::BlendMode::LinearDodge
                             | aurora_doc::BlendMode::Dissolve
                     ) | None
                 )
@@ -7307,7 +7332,7 @@ fn accumulator_or_create<'slot>(
 /// lets one call site serve both builds without a `#[cfg]` at the call
 /// site itself.
 ///
-/// The variants are exactly the six modes
+/// The variants are exactly the seven modes
 /// [`document_qualifies_for_gpu_compositing`] admits *other than*
 /// `Normal`, which is deliberately absent: the `Normal` arm is shared by
 /// real `Normal` layers and by `Dissolve` layers that [`resolve_tile`]
@@ -7316,7 +7341,7 @@ fn accumulator_or_create<'slot>(
 /// call site and why it is where it is.
 ///
 /// **`Dissolve` is the one variant that *is* `#[cfg(test)]`, and this is a
-/// consequence of 0.103.1 rather than an inconsistency.** The other five
+/// consequence of 0.103.1 rather than an inconsistency.** The other six
 /// are named by real dispatch arms that exist in both builds, so they are
 /// constructed in both. `Dissolve` has no arm; the only thing that ever
 /// names it is [`note_dissolve_dispatch`], whose guard 0.103.1 moved
@@ -7332,6 +7357,7 @@ enum GpuBlendDispatch {
     Lighten,
     Screen,
     Difference,
+    LinearDodge,
     #[cfg(test)]
     Dissolve,
 }
@@ -7353,19 +7379,23 @@ impl GpuBlendDispatch {
     /// This does not close the gap — `ALL` is still hand-maintained, and
     /// no stable API counts an enum's variants — but it collapses the two
     /// driftable lists into one, sitting directly under the definition a
-    /// new variant is added to. The fixed `[Self; 6]` length is part of
-    /// that signal: a seventh variant cannot be appended here without the
-    /// author also editing the count, and the test asserts the same `6`
-    /// as a literal so the expectation is stated in both places.
+    /// new variant is added to. The fixed `[Self; 7]` length is part of
+    /// that signal: an eighth variant cannot be appended here without the
+    /// author also editing the count, and the test asserts the same `7`
+    /// as a literal so the expectation is stated in both places. (The
+    /// mechanism did its job on its first outing: `LinearDodge` in 0.105.0
+    /// went from `[Self; 6]` to `[Self; 7]` in one edit, with the test's
+    /// own literal the only other place to touch.)
     ///
     /// `cfg(test)` because `Dissolve` is: see the enum's own comment for
     /// why that one variant is test-only.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Multiply,
         Self::Darken,
         Self::Lighten,
         Self::Screen,
         Self::Difference,
+        Self::LinearDodge,
         Self::Dissolve,
     ];
 }
@@ -7409,6 +7439,10 @@ impl GpuBlendDispatch {
 ///   first mode to be added *after* the merge — which cost exactly what
 ///   the merge predicted, one variant, one field and one `counter` arm,
 ///   with no copied block anywhere.
+/// - `LinearDodge` (0.105.0): the same, and the second data point for that
+///   prediction — one variant, one field, one `counter` arm, plus the
+///   `GpuBlendDispatch::ALL` entry 0.104.1 added so the enum and the only
+///   test that can see a counter mis-wire cannot drift apart.
 ///
 /// **Why a struct of named fields and an exhaustive `match`, not a
 /// `[AtomicU64; N]` indexed by discriminant.** This workspace denies
@@ -7446,12 +7480,13 @@ struct GpuBlendDispatches {
     lighten: std::sync::atomic::AtomicU64,
     screen: std::sync::atomic::AtomicU64,
     difference: std::sync::atomic::AtomicU64,
+    linear_dodge: std::sync::atomic::AtomicU64,
     dissolve: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
 impl GpuBlendDispatches {
-    /// All six counters at zero. `const` so the static below is a
+    /// All seven counters at zero. `const` so the static below is a
     /// compile-time initializer rather than a lazily-initialized cell,
     /// exactly as the three separate `AtomicU64::new(0)` statics it
     /// replaces were.
@@ -7462,6 +7497,7 @@ impl GpuBlendDispatches {
             lighten: std::sync::atomic::AtomicU64::new(0),
             screen: std::sync::atomic::AtomicU64::new(0),
             difference: std::sync::atomic::AtomicU64::new(0),
+            linear_dodge: std::sync::atomic::AtomicU64::new(0),
             dissolve: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -7471,7 +7507,7 @@ impl GpuBlendDispatches {
     /// The `match` is exhaustive and total by construction — no `_` arm,
     /// no fallible lookup, so there is no "which counter?" failure to
     /// either defend against or drop on the floor. See
-    /// [`GpuBlendDispatches`] for why that mattered enough to spend six
+    /// [`GpuBlendDispatches`] for why that mattered enough to spend seven
     /// named fields on.
     ///
     /// That every variant maps to a *distinct* counter is not something
@@ -7485,6 +7521,7 @@ impl GpuBlendDispatches {
             GpuBlendDispatch::Lighten => &self.lighten,
             GpuBlendDispatch::Screen => &self.screen,
             GpuBlendDispatch::Difference => &self.difference,
+            GpuBlendDispatch::LinearDodge => &self.linear_dodge,
             GpuBlendDispatch::Dissolve => &self.dissolve,
         }
     }
@@ -7559,7 +7596,7 @@ fn note_dissolve_dispatch(_layers: &aurora_doc::LayerTree, _id: aurora_doc::Laye
 ///
 /// Deliberately here, beside [`note_gpu_blend_dispatch`], rather than
 /// inside `mod tests` where the three per-mode accessors it replaces
-/// lived: one function for six modes is not worth six lines of `use
+/// lived: one function for seven modes is not worth seven lines of `use
 /// super::{…}` churn every time a mode is added.
 ///
 /// The swap is `Relaxed` for the same reason the increment is — see
@@ -8800,10 +8837,10 @@ fn begin_gpu_composite_tile(
             // texture exists, and why it is created right here, on the
             // first blend-math layer that actually reaches this tile,
             // rather than alongside the first accumulator. `spare` is
-            // shared with the `Darken`, `Lighten`, `Screen` and
-            // `Difference` arms below rather than owned by
+            // shared with the `Darken`, `Lighten`, `Screen`,
+            // `Difference` and `LinearDodge` arms below rather than owned by
             // this one: `accumulator_or_create` creates it once,
-            // whichever of the five blend-math arms gets there first. The written
+            // whichever of the six blend-math arms gets there first. The written
             // one is now the fold, so the two swap places: what was
             // `spare` becomes `current`, and the exhausted backdrop
             // becomes the next blend-math pass's render target.
@@ -8827,7 +8864,9 @@ fn begin_gpu_composite_tile(
                 // itself landed -- and the most load-bearing of the five,
                 // because the app's own default startup document carries a
                 // `Multiply` layer, so this is the arm every user's first
-                // frame takes. See `GpuBlendDispatches`.
+                // frame takes. See `GpuBlendDispatches`. ("the five" was
+                // the 0.103.0 count; there are seven counted modes as of
+                // 0.105.0, and `GpuBlendDispatches` states the live one.)
                 note_gpu_blend_dispatch(GpuBlendDispatch::Multiply);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
@@ -8945,10 +8984,42 @@ fn begin_gpu_composite_tile(
                 note_gpu_blend_dispatch(GpuBlendDispatch::Difference);
                 std::mem::swap(current_accumulator, spare_accumulator);
             }
+            // The sixth ported mode (0.105.0), through the *same*
+            // mechanism as the five arms above -- the same single `spare`
+            // accumulator, the same sample-backdrop/write-spare/swap
+            // sequence, the same aliasing rule. Only the compositor
+            // method, and so the WGSL entry point behind it, differs:
+            // `min(Cb + Cs, 1)` per channel. Deliberately not
+            // `max(Cb + Cs - 1, 0)`, which is `LinearBurn`, this mode's
+            // exact mirror image and a different, still-CPU-only mode; not
+            // `Cb + Cs - Cb*Cs`, which is `Screen`, its nearest arithmetic
+            // neighbour and the arm directly above the `Difference` one;
+            // and not `ColorDodge`, the other dodge-family mode.
+            // Instrumented from its first round -- see
+            // `GpuBlendDispatches`.
+            aurora_render::BlendMode::LinearDodge => {
+                let spare_accumulator = accumulator_or_create(
+                    &mut spare,
+                    device,
+                    &mut encoder,
+                    tile_extent,
+                    "gpu-composite-b",
+                );
+                compositor.composite_linear_dodge_over_with_opacity(
+                    gpu,
+                    &mut encoder,
+                    &src_view,
+                    &current_accumulator.1,
+                    &spare_accumulator.1,
+                    opacity,
+                );
+                note_gpu_blend_dispatch(GpuBlendDispatch::LinearDodge);
+                std::mem::swap(current_accumulator, spare_accumulator);
+            }
             // Unreachable through the real caller: `document_qualifies_
             // for_gpu_compositing` admits only `Normal`, `Multiply`,
-            // `Darken`, `Lighten`, `Screen`, `Difference` and
-            // `Dissolve` (which `resolve_tile` has already reduced to
+            // `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge`
+            // and `Dissolve` (which `resolve_tile` has already reduced to
             // `Normal` by the time it gets here), and
             // `recomposite_visible_tiles` checks it before calling this.
             // If the two ever drift apart, bail to the CPU path rather
@@ -9006,9 +9077,10 @@ fn begin_gpu_composite_tile(
     // fully transparent target leaves exactly the state
     // `aurora_render::composite_layer_into` leaves on the CPU side (a
     // lone opaque-white layer at 50% opacity gives (0.5, 0.5, 0.5, 0.5),
-    // not the straight (1.0, 1.0, 1.0, 0.5)), and all five blend-math
+    // not the straight (1.0, 1.0, 1.0, 0.5)), and all six blend-math
     // methods write premultiplied texels
-    // too, so a `Multiply`, `Darken`, `Lighten` or `Screen` layer in the
+    // too, so a `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference` or
+    // `LinearDodge` layer in the
     // stack does not change this. That
     // is left as it is: `finish_tile_readback` straightens the decoded
     // samples on the CPU, in the one shared
@@ -17251,8 +17323,9 @@ mod tests {
     /// predicate: it chooses the GPU fast path or the CPU fallback for
     /// every visible tile at once. Undoing a `SetBlendMode` on a
     /// root-level pixel layer across the GPU-expressible boundary
-    /// (`Normal`/`Multiply`/`Darken`/`Lighten`/`Screen`/`Dissolve` on one
-    /// side, the other 20 modes on the
+    /// (`Normal`/`Multiply`/`Darken`/`Lighten`/`Screen`/`Difference`/
+    /// `LinearDodge`/`Dissolve` on one
+    /// side, the other 19 modes on the
     /// other) flips it, so
     /// the whole document's compositing path changes while the step's own
     /// reported rect names one layer's region. This pins both halves:
@@ -27341,16 +27414,17 @@ mod tests {
         );
     }
 
-    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 20 modes the GPU
+    /// [`CPU_ONLY_BLEND_MODE`] stands in for "one of the 19 modes the GPU
     /// path still cannot express" (27 `aurora_doc::BlendMode` variants
-    /// minus the seven admitted as of 0.104.0: `Normal`, `Multiply`,
-    /// `Darken`, `Lighten`, `Screen`, `Difference` and
+    /// minus the eight admitted as of 0.105.0: `Normal`, `Multiply`,
+    /// `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge` and
     /// `Dissolve`) — it has a real, 1:1 `translate_blend_mode`
     /// mapping and a real CPU formula, so it is a genuine blend mode
     /// being rejected, not an unimplemented one. This used to use
     /// `Multiply`, which 0.84.0 moved to the *admitted* side, and then
     /// `Screen`, which 0.102.0 moved there too. `Difference` joined the
-    /// admitted side in 0.104.0 and this const was untouched by it, which
+    /// admitted side in 0.104.0 and `LinearDodge` in 0.105.0, and this
+    /// const was untouched by either, which
     /// is the point; the sibling tests below
     /// pin that direction. Going through the const rather than naming a
     /// mode literally is what makes the next such move one edit.
@@ -27560,6 +27634,53 @@ mod tests {
         assert!(
             document_qualifies_for_gpu_compositing(&layers),
             "a root-level Difference pixel layer must qualify for the GPU path as of 0.104.0"
+        );
+    }
+
+    /// The sixth ported mode (0.105.0): `LinearDodge` is expressible on the
+    /// GPU path (`composite_linear_dodge_over_with_opacity`), so a
+    /// root-level `LinearDodge` pixel layer must *not* disqualify the
+    /// document. Pins the seventh `matches!` alternative directly,
+    /// headlessly — the GPU-vs-CPU differential test below proves the
+    /// resulting composite is actually right.
+    ///
+    /// Deliberately `LinearDodge`, and deliberately none of its three
+    /// neighbours, every one of which must stay disqualified:
+    ///
+    /// - `LinearBurn` (`max(Cb + Cs - 1, 0)`), this mode's exact mirror
+    ///   image — the realistic copy-paste hazard;
+    /// - `ColorDodge` (`Cb / (1 - Cs)`), the *other* dodge-family mode,
+    ///   which shares half a name with this one and nothing else;
+    /// - `Exclusion`, which is [`CPU_ONLY_BLEND_MODE`] and therefore
+    ///   already pinned on the rejected side by
+    ///   `document_qualifies_for_gpu_compositing_is_false_for_a_non_normal_
+    ///   blend_mode`. This round deliberately left that const alone, as
+    ///   0.104.0 did.
+    ///
+    /// Nothing here asserts the first two directly — that general case is
+    /// what [`CPU_ONLY_BLEND_MODE`]'s own test covers.
+    #[test]
+    fn document_qualifies_for_gpu_compositing_admits_a_linear_dodge_blend_mode() {
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        if let Err(err) = layers.add_pixel_layer("a", bounds, None) {
+            unreachable!("{err:?}");
+        }
+        let top = match layers.add_pixel_layer("b", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(top, aurora_doc::BlendMode::LinearDodge) {
+            unreachable!("{err:?}");
+        }
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a root-level LinearDodge pixel layer must qualify for the GPU path as of 0.105.0"
         );
     }
 
@@ -28701,8 +28822,8 @@ mod tests {
         let modes = GpuBlendDispatch::ALL;
         assert_eq!(
             modes.len(),
-            6,
-            "GpuBlendDispatch::ALL no longer has the six variants this test was written against \
+            7,
+            "GpuBlendDispatch::ALL no longer has the seven variants this test was written against \
              -- if a mode was added, that is expected: bump this literal. If a mode was added to \
              the enum but *not* to ALL, this assertion cannot see it, and the new variant is \
              silently uncovered by the only test in this crate that can catch a counter mis-wire."
@@ -29487,6 +29608,188 @@ mod tests {
         );
     }
 
+    /// **`LinearDodge` end to end through the app's own GPU path**
+    /// (0.105.0), the sibling of
+    /// `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_difference_blend_document`
+    /// above and the sixth such test. `aurora-render`'s own
+    /// `composite_linear_dodge_*` tests already prove the shader math in
+    /// isolation; what this adds is that setting `BlendMode::LinearDodge`
+    /// on a real `LayerTree` layer actually reaches
+    /// `composite_linear_dodge_over_with_opacity` through
+    /// `document_qualifies_for_gpu_compositing` and
+    /// `begin_gpu_composite_tile`'s new dispatch arm.
+    ///
+    /// **Three layers, not two, and the middle one is a `Multiply`** —
+    /// the same shape as the `Difference` sibling, and for the same
+    /// reason: it makes the `LinearDodge` layer sample a backdrop a
+    /// *different* blend-math pipeline last wrote, and render into the
+    /// `spare` accumulator that pipeline created, which is the
+    /// shared-ping-pong property no single-blend-mode fixture can reach:
+    ///
+    /// | # | mode          | rgba                     | fold after             |
+    /// |---|---------------|--------------------------|------------------------|
+    /// | 1 | `Normal`      | `(0.25, 0.75, 0.5, 1)`   | `(0.25, 0.75, 0.5)`    |
+    /// | 2 | `Multiply`    | `(0.5, 0.5, 0.5, 1)`     | `(0.125, 0.375, 0.25)` |
+    /// | 3 | `LinearDodge` | `(0.25, 0.875, 0.5, 1)`  | `(0.375, 1.0, 0.75)`   |
+    ///
+    /// Every layer is fully opaque at opacity `1.0`, so the accumulator's
+    /// alpha is `1.0` when the `LinearDodge` pass runs and the whole
+    /// "over" reduces to `B` itself — the golden below *is*
+    /// `min((0.125, 0.375, 0.25) + (0.25, 0.875, 0.5), 1)`, all exact
+    /// binary fractions, so it is asserted absolutely and not merely
+    /// differentially.
+    ///
+    /// **The top layer straddles the clamp**, which is what the fixture
+    /// was chosen for. The per-channel sums are `(0.375, 1.25, 0.75)`:
+    /// green is over the boundary and clamps to `1.0`, red and blue stay
+    /// strictly under it. So one channel discriminates the *clamp* (a
+    /// shader without it writes `1.25` there, which `read_first_texel`
+    /// reads back unclamped — it is a raw `f16::to_f32`, verified while
+    /// writing this test, so the mutation cannot hide behind a readback
+    /// clamp the way it can in `aurora-render`'s own 8-bit whole-tile
+    /// test 6) and two discriminate the *formula* against `Screen`, this
+    /// mode's nearest arithmetic neighbour. No channel has `Cb == Cs`, and
+    /// none of the six operands is `0.0` or `1.0`, so neither
+    /// `LinearDodge(0, Cs) = Cs` nor `LinearDodge(1, Cs) = 1` is in play.
+    ///
+    /// **Four** independent guards, the same four the `Difference` sibling
+    /// carries:
+    ///
+    /// - the GPU-vs-CPU differential (`assert_gpu_matches_cpu`);
+    /// - the absolute golden, which a wrong-arm dispatch fails outright;
+    /// - the [`GpuBlendDispatch::LinearDodge`] count, which is what
+    ///   distinguishes "the `LinearDodge` arm ran on the GPU" from "it
+    ///   silently fell back to the CPU, which computes the same correct
+    ///   pixels" — historically the one mutation in a round like this that
+    ///   nothing else catches;
+    /// - and the `assert_ne!` vacuity guard at the end: the same stack
+    ///   with `LinearDodge` replaced by `Screen` must composite to
+    ///   something *different* (`(0.34375, 0.921875, 0.625)` against
+    ///   `(0.375, 1.0, 0.75)` — all three channels differ). `Screen` is
+    ///   chosen as the substitute deliberately: it is this mode's nearest
+    ///   arithmetic neighbour, the same sum with a correction term instead
+    ///   of a clamp, so it is the realistic wrong answer.
+    ///
+    /// **One thing this fixture structurally cannot see, disclosed rather
+    /// than left implied**: a transposed `src`/`backdrop` binding in the
+    /// dispatch arm. Every layer here is fully opaque, so the fold reduces
+    /// to `out = B`, and `Cb + Cs` is commutative — the transpose is
+    /// invisible. It is the same accepted gap the `Screen` and
+    /// `Difference` siblings already carry for the same reason, and what
+    /// covers it is `aurora-render`'s own spatial per-texel differential,
+    /// `composite_linear_dodge_over_with_opacity_matches_the_cpu_across_a_
+    /// spatially_varying_tile`.
+    #[test]
+    fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let stack: [(&str, aurora_doc::BlendMode, f32, [f32; 4]); 3] = [
+            (
+                "l1",
+                aurora_doc::BlendMode::Normal,
+                1.0,
+                [0.25, 0.75, 0.5, 1.0],
+            ),
+            (
+                "l2",
+                aurora_doc::BlendMode::Multiply,
+                1.0,
+                [0.5, 0.5, 0.5, 1.0],
+            ),
+            (
+                "l3",
+                aurora_doc::BlendMode::LinearDodge,
+                1.0,
+                [0.25, 0.875, 0.5, 1.0],
+            ),
+        ];
+        let layers = solid_root_stack(&mut store, &stack);
+        assert!(
+            document_qualifies_for_gpu_compositing(&layers),
+            "a mixed Normal/Multiply/LinearDodge root stack must qualify for the GPU path as of \
+             0.105.0 -- otherwise this test would compare the CPU path against itself"
+        );
+
+        // Zeroed inside `real_gpu_context`'s lock, so what the assertion
+        // below reads is this run's dispatches and nothing else's.
+        let _ = take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearDodge);
+        let (gpu_result, cpu_result) = gpu_and_cpu_first_texel(&context, &mut store, &layers);
+        // One = this stack's single `LinearDodge` layer, dispatched once
+        // for the one tile it actually has content at. `solid_root_stack`
+        // fills only tile `(0, 0)`; `gpu_and_cpu_first_texel`'s 256x256
+        // residency viewport marks four tiles visible at `TILE` = 256, and
+        // the other three resolve nothing at all, taking
+        // `begin_gpu_composite_tile`'s `current?` bail before any blend
+        // pass is recorded. The second, CPU-only run inside that helper
+        // adds none. **A count of 0 is the failure this assertion exists
+        // for** -- see `GpuBlendDispatches`, and PLAN.md's 0.105.0
+        // mutation-testing record, where deleting the dispatch arm left
+        // every other assertion in this test green.
+        assert_eq!(
+            take_gpu_blend_dispatch_count(GpuBlendDispatch::LinearDodge),
+            1,
+            "the LinearDodge layer must have dispatched a real GPU blend pass on the one visible \
+             tile that has stored content -- 0 means the dispatch arm is gone and every \
+             assertion below is being satisfied by the CPU fallback running twice"
+        );
+        assert_gpu_matches_cpu(
+            gpu_result,
+            cpu_result,
+            "a three-layer Normal/Multiply/LinearDodge document (the LinearDodge layer sampling a \
+             backdrop a Multiply pass wrote, and reusing the spare accumulator it created)",
+        );
+        assert_eq!(
+            gpu_result,
+            (0.375, 1.0, 0.75, 1.0),
+            "min(Cb + Cs, 1) must come out of the GPU path itself -- the sums are \
+             (0.375, 1.25, 0.75), so green clamps and red and blue do not. \
+             (0.34375, 0.921875, 0.625, 1.0) would mean the Screen arm ran, \
+             (0.25, 0.875, 0.5, 1.0) the Normal or the Lighten arm (they coincide here, since \
+             Cs > Cb in every channel), (0.125, 0.375, 0.25, 1.0) the Darken arm, \
+             (0.03125, 0.328125, 0.125, 1.0) the Multiply arm and (0.125, 0.5, 0.25, 1.0) the \
+             Difference arm. A shader that dropped the clamp gives (0.375, 1.25, 0.75, 1.0) -- \
+             agreeing in red and blue, which is why this fixture needs a channel whose sum \
+             exceeds 1.0 -- and one using LinearBurn's max(Cb + Cs - 1, 0) gives \
+             (0.0, 0.25, 0.0, 1.0)."
+        );
+
+        // The vacuity guard: the same stack with its `LinearDodge` layer
+        // turned into a `Screen` one, composited on the CPU path only. If
+        // that produced the same texel, every assertion above would hold
+        // just as well with the wrong arm dispatched.
+        let mut substituted = stack;
+        for entry in &mut substituted {
+            if entry.1 == aurora_doc::BlendMode::LinearDodge {
+                entry.1 = aurora_doc::BlendMode::Screen;
+            }
+        }
+        let with_screen = solid_root_stack(&mut store, &substituted);
+        let residency =
+            aurora_gpu::TileResidency::new(context.device(), context.queue(), (256, 256));
+        let mut cache = CompositeCache::default();
+        recomposite_visible_tiles(
+            &residency,
+            &with_screen,
+            None,
+            &mut store,
+            &mut cache,
+            None,
+            None,
+        );
+        let if_linear_dodge_were_screen = read_first_texel(
+            &mut store,
+            composite_surface_id(),
+            aurora_tile::TileId { x: 0, y: 0 },
+        );
+        assert_ne!(
+            gpu_result, if_linear_dodge_were_screen,
+            "setup: this fixture must distinguish its LinearDodge layer from a Screen one, or \
+             the differential above would pass with the wrong dispatch arm running"
+        );
+    }
+
     /// **The test this whole round exists to make possible** (0.85.0):
     /// three *different* expressible modes in one stack, proving the
     /// ping-pong mechanism generalises past a single blend mode.
@@ -30204,10 +30507,10 @@ mod tests {
     }
 
     /// The fallback's own correctness proof, not just that it was taken:
-    /// a document with one layer at [`CPU_ONLY_BLEND_MODE`] (one of the 20
+    /// a document with one layer at [`CPU_ONLY_BLEND_MODE`] (one of the 19
     /// modes the GPU path still cannot express — `Normal`, `Multiply`,
-    /// `Darken`, `Lighten`, `Screen`, `Difference` and `Dissolve` are the
-    /// seven admitted as of 0.104.0) must still
+    /// `Darken`, `Lighten`, `Screen`, `Difference`, `LinearDodge` and
+    /// `Dissolve` are the eight admitted as of 0.105.0) must still
     /// composite to that mode's own real result, not to
     /// whatever `Normal` would have produced for the same inputs — which
     /// would be a different, wrong value here, so this genuinely
@@ -30292,8 +30595,18 @@ mod tests {
         //                        `Exclusion` is the textbook "softer"
         //                        variant *of*, so keeping them separated
         //                        by exact fractions matters most here)
+        //   LinearDodge -> 1.0  (min(0.25 + 0.75, 1) -- exactly at the
+        //                        clamp boundary, admitted to the GPU path
+        //                        in 0.105.0 and so newly a wrong answer
+        //                        this fixture must distinguish, which it
+        //                        does: 1.0 against Exclusion's own 0.625.
+        //                        Landing exactly *on* the boundary is
+        //                        harmless here -- this row only has to
+        //                        differ from 0.625, and it does whether
+        //                        the clamp fires or not, since an
+        //                        unclamped Cb + Cs is also 1.0)
         //
-        // `Dissolve`, the seventh admitted mode, never reaches a blend
+        // `Dissolve`, the eighth admitted mode, never reaches a blend
         // formula at all (`resolve_tile` reduces it to `Normal`), so it is
         // covered by the `Normal` row.
         for (id, rgba) in [
@@ -31599,7 +31912,7 @@ mod tests {
     /// A second, smaller measurement, exercising the CPU compositing
     /// fallback specifically -- `document_qualifies_for_gpu_compositing`
     /// returns `false` here (the single root layer's own blend mode is
-    /// [`CPU_ONLY_BLEND_MODE`], one of the 20 modes the GPU path still
+    /// [`CPU_ONLY_BLEND_MODE`], one of the 19 modes the GPU path still
     /// cannot express; it was `Multiply` until 0.84.0 wired that mode onto
     /// the GPU path, then `Screen` until 0.102.0 did the same, either of
     /// which would have quietly turned this into a second GPU-path
@@ -38734,18 +39047,31 @@ mod tests {
             "setup: and to something non-zero -- otherwise every comparison below is vacuous"
         );
 
-        // **All six modes `document_qualifies_for_gpu_compositing`
+        // **All eight modes `document_qualifies_for_gpu_compositing`
         // admits, and this list has to keep pace with it** -- the test's
         // own name says "every expressible mode", so a mode ported to the
         // GPU path but not added here turns that name into a false claim
         // without anything going red. `Screen` was added in 0.102.0, the
         // round that ported it.
+        //
+        // **`Difference` is the mode 0.104.0 admitted at the predicate
+        // without adding here**, which is exactly the drift the paragraph
+        // above exists to prevent, and it went unnoticed for a full round:
+        // between 0.104.0 and 0.105.0 this loop's name claimed eight modes
+        // and covered six. 0.105.0 added both `Difference` and its own
+        // `LinearDodge`. Neither addition surfaced a failure -- the
+        // never-painted-layer property genuinely does hold for both -- so
+        // the cost of the drift was a year of false coverage, not a bug in
+        // the shipped path. Add a mode here in the same commit that admits
+        // it at the predicate.
         for mode in [
             aurora_doc::BlendMode::Normal,
             aurora_doc::BlendMode::Multiply,
             aurora_doc::BlendMode::Darken,
             aurora_doc::BlendMode::Lighten,
             aurora_doc::BlendMode::Screen,
+            aurora_doc::BlendMode::Difference,
+            aurora_doc::BlendMode::LinearDodge,
             aurora_doc::BlendMode::Dissolve,
         ] {
             let mut layers = solid_root_stack(
