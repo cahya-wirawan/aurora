@@ -29144,19 +29144,42 @@ mod tests {
     /// property the `Darken` round's five-layer fixture pins, reached
     /// here in the smallest stack that can reach it at all:
     ///
-    /// | # | mode       | rgba                     | fold after           |
-    /// |---|------------|--------------------------|----------------------|
-    /// | 1 | `Normal`   | `(0.25, 0.75, 0.5, 1)`   | `(0.25, 0.75, 0.5)`  |
-    /// | 2 | `Multiply` | `(0.5, 0.5, 0.5, 1)`     | `(0.125, 0.375, 0.25)` |
-    /// | 3 | `Lighten`  | `(0.25, 0.25, 0.75, 1)`  | `(0.25, 0.375, 0.75)`  |
+    /// | # | mode       | opacity | rgba                    | fold after             |
+    /// |---|------------|---------|-------------------------|------------------------|
+    /// | 1 | `Normal`   | `1.0`   | `(0.25, 0.75, 0.5, 1)`  | `(0.25, 0.75, 0.5)`    |
+    /// | 2 | `Multiply` | `1.0`   | `(0.5, 0.5, 0.5, 1)`    | `(0.125, 0.375, 0.25)` |
+    /// | 3 | `Lighten`  | `0.5`   | `(0.25, 0.25, 0.75, 1)` | `(0.1875, 0.375, 0.5)` |
     ///
-    /// Every layer is fully opaque at opacity `1.0`, so the whole fold is
-    /// exact binary fractions and the golden below is asserted
-    /// absolutely, not merely differentially. The maximum is genuinely
-    /// two-sided: red comes from the *source* (`0.25` over `0.125`),
-    /// green from the *backdrop* (`0.375` over `0.25`), and blue from the
-    /// source (`0.75` over `0.25`) — so neither layer's own colour, and
-    /// no other wired arm, can produce this texel.
+    /// **The top layer's opacity is `0.5`, and that is load-bearing**
+    /// (0.105.2). It was `1.0` from 0.95.0 until then, and with every
+    /// layer opaque the outer "over" collapsed to `out = B`, which left
+    /// the `opacity` uniform and the dispatch arm's own argument order
+    /// unobservable here — see the transpose section at the bottom. The
+    /// backdrop's alpha is still `1.0` where the `Lighten` pass runs, so
+    /// `blended` reduces to `B` itself —
+    /// `B = max((0.125, 0.375, 0.25), (0.25, 0.25, 0.75)) =
+    /// (0.25, 0.375, 0.75)` — but the fold around it no longer collapses:
+    /// `out.rgb = 0.5 * (0.125, 0.375, 0.25) + 0.5 * B =
+    /// (0.1875, 0.375, 0.5)`, and `out.a = 0.5 + 1.0 * 0.5 = 1.0`. Every
+    /// intermediate is an exact binary fraction, so the golden below is
+    /// still asserted absolutely and not merely differentially.
+    ///
+    /// The maximum is genuinely two-sided: red comes from the *source*
+    /// (`0.25` over `0.125`), green from the *backdrop* (`0.375` over
+    /// `0.25`), and blue from the source (`0.75` over `0.25`) — so
+    /// `Cb != Cs` in all three channels, which is the precondition for
+    /// the transpose below being visible at all, and neither layer's own
+    /// colour can produce this texel.
+    ///
+    /// One coincidence worth naming, because it is unchanged from the
+    /// opaque fixture and is not a regression: `Lighten` picks the
+    /// *source* in red and blue, so the `Normal` arm agrees with the
+    /// golden in exactly those two channels and differs only in green
+    /// (`0.3125` against `0.375`, the golden's green being `Cb` itself,
+    /// since `max` takes the backdrop there). Green is the single channel
+    /// that discriminates `Normal`; the pre-0.105.2 golden
+    /// `(0.25, 0.375, 0.75)` had the same one-channel margin against its
+    /// own `Normal` value `(0.25, 0.25, 0.75)`.
     ///
     /// **Four** independent guards — one more than the `Darken`
     /// five-layer test above, whose own doc comment names *two* and
@@ -29172,8 +29195,37 @@ mod tests {
     ///   the CPU, which computes the same correct pixels";
     /// - and the `assert_ne!` vacuity guard at the end: the same stack
     ///   with `Lighten` replaced by `Darken` must composite to something
-    ///   *different* (`(0.125, 0.25, 0.25)` against
-    ///   `(0.25, 0.375, 0.75)` — all three channels differ).
+    ///   *different* (`(0.125, 0.3125, 0.25)` against
+    ///   `(0.1875, 0.375, 0.5)` — all three channels differ). The
+    ///   substitute is composited at this fixture's own `0.5` opacity too,
+    ///   so the guard is still a comparison of two full folds, not of two
+    ///   bare blend terms.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is
+    /// caught here** (0.105.2), and that is what the `0.5` opacity above
+    /// buys. `B = max(Cb, Cs)` is symmetric, so the transpose survives
+    /// inside `B`; what it cannot survive is the asymmetric fold around
+    /// it, `out = (1 - a) * bd + a * blended`, which weights the backdrop
+    /// and the source differently as soon as `a != 1`. Swapping the two
+    /// arguments makes the *layer's* own colour the down-weighted operand:
+    /// `out = 0.5 * Cs + 0.5 * B = (0.25, 0.3125, 0.75, 1.0)` against the
+    /// golden `(0.1875, 0.375, 0.5, 1.0)` — all three channels — so both
+    /// the absolute golden and `assert_gpu_matches_cpu` fail (the CPU path
+    /// is unaffected by an app-side GPU dispatch arm, so the differential
+    /// genuinely diverges). Verified by really running the mutation, not
+    /// reasoned about: against the pre-0.105.2 opaque fixture it survived
+    /// with 396 passed / 0 failed, and against this one it fails — see
+    /// PLAN.md's 0.105.2 entry for both measurements and the adapter.
+    ///
+    /// `aurora-render`'s own per-texel spatial differential,
+    /// `composite_lighten_over_with_opacity_matches_the_cpu_across_a_
+    /// spatially_varying_tile`, does not and structurally cannot cover
+    /// this. It catches a transpose *inside* the wrapper or the shader, a
+    /// real and different mutation, but it calls the compositor method
+    /// directly with its own hand-passed arguments and never runs
+    /// `begin_gpu_composite_tile` at all — `aurora-render` cannot depend
+    /// on `aurora-app` (PRD §7.2 layering), so no test in that crate can
+    /// reach this dispatch arm.
     #[test]
     fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_lighten_blend_document() {
         let Some(context) = real_gpu_context() else {
@@ -29196,7 +29248,7 @@ mod tests {
             (
                 "l3",
                 aurora_doc::BlendMode::Lighten,
-                1.0,
+                0.5,
                 [0.25, 0.25, 0.75, 1.0],
             ),
         ];
@@ -29241,10 +29293,14 @@ mod tests {
         );
         assert_eq!(
             gpu_result,
-            (0.25, 0.375, 0.75, 1.0),
-            "the per-channel maximum must come out of the GPU path itself -- (0.125, 0.25, 0.25, \
-             1.0) would mean the Darken arm ran, (0.25, 0.25, 0.75, 1.0) the Normal arm, and \
-             (0.03125, 0.09375, 0.1875, 1.0) the Multiply arm"
+            (0.1875, 0.375, 0.5, 1.0),
+            "0.5*Cb + 0.5*max(Cb, Cs) must come out of the GPU path itself -- B is \
+             (0.25, 0.375, 0.75), the two-sided maximum. (0.125, 0.3125, 0.25, 1.0) would mean \
+             the Darken arm ran, (0.1875, 0.3125, 0.5, 1.0) the Normal arm (agreeing in red and \
+             blue, where Lighten itself takes the source, so green is the one channel that \
+             separates them), (0.078125, 0.234375, 0.21875, 1.0) the Multiply arm, and a \
+             dispatch arm that transposed src and backdrop gives (0.25, 0.3125, 0.75, 1.0), \
+             differing in all three channels."
         );
 
         // The vacuity guard: the same stack with its `Lighten` layer
@@ -29300,23 +29356,37 @@ mod tests {
     /// accumulator that pipeline created, which is the shared-ping-pong
     /// property no single-blend-mode fixture can reach:
     ///
-    /// | # | mode       | rgba                     | fold after               |
-    /// |---|------------|--------------------------|--------------------------|
-    /// | 1 | `Normal`   | `(0.25, 0.75, 0.5, 1)`   | `(0.25, 0.75, 0.5)`      |
-    /// | 2 | `Multiply` | `(0.5, 0.5, 0.5, 1)`     | `(0.125, 0.375, 0.25)`   |
-    /// | 3 | `Screen`   | `(0.25, 0.25, 0.75, 1)`  | `(0.34375, 0.53125, 0.8125)` |
+    /// | # | mode       | opacity | rgba                    | fold after                    |
+    /// |---|------------|---------|-------------------------|-------------------------------|
+    /// | 1 | `Normal`   | `1.0`   | `(0.25, 0.75, 0.5, 1)`  | `(0.25, 0.75, 0.5)`           |
+    /// | 2 | `Multiply` | `1.0`   | `(0.5, 0.5, 0.5, 1)`    | `(0.125, 0.375, 0.25)`        |
+    /// | 3 | `Screen`   | `0.5`   | `(0.25, 0.25, 0.75, 1)` | `(0.234375, 0.453125, 0.53125)` |
     ///
-    /// Every layer is fully opaque at opacity `1.0`, so the accumulator's
-    /// alpha is `1.0` when the `Screen` pass runs and the whole "over"
-    /// reduces to `B` itself — the golden below *is*
-    /// `Screen((0.125, 0.375, 0.25), (0.25, 0.25, 0.75))`, all exact
-    /// binary fractions, so it is asserted absolutely and not merely
-    /// differentially.
+    /// **The top layer's opacity is `0.5`, and that is load-bearing**
+    /// (0.105.2). It was `1.0` from 0.102.0 until then, and with every
+    /// layer opaque the whole "over" reduced to `out = B`, which left the
+    /// `opacity` uniform and the dispatch arm's own argument order
+    /// unobservable here — see the transpose section at the bottom. The
+    /// accumulator's alpha is still `1.0` when the `Screen` pass runs, so
+    /// `blended` reduces to `B` itself —
+    /// `B = Screen((0.125, 0.375, 0.25), (0.25, 0.25, 0.75)) =
+    /// (0.34375, 0.53125, 0.8125)` — but the fold around it no longer
+    /// collapses: `out.rgb = 0.5 * (0.125, 0.375, 0.25) + 0.5 * B =
+    /// (0.234375, 0.453125, 0.53125)`, and
+    /// `out.a = 0.5 + 1.0 * 0.5 = 1.0`. Every intermediate is an exact
+    /// binary fraction, so the golden below is still asserted absolutely
+    /// and not merely differentially.
     ///
     /// Note the fixture's operands are the `Lighten` sibling's, unchanged,
     /// and they suit `Screen` as they stand: no channel of either operand
     /// is `0.0` or `1.0`, the two values at which `Screen` degenerates (to
-    /// `Normal` and to a constant `1.0`).
+    /// `Normal` and to a constant `1.0`). Nothing saturates on the way out
+    /// either — every operand is strictly inside `(0, 1)` and the largest
+    /// channel of `B` is `0.8125` — and `Screen` has no branch, clamp or
+    /// division of its own, so the whole fold is *affine* in the opacity.
+    /// There is nothing special about that opacity being `0.5` rather than
+    /// any other value in `(0, 1)`: no channel changes which side of a
+    /// boundary it sits on as it moves.
     ///
     /// **Four** independent guards, the same four the `Lighten` sibling
     /// carries:
@@ -29329,11 +29399,40 @@ mod tests {
     ///   mutation in this round's own set that nothing else caught;
     /// - and the `assert_ne!` vacuity guard at the end: the same stack
     ///   with `Screen` replaced by `Lighten` must composite to something
-    ///   *different* (`(0.25, 0.375, 0.75)` against
-    ///   `(0.34375, 0.53125, 0.8125)` — all three channels differ).
+    ///   *different* (`(0.1875, 0.375, 0.5)` against
+    ///   `(0.234375, 0.453125, 0.53125)` — all three channels differ).
     ///   `Lighten` is chosen as the substitute deliberately: it is the
     ///   entry point `fs_composite_screen` was written from, so it is the
-    ///   realistic copy-paste failure.
+    ///   realistic copy-paste failure. The substitute is composited at
+    ///   this fixture's own `0.5` opacity too, so the guard is still a
+    ///   comparison of two full folds, not of two bare blend terms.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is
+    /// caught here** (0.105.2), and that is what the `0.5` opacity above
+    /// buys. `B = Cb + Cs - Cb*Cs` is symmetric, so the transpose survives
+    /// inside `B`; what it cannot survive is the asymmetric fold around it,
+    /// `out = (1 - a) * bd + a * blended`, which weights the backdrop and
+    /// the source differently as soon as `a != 1`. Swapping the two
+    /// arguments makes the *layer's* own colour the down-weighted operand:
+    /// `out = 0.5 * Cs + 0.5 * B = (0.296875, 0.390625, 0.78125, 1.0)`
+    /// against the golden `(0.234375, 0.453125, 0.53125, 1.0)` — all three
+    /// channels — so both the absolute golden and `assert_gpu_matches_cpu`
+    /// fail (the CPU path is unaffected by an app-side GPU dispatch arm, so
+    /// the differential genuinely diverges). Verified by really running the
+    /// mutation, not reasoned about: against the pre-0.105.2 opaque fixture
+    /// it survived with 396 passed / 0 failed, and against this one it
+    /// fails — see PLAN.md's 0.105.2 entry for both measurements and the
+    /// adapter.
+    ///
+    /// `aurora-render`'s own per-texel spatial differential,
+    /// `composite_screen_over_with_opacity_matches_the_cpu_across_a_
+    /// spatially_varying_tile`, does not and structurally cannot cover
+    /// this. It catches a transpose *inside* the wrapper or the shader, a
+    /// real and different mutation, but it calls the compositor method
+    /// directly with its own hand-passed arguments and never runs
+    /// `begin_gpu_composite_tile` at all — `aurora-render` cannot depend
+    /// on `aurora-app` (PRD §7.2 layering), so no test in that crate can
+    /// reach this dispatch arm.
     #[test]
     fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_screen_blend_document() {
         let Some(context) = real_gpu_context() else {
@@ -29356,7 +29455,7 @@ mod tests {
             (
                 "l3",
                 aurora_doc::BlendMode::Screen,
-                1.0,
+                0.5,
                 [0.25, 0.25, 0.75, 1.0],
             ),
         ];
@@ -29397,11 +29496,14 @@ mod tests {
         );
         assert_eq!(
             gpu_result,
-            (0.34375, 0.53125, 0.8125, 1.0),
-            "Cb + Cs - Cb*Cs must come out of the GPU path itself -- (0.25, 0.375, 0.75, 1.0) \
-             would mean the Lighten arm ran, (0.125, 0.25, 0.25, 1.0) the Darken arm, \
-             (0.25, 0.25, 0.75, 1.0) the Normal arm, and (0.03125, 0.09375, 0.1875, 1.0) the \
-             Multiply arm"
+            (0.234_375, 0.453_125, 0.53125, 1.0),
+            "0.5*Cb + 0.5*(Cb + Cs - Cb*Cs) must come out of the GPU path itself -- B is \
+             (0.34375, 0.53125, 0.8125), no channel of which saturates. \
+             (0.1875, 0.375, 0.5, 1.0) would mean the Lighten arm ran, \
+             (0.125, 0.3125, 0.25, 1.0) the Darken arm, (0.1875, 0.3125, 0.5, 1.0) the Normal \
+             arm, (0.078125, 0.234375, 0.21875, 1.0) the Multiply arm, and a dispatch arm that \
+             transposed src and backdrop gives (0.296875, 0.390625, 0.78125, 1.0), differing in \
+             all three channels."
         );
 
         // The vacuity guard: the same stack with its `Screen` layer turned
@@ -29457,18 +29559,25 @@ mod tests {
     /// accumulator that pipeline created, which is the shared-ping-pong
     /// property no single-blend-mode fixture can reach:
     ///
-    /// | # | mode         | rgba                     | fold after             |
-    /// |---|--------------|--------------------------|------------------------|
-    /// | 1 | `Normal`     | `(0.25, 0.75, 0.5, 1)`   | `(0.25, 0.75, 0.5)`    |
-    /// | 2 | `Multiply`   | `(0.5, 0.5, 0.5, 1)`     | `(0.125, 0.375, 0.25)` |
-    /// | 3 | `Difference` | `(0.5, 0.125, 0.75, 1)`  | `(0.375, 0.25, 0.5)`   |
+    /// | # | mode         | opacity | rgba                    | fold after               |
+    /// |---|--------------|---------|-------------------------|--------------------------|
+    /// | 1 | `Normal`     | `1.0`   | `(0.25, 0.75, 0.5, 1)`  | `(0.25, 0.75, 0.5)`      |
+    /// | 2 | `Multiply`   | `1.0`   | `(0.5, 0.5, 0.5, 1)`    | `(0.125, 0.375, 0.25)`   |
+    /// | 3 | `Difference` | `0.5`   | `(0.5, 0.125, 0.75, 1)` | `(0.25, 0.3125, 0.375)`  |
     ///
-    /// Every layer is fully opaque at opacity `1.0`, so the accumulator's
-    /// alpha is `1.0` when the `Difference` pass runs and the whole "over"
-    /// reduces to `B` itself — the golden below *is*
-    /// `|(0.125, 0.375, 0.25) - (0.5, 0.125, 0.75)|`, all exact binary
-    /// fractions, so it is asserted absolutely and not merely
-    /// differentially.
+    /// **The top layer's opacity is `0.5`, and that is load-bearing**
+    /// (0.105.2). It was `1.0` from 0.104.0 until then, and with every
+    /// layer opaque the whole "over" reduced to `out = B`, which left the
+    /// `opacity` uniform and the dispatch arm's own argument order
+    /// unobservable here — see the transpose section at the bottom. The
+    /// accumulator's alpha is still `1.0` when the `Difference` pass runs,
+    /// so `blended` reduces to `B` itself —
+    /// `B = |(0.125, 0.375, 0.25) - (0.5, 0.125, 0.75)| =
+    /// (0.375, 0.25, 0.5)` — but the fold around it no longer collapses:
+    /// `out.rgb = 0.5 * (0.125, 0.375, 0.25) + 0.5 * B =
+    /// (0.25, 0.3125, 0.375)`, and `out.a = 0.5 + 1.0 * 0.5 = 1.0`. Every
+    /// intermediate is an exact binary fraction, so the golden below is
+    /// still asserted absolutely and not merely differentially.
     ///
     /// **The `Screen` sibling's top layer could not be reused unchanged —
     /// on *magnitude* grounds, not sign grounds.** (0.104.1 corrected this
@@ -29491,12 +29600,24 @@ mod tests {
     /// `(0.375, 0.25, 0.5)`, three distinct values, which is the whole
     /// advantage.
     ///
+    /// **0.105.2's opacity change does not weaken that argument, and
+    /// mildly strengthens it.** The three magnitudes are a property of the
+    /// two operands alone, and neither operand changed, so `B` is still
+    /// `(0.375, 0.25, 0.5)` with all three values distinct. The fold then
+    /// adds a per-channel `0.5 * Cb = (0.0625, 0.1875, 0.125)` offset,
+    /// which is itself distinct in all three channels, so the folded
+    /// golden `(0.25, 0.3125, 0.375)` separates the channels twice over
+    /// rather than once.
+    ///
     /// The wrong-arm consequences are the same for either source, and hold
     /// for the one actually used: green is the single channel with
     /// `Cb > Cs`, so it is the channel an `abs()`-less `Cb - Cs`
     /// (`(-0.375, +0.25, -0.5)`) and `Subtract`'s `max(Cb - Cs, 0)`
     /// (`(0.0, 0.25, 0.0)`) both still get right, and red and blue are the
-    /// two each of them gets wrong.
+    /// two each of them gets wrong. That survives the fold: those two
+    /// blend terms fold to `(-0.125, 0.3125, -0.125)` and
+    /// `(0.0625, 0.3125, 0.125)`, each still agreeing with the golden in
+    /// green only.
     ///
     /// **Four** independent guards, the same four the `Screen` sibling
     /// carries:
@@ -29510,11 +29631,41 @@ mod tests {
     ///   nothing else catches;
     /// - and the `assert_ne!` vacuity guard at the end: the same stack
     ///   with `Difference` replaced by `Screen` must composite to something
-    ///   *different* (`(0.5625, 0.453125, 0.8125)` against
-    ///   `(0.375, 0.25, 0.5)` — all three channels differ). `Screen` is
+    ///   *different* (`(0.34375, 0.4140625, 0.53125)` against
+    ///   `(0.25, 0.3125, 0.375)` — all three channels differ). `Screen` is
     ///   chosen as the substitute deliberately: it is the entry point
     ///   `fs_composite_difference` was written from, so it is the realistic
-    ///   copy-paste failure.
+    ///   copy-paste failure. The substitute is composited at this
+    ///   fixture's own `0.5` opacity too, so the guard is still a
+    ///   comparison of two full folds, not of two bare blend terms.
+    ///
+    /// **A transposed `src`/`backdrop` binding in the dispatch arm is
+    /// caught here** (0.105.2), and that is what the `0.5` opacity above
+    /// buys. `|Cb - Cs| = |Cs - Cb|`, so the transpose survives inside `B`
+    /// — the property `fs_composite_difference`'s own comment discloses;
+    /// what it cannot survive is the asymmetric fold around it,
+    /// `out = (1 - a) * bd + a * blended`, which weights the backdrop and
+    /// the source differently as soon as `a != 1`. Swapping the two
+    /// arguments makes the *layer's* own colour the down-weighted operand:
+    /// `out = 0.5 * Cs + 0.5 * B = (0.4375, 0.1875, 0.625, 1.0)` against
+    /// the golden `(0.25, 0.3125, 0.375, 1.0)` — all three channels — so
+    /// both the absolute golden and `assert_gpu_matches_cpu` fail (the CPU
+    /// path is unaffected by an app-side GPU dispatch arm, so the
+    /// differential genuinely diverges). Verified by really running the
+    /// mutation, not reasoned about: against the pre-0.105.2 opaque fixture
+    /// it survived with 396 passed / 0 failed, and against this one it
+    /// fails — see PLAN.md's 0.105.2 entry for both measurements and the
+    /// adapter.
+    ///
+    /// `aurora-render`'s own per-texel spatial differential,
+    /// `composite_difference_over_with_opacity_matches_the_cpu_across_a_
+    /// spatially_varying_tile`, does not and structurally cannot cover
+    /// this — and that shader comment's pointer at it is about a transpose
+    /// *inside* the wrapper or the shader, which is a real and different
+    /// mutation. That test calls the compositor method directly with its
+    /// own hand-passed arguments and never runs `begin_gpu_composite_tile`
+    /// at all; `aurora-render` cannot depend on `aurora-app` (PRD §7.2
+    /// layering), so no test in that crate can reach this dispatch arm.
     #[test]
     fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_difference_blend_document() {
         let Some(context) = real_gpu_context() else {
@@ -29537,7 +29688,7 @@ mod tests {
             (
                 "l3",
                 aurora_doc::BlendMode::Difference,
-                1.0,
+                0.5,
                 [0.5, 0.125, 0.75, 1.0],
             ),
         ];
@@ -29578,14 +29729,18 @@ mod tests {
         );
         assert_eq!(
             gpu_result,
-            (0.375, 0.25, 0.5, 1.0),
-            "|Cb - Cs| must come out of the GPU path itself -- (0.5625, 0.453125, 0.8125, 1.0) \
-             would mean the Screen arm ran, (0.5, 0.375, 0.75, 1.0) the Lighten arm, \
-             (0.125, 0.125, 0.25, 1.0) the Darken arm, (0.5, 0.125, 0.75, 1.0) the Normal arm, \
-             and (0.0625, 0.046875, 0.1875, 1.0) the Multiply arm. A shader that dropped the \
-             abs() gives (-0.375, 0.25, -0.5, 1.0) and one using Subtract's max(Cb - Cs, 0) \
-             gives (0.0, 0.25, 0.0, 1.0) -- both agreeing with the golden in green only, which \
-             is why this fixture straddles the sign change."
+            (0.25, 0.3125, 0.375, 1.0),
+            "0.5*Cb + 0.5*|Cb - Cs| must come out of the GPU path itself -- B is \
+             (0.375, 0.25, 0.5), three distinct magnitudes. \
+             (0.34375, 0.4140625, 0.53125, 1.0) would mean the Screen arm ran, \
+             (0.3125, 0.375, 0.5, 1.0) the Lighten arm, (0.125, 0.25, 0.25, 1.0) the Darken arm, \
+             (0.3125, 0.25, 0.5, 1.0) the Normal arm, and \
+             (0.09375, 0.2109375, 0.21875, 1.0) the Multiply arm. A shader that dropped the \
+             abs() gives (-0.125, 0.3125, -0.125, 1.0) and one using Subtract's \
+             max(Cb - Cs, 0) gives (0.0625, 0.3125, 0.125, 1.0) -- both agreeing with the golden \
+             in green only, which is why this fixture straddles the sign change. A dispatch arm \
+             that transposed src and backdrop gives (0.4375, 0.1875, 0.625, 1.0), differing in \
+             all three channels."
         );
 
         // The vacuity guard: the same stack with its `Difference` layer
@@ -29658,9 +29813,11 @@ mod tests {
     /// asserted absolutely and not merely differentially — and mixing a
     /// non-opaque layer in is what makes the `opacity` uniform itself, and
     /// the argument order of the dispatch arm's own call, observable at
-    /// all (see the transpose note at the bottom). The two siblings above
-    /// were written with every layer at `1.0`; this one deliberately is
-    /// not.
+    /// all (see the transpose note at the bottom). This was the first of
+    /// the six blend-math fixtures written that way; the `Lighten`,
+    /// `Screen` and `Difference` siblings above had every layer at `1.0`
+    /// until 0.105.2 retrofitted the same `0.5` onto each of them for the
+    /// same reason.
     ///
     /// **The top layer straddles the clamp**, which is what the fixture
     /// was chosen for. The per-channel sums inside `B` are
@@ -29720,28 +29877,33 @@ mod tests {
     ///   on `aurora-app` (PRD §7.2 layering), so no test in that crate can
     ///   reach this dispatch arm. Until 0.105.1 this doc comment claimed
     ///   that test covered the arm; it never did.
-    /// - **Three other dispatch arms still have no transpose coverage at
-    ///   all**: `Lighten` (0.95.0), `Screen` (0.102.0) and `Difference`
-    ///   (0.104.0). Every layer in all three fixtures is at opacity
-    ///   `1.0`, so the outer fold collapses to `out = B` and each mode's
-    ///   symmetric blend math (`max`, `Cb + Cs - Cb*Cs`, `|Cb - Cs|`)
-    ///   absorbs the swap. Measured, not assumed: transposing each of the
-    ///   six arms one at a time in 0.105.1 and running `aurora-app`'s
-    ///   whole test binary on a real discrete GPU killed `Multiply` (2
-    ///   tests), `Darken` (1) and — after the fixture change above —
-    ///   `LinearDodge` (1), while `Lighten`, `Screen` and `Difference`
-    ///   each survived with 396 passed, 0 failed. `Multiply` (`Cb*Cs`) and
-    ///   `Darken` (`min(Cb,Cs)`) are themselves just as commutative as the
-    ///   three survivors' formulas — what actually catches the swap there
-    ///   is the same mechanism used above: each mode's own fixture layer
-    ///   (`l4`) already sits at a non-`1.0` opacity, for reasons unrelated
-    ///   to this gap, so the outer fold does not collapse to `out = B` and
-    ///   the swap is caught incidentally, not by formula asymmetry.
-    ///   Those three survivors are a real, open, disclosed gap, not a
-    ///   structural limit: the fix is the one applied here — set that
-    ///   mode's own layer to a non-opaque opacity and re-derive the golden
-    ///   — and it is deliberately left to a future round rather than
-    ///   retrofitted into three already-shipped ones.
+    /// - **All six blend-math dispatch arms now carry transpose coverage**
+    ///   (0.105.2). None of the six gets it from formula asymmetry:
+    ///   `Cb*Cs`, `min(Cb,Cs)`, `max(Cb,Cs)`, `Cb + Cs - Cb*Cs`,
+    ///   `|Cb - Cs|` and `min(Cb + Cs, 1)` are all commutative, so the
+    ///   surrounding "over" is the only thing that can ever notice the
+    ///   swap, and it only does so where some layer is not fully opaque.
+    ///   `Multiply` and `Darken` are covered **incidentally**: each of
+    ///   those two modes' own app-level fixture already carries a
+    ///   non-`1.0` opacity on an unrelated layer (`l4`), for reasons that
+    ///   predate this gap being noticed. `LinearDodge` (0.105.1, above)
+    ///   and then `Lighten`, `Screen` and `Difference` (0.105.2) are
+    ///   covered **deliberately**, all four by the same mechanism: set
+    ///   that mode's own layer to opacity `0.5` and re-derive the golden.
+    ///   The three later ones were test-fixture and doc-comment changes
+    ///   only — no shader, wrapper, dispatch-arm or predicate line moved,
+    ///   and no mode was admitted to the GPU path.
+    ///
+    ///   Measured, not assumed, in both rounds, by transposing one arm at
+    ///   a time and running `aurora-app`'s whole test binary on a real
+    ///   discrete GPU (Vulkan/NVIDIA — no other backend is claimed).
+    ///   0.105.1 killed `Multiply` (2 tests), `Darken` (1) and — after
+    ///   that round's own fixture change — `LinearDodge` (1), while
+    ///   `Lighten`, `Screen` and `Difference` each survived with 396
+    ///   passed, 0 failed. 0.105.2 re-measured all six against the fixed
+    ///   fixtures; each of those three now kills exactly its own test with
+    ///   the hand-derived transposed texel. PLAN.md's 0.105.2 entry has
+    ///   both tables in full.
     #[test]
     fn recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_linear_dodge_blend_document() {
         let Some(context) = real_gpu_context() else {

@@ -19203,7 +19203,9 @@ severity choice.
   transpose coverage. The fix is now proven rather than hypothesised (set
   that mode's own layer non-opaque, re-derive the golden), and is
   deliberately left to a future round rather than retrofitted into three
-  already-shipped, already-reviewed ones.
+  already-shipped, already-reviewed ones. **Done in 0.105.2 (below)** —
+  by exactly that mechanism, and each of the three mutations really run
+  again against the fixed fixture.
 
   **Five documentation corrections**, each a factual error rather than a
   wording preference:
@@ -19252,6 +19254,198 @@ severity choice.
   **Disk-space check**, per 0.104.1's hard precondition. `/home` at 77%
   used, **93G free** of 403G before starting. Above threshold, so nothing
   was cleaned.
+
+- [x] **0.105.1's named follow-on discharged: the `Lighten`, `Screen` and
+  `Difference` dispatch-arm transpose gap closed — done 2026-09-04
+  (0.105.2).** A coverage round, not a behavioural one. **Scope, stated
+  first because it bounds every claim below: no shader, wrapper,
+  dispatch-arm or predicate line changed.** The only non-comment edits are
+  three test fixtures' top-layer opacity (`1.0` → `0.5`), the three
+  goldens and wrong-arm literals that follow from them, and the version.
+  The mode counts are therefore **unchanged**: still **19 of 27** blend
+  modes CPU-only at the app's GPU predicate, **20 of 26** with no
+  dedicated blend-math WGSL entry point. No mode was admitted, no test was
+  added or removed, and no new claim is made about any shader on any
+  backend.
+
+  **The gap, restated.** 0.105.1 measured that transposing the
+  `src`/`backdrop` arguments in `begin_gpu_composite_tile`'s `Lighten`,
+  `Screen` and `Difference` arms was a *total* test survivor — the whole
+  `aurora-app` binary stayed green. The cause is structural and shared:
+  every layer in each of those three fixtures sat at opacity `1.0`, so the
+  premultiplied "over" around the blend term,
+  `out = (1 - a) * bd + a * blended`, collapsed to `out = blended = B`; and
+  each of the three formulas (`max(Cb, Cs)`, `Cb + Cs - Cb*Cs`,
+  `|Cb - Cs|`) is commutative, so `B` itself cannot see an operand swap.
+  With the swap, `s` becomes the accumulator and `bd` the layer tile, so
+  `a = 1 * opacity` is unchanged and the fold becomes
+  `out = (1 - p) * Cs + p * B` instead of `(1 - p) * Cb + p * B` — a real
+  difference at any `p != 1`, and none at all at `p = 1`. The fix is the
+  one 0.105.1 proved on `LinearDodge`: move that mode's own layer to
+  opacity `0.5` and re-derive the golden.
+
+  **Three hand-derivations, in full.** All three fixtures share the same
+  first two layers, so all three share a backdrop
+  `Cb = (0.125, 0.375, 0.25)` at alpha `1.0` when the third pass runs
+  (`Normal (0.25, 0.75, 0.5, 1)` → `Multiply (0.5, 0.5, 0.5, 1)`, both at
+  opacity `1.0`). With `p = 0.5` and `ab = 1`: `blended = B`,
+  `out.rgb = 0.5 * Cb + 0.5 * B`, `out.a = 0.5 + 1.0 * 0.5 = 1.0`.
+  Re-derived independently in exact rational arithmetic before any
+  assertion was written, and every value below is an exact binary fraction
+  representable in `f16`, so the goldens stay *absolute* rather than
+  becoming tolerance comparisons:
+
+  | test | `Cs` | `B` | golden `out` | transposed `out` |
+  |---|---|---|---|---|
+  | `Lighten` | `(0.25, 0.25, 0.75)` | `max` → `(0.25, 0.375, 0.75)` | **`(0.1875, 0.375, 0.5, 1.0)`** | `(0.25, 0.3125, 0.75, 1.0)` |
+  | `Screen` | `(0.25, 0.25, 0.75)` | `Cb+Cs-Cb·Cs` → `(0.34375, 0.53125, 0.8125)` | **`(0.234375, 0.453125, 0.53125, 1.0)`** | `(0.296875, 0.390625, 0.78125, 1.0)` |
+  | `Difference` | `(0.5, 0.125, 0.75)` | `abs` → `(0.375, 0.25, 0.5)` | **`(0.25, 0.3125, 0.375, 1.0)`** | `(0.4375, 0.1875, 0.625, 1.0)` |
+
+  Every wrong-arm alternative named in each assertion message was
+  recomputed the same way and rewritten, not carried over — the previous
+  literals were the *blend terms*, which are no longer the output. So, at
+  `p = 0.5`: `Lighten`'s message now names Darken
+  `(0.125, 0.3125, 0.25)`, Normal `(0.1875, 0.3125, 0.5)` and Multiply
+  `(0.078125, 0.234375, 0.21875)`; `Screen`'s names Lighten
+  `(0.1875, 0.375, 0.5)`, Darken `(0.125, 0.3125, 0.25)`, Normal
+  `(0.1875, 0.3125, 0.5)` and Multiply `(0.078125, 0.234375, 0.21875)`;
+  `Difference`'s names Screen `(0.34375, 0.4140625, 0.53125)`, Lighten
+  `(0.3125, 0.375, 0.5)`, Darken `(0.125, 0.25, 0.25)`, Normal
+  `(0.3125, 0.25, 0.5)`, Multiply `(0.09375, 0.2109375, 0.21875)`, an
+  `abs()`-less shader `(-0.125, 0.3125, -0.125)` and `Subtract`'s
+  `max(Cb - Cs, 0)` `(0.0625, 0.3125, 0.125)`. The three `assert_ne!`
+  vacuity guards were re-checked rather than assumed: each substituted
+  mode now runs at the new `p = 0.5` too, and each still differs from its
+  golden in **all three** channels (`Lighten`-test Darken substitute
+  `(0.125, 0.3125, 0.25, 1.0)`; `Screen`-test Lighten substitute
+  `(0.1875, 0.375, 0.5, 1.0)`; `Difference`-test Screen substitute
+  `(0.34375, 0.4140625, 0.53125, 1.0)`), so none of the three guards went
+  vacuous.
+
+  **PRE-fix survivor baseline, measured on the unmodified fixtures before
+  anything was edited** — because once the fixtures change this number
+  cannot be reconstructed. One arm transposed at a time, `aurora-app`'s
+  whole test binary run each time under `AURORA_REQUIRE_GPU=1`, arm
+  reverted between runs:
+
+  | arm transposed alone (old fixtures) | result |
+  |---|---|
+  | `Lighten` | **survived** — 396 passed, 0 failed |
+  | `Screen` | **survived** — 396 passed, 0 failed |
+  | `Difference` | **survived** — 396 passed, 0 failed |
+
+  Reproduces 0.105.1's finding exactly, on the same hardware.
+
+  **POST-fix kill matrix, all six blend-math arms re-measured against the
+  fixed fixtures**, same method, same binary:
+
+  | arm transposed alone (new fixtures) | result |
+  |---|---|
+  | `Multiply` | killed — **2** tests (`..._composites_a_mixed_normal_and_multiply_stack`, `..._reads_back_the_right_member_after_an_odd_swap_count`) |
+  | `Darken` | killed — **1** (`..._composites_a_mixed_normal_multiply_and_darken_stack`) |
+  | `Lighten` | killed — **1** (`..._agree_on_a_lighten_blend_document`) |
+  | `Screen` | killed — **1** (`..._agree_on_a_screen_blend_document`) |
+  | `Difference` | killed — **1** (`..._agree_on_a_difference_blend_document`) |
+  | `LinearDodge` | killed — **1** (`..._agree_on_a_linear_dodge_blend_document`) |
+
+  Each of the three new kills is **exactly one** test, exactly the
+  intended one — 395 passed / 1 failed in each case, no collateral. The
+  `Multiply` and `Darken` rows are unchanged from 0.105.1, re-measured
+  here rather than inherited, which also confirms this round's fixture
+  edits did not accidentally recruit the three tests into covering *other*
+  arms (their own `Multiply` layer stays at opacity `1.0`, so the
+  `Multiply` arm's swap is still invisible there). All six arms now carry
+  transpose coverage; none of the six gets it from formula asymmetry, since
+  all six formulas are commutative.
+
+  **What actually fires, and in what order.** The reported divergence in
+  all three cases came from `assert_gpu_matches_cpu`, the GPU-vs-CPU
+  differential, which sits earlier in each test body than the absolute
+  golden — e.g. `channel r: ... (0.4375, 0.1875, 0.625, 1.0) vs
+  (0.25, 0.3125, 0.375, 1.0)` for `Difference`. Every observed transposed
+  texel matched the hand-derivation **exactly**, all three of them, before
+  the runs. The dispatch-counter assertion sits earlier still and passes
+  under the transpose (the arm does dispatch; it dispatches with the
+  operands swapped), which is the correct behaviour for that guard and the
+  reason the differential is the one that reports. All four independent
+  guards per test are structurally intact and unweakened — only literals
+  inside them moved.
+
+  **Degeneracy re-audit at the new operating point**, since changing the
+  opacity changes where each fixture sits relative to its mode's
+  boundaries:
+
+  - `Lighten`: `Cb != Cs` in all three channels
+    (`0.125/0.25`, `0.375/0.25`, `0.25/0.75`), the precondition for the
+    swap being visible at all, and the maximum is still genuinely
+    two-sided (source, backdrop, source). One coincidence, unchanged from
+    the opaque fixture and now stated in the doc comment: `Lighten` takes
+    the *source* in red and blue, so the `Normal` arm agrees with the
+    golden in exactly those two channels and green is the single channel
+    separating them (`0.3125` vs `0.375`). The old golden had the same
+    one-channel margin against its own `Normal` value, so this is not a
+    regression introduced here.
+  - `Screen`: every operand strictly inside `(0, 1)`, so neither of
+    `Screen`'s two degeneracies (`Cs = 0` → `Normal`, `Cs = 1` →
+    constant `1`) is in play, and no channel saturates — the largest
+    channel of `B` is `0.8125`. `Screen` has no branch, clamp or division
+    of its own, so the fold is *affine* in `p` and nothing about `p = 0.5`
+    is special: no channel crosses a boundary as `p` moves.
+  - `Difference`: `B = |Cb - Cs| = (0.375, 0.25, 0.5)`, three distinct
+    magnitudes, and this is **unchanged** by the opacity edit — the
+    magnitudes depend only on the two operands, neither of which moved.
+    Verified rather than assumed, because the whole reason 0.104.0 chose
+    this source over the inherited `Screen` one was that magnitude
+    distinctness (a swizzle between two channels sharing a magnitude is
+    invisible in `B`). The edit mildly *strengthens* it: the fold adds a
+    per-channel `0.5 * Cb = (0.0625, 0.1875, 0.125)` offset that is itself
+    distinct in all three channels, so the folded golden separates the
+    channels twice over. The `abs()`-vs-`Subtract` discriminator also
+    survives: green is still the only channel where `Cb > Cs`, and both
+    wrong formulas still agree with the golden in green **only**.
+
+  **No other test affected.** Each of the three fixtures is a local
+  `let stack: [...; 3]` inside its own `#[test]` fn — no shared mutable
+  state, no helper reads them — confirmed by inspecting every `let stack`
+  binding in the file. The workspace suite's pass/fail counts are
+  identical before and after: **1,688 passed, 0 failed, 10 ignored** both
+  times, with the three touched tests passing in both (on their old and
+  new goldens respectively).
+
+  **Hardware scoping, explicit.** Every measurement above was taken on one
+  adapter: `NVIDIA GeForce RTX 3090 (Vulkan, DiscreteGpu)`, printed by
+  `aurora_gpu::test_support::real_context_or_skip` on each run, with
+  `AURORA_REQUIRE_GPU=1` set so a missing or CPU adapter would have failed
+  rather than silently skipped. **Metal and DX12 remain unverified for
+  this mechanism.** That said, this round changes no shader and no GPU-side
+  code at all, so it adds no *new* shader claim on any backend — it only
+  makes an existing, already-shipped app-side dispatch arm's argument
+  order observable by a test on the one backend that test runs on here.
+
+  **Full local gate green** in CI's own order: `cargo fmt --all --check`,
+  `scripts/check_layering.py`, `scripts/check_no_hardcoded_style.py`,
+  `cargo check --workspace --locked`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `AURORA_REQUIRE_GPU=1
+  cargo test --workspace` (**1,688 passed, 0 failed, 10 ignored**;
+  `aurora-app` alone **396 passed, 0 failed**), `cargo test --workspace
+  --doc`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+  --all-features`, `cargo deny check all`. `cargo check -p aurora-app` on
+  its own (the flagless build) also passes.
+
+  **Disk-space check**, per 0.104.1's hard precondition. `/home` at 78%
+  used, **88G free** of 403G before starting. Above threshold, so nothing
+  was cleaned. Still done by hand — the automation remains an unbuilt
+  candidate follow-on.
+
+  **Not fixed here, deliberately, and flagged for the maintainer.**
+  `fs_composite_difference`'s WGSL comment says the symmetry property it
+  discloses is "exactly the property `fs_composite_screen` above discloses
+  for the same reason" — but `fs_composite_screen`'s own comment contains
+  no such disclosure, so the cross-reference points at nothing.
+  `fs_composite_linear_dodge`'s comment inherits the same claim about both.
+  That is a pre-existing `aurora-render` documentation error, unrelated to
+  this app-level round, and touching it would put a shader file in a diff
+  that is otherwise fixture-and-comment-only in `aurora-app`.
 
 ### M1.10 — Phase 1 gate
 
@@ -24095,6 +24289,39 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.105.2) — 0.105.1's named follow-on discharged:
+the `Lighten`, `Screen` and `Difference` dispatch-arm transpose gap is
+closed.** A coverage round, test-fixture and doc-comment only. **No
+shader, wrapper, dispatch-arm or predicate line changed**, so the counts
+below are unchanged from 0.105.0/0.105.1 — no mode was ported, no mode was
+admitted to the GPU predicate, and no test was added.
+
+The substantive change is three fixtures: the top (`l3`) layer in each of
+`recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_{lighten,screen,difference}_blend_document`
+now sits at opacity `0.5` rather than `1.0`, which makes the premultiplied
+"over" fold asymmetric and so makes a transposed `src`/`backdrop` binding
+in `begin_gpu_composite_tile`'s own dispatch arm observable — the same
+mechanism 0.105.1 proved on `LinearDodge`. Hand-derived goldens, all exact
+binary fractions: `Lighten` `(0.1875, 0.375, 0.5, 1.0)`, `Screen`
+`(0.234375, 0.453125, 0.53125, 1.0)`, `Difference`
+`(0.25, 0.3125, 0.375, 1.0)`; the transposes yield
+`(0.25, 0.3125, 0.75, 1.0)`, `(0.296875, 0.390625, 0.78125, 1.0)` and
+`(0.4375, 0.1875, 0.625, 1.0)`, each diverging in all three channels.
+
+**Measured both before and after, on an RTX 3090 (Vulkan, `DiscreteGpu`)
+under `AURORA_REQUIRE_GPU=1`.** Against the old fixtures all three
+transposes survived with 396 passed / 0 failed apiece; against the new
+ones each kills **exactly one** test — its own — with exactly the
+predicted texel, reported by `assert_gpu_matches_cpu`. Re-running the
+`Multiply`, `Darken` and `LinearDodge` mutations too confirms all six
+blend-math arms now carry transpose coverage, and that this round's
+fixture edits recruited no test into covering an arm it does not own.
+Vulkan/NVIDIA only; Metal and DX12 stay unverified, though this round adds
+no new shader claim on any backend because it changes no shader. See the
+0.105.2 M1.10 entry for the full derivations, both mutation tables, the
+degeneracy re-audit, and one pre-existing `aurora-render` comment
+cross-reference error found and deliberately left alone.
 
 **Addendum 2026-09-04 (0.105.1) — 0.105.0's review follow-ups: the
 `LinearDodge` dispatch-arm transpose gap is closed for real, and the
