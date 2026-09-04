@@ -69,8 +69,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // than reached through the fixed-function blend unit. Binding 3 is the
 // next free slot after src_tex (0), src_smp (1) and the opacity uniform
 // (2) declared above; only the real blend-math entry points below --
-// fs_composite_multiply, fs_composite_darken, fs_composite_lighten and
-// fs_composite_screen -- use it, through the
+// fs_composite_multiply, fs_composite_darken, fs_composite_lighten,
+// fs_composite_screen and fs_composite_difference -- use it, through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
 // fixed-function entry point's own layout gains an entry.
@@ -78,8 +78,9 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // Named `backdrop_tex` after the Rust parameter it is actually bound to
 // (`TileCompositor::composite_multiply_over_with_opacity`'s,
 // `composite_darken_over_with_opacity`'s,
-// `composite_lighten_over_with_opacity`'s and
-// `composite_screen_over_with_opacity`'s `backdrop`),
+// `composite_lighten_over_with_opacity`'s,
+// `composite_screen_over_with_opacity`'s and
+// `composite_difference_over_with_opacity`'s `backdrop`),
 // deliberately *not* `dst_tex`: `dst` on the Rust side is the render
 // target this entry point writes to, which is a different texture
 // entirely and must never alias this one. Calling the sampled backdrop
@@ -87,9 +88,9 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // against, so the name was corrected in 0.83.1, while `Multiply` was
 // still the only ported mode and the 25 then-unported ones had yet to be
 // written against this file. That "25" is the 0.83.1 count and is not
-// maintained here; `Darken` (0.85.0), `Lighten` (0.95.0) and `Screen`
-// (0.102.0) have since landed, and the live numbers live in
-// `TileCompositor`'s own doc comment.
+// maintained here; `Darken` (0.85.0), `Lighten` (0.95.0), `Screen`
+// (0.102.0) and `Difference` (0.104.0) have since landed, and the live
+// numbers live in `TileCompositor`'s own doc comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
 
 // Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
@@ -270,6 +271,58 @@ fn fs_composite_screen(in: VsOut) -> @location(0) vec4<f32> {
         cb = bd.rgb / ab;
     }
     let b = cb + s.rgb - cb * s.rgb;          // blend_rgb(Screen, cb, cs)
+    let blended = ab_inv * s.rgb + ab * b;
+    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+}
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
+// exactly, for `BlendMode::Difference` only -- the fifth blend mode
+// ported to the GPU, and structurally identical to the four entry points
+// above in every line but one.
+//
+// Read `fs_composite_multiply`'s own comment for the full derivation of
+// the surrounding "over": the alpha compositing around `B(Cb, Cs)` is
+// blend-mode-independent, so only the `b = ...` line below differs.
+//
+// `blend_rgb(Difference, cb, cs)` is `blend_channel`'s `(cb - cs).abs()`
+// applied per channel, through `blend_rgb`'s own generic per-channel arm
+// (a separable mode, not one of the six whole-triple ones). WGSL's
+// `abs()` on a `vec3<f32>` is componentwise, so one intrinsic is exactly
+// those three independent per-channel absolute differences.
+//
+// **`abs()` on the difference, not `max(cb - s.rgb, 0.0)`.** Those two
+// agree wherever `Cb >= Cs` and disagree everywhere else, and the second
+// is `Subtract`, a different, still-CPU-only mode. The fixtures in this
+// crate's `composite_difference_*` tests separate the two deliberately:
+// each has at least one channel where `Cb < Cs`, so a `max(..., 0)` in
+// place of the `abs()` here fails them rather than passing by accident.
+//
+// **Symmetry, disclosed rather than assumed.** `|Cb - Cs| = |Cs - Cb|`,
+// so this mode's blend term is symmetric in backdrop and source and a
+// transposed src/backdrop binding is **not** caught by the blend term
+// alone -- exactly the property `fs_composite_screen` above discloses for
+// the same reason (`Screen` is likewise commutative). What does catch a
+// transpose is the surrounding "over", which is not symmetric, and the
+// per-texel spatial differential in
+// `composite_difference_over_with_opacity_matches_the_cpu_across_a_
+// spatially_varying_tile`.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2)
+// and `TileCompositor::bind_group_layout_blend` with the four entry
+// points above; no new binding, no new layout.
+@fragment
+fn fs_composite_difference(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let a = s.a * opacity.value;
+    let inv = 1.0 - a;
+    let ab = bd.a;
+    let ab_inv = 1.0 - ab;
+    var cb = vec3<f32>(0.0, 0.0, 0.0);
+    if (ab > 0.0) {
+        cb = bd.rgb / ab;
+    }
+    let b = abs(cb - s.rgb);                  // blend_rgb(Difference, cb, cs)
     let blended = ab_inv * s.rgb + ab * b;
     return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
 }

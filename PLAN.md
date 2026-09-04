@@ -18477,6 +18477,265 @@ severity choice.
   aurora-app` on its own (the flagless build, which is what would catch a
   `dead_code` warning on an unconstructed enum variant) also passes.
 
+- [x] **GPU blend-mode math, slice 6 of the epic: `BlendMode::Difference`
+  ported and wired — done 2026-09-04 (0.104.0).** The fifth real blend
+  mode on the GPU path, at exactly the cost 0.95.0 predicted and 0.102.0
+  confirmed: one WGSL entry point, one `BlendPass` const, one wrapper, one
+  dispatch arm, one counter, and **no change to
+  `composite_blend_over_with_opacity`'s signature or body**. It is also
+  the first mode added *after* 0.103.0's counter merge, and that merge paid
+  off as advertised — the dispatch proof cost one enum variant, one struct
+  field and one `counter` arm, with no copied `static`/`note_*`/`take_*`
+  block anywhere.
+
+  What landed:
+
+  - **`fs_composite_difference`** in
+    `crates/aurora-render/src/shaders/composite.wgsl`, structurally
+    identical to the four entry points above it in every line but one:
+    `let b = abs(cb - s.rgb);`. That mirrors `blend_channel`'s own
+    `(cb - cs).abs()` arm; WGSL's `abs()` on a `vec3<f32>` is
+    componentwise, so one intrinsic is exactly the three independent
+    per-channel absolute differences (a separable mode, not one of the six
+    whole-triple ones). No new binding, no new bind group layout — it
+    shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2)
+    and `TileCompositor::bind_group_layout_blend` with the four before it.
+  - **`TileCompositor::composite_difference_over_with_opacity`** in
+    `crates/aurora-render/src/composite.rs` — a one-line delegation to the
+    unchanged shared helper with a new `BLEND_PASS_DIFFERENCE` const and
+    four new `wgpu` debug labels (`composite.difference{,.opacity,
+    .bind_group,.pass}`).
+  - **Predicate admission and a dispatch arm** in `crates/aurora-app/src/lib.rs`:
+    `document_qualifies_for_gpu_compositing` gains
+    `| aurora_doc::BlendMode::Difference`, and `begin_gpu_composite_tile`
+    gains a `Difference` arm byte-for-byte the shape of `Screen`'s,
+    sharing the *same single* `spare` ping-pong accumulator.
+  - **`GpuBlendDispatch::Difference` + `GpuBlendDispatches::difference`**,
+    instrumented from this mode's first round rather than retrofitted.
+    Deliberately **not** `#[cfg(test)]`-gated, unlike `Dissolve`: real
+    shipping code (the new dispatch arm) constructs it, so the flagless
+    `cargo check -p aurora-app` is satisfied without an `allow`.
+  - **Nine new tests** — six in `aurora-render` (`composite_difference_*`,
+    mirroring the `Screen` suite one for one), two in `aurora-app` (the
+    headless admission test and the three-layer end-to-end differential),
+    and `GpuBlendDispatch::Difference` added to
+    `every_gpu_blend_dispatch_mode_gets_its_own_counter`'s hand-written
+    variant list, as that test's own doc comment requires.
+
+  **Mode accounting, stated exactly.**
+
+  **7 of 27** `aurora_doc::BlendMode` variants are now admitted by
+  `document_qualifies_for_gpu_compositing` (`Normal`, `Multiply`,
+  `Darken`, `Lighten`, `Screen`, `Difference`, `Dissolve`), up from 6;
+  **20 remain CPU-only** at the app's GPU predicate, down from 21.
+
+  **5 of 26** `aurora_render::BlendMode` variants now have a real WGSL
+  blend-math entry point (`Multiply`, `Darken`, `Lighten`, `Screen`,
+  `Difference`), up from 4; **21 remain without one**, down from 22. The
+  denominator is 26, not 27, because this crate's own enum excludes
+  `Dissolve` — a pre-composite visibility gate, never a per-pixel formula
+  it would need to port. And `Normal` is *not* counted among the five even
+  though it composites on the GPU: its "blend" is the fixed-function alpha
+  unit (`Blend::AlphaBlending`), not a blend-math entry point, which is
+  exactly why it needs no formula in `composite.wgsl`. So the two figures
+  differ by one mode (`Normal`) plus `Dissolve`'s absence, and they are
+  counting different things rather than disagreeing — the same reconciliation
+  0.84.1's addendum first spelled out.
+
+  **Verified (0.104.0), on this box's real discrete GPU**: every test
+  above ran under `AURORA_REQUIRE_GPU=1` against **NVIDIA GeForce RTX 3090
+  (Vulkan, DiscreteGpu)**, printed by `real_context_or_skip` on each
+  creation. Not one self-skipped.
+
+  **Fixtures were derived against `Difference`'s own three degeneracies**,
+  which are different from every prior mode's, and each is audited in the
+  suite's section header:
+
+  1. `Difference(Cb, Cb) = 0` — so no fixture has `Cb == Cs` in any
+     channel, with one deliberate, *disclosed* exception (below).
+  2. `Difference` agrees with `Subtract` (`max(Cb - Cs, 0)`) and with a
+     plain `abs()`-less `Cb - Cs` in every channel where `Cb >= Cs` — so
+     every fixture has at least one channel with `Cb < Cs`, and most
+     straddle the sign change.
+  3. `Difference(0, Cs) = Cs` (indistinguishable from `Normal`) and
+     `Difference(1, Cs) = 1 - Cs` — so every operand is strictly inside
+     `(0, 1)`.
+
+  **Mutation testing: seven mutations planned, seven killed.** Each was
+  applied for real, both crates' full `--lib` suites re-run under
+  `AURORA_REQUIRE_GPU=1`, then reverted and the file `touch`ed to defeat a
+  stale-mtime skip. Baseline: `aurora-render` 156 passed / 0 failed,
+  `aurora-app` 394 passed / 0 failed.
+
+  | # | mutation | kills | killing test(s) |
+  |---|---|---|---|
+  | a | delete the whole `Difference` arm from `begin_gpu_composite_tile` | **1** | `recomposite_visible_tiles_gpu_and_cpu_paths_agree_on_a_difference_blend_document`, *and only via its dispatch-count assertion* (`0 != 1`) |
+  | b | shader formula → `Screen`'s `cb + s.rgb - cb * s.rgb` | **7** | all six `composite_difference_*` + the app test's golden |
+  | c | `BLEND_PASS_DIFFERENCE.fragment_entry` → `"fs_composite_screen"` | **7** | the same seven |
+  | d | remove `Difference` from `document_qualifies_for_gpu_compositing` | **2** | `document_qualifies_for_gpu_compositing_admits_a_difference_blend_mode` + the integration test's setup assert |
+  | e | drop the `abs()` (`cb - s.rgb`) | **7** | all six + the app golden |
+  | f | `abs()` → `max(cb - s.rgb, vec3<f32>(0.0))` (Subtract) | **7** | all six + the app golden |
+  | g | `counter()`'s `Difference` arm → `&self.screen` | **1** | `every_gpu_blend_dispatch_mode_gets_its_own_counter`, and nothing else |
+
+  **Mutation (a) is the one worth reading twice, and it was measured, not
+  reasoned about.** With the arm deleted, `Difference` falls through the
+  defensive `_` arm to the CPU path, which computes *the same correct
+  pixels* — so a sub-experiment was run: the arm still deleted, only the
+  counter assertion neutralised. **The test passed.** Every pixel
+  assertion in it — the GPU-vs-CPU differential, the absolute golden, and
+  the `assert_ne!` vacuity guard — stayed green with the GPU arm gone.
+  The dispatch counter is the sole thing standing between "this mode
+  composites on the GPU" and a silent regression to CPU, exactly as
+  0.102.0's RT-2026-0904-02 measured for `Screen`. That is the whole
+  argument for instrumenting from a mode's first round, now confirmed a
+  second time on a second mode.
+
+  **Mutations (e) and (f) were checked for non-vacuity rather than assumed
+  to be real kills**, since a clamp anywhere could have masked them. Under
+  (e), render test 1's texel came back
+  `(-0.1875, 0.625, 0.1875, 1.0)` against its golden
+  `(0.4375, 0.625, 0.3125, 1.0)` — red genuinely **negative**, not
+  clamped to zero — matching the hand-derived "dropped `abs()`" value in
+  that test's own doc comment to the bit. The app test's GPU texel came
+  back `(-0.375, 0.25, -0.5, 1.0)` against golden `(0.375, 0.25, 0.5, 1.0)`,
+  again exactly the documented prediction, with green agreeing (`0.25`)
+  because that is the one channel where `Cb > Cs` in that fixture. (f)
+  kills the same set, which is what separates these fixtures from
+  "anything missing an `abs()`" — they discriminate `Difference` from
+  `Subtract` specifically.
+
+  **Every golden value was independently re-derived before it was written**,
+  and one claim in this round's own plan **did not survive that check and
+  was corrected rather than transcribed**: the plan asserted that the
+  `Screen` suite's half-opacity fixture had `Cb == Cs` in blue and would
+  therefore zero `Difference`'s blend term. It does not — that pair is
+  `(0.5, 0.75, 0.25)` / `(0.25, 0.5, 0.75)`, with **no** channel equal and
+  blue on the far side of the sign change. The real, weaker reason not to
+  inherit it is that its per-channel differences are `(0.25, 0.25, 0.5)`:
+  red and green share a magnitude, and since this mode's blend term *is*
+  that magnitude, a red/green swizzle inside the blend line would survive
+  it. The suite header and the half-opacity test's own doc comment now say
+  that, precisely, instead of the stronger false claim.
+
+  **A second, smaller plan correction, also verified empirically.** The
+  plan specified the unclamped-source-alpha test as "top
+  `[0.25, 0.75, 0.5, 1.0]` with `opacity = 2.0`". That would have proven
+  nothing: `composite_blend_over_with_opacity` clamps its `opacity`
+  argument to `0.0..=1.0` before it ever reaches the uniform, so `a` would
+  have come out `1.0` and the test would have asserted the *clamped*
+  answer. The test instead carries the source alpha at `2.0` in the tile
+  itself with `opacity = 1.0` — the only way the unclamped product is
+  reachable, and what the `Screen` sibling already does. The derived
+  goldens are unchanged by the fix.
+
+  **The negative-channel golden was confirmed on hardware, not assumed.**
+  `composite_difference_over_with_opacity_does_not_clamp_a_source_alpha_above_one`
+  asserts `(0.125, 0.75, -0.125, 1.0)` — a genuinely negative blue. The
+  plan flagged this as needing empirical confirmation, since a clamp in
+  `composite_layer_into`, in the shader, or in the readback would have
+  broken it. GPU and CPU **agree exactly**: `Rgba16Float` stores a
+  negative `f16`, neither path clamps its output, and `read_first_texel`
+  does not clamp on the way back. No discrepancy to report.
+
+  **Disclosed weaknesses, carried forward:**
+
+  - **`patterned_texels`' blue channel cannot discriminate this mode's
+    formula, and the spatial test says so in its own doc comment.** That
+    helper's blue is a pure function of the texel's quadrant with no
+    `seed` term at all, unlike red (`quarters(x + seed)`) and green
+    (`quarters(y + seed)`). So both layers' blue channels are *equal at
+    every texel*, `Cb == Cs` there, and `Difference`'s blend term is
+    identically `0` in blue across the whole tile — degeneracy 1 above,
+    hit deliberately in one channel. Blue still varies in the *output* via
+    the `inv * bd.rgb` term, so a wrong-texel bug is still caught there;
+    what blue cannot do is separate this formula from another. Red and
+    green are what exercise `abs()` spatially, and they do it in **both**
+    directions (`Cb < Cs` at `x % 4 ∈ {0,1,2}`, `Cb > Cs` at `x % 4 == 3`
+    where `quarters` wraps `0.75` back to `0.0`). Stated rather than
+    implying all three channels discriminate.
+  - **A transposed `src`/`backdrop` binding is not caught by this mode's
+    blend term.** `|Cb - Cs| = |Cs - Cb|`, so `Difference` is symmetric in
+    its two operands, exactly as `Screen` is. What catches a transpose is
+    the surrounding, *asymmetric* "over" and the per-texel spatial
+    differential — not the blend line. Disclosed in the WGSL comment, the
+    Rust doc comment, and the per-channel test's own enumeration rather
+    than claimed away.
+  - **The out-of-range-*opacity* test is omitted for this mode**, as it was
+    for `Darken` and `Screen`: since 0.85.1's merge that property lives in
+    one shared Rust line (`composite_blend_over_with_opacity`'s own
+    `opacity.clamp(0.0, 1.0)`) which every mode's wrapper reaches through,
+    and the `Multiply`/`Darken` suites already pin it on real hardware. A
+    disclosed reduction in coverage, not an equivalence claim. The
+    unclamped *source-alpha* test is emphatically **not** omitted — that
+    one asserts a line inside this separately-compiled entry point, and
+    0.95.0 dropping it for `Lighten` on the opacity-clamp argument was the
+    mistake 0.95.1 had to correct.
+  - **RT-2026-0904-01 is now reachable by a wider set of documents.** The
+    pre-existing GPU/CPU divergence on non-finite samples — an infinite
+    `f16` sample makes the GPU path clamp to `f16::MAX` where
+    `composite_tile_cpu` produces `NaN` — lives in the fixed-function
+    `Normal`/`Multiply` pass and **predates this round**. Nothing here
+    introduces it and nothing here worsens it; `abs()` in particular is not
+    implicated (`abs(NaN)` is `NaN`, and this round's own
+    half-transparent-backdrop test confirms no `NaN` escapes the untaken
+    `ab > 0.0` branch on this backend). But admitting `Difference` *widens
+    the set of documents that take the GPU path at all*, and so widens the
+    set that can meet it. **Real, disclosed, unfixed, and wider in scope
+    than before** — deciding which of the two answers is correct
+    (invariant §7.3.1b says nothing about infinities) and making both paths
+    agree remains its own round.
+  - **A counter can still tick for a tile whose GPU work is then
+    discarded**, unchanged from 0.103.0: if a later layer in the same tile
+    hits the defensive `_` arm, `begin_gpu_composite_tile` returns `None`
+    and the encoder is dropped unsubmitted, but any earlier mode's count
+    has already been incremented. Unreachable through the real caller,
+    which checks the predicate first. Named, not fixed.
+  - **22 modes still have no GPU path of any kind** at the app's predicate
+    (20 CPU-only plus the 2 the render-crate figure counts differently),
+    and **group support remains entirely CPU-only**. Nothing in this round
+    changes either. This is one mode of a long epic, not a milestone.
+  - **Vulkan/NVIDIA only**, as with every round of this epic. **Metal and
+    DX12 remain unverified** for `fs_composite_difference`, including its
+    separately-compiled `ab > 0.0` guard — whether a shader compiler
+    flattens that branch and evaluates the `0.0 / 0.0` on both sides is a
+    property of the *backend*, so proving it for `fs_composite_screen`
+    proves nothing here. Verification on those two backends is impossible
+    on this box; it needs the hardware.
+
+  **Both tracked benchmarks re-run 3× each, release, `AURORA_REQUIRE_GPU=1`
+  — and unlike the 0.102.0 round, their numbers ARE comparable across this
+  one.** `Screen`'s round had to retarget six fixtures that used `Screen`
+  *because* it disqualified GPU compositing, two of them these very
+  benchmarks, so no timing delta across 0.102.0 was a performance result.
+  Nothing of the kind was needed here: both benchmarks route through
+  `CPU_ONLY_BLEND_MODE`, which stays `Exclusion` and which this round
+  deliberately did not touch. All six runs reported **`gpu_tiles=0`**,
+  confirming on the instrument rather than by argument that neither
+  fixture reaches any of this round's call sites.
+
+  | benchmark | run 1 | run 2 | run 3 |
+  |---|---|---|---|
+  | `…exercises_the_cpu_fallback_path`, whole-frame mean | 9.60 ms | 8.99 ms | 9.03 ms |
+  | same, p50 | 9.15 ms | 8.77 ms | 9.03 ms |
+  | same, worst of 12 | 15.95 ms | 12.22 ms | 12.25 ms |
+  | `…measures_two_overlapping_roots`, main arm mean | 43.63 ms | 40.69 ms | 40.65 ms |
+  | same, control arm (backdrop hidden, single fold) | 24.86 ms | 24.97 ms | 24.95 ms |
+
+  These sit in the same ballpark as 0.103.0's own (9.64 / 8.96 / 9.17 and
+  40.79 / 40.29 / 40.66) and are quoted as a **no-change check**, not as a
+  new hardware record and not as progress against the 60 FPS gate, which
+  both still miss. `recomposite` remains ~72–77% of the CPU-fallback
+  frame mean. Read 0.94.1's note before treating the "worst of 12" column
+  as a p99: at n=12 it is a single-sample order statistic and must not be
+  quoted as a ratio.
+
+  **Disk-space check, per 0.102.1's named follow-on.** Checked before
+  starting: `/home` at 95% used, **21G free** (403G total), `target/` at
+  87G. Above the ~15G threshold this round set for itself, so nothing was
+  cleaned; 20G free after the mutation matrix and both release benchmark
+  sets. Performed by hand again rather than automated — still a candidate
+  follow-on, still not built.
+
 ### M1.10 — Phase 1 gate
 
 - [ ] Accessibility audit passes on all three platforms — against WCAG
@@ -23319,6 +23578,44 @@ here so they are not silently lost between phases.
 ---
 
 ## Next action
+
+**Addendum 2026-09-04 (0.104.0) — `BlendMode::Difference` is on the GPU
+path; the fifth WGSL blend-math entry point, and the first mode added
+after 0.103.0's counter merge.** **7 of 27** `aurora_doc::BlendMode`
+variants are now admitted by `document_qualifies_for_gpu_compositing`
+(`Normal`, `Multiply`, `Darken`, `Lighten`, `Screen`, `Difference`,
+`Dissolve`), up from 6; **20 remain CPU-only** at the app's GPU predicate,
+down from 21. **5 of 26** `aurora_render::BlendMode` variants now have a
+real WGSL blend-math entry point, up from 4; **21 remain without one**,
+down from 22 (that denominator excludes `Dissolve`, absent from the render
+crate's enum, and does not count `Normal`, whose "blend" is the
+fixed-function alpha unit rather than a blend-math entry point).
+
+Seven mutations planned, **seven killed** — see the 0.104.0 M1.10 entry
+for the table, the killing test names, and the sub-experiment showing that
+deleting the dispatch arm leaves *every pixel assertion* in the app
+integration test green, so the dispatch counter is again the sole
+detector. Two claims in this round's own plan were re-derived and
+**corrected rather than transcribed**: a false "`Cb == Cs` in blue" claim
+about the `Screen` half-opacity fixture, and a test specification that
+would have passed `opacity = 2.0` into an argument the shared helper
+clamps (proving nothing). Both corrections are recorded in that entry.
+
+**Both tracked CPU-fallback benchmarks are comparable across this round**,
+unlike 0.102.0's — nothing needed retargeting, because both route through
+`CPU_ONLY_BLEND_MODE`, which stays `Exclusion`. All six runs reported
+`gpu_tiles=0`. The figures are a no-change check, **not** a hardware
+record and **not** progress against the 60 FPS gate, which both still
+miss.
+
+**RT-2026-0904-01 is re-disclosed as wider in scope**: the pre-existing
+GPU/CPU divergence on non-finite samples is not introduced or worsened by
+this round (and `abs()` is specifically not implicated), but admitting
+`Difference` widens the set of documents that take the GPU path at all,
+and so widens the set that can meet it. Still real, still unfixed, still
+its own round. Metal/DX12 remain unverified for this entry point,
+including its separately-compiled `ab > 0.0` branch; that needs hardware
+this box does not have.
 
 **Addendum 2026-09-04 (0.103.1) — 0.103.0's review follow-ups: one real
 cfg-gating fix on the hot path, one test made non-vacuous, and four
