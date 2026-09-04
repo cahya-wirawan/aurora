@@ -20855,7 +20855,12 @@ severity choice.
     case; a conditional, second-choice GO for multi-root documents
     only.** Full reasoning in "Verdict" below, and see "Alternatives
     considered" — added at 0.97.1 — for the cheaper fix that should be
-    measured *before* any parallelization round starts.
+    measured *before* any parallelization round starts. **Superseded
+    0.101.0: that conditional GO is now CLOSED as a NO-GO. The "cheaper
+    fix" was taken (0.98.0's vectorization) and it dropped
+    `fold_onto_opaque` from 2.0758 / 2.0485 ms to 1.7051 / 1.7335 ms, i.e.
+    below this round's own 2.0 ms T1 bar — so the one condition under which
+    T1 passed no longer exists. See the 0.101.0 entry.**
 
   Round A (0.96.0–0.96.2 above) parallelized `TileResidency::sync`'s
   serialize loop, shipped a `panic = "abort"` crash path, shipped a ~2x
@@ -21486,9 +21491,13 @@ severity choice.
   1.817 / 1.765 ms — FAIL. After: 1.681 / 1.704 ms — **still FAIL, and
   now further below the bar**, which makes parallelizing the common
   single-root case *less* attractive than 0.97.1 already judged it, not
-  more. The conditional, multi-root-only GO 0.97.1 registered is
+  more. ~~The conditional, multi-root-only GO 0.97.1 registered is
   unchanged and still open; this composes with it rather than replacing
-  it. And the M1.10 tables above remain the standing 60 FPS numbers: this
+  it.~~ **Corrected 0.101.0: it was not unchanged. This round's own
+  `fold_onto_opaque` numbers (which 0.98.0 reported but did not read
+  against T1) put that column at 1.7051 / 1.7335 ms, below the 2.0 ms bar
+  the conditional GO rested on — so 0.98.0 in fact *closed* it, and
+  0.101.0 is where that was noticed and recorded.** And the M1.10 tables above remain the standing 60 FPS numbers: this
   is a constant-factor reduction on the CPU compositing *fallback* path,
   measured per call on one tile, never re-measured end-to-end on a frame.
 
@@ -21828,12 +21837,21 @@ severity choice.
     as run-to-run drift, not an effect. Neither test's text changed, and
     neither needs the return value.
 
-  **The `rayon` multi-root parallelization named as future work above is
-  NOT started by this round** — not begun, not prototyped, not partially
+  ~~**The `rayon` multi-root parallelization named as future work above is
+  NOT started by this round**~~ **— wording corrected 0.101.0: "the `rayon`
+  multi-root parallelization" names a target that does not exist and is not
+  sound. What 0.97.0 registered is a `rayon` parallelization of the *texel
+  loop inside one `composite_layer_into` call*, conditionally gated on the
+  document being multi-root; 0.97.0's own entry says in as many words that
+  parallelizing *across* roots is impossible, because blend modes do not
+  commute. Read this sentence as "the conditionally-gated texel-loop
+  parallelization named as future work above is NOT started by this round"
+  — which is still true.** Not begun, not prototyped, not partially
   landed. This round is diagnostic only, exactly as 0.99.0 was. What it
   does add is the fixture that work would need to prove itself against:
   a `later`-fold-dominated frame whose cost is now a known number on known
-  hardware.
+  hardware. **(0.101.0 measured it against that fixture and closed it
+  NO-GO — see the 0.101.0 entry below.)**
 
   **0.100.1 (2026-09-04) — correction round on the entry above. Four of its
   claims were overstated and one of its assertions was nearly vacuous;
@@ -22026,6 +22044,207 @@ severity choice.
   numbers and no shipping-code change, the way 0.99.0 and 0.100.0 landed as
   diagnostic rounds.
 
+  **0.101.0 (2026-09-04) — the answer to the bars above: NO-GO, on three
+  independent grounds, and the round additionally *closes* the conditional
+  multi-root-only GO 0.97.1 left open rather than leaving it open one more
+  round.** Diagnostic only: no shipping-code change, no new test, no new
+  dependency, no `rayon` anywhere. Two doc comments corrected in place and
+  this entry are the whole diff besides the version bump.
+
+  **P1 (soundness) — FAIL for both of the framings this round set out to
+  test, and this is a code-reading result, not a measurement.**
+
+  1. **Parallelizing the fold loop *across roots* is unsound, not merely
+     unprofitable.** `composite_roots_into_tile`
+     (`crates/aurora-app/src/lib.rs:6720`–`6744`) is a strictly sequential
+     accumulator chain: `let mut composited = transparent_tile();` at
+     `:6728`, then `for &id in layers.roots().iter().rev()` at `:6730`
+     calling `composite_layer_into(&mut composited, ..)` at `:6741`. Fold
+     *n+1* reads fold *n*'s output through that `&mut`. Any tree reduction
+     or fold-order change requires blend-mode composition to be
+     **associative**, which it is not — 0.97.0's own worked counterexample
+     above (two opaque layers, bottom `Normal` 0.5 grey, top `Multiply` 0.4:
+     0.2 in the real order, 0.5 swapped) is the general refutation, and it
+     applies to *reassociation* just as it does to *reordering*.
+     **This limb was never open.** 0.97.0's entry already says "Cross-layer
+     is impossible"; what was open was a *different* candidate (see P2b
+     below), and only 0.100.0's shorthand — corrected in place below — made
+     it read as though parallelizing across roots was the named future work.
+  2. **Parallelizing across the ~9 independent tiles a frame touches is
+     blocked at the type level, twice over.**
+     `aurora_tile::TileStore::get` (`crates/aurora-tile/src/store.rs:568`)
+     and `::get_mut` (`:581`) both take `&mut self`, so the API shape alone
+     forbids a shared read — but the stronger blocker is that **`TileStore`
+     is `!Sync`**, so a `&TileStore` cannot cross a thread boundary at all
+     and no interior-mutability retrofit of `get` would rescue it. Verified
+     by the compiler, not by inspection: a throwaway
+     `fn assert_sync<T: Sync>()` instantiated at `TileStore` fails with
+     `error[E0277]: std::sync::mpsc::Receiver<WriteResult> cannot be shared
+     between threads safely`, blaming
+     `BackgroundWriter`'s `results_rx` field
+     (`crates/aurora-tile/src/writer.rs:119`–`123`) reached through
+     `TileStore::writer` (`store.rs:260`). The probe was deleted before
+     commit; re-create it in ten seconds if this ever needs re-checking.
+     Making `TileStore` `Sync` means changing the concurrency contract of
+     the store — and `writer.rs:131`–`164` spells out at length why the
+     single-thread single-queue FIFO property there is half of a
+     *correctness* argument (stale-write ordering on disk), not tidiness.
+     P1 forbids paying that. **Not a new discovery, and said so: 0.96.0's
+     own correction of the "`rayon` per-tile parallelism" bullet already
+     recorded both facts** (the `&mut self` accessor and the
+     `BackgroundWriter`-holds-an-`mpsc::Receiver` `!Sync`) for
+     `aurora-gpu`'s `TileResidency::sync`. What 0.101.0 adds is that the
+     same two facts bind the *compositing* caller as well, and a compiler
+     check rather than a prose claim.
+
+  **The one framing that does pass P1 is the one 0.97.0 actually
+  registered**, and it is *not* the fold loop: parallelizing the texel
+  loop **inside** one `composite_layer_into` call
+  (`crates/aurora-render/src/composite.rs`) — disjoint per-texel writes, no
+  cross-texel carry, no associativity assumption, no `TileStore` access
+  inside the loop. It is measured against P2/P2b below.
+
+  **The measurements.** RTX 3090 / Vulkan / DiscreteGpu, i3-10100
+  (4 physical / 8 logical), Linux, idle, release profile,
+  `AURORA_REQUIRE_GPU=1 … --test-threads=1`, three consecutive runs of
+  0.100.0's two-root fixture:
+
+  | run | main arm total mean | main `recomposite` phase1 `cpu_fallback_real` | control total mean | control phase1 `cpu_fallback_real` |
+  |---|---|---|---|---|
+  | 1 | 41.11 ms | 39.34 ms | 25.15 ms | 23.47 ms |
+  | 2 | 41.04 ms | 39.28 ms | 25.12 ms | 23.46 ms |
+  | 3 | 40.78 ms | 39.01 ms | 25.13 ms | 23.47 ms |
+
+  Fold census `folds=216 first=108 later=108` on the main arm and
+  `folds=108 first=108 later=0` on the control, identical on all three runs
+  — i.e. 9 first folds + 9 later folds per frame, and 9 first folds per
+  frame respectively, over 12 frames. `mark_imbalance=0` throughout.
+
+  Per-call criterion medians on the **current, post-0.98.0** tree
+  (`cargo bench -p aurora-render --bench composite --
+  '^fold_onto_(transparent|opaque)/(Normal|Screen|Multiply)$'`), quoted as
+  criterion's `[lower median upper]`:
+
+  | mode | `fold_onto_transparent` | `fold_onto_opaque` |
+  |---|---|---|
+  | `Normal` | [1.6742 **1.6826** 1.6928] ms | [1.6962 **1.7051** 1.7160] ms |
+  | `Multiply` | [1.6814 **1.6911** 1.7029] ms | [1.7152 **1.7335** 1.7541] ms |
+  | `Screen` | [1.6848 **1.6977** 1.7120] ms | [1.7063 **1.7172** 1.7299] ms |
+
+  Criterion's own `change` column against its stored pre-0.98.0 baseline
+  reads −16.9 % (`opaque/Normal`), −16.4 % (`opaque/Multiply`) and −17.4 %
+  (`opaque/Screen`), independently reproducing 0.98.0's claimed win on the
+  arm that matters here.
+
+  **P2b — FAIL, in every cell, and this is the round's real finding.** The
+  bar is ≥ 2.0 ms per synchronous dispatch unit. At 0.97.1 the
+  `fold_onto_opaque` column read `Normal` **2.0758** / `Multiply`
+  **2.0485** ms — a thin *pass*, and the sole basis for the conditional
+  multi-root-only GO. It now reads **1.7051 / 1.7335 ms**: a **15 % / 15 %
+  FAIL**, with both confidence intervals entirely below the bar.
+  `fold_onto_transparent` fails by 16 % (1.6826 / 1.6911), as it already
+  did. **0.98.0's sequential vectorization did not merely fail to help the
+  parallelization case — it removed the only condition under which that
+  case cleared its own pre-registered bar.** Every one of the six cells
+  measured is now below 2.0 ms, so there is no document shape left in which
+  T1/P2b passes.
+
+  **P2 — PASS for the texel-loop candidate, and reported rather than
+  suppressed because a partial pass is more useful to a future reader than
+  a bare NO-GO.** Modelling the fixture's blend math as
+  `9 × fold_onto_transparent/Normal` (the backdrop root, default `Normal`,
+  folding first onto the transparent seed) `+ 9 × fold_onto_opaque/Screen`
+  (the `Screen`-blend canvas root folding second) gives
+  `9 × (1.6826 + 1.7172) =` **30.60 ms/frame**, comfortably over the 8.0 ms
+  bar. P2 is not what decides this round.
+
+  **Cross-check of that model against the frame fixture** (the same
+  technique 0.97.1 used, and reported the same way — as corroboration with
+  a named residual, not as agreement):
+
+  | arm | modelled blend math | measured phase-1 `cpu_fallback_real` | share | residual |
+  |---|---|---|---|---|
+  | main (two roots) | 30.60 ms/frame | 39.21 ms/frame (mean of 3) | 78.0 % | 8.61 ms/frame ≈ 0.96 ms/tile |
+  | control (one root) | 15.28 ms/frame (`9 × fold_onto_transparent/Screen`) | 23.47 ms/frame | 65.1 % | 8.19 ms/frame ≈ 0.91 ms/tile |
+
+  The residual is **not** an error term to be explained away: it is
+  `resolve_tile`'s own per-tile work (store fetch, decode, the mask and
+  origin arms), `transparent_tile`'s allocate-and-zero, the nine
+  `un_premultiply_in_place` straightening passes, and `write_composited`'s
+  compare. What makes the model credible is that the residual comes out
+  **nearly the same on both arms** (8.61 vs 8.19 ms/frame) although the
+  modelled blend math differs by 2×, which is exactly what a correct
+  per-tile-overhead term should do — both arms visit the same nine tiles
+  per frame. The differential is tighter still: measured
+  `39.21 − 23.47 = 15.74 ms`, modelled
+  `9 × (1.6826 + 1.7172 − 1.6977) = 15.32 ms`, agreeing to **2.7 %**. Do
+  not read that as exact: the bench folds one random-content tile in a
+  tight warm-cache loop, while the fixture walks nine distinct painted
+  tiles per frame with paging, and `fold_texel` picks its arm **per texel**
+  on `backdrop_alpha > 0.0`, which the fixture verifies whole-tile for one
+  probe tile only.
+
+  **P3 — not run.** It is gated on P1 + P2 + P2b all passing, and two of
+  the three failed. No contended figure was gathered and none is quoted.
+
+  **Verdict: NO-GO**, and specifically:
+  - Parallelizing the fold loop across roots: **NO-GO on P1**, permanently
+    — this cannot be reopened by a faster machine or a bigger document.
+  - Parallelizing across tiles: **NO-GO on P1** while `TileStore` stays
+    `!Sync`; reopening it means reopening `writer.rs`'s FIFO correctness
+    argument first.
+  - Parallelizing the texel loop inside one fold (0.97.x's real candidate):
+    **NO-GO on P2b**, and the conditional multi-root-only GO 0.97.1
+    registered is hereby **closed, not carried forward**.
+
+  **Disclosed weakness in that last limb, stated plainly.** P2b failing is
+  not a measurement that no idle win exists. The 2.0 ms bar is a
+  *contention-survival proxy* — 0.97.0 set it at ~8× Round A's
+  measured-insufficient 0.25 ms/tile dispatch unit — so what the number
+  says is "this unit is too small to be worth the pool-init and contention
+  risk 0.96.1 already paid for once", not "splitting it would not go
+  faster on an idle box". A 1.70 ms unit split over four physical cores
+  plausibly *would* win idle. The bar was fixed in advance precisely so
+  that argument could not be made after the fact, and it is being honoured.
+  If a future round wants to reopen this, the honest way is to argue the
+  bar down **before** measuring, with a reason, not to quote an idle
+  speedup against it.
+
+  **Follow-on, named and not built: the loop-inverted block×root fold.**
+  The one restructuring that is both sound and potentially larger than
+  anything above is inverting the two loops — walk *texel blocks* on the
+  outside and *roots* on the inside, so each block folds its whole root
+  stack in the correct sequential order within one worker, and blocks are
+  independent of one another. That preserves fold order exactly (no
+  associativity assumption) and touches no `TileStore` inside the parallel
+  region. It is deliberately **not** in scope here: it is a real
+  architectural change with memory-shape implications against invariant
+  §7.3.1's 300,000² ceiling (a per-block staging shape for every root's
+  resolved texels, rather than one whole-tile buffer per root), and it
+  needs `resolve_tile`'s output to be block-addressable, which it is not
+  today. **Its own bar, pre-registered here:** it must clear the same
+  P2b ≥ 2.0 ms per synchronous dispatch unit measured on the *aggregated*
+  unit it would actually dispatch (all roots of one block, i.e. roughly the
+  sum of a tile's folds — 3.40 ms on this fixture, which *would* clear the
+  bar), and it must clear P3 contended before any of it reaches the frame
+  path. Nobody should start it before the 60 FPS gate has a better reason
+  to need it than this.
+
+  **Gate at this commit**, all green: `cargo fmt --all --check`,
+  `python3 scripts/check_layering.py`, `python3
+  scripts/check_no_hardcoded_style.py`, `cargo check --workspace --locked`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  `cargo test --workspace`, `cargo test --workspace --doc`, `cargo deny
+  check all`. Test count unchanged at **1,662** (this round adds none and
+  changes none). The two older whole-frame fixtures were re-run on the real
+  adapter alongside the two-root one and are unaffected, as they must be on
+  a no-shipping-code-change round: CPU fallback **8.96 ms** mean over 12
+  frames, GPU path **9.58 ms** over 40 — both inside the run-to-run bands
+  0.99.0 and 0.100.1 already recorded (8.90–9.56 and 8.19–8.94/8.56), with
+  the GPU-path figure at the high end of its own, which is drift on an n=40
+  single-order-statistic benchmark and not an effect of a round that
+  changed no shipping code.
+
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
@@ -22178,6 +22397,40 @@ here so they are not silently lost between phases.
 
 ## Next action
 
+**Addendum 2026-09-04 (0.101.0) — the `rayon`-in-`composite_layer_into`
+question is CLOSED, NO-GO, and the conditional multi-root-only GO 0.97.1
+registered is closed with it. Nothing about `rayon` and CPU compositing is
+open any more.** Three independent grounds, against bars pre-registered in
+their own commit (`62790b1`) before any number for this round existed:
+
+- **P1, soundness.** Parallelizing `composite_roots_into_tile`'s fold loop
+  *across roots* is unsound — it is a sequential accumulator chain
+  (`crates/aurora-app/src/lib.rs:6728`–`6744`) and reassociating it assumes
+  blend-mode associativity, which 0.97.0's own counterexample refutes.
+  Parallelizing *across tiles* is blocked because `aurora_tile::TileStore`
+  is `!Sync` (compiler-checked: `BackgroundWriter`'s
+  `std::sync::mpsc::Receiver`) and its accessors take `&mut self`.
+- **P2b, dispatch unit.** The one framing that *is* sound — the texel loop
+  inside one `composite_layer_into` call, which is what 0.97.0 actually
+  registered — now measures **1.6826–1.7335 ms** per whole-tile call across
+  all six `{transparent, opaque} × {Normal, Multiply, Screen}` cells,
+  against a 2.0 ms bar. **FAIL by 13–16 %, everywhere.** 0.98.0's
+  sequential vectorization is what did this: it dropped `fold_onto_opaque`
+  by ~16–17 % and thereby removed the only condition under which T1 had
+  ever passed.
+- **P3, contention.** Not run, correctly: it is gated on P1 + P2b passing.
+
+P2 (magnitude) did pass for the sound framing — the blend math models at
+~30.6 ms of the two-root fixture's ~39.2 ms phase-1 CPU compositing — so
+this is a *dispatch-granularity* NO-GO, not a "the blend loop is not where
+the time goes" NO-GO. **Disclosed:** the 2.0 ms bar is a
+contention-survival proxy (~8× Round A's insufficient 0.25 ms unit), so
+failing it does not prove no idle win exists; reopening it honestly means
+arguing the bar down *before* measuring. The one sound restructuring left
+— inverting the loops so texel *blocks* are outside and roots inside — is
+named, given its own bar, and deliberately not built; see the 0.101.0 M1.10
+entry.
+
 **Addendum 2026-09-04 (0.98.2) — 0.97.1's directive is DISCHARGED, and
 0.98.0's three "real, not noise" regressions are corrected: two downgrade
 to a disclosed possible cost, one (LinearLight) upgrades to a plausibly
@@ -22194,11 +22447,19 @@ takes — was `Normal` 1.7983 / `Multiply` 1.7876 ms at 0.97.1; it is now
 **`Normal` 1.681 / `Multiply` 1.704 ms**, so the work parallelization
 would have to amortize is ~6 % *smaller* than when 0.97.1 called it
 NO-GO. **That hardens the single-root NO-GO rather than reopening it** —
-parallelizing the common case is now less attractive, not more. (3) **The
+parallelizing the common case is now less attractive, not more. (3) ~~**The
 conditional, multi-root-only GO is unchanged and still open**, and
 composes with this round rather than being replaced by it: any future
 round must still gate a parallel path on a document genuinely folding
-multiple roots, never parallelize every call. (4) **The 60 FPS gate is
+multiple roots, never parallelize every call.~~ **Corrected 0.101.0 — this
+is the one item on this list that is wrong. 0.98.0 measured
+`fold_onto_opaque` as well, and reported it as a win (−16 % to −17 %),
+without noticing that the win pushes that column *below* T1's 2.0 ms bar
+— the bar the conditional GO existed to clear. So 0.98.0 in fact CLOSED
+the conditional GO rather than composing with it; 0.101.0's independent
+re-measurement (`Normal` 1.7051 ms, `Multiply` 1.7335 ms, both confidence
+intervals wholly under 2.0) is where that was caught and recorded.**
+(4) **The 60 FPS gate is
 untouched by this round, explicitly.** This was a per-call, CPU-only
 constant-factor reduction on the compositing *fallback* path, measured on
 one tile per call. **Correction (0.99.0): it HAS now been re-measured
@@ -22229,8 +22490,10 @@ mislabelled "criterion medians" when it quotes criterion's
 separate estimate and deliberately does not ratio-match; mutation A's
 "116 pass" was stale (**143 pass**, of 144); and four doc-comment claims
 in `composite.rs` were overstated. **Next actual decision is unchanged
-and still Cahya's**: the multi-root-only parallelization GO is open but
-low-value, and nothing here advances the 60 FPS gate.
+and still Cahya's**: ~~the multi-root-only parallelization GO is open but
+low-value~~ **— closed NO-GO at 0.101.0, on the `fold_onto_opaque` numbers
+0.98.0 itself produced; see that entry** — and nothing here advances the
+60 FPS gate.
 
 **Addendum 2026-09-04 (0.97.1) — 0.97.0's GO verdict is WITHDRAWN: T1 was
 read from a condition the round's own corroborating fixture never
@@ -22260,10 +22523,18 @@ so that limb stands and the blend loop really is where this fixture's
 **Corrected verdict: NO-GO for the common single-root case** (a
 parallelized `composite_layer_into` there would hit the exact
 "work too cheap to amortize synchronous dispatch" failure Round A had to
-revert off the frame path), **and a conditional, second-choice GO for
+revert off the frame path), ~~**and a conditional, second-choice GO for
 multi-root documents only** — which means any future round must gate the
 parallel path on a document genuinely having multiple roots being folded,
-never parallelize every call.
+never parallelize every call.~~ **Closed 0.101.0 as a NO-GO: 0.98.0's
+vectorization — the "cheaper fix" the next paragraph recommends taking
+first — dropped `fold_onto_opaque` to `Normal` 1.7051 / `Multiply`
+1.7335 ms, under this round's own 2.0 ms T1 bar, so no document shape
+clears T1 any more. Note also, since the phrase "multi-root" has since
+been misread that way: this conditional GO was always about the texel loop
+*inside* one fold, gated on a multi-root document — never about
+parallelizing across roots, which the "Cross-layer is impossible"
+paragraph above already rules out.**
 
 **And parallelization should not be tried first.** 0.97.0's most durable
 finding is that the per-texel cost is dominated by twelve `f16` ↔ `f32`

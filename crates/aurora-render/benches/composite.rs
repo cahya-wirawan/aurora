@@ -27,9 +27,24 @@
 //! `Screen` root) has — therefore never reaches `fold_onto_opaque` at
 //! all. Read against `fold_onto_transparent`, the condition that fixture
 //! actually exercises, `Normal` (~1.80 ms) and `Multiply` (~1.79 ms)
-//! both **fail** the 2.0 ms bar by ~10%. T1 passes only for
-//! second-root-onward folds, i.e. only on multi-root documents. Do not
+//! both **fail** the 2.0 ms bar by ~10%. ~~T1 passes only for
+//! second-root-onward folds, i.e. only on multi-root documents.~~ Do not
 //! quote a T1 pass without naming which condition it came from.
+//!
+//! **Closed (0.101.0): T1 now fails in *both* conditions, so there is no
+//! document shape left in which it passes and the `rayon` question this
+//! file exists to answer is settled NO-GO.** 0.98.0's batched `f16` ↔
+//! `f32` conversions cut `fold_onto_opaque` by ~16–17%, which took the
+//! very column the conditional pass depended on below the bar. Re-measured
+//! on this box at 0.101.0: `fold_onto_transparent` `Normal` **1.6826 ms**
+//! / `Multiply` **1.6911 ms**; `fold_onto_opaque` `Normal` **1.7051 ms** /
+//! `Multiply` **1.7335 ms** — four cells, all under 2.0 ms, all with
+//! confidence intervals wholly under it. This file stays because the
+//! numbers are the standing per-call record of what CPU compositing costs,
+//! not because the decision is still open. PLAN.md's 0.101.0 M1.10 entry
+//! has the verdict, the two separate soundness blockers on the *other*
+//! two framings (fold-across-roots, fold-across-tiles), and the one sound
+//! restructuring left unbuilt.
 //!
 //! **Read the decision off `Normal` and `Multiply` only.** Those two
 //! dominate real documents — the app's own default startup document uses

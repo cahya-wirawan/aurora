@@ -919,8 +919,14 @@ fn fold_texel(
 /// **This is not progress against the 60 FPS gate.** It shrinks a
 /// constant factor on the CPU compositing *fallback* path; it does not
 /// change the measured pan-while-painting numbers in CLAUDE.md, and it
-/// composes with — rather than replaces — the still-open conditional-
-/// parallelization question 0.97.1 left registered. Read the real
+/// ~~composes with — rather than replaces — the still-open conditional-
+/// parallelization question 0.97.1 left registered~~ **— corrected
+/// 0.101.0: it did not compose with that question, it *closed* it.
+/// 0.97.1's conditional GO rested on the `fold_onto_opaque` column
+/// clearing a pre-registered 2.0 ms-per-call bar; this batching dropped
+/// that column ~16–17 %, to 1.71–1.73 ms, so no document shape clears the
+/// bar any longer and the `rayon` question for this function is closed
+/// NO-GO. See PLAN.md's 0.101.0 entry.** Read the real
 /// before/after numbers off PLAN.md's own 0.98.0 entry, not off this
 /// comment.
 ///
