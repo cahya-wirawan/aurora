@@ -18217,6 +18217,17 @@ severity choice.
     finding, and it is why "instrument from the mode's first round" is
     now the established precedent. Still not built here: it means
     modifying two arms this round did not otherwise change.
+  - **Ops note, disclosed rather than silently worked around**: this
+    round's own gate run hit `No space left on device` mid-`cargo test`
+    with `/home` at 100% (`target/` alone at 107G); it was unblocked by
+    deleting `target/debug/incremental` (28G, regenerates automatically),
+    leaving `/home` at ~94% used, ~26G free — still not much headroom.
+    Nothing outside `target/` was touched. Named because an `ENOSPC`
+    mid-gate reads like a code failure and a re-run after cleanup should
+    say so, since the gate's provenance is part of this round's own
+    evidence. Real, disclosed, unfixed: a pre-gate free-space check or a
+    routine `target/debug/incremental` hygiene step is a candidate cheap
+    follow-on, not attempted here.
 
 ### M1.10 — Phase 1 gate
 
