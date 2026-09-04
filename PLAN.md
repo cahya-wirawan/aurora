@@ -21985,6 +21985,47 @@ severity choice.
   ~4.7 ms effect, which is why medians-with-dispersion is the honest way to
   quote this fixture and range-separability at n=6 was not.
 
+  **0.101.0 — pre-registered bars for the fold-loop `rayon` go/no-go.
+  Written BEFORE any measurement for this round was taken: the commit that
+  adds this paragraph contains no measurement, no table and no verdict, so
+  `git log` shows the bar predating the result rather than a threshold
+  reverse-fitted to a number already in hand.** The question is narrow, and
+  narrower than 0.97.1's own "conditional, multi-root-only GO" wording
+  suggests: now that 0.100.0's two-root fixture exists, is parallelizing
+  `aurora_app::composite_roots_into_tile`'s **fold loop** with `rayon` — as
+  distinct from vectorizing its arithmetic, which 0.98.0 already did,
+  sequentially — worth doing? Four gates, all fixed now:
+
+  - **P1 — soundness, binary.** Whatever target is proposed must be sound
+    *without* assuming blend-mode composition is associative (0.97.0's own
+    worked counterexample above) and *without* changing
+    `aurora_tile::TileStore`'s concurrency contract. Failing P1 is a NO-GO
+    on its own, regardless of P2/P2b/P3, and no measurement can buy it back.
+  - **P2 — magnitude. ≥ 8.0 ms/frame mean** of measured cost attributable to
+    whatever sound target survives P1, on 0.100.0's two-root fixture.
+    Reasoning: that fixture's whole frame is ~40.5 ms, so 8.0 ms is ~20% of
+    it, and ~1.7× the ~4.7 ms median win 0.98.0's *sequential* vectorization
+    already banked on this same fixture. Parallelizing something smaller
+    than an already-shipped sequential win, at the cost of thread-pool and
+    pool-init failure risk (0.96.1's `panic = "abort"` incident is the
+    precedent), is not worth it.
+  - **P2b — per-call dispatch unit. ≥ 2.0 ms per synchronous dispatch
+    unit**, inherited verbatim from 0.97.0's T1 as corrected by 0.97.1, but
+    read off `crates/aurora-render/benches/composite.rs` on the **current,
+    post-0.98.0** tree rather than 0.97.x's pre-vectorization numbers — in
+    both the `fold_onto_transparent` and `fold_onto_opaque` conditions, for
+    `Normal` and `Multiply` (0.97.1's rule: the decision is read off those
+    two, not off an exotic mode no real document uses).
+  - **P3 — contention, applies only if P1 + P2 + P2b all pass and code
+    actually gets written.** The contended whole-frame mean must not regress
+    *at all* against the sequential baseline, measured with 8 competing
+    CPU-bound background processes (`yes > /dev/null`), the methodology
+    0.96.1/0.96.2 established and CLAUDE.md requires beside any idle figure.
+
+  If the bars are not cleared, the round lands as a NO-GO carrying its
+  numbers and no shipping-code change, the way 0.99.0 and 0.100.0 landed as
+  diagnostic rounds.
+
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02
