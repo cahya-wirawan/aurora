@@ -70,8 +70,9 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // next free slot after src_tex (0), src_smp (1) and the opacity uniform
 // (2) declared above; only the real blend-math entry points below --
 // fs_composite_multiply, fs_composite_darken, fs_composite_lighten,
-// fs_composite_screen, fs_composite_difference and
-// fs_composite_linear_dodge -- use it, through the
+// fs_composite_screen, fs_composite_difference,
+// fs_composite_linear_dodge and fs_composite_linear_burn -- use it,
+// through the
 // one bind group layout they share
 // (`TileCompositor::bind_group_layout_blend`), so neither
 // fixed-function entry point's own layout gains an entry.
@@ -80,7 +81,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // -- the `backdrop` of every `TileCompositor::composite_*_over_with_
 // opacity` blend-math method (as of 0.105.0
 // `composite_multiply_over_with_opacity` and its
-// `darken`/`lighten`/`screen`/`difference`/`linear_dodge` siblings, named
+// `darken`/`lighten`/`screen`/`difference`/`linear_dodge`/`linear_burn`
+// siblings, named
 // as a family rather than relisted, since one more joins them every time
 // a mode is ported) --
 // deliberately *not* `dst_tex`: `dst` on the Rust side is the render
@@ -91,7 +93,8 @@ fn fs_composite_opacity(in: VsOut) -> @location(0) vec4<f32> {
 // still the only ported mode and the 25 then-unported ones had yet to be
 // written against this file. That "25" is the 0.83.1 count and is not
 // maintained here; `Darken` (0.85.0), `Lighten` (0.95.0), `Screen`
-// (0.102.0), `Difference` (0.104.0) and `LinearDodge` (0.105.0) have
+// (0.102.0), `Difference` (0.104.0), `LinearDodge` (0.105.0) and
+// `LinearBurn` (0.106.0) have
 // since landed, and the live numbers live in `TileCompositor`'s own doc
 // comment.
 @group(0) @binding(3) var backdrop_tex: texture_2d<f32>;
@@ -360,11 +363,14 @@ fn fs_composite_difference(in: VsOut) -> @location(0) vec4<f32> {
 // **Three things this is not, all near enough to be real copy-paste
 // risks:**
 //
-//   - **`max(cb + s.rgb - 1.0, 0.0)` is `LinearBurn`**, a different,
-//     still-CPU-only mode -- the exact mirror image of this one, same
+//   - **`max(cb + s.rgb - 1.0, 0.0)` is `LinearBurn`**, a different
+//     mode -- the exact mirror image of this one, same
 //     sum, opposite offset and opposite clamp direction. Written out
 //     side by side the two differ by three characters, which is why it
-//     is named here rather than left to be noticed.
+//     is named here rather than left to be noticed. As of 0.106.0 it is
+//     `fs_composite_linear_burn` directly below, so the copy-paste
+//     hazard now runs in both directions between two entry points that
+//     both exist rather than one existing and one not.
 //   - **`cb + s.rgb - cb * s.rgb` is `Screen`** (fs_composite_screen
 //     above), this mode's nearest arithmetic neighbour: the same sum
 //     with a correction term instead of a clamp. The two agree only
@@ -412,6 +418,115 @@ fn fs_composite_linear_dodge(in: VsOut) -> @location(0) vec4<f32> {
         cb = bd.rgb / ab;
     }
     let b = min(cb + s.rgb, vec3<f32>(1.0)); // blend_rgb(LinearDodge, cb, cs)
+    let blended = ab_inv * s.rgb + ab * b;
+    return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
+}
+
+// Mirrors `aurora_render::composite_layer_into` (src/composite.rs)
+// exactly, for `BlendMode::LinearBurn` only -- the seventh blend mode
+// ported to the GPU, and structurally identical to the six entry points
+// above in every line but one.
+//
+// Read `fs_composite_multiply`'s own comment for the full derivation of
+// the surrounding "over": the alpha compositing around `B(Cb, Cs)` is
+// blend-mode-independent, so only the `b = ...` line below differs.
+//
+// `blend_rgb(LinearBurn, cb, cs)` is `blend_channel`'s
+// `(cb + cs - 1.0).max(0.0)` applied per channel, through `blend_rgb`'s
+// own generic per-channel arm (a separable mode, not one of the six
+// whole-triple ones). WGSL's `max()` on two `vec3<f32>`s is
+// componentwise, so `max(cb + s.rgb - 1.0, vec3<f32>(0.0))` is exactly
+// those three independent per-channel offset-and-clamped sums. The
+// `vec3<f32>(0.0)` splat rather than a bare `0.0` is not cosmetic: WGSL's
+// `max` requires both operands to have the same type, so the scalar form
+// does not type-check here. The `- 1.0` scalar *does* type-check, because
+// WGSL's `-` broadcasts an abstract-float scalar against a `vec3<f32>`;
+// the asymmetry between the two lines is real and deliberate.
+//
+// **The clamp is part of the mode, not a defensive guard.** `Cb + Cs - 1`
+// is unbounded below (it reaches `-1` at `Cb == Cs == 0`), and
+// `LinearBurn` is *defined* as the clamped difference -- Photoshop's
+// "Linear Burn". Dropping the `max` would not merely widen a range; it
+// would compute a different function everywhere the sum falls under
+// `1.0`, which is most of this mode's interesting domain, and would emit
+// negative colour channels. This is the second ported entry point whose
+// formula has an operation existing purely to bound the result (the first
+// is `fs_composite_linear_dodge` above, which bounds the other end).
+//
+// **Three things this is not, all near enough to be real copy-paste
+// risks:**
+//
+//   - **`min(cb + s.rgb, 1.0)` is `LinearDodge`** (fs_composite_linear_
+//     dodge directly above), this mode's exact mirror image: same sum,
+//     opposite offset and opposite clamp direction. Written out side by
+//     side the two differ by three characters. It is **also on the GPU**
+//     as of 0.105.0, so the hazard is now a live one in both directions
+//     rather than a mode that does not yet exist here -- which is exactly
+//     why this function's blend line was derived from `blend_channel`'s
+//     Rust arm rather than copied from that one and edited.
+//   - **`cb * s.rgb` is `Multiply`** (fs_composite_multiply above), this
+//     mode's nearest arithmetic neighbour in *behaviour* rather than in
+//     spelling: both darken, both give `0` for a zero backdrop, and the
+//     two agree wherever `Cb + Cs - 1 == Cb * Cs`, i.e. where
+//     `(1 - Cb) * (1 - Cs) == 0`.
+//   - **`ColorBurn` is the other "burn"** (`1 - (1 - cb) / cs`), still
+//     CPU-only. Sharing half a name is the whole risk there; nothing
+//     about the arithmetic is close.
+//
+// **Six degeneracies, disclosed because they constrain every fixture in
+// this crate's `composite_linear_burn_*` tests:**
+//
+//   1. `LinearBurn(0, Cs) = 0` for every `Cs <= 1` -- a zero backdrop
+//      channel erases the source entirely.
+//   2. `LinearBurn(1, Cs) = Cs` -- identical to `Normal`, and to
+//      `Darken` and `Lighten` and `Screen`, wherever the backdrop channel
+//      is saturated.
+//   3. A channel whose sum falls under `1.0` is **clamped**, so its
+//      output carries no information about how far below the boundary the
+//      operands were: `(0.25, 0.5)` and `(0.1, 0.1)` both give `0.0`.
+//      A clamped channel discriminates the clamp, not the operands.
+//   4. `Cb == Cs` in a channel lets a transposed operand pair hide behind
+//      an accidental equality, so the solid-colour fixtures avoid it.
+//   5. **Specific to this mode, and the reason several otherwise-natural
+//      fixtures were rejected:** in an *unclamped* channel,
+//      `Cb + Cs - 1 == |Cb - Cs|` exactly when `Cb == 0.5` (if
+//      `Cs > Cb`) or `Cs == 0.5` (if `Cb > Cs`) -- the algebra is
+//      `Cb + Cs - 1 = Cs - Cb  <=>  Cb = 0.5`. So an unclamped channel
+//      with either operand at exactly `0.5` cannot discriminate this mode
+//      from `Difference`, which is also on the GPU. No unclamped channel
+//      in any solid-colour fixture here has an operand at `0.5`.
+//   6. With both operands strictly inside `(0, 1)` -- which degeneracies
+//      1 and 2 force -- the sum is strictly above `0.0`, so a deficit of
+//      `1.0` is unreachable in principle; `0.625` is close to the
+//      practical maximum at exact-binary-fraction magnitudes.
+//
+// **Symmetry, disclosed rather than assumed.** `Cb + Cs = Cs + Cb`, so
+// this mode's blend term is symmetric in backdrop and source and a
+// transposed src/backdrop binding is **not** caught by the blend term
+// alone -- exactly the property `fs_composite_screen`,
+// `fs_composite_difference` and `fs_composite_linear_dodge` above
+// disclose for the same reason. What catches a transpose is the
+// surrounding "over", which is not symmetric, and the per-texel spatial
+// differential in
+// `composite_linear_burn_over_with_opacity_matches_the_cpu_across_a_
+// spatially_varying_tile`.
+//
+// Shares `backdrop_tex` (binding 3), the `Opacity` uniform (binding 2)
+// and `TileCompositor::bind_group_layout_blend` with the six entry
+// points above; no new binding, no new layout.
+@fragment
+fn fs_composite_linear_burn(in: VsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_smp, in.uv);
+    let bd = textureSample(backdrop_tex, src_smp, in.uv);
+    let a = s.a * opacity.value;
+    let inv = 1.0 - a;
+    let ab = bd.a;
+    let ab_inv = 1.0 - ab;
+    var cb = vec3<f32>(0.0, 0.0, 0.0);
+    if (ab > 0.0) {
+        cb = bd.rgb / ab;
+    }
+    let b = max(cb + s.rgb - 1.0, vec3<f32>(0.0)); // blend_rgb(LinearBurn, cb, cs)
     let blended = ab_inv * s.rgb + ab * b;
     return vec4<f32>(inv * bd.rgb + a * blended, a + bd.a * inv);
 }
