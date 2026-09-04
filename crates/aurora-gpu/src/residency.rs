@@ -9,6 +9,7 @@ use aurora_core::MAX_DOCUMENT_EXTENT;
 use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 use half::slice::HalfFloatSliceExt;
+use rayon::prelude::*;
 
 use crate::error::GpuError;
 
@@ -145,6 +146,202 @@ fn premultiply_rgba(texels: &mut [f16]) {
 /// the scalar remainder.
 const CHUNK_TEXELS: usize = 64;
 const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
+
+/// `CHUNK_SAMPLES` chunks one rayon task converts. 16 chunks = 4096
+/// samples = 1024 texels = 8 KiB of output bytes, so a full 256×256 tile
+/// ([`SAMPLES`] = 262,144) splits into exactly **64** independent tasks —
+/// coarse enough that rayon's per-task bookkeeping is not the cost, fine
+/// enough to fill a desktop core count several times over. This is the
+/// one tuning knob for the parallel serializer; `SAMPLES % BLOCK_SAMPLES
+/// == 0` and `BLOCK_SAMPLES % CHUNK_SAMPLES == 0` are pinned by
+/// `the_block_and_chunk_constants_divide_a_whole_tile_evenly` rather than
+/// left implied.
+const BLOCK_CHUNKS: usize = 16;
+const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
+
+/// The sequential core of the premultiply/serialize path: converts every
+/// whole texel of `texels` into the little-endian `f16` bytes
+/// `wgpu::Queue::write_texture` wants, premultiplied on the way, writing
+/// them into `out` **in place** rather than appending.
+///
+/// The arithmetic here — the two `half::slice` vectorized conversions, the
+/// `rgb * alpha` operand order, why alpha is copied from the source chunk
+/// and never from the narrowed scratch buffer, and exactly which
+/// bit-exactness guarantees hold against [`premultiply_rgba`] — is
+/// unchanged from 0.92.0/0.92.1 and is documented in full on
+/// [`extend_premultiplied_le_bytes`] below. This function is where it
+/// lives as of 0.96.0; read that comment for the *why* and this one for
+/// the panic-freedom and slice-length argument.
+///
+/// **Panic-freedom, argued rather than asserted.** The release profile
+/// sets `panic = "abort"`, and as of 0.96.0 this function also runs inside
+/// a `rayon` worker closure, so a panic here is a process abort rather
+/// than a recoverable error. There are exactly four places a panic could
+/// come from, and none of them can fire:
+///
+/// 1. `chunk.convert_to_f32_slice(&mut wide)` — `half`'s only failure mode
+///    is an `assert_eq!` that source and destination lengths match.
+///    `chunk` comes from `texels.chunks_exact(CHUNK_SAMPLES)`, which by
+///    definition yields slices of exactly `CHUNK_SAMPLES` elements, and
+///    `wide` is a fixed-size `[f32; CHUNK_SAMPLES]` array. The lengths are
+///    equal by construction, not by check.
+/// 2. `narrow.convert_from_f32_slice(&wide)` — same assertion, and both
+///    operands are fixed-size `CHUNK_SAMPLES` arrays declared three lines
+///    apart. Equal for the same reason.
+/// 3. Slice indexing — there is none. Every read walks an iterator
+///    (`chunks_exact`, `chunks_exact_mut`, `zip`), and every write goes
+///    through an irrefutable-on-success slice pattern whose failure arm
+///    `continue`s instead of panicking. No `[i]`, no `copy_from_slice`
+///    (which *does* panic on a length mismatch), no `unwrap`, no `expect`.
+/// 4. Running out of `out` — impossible to panic on, because `out` is
+///    consumed through `chunks_exact_mut(CHANNELS * 2)` zipped against the
+///    texel iterators. A `zip` stops at whichever side ends first, so an
+///    `out` too short simply writes fewer texels and an `out` too long
+///    leaves its tail untouched. That is what makes the reused
+///    [`Self::sync`] buffer and the parallel splitter's short trailing
+///    block both safe without a length assertion.
+///
+/// **Trailing partial texel**: a `texels` length that is not a multiple of
+/// [`CHANNELS`] contributes nothing for its final incomplete texel, the
+/// same contract [`premultiply_rgba`] and the pre-0.96.0 spelling of
+/// [`extend_premultiplied_le_bytes`] both have.
+fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
+    // `wide`/`narrow` name the sample width (`f32`/`f16`) of the scratch
+    // buffers. `wide` is deliberately *not* a reference to the rejected
+    // crate of the same name -- see `extend_premultiplied_le_bytes`.
+    let mut wide = [0f32; CHUNK_SAMPLES];
+    let mut narrow = [f16::ZERO; CHUNK_SAMPLES];
+    // One texel of output is `CHANNELS` little-endian `f16` samples.
+    let mut sink = out.chunks_exact_mut(CHANNELS * 2);
+    let mut chunks = texels.chunks_exact(CHUNK_SAMPLES);
+    for chunk in chunks.by_ref() {
+        // One vectorized f16 -> f32 pass: 8 lanes per `vcvtph2ps`, one
+        // feature-detection check for the whole slice.
+        chunk.convert_to_f32_slice(&mut wide);
+        for texel in wide.chunks_exact_mut(CHANNELS) {
+            let [r, g, b, a] = texel else {
+                continue;
+            };
+            let alpha = *a;
+            // Operand order (rgb * alpha) matches the scalar path's, so
+            // single-NaN products keep the same payload. A *double*-NaN
+            // product does not necessarily -- see
+            // `extend_premultiplied_le_bytes`'s "Bit-exactness" section;
+            // it is disclosed, tested and deliberately not chased.
+            *r *= alpha;
+            *g *= alpha;
+            *b *= alpha;
+        }
+        // One vectorized f32 -> f16 pass: 8 lanes per `vcvtps2ph`.
+        narrow.convert_from_f32_slice(&wide);
+        // Alpha comes from `chunk`, never from `narrow`: f16 -> f32 -> f16
+        // is not the identity for a signalling NaN (0x7c01 -> 0x7e01), and
+        // `premultiply_rgba` leaves alpha's bits untouched -- this must too.
+        for ((premultiplied, source), dest) in narrow
+            .chunks_exact(CHANNELS)
+            .zip(chunk.chunks_exact(CHANNELS))
+            .zip(sink.by_ref())
+        {
+            let [r, g, b, _] = premultiplied else {
+                continue;
+            };
+            let [_, _, _, a] = source else {
+                continue;
+            };
+            write_texel_le_bytes(*r, *g, *b, *a, dest);
+        }
+    }
+    // Trailing partial chunk, unchanged contract: whole texels in the
+    // remainder are premultiplied scalar-wise; a final incomplete texel
+    // contributes nothing.
+    for (texel, dest) in chunks.remainder().chunks_exact(CHANNELS).zip(sink.by_ref()) {
+        let [r, g, b, a] = texel else {
+            continue;
+        };
+        let alpha = f32::from(*a);
+        write_texel_le_bytes(
+            f16::from_f32(f32::from(*r) * alpha),
+            f16::from_f32(f32::from(*g) * alpha),
+            f16::from_f32(f32::from(*b) * alpha),
+            *a,
+            dest,
+        );
+    }
+}
+
+/// Writes one already-premultiplied texel into `dest` as eight
+/// little-endian bytes.
+///
+/// Split out only so the vectorized chunk loop and the scalar remainder
+/// loop in [`serialize_premultiplied_le_bytes`] cannot drift apart in byte
+/// order — they wrote two independently-spelled copies of this before
+/// 0.96.0.
+///
+/// `dest` is destructured with a slice pattern rather than
+/// `copy_from_slice`, which panics on a length mismatch. A `dest` that is
+/// not exactly `CHANNELS * 2` bytes writes nothing instead of aborting the
+/// process (`panic = "abort"` in release), and cannot occur anyway: every
+/// caller obtains `dest` from `chunks_exact_mut(CHANNELS * 2)`.
+fn write_texel_le_bytes(r: f16, g: f16, b: f16, a: f16, dest: &mut [u8]) {
+    let [r_lo, r_hi] = r.to_le_bytes();
+    let [g_lo, g_hi] = g.to_le_bytes();
+    let [b_lo, b_hi] = b.to_le_bytes();
+    let [a_lo, a_hi] = a.to_le_bytes();
+    let [d0, d1, d2, d3, d4, d5, d6, d7] = dest else {
+        return;
+    };
+    *d0 = r_lo;
+    *d1 = r_hi;
+    *d2 = g_lo;
+    *d3 = g_hi;
+    *d4 = b_lo;
+    *d5 = b_hi;
+    *d6 = a_lo;
+    *d7 = a_hi;
+}
+
+/// [`serialize_premultiplied_le_bytes`], split across `rayon` worker
+/// threads at [`BLOCK_SAMPLES`]-sample granularity. **This is 0.96.0's
+/// actual change**; everything it calls is 0.92.x code.
+///
+/// `texels` is split by `par_chunks(BLOCK_SAMPLES)` and `out` by
+/// `par_chunks_mut(BLOCK_SAMPLES * 2)` — two samples of output per input
+/// sample — and the two are `zip`ped so block *k* of the input always
+/// meets block *k* of the output. A whole [`TILE`]×[`TILE`] tile
+/// ([`SAMPLES`] samples) therefore becomes exactly 64 independent tasks.
+///
+/// **Why the output is bit-identical to the sequential version, regardless
+/// of thread count or scheduling.** There is no shared mutable state: no
+/// accumulator, no reduction, no cross-block carry. Each task owns a
+/// disjoint `&mut [u8]` sub-slice (that disjointness is what
+/// `par_chunks_mut` guarantees and what the borrow checker enforces), and
+/// each task's output depends only on its own input block. Because
+/// `BLOCK_SAMPLES % CHANNELS == 0`, a texel never straddles a block
+/// boundary, so no task can see a partial texel that the sequential walk
+/// would have seen whole; and because `BLOCK_SAMPLES % CHUNK_SAMPLES ==
+/// 0`, every block but possibly the last is a whole number of vectorized
+/// chunks, so no block is pushed onto the scalar remainder path that the
+/// sequential walk would have vectorized. There is consequently **no
+/// run-to-run non-determinism to disclose**: the bytes are a pure function
+/// of the input, and `the_parallel_serializer_matches_the_scalar_reference_across_block_boundaries`
+/// pins that against the scalar oracle.
+///
+/// `par_chunks`, not `par_chunks_exact`: a short trailing block then goes
+/// through the *same* code path as every other block, with
+/// `serialize_premultiplied_le_bytes`'s own `chunks_exact`/remainder
+/// handling doing what it already did sequentially, instead of needing a
+/// separate remainder branch here that could disagree with it.
+///
+/// A mismatched pair of chunk sizes — the one real way to get this wrong —
+/// would silently write correct bytes at wrong offsets, which is why
+/// `the_block_and_chunk_constants_divide_a_whole_tile_evenly` pins the
+/// arithmetic and the boundary sweep below checks every length class.
+fn write_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
+    texels
+        .par_chunks(BLOCK_SAMPLES)
+        .zip(out.par_chunks_mut(BLOCK_SAMPLES * 2))
+        .for_each(|(block, bytes)| serialize_premultiplied_le_bytes(block, bytes));
+}
 
 /// Appends `texels` to `out` as the little-endian `f16` bytes
 /// `wgpu::Queue::write_texture` wants, **premultiplied on the way**
@@ -329,81 +526,59 @@ const CHUNK_SAMPLES: usize = CHUNK_TEXELS * CHANNELS;
 /// buffer would therefore silently change one class of input. It is
 /// copied straight from `chunk` instead.
 ///
-/// **Parallelizing per tile with `rayon` is NOT done**, and is not merely
-/// a code change. `rayon` is not a dependency of this crate, nor of any
-/// other real workspace crate — it appears in `Cargo.lock` only as a
-/// transitive *dev*-dependency of `aurora-tile` (via `criterion`), so
-/// using it here would mean adding a genuine new runtime dependency,
-/// with the licence and review that implies. Beyond that,
-/// [`TileResidency::sync`]'s loop deliberately shares one reused
-/// `Vec<u8>` across every tile it uploads while interleaving store
-/// mutation and upload-budget bookkeeping between tiles; that structure
-/// would have to be reworked before any per-tile parallelism could be
-/// sound. Treat it as a separate, unmade decision.
+/// **Parallelism, as of 0.96.0: done *within* a tile, still not done
+/// *across* tiles.** This function is now a thin wrapper — it sizes `out`
+/// and hands the work to [`write_premultiplied_le_bytes`], which splits one
+/// tile's texels into [`BLOCK_SAMPLES`]-sample blocks (64 of them for a
+/// whole tile) and converts them on `rayon` worker threads. `rayon` became
+/// a genuine runtime dependency of this crate in that round, PRD §8's own
+/// pre-decided choice for CPU tile parallelism. [`TileResidency::upload_mip`]
+/// inherits the parallelism for free, since it calls this function too.
+///
+/// Text before 0.96.0 said parallelizing "is NOT done" and gave two
+/// reasons: the new dependency, and [`TileResidency::sync`]'s reused
+/// `Vec<u8>`. The first is now spent. The second was real but *incidental*
+/// — the buffer only ever held one tile at a time, so it was never what
+/// stood in the way. **The across-tile blockers are three, and two of them
+/// are API facts no amount of restructuring in this crate can move:**
+///
+/// 1. `aurora_tile::TileStore::get` takes `&mut self`, and the type exposes
+///    no `&self` tile accessor at all. A caller therefore cannot hold two
+///    tiles' texels at once, so there is nothing for a `par_iter` across
+///    tiles to iterate over.
+/// 2. `TileStore` is `Send` but **not** `Sync` — its `BackgroundWriter`
+///    holds an `mpsc::Receiver` — so the store cannot be shared with a
+///    worker thread either.
+/// 3. [`TileResidency::sync`]'s `bytes_left` budget must decide *which*
+///    tiles upload, in a fixed row-major order, before any of them is
+///    touched (two tests pin the resulting retry-on-a-later-call
+///    behaviour). Any across-tile scheme has to reproduce that ordering
+///    exactly, which is a redesign of the budget, not a `par_iter`.
+///
+/// Block-level parallelism has none of those problems, touches no store
+/// bookkeeping and no budget logic, and gives *more* parallel width than
+/// the across-tile design would have: 64 blocks per tile against a measured
+/// mean of ~6.8 tiles per frame. PLAN.md's 0.96.0 entry carries the costed
+/// across-tile alternative that was considered and not taken this round,
+/// together with the round's own measured result.
 ///
 /// Same trailing-partial-chunk contract as `premultiply_rgba`: a slice
 /// whose length is not a multiple of [`CHANNELS`] contributes nothing for
 /// its final incomplete texel rather than emitting corrupt bytes.
 fn extend_premultiplied_le_bytes(texels: &[f16], out: &mut Vec<u8>) {
-    // `wide`/`narrow` name the sample width (`f32`/`f16`) of the scratch
-    // buffers. `wide` is deliberately *not* a reference to the rejected
-    // crate of the same name — see the doc comment above.
-    let mut wide = [0f32; CHUNK_SAMPLES];
-    let mut narrow = [f16::ZERO; CHUNK_SAMPLES];
-    let mut chunks = texels.chunks_exact(CHUNK_SAMPLES);
-    for chunk in chunks.by_ref() {
-        // One vectorized f16 -> f32 pass: 8 lanes per `vcvtph2ps`, one
-        // feature-detection check for the whole slice.
-        chunk.convert_to_f32_slice(&mut wide);
-        for texel in wide.chunks_exact_mut(CHANNELS) {
-            let [r, g, b, a] = texel else {
-                continue;
-            };
-            let alpha = *a;
-            // Operand order (rgb * alpha) matches the scalar path's, so
-            // single-NaN products keep the same payload. A *double*-NaN
-            // product does not necessarily -- see the doc comment's
-            // "Bit-exactness" section; it is disclosed, tested and
-            // deliberately not chased.
-            *r *= alpha;
-            *g *= alpha;
-            *b *= alpha;
-        }
-        // One vectorized f32 -> f16 pass: 8 lanes per `vcvtps2ph`.
-        narrow.convert_from_f32_slice(&wide);
-        // Alpha comes from `chunk`, never from `narrow`: f16 -> f32 -> f16
-        // is not the identity for a signalling NaN (0x7c01 -> 0x7e01), and
-        // `premultiply_rgba` leaves alpha's bits untouched -- this must too.
-        for (premultiplied, source) in narrow
-            .chunks_exact(CHANNELS)
-            .zip(chunk.chunks_exact(CHANNELS))
-        {
-            let [r, g, b, _] = premultiplied else {
-                continue;
-            };
-            let [_, _, _, a] = source else {
-                continue;
-            };
-            let [r_lo, r_hi] = r.to_le_bytes();
-            let [g_lo, g_hi] = g.to_le_bytes();
-            let [b_lo, b_hi] = b.to_le_bytes();
-            let [a_lo, a_hi] = a.to_le_bytes();
-            out.extend_from_slice(&[r_lo, r_hi, g_lo, g_hi, b_lo, b_hi, a_lo, a_hi]);
-        }
-    }
-    // Trailing partial chunk, unchanged contract: whole texels in the
-    // remainder are premultiplied scalar-wise; a final incomplete texel
-    // contributes nothing.
-    for texel in chunks.remainder().chunks_exact(CHANNELS) {
-        let [r, g, b, a] = texel else {
-            continue;
-        };
-        let alpha = f32::from(*a);
-        let [r_lo, r_hi] = f16::from_f32(f32::from(*r) * alpha).to_le_bytes();
-        let [g_lo, g_hi] = f16::from_f32(f32::from(*g) * alpha).to_le_bytes();
-        let [b_lo, b_hi] = f16::from_f32(f32::from(*b) * alpha).to_le_bytes();
-        let [a_lo, a_hi] = a.to_le_bytes();
-        out.extend_from_slice(&[r_lo, r_hi, g_lo, g_hi, b_lo, b_hi, a_lo, a_hi]);
+    // Whole texels only, matching the trailing-partial-texel contract
+    // above: two output bytes per input sample.
+    let start = out.len();
+    let whole_texel_bytes = texels.len() / CHANNELS * CHANNELS * 2;
+    out.resize(start + whole_texel_bytes, 0);
+    // `Some` by construction: `resize` just made `out` exactly
+    // `start + whole_texel_bytes` long, and `start <= out.len()`, so
+    // `start..` is always a valid range. Spelled as a guard rather than an
+    // index or an `expect` because the workspace denies both, and because a
+    // hypothetical `None` writing nothing is a blank tile rather than an
+    // aborted process.
+    if let Some(tail) = out.get_mut(start..) {
+        write_premultiplied_le_bytes(texels, tail);
     }
 }
 
@@ -1071,13 +1246,24 @@ impl TileResidency {
         let mut stats = SyncStats::default();
         let mut bytes_left = byte_budget;
         // *One* buffer, reused across every tile this call uploads, and
-        // the only one: `extend_premultiplied_le_bytes` premultiplies as
+        // the only one: `write_premultiplied_le_bytes` premultiplies as
         // it serializes, so the store's own tile stays straight alpha
         // without a separate mutable copy of it. 0.68.0 had a staging
         // `Vec<f16>` here *and* a fresh `Vec<u8>` per tile, which is the
         // half-megabyte copy and the per-tile allocation the staging
         // buffer's own comment claimed to be avoiding.
-        let mut bytes: Vec<u8> = Vec::with_capacity(TILE_BYTES);
+        //
+        // **Allocated at full length once (0.96.0), not cleared and
+        // re-grown per tile.** The parallel serializer writes into a
+        // pre-sized `&mut [u8]` rather than appending, so this buffer has
+        // to be `TILE_BYTES` long before the first tile, not merely
+        // reserved. That makes it a *reused* buffer in the literal sense —
+        // tile N+1 overwrites tile N's bytes in place — which is only safe
+        // because the `texels().len() != SAMPLES` guard below refuses any
+        // tile that would not overwrite all of it. Without that guard a
+        // short tile would upload its own bytes followed by the tail of the
+        // previous tile's.
+        let mut bytes: Vec<u8> = vec![0u8; TILE_BYTES];
         for gy in 0..self.grid.1 {
             for gx in 0..self.grid.0 {
                 let id = TileId {
@@ -1165,13 +1351,34 @@ impl TileResidency {
                         continue;
                     }
                 };
+                // A whole tile, or nothing. `TileStore` hands back
+                // `SAMPLES` samples for every tile it has, so this is not
+                // expected to fire -- it is what makes the reused,
+                // pre-sized `bytes` buffer above sound rather than merely
+                // probably-sound. A short tile would leave the tail of the
+                // *previous* tile's bytes in the buffer and upload them as
+                // if they were this tile's. Handled exactly like the `get`
+                // failure above, and for the same reason: drop the slot
+                // mapping so the tile is retried instead of silently
+                // sticking as resident-but-never-uploaded.
+                if tile.texels().len() != SAMPLES {
+                    self.slots.remove(&slot);
+                    tracing::warn!(
+                        ?id,
+                        samples = tile.texels().len(),
+                        expected = SAMPLES,
+                        "skipping tile for this frame's upload: unexpected sample count"
+                    );
+                    stats.remaining += 1;
+                    stats.errors += 1;
+                    continue;
+                }
                 // Premultiplied on the way in -- see `premultiply_rgba`
                 // for why the atlas, and only the atlas, holds that
                 // convention (it is the test-only reference now; this
                 // function is what actually applies it, on both this path
                 // and `upload_mip`'s). The store's own tile is untouched.
-                bytes.clear();
-                extend_premultiplied_le_bytes(tile.texels(), &mut bytes);
+                write_premultiplied_le_bytes(tile.texels(), &mut bytes);
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &self.texture,
@@ -1332,10 +1539,11 @@ impl std::fmt::Debug for TileResidency {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHUNK_TEXELS, TILE_BYTES, TileResidency, extend_premultiplied_le_bytes, premultiply_rgba,
+        BLOCK_SAMPLES, CHUNK_SAMPLES, CHUNK_TEXELS, TILE_BYTES, TileResidency,
+        extend_premultiplied_le_bytes, premultiply_rgba, write_premultiplied_le_bytes,
     };
     use crate::test_support::{real_context, real_tile_store};
-    use aurora_tile::{CHANNELS, SurfaceId, TILE, TileId};
+    use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileId};
     use half::f16;
 
     /// The one surface every test in this module addresses — nothing
@@ -2963,5 +3171,391 @@ mod tests {
                 "premultiplied {colour} * {alpha}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // 0.96.0: the rayon-parallel serializer.
+    //
+    // **Every fixture above is far shorter than one `BLOCK_SAMPLES`**
+    // (4,096 samples), so without the tests below the parallel splitter
+    // would never be handed more than a single block and every green run
+    // above would be measuring a one-task "parallel" path. These are what
+    // actually exercise multiple blocks, a short trailing block, and a
+    // whole tile.
+    // ---------------------------------------------------------------
+
+    /// The eight `f16` bit patterns a premultiply bug hides in, as used by
+    /// `the_fused_serializer_matches_premultiply_then_serialize_across_a_chunk_boundary`
+    /// above. `0x7c01` (a signalling NaN) is last on purpose: it lands on
+    /// the alpha channel on every other extreme texel, and alpha is the one
+    /// channel the "sourced alpha from the round-tripped scratch buffer"
+    /// mutation can change.
+    const EXTREMES: [u16; 8] = [
+        0x0000, // +0
+        0x8000, // -0
+        0x0001, // smallest subnormal
+        0x03ff, // largest subnormal
+        0x7bff, // largest finite (65504)
+        0x7c00, // +infinity
+        0xfc00, // -infinity
+        0x7c01, // signalling NaN
+    ];
+
+    /// `samples` samples whose value varies per texel *and* per channel,
+    /// with every fifth texel filled from a cycle of [`EXTREMES`] instead.
+    ///
+    /// Varying per channel is what makes a swapped R/G/B, a stale
+    /// scratch-buffer lane carried between chunks, an alpha read from the
+    /// wrong texel, or a block written at the wrong offset all show up as a
+    /// byte mismatch rather than hiding behind uniform data. The every-fifth
+    /// extreme texel places NaN/infinity/subnormal/signed-zero inputs inside
+    /// *every* block of any fixture longer than 20 texels, and inside the
+    /// trailing partial block too, since the texel index keeps counting
+    /// across block boundaries.
+    fn varied_fixture(samples: usize) -> Vec<f16> {
+        let mut extremes = EXTREMES.iter().cycle();
+        let mut source: Vec<f16> = Vec::with_capacity(samples);
+        let mut texel = 0usize;
+        while source.len() < samples {
+            if texel.is_multiple_of(5) {
+                for _ in 0..CHANNELS {
+                    if source.len() == samples {
+                        break;
+                    }
+                    // `cycle()` over a non-empty array never yields `None`;
+                    // the fallback is only here because the workspace
+                    // denies `unwrap`.
+                    let bits = extremes.next().copied().unwrap_or(0x3800);
+                    source.push(f16::from_bits(bits));
+                }
+            } else {
+                let n = texel as f32;
+                for channel in [
+                    n / 137.0,
+                    1.0 - n / 149.0,
+                    ((texel * 7) % 137) as f32 / 137.0,
+                    // Alpha sweeps 0.0 through 1.0 inclusive, so both a
+                    // fully transparent and a fully opaque texel appear.
+                    ((texel * 13) % 131) as f32 / 130.0,
+                ] {
+                    if source.len() == samples {
+                        break;
+                    }
+                    source.push(f16::from_f32(channel));
+                }
+            }
+            texel += 1;
+        }
+        source
+    }
+
+    /// The scalar oracle every test below compares against: the *obvious*
+    /// spelling — [`premultiply_rgba`] in place, then a plain
+    /// little-endian serialize of the whole-texel prefix — with no
+    /// vectorization, no blocking, and no `rayon` anywhere near it.
+    ///
+    /// Deliberately not shared with the parallel path in any way, so an
+    /// error common to both cannot cancel out.
+    fn scalar_reference(source: &[f16]) -> Vec<u8> {
+        let whole = source.len() / CHANNELS * CHANNELS;
+        let mut in_place = source.to_vec();
+        premultiply_rgba(&mut in_place);
+        let mut expected: Vec<u8> = Vec::with_capacity(whole * 2);
+        for sample in in_place.iter().take(whole) {
+            expected.extend_from_slice(&sample.to_le_bytes());
+        }
+        expected
+    }
+
+    /// **The primary correctness guard for 0.96.0's parallel serializer.**
+    ///
+    /// The length is chosen so one call covers every structural case at
+    /// once: `BLOCK_SAMPLES * 3` gives three *full* rayon blocks (so the
+    /// splitter genuinely has to hand disjoint sub-slices to more than one
+    /// worker, and a block written at the wrong offset cannot go unnoticed);
+    /// `+ CHUNK_SAMPLES` makes the fourth block short but still containing a
+    /// whole vectorized chunk; `+ 13 * CHANNELS` adds thirteen whole texels
+    /// that fall into the sequential core's *scalar remainder*; and `+ 2`
+    /// adds a trailing incomplete texel, which must contribute nothing.
+    ///
+    /// Extremes (NaN, both infinities, both signed zeros, both subnormal
+    /// bounds) land in all four blocks and in the remainder, per
+    /// [`varied_fixture`]'s own doc.
+    ///
+    /// Compared byte-for-byte against [`scalar_reference`]. Non-vacuity was
+    /// checked by hand for 0.96.0 with two mutations of
+    /// `write_premultiplied_le_bytes`, both of which this test catches: a
+    /// mismatched output chunk size (`BLOCK_SAMPLES` instead of
+    /// `BLOCK_SAMPLES * 2`), and an off-by-one-block `zip` between the input
+    /// and output block iterators.
+    #[test]
+    fn the_parallel_serializer_matches_the_scalar_reference_across_block_boundaries() {
+        let samples = BLOCK_SAMPLES * 3 + CHUNK_SAMPLES + (13 * CHANNELS) + 2;
+        let source = varied_fixture(samples);
+        assert_eq!(source.len(), samples, "the fixture must be exactly as long");
+
+        let mut fused = Vec::new();
+        extend_premultiplied_le_bytes(&source, &mut fused);
+
+        let expected = scalar_reference(&source);
+        assert_eq!(
+            fused.len(),
+            expected.len(),
+            "the whole-texel prefix must be serialized and the trailing \
+             partial texel dropped"
+        );
+        assert_eq!(
+            fused, expected,
+            "the rayon-parallel serializer must match the scalar \
+             premultiply-then-serialize reference bit-for-bit across three \
+             full blocks, a short block, a scalar remainder and a trailing \
+             partial texel"
+        );
+    }
+
+    /// The real upload shape: exactly one whole tile, which is what
+    /// [`TileResidency::sync`] hands the serializer on every frame.
+    ///
+    /// [`SAMPLES`] is `BLOCK_SAMPLES * 64`, so this is the 64-task case the
+    /// parallelism was added for — no short block, no remainder.
+    #[test]
+    fn the_parallel_serializer_matches_the_scalar_reference_for_a_whole_tile() {
+        let source = varied_fixture(SAMPLES);
+        assert_eq!(source.len(), SAMPLES);
+
+        let mut fused = Vec::new();
+        extend_premultiplied_le_bytes(&source, &mut fused);
+
+        assert_eq!(
+            fused.len(),
+            TILE_BYTES,
+            "a whole tile must serialize to exactly one tile's worth of bytes"
+        );
+        assert_eq!(
+            fused,
+            scalar_reference(&source),
+            "a whole tile must match the scalar reference bit-for-bit"
+        );
+    }
+
+    /// The arithmetic the parallel splitter's correctness rests on, pinned
+    /// so that a future edit to [`BLOCK_SAMPLES`]/[`CHUNK_SAMPLES`] which
+    /// breaks it fails loudly here instead of silently pushing real uploads
+    /// onto an untested path.
+    ///
+    /// - `SAMPLES % BLOCK_SAMPLES == 0`: a whole tile splits into equal
+    ///   blocks with no short trailing one, which is the case every real
+    ///   frame takes.
+    /// - `BLOCK_SAMPLES % CHUNK_SAMPLES == 0`: every full block is a whole
+    ///   number of vectorized chunks, so no block is pushed onto the scalar
+    ///   remainder that the sequential walk would have vectorized.
+    /// - `BLOCK_SAMPLES % CHANNELS == 0`: a texel never straddles a block
+    ///   boundary, so no worker can see a partial texel. This is the one
+    ///   that makes "bit-identical regardless of thread count" true rather
+    ///   than merely usually-true.
+    /// - `TILE_BYTES == SAMPLES * 2`: the `par_chunks_mut(BLOCK_SAMPLES *
+    ///   2)` output stride is the right one, i.e. two bytes of output per
+    ///   input sample.
+    #[test]
+    fn the_block_and_chunk_constants_divide_a_whole_tile_evenly() {
+        assert_eq!(
+            SAMPLES % BLOCK_SAMPLES,
+            0,
+            "a whole tile must split into whole blocks"
+        );
+        assert_eq!(
+            SAMPLES / BLOCK_SAMPLES,
+            64,
+            "a whole tile is expected to become 64 rayon tasks; if this \
+             changes deliberately, re-measure before accepting it"
+        );
+        assert_eq!(
+            BLOCK_SAMPLES % CHUNK_SAMPLES,
+            0,
+            "a block must be a whole number of vectorized chunks"
+        );
+        assert_eq!(
+            BLOCK_SAMPLES % CHANNELS,
+            0,
+            "a texel must never straddle a block boundary"
+        );
+        assert_eq!(
+            TILE_BYTES,
+            SAMPLES * 2,
+            "two output bytes per input sample is what the output chunk \
+             stride assumes"
+        );
+    }
+
+    /// Every length class around a chunk and a block boundary, in one
+    /// sweep. This is the executable half of
+    /// [`serialize_premultiplied_le_bytes`]'s panic-freedom argument: any
+    /// length-mismatch bug in the `half` conversions fires that crate's own
+    /// internal `assert_eq!`, and a test build does not set `panic =
+    /// "abort"`, so it surfaces here as an ordinary test failure rather
+    /// than as a process abort in a shipped release.
+    #[test]
+    fn the_parallel_serializer_matches_the_scalar_reference_at_every_boundary_length() {
+        for samples in [
+            0,
+            1,
+            CHANNELS - 1,
+            CHANNELS,
+            CHANNELS + 1,
+            CHUNK_SAMPLES - 1,
+            CHUNK_SAMPLES,
+            CHUNK_SAMPLES + 1,
+            BLOCK_SAMPLES - 1,
+            BLOCK_SAMPLES,
+            BLOCK_SAMPLES + 1,
+            2 * BLOCK_SAMPLES - 1,
+            2 * BLOCK_SAMPLES,
+            2 * BLOCK_SAMPLES + 1,
+        ] {
+            let source = varied_fixture(samples);
+            let mut fused = Vec::new();
+            extend_premultiplied_le_bytes(&source, &mut fused);
+            assert_eq!(
+                fused,
+                scalar_reference(&source),
+                "mismatch at an input length of {samples} samples"
+            );
+        }
+    }
+
+    /// The splitter called directly with an `out` buffer that is *not*
+    /// exactly the right length — one byte short, and one byte long.
+    ///
+    /// Neither may panic. `write_premultiplied_le_bytes` and its sequential
+    /// core consume `out` through `chunks_exact_mut(CHANNELS * 2)` zipped
+    /// against the texel iterators, never by indexing or
+    /// `copy_from_slice`, so a short buffer writes fewer whole texels and a
+    /// long one leaves its tail untouched. That property is what makes both
+    /// [`TileResidency::sync`]'s reused pre-sized buffer and the splitter's
+    /// short trailing block safe without a length assertion, so it is
+    /// checked rather than asserted in prose.
+    ///
+    /// The fixture is deliberately shorter than one [`BLOCK_SAMPLES`] so
+    /// there is exactly one block and the arithmetic below is easy to read;
+    /// the property does not depend on that (earlier blocks stay aligned
+    /// either way).
+    #[test]
+    fn the_parallel_serializer_tolerates_a_mis_sized_output_buffer() {
+        const SENTINEL: u8 = 0xab;
+        let source = varied_fixture(CHUNK_SAMPLES * 2 + 12);
+        let expected = scalar_reference(&source);
+        let texels = source.len() / CHANNELS;
+        assert_eq!(expected.len(), texels * CHANNELS * 2);
+        assert!(
+            source.len() < BLOCK_SAMPLES,
+            "this fixture is meant to be a single block"
+        );
+
+        // One byte short: the last texel has nowhere to go, so exactly
+        // `texels - 1` texels are written and nothing panics.
+        let mut short = vec![0u8; expected.len() - 1];
+        write_premultiplied_le_bytes(&source, &mut short);
+        let prefix = (texels - 1) * CHANNELS * 2;
+        assert_eq!(
+            short.get(..prefix),
+            expected.get(..prefix),
+            "a one-byte-short buffer must still receive every texel that fits"
+        );
+
+        // One byte long: the extra byte falls in `chunks_exact_mut`'s
+        // remainder and must be left exactly as it was.
+        let mut long = vec![SENTINEL; expected.len() + 1];
+        write_premultiplied_le_bytes(&source, &mut long);
+        assert_eq!(
+            long.get(..expected.len()),
+            expected.get(..),
+            "a one-byte-long buffer must receive every texel"
+        );
+        assert_eq!(
+            long.last(),
+            Some(&SENTINEL),
+            "the byte past the last whole texel must be untouched"
+        );
+    }
+
+    /// **The budget/ordering characterization guard.** `sync`'s
+    /// `bytes_left` budget decides *which* tiles upload, in a fixed
+    /// row-major order, and the two tests above
+    /// (`budget_limited_sync_converges_over_multiple_calls` and
+    /// `a_resident_tile_skipped_for_budget_is_still_uploaded_on_a_later_call`)
+    /// pin the *counts* that come out of that — but nothing pinned the
+    /// *identities*. A change that uploaded the last two tiles first, or in
+    /// a `HashMap`'s iteration order, would pass both of them.
+    ///
+    /// Added in 0.96.0 alongside the block-level parallelism, which
+    /// deliberately does not touch this logic. Its real purpose is the
+    /// *next* round: an across-tile parallelization (see
+    /// [`extend_premultiplied_le_bytes`]'s doc for why it is blocked today)
+    /// would have to reproduce this ordering exactly, and this test is what
+    /// makes an accidental reordering a test failure instead of a silent
+    /// behaviour change a user would see as tiles filling in from the wrong
+    /// corner.
+    ///
+    /// Reads `residency.slots` directly, as
+    /// `resize_to_a_smaller_grid_drops_the_slot_mapping` above already does.
+    #[test]
+    fn a_budget_limited_sync_uploads_the_first_tiles_in_row_major_order() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store(64);
+
+        // 256x256 viewport -> a (2, 2) grid at origin (0, 0), so the
+        // row-major visit order is (0,0), (1,0), (0,1), (1,1) and each tile
+        // maps to the slot of the same coordinates.
+        let viewport = (256, 256);
+        let mut residency = TileResidency::new(context.device(), context.queue(), viewport);
+        assert_eq!(residency.grid, (2, 2));
+        for gy in 0..2 {
+            for gx in 0..2 {
+                paint(&mut store, TileId { x: gx, y: gy }, [0.0, 1.0, 1.0, 1.0]);
+            }
+        }
+
+        let first = residency.sync(
+            context.queue(),
+            &mut store,
+            surface(),
+            false,
+            TILE_BYTES * 2,
+        );
+        assert_eq!(first.uploaded, 2);
+        assert_eq!(first.errors, 0);
+
+        let mut mapped: Vec<((u32, u32), TileId)> =
+            residency.slots.iter().map(|(&s, &id)| (s, id)).collect();
+        mapped.sort_by_key(|&(slot, _)| (slot.1, slot.0));
+        assert_eq!(
+            mapped,
+            vec![
+                ((0, 0), TileId { x: 0, y: 0 }),
+                ((1, 0), TileId { x: 1, y: 0 }),
+            ],
+            "a budget for two tiles must upload the first two in row-major \
+             order -- not the last two, and not an arbitrary pair"
+        );
+
+        let second = residency.sync(context.queue(), &mut store, surface(), false, usize::MAX);
+        assert_eq!(second.uploaded, 2);
+        assert_eq!(second.remaining, 0);
+
+        let mut all: Vec<((u32, u32), TileId)> =
+            residency.slots.iter().map(|(&s, &id)| (s, id)).collect();
+        all.sort_by_key(|&(slot, _)| (slot.1, slot.0));
+        assert_eq!(
+            all,
+            vec![
+                ((0, 0), TileId { x: 0, y: 0 }),
+                ((1, 0), TileId { x: 1, y: 0 }),
+                ((0, 1), TileId { x: 0, y: 1 }),
+                ((1, 1), TileId { x: 1, y: 1 }),
+            ],
+            "a second, unlimited call must finish the backlog"
+        );
     }
 }

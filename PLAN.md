@@ -19378,6 +19378,25 @@ severity choice.
     dependency, and `sync`'s shared-buffer loop needing restructuring
     first).
 
+    **Superseded/refined in 0.96.0** (see that entry below). Two things
+    here are now wrong. The *blocker count* was understated: it is three,
+    not two, and the two that actually mattered are neither of the ones
+    named. `aurora_tile::TileStore::get` takes `&mut self` with no `&self`
+    accessor anywhere on the type, so a caller cannot hold two tiles'
+    texels at once; and `TileStore` is `Send` but **not** `Sync` (its
+    `BackgroundWriter` holds an `mpsc::Receiver`), so it cannot be shared
+    with a worker thread. Those are `aurora-tile` API facts, not
+    restructuring work. Of the two blockers this bullet did name, the new
+    dependency is now spent (`rayon` is a real dependency of `aurora-gpu`
+    as of 0.96.0), and `sync`'s reused `Vec<u8>` was real but *incidental*
+    — it only ever held one tile at a time, so it was never what stood in
+    the way; the genuine behavioural constraint is the `bytes_left` budget
+    having to choose which tiles upload, in row-major order, before any is
+    touched. And parallelism **is** now done, just at a different
+    granularity than this bullet imagined: *within* one tile, across 64
+    fixed-size blocks of its texels, measured at ~0.7–1.1 ms/frame off
+    `upload_sync`. Across-tile parallelism remains not done.
+
   Zero new dependencies (`Cargo.lock`'s diff is the 20 workspace version
   strings and nothing else), no `unsafe` added to `aurora-gpu`, no
   `RUSTFLAGS` or `.cargo/config.toml` change, no new lint exception.
@@ -20237,6 +20256,232 @@ severity choice.
   method), no new lint exception, no `unwrap`/`expect`/`panic`/
   `indexing_slicing`. `aurora-tile` untouched. 1 new test (1,638 → 1,639
   workspace-wide; `aurora-app` 384 → 385), 0 changed, 0 removed.
+
+  **0.96.0 (2026-09-04) — `rayon` becomes this workspace's first genuine
+  production dependency, and `TileResidency::sync`'s serialize loop is
+  parallelized *within* one tile. A real win on the stage it targets, and
+  it still does not close the 60 FPS gate.**
+
+  **The success threshold was written down before any "after" run existed**
+  (`scratchpad/bench/threshold.md`, recorded at HEAD `0321d66`/0.95.1 with
+  the three baseline runs already in hand and no changed source on disk):
+  a win requires the GPU-path `upload_sync` **mean** and **p50** to each
+  fall with a 3-run min–max range that does **not overlap** the baseline's
+  range, *and* the `upload_sync moved ...` control line to stay
+  byte-identical, proving a pure CPU-time change rather than a change in
+  upload volume. p99 was excluded from the verdict in advance, on 0.94.1's
+  own grounds: `ms_stats` computes `round((len - 1) * p)`, which at
+  `len = 40` is index 39, so this benchmark's "p99" is the single worst
+  frame and cannot support a ratio. All three conditions were met.
+
+  **The design the round did *not* build, and why.** The proposal was
+  "parallelize across tiles". Investigation found that blocked by two API
+  facts that no restructuring inside `aurora-gpu` can move:
+  `aurora_tile::TileStore::get` takes `&mut self` and the type exposes no
+  `&self` tile accessor at all, so a caller cannot hold two tiles' texels
+  at once — there is nothing for a `par_iter` across tiles to iterate over;
+  and `TileStore` is `Send` but **not** `Sync` (its `BackgroundWriter`
+  holds an `mpsc::Receiver`), so the store cannot be shared with a worker
+  thread either. A third constraint is behavioural rather than structural:
+  `sync`'s `bytes_left` budget must decide *which* tiles upload, in a fixed
+  row-major order, before any of them is touched, and two existing tests
+  pin the resulting retry-on-a-later-call semantics. Across-tile work would
+  therefore be an `aurora-tile` API change plus a budget redesign, not a
+  `par_iter` — costed and deliberately not taken this round.
+
+  **What was built instead: parallelism *within* one tile**, across
+  fixed-size blocks of its texels. `BLOCK_SAMPLES` = `CHUNK_SAMPLES * 16` =
+  4,096 samples = 1,024 texels, so a whole 256×256 tile (`SAMPLES` =
+  262,144) splits into exactly **64 independent tasks**. That is *more*
+  parallel width than the across-tile design would have given — 64 blocks
+  per tile against this fixture's measured mean of ~6.8 tiles per frame —
+  and it touches zero store bookkeeping, zero budget logic and zero
+  ordering logic.
+
+  **The output is bit-identical to the sequential version by construction**,
+  not by luck: there is no shared mutable state, no accumulator and no
+  cross-block reduction; each task owns a disjoint `&mut [u8]` sub-slice
+  (`par_chunks_mut`'s guarantee, enforced by the borrow checker) and its
+  output depends only on its own input block. `BLOCK_SAMPLES % CHANNELS ==
+  0` means a texel never straddles a block boundary, and `BLOCK_SAMPLES %
+  CHUNK_SAMPLES == 0` means no full block is pushed onto the scalar
+  remainder path the sequential walk would have vectorized. **There is no
+  run-to-run non-determinism to disclose**; a new test pins the three
+  divisibility relations so a future edit to the constants fails loudly
+  rather than silently pushing real uploads onto an untested path.
+
+  `extend_premultiplied_le_bytes` keeps its exact name, signature and
+  observable behaviour and becomes a thin `Vec`-sizing wrapper, so
+  `upload_mip` and every existing test are unaffected — and `upload_mip`
+  inherits the parallelism for free.
+
+  **Measured on real hardware, three runs per side, one session, one
+  machine state.** Adapter printed on every run: `NVIDIA GeForce RTX 3090
+  (Vulkan, DiscreteGpu)`. CPU: Intel Core i3-10100 @ 3.60 GHz, **4 physical
+  cores / 8 threads, `nproc` = 8**, F16C present. Command both sides:
+  `AURORA_REQUIRE_GPU=1 cargo test --release -p aurora-app -- --nocapture
+  --test-threads=1 recomposite_and_present_loop`.
+
+  GPU path (n=40), `upload_sync`:
+
+  | metric (ms) | before (3 runs) | before range | after (3 runs) | after range | verdict |
+  |---|---|---|---|---|---|
+  | **mean** | 2.10 / 2.14 / 2.53 | 2.10–2.53 | **1.41 / 1.44 / 1.40** | **1.40–1.44** | non-overlapping, **met** |
+  | **p50** | 1.82 / 1.83 / 2.36 | 1.82–2.36 | **1.24 / 1.33 / 1.23** | **1.23–1.33** | non-overlapping, **met** |
+  | p99 *(= worst of 40 — not part of the verdict)* | 8.05 / 8.00 / 8.92 | 8.00–8.92 | 6.90 / 6.17 / 6.24 | 6.17–6.90 | moves the same way; one order statistic, do not read a ratio off it |
+
+  CPU-fallback fixture (n=12), `upload_sync` — not part of the pre-stated
+  threshold, reported because it is the second benchmark and it agrees:
+
+  | metric (ms) | before | after |
+  |---|---|---|
+  | mean | 1.55 / 1.55 / 1.55 | **1.13 / 1.13 / 1.23** |
+  | p50 | 1.49 / 1.51 / 1.50 | **1.11 / 1.02 / 1.10** |
+  | p99 | 3.68 / 3.60 / 3.59 | 3.16 / 3.03 / 3.16 |
+
+  Whole frame, same runs:
+
+  | metric (ms) | GPU path before | GPU path after | CPU fb before | CPU fb after |
+  |---|---|---|---|---|
+  | mean | 8.41 / 8.22 / 9.71 | **7.71 / 7.63 / 7.52** | 9.51 / 9.07 / 9.02 | 9.59 / 8.47 / 10.36 |
+  | p50 | 7.77 / 7.66 / 9.18 | **7.25 / 7.32 / 7.16** | 9.04 / 8.76 / 8.80 | 8.90 / 8.08 / 11.08 |
+  | p99 *(worst of n)* | 30.72 / 21.26 / 25.64 | 30.21 / 21.08 / 21.72 | 16.10 / 12.35 / 12.37 | 17.34 / 11.40 / 12.32 |
+
+  **The control line is byte-identical on both benchmarks across all six
+  runs** — verified by hashing it rather than by eye (one MD5,
+  `3e773059f637dd66a06f2e7ee59e72f2`, for all six logs' `upload_sync moved`
+  lines together):
+
+  ```
+  upload_sync moved mean=6.8 tiles/frame (min=2 max=20), mean=3.41 MB/frame (min=1048576B max=10485760B)
+  upload_sync moved mean=4.9 tiles/frame (min=2 max=9), mean=2.46 MB/frame (min=1048576B max=4718592B)
+  ```
+
+  So the same tiles and the same bytes moved before and after: this is a
+  CPU-time change, exactly as intended, and not an upload-volume artefact.
+  `recomposite`'s own mean is likewise unmoved (5.58 / 5.40 / 6.43 →
+  5.67 / 5.55 / 5.50 ms), which is the other half of the same argument —
+  the change is localized to the stage it claims.
+
+  **Call it ~0.7–1.1 ms/frame off `upload_sync`, roughly a 1.5× cut to that
+  stage**, on 4 physical cores. Not the 4× a core count might suggest: the
+  work is memory-bandwidth-heavy `f16 -> f32 -> f16` conversion already
+  vectorized 8 lanes wide since 0.92.0, ~435 rayon tasks per frame carry
+  real per-task bookkeeping, and only ~6.8 tiles/frame move, so most frames
+  never reach the full 64-task width.
+
+  **What this does NOT do, stated plainly:**
+
+  - **It does not close the 60 FPS gate, and could not have.** Even a
+    *perfect* win here — `upload_sync` to zero — leaves the GPU-path frame
+    mean around 6.1–6.3 ms with a worst frame still in the 21–30 ms range
+    against a 16.7 ms budget. `recomposite` is now the dominant stage at
+    **~73% of the GPU-path frame mean** (it was ~66% before this round,
+    purely because the denominator shrank), and that is where the next
+    attempt belongs. The gate remains open and is still missed on the tail
+    in every run of every build measured.
+  - **One configuration**: Linux, Vulkan, NVIDIA RTX 3090, `x86_64` with
+    F16C, 4 cores / 8 threads. No Metal, no DX12, no macOS, no Windows, no
+    other core count. A machine with more cores would plausibly do better
+    and a single-core one worse; neither is measured.
+  - **Run 3 of the baseline is uniformly slower than runs 1–2 in every
+    stage including `recomposite`** (6.43 vs 5.58/5.40 ms) — machine-state
+    drift, not an upload-path property. The threshold used the full,
+    conservative 3-run range anyway, and the verdict does not depend on
+    that run: even against baseline run 2 alone (mean 2.14, p50 1.83) the
+    after-ranges are still entirely below.
+  - **The CPU-fallback fixture's whole-frame numbers got *noisier*, not
+    better** (after run 3's p50 of 11.08 ms is the worst figure on either
+    side). Its `upload_sync` improved cleanly and monotonically; its
+    `recomposite`-dominated total did not, and n=12 is too small to say
+    more. Not spun as a win.
+  - **Both benchmarks still call `CompositeCache::bump()` once per frame**,
+    so the stage shares remain a property of these fixtures rather than of
+    a real, mostly-painted document — the same caveat every entry in this
+    section carries.
+  - **Across-tile parallelism is still not done**, for the three reasons
+    at the top of this entry, two of which are `aurora-tile` API facts.
+
+  **Correctness work that landed with it, and would have been worth keeping
+  even on a null result:**
+
+  - **A `texels().len() != SAMPLES` guard in `sync`.** The reused scratch
+    buffer is now allocated at full `TILE_BYTES` length once per call and
+    written *in place*, rather than cleared and re-grown per tile, because
+    the parallel serializer writes into a pre-sized `&mut [u8]`. A short
+    tile would therefore have uploaded its own bytes followed by the tail
+    of the *previous* tile's. The guard drops the slot mapping, warns,
+    counts the tile as `remaining`/`errors` and continues — the same
+    treatment, for the same reason, as the existing `store.get` failure
+    arm: so the tile is retried rather than sticking as
+    resident-but-never-uploaded.
+  - **Six new tests** (1,647 → 1,653 workspace-wide; `aurora-gpu` 68 → 74).
+    Every pre-existing fixture in that module is far shorter than one
+    `BLOCK_SAMPLES`, so without these the splitter would never have been
+    handed more than a single block and every green run would have been
+    measuring a one-task "parallel" path. The primary guard uses
+    `BLOCK_SAMPLES * 3 + CHUNK_SAMPLES + 13 * CHANNELS + 2` samples —
+    three full blocks, a short block containing a whole vectorized chunk,
+    a scalar-remainder run of whole texels, and a trailing incomplete
+    texel — with values varying per texel *and* per channel and extreme
+    bit patterns (NaN, both infinities, both signed zeros, both subnormal
+    bounds) seeded into every block and the remainder, compared
+    byte-for-byte against a scalar `premultiply_rgba`-plus-serialize
+    oracle. Plus a whole-tile (64-task) case, the constant-divisibility
+    test, a 14-length boundary sweep, and a mis-sized-output-buffer test.
+  - **A budget/ordering characterization test.** The two existing
+    budget tests pin the *counts* a budget-limited `sync` produces but
+    never the *identities*: a change that uploaded the last two tiles
+    first, or in a `HashMap`'s iteration order, would pass both. The new
+    test reads `residency.slots` directly and asserts that a two-tile
+    budget maps exactly tiles `(0,0)` and `(1,0)` — the first two in
+    row-major order — and that a second unlimited call finishes the
+    backlog. Its real purpose is the *next* round: an across-tile
+    parallelization would have to reproduce that ordering exactly, and
+    this makes an accidental reordering a test failure instead of tiles
+    filling in from the wrong corner in front of a user.
+  - **A panic-freedom argument written out rather than asserted**, because
+    the release profile sets `panic = "abort"` and this code now runs
+    inside a rayon worker closure. All four candidate panic sites are
+    named and discharged: `half`'s two `assert_eq!` length checks (both
+    operands are fixed-size `CHUNK_SAMPLES` arrays or `chunks_exact`
+    output, so equal by construction), no indexing anywhere, and no
+    `copy_from_slice` — the per-texel byte write goes through a slice
+    pattern whose failure arm returns instead of panicking, so a
+    wrong-length `dest` writes nothing rather than aborting the process.
+    The boundary sweep is the executable half of that argument: a test
+    build does not set `panic = "abort"`, so any length-mismatch bug
+    surfaces as an ordinary test failure.
+
+  **Non-vacuity, checked by hand, both mutations reverted afterwards:**
+
+  | mutation | result |
+  |---|---|
+  | output chunk size `BLOCK_SAMPLES` instead of `BLOCK_SAMPLES * 2` (drop the `* 2`) | **12 failures**: the three multi-block serializer tests, plus 9 `render_test` GPU pixel-readback tests that independently caught the corrupted atlas |
+  | `.rev()` on the input block iterator before the `zip` (blocks meet the wrong output offsets) | **3 failures**: the three multi-block serializer tests |
+
+  Both leave `the_block_and_chunk_constants_divide_a_whole_tile_evenly` and
+  `the_parallel_serializer_tolerates_a_mis_sized_output_buffer` green, which
+  is correct — neither asserts about block↔output alignment.
+
+  `rayon` was already in `Cargo.lock` as a transitive **dev**-dependency of
+  `criterion`; this promotes it to a genuine runtime dependency of exactly
+  **one** crate (`aurora-gpu`), which is what PRD §8 pre-decided it for
+  ("rayon for CPU tile parallelism"). `Cargo.lock`'s diff is the 20
+  workspace version strings plus one `rayon` line. `rayon`, `rayon-core`,
+  `crossbeam-deque`/`-epoch`/`-utils` and `either` are all MIT OR
+  Apache-2.0 and were already covered by `deny.toml`'s SPDX allow-list, so
+  **no `deny.toml` change was needed**: `cargo deny check all` reports
+  `advisories ok, bans ok, licenses ok, sources ok`. No
+  `scripts/layering.json` change either — `check_layering.py` only inspects
+  `aurora-`prefixed dependencies, so external crates are outside its remit.
+  **No new `unsafe`**, no new lint exception (three clippy findings on the
+  new code — `manual_is_multiple_of`, `items_after_statements`,
+  `doc_markdown` — were fixed at the source), and no
+  `unwrap`/`expect`/`panic`/`indexing_slicing`. `TileResidency::sync`'s
+  budget enforcement, `take_dirty`/`get` ordering, `slots` mutation and
+  row-major iteration order are all untouched. 6 tests added, 0 changed, 0
+  removed.
 - [x] **Brush latency regression test green in CI** — this checklist
   line itself was stale, not the underlying work: §0.2 already tracks
   a real, CI-gated pair of latency regression tests, done 2026-08-02

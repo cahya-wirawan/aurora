@@ -29420,9 +29420,14 @@ mod tests {
         /// breakdown of this interval:
         ///
         /// - **87.1%** `aurora_gpu::residency`'s
-        ///   `extend_premultiplied_le_bytes` -- a single-threaded
+        ///   `extend_premultiplied_le_bytes` -- an
         ///   `f16 -> f32 -> premultiply -> f16 -> le_bytes` loop over
-        ///   every texel of every dirty tile. No `rayon`.
+        ///   every texel of every dirty tile. That loop was
+        ///   single-threaded with no `rayon` when this was probed;
+        ///   **since 0.96.0 it is `rayon`-parallel across fixed-size
+        ///   blocks of one tile** (64 tasks for a whole tile), so the
+        ///   share below is stale in that direction too. See PLAN.md's
+        ///   0.96.0 entry for what that actually bought, measured.
         /// - **12.7%** `queue.write_texture`'s own CPU-side staging
         ///   `memcpy`.
         /// - **~0%** `TileStore::get` (the tile-store read).
@@ -30196,8 +30201,10 @@ mod tests {
     /// picking the next optimization target:
     ///
     /// - `upload_sync` is **not** GPU upload bandwidth. It is ~87%
-    ///   `aurora_gpu::residency`'s single-threaded
-    ///   `extend_premultiplied_le_bytes` serialize loop and ~13%
+    ///   `aurora_gpu::residency`'s
+    ///   `extend_premultiplied_le_bytes` serialize loop -- single-threaded
+    ///   when probed, `rayon`-parallel across blocks of one tile since
+    ///   0.96.0 -- and ~13%
     ///   `write_texture`'s staging `memcpy`; the real GPU DMA runs later,
     ///   at `queue.submit`, inside `submit_poll`. See [`FrameStages`]'s
     ///   own `upload_sync` field doc. Those two shares were probed
