@@ -21415,7 +21415,9 @@ severity choice.
 
   **So the honest statement is:** the *direction* is consistent across
   every run and every reviewer — these three modes are slightly slower —
-  and the magnitude is somewhere around **+0.5 % to +2 %**. For ColorBurn
+  and the magnitude is somewhere around **+0.5 % to +2 %** for ColorBurn
+  and Color; LinearLight runs somewhat higher, **+2.0 % to +3.1 %** (see
+  the 0.98.2 correction below, which treats it separately). For ColorBurn
   and Color, the effect is **inside this benchmark's own noise floor at
   this sample size**: every trial across both re-measurements above (and
   a further independent one, below) printed criterion's *"Change within
@@ -21467,12 +21469,16 @@ severity choice.
   scratch arrays add memory traffic the old code did not have. That third
   effect is the best available explanation for the three
   `fold_onto_transparent` modes that came back slower, in the cheapest
-  modes on the arm with the least conversion work to amortize — but per
-  the 0.98.1 correction above, that slowdown is itself inside the
-  benchmark's noise floor, so this is a plausible mechanism for a possible
-  small cost, **not** a measured effect with a confirmed cause. The first
-  two did not hold — the win is real and, for the expensive non-separable
-  modes, large.
+  modes on the arm with the least conversion work to amortize — but **not
+  uniformly**: per the 0.98.1/0.98.2 corrections above, ColorBurn and
+  Color's slowdown is inside the benchmark's noise floor (a plausible
+  mechanism for a possible small cost, **not** a measured effect with a
+  confirmed cause), while LinearLight's is not — it reproduced as a real
+  effect above the noise floor in every further trial, so for that one
+  mode the mechanism above **is** the leading explanation for a measured,
+  not merely plausible, small cost. The first two effects (dominant
+  dispatch, CSE) did not hold — the win is real and, for the expensive
+  non-separable modes, large.
 
   **What this does *not* do: move T1, or the 60 FPS gate.** 0.97.1's T1
   bar was "median >= 2.0 ms for both `Normal` and `Multiply` in the
@@ -21786,9 +21792,10 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**Addendum 2026-09-04 (0.98.1) — 0.97.1's directive is DISCHARGED, and
-0.98.0's three "real, not noise" regressions are downgraded to a
-disclosed possible cost.** (1) **The directive is done.** 0.97.1 ended
+**Addendum 2026-09-04 (0.98.2) — 0.97.1's directive is DISCHARGED, and
+0.98.0's three "real, not noise" regressions are corrected: two downgrade
+to a disclosed possible cost, one (LinearLight) upgrades to a plausibly
+real small regression.** (1) **The directive is done.** 0.97.1 ended
 "Measure vectorization against this same benchmark before committing to
 `rayon` here." 0.98.0 did exactly that: batching `composite_layer_into`'s
 `f16` ↔ `f32` conversions through `half::slice::HalfFloatSliceExt`, no
